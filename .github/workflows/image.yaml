@@ -55,6 +55,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,7 +95,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
-        if: always()
+        continue-on-error: true
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: sarif
@@ -103,7 +104,8 @@ jobs:
           exit-code: "0"
 
       - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        continue-on-error: true
         with:
           sarif_file: trivy-results.sarif
