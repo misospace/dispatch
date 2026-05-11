@@ -1,0 +1,90 @@
+"use client";
+
+import { useRouter, useSearchParams } from "next/navigation";
+import { Input } from "@/components/ui/input";
+import { AGENT_LABELS, PRIORITY_LABELS } from "@/types";
+
+interface FilterBarProps {
+  repos: { fullName: string }[];
+  activeFilters: {
+    repo: string;
+    agent: string;
+    owner: string;
+    project: string;
+    priority: string;
+  };
+}
+
+export function FilterBar({ repos, activeFilters }: FilterBarProps) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  function updateFilter(key: string, value: string) {
+    const params = new URLSearchParams(searchParams.toString());
+    if (value) {
+      params.set(key, value);
+    } else {
+      params.delete(key);
+    }
+    router.push(`?${params.toString()}`);
+  }
+
+  return (
+    <div className="flex flex-wrap gap-3 p-4 bg-muted/30 rounded-lg">
+      <select
+        value={activeFilters.repo}
+        onChange={(e) => updateFilter("repo", e.target.value)}
+        className="h-9 px-3 rounded-md border border-input bg-background text-sm"
+      >
+        <option value="">All Repos</option>
+        {repos.map((r) => (
+          <option key={r.fullName} value={r.fullName}>
+            {r.fullName}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={activeFilters.agent}
+        onChange={(e) => updateFilter("agent", e.target.value)}
+        className="h-9 px-3 rounded-md border border-input bg-background text-sm"
+      >
+        <option value="">All Agents</option>
+        {AGENT_LABELS.map((a) => (
+          <option key={a} value={a}>
+            {a.replace("agent/", "")}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={activeFilters.owner}
+        onChange={(e) => updateFilter("owner", e.target.value)}
+        className="h-9 px-3 rounded-md border border-input bg-background text-sm"
+      >
+        <option value="">All Owners</option>
+        <option value="owner/vet">Vet</option>
+      </select>
+
+      <Input
+        placeholder="Project name"
+        value={activeFilters.project}
+        onChange={(e) => updateFilter("project", e.target.value)}
+        className="h-9 w-40"
+      />
+
+      <select
+        value={activeFilters.priority}
+        onChange={(e) => updateFilter("priority", e.target.value)}
+        className="h-9 px-3 rounded-md border border-input bg-background text-sm"
+      >
+        <option value="">All Priorities</option>
+        {PRIORITY_LABELS.map((p) => (
+          <option key={p} value={p}>
+            {p.replace("priority/", "p")}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
