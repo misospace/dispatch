@@ -14,11 +14,28 @@ import {
 const REPOS = process.env.GITHUB_REPOSITORIES?.split(",").map((r) => r.trim()) || [];
 
 async function syncRepo(repoFullName: string) {
-  const syncRun = await prisma.automationSyncRun.create({
-    data: { repoId: "", status: "running", reposFetched: 0, workflowsFetched: 0, runsFetched: 0 },
+  const parts = repoFullName.split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return { success: false, error: `Invalid repo full name: "${repoFullName}". Expected format: owner/repo`, syncRunId: null };
+  }
+  const [owner, name] = parts;
+
+  let repo = await prisma.automationRepo.upsert({
+    where: { fullName: repoFullName },
+    create: {
+      fullName: repoFullName,
+      name,
+      owner,
+      defaultBranch: "main",
+    },
+    update: {},
   });
 
-  let repoId = "";
+  const syncRun = await prisma.automationSyncRun.create({
+    data: { repoId: repo.id, status: "running", reposFetched: 0, workflowsFetched: 0, runsFetched: 0 },
+  });
+
+  let repoUpdated = false;
 
   try {
     const [githubRepo, workflows, runs, releases, prs, packages] = await Promise.all([
@@ -30,30 +47,24 @@ async function syncRepo(repoFullName: string) {
       fetchPackages(repoFullName).catch(() => []),
     ]);
 
-    let repo = await prisma.automationRepo.upsert({
-      where: { fullName: repoFullName },
-      create: {
-        fullName: repoFullName,
-        name: githubRepo.name,
-        owner: githubRepo.owner.login,
-        defaultBranch: githubRepo.default_branch,
-      },
-      update: {
+    repo = await prisma.automationRepo.update({
+      where: { id: repo.id },
+      data: {
         name: githubRepo.name,
         owner: githubRepo.owner.login,
         defaultBranch: githubRepo.default_branch,
       },
     });
-    repoId = repo.id;
+    repoUpdated = true;
 
     await prisma.automationSyncRun.update({
       where: { id: syncRun.id },
-      data: { repoId, reposFetched: 1 },
+      data: { reposFetched: 1 },
     });
 
     const latestCommit = await fetchLatestCommit(repoFullName, githubRepo.default_branch);
     await prisma.automationRepo.update({
-      where: { id: repoId },
+      where: { id: repo.id },
       data: {
         latestCommitSha: latestCommit?.sha || null,
         openPRCount: prs.filter((pr) => pr.state === "open").length,
@@ -66,7 +77,7 @@ async function syncRepo(repoFullName: string) {
       await prisma.githubWorkflow.upsert({
         where: { workflowId: wf.id },
         create: {
-          repoId,
+          repoId: repo.id,
           workflowId: wf.id,
           name: wf.name,
           path: wf.path,
@@ -92,20 +103,6 @@ async function syncRepo(repoFullName: string) {
 
     for (const run of runs) {
       const prUrl = run.pull_requests?.[0]?.url || null;
-      let prId: string | null = null;
-      if (prUrl) {
-        const prNumber = run.pull_requests[0].number;
-        const existingPr = await prisma.githubPullRequest.findUnique({
-          where: { repoId_number: { repoId, number: prNumber } },
-        });
-        if (existingPr) {
-          prId = existingPr.id;
-        }
-      }
-
-      const existingRun = await prisma.githubWorkflowRun.findUnique({
-        where: { runId: run.id },
-      });
 
       let durationSecs: number | null = null;
       if (run.status === "completed" && run.run_started_at) {
@@ -176,9 +173,9 @@ async function syncRepo(repoFullName: string) {
 
     for (const rel of releases) {
       await prisma.githubRelease.upsert({
-        where: { repoId_releaseId: { repoId, releaseId: rel.id } },
+        where: { repoId_releaseId: { repoId: repo.id, releaseId: rel.id } },
         create: {
-          repoId,
+          repoId: repo.id,
           releaseId: rel.id,
           tagName: rel.tag_name,
           name: rel.name,
@@ -203,9 +200,9 @@ async function syncRepo(repoFullName: string) {
     const prsToUpsert = prs.slice(0, 50);
     for (const pr of prsToUpsert) {
       await prisma.githubPullRequest.upsert({
-        where: { repoId_number: { repoId, number: pr.number } },
+        where: { repoId_number: { repoId: repo.id, number: pr.number } },
         create: {
-          repoId,
+          repoId: repo.id,
           number: pr.number,
           url: pr.url,
           title: pr.title,
@@ -234,9 +231,9 @@ async function syncRepo(repoFullName: string) {
     for (const pkg of packages) {
       const latestTag = pkg.metadata?.container?.tags?.[0] || null;
       await prisma.githubPackage.upsert({
-        where: { repoId_name: { repoId, name: pkg.name } },
+        where: { repoId_name: { repoId: repo.id, name: pkg.name } },
         create: {
-          repoId,
+          repoId: repo.id,
           packageType: pkg.package_type,
           name: pkg.name,
           visibility: pkg.visibility,
@@ -253,11 +250,9 @@ async function syncRepo(repoFullName: string) {
       });
     }
 
-    const eventTypes = ["workflow_run", "release", "pr"];
-    const eventType = eventTypes[Math.floor(Math.random() * eventTypes.length)];
     await prisma.automationEvent.create({
       data: {
-        repoId,
+        repoId: repo.id,
         eventType: "sync_completed",
         title: `Sync completed for ${repoFullName}`,
         description: `Fetched ${workflows.length} workflows, ${runs.length} runs, ${releases.length} releases`,
@@ -277,12 +272,10 @@ async function syncRepo(repoFullName: string) {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
-    if (repoId) {
-      await prisma.automationRepo.update({
-        where: { id: repoId },
-        data: { syncError: errorMessage, lastSyncedAt: new Date() },
-      }).catch(() => {});
-    }
+    await prisma.automationRepo.update({
+      where: { id: repo.id },
+      data: { syncError: errorMessage, lastSyncedAt: new Date() },
+    }).catch(() => {});
 
     await prisma.automationSyncRun.update({
       where: { id: syncRun.id },

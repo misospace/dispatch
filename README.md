@@ -67,6 +67,7 @@ Agent Runs → Mission Control → Agent Activity Page
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
 | `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `GITHUB_REPOSITORIES` | Yes | Comma-separated list of repos to track for automation visibility (e.g., `misospace/windowstead,misospace/miso-chat`) |
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
 
@@ -135,11 +136,30 @@ npm install
 # Generate Prisma client
 npm run db:generate
 
-# Push schema to database
+# Push schema to database (local dev only - no migrations exist yet)
 npm run db:push
 
 # Start development server
 npm run dev
+```
+
+## Database Setup
+
+Mission Control uses Prisma with PostgreSQL. The current schema does not have migrations yet (as of v0.1.1).
+
+### Local Development
+- Use `npm run db:push` to apply schema changes without migrations.
+
+### Production Deployment
+- Once migrations are added, use `npm run db:deploy` to apply migrations in production.
+- For v0.1.1 initial deploy, `npm run db:push` is still acceptable since no migrations exist.
+
+```bash
+# For production with migrations:
+npm run db:deploy
+
+# For initial v0.1.1 deploy (no migrations yet):
+npm run db:push
 ```
 
 ## Deployment

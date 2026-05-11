@@ -40,10 +40,10 @@ jobs:
         run: npx prisma generate
 
       - name: Run lint
-        run: npm run lint || true
+        run: npm run lint
 
       - name: Run typecheck
-        run: npm run typecheck || true
+        run: npm run typecheck
 
       - name: Run build
         run: npm run build
@@ -94,18 +94,18 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Run Trivy vulnerability scanner
+        if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          image-ref: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
           exit-code: "0"
 
       - name: Upload Trivy results
+        if: github.event_name != 'pull_request' && hashFiles('trivy-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
-        if: always() && hashFiles('trivy-results.sarif') != ''
-        continue-on-error: true
         with:
           sarif_file: trivy-results.sarif
