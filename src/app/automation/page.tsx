@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { RefreshCw, ExternalLink, AlertTriangle, CheckCircle, XCircle, Clock, GitBranch } from "lucide-react";
+import { RefreshCw, ExternalLink, AlertTriangle, CheckCircle, XCircle, Clock, GitBranch, Trash2 } from "lucide-react";
 
 interface RepoOverview {
   id: string;
@@ -22,6 +22,7 @@ interface RepoOverview {
   _count: { workflows: number; releases: number };
   failingRuns: number;
   runningRuns: number;
+  enabled: boolean;
 }
 
 function StatusBadge({ status }: { status: string | null }) {
@@ -38,7 +39,7 @@ function StatusBadge({ status }: { status: string | null }) {
   }
 }
 
-function RepoCard({ repo }: { repo: RepoOverview }) {
+function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => void }) {
   const latestWorkflow = repo.workflows[0];
   const latestRelease = repo.releases[0];
   const isStale = repo.lastSyncedAt && new Date(repo.lastSyncedAt) < new Date(Date.now() - 60 * 60 * 1000);
@@ -148,6 +149,16 @@ function RepoCard({ repo }: { repo: RepoOverview }) {
               <ExternalLink className="h-3 w-3 mr-1" /> GitHub
             </a>
           </Button>
+          {onDelete && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onDelete}
+              className="text-destructive hover:text-destructive"
+            >
+              <Trash2 className="h-3 w-3 mr-1" /> Remove
+            </Button>
+          )}
         </div>
       </CardContent>
     </Card>
@@ -158,6 +169,10 @@ export default function AutomationOverview() {
   const [repos, setRepos] = useState<RepoOverview[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newRepo, setNewRepo] = useState("");
+  const [addError, setAddError] = useState("");
+  const [addLoading, setAddLoading] = useState(false);
 
   useEffect(() => {
     fetch("/api/automation/sync")
@@ -182,6 +197,42 @@ export default function AutomationOverview() {
     }
   }
 
+  async function addRepo() {
+    if (!newRepo.trim()) return;
+    setAddLoading(true);
+    setAddError("");
+    try {
+      const res = await fetch("/api/automation/repositories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fullName: newRepo.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAddError(data.error || "Failed to add repo");
+        return;
+      }
+      setNewRepo("");
+      setShowAddForm(false);
+      const res2 = await fetch("/api/automation/repos");
+      const data2 = await res2.json();
+      setRepos(data2);
+    } catch {
+      setAddError("Failed to add repo");
+    } finally {
+      setAddLoading(false);
+    }
+  }
+
+  async function deleteRepo(id: string) {
+    try {
+      await fetch(`/api/automation/repositories/${id}`, { method: "DELETE" });
+      setRepos(repos.filter((r) => r.id !== id));
+    } catch {
+      // ignore
+    }
+  }
+
   if (loading) {
     return <div className="flex items-center justify-center h-64">Loading...</div>;
   }
@@ -193,25 +244,51 @@ export default function AutomationOverview() {
           <h1 className="text-2xl font-bold">Automation</h1>
           <p className="text-muted-foreground">CI/CD, builds, releases, and workflow status</p>
         </div>
-        <Button onClick={syncAll} disabled={syncing}>
-          <RefreshCw className={`h-4 w-4 mr-2 ${syncing ? "animate-spin" : ""}`} />
-          {syncing ? "Syncing..." : "Sync All"}
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => setShowAddForm(!showAddForm)}>
+            {showAddForm ? "Cancel" : "Add Repo"}
+          </Button>
+          <Button onClick={syncAll} disabled={syncing}>
+            <RefreshCw className={`h-4 w-4 mr-2 ${syncing ? "animate-spin" : ""}`} />
+            {syncing ? "Syncing..." : "Sync All"}
+          </Button>
+        </div>
       </div>
 
-      {repos.length === 0 ? (
+      {showAddForm && (
+        <Card>
+          <CardContent className="pt-4">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="owner/repo (e.g. myorg/myrepo)"
+                value={newRepo}
+                onChange={(e) => setNewRepo(e.target.value)}
+                className="flex-1 h-9 px-3 rounded-md border border-input bg-background text-sm"
+                onKeyDown={(e) => e.key === "Enter" && addRepo()}
+              />
+              <Button onClick={addRepo} disabled={addLoading || !newRepo.trim()}>
+                {addLoading ? "Adding..." : "Add"}
+              </Button>
+            </div>
+            {addError && <p className="text-sm text-destructive mt-2">{addError}</p>}
+          </CardContent>
+        </Card>
+      )}
+
+      {repos.length === 0 && !showAddForm ? (
         <Card>
           <CardContent className="py-8 text-center">
             <p className="text-muted-foreground">No repositories configured.</p>
             <p className="text-sm text-muted-foreground mt-1">
-              Set GITHUB_REPOSITORIES environment variable to track repos.
+              Click &quot;Add Repo&quot; to track your first repository, or set GITHUB_REPOSITORIES environment variable.
             </p>
           </CardContent>
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {repos.map((repo) => (
-            <RepoCard key={repo.id} repo={repo} />
+            <RepoCard key={repo.id} repo={repo} onDelete={() => deleteRepo(repo.id)} />
           ))}
         </div>
       )}

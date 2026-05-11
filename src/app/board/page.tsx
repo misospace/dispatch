@@ -28,14 +28,37 @@ async function getRepos() {
   });
 }
 
+async function getFilterOptions() {
+  const issues = await prisma.issue.findMany({
+    where: { repository: { enabled: true } },
+    select: { labels: true },
+  });
+
+  const agents = new Set<string>();
+  const owners = new Set<string>();
+
+  for (const issue of issues) {
+    for (const label of issue.labels) {
+      if (label.startsWith("agent/")) agents.add(label);
+      if (label.startsWith("owner/")) owners.add(label);
+    }
+  }
+
+  return {
+    agents: Array.from(agents).sort(),
+    owners: Array.from(owners).sort(),
+  };
+}
+
 interface PageProps {
   searchParams: { repo?: string; agent?: string; owner?: string; project?: string; priority?: string };
 }
 
 export default async function BoardPage({ searchParams }: PageProps) {
-  const [issues, repos] = await Promise.all([
+  const [issues, repos, filterOptions] = await Promise.all([
     getIssues(searchParams.repo, searchParams.agent, searchParams.owner, searchParams.project, searchParams.priority),
     getRepos(),
+    getFilterOptions(),
   ]);
 
   return (
@@ -47,6 +70,8 @@ export default async function BoardPage({ searchParams }: PageProps) {
 
       <FilterBar
         repos={repos}
+        agents={filterOptions.agents}
+        owners={filterOptions.owners}
         activeFilters={{
           repo: searchParams.repo || "",
           agent: searchParams.agent || "",

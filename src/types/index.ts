@@ -65,16 +65,46 @@ export interface AuditLog {
 }
 
 export type StatusLabel = "status/backlog" | "status/in-progress" | "status/in-review" | "status/done";
-export type AgentLabel = "agent/miso" | "agent/saffron" | "agent/maple" | "agent/sage";
-export type OwnerLabel = "owner/vet";
+export type AgentLabel = `agent/${string}`;
+export type OwnerLabel = `owner/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
 
 export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/in-progress", "status/in-review", "status/done"];
-export const AGENT_LABELS: AgentLabel[] = ["agent/miso", "agent/saffron", "agent/maple", "agent/sage"];
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
 export const PROJECT_PREFIX = "project/";
+export const AGENT_PREFIX = "agent/";
+export const OWNER_PREFIX = "owner/";
+
+export function isAgentLabel(label: string): label is AgentLabel {
+  return label.startsWith(AGENT_PREFIX);
+}
+
+export function isOwnerLabel(label: string): label is OwnerLabel {
+  return label.startsWith(OWNER_PREFIX);
+}
+
+export function getStatusFromLabels(labels: string[]): StatusLabel | null {
+  return STATUS_LABELS.find((l) => labels.includes(l)) ?? null;
+}
+
+export function getProjectFromLabels(labels: string[]): string | null {
+  const projectLabel = labels.find((l: string) => l.startsWith(PROJECT_PREFIX));
+  return projectLabel?.replace(PROJECT_PREFIX, "") ?? null;
+}
+
+export function getAgentFromLabels(labels: string[]): AgentLabel | null {
+  return labels.find(isAgentLabel) as AgentLabel | null;
+}
+
+export function getOwnerFromLabels(labels: string[]): OwnerLabel | null {
+  return labels.find(isOwnerLabel) as OwnerLabel | null;
+}
+
+export function getPriorityFromLabels(labels: string[]): PriorityLabel | null {
+  return PRIORITY_LABELS.find((l) => labels.includes(l)) ?? null;
+}
 
 export const LABEL_COLORS: Record<string, string> = {
   "status/backlog": "6b7280",
@@ -86,20 +116,3 @@ export const LABEL_COLORS: Record<string, string> = {
   "priority/p2": "eab308",
   "priority/p3": "22c55e",
 };
-
-export function getStatusFromLabels(labels: string[]): StatusLabel | null {
-  return STATUS_LABELS.find((l) => labels.includes(l)) ?? null;
-}
-
-export function getProjectFromLabels(labels: string[]): string | null {
-  const projectLabel = labels.find((l) => l.startsWith(PROJECT_PREFIX));
-  return projectLabel?.replace(PROJECT_PREFIX, "") ?? null;
-}
-
-export function getAgentFromLabels(labels: string[]): AgentLabel | null {
-  return AGENT_LABELS.find((l) => labels.includes(l)) ?? null;
-}
-
-export function getPriorityFromLabels(labels: string[]): PriorityLabel | null {
-  return PRIORITY_LABELS.find((l) => labels.includes(l)) ?? null;
-}

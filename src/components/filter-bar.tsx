@@ -2,10 +2,12 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { Input } from "@/components/ui/input";
-import { AGENT_LABELS, PRIORITY_LABELS } from "@/types";
+import { PRIORITY_LABELS, AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 
 interface FilterBarProps {
   repos: { fullName: string }[];
+  agents: string[];
+  owners: string[];
   activeFilters: {
     repo: string;
     agent: string;
@@ -15,7 +17,7 @@ interface FilterBarProps {
   };
 }
 
-export function FilterBar({ repos, activeFilters }: FilterBarProps) {
+export function FilterBar({ repos, agents, owners, activeFilters }: FilterBarProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -50,9 +52,9 @@ export function FilterBar({ repos, activeFilters }: FilterBarProps) {
         className="h-9 px-3 rounded-md border border-input bg-background text-sm"
       >
         <option value="">All Agents</option>
-        {AGENT_LABELS.map((a) => (
+        {agents.map((a) => (
           <option key={a} value={a}>
-            {a.replace("agent/", "")}
+            {a.replace(AGENT_PREFIX, "")}
           </option>
         ))}
       </select>
@@ -63,7 +65,11 @@ export function FilterBar({ repos, activeFilters }: FilterBarProps) {
         className="h-9 px-3 rounded-md border border-input bg-background text-sm"
       >
         <option value="">All Owners</option>
-        <option value="owner/vet">Vet</option>
+        {owners.map((o) => (
+          <option key={o} value={o}>
+            {o.replace(OWNER_PREFIX, "")}
+          </option>
+        ))}
       </select>
 
       <Input

@@ -64,7 +64,7 @@ Agent Runs → Mission Control → Agent Activity Page
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
 | `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
-| `GITHUB_REPOSITORIES` | Yes | Comma-separated list of repos to track for automation visibility (e.g., `misospace/windowstead,misospace/miso-chat`) |
+| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Mission Control UI after initial setup. |
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
 
@@ -221,7 +221,7 @@ For control actions (rerun, dispatch):
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GITHUB_REPOSITORIES` | Yes | Comma-separated list of repos to track (e.g., `misospace/windowstead,misospace/miso-chat,misospace/miso-gallery`) |
+| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for tracked repos. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2`). Managed repos can also be added/removed via UI at `/automation`. |
 
 ### Screens Added
 
@@ -230,6 +230,7 @@ For control actions (rerun, dispatch):
    - Shows: repo name, default branch, latest commit SHA, workflow status, failing/running counts, latest release, open PR count
    - Sync button to refresh data
    - Link to GitHub repo
+   - Add/remove tracked repos via UI
 
 2. **Repo Automation Detail** (`/automation/repos/[repo]`)
    - Workflow list with recent runs per workflow

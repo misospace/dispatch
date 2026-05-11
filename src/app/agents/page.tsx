@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { AGENT_LABELS } from "@/types";
+import { AGENT_PREFIX } from "@/types";
 
 export const dynamic = "force-dynamic";
 
@@ -13,20 +13,18 @@ async function getAgentStats() {
 
   const agentMap: Record<string, { assigned: number; inProgress: number; inReview: number }> = {};
 
-  for (const label of AGENT_LABELS) {
-    agentMap[label] = { assigned: 0, inProgress: 0, inReview: 0 };
-  }
+  const agentIssues = await prisma.issue.findMany({
+    where: { repository: { enabled: true } },
+    select: { labels: true },
+  });
 
-  for (const issue of issues) {
-    for (const label of AGENT_LABELS) {
-      if (issue.labels.includes(label)) {
+  for (const issue of agentIssues) {
+    for (const label of issue.labels) {
+      if (label.startsWith(AGENT_PREFIX)) {
+        if (!agentMap[label]) agentMap[label] = { assigned: 0, inProgress: 0, inReview: 0 };
         agentMap[label].assigned++;
-        if (issue.labels.includes("status/in-progress")) {
-          agentMap[label].inProgress++;
-        }
-        if (issue.labels.includes("status/in-review")) {
-          agentMap[label].inReview++;
-        }
+        if (issue.labels.includes("status/in-progress")) agentMap[label].inProgress++;
+        if (issue.labels.includes("status/in-review")) agentMap[label].inReview++;
       }
     }
   }
@@ -41,8 +39,20 @@ async function getRecentRuns() {
   });
 }
 
+async function getDiscoveredAgents(): Promise<string[]> {
+  const runs = await prisma.agentRun.findMany({
+    distinct: ["agentName"],
+    select: { agentName: true },
+  });
+  return runs.map((r) => r.agentName);
+}
+
 export default async function AgentsPage() {
-  const [agentStats, recentRuns] = await Promise.all([getAgentStats(), getRecentRuns()]);
+  const [agentStats, recentRuns, discoveredAgents] = await Promise.all([
+    getAgentStats(),
+    getRecentRuns(),
+    getDiscoveredAgents(),
+  ]);
 
   return (
     <div className="space-y-6">
@@ -51,36 +61,47 @@ export default async function AgentsPage() {
         <p className="text-muted-foreground">Agent activity and assignments</p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        {AGENT_LABELS.map((label) => {
-          const stats = agentStats[label];
-          return (
-            <Card key={label}>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm font-medium capitalize">
-                  {label.replace("agent/", "")}
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-1 text-sm">
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">Assigned</span>
-                    <span className="font-medium">{stats.assigned}</span>
+      {discoveredAgents.length === 0 ? (
+        <Card>
+          <CardContent className="pt-6">
+            <p className="text-sm text-muted-foreground">
+              No agents have reported yet. Agents appear after POSTing to /api/agent-runs with your agent token.
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {discoveredAgents.map((agentName) => {
+            const label = `${AGENT_PREFIX}${agentName}`;
+            const stats = agentStats[label] || { assigned: 0, inProgress: 0, inReview: 0 };
+            return (
+              <Card key={agentName}>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium capitalize">
+                    {agentName.replace(AGENT_PREFIX, "")}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-1 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Assigned</span>
+                      <span className="font-medium">{stats.assigned}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">In Progress</span>
+                      <span className="font-medium">{stats.inProgress}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">In Review</span>
+                      <span className="font-medium">{stats.inReview}</span>
+                    </div>
                   </div>
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">In Progress</span>
-                    <span className="font-medium">{stats.inProgress}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">In Review</span>
-                    <span className="font-medium">{stats.inReview}</span>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          );
-        })}
-      </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      )}
 
       <Card>
         <CardHeader>

@@ -10,8 +10,7 @@ import {
   fetchPackages,
   fetchRunJobs,
 } from "@/lib/github";
-
-const REPOS = process.env.GITHUB_REPOSITORIES?.split(",").map((r) => r.trim()) || [];
+import { getTrackedRepos } from "@/lib/config";
 
 async function syncRepo(repoFullName: string) {
   const parts = repoFullName.split("/");
@@ -313,8 +312,9 @@ export async function POST(request: Request) {
     }
   }
 
+  const repos = await getTrackedRepos();
   const results = [];
-  for (const repo of REPOS) {
+  for (const repo of repos) {
     results.push({ repo, result: await syncRepo(repo) });
   }
 
