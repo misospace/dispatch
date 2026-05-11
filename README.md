@@ -36,13 +36,10 @@ Agent Runs → Mission Control → Agent Activity Page
 - `status/done` - Issue is completed
 
 ### Owner Labels
-- `owner/vet` - Issue is owned by vet
+- `owner/*` - Issue is owned by a specific person (e.g., `owner/alice`, `owner/bob`)
 
 ### Agent Labels
-- `agent/miso`
-- `agent/saffron`
-- `agent/maple`
-- `agent/sage`
+- `agent/*` - Issue is being worked on by an agent (e.g., `agent/alpha`, `agent/beta`)
 
 ### Project Labels
 - `project/*` - Issue belongs to a project (e.g., `project/k8s`, `project/web`)
