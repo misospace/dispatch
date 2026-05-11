@@ -142,20 +142,22 @@ npm run dev
 
 ## Database Setup
 
-Mission Control uses Prisma with PostgreSQL. The current schema does not have migrations yet (as of v0.1.1).
+Mission Control uses Prisma with PostgreSQL. Migrations are used for production; `db push` is for local development only.
 
 ### Local Development
 - Use `npm run db:push` to apply schema changes without migrations.
 
 ### Production Deployment
-- Once migrations are added, use `npm run db:deploy` to apply migrations in production.
-- For v0.1.1 initial deploy, `npm run db:push` is still acceptable since no migrations exist.
+- Production automatically runs `prisma migrate deploy` on container startup.
+- First deploy against an empty database creates all tables automatically.
+- No manual `kubectl exec` or `db push` is required.
+- Set `SKIP_DB_MIGRATIONS=true` to skip migrations if needed.
 
 ```bash
-# For production with migrations:
+# Production (automatic on startup):
 npm run db:deploy
 
-# For initial v0.1.1 deploy (no migrations yet):
+# Local dev only:
 npm run db:push
 ```
 
