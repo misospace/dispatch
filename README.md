@@ -42,7 +42,7 @@ Agent Runs → Mission Control → Agent Activity Page
 - `agent/*` - Issue is being worked on by an agent (e.g., `agent/alpha`, `agent/beta`)
 
 ### Project Labels
-- `project/*` - Issue belongs to a project (e.g., `project/k8s`, `project/web`)
+- Optional: `project/*` labels may exist on issues, but Mission Control Projects group issues by repository by default.
 
 ### Priority Labels
 - `priority/p0` - Critical
@@ -90,8 +90,8 @@ Agent Runs → Mission Control → Agent Activity Page
    - Filter by repo, agent, owner, project, priority
 
 5. **Project View**
-   - Group issues by `project/*` labels
-   - Show issues by status per project
+   - Group synced issues by repository
+   - Show issues by status per repository project
 
 6. **Agent Activity Ingestion**
    - `POST /api/agent-runs` with bearer token auth
@@ -139,6 +139,31 @@ npm run db:push
 # Start development server
 npm run dev
 ```
+
+## Testing
+
+Run the smoke/regression suite locally with:
+
+```bash
+npm run test
+```
+
+The tests are intentionally lightweight and do not require Postgres, GitHub API access, or secrets. They cover:
+
+- repository env parsing and validation
+- BigInt-safe JSON serialization for automation API responses
+- critical API route file presence
+- issue sync response shaping and per-repo error handling
+- Kanban status grouping, including no-status issues appearing in Backlog
+- project grouping by repository boundaries
+- dark mode toggle class and localStorage behavior
+
+Recommended Renovate flow:
+
+1. Merge the test harness first.
+2. Let Renovate PRs rebase onto the new checks.
+3. Merge low-risk dependency PRs first.
+4. Handle framework, Prisma, and React updates separately.
 
 ## Database Setup
 

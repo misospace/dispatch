@@ -11,7 +11,9 @@ export function parseRepoList(input: string | undefined): string[] {
     const trimmed = part.trim();
     if (!trimmed) continue;
     if (seen.has(trimmed)) continue;
-    const [owner, repo] = trimmed.split("/");
+    const parts = trimmed.split("/");
+    if (parts.length !== 2) continue;
+    const [owner, repo] = parts;
     if (!owner || !repo || owner.includes(" ") || repo.includes(" ")) continue;
     seen.add(trimmed);
     result.push(trimmed);
