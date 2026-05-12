@@ -95,6 +95,15 @@ async function syncRepo(repoFullName: string) {
       });
     }
 
+    const workflowMap = new Map<string, string>();
+    const dbWorkflows = await prisma.githubWorkflow.findMany({
+      where: { repoId: repo.id },
+      select: { id: true, name: true },
+    });
+    for (const wf of dbWorkflows) {
+      workflowMap.set(wf.name, wf.id);
+    }
+
     await prisma.automationSyncRun.update({
       where: { id: syncRun.id },
       data: { workflowsFetched: workflows.length },
@@ -110,10 +119,27 @@ async function syncRepo(repoFullName: string) {
         durationSecs = Math.round((end - start) / 1000);
       }
 
+      let wfId = workflowMap.get(run.name);
+      if (!wfId) {
+        const placeholderWf = await prisma.githubWorkflow.create({
+          data: {
+            repoId: repo.id,
+            workflowId: BigInt(run.id),
+            name: run.name,
+            path: "unknown",
+            state: "unknown",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        });
+        wfId = placeholderWf.id;
+        workflowMap.set(run.name, wfId);
+      }
+
       await prisma.githubWorkflowRun.upsert({
         where: { runId: run.id },
         create: {
-          workflowId: (await prisma.githubWorkflow.findUnique({ where: { workflowId: workflows.find(w => w.name === run.name)?.id || 0 } }))?.id || "",
+          workflowId: wfId,
           runId: run.id,
           name: run.name,
           status: run.status,

@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -16,7 +17,17 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: `
+          (function() {
+            var theme = localStorage.getItem('mission-control-theme');
+            if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+              document.documentElement.classList.add('dark');
+            }
+          })();
+        `}} />
+      </head>
       <body className={inter.className}>
         <div className="min-h-screen flex flex-col">
           <header className="border-b">
@@ -41,6 +52,9 @@ export default function RootLayout({
                   Automation
                 </Link>
               </nav>
+              <div className="ml-auto">
+                <ThemeToggle />
+              </div>
             </div>
           </header>
           <main className="flex-1 container py-6">{children}</main>

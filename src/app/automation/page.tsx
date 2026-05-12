@@ -45,40 +45,40 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
   const isStale = repo.lastSyncedAt && new Date(repo.lastSyncedAt) < new Date(Date.now() - 60 * 60 * 1000);
 
   return (
-    <Card className={repo.syncError ? "border-destructive" : ""}>
+    <Card className={`${repo.syncError ? "border-destructive" : ""} min-w-0 overflow-hidden`}>
       <CardHeader className="pb-3">
-        <div className="flex items-center justify-between">
-          <Link href={`/automation/repos/${repo.fullName}`} className="hover:underline">
-            <CardTitle className="text-lg">{repo.fullName}</CardTitle>
+        <div className="flex items-center justify-between gap-2 min-w-0">
+          <Link href={`/automation/repos/${repo.fullName}`} className="hover:underline min-w-0">
+            <CardTitle className="text-lg truncate">{repo.fullName}</CardTitle>
           </Link>
-          {repo.syncError && <AlertTriangle className="h-5 w-5 text-destructive" />}
+          {repo.syncError && <AlertTriangle className="h-5 w-5 text-destructive shrink-0" />}
         </div>
-        <div className="flex gap-2 text-sm text-muted-foreground">
-          <span className="flex items-center gap-1">
+        <div className="flex gap-2 text-sm text-muted-foreground min-w-0">
+          <span className="flex items-center gap-1 shrink-0">
             <GitBranch className="h-3 w-3" />
             {repo.defaultBranch}
           </span>
           {repo.latestCommitSha && (
-            <span className="font-mono text-xs">{repo.latestCommitSha.slice(0, 7)}</span>
+            <span className="font-mono text-xs truncate">{repo.latestCommitSha.slice(0, 7)}</span>
           )}
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
         {repo.syncError ? (
-          <div className="text-sm text-destructive">{repo.syncError}</div>
+          <div className="text-sm text-destructive break-words">{repo.syncError}</div>
         ) : (
           <>
             <div className="grid grid-cols-2 gap-2 text-sm">
-              <div>
+              <div className="min-w-0">
                 <span className="text-muted-foreground">Workflows:</span> {repo._count.workflows}
               </div>
-              <div>
+              <div className="min-w-0">
                 <span className="text-muted-foreground">Releases:</span> {repo._count.releases}
               </div>
-              <div>
+              <div className="min-w-0">
                 <span className="text-muted-foreground">Open PRs:</span> {repo.openPRCount}
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 flex-wrap">
                 {repo.failingRuns > 0 && (
                   <span className="text-destructive flex items-center gap-1">
                     <XCircle className="h-3 w-3" /> {repo.failingRuns} failing
@@ -98,21 +98,21 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
             </div>
 
             {latestWorkflow && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Latest: </span>
+              <div className="text-sm min-w-0 flex items-center gap-1 flex-wrap">
+                <span className="text-muted-foreground shrink-0">Latest:</span>
                 <StatusBadge status={latestWorkflow.state} />
-                <span className="ml-1">{latestWorkflow.name}</span>
+                <span className="truncate">{latestWorkflow.name}</span>
               </div>
             )}
 
             {latestRelease && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Latest release: </span>
+              <div className="text-sm min-w-0 flex items-center gap-1 flex-wrap">
+                <span className="text-muted-foreground shrink-0">Release:</span>
                 <a
                   href={`https://github.com/${repo.fullName}/releases/tag/${latestRelease.tagName}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-primary hover:underline"
+                  className="text-primary hover:underline truncate"
                 >
                   {latestRelease.tagName}
                 </a>
@@ -127,8 +127,8 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
           </>
         )}
 
-        <div className="flex gap-2 pt-2">
-          <Button variant="outline" size="sm" asChild>
+        <div className="flex gap-2 pt-2 flex-wrap">
+          <Button variant="outline" size="sm" asChild className="text-xs">
             <Link href={`/automation/repos/${repo.fullName}`}>Details</Link>
           </Button>
           <Button
@@ -141,10 +141,11 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
                 body: JSON.stringify({ repo: repo.fullName }),
               }).then(() => window.location.reload());
             }}
+            className="text-xs"
           >
             <RefreshCw className="h-3 w-3 mr-1" /> Sync
           </Button>
-          <Button variant="ghost" size="sm" asChild>
+          <Button variant="ghost" size="sm" asChild className="text-xs">
             <a href={`https://github.com/${repo.fullName}`} target="_blank" rel="noopener noreferrer">
               <ExternalLink className="h-3 w-3 mr-1" /> GitHub
             </a>
@@ -154,7 +155,7 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
               variant="ghost"
               size="sm"
               onClick={onDelete}
-              className="text-destructive hover:text-destructive"
+              className="text-destructive hover:text-destructive text-xs"
             >
               <Trash2 className="h-3 w-3 mr-1" /> Remove
             </Button>
