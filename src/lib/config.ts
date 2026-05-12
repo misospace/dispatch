@@ -66,3 +66,31 @@ export async function getTrackedRepos(): Promise<string[]> {
 
   return envRepos;
 }
+
+export async function getSyncRepos(): Promise<{ id: string; fullName: string }[]> {
+  const dbRepos = await prisma.repository.findMany({
+    where: { enabled: true },
+    select: { id: true, fullName: true },
+    orderBy: { fullName: "asc" },
+  });
+
+  if (dbRepos.length > 0) {
+    return dbRepos;
+  }
+
+  const trackedRepos = await getTrackedRepos();
+  const results: { id: string; fullName: string }[] = [];
+
+  for (const fullName of trackedRepos) {
+    const [owner, name] = fullName.split("/");
+    const repo = await prisma.repository.upsert({
+      where: { fullName },
+      create: { fullName, owner: owner || fullName, name: name || fullName, enabled: true },
+      update: {},
+      select: { id: true, fullName: true },
+    });
+    results.push(repo);
+  }
+
+  return results;
+}

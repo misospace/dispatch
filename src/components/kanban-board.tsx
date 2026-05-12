@@ -47,6 +47,13 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
   }, [initialIssues]);
 
   function getIssuesByStatus(status: StatusLabel): Issue[] {
+    if (status === "status/backlog") {
+      return issues.filter(
+        (issue) =>
+          issue.labels.includes(status) ||
+          !issue.labels.some((l) => l.startsWith("status/"))
+      );
+    }
     return issues.filter((issue) => issue.labels.includes(status));
   }
 

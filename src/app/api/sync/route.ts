@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchIssues, updateIssueLabels } from "@/lib/github";
-import { STATUS_LABELS, getStatusFromLabels } from "@/types";
+import { fetchIssues } from "@/lib/github";
+import { getSyncRepos } from "@/lib/config";
 
 export async function POST() {
   try {
-    const repos = await prisma.repository.findMany({ where: { enabled: true } });
+    const repos = await getSyncRepos();
     let syncedCount = 0;
 
     for (const repo of repos) {
@@ -21,7 +21,6 @@ export async function POST() {
           number: ghIssue.number,
           title: ghIssue.title,
           body: ghIssue.body,
-          state: ghIssue.state,
           url: ghIssue.html_url,
           labels: labelNames,
           assignees: ghIssue.assignees.map((a) => a.login),
@@ -30,6 +29,7 @@ export async function POST() {
           updatedAt: new Date(ghIssue.updated_at),
           closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : null,
           lastSyncedAt: new Date(),
+          state: ghIssue.state,
         };
 
         if (existingIssue) {

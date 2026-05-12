@@ -58,3 +58,35 @@
     color: var(--foreground);
   }
 }
+
+/* Dark mode overrides for common hardcoded Tailwind colors */
+.dark .bg-white { background-color: var(--background); }
+.dark .bg-gray-50 { background-color: var(--background); }
+.dark .bg-gray-100 { background-color: var(--secondary); }
+.dark .bg-gray-200 { background-color: var(--muted); }
+.dark .bg-gray-950 { background-color: var(--background); }
+
+.dark .text-gray-900 { color: var(--foreground); }
+.dark .text-gray-800 { color: var(--foreground); }
+.dark .text-gray-600 { color: var(--muted-foreground); }
+.dark .text-gray-500 { color: var(--muted-foreground); }
+.dark .text-gray-400 { color: var(--muted-foreground); }
+
+.dark .border-gray-200 { border-color: var(--border); }
+.dark .border-gray-300 { border-color: var(--border); }
+
+.dark .bg-muted { background-color: var(--muted); }
+.dark .text-muted-foreground { color: var(--muted-foreground); }
+
+.dark .bg-card { background-color: var(--card); }
+.dark .text-card-foreground { color: var(--card-foreground); }
+.dark .bg-popover { background-color: var(--popover); }
+.dark .text-popover-foreground { color: var(--popover-foreground); }
+.dark .bg-primary { background-color: var(--primary); }
+.dark .text-primary-foreground { color: var(--primary-foreground); }
+.dark .bg-secondary { background-color: var(--secondary); }
+.dark .text-secondary-foreground { color: var(--secondary-foreground); }
+.dark .bg-accent { background-color: var(--accent); }
+.dark .text-accent-foreground { color: var(--accent-foreground); }
+.dark .bg-destructive { background-color: var(--destructive); }
+.dark .text-destructive-foreground { color: var(--destructive-foreground); }
