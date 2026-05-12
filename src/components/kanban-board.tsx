@@ -20,6 +20,7 @@ import {
 import { KanbanColumn } from "./kanban-column";
 import { IssueCard } from "./issue-card";
 import { Issue, StatusLabel } from "@/types";
+import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
 
 const COLUMNS: { id: StatusLabel; title: string }[] = [
   { id: "status/backlog", title: "Backlog" },
@@ -45,21 +46,6 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
   useEffect(() => {
     setIssues(initialIssues);
   }, [initialIssues]);
-
-  function getIssuesByStatus(status: StatusLabel): Issue[] {
-    if (status === "status/backlog") {
-      return issues.filter(
-        (issue) =>
-          issue.labels.includes(status) ||
-          !issue.labels.some((l) => l.startsWith("status/"))
-      );
-    }
-    return issues.filter((issue) => issue.labels.includes(status));
-  }
-
-  function getIssueStatus(issue: Issue): StatusLabel {
-    return COLUMNS.find((c) => issue.labels.includes(c.id))?.id ?? "status/backlog";
-  }
 
   function handleDragStart(event: DragStartEvent) {
     const { active } = event;
@@ -148,7 +134,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
       >
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {COLUMNS.map((column) => {
-            const columnIssues = getIssuesByStatus(column.id);
+            const columnIssues = getIssuesByStatus(issues, column.id);
             return (
               <KanbanColumn
                 key={column.id}

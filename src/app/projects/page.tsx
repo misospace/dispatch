@@ -1,7 +1,8 @@
 import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { getProjectFromLabels, getStatusFromLabels, STATUS_LABELS } from "@/types";
+import { STATUS_LABELS } from "@/types";
+import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
 
@@ -11,39 +12,25 @@ async function getProjects() {
     include: { repository: true },
   });
 
-  const projectMap = new Map<string, { name: string; issues: typeof issues }>();
-
-  for (const issue of issues) {
-    const projectName = getProjectFromLabels(issue.labels);
-    if (!projectName) continue;
-
-    if (!projectMap.has(projectName)) {
-      projectMap.set(projectName, { name: projectName, issues: [] });
-    }
-    projectMap.get(projectName)!.issues.push(issue);
-  }
-
   return {
-    projects: Array.from(projectMap.values()).sort((a, b) => a.name.localeCompare(b.name)),
+    projects: groupIssuesByProject(issues),
     issueCount: issues.length,
   };
 }
 
 export default async function ProjectsPage() {
-  const { projects, issueCount } = await getProjects();
+  const { projects } = await getProjects();
 
   if (projects.length === 0) {
     return (
       <div className="space-y-6">
         <div>
           <h1 className="text-2xl font-bold">Projects</h1>
-          <p className="text-muted-foreground">Group issues by project/* labels</p>
+          <p className="text-muted-foreground">Group synced issues by repository</p>
         </div>
         <Card>
           <CardContent className="py-8 text-center text-muted-foreground">
-            {issueCount > 0
-              ? "Issues are synced, but no project/* labels were found. Add project/* labels in GitHub to group issues here."
-              : "No issues have been synced yet. Use Sync Issues on the Board to import GitHub issues first."}
+            No issues have been synced yet. Use Sync Issues on the Board to import GitHub issues first.
           </CardContent>
         </Card>
       </div>
@@ -54,12 +41,12 @@ export default async function ProjectsPage() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">Projects</h1>
-        <p className="text-muted-foreground">Group issues by project/* labels</p>
+        <p className="text-muted-foreground">Group synced issues by repository</p>
       </div>
 
       <div className="grid gap-6">
         {projects.map((project) => (
-          <Card key={project.name}>
+          <Card key={project.key}>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 {project.name}
@@ -70,7 +57,7 @@ export default async function ProjectsPage() {
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 {STATUS_LABELS.map((status) => {
                   const statusIssues = project.issues.filter(
-                    (i) => (getStatusFromLabels(i.labels) ?? "status/backlog") === status
+                    (i) => getProjectIssueStatus(i) === status
                   );
                   return (
                     <div key={status} className="space-y-2">
