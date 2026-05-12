@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { jsonSafe } from "@/lib/json";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -19,7 +20,7 @@ export async function GET(request: Request) {
       include: { repo: true },
     });
 
-    return NextResponse.json(events);
+    return NextResponse.json(jsonSafe(events));
   } catch (error) {
     console.error("Failed to fetch automation events:", error);
     return NextResponse.json({ error: "Failed to fetch events" }, { status: 500 });

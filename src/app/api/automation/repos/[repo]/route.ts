@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { jsonSafe } from "@/lib/json";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -61,13 +62,13 @@ export async function GET(request: Request) {
       orderBy: { createdAt: "desc" },
     });
 
-    return NextResponse.json({
+    return NextResponse.json(jsonSafe({
       ...repo,
       failingRuns,
       runningRuns,
       lastSyncRun,
       recentEvents,
-    });
+    }));
   } catch (error) {
     console.error("Failed to fetch repo:", error);
     return NextResponse.json({ error: "Failed to fetch repo" }, { status: 500 });

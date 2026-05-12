@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { jsonSafe } from "@/lib/json";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -28,7 +29,7 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
     }
 
-    return NextResponse.json(workflow);
+    return NextResponse.json(jsonSafe(workflow));
   } catch (error) {
     console.error("Failed to fetch workflow:", error);
     return NextResponse.json({ error: "Failed to fetch workflow" }, { status: 500 });

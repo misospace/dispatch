@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { jsonSafe } from "@/lib/json";
 
 export async function GET() {
   try {
@@ -56,7 +57,7 @@ export async function GET() {
       })
     );
 
-    return NextResponse.json(reposWithCounts);
+    return NextResponse.json(jsonSafe(reposWithCounts));
   } catch (error) {
     console.error("Failed to fetch repos:", error);
     return NextResponse.json({ error: "Failed to fetch repos" }, { status: 500 });
