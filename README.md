@@ -158,6 +158,8 @@ The tests are intentionally lightweight and do not require Postgres, GitHub API 
 - project grouping by repository boundaries
 - dark mode toggle class and localStorage behavior
 
+The `CI` workflow runs lint, typecheck, tests, and build. The image workflow builds the Docker image, publishes GHCR images on `main` and `v*` tags, and uploads advisory Trivy scan results.
+
 Recommended Renovate flow:
 
 1. Merge the test harness first.
