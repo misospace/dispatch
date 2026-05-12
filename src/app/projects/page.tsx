@@ -42,8 +42,8 @@ export default async function ProjectsPage() {
         <Card>
           <CardContent className="py-8 text-center text-muted-foreground">
             {issueCount > 0
-              ? "Synced issues were found, but none have project/* labels yet."
-              : "No synced issues found. Projects appear after synced issues have project/* labels."}
+              ? "Issues are synced, but no project/* labels were found. Add project/* labels in GitHub to group issues here."
+              : "No issues have been synced yet. Use Sync Issues on the Board to import GitHub issues first."}
           </CardContent>
         </Card>
       </div>
