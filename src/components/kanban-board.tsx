@@ -57,6 +57,10 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
     return issues.filter((issue) => issue.labels.includes(status));
   }
 
+  function getIssueStatus(issue: Issue): StatusLabel {
+    return COLUMNS.find((c) => issue.labels.includes(c.id))?.id ?? "status/backlog";
+  }
+
   function handleDragStart(event: DragStartEvent) {
     const { active } = event;
     const issue = issues.find((i) => i.id === active.id);
@@ -77,12 +81,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
       const overIssue = issues.find((i) => i.id === overId);
       if (!overIssue) return;
 
-      const overIssueColumn = COLUMNS.find((c) =>
-        overIssue.labels.includes(c.id)
-      );
-      if (!overIssueColumn) return;
-
-      await moveIssue(activeId, overIssueColumn.id);
+      await moveIssue(activeId, getIssueStatus(overIssue));
     } else {
       await moveIssue(activeId, overColumn.id);
     }

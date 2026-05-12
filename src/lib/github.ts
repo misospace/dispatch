@@ -16,7 +16,7 @@ function getHeaders(): HeadersInit {
 
 export async function fetchIssues(repoFullName: string): Promise<GitHubIssue[]> {
   const [owner, repo] = repoFullName.split("/");
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=all&per_page=100&labels=`;
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=all&per_page=100`;
   const response = await fetch(url, { headers: getHeaders() });
 
   if (!response.ok) {

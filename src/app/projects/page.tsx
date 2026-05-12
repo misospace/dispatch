@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { getProjectFromLabels, STATUS_LABELS } from "@/types";
+import { getProjectFromLabels, getStatusFromLabels, STATUS_LABELS } from "@/types";
 
 export const dynamic = "force-dynamic";
 
@@ -23,11 +23,14 @@ async function getProjects() {
     projectMap.get(projectName)!.issues.push(issue);
   }
 
-  return Array.from(projectMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    projects: Array.from(projectMap.values()).sort((a, b) => a.name.localeCompare(b.name)),
+    issueCount: issues.length,
+  };
 }
 
 export default async function ProjectsPage() {
-  const projects = await getProjects();
+  const { projects, issueCount } = await getProjects();
 
   if (projects.length === 0) {
     return (
@@ -38,7 +41,9 @@ export default async function ProjectsPage() {
         </div>
         <Card>
           <CardContent className="py-8 text-center text-muted-foreground">
-            No projects found. Add project/* labels to your GitHub issues.
+            {issueCount > 0
+              ? "Synced issues were found, but none have project/* labels yet."
+              : "No synced issues found. Projects appear after synced issues have project/* labels."}
           </CardContent>
         </Card>
       </div>
@@ -64,7 +69,9 @@ export default async function ProjectsPage() {
             <CardContent>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 {STATUS_LABELS.map((status) => {
-                  const statusIssues = project.issues.filter((i) => i.labels.includes(status));
+                  const statusIssues = project.issues.filter(
+                    (i) => (getStatusFromLabels(i.labels) ?? "status/backlog") === status
+                  );
                   return (
                     <div key={status} className="space-y-2">
                       <h4 className="text-sm font-medium text-muted-foreground">

@@ -28,9 +28,9 @@ export default function RootLayout({
           })();
         `}} />
       </head>
-      <body className={inter.className}>
-        <div className="min-h-screen flex flex-col">
-          <header className="border-b">
+      <body className={`${inter.className} bg-background text-foreground`}>
+        <div className="min-h-screen flex flex-col bg-background">
+          <header className="border-b bg-card">
             <div className="container flex items-center gap-6 py-4">
               <Link href="/" className="font-bold text-lg">
                 Mission Control
