@@ -25,10 +25,10 @@ ENV NODE_ENV=production
 
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=prod-deps /app/node_modules ./node_modules
-
 RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+RUN adduser --system --uid 1001 --ingroup nodejs nextjs
+
+COPY --from=prod-deps --chown=nextjs:nodejs /app/node_modules ./node_modules
 
 COPY --from=builder /app/docker-entrypoint.sh /docker-entrypoint.sh
 COPY --from=builder /app/.next/standalone ./

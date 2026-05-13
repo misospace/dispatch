@@ -66,9 +66,10 @@ jobs:
 
       - name: Validate Prisma CLI runtime
         run: |
-          IMAGE="${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          IMAGE="mission-control:prisma-cli-runtime"
+          docker build -t "$IMAGE" .
           echo "Validating Prisma CLI in image: $IMAGE"
-          docker run --rm --entrypoint ./node_modules/.bin/prisma "$IMAGE" version
+          docker run --rm --entrypoint ./node_modules/.bin/prisma "$IMAGE" --version
 
       - name: Run Trivy vulnerability scanner
         if: github.event_name != 'pull_request'
