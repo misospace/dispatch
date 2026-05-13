@@ -64,6 +64,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Validate Prisma CLI runtime
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          echo "Validating Prisma CLI in image: $IMAGE"
+          docker run --rm --entrypoint ./node_modules/.bin/prisma "$IMAGE" version
+
       - name: Run Trivy vulnerability scanner
         if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@master
