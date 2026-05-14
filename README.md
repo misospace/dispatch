@@ -215,7 +215,7 @@ Add a repository. Body: `{ fullName: "owner/repo" }`
 Sync all issues from configured repositories. Intended callers are:
 
 - the board UI's manual **Sync Issues** action
-- Saffron heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
+- openclaw agent heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
 
 ### GET /api/agent-runs
 List agent runs. Query params: `limit`
@@ -303,10 +303,10 @@ For control actions (rerun, dispatch):
 
 ## Scheduled Issue Sync Strategy
 
-Mission Control keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **Saffron heartbeat sync** rather than by a Mission Control background worker or new cluster CronJob.
+Mission Control keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **openclaw agent heartbeat sync** rather than by a Mission Control background worker or new cluster CronJob.
 
 Decision:
-- At the start of each Saffron heartbeat, Saffron should make a best-effort `POST` request to Mission Control's `/api/sync` endpoint.
+- At the start of each openclaw agent heartbeat, the agent should make a best-effort `POST` request to Mission Control's `/api/sync` endpoint.
 - The request must be non-blocking for heartbeat work: log/report a warning if the sync fails or times out, then continue the heartbeat.
 - Manual UI sync remains supported for immediate refreshes and troubleshooting.
 
@@ -320,7 +320,7 @@ Rejected alternatives for the first implementation:
 - **Mission Control internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
 
 Operational notes:
-- Configure Saffron with `MISSION_CONTROL_URL` and any required network access to reach Mission Control.
+- Configure the openclaw agent with `MISSION_CONTROL_URL` and any required network access to reach Mission Control.
 - `/api/sync` currently does not require `MISSION_CONTROL_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
 - Treat sync failures as freshness warnings, not heartbeat failures, unless the heartbeat itself cannot complete.
 
