@@ -194,7 +194,7 @@ describe("POST /api/issues/move — validation", () => {
     expect(body.success).toBe(true);
   });
 
-  it("returns 500 on malformed JSON body", async () => {
+  it("returns 400 on malformed JSON body", async () => {
     const res = await POST(
       new Request("http://localhost/api/issues/move", {
         method: "POST",
@@ -202,6 +202,6 @@ describe("POST /api/issues/move — validation", () => {
         body: "not-json",
       })
     );
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(400);
   });
 });
