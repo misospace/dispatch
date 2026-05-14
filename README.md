@@ -212,7 +212,10 @@ List configured repositories
 Add a repository. Body: `{ fullName: "owner/repo" }`
 
 ### POST /api/sync
-Sync all issues from configured repositories
+Sync all issues from configured repositories. Intended callers are:
+
+- the board UI's manual **Sync Issues** action
+- openclaw agent heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
 
 ### GET /api/agent-runs
 List agent runs. Query params: `limit`
@@ -298,6 +301,29 @@ For control actions (rerun, dispatch):
 - UI shows stale warnings when `lastSyncedAt` > 1 hour ago
 - Sync runs are recorded in `AutomationSyncRun` table with stats
 
+## Scheduled Issue Sync Strategy
+
+Mission Control keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **openclaw agent heartbeat sync** rather than by a Mission Control background worker or new cluster CronJob.
+
+Decision:
+- At the start of each openclaw agent heartbeat, the agent should make a best-effort `POST` request to Mission Control's `/api/sync` endpoint.
+- The request must be non-blocking for heartbeat work: log/report a warning if the sync fails or times out, then continue the heartbeat.
+- Manual UI sync remains supported for immediate refreshes and troubleshooting.
+
+Rationale:
+- Reuses the existing heartbeat that already reports to Mission Control, so no new Kubernetes manifests, images, queues, or background scheduler are required.
+- Keeps cache freshness close to the agent workflow that consumes the board.
+- Preserves Mission Control's simple app model: it serves API/UI requests and does not need long-running in-process scheduling state.
+
+Rejected alternatives for the first implementation:
+- **Kubernetes CronJob**: valid later if heartbeat-driven sync is too sparse, but it adds deployment and auth plumbing for little immediate benefit.
+- **Mission Control internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
+
+Operational notes:
+- Configure the openclaw agent with `MISSION_CONTROL_URL` and any required network access to reach Mission Control.
+- `/api/sync` currently does not require `MISSION_CONTROL_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
+- Treat sync failures as freshness warnings, not heartbeat failures, unless the heartbeat itself cannot complete.
+
 ### Known Limitations
 
 1. **No workflow YAML parsing**: Trigger types (push, PR, schedule, manual) are not parsed from workflow files. GitHub shows workflow state (active/inactive) but not trigger configuration.
@@ -305,7 +331,7 @@ For control actions (rerun, dispatch):
 3. **No check runs/check suites**: Job-level visibility is limited to Actions jobs; separate status checks from other integrations are not fetched.
 4. **No Secrets scanning**: Secret detection results from GitHub's secret scanning are not fetched (requires additional API endpoint).
 5. **Package visibility**: GitHub packages require the user to have appropriate permissions to view; private packages may not be visible.
-6. **No automatic sync**: Sync is manual-triggered via API; no webhook receiver for real-time updates.
+6. **No webhook receiver for real-time updates**: Issue cache refresh is heartbeat-driven and best-effort, not push-based from GitHub.
 7. **No workflow run logs**: Full logs are not stored; only run metadata and job status.
 
 ### Deferred Phase 2 Items
@@ -318,7 +344,7 @@ For control actions (rerun, dispatch):
 6. **Artifact listing** for workflow runs
 7. **Deployment status** correlation (link runs to environments)
 8. **Caching improvements** with Redis if sync load becomes problematic
-9. **Scheduled sync** via cron or background job
+9. **Webhook-based issue sync** if heartbeat freshness is not enough
 
 ## Container Image
 
