@@ -68,6 +68,24 @@ Agent Runs → Mission Control → Agent Activity Page
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
 
+## First-Run Flow
+
+To get started with Mission Control:
+
+1. **Configure repos**: Set `GITHUB_REPOSITORIES` env var (comma or newline separated) _or_ add tracked repos via the UI after boot. `GITHUB_REPOSITORIES` is a bootstrap seed config — repos can be managed post-boot via the UI or API (`POST /api/repos`).
+2. **Deploy** with your database and GitHub token configured.
+3. **Sync automation data**: `POST /api/automation/sync` (or use the Sync button on the Automation page).
+4. **Sync issues**: `POST /api/sync` (or use the Sync Issues action in the board UI). OpenClaw agent heartbeats also trigger best-effort issue sync automatically.
+5. **View results**: The Kanban Board shows synced issues; the Projects view groups them by repository.
+
+Production database migrations (`prisma migrate deploy`) run automatically on container startup — no manual intervention needed.
+
+## Security
+
+Mission Control is designed as an **internal-only** application. It does not include public-facing authentication in Phase 1 (NextAuth.js is a stub for local development). The app remains internal unless external auth integration (e.g., OIDC/Authentik) is added later.
+
+Ensure it is only accessible within your trusted network via ingress rules.
+
 ## Phase 1 Features
 
 ### Implemented
@@ -225,6 +243,11 @@ Create agent run. Requires `MISSION_CONTROL_AGENT_TOKEN` bearer auth.
 
 ### GET /api/audit
 List audit logs. Query params: `limit`, `repo`
+
+**Note: Issue sync and automation sync are separate concerns.**
+- **Issue sync** (`POST /api/sync`) refreshes GitHub issues into the Kanban board. It is heartbeat-driven (best-effort via openclaw agent) or manual via UI.
+- **Automation sync** (`POST /api/automation/sync`) refreshes CI/CD, workflow runs, releases, and packages data. It is managed independently on the Automation page.
+- Each sync operates on its own data models and caching layer.
 
 ## Automation Section
 
