@@ -108,7 +108,7 @@ export default async function OverviewPage() {
                 {Object.entries(byAgent).map(([agent, count]) => (
                   <div key={agent} className="flex justify-between text-sm">
                     <span>{agent.replace("agent/", "")}</span>
-                    <span className="font-medium">{count}</span>
+                    <span className="font-medium">{(count as number)}</span>
                   </div>
                 ))}
               </div>
