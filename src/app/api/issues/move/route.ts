@@ -1,19 +1,35 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels, removeIssueLabel, addIssueLabel } from "@/lib/github";
-import { STATUS_LABELS } from "@/types";
+import { STATUS_LABELS, StatusLabel } from "@/types";
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
     const { issueId, repoFullName, issueNumber, oldLabels, newLabels } = body;
 
-    if (!issueId || !repoFullName || !issueNumber === undefined || !oldLabels || !newLabels) {
+    // Validate required fields with explicit type checks
+    if (!issueId || !repoFullName || typeof issueNumber !== "number" || !oldLabels || !newLabels) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
     }
 
+    // Validate status labels are from the allowed set
     const oldStatusLabel = oldLabels.find((l: string) => l.startsWith("status/"));
     const newStatusLabel = newLabels.find((l: string) => l.startsWith("status/"));
+
+    if (oldStatusLabel && !STATUS_LABELS.includes(oldStatusLabel as StatusLabel)) {
+      return NextResponse.json(
+        { error: `Invalid status label: ${oldStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
+        { status: 400 },
+      );
+    }
+
+    if (newStatusLabel && !STATUS_LABELS.includes(newStatusLabel as StatusLabel)) {
+      return NextResponse.json(
+        { error: `Invalid status label: ${newStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
+        { status: 400 },
+      );
+    }
 
     try {
       const labelsToRemove = oldStatusLabel && oldStatusLabel !== newStatusLabel ? [oldStatusLabel] : [];
