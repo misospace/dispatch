@@ -3,6 +3,10 @@ import { prisma } from "@/lib/prisma";
 import { updateIssueLabels, removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, StatusLabel } from "@/types";
 
+function isStatusLabel(label: string): label is StatusLabel {
+  return (STATUS_LABELS as readonly string[]).includes(label);
+}
+
 export async function POST(request: Request) {
   try {
     let body: unknown;
@@ -27,14 +31,14 @@ export async function POST(request: Request) {
     const oldStatusLabel = (oldLabels as string[]).find((l: string) => l.startsWith("status/"));
     const newStatusLabel = (newLabels as string[]).find((l: string) => l.startsWith("status/"));
 
-    if (oldStatusLabel && !STATUS_LABELS.includes(oldStatusLabel)) {
+    if (oldStatusLabel && !isStatusLabel(oldStatusLabel)) {
       return NextResponse.json(
         { error: `Invalid status label: ${oldStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
         { status: 400 },
       );
     }
 
-    if (newStatusLabel && !STATUS_LABELS.includes(newStatusLabel)) {
+    if (newStatusLabel && !isStatusLabel(newStatusLabel)) {
       return NextResponse.json(
         { error: `Invalid status label: ${newStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
         { status: 400 },
@@ -49,7 +53,7 @@ export async function POST(request: Request) {
         await removeIssueLabel(repoFullName as string, issueNumber as number, label);
       }
 
-      for (label of labelsToAdd) {
+      for (const label of labelsToAdd) {
         await addIssueLabel(repoFullName as string, issueNumber as number, label);
       }
 
