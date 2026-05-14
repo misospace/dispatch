@@ -1,37 +1,67 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels, removeIssueLabel, addIssueLabel } from "@/lib/github";
-import { STATUS_LABELS } from "@/types";
+import { STATUS_LABELS, StatusLabel } from "@/types";
+
+function isStatusLabel(label: string): label is StatusLabel {
+  return (STATUS_LABELS as readonly string[]).includes(label);
+}
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { issueId, repoFullName, issueNumber, oldLabels, newLabels } = body;
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
 
-    if (!issueId || !repoFullName || !issueNumber === undefined || !oldLabels || !newLabels) {
+    if (typeof body !== "object" || body === null) {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+
+    const { issueId, repoFullName, issueNumber, oldLabels, newLabels } = body as Record<string, unknown>;
+
+    // Validate required fields with explicit type checks
+    if (!issueId || !repoFullName || typeof issueNumber !== "number" || !oldLabels || !newLabels) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
     }
 
-    const oldStatusLabel = oldLabels.find((l: string) => l.startsWith("status/"));
-    const newStatusLabel = newLabels.find((l: string) => l.startsWith("status/"));
+    // Validate status labels are from the allowed set
+    const oldStatusLabel = (oldLabels as string[]).find((l: string) => l.startsWith("status/"));
+    const newStatusLabel = (newLabels as string[]).find((l: string) => l.startsWith("status/"));
+
+    if (oldStatusLabel && !isStatusLabel(oldStatusLabel)) {
+      return NextResponse.json(
+        { error: `Invalid status label: ${oldStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
+        { status: 400 },
+      );
+    }
+
+    if (newStatusLabel && !isStatusLabel(newStatusLabel)) {
+      return NextResponse.json(
+        { error: `Invalid status label: ${newStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
+        { status: 400 },
+      );
+    }
 
     try {
       const labelsToRemove = oldStatusLabel && oldStatusLabel !== newStatusLabel ? [oldStatusLabel] : [];
       const labelsToAdd = newStatusLabel && oldStatusLabel !== newStatusLabel ? [newStatusLabel] : [];
 
       for (const label of labelsToRemove) {
-        await removeIssueLabel(repoFullName, issueNumber, label);
+        await removeIssueLabel(repoFullName as string, issueNumber as number, label);
       }
 
       for (const label of labelsToAdd) {
-        await addIssueLabel(repoFullName, issueNumber, label);
+        await addIssueLabel(repoFullName as string, issueNumber as number, label);
       }
 
-      const issue = await prisma.issue.findUnique({ where: { id: issueId } });
+      const issue = await prisma.issue.findUnique({ where: { id: issueId as string } });
       if (issue) {
         await prisma.issue.update({
-          where: { id: issueId },
-          data: { labels: newLabels, lastSyncedAt: new Date() },
+          where: { id: issueId as string },
+          data: { labels: newLabels as string[], lastSyncedAt: new Date() },
         });
       }
 
@@ -39,11 +69,11 @@ export async function POST(request: Request) {
         data: {
           actor: "user",
           action: "move_issue",
-          repoFullName,
-          issueNumber,
-          issueId,
-          beforeLabels: oldLabels,
-          afterLabels: newLabels,
+          repoFullName: repoFullName as string,
+          issueNumber: issueNumber as number,
+          issueId: issueId as string,
+          beforeLabels: oldLabels as string[],
+          afterLabels: newLabels as string[],
           success: true,
         },
       });
@@ -56,11 +86,11 @@ export async function POST(request: Request) {
         data: {
           actor: "user",
           action: "move_issue",
-          repoFullName,
-          issueNumber,
-          issueId,
-          beforeLabels: oldLabels,
-          afterLabels: newLabels,
+          repoFullName: repoFullName as string,
+          issueNumber: issueNumber as number,
+          issueId: issueId as string,
+          beforeLabels: oldLabels as string[],
+          afterLabels: newLabels as string[],
           success: false,
           errorMessage,
         },
@@ -70,6 +100,6 @@ export async function POST(request: Request) {
     }
   } catch (error) {
     console.error("Move issue failed:", error);
-    return NextResponse.json({ error: "Failed to move issue" }, { status: 500 });
+    return NextResponse.json({ error: "Failed to move issue" }, { status: 400 });
   }
 }
