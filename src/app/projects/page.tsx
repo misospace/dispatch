@@ -68,7 +68,7 @@ export default async function ProjectsPage() {
                         <p className="text-xs text-muted-foreground">No issues</p>
                       ) : (
                         <div className="space-y-1">
-                          {(statusIssues as any).map((issue) => (
+                          {(statusIssues as any).map((issue: any) => (
                             <a
                               key={issue.id}
                               href={issue.url}

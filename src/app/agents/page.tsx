@@ -43,10 +43,15 @@ async function getAgentStats() {
 }
 
 async function getRecentRuns(): Promise<AgentRun[]> {
-  return prisma.agentRun.findMany({
+  const runs = await prisma.agentRun.findMany({
     take: 20,
     orderBy: { createdAt: "desc" },
   });
+  return runs.map((run) => ({
+    ...run,
+    summary: run.summary ?? undefined,
+    errorMessage: run.errorMessage ?? undefined,
+  }));
 }
 
 async function getDiscoveredAgents(): Promise<string[]> {
