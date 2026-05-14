@@ -61,7 +61,12 @@ export async function getTrackedRepos(): Promise<string[]> {
   for (const fullName of envRepos) {
     await prisma.automationRepo.upsert({
       where: { fullName },
-      create: { fullName, name: fullName.split("/")[1] || fullName, owner: fullName.split("/")[0] || fullName },
+      create: {
+        fullName,
+        name: fullName.split("/")[1] || fullName,
+        owner: fullName.split("/")[0] || fullName,
+        source: "env",
+      },
       update: {},
     });
   }
