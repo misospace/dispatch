@@ -204,4 +204,23 @@ describe("POST /api/issues/move — validation", () => {
     );
     expect(res.status).toBe(400);
   });
+
+  it("writes an AuditLog entry with success=false when the GitHub mutation fails", async () => {
+    mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
+
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error).toBe("github 500");
+
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "move_issue",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        success: false,
+        errorMessage: "github 500",
+      }),
+    });
+  });
 });
