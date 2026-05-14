@@ -6,6 +6,16 @@ import { AGENT_PREFIX } from "@/types";
 
 export const dynamic = "force-dynamic";
 
+interface AgentRun {
+  id: string;
+  agentName: string;
+  runType: string;
+  status: string;
+  startedAt: Date;
+  summary?: string;
+  errorMessage?: string;
+}
+
 async function getAgentStats() {
   const issues = await prisma.issue.findMany({
     where: { state: "open", repository: { enabled: true } },
@@ -32,7 +42,7 @@ async function getAgentStats() {
   return agentMap;
 }
 
-async function getRecentRuns() {
+async function getRecentRuns(): Promise<AgentRun[]> {
   return prisma.agentRun.findMany({
     take: 20,
     orderBy: { createdAt: "desc" },
@@ -44,7 +54,7 @@ async function getDiscoveredAgents(): Promise<string[]> {
     distinct: ["agentName"],
     select: { agentName: true },
   });
-  return runs.map((r) => r.agentName);
+  return runs.map((r: { agentName: string }) => r.agentName);
 }
 
 export default async function AgentsPage() {
@@ -71,7 +81,7 @@ export default async function AgentsPage() {
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {discoveredAgents.map((agentName) => {
+          {discoveredAgents.map((agentName: string) => {
             const label = `${AGENT_PREFIX}${agentName}`;
             const stats = agentStats[label] || { assigned: 0, inProgress: 0, inReview: 0 };
             return (
@@ -113,7 +123,7 @@ export default async function AgentsPage() {
           ) : (
             <Table>
               <TableBody>
-                {recentRuns.map((run) => (
+                {recentRuns.map((run: AgentRun) => (
                   <TableRow key={run.id}>
                     <TableCell className="font-medium capitalize">{run.agentName}</TableCell>
                     <TableCell>{run.runType}</TableCell>

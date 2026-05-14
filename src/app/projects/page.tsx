@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 async function getProjects() {
   const issues = await prisma.issue.findMany({
     where: { repository: { enabled: true } },
-    include: { repository: true },
+    include: { repository: true, labels: true },
   });
 
   return {
@@ -57,7 +57,7 @@ export default async function ProjectsPage() {
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 {STATUS_LABELS.map((status) => {
                   const statusIssues = project.issues.filter(
-                    (i) => getProjectIssueStatus(i) === status
+                    (i: any) => getProjectIssueStatus(i as any) === status
                   );
                   return (
                     <div key={status} className="space-y-2">
@@ -68,7 +68,7 @@ export default async function ProjectsPage() {
                         <p className="text-xs text-muted-foreground">No issues</p>
                       ) : (
                         <div className="space-y-1">
-                          {statusIssues.map((issue) => (
+                          {(statusIssues as any).map((issue) => (
                             <a
                               key={issue.id}
                               href={issue.url}
