@@ -34,7 +34,7 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token |
 | `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API |
-| `GITHUB_REPOSITORIES` | Yes | Comma-separated repos to track |
+| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for tracked repos (comma or newline separated). Also managed via UI/API after boot. |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
 
@@ -46,6 +46,7 @@ Labels follow a `category/value` pattern:
 - **Owner**: `owner/*` (e.g., `owner/alice`)
 - **Agent**: `agent/*` (e.g., `agent/alpha`)
 - **Project**: `project/*` (e.g., `project/k8s`)
+- **Note:** `project/*` labels are **optional** and not required for the Projects view. Projects groups issues by repository by default.
 - **Priority**: `priority/p0` through `priority/p3`
 - **Type**: `type/bug`, `type/feature`, `type/chore`, `type/research`, `type/security`
 
@@ -69,8 +70,8 @@ For control actions (rerun, dispatch):
 ## Prisma Notes
 
 - Schema is in `prisma/schema.prisma`
-- Current setup uses `db push` for local dev (no migrations yet)
-- Production uses `prisma migrate deploy` when migrations exist
+- Local dev: `db push` (push schema without migrations)
+- Production: `prisma migrate deploy` runs automatically on container startup
 - binaryTargets includes `linux-arm64-openssl-3.0.x` for Debian bookworm-slim runtime
 
 ## Docker
