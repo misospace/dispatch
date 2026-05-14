@@ -7,13 +7,12 @@ import { getTrackedRepos } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
 
-async function getIssues(repo?: string, agent?: string, owner?: string, project?: string, priority?: string) {
+async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string) {
   const where: Record<string, unknown> = { repository: { enabled: true } };
 
   if (repo) where.repository = { ...(where.repository as object), fullName: repo };
   if (agent) where.labels = { has: agent };
   if (owner) where.labels = { has: owner };
-  if (project) where.labels = { has: `project/${project}` };
   if (priority) where.labels = { has: priority };
 
   return prisma.issue.findMany({
@@ -70,12 +69,13 @@ async function getIssueSyncStatus() {
 }
 
 interface PageProps {
-  searchParams: { repo?: string; agent?: string; owner?: string; project?: string; priority?: string };
+  searchParams: Promise<{ repo?: string; agent?: string; owner?: string; priority?: string }>;
 }
 
 export default async function BoardPage({ searchParams }: PageProps) {
+  const params = await searchParams;
   const [issues, repos, filterOptions, syncStatus] = await Promise.all([
-    getIssues(searchParams.repo, searchParams.agent, searchParams.owner, searchParams.project, searchParams.priority),
+    getIssues(params.repo, params.agent, params.owner, params.priority),
     getRepos(),
     getFilterOptions(),
     getIssueSyncStatus(),
@@ -100,11 +100,10 @@ export default async function BoardPage({ searchParams }: PageProps) {
         agents={filterOptions.agents}
         owners={filterOptions.owners}
         activeFilters={{
-          repo: searchParams.repo || "",
-          agent: searchParams.agent || "",
-          owner: searchParams.owner || "",
-          project: searchParams.project || "",
-          priority: searchParams.priority || "",
+          repo: params.repo || "",
+          agent: params.agent || "",
+          owner: params.owner || "",
+          priority: params.priority || "",
         }}
       />
 

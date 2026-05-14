@@ -133,3 +133,38 @@ src/
 ```
 
 Returns 503 if database is unreachable.
+
+## OpenClaw Agent Workflow Contract
+
+This section is the source of truth for how an OpenClaw agent should interact with Mission Control. Agents should follow this contract instead of grooming a GitHub Project board.
+
+### Heartbeat lifecycle
+
+At the **start** of each heartbeat:
+
+1. **Best-effort `POST /api/sync`** to refresh Mission Control's issue cache. Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
+
+At the **end** of each heartbeat:
+
+2. **`POST /api/agent-runs`** (bearer-auth with `MISSION_CONTROL_AGENT_TOKEN`) with run metadata: `agentName`, `runType`, `status`, `startedAt`, `finishedAt`, `summary`, `touchedIssueUrls`.
+
+### Reading work
+
+3. **Read issues from `GET /api/issues`.** Do not query the Postgres cache directly — the API is the contract.
+4. **Prefer issues assigned via `agent/<agent-id>` label** if present. If no `agent/*` label exists, fall back to general backlog.
+5. **Treat "no status label" or `status/backlog` as backlog work.** Both are valid entry states.
+
+### Source of truth
+
+6. **GitHub Issues and PRs remain the source of truth.** Mission Control's Postgres is a cache; do not write back to it as if it were authoritative.
+7. **Do not rely on GitHub Projects.** The Projects board is deprecated for this workflow — group by repository instead.
+8. **Do not auto-close issues without explicit evidence of completion.** Mission Control's audit log is not a license to close — a green pipeline, merged PR, or human approval is.
+
+### Failure modes
+
+9. **Mission Control failures must not fail the heartbeat.** Sync, agent-run POST, and issue read are all best-effort from the heartbeat's perspective. Log a warning, continue.
+10. **Tokens are secrets.** `MISSION_CONTROL_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
+
+### Auditability
+
+11. **Every state-changing move on Mission Control must produce an AuditLog row.** Operators trace agent activity through `/api/audit`. Drag-and-drop moves on the Kanban board already write audit entries via `POST /api/issues/move`; agents using the same endpoint inherit this behavior.

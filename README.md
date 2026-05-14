@@ -324,6 +324,27 @@ For control actions (rerun, dispatch):
 - UI shows stale warnings when `lastSyncedAt` > 1 hour ago
 - Sync runs are recorded in `AutomationSyncRun` table with stats
 
+## Pre-migration Smoke Checklist
+
+Run this checklist before pointing an OpenClaw agent at Mission Control as its task-visibility layer (instead of a GitHub Project board). Every step should pass; stop and investigate on the first failure.
+
+Set `BASE` to your Mission Control URL (e.g. `BASE=https://mission-control.internal`) before running.
+
+| # | Check | Expected |
+|---|-------|----------|
+| 1 | `curl -fsS "$BASE/api/health"` | `{"ok":true,"database":"ok",...}` |
+| 2 | `curl -fsS -X POST "$BASE/api/automation/sync"` | 2xx, no error body |
+| 3 | `curl -fsS "$BASE/api/automation/repos"` | JSON array, non-empty if repos are configured |
+| 4 | `curl -fsS -X POST "$BASE/api/sync"` | `syncedCount > 0` |
+| 5 | `curl -fsS "$BASE/api/issues"` | JSON array, length > 0 |
+| 6 | Open `/board` in a browser | Issues render — no "no issues synced yet" empty state |
+| 7 | Open `/projects` | Repo groups render |
+| 8 | Open `/agents` | Recent OpenClaw agent heartbeat visible with agent name |
+| 9 | Move a low-risk test issue between columns | GitHub label changes; AuditLog row appears in `GET /api/audit` |
+| 10 | `kubectl logs -n <ns> <pod>` (or equivalent) | No Prisma / BigInt / FK errors |
+
+Only flip the agent's workflow over once all ten steps pass.
+
 ## Scheduled Issue Sync Strategy
 
 Mission Control keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **openclaw agent heartbeat sync** rather than by a Mission Control background worker or new cluster CronJob.
