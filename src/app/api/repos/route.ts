@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isValidRepoName } from "@/lib/config";
+import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
 
 export async function GET() {
   try {
@@ -15,9 +16,8 @@ export async function GET() {
   }
 }
 
-// AutomationRepo is the canonical tracked-repos table. POST creates an
-// AutomationRepo (source=user) and a mirror Repository so the board surfaces
-// the new repo without waiting for the next /api/sync.
+// Deprecated compatibility endpoint. Use POST /api/automation/repos for
+// tracked repository management.
 export async function POST(request: Request) {
   let body: unknown;
   try {
@@ -43,49 +43,20 @@ export async function POST(request: Request) {
     );
   }
 
-  const [owner, name] = fullName.split("/");
-
   try {
-    const [automationRepo, repository] = await prisma.$transaction([
-      prisma.automationRepo.create({
-        data: { fullName, owner, name, source: "user" },
-      }),
-      prisma.repository.upsert({
-        where: { fullName },
-        create: { fullName, owner, name, enabled: true },
-        update: { enabled: true },
-      }),
-    ]);
+    const { automationRepo, repository } = await createTrackedRepo(fullName);
 
-    await prisma.auditLog.create({
-      data: {
-        actor: "user",
-        action: "add_tracked_repo",
-        repoFullName: fullName,
-        beforeLabels: [],
-        afterLabels: [],
-        success: true,
-      },
-    });
-
-    return NextResponse.json({ ...repository, automationRepoId: automationRepo.id }, { status: 201 });
+    const response = NextResponse.json({ ...repository, automationRepoId: automationRepo.id }, { status: 201 });
+    response.headers.set("Deprecation", "true");
+    response.headers.set("Link", '</api/automation/repos>; rel="successor-version"');
+    return response;
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       return NextResponse.json({ error: "Repository is already tracked" }, { status: 409 });
     }
 
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    await prisma.auditLog.create({
-      data: {
-        actor: "user",
-        action: "add_tracked_repo",
-        repoFullName: fullName,
-        beforeLabels: [],
-        afterLabels: [],
-        success: false,
-        errorMessage,
-      },
-    });
+    await auditTrackedRepoCreateFailure(fullName, errorMessage);
     console.error("Failed to create repo:", error);
     return NextResponse.json({ error: errorMessage }, { status: 500 });
   }

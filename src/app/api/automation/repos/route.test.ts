@@ -3,13 +3,23 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     createAutomationRepo: vi.fn(),
+    upsertRepository: vi.fn(),
+    transaction: vi.fn((callback) =>
+      callback({
+        automationRepo: { create: mocks.createAutomationRepo },
+        repository: { upsert: mocks.upsertRepository },
+        auditLog: { create: mocks.createAuditLog },
+      }),
+    ),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
   },
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
+    $transaction: mocks.transaction,
     automationRepo: { create: mocks.createAutomationRepo },
+    repository: { upsert: mocks.upsertRepository },
     auditLog: { create: mocks.createAuditLog },
   },
 }));
@@ -52,6 +62,13 @@ describe("POST /api/automation/repos", () => {
       name: "myrepo",
       source: "user",
     });
+    mocks.upsertRepository.mockResolvedValue({
+      id: "mirror-1",
+      fullName: "myorg/myrepo",
+      owner: "myorg",
+      name: "myrepo",
+      enabled: true,
+    });
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
   });
 
@@ -70,12 +87,17 @@ describe("POST /api/automation/repos", () => {
     expect(res.status).toBe(400);
   });
 
-  it("creates an AutomationRepo with source=user and writes an audit row on success", async () => {
+  it("creates AutomationRepo and Repository rows, then writes an audit row on success", async () => {
     const res = await postRequest({ fullName: "myorg/myrepo" });
     expect(res.status).toBe(201);
 
     expect(mocks.createAutomationRepo).toHaveBeenCalledWith({
       data: { fullName: "myorg/myrepo", owner: "myorg", name: "myrepo", source: "user" },
+    });
+    expect(mocks.upsertRepository).toHaveBeenCalledWith({
+      where: { fullName: "myorg/myrepo" },
+      create: { fullName: "myorg/myrepo", owner: "myorg", name: "myrepo", enabled: true },
+      update: { owner: "myorg", name: "myrepo", enabled: true },
     });
 
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
