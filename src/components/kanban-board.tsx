@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { cn } from "@/lib/utils";
 import {
   DndContext,
   DragOverlay,
@@ -37,6 +38,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
   const [issues, setIssues] = useState<Issue[]>(initialIssues);
   const [activeIssue, setActiveIssue] = useState<Issue | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notification, setNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -46,6 +48,14 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
   useEffect(() => {
     setIssues(initialIssues);
   }, [initialIssues]);
+
+  // Auto-dismiss notification after 5 seconds
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
 
   function handleDragStart(event: DragStartEvent) {
     const { active } = event;
@@ -119,11 +129,52 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
     }
   }
 
+  // Refresh the board by re-fetching issues from the API
+  async function refreshBoard() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const query = params.toString();
+      const url = `/api/issues${query ? `?${query}` : ""}`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setIssues(data);
+      }
+    } catch {
+      // If refresh fails, just sync to pick up changes
+      try {
+        await fetch("/api/sync", { method: "POST" });
+      } catch {
+        // Silent fail — user can manually sync
+      }
+    }
+  }
+
   return (
     <div className="space-y-4">
       {error && (
-        <div className="bg-destructive/10 text-destructive text-sm p-3 rounded">
-          {error}
+        <div className="bg-destructive/10 text-destructive text-sm p-3 rounded flex items-center justify-between">
+          <span>{error}</span>
+          <button
+            className="text-destructive hover:text-destructive-foreground ml-4"
+            onClick={() => setError(null)}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {notification && (
+        <div className={cn(
+          "text-sm p-3 rounded flex items-center justify-between",
+          notification.type === "success" ? "bg-green-50 text-green-800" : "bg-destructive/10 text-destructive"
+        )}>
+          <span>{notification.message}</span>
+          <button
+            className="ml-4 opacity-60 hover:opacity-100"
+            onClick={() => setNotification(null)}
+          >
+            ✕
+          </button>
         </div>
       )}
       <DndContext
@@ -148,7 +199,11 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
                 >
                   <div className="space-y-2">
                     {columnIssues.map((issue) => (
-                      <IssueCard key={issue.id} issue={issue} />
+                      <IssueCard
+                        key={issue.id}
+                        issue={issue}
+                        onIssueUpdate={() => refreshBoard()}
+                      />
                     ))}
                   </div>
                 </SortableContext>
