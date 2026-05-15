@@ -64,7 +64,7 @@ Agent Runs → Mission Control → Agent Activity Page
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
 | `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
-| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Mission Control UI after initial setup. |
+| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Mission Control UI or `/api/automation/repos` after initial setup. |
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
 
@@ -72,7 +72,7 @@ Agent Runs → Mission Control → Agent Activity Page
 
 To get started with Mission Control:
 
-1. **Configure repos**: Set `GITHUB_REPOSITORIES` env var (comma or newline separated) _or_ add tracked repos via the UI after boot. `GITHUB_REPOSITORIES` is a **one-time bootstrap seed** — it is read only when the tracked-repos table is empty. Once any repo exists (seeded or added via UI), the env var is not consulted again, so updates must go through the UI or API (`POST /api/repos` / `POST /api/automation/repos`). Env-seeded repos are tagged `source: "env"` and shown with a `seed` badge in `/automation`; user-added repos are tagged `source: "user"`.
+1. **Configure repos**: Set `GITHUB_REPOSITORIES` env var (comma or newline separated) _or_ add tracked repos via the UI after boot. `GITHUB_REPOSITORIES` is a **one-time bootstrap seed** — it is read only when the tracked-repos table is empty. Once any repo exists (seeded or added via UI), the env var is not consulted again, so updates must go through the UI or canonical API (`POST /api/automation/repos`). Env-seeded repos are tagged `source: "env"` and shown with a `seed` badge in `/automation`; user-added repos are tagged `source: "user"`.
 2. **Deploy** with your database and GitHub token configured.
 3. **Sync automation data**: `POST /api/automation/sync` (or use the Sync button on the Automation page).
 4. **Sync issues**: `POST /api/sync` (or use the Sync Issues action in the board UI). OpenClaw agent heartbeats also trigger best-effort issue sync automatically.
@@ -224,16 +224,21 @@ List cached issues. Query params: `repo`, `agent`, `owner`, `project`, `priority
 Move issue between status columns. Body: `{ issueId, repoFullName, issueNumber, oldLabels, newLabels }`
 
 ### GET /api/repos
-List configured repositories (board/issue-sync view; `Repository` rows).
+List configured repositories for the board/issue-sync view (`Repository` rows). This is not the tracked repository management API.
 
 ### POST /api/repos
-Add a tracked repository. Body: `{ fullName: "owner/repo" }`. Creates an `AutomationRepo` row with `source: "user"` (canonical tracked-repos list) **and** a mirror `Repository` row so the board sees it immediately. Returns 409 if the repo is already tracked. Writes an `add_tracked_repo` AuditLog entry.
+Deprecated compatibility endpoint for adding a tracked repository. Prefer `POST /api/automation/repos`; this endpoint delegates to the same behavior and returns deprecation headers.
+
+### GET /api/automation/repos
+Canonical tracked repository list for automation. Returns `AutomationRepo` rows with workflow/release summary fields used by `/automation`.
 
 ### POST /api/automation/repos
-Same shape and semantics as `POST /api/repos` but scoped to the automation surface. Used by the `/automation` Add Repo button.
+Canonical tracked repository add endpoint. Body: `{ fullName: "owner/repo" }`. Creates an `AutomationRepo` row with `source: "user"` **and** a mirror enabled `Repository` row so issue sync and the board see it immediately. Returns 409 if the repo is already tracked. Writes an `add_tracked_repo` AuditLog entry.
 
 ### DELETE /api/automation/repos/[repo]
 Stop tracking a repository. `[repo]` is the URL-encoded `owner/repo` fullName. Hard-deletes the `AutomationRepo` row (cascading workflow/run/release history) and soft-disables the mirror `Repository` row (`enabled = false`) so cached issues remain visible for history but are excluded from active board filters. Writes a `remove_tracked_repo` AuditLog entry.
+
+`/api/automation/repositories` and `/api/automation/repositories/[id]` were legacy duplicate routes and have been removed. Use `/api/automation/repos` for tracked repository management.
 
 ### POST /api/sync
 Sync all issues from configured repositories. Intended callers are:

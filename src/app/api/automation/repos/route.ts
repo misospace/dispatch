@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { isValidRepoName } from "@/lib/config";
+import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
 
 export async function GET() {
   try {
@@ -92,42 +93,17 @@ export async function POST(request: Request) {
     );
   }
 
-  const [owner, name] = fullName.split("/");
-
   try {
-    const repo = await prisma.automationRepo.create({
-      data: { fullName, owner, name, source: "user" },
-    });
+    const { automationRepo, repository } = await createTrackedRepo(fullName);
 
-    await prisma.auditLog.create({
-      data: {
-        actor: "user",
-        action: "add_tracked_repo",
-        repoFullName: fullName,
-        beforeLabels: [],
-        afterLabels: [],
-        success: true,
-      },
-    });
-
-    return NextResponse.json(jsonSafe(repo), { status: 201 });
+    return NextResponse.json(jsonSafe({ ...automationRepo, repositoryId: repository.id }), { status: 201 });
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       return NextResponse.json({ error: "Repository is already tracked" }, { status: 409 });
     }
 
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    await prisma.auditLog.create({
-      data: {
-        actor: "user",
-        action: "add_tracked_repo",
-        repoFullName: fullName,
-        beforeLabels: [],
-        afterLabels: [],
-        success: false,
-        errorMessage,
-      },
-    });
+    await auditTrackedRepoCreateFailure(fullName, errorMessage);
     console.error("Failed to add tracked repo:", error);
     return NextResponse.json({ error: errorMessage }, { status: 500 });
   }
