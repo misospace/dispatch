@@ -6,9 +6,9 @@ Mission Control is a self-hosted Next.js/TypeScript dashboard that visualizes Gi
 
 ## Tech Stack
 
-- **Framework**: Next.js 14 (App Router)
+- **Framework**: Next.js 16 (App Router)
 - **Language**: TypeScript
-- **Database**: PostgreSQL via Prisma ORM
+- **Database**: PostgreSQL via Prisma v7 ORM
 - **Styling**: Tailwind CSS
 - **Container**: Docker (Debian bookworm-slim based)
 
@@ -76,7 +76,7 @@ For control actions (rerun, dispatch):
 
 ## Docker
 
-- Base image: `node:20-bookworm-slim`
+- Base image: `node:24-bookworm-slim`
 - OpenSSL and ca-certificates installed in builder stage for Prisma generation
 - Runtime image installs same packages for Prisma client operation
 - Multi-stage build: deps → builder → runner
@@ -128,7 +128,7 @@ src/
 {
   "ok": true,
   "database": "ok",
-  "version": "0.1.1"
+  "version": "0.1.13"
 }
 ```
 

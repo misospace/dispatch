@@ -2,6 +2,15 @@
 
 OpenClaw Mission Control is a self-hosted dashboard that visualizes GitHub issues and OpenClaw agent activity. It replaces dependency on GitHub Projects while keeping GitHub Issues and PRs as the public collaboration surface.
 
+## Tech Stack
+
+- **Next.js**: 16.2.6 (App Router)
+- **React**: v19
+- **Prisma**: v7
+- **Node**: v24 (Dockerfile uses `node:24-bookworm-slim`)
+- **TypeScript**: v6
+- **Tailwind CSS**: v4
+
 ## Architecture
 
 ### Source of Truth Rules
