@@ -2,140 +2,66 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 
-interface RouteContext {
-  params: Promise<{ repo: string }>;
-}
-
-export async function GET(request: Request, context: RouteContext) {
-  const { searchParams } = new URL(request.url);
-  const queryRepo = searchParams.get("repo");
-  const { repo: pathRepo } = await context.params;
-  const repoFullName = queryRepo ?? decodeURIComponent(pathRepo);
-
-  if (!repoFullName) {
-    return NextResponse.json({ error: "repo parameter required" }, { status: 400 });
-  }
+export async function GET(_request: Request, { params }: { params: Promise<{ repo: string }> }) {
+  const fullName = (await params).repo;
 
   try {
-    const repo = await prisma.automationRepo.findUnique({
-      where: { fullName: repoFullName },
+    const automationRepo = await prisma.automationRepo.findUnique({
+      where: { fullName },
       include: {
         workflows: {
+          orderBy: { lastRunAt: "desc" },
           include: {
             runs: {
-              take: 5,
+              take: 50,
               orderBy: { runStartedAt: "desc" },
+              include: {
+                jobs: true,
+              },
             },
           },
         },
         releases: {
-          take: 10,
+          take: 20,
           orderBy: { publishedAt: "desc" },
         },
-        packages: true,
+        packages: {
+          orderBy: { updatedAt: "desc" },
+        },
         _count: {
-          select: { workflows: true, releases: true },
+          select: { workflows: true, releases: true, packages: true },
         },
       },
     });
 
-    if (!repo) {
-      return NextResponse.json({ error: "Repo not found" }, { status: 404 });
+    if (!automationRepo) {
+      return NextResponse.json({ error: "Repository not found" }, { status: 404 });
     }
 
-    const failingRuns = await prisma.githubWorkflowRun.count({
-      where: {
-        workflow: { repoId: repo.id },
-        conclusion: "failure",
-      },
-    });
-
-    const runningRuns = await prisma.githubWorkflowRun.count({
-      where: {
-        workflow: { repoId: repo.id },
-        status: "in_progress",
-      },
-    });
+    const [failingRuns, runningRuns] = await Promise.all([
+      prisma.githubWorkflowRun.count({
+        where: { workflow: { repoId: automationRepo.id }, conclusion: "failure" },
+      }),
+      prisma.githubWorkflowRun.count({
+        where: { workflow: { repoId: automationRepo.id }, status: "in_progress" },
+      }),
+    ]);
 
     const lastSyncRun = await prisma.automationSyncRun.findFirst({
-      where: { repoId: repo.id },
+      where: { repoId: automationRepo.id },
       orderBy: { startedAt: "desc" },
     });
 
-    const recentEvents = await prisma.automationEvent.findMany({
-      where: { repoId: repo.id },
-      take: 10,
-      orderBy: { createdAt: "desc" },
-    });
-
-    return NextResponse.json(jsonSafe({
-      ...repo,
+    const result = {
+      ...automationRepo,
       failingRuns,
       runningRuns,
       lastSyncRun,
-      recentEvents,
-    }));
+    };
+
+    return NextResponse.json(jsonSafe(result));
   } catch (error) {
-    console.error("Failed to fetch repo:", error);
-    return NextResponse.json({ error: "Failed to fetch repo" }, { status: 500 });
-  }
-}
-
-export async function DELETE(_request: Request, context: RouteContext) {
-  const { repo: pathRepo } = await context.params;
-  const repoFullName = decodeURIComponent(pathRepo);
-
-  if (!repoFullName) {
-    return NextResponse.json({ error: "repo parameter required" }, { status: 400 });
-  }
-
-  try {
-    const existing = await prisma.automationRepo.findUnique({
-      where: { fullName: repoFullName },
-      select: { id: true, source: true },
-    });
-
-    if (!existing) {
-      return NextResponse.json({ error: "Repository not tracked" }, { status: 404 });
-    }
-
-    // Hard delete AutomationRepo (cascades to workflows/runs/releases/etc).
-    await prisma.automationRepo.delete({ where: { fullName: repoFullName } });
-
-    // Soft-disable the matching Repository row so cached issues stay visible in
-    // history but are excluded from active board filters. Use updateMany so it
-    // is a no-op when no Repository row exists yet.
-    await prisma.repository.updateMany({
-      where: { fullName: repoFullName },
-      data: { enabled: false },
-    });
-
-    await prisma.auditLog.create({
-      data: {
-        actor: "user",
-        action: "remove_tracked_repo",
-        repoFullName,
-        beforeLabels: [existing.source],
-        afterLabels: [],
-        success: true,
-      },
-    });
-
-    return NextResponse.json({ success: true });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    await prisma.auditLog.create({
-      data: {
-        actor: "user",
-        action: "remove_tracked_repo",
-        repoFullName,
-        beforeLabels: [],
-        afterLabels: [],
-        success: false,
-        errorMessage,
-      },
-    });
-    console.error("Failed to remove tracked repo:", error);
-    return NextResponse.json({ error: errorMessage }, { status: 500 });
+    console.error("Failed to fetch repo detail:", error);
+    return NextResponse.json({ error: "Failed to fetch repository details" }, { status: 500 });
   }
 }
