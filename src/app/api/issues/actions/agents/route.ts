@@ -9,7 +9,7 @@ import { parseAgentList } from "@/lib/config";
  * - Discovered agents come from unique agent/ labels on synced issues.
  * The combined set has no duplicates and is sorted alphabetically.
  */
-export async function GET() {
+export async function GET(request: Request) {
   try {
     // 1. Configured agents from env
     const configuredAgents = parseAgentList(process.env.AGENTS);

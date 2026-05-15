@@ -33,6 +33,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
   const [error, setError] = useState<string | null>(null);
   const [agents, setAgents] = useState<string[]>([]);
   const [fetchingAgents, setFetchingAgents] = useState(false);
+  const [ownerNameInput, setOwnerNameInput] = useState("");
 
   const statusColor = issue.labels
     .filter((l) => l.startsWith("status/"))
@@ -69,6 +70,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
   const handleSuccess = async (actionType: string) => {
     setLoadingAction(null);
     setError(null);
+    setOwnerNameInput("");
 
     // Trigger a sync to pick up label changes from GitHub
     try {
@@ -146,6 +148,13 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     } finally {
       setLoadingAction(null);
     }
+  }
+
+  async function handleAssignOwnerSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = ownerNameInput.trim();
+    if (!trimmed) return;
+    await handleAssign("owner", trimmed);
   }
 
   return (
@@ -288,8 +297,27 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
                       <p className="text-xs font-medium mb-1 text-muted-foreground flex items-center gap-1">
                         <User className="h-3 w-3" /> Assign owner
                       </p>
-                      <p className="text-xs text-muted-foreground">
-                        Enter an owner name (e.g., <code>alice</code>). Owner labels are applied as <code>owner/{name}</code>.
+                      <form onSubmit={handleAssignOwnerSubmit} className="flex gap-1">
+                        <input
+                          type="text"
+                          placeholder="e.g. alice"
+                          value={ownerNameInput}
+                          onChange={(e) => setOwnerNameInput(e.target.value)}
+                          disabled={loadingAction !== null}
+                          className="flex-1 min-w-0 px-2 py-0.5 text-xs rounded border bg-background text-popover-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                          aria-label="Owner name"
+                        />
+                        <button
+                          type="submit"
+                          disabled={loadingAction !== null || !ownerNameInput.trim()}
+                          className="px-2 py-0.5 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                          aria-label="Assign owner"
+                        >
+                          Assign
+                        </button>
+                      </form>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Owner labels are applied as <code>owner/{ownerNameInput || "name"}</code>.
                       </p>
                     </div>
                   </div>
