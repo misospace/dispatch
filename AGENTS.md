@@ -43,8 +43,8 @@ npm run db:deploy    # Deploy migrations (prod)
 Labels follow a `category/value` pattern:
 
 - **Status**: `status/backlog`, `status/in-progress`, `status/in-review`, `status/done`
-- **Owner**: `owner/*` (e.g., `owner/alice`)
-- **Agent**: `agent/*` (e.g., `agent/alpha`)
+- **Owner**: `owner/*` (e.g., `owner/alice`); Board owner filtering is label-based and does not use GitHub assignees
+- **Agent**: `agent/*` (e.g., `agent/alpha`); Board agent filtering is label-based and does not use AgentRun names, configured agents, or GitHub assignees
 - **Project**: `project/*` (e.g., `project/k8s`)
 - **Note:** `project/*` labels are **optional** and not required for the Projects view. Projects groups issues by repository by default.
 - **Priority**: `priority/p0` through `priority/p3`

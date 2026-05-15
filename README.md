@@ -36,10 +36,10 @@ Agent Runs → Mission Control → Agent Activity Page
 - `status/done` - Issue is completed
 
 ### Owner Labels
-- `owner/*` - Issue is owned by a specific person (e.g., `owner/alice`, `owner/bob`)
+- `owner/*` - Issue is owned by a specific person (e.g., `owner/alice`, `owner/bob`). The Board Owner filter is derived only from synced `owner/*` labels, not GitHub assignees.
 
 ### Agent Labels
-- `agent/*` - Issue is being worked on by an agent (e.g., `agent/alpha`, `agent/beta`)
+- `agent/*` - Issue is assigned to or being worked on by an agent (e.g., `agent/alpha`, `agent/beta`). The Board Agent filter is derived only from synced `agent/*` labels, not `AgentRun` names, configured agents, or GitHub assignees.
 
 ### Project Labels
 - Optional: `project/*` labels may exist on issues, but Mission Control Projects group issues by repository by default.
@@ -105,7 +105,8 @@ Ensure it is only accessible within your trusted network via ingress rules.
    - Visible error on GitHub mutation failure
 
 4. **Filtering**
-   - Filter by repo, agent, owner, project, priority
+   - Filter by repo and priority
+   - Filter by agent and owner labels; empty agent/owner dropdowns mean no synced issues currently carry `agent/*` or `owner/*` labels
 
 5. **Project View**
    - Group synced issues by repository
