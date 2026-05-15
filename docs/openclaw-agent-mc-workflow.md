@@ -1,18 +1,18 @@
-# Saffron Phase 1 — Mission Control Workflow Contract
+# OpenClaw Agent — Mission Control Phase 1 Workflow Contract
 
 > **Status:** Pre-cutover documentation
 > **Issue:** [misospace/mission-control#53](https://github.com/misospace/mission-control/issues/53)
 > **Date:** 2026-05-15
 
-This document defines the operational contract between Saffron (the OpenClaw agent) and Mission Control during Phase 1 of the migration from GitHub Projects to Mission Control-backed visibility.
+This document defines the operational contract between an OpenClaw agent and Mission Control during Phase 1 of the migration from GitHub Projects to Mission Control-backed visibility.
 
 ## Overview
 
-Saffron gradually moves from GitHub Projects grooming to Mission Control as her task visibility layer. During this period:
+The OpenClaw agent gradually moves from GitHub Projects grooming to Mission Control as the task visibility layer. During this period:
 
 - **GitHub Issues and PRs remain the source of truth.** Mission Control's Postgres database is a cache, not authoritative storage.
 - **GitHub Projects board is deprecated for this workflow** — group by repository instead.
-- All Mission Control interactions are **best-effort**; failures must never break the heartbeat.
+- All Mission Control interactions are **best-effort**; failures must never break the agent heartbeat.
 
 ## Heartbeat Lifecycle
 
@@ -39,14 +39,14 @@ Content-Type: application/json
 
 ```json
 {
-  "agentName": "saffron",
+  "agentName": "openclaw-agent",
   "runType": "heartbeat",
   "status": "completed",
   "startedAt": "2026-05-15T13:44:00.000Z",
   "finishedAt": "2026-05-15T13:47:00.000Z",
   "summary": "Processed 3 issues, opened 1 PR",
   "touchedIssueUrls": [
-    "https://github.com/misospace/mission-control/pull/54",
+    "https://github.com/misospace/mission-control/pull/74",
     "https://github.com/misospace/miso-gallery/issues/143"
   ]
 }
@@ -62,11 +62,11 @@ Content-Type: application/json
 GET /api/issues
 ```
 
-- **Purpose:** Fetch the current issue list for Saffron to select work from.
+- **Purpose:** Fetch the current issue list for the agent to select work from.
 - **Auth:** None required.
 - **Expected response:** Array of issue objects.
 - **Selection priority:**
-  1. Prefer issues labeled `agent/saffron` (or `agent/<agent-id>`) if present.
+  1. Prefer issues labeled `agent/<agent-id>` if present (e.g. `agent/saffron`, `agent/matcha`).
   2. Fall back to general backlog if no agent-specific label exists.
   3. Treat "no status label" or `status/backlog` as backlog work — both are valid entry states.
 
@@ -98,7 +98,7 @@ All Mission Control interactions are best-effort from the heartbeat's perspectiv
 
 ## Pre-Cutover Validation
 
-Before Saffron stops grooming GitHub Projects and fully adopts Mission Control, run the [smoke checklist](./smoke-checklist.md):
+Before the OpenClaw agent stops grooming GitHub Projects and fully adopts Mission Control, run the [smoke checklist](./smoke-checklist.md):
 
 ```bash
 # Against local dev instance
@@ -133,4 +133,4 @@ Phase 3 (future)       → Evaluate whether GitHub Projects board can be fully r
 
 ## History
 
-- **2026-05-15** — Created as part of Saffron Phase 1 pre-cutover validation (Issue #53). Consolidates workflow contract from AGENTS.md and smoke checklist into a single operational reference.
+- **2026-05-15** — Created as part of OpenClaw agent Phase 1 pre-cutover validation (Issue #53). Consolidates workflow contract from AGENTS.md and smoke checklist into a single operational reference.
