@@ -34,7 +34,7 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token |
 | `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API |
-| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for tracked repos (comma or newline separated). Also managed via UI/API after boot. |
+| `GITHUB_REPOSITORIES` | Yes | **One-time** bootstrap seed for tracked repos (comma or newline separated). Read only when `AutomationRepo` is empty. After first seed, manage via `/automation` UI or `POST /api/repos` / `POST /api/automation/repos`. Seeded repos carry `source: "env"`; UI-added repos carry `source: "user"`. |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
 

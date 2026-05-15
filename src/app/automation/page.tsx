@@ -17,6 +17,7 @@ interface RepoOverview {
   openPRCount: number;
   lastSyncedAt: string | null;
   syncError: string | null;
+  source: "env" | "user";
   workflows: { id: string; name: string; state: string }[];
   releases: { id: string; tagName: string; publishedAt: string }[];
   _count: { workflows: number; releases: number };
@@ -51,7 +52,12 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
           <Link href={`/automation/repos/${repo.fullName}`} className="hover:underline min-w-0">
             <CardTitle className="text-lg truncate">{repo.fullName}</CardTitle>
           </Link>
-          {repo.syncError && <AlertTriangle className="h-5 w-5 text-destructive shrink-0" />}
+          <div className="flex items-center gap-2 shrink-0">
+            {repo.source === "env" && (
+              <Badge variant="secondary" title="Seeded from GITHUB_REPOSITORIES env var">seed</Badge>
+            )}
+            {repo.syncError && <AlertTriangle className="h-5 w-5 text-destructive" />}
+          </div>
         </div>
         <div className="flex gap-2 text-sm text-muted-foreground min-w-0">
           <span className="flex items-center gap-1 shrink-0">
@@ -203,7 +209,7 @@ export default function AutomationOverview() {
     setAddLoading(true);
     setAddError("");
     try {
-      const res = await fetch("/api/automation/repositories", {
+      const res = await fetch("/api/automation/repos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fullName: newRepo.trim() }),
@@ -225,10 +231,16 @@ export default function AutomationOverview() {
     }
   }
 
-  async function deleteRepo(id: string) {
+  async function deleteRepo(fullName: string) {
+    if (!confirm(`Stop tracking ${fullName}? Cached issues will be hidden from the board but kept for history.`)) {
+      return;
+    }
     try {
-      await fetch(`/api/automation/repositories/${id}`, { method: "DELETE" });
-      setRepos(repos.filter((r) => r.id !== id));
+      const res = await fetch(`/api/automation/repos/${encodeURIComponent(fullName)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) return;
+      setRepos(repos.filter((r) => r.fullName !== fullName));
     } catch {
       // ignore
     }
@@ -289,7 +301,7 @@ export default function AutomationOverview() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {repos.map((repo) => (
-            <RepoCard key={repo.id} repo={repo} onDelete={() => deleteRepo(repo.id)} />
+            <RepoCard key={repo.id} repo={repo} onDelete={() => deleteRepo(repo.fullName)} />
           ))}
         </div>
       )}

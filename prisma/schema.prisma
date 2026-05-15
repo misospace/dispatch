@@ -86,6 +86,7 @@ model AutomationRepo {
   openPRCount     Int      @default(0)
   lastSyncedAt    DateTime @default(now())
   syncError       String?
+  source          String   @default("env")
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
