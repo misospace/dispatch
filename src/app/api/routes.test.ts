@@ -11,6 +11,7 @@ describe("API route smoke checks", () => {
     "src/app/api/issues/move/route.ts",
     "src/app/api/automation/repos/route.ts",
     "src/app/api/health/route.ts",
+    "src/app/api/agents/[agentName]/queue/route.ts",
   ])("keeps %s present", (routePath) => {
     expect(existsSync(join(root, routePath))).toBe(true);
   });
