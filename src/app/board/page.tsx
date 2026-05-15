@@ -4,6 +4,7 @@ import { FilterBar } from "@/components/filter-bar";
 import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getTrackedRepos } from "@/lib/config";
+import { buildLabelWhere, discoverLabelFilterOptions } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
 
@@ -11,9 +12,9 @@ async function getIssues(repo?: string, agent?: string, owner?: string, priority
   const where: Record<string, unknown> = { repository: { enabled: true } };
 
   if (repo) where.repository = { ...(where.repository as object), fullName: repo };
-  if (agent) where.labels = { has: agent };
-  if (owner) where.labels = { has: owner };
-  if (priority) where.labels = { has: priority };
+
+  const labels = buildLabelWhere([agent, owner, priority]);
+  if (labels) where.labels = labels;
 
   return prisma.issue.findMany({
     where,
@@ -35,20 +36,7 @@ async function getFilterOptions() {
     select: { labels: true },
   });
 
-  const agents = new Set<string>();
-  const owners = new Set<string>();
-
-  for (const issue of issues) {
-    for (const label of issue.labels) {
-      if (label.startsWith("agent/")) agents.add(label);
-      if (label.startsWith("owner/")) owners.add(label);
-    }
-  }
-
-  return {
-    agents: Array.from(agents).sort(),
-    owners: Array.from(owners).sort(),
-  };
+  return discoverLabelFilterOptions(issues);
 }
 
 async function getIssueSyncStatus() {

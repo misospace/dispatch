@@ -2,6 +2,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { PRIORITY_LABELS, AGENT_PREFIX, OWNER_PREFIX } from "@/types";
+import { LABEL_FILTER_HELP } from "@/lib/issue-filters";
 
 interface FilterBarProps {
   repos: { fullName: string }[];
@@ -46,12 +47,17 @@ export function FilterBar({ repos, agents, owners, activeFilters }: FilterBarPro
 
       <select
         aria-label="Filter by agent label"
-        title="Filters by agent/* label only"
+        title={LABEL_FILTER_HELP.agent}
         value={activeFilters.agent}
         onChange={(e) => updateFilter("agent", e.target.value)}
         className="h-9 px-3 rounded-md border border-input bg-background text-sm"
       >
         <option value="">All agent labels</option>
+        {agents.length === 0 && (
+          <option value="" disabled>
+            No agent/* labels found
+          </option>
+        )}
         {agents.map((a) => (
           <option key={a} value={a}>
             {a.replace(AGENT_PREFIX, "")}
@@ -61,12 +67,17 @@ export function FilterBar({ repos, agents, owners, activeFilters }: FilterBarPro
 
       <select
         aria-label="Filter by owner label"
-        title="Filters by owner/* label only"
+        title={LABEL_FILTER_HELP.owner}
         value={activeFilters.owner}
         onChange={(e) => updateFilter("owner", e.target.value)}
         className="h-9 px-3 rounded-md border border-input bg-background text-sm"
       >
         <option value="">All owner labels</option>
+        {owners.length === 0 && (
+          <option value="" disabled>
+            No owner/* labels found
+          </option>
+        )}
         {owners.map((o) => (
           <option key={o} value={o}>
             {o.replace(OWNER_PREFIX, "")}

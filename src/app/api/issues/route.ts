@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { buildLabelWhere, toProjectLabel } from "@/lib/issue-filters";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -16,21 +17,8 @@ export async function GET(request: Request) {
       where.repository = { ...(where.repository as object), fullName: repo };
     }
 
-    if (agent) {
-      where.labels = { has: agent };
-    }
-
-    if (owner) {
-      where.labels = { has: owner };
-    }
-
-    if (project) {
-      where.labels = { has: `project/${project}` };
-    }
-
-    if (priority) {
-      where.labels = { has: priority };
-    }
+    const labels = buildLabelWhere([agent, owner, toProjectLabel(project), priority]);
+    if (labels) where.labels = labels;
 
     const issues = await prisma.issue.findMany({
       where,
