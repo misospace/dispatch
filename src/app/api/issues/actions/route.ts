@@ -59,24 +59,24 @@ export async function POST(request: Request) {
     }
 
     try {
-      // Fetch current issue to get existing labels
+      // Fetch current issue to get existing labels and state
       const issue = await prisma.issue.findUnique({ where: { id: issueId } });
       if (!issue) {
         return NextResponse.json({ error: `Issue not found: ${issueId}` }, { status: 404 });
+      }
+
+      // Policy §1: agents may only claim open issues
+      if (issue.state !== "open") {
+        return NextResponse.json(
+          { error: `Cannot assign to closed issue (state: ${issue.state})` },
+          { status: 400 },
+        );
       }
 
       const currentLabels = issue.labels;
 
       // Analyze conflicts using the shared conflict resolution module
       const analysis = analyzeAssignmentConflict(currentLabels);
-
-      // Check for conflicts and log them in the audit trail
-      if (payload.action === "assign_agent" && analysis.hasAgentConflict) {
-        // Agent conflict detected — existing agent labels will be replaced
-      }
-      if (payload.action === "assign_owner" && analysis.hasOwnerConflict) {
-        // Owner conflict detected — existing owner labels will be replaced
-      }
 
       // Build new label set using the shared module
       const newLabels = buildNewLabels(currentLabels, payload.action, payload.value);
@@ -90,7 +90,24 @@ export async function POST(request: Request) {
         data: { labels: newLabels, lastSyncedAt: new Date() },
       });
 
-      // Write audit log with conflict details
+      // Build audit log notes with conflict analysis and force_claim acknowledgment
+      const auditNotesParts: string[] = [];
+      if (analysis.hasAgentConflict || analysis.hasOwnerConflict) {
+        auditNotesParts.push(
+          `conflict: agent=${analysis.hasAgentConflict}, owner=${analysis.hasOwnerConflict}`,
+        );
+        if (analysis.existingAgents.length > 0) {
+          auditNotesParts.push(`existingAgents=[${analysis.existingAgents.join(", ")}]`);
+        }
+        if (analysis.existingOwners.length > 0) {
+          auditNotesParts.push(`existingOwners=[${analysis.existingOwners.join(", ")}]`);
+        }
+      }
+      // Acknowledge force_claim flag in audit trail (policy §4)
+      if (payload.force_claim === true) {
+        auditNotesParts.push("force_claim=true (accepted per policy §4, no additional blocking applied)");
+      }
+
       await prisma.auditLog.create({
         data: {
           actor: "user",
@@ -101,6 +118,7 @@ export async function POST(request: Request) {
           beforeLabels: currentLabels,
           afterLabels: newLabels,
           success: true,
+          notes: auditNotesParts.length > 0 ? auditNotesParts.join(" | ") : undefined,
         },
       });
 

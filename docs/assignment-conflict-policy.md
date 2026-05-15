@@ -134,3 +134,16 @@ All assignment and unassignment actions are logged with:
   This may change if exclusive ownership becomes a requirement.
 - **Role-based force-claim**: Restrict force-claim to admin or operator roles.
 - **Soft conflict warnings**: Return warnings (not errors) when an issue has conflicting assignments, allowing the caller to decide whether to proceed.
+
+---
+
+## Implementation Status
+
+| Section | Status | Notes |
+|---------|--------|-------|
+| §1 Issue state validation | ✅ Implemented | `POST /api/issues/actions` rejects assignments to closed issues (returns 400) |
+| §2 Agent conflict replacement | ✅ Implemented | Existing agent labels replaced; force-claim accepted but doesn't change behavior |
+| §3 Owner/agent independence | ✅ Implemented | Owner and agent labels are independent; each type replaced independently |
+| §4 Force-claim acknowledgment | ✅ Implemented | Flag accepted and logged in audit trail notes; no additional blocking applied |
+| §5 Endpoint compliance | ✅ Implemented | Both assign and unassign endpoints follow policy |
+| §6 Audit trail | ✅ Implemented | Conflict details and force_claim status recorded in audit log `notes` field |

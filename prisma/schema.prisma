@@ -51,6 +51,7 @@ model AgentRun {
   finishedAt  DateTime?
   summary     String?
   errorMessage String?
+  notes        String?
   touchedIssueUrls String[]
   createdAt   DateTime  @default(now())
   issueId     String?
@@ -69,6 +70,7 @@ model AuditLog {
   afterLabels  String[]
   success      Boolean
   errorMessage String?
+  notes        String?
   createdAt    DateTime @default(now())
 
   @@index([repoFullName])
@@ -256,6 +258,7 @@ model AutomationSyncRun {
   workflowsFetched Int  @default(0)
   runsFetched  Int      @default(0)
   errorMessage String?
+  notes        String?
   startedAt    DateTime @default(now())
   completedAt  DateTime?
 
