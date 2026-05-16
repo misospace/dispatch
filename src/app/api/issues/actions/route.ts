@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
+import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 
 type ActionPayload = {
@@ -9,15 +10,8 @@ type ActionPayload = {
   issueNumber?: number;
   action: "assign_agent" | "assign_owner";
   value: string;
+  force_claim?: boolean;
 };
-
-function isAgentLabel(label: string): boolean {
-  return label.startsWith(AGENT_PREFIX);
-}
-
-function isOwnerLabel(label: string): boolean {
-  return label.startsWith(OWNER_PREFIX);
-}
 
 export async function POST(request: Request) {
   try {
@@ -66,23 +60,27 @@ export async function POST(request: Request) {
     }
 
     try {
-      // Fetch current issue to get existing labels
+      // Fetch current issue to get existing labels and state
       const issue = await prisma.issue.findUnique({ where: { id: issueId } });
       if (!issue) {
         return NextResponse.json({ error: `Issue not found: ${issueId}` }, { status: 404 });
       }
 
+      // Policy §1: agents may only claim open issues
+      if (issue.state !== "open") {
+        return NextResponse.json(
+          { error: `Cannot assign to closed issue (state: ${issue.state})` },
+          { status: 400 },
+        );
+      }
+
       const currentLabels = issue.labels;
 
-      // Identify ALL existing agent/owner labels to remove (not just the first one)
-      const isConflicting =
-        payload.action === "assign_agent" ? isAgentLabel : isOwnerLabel;
+      // Analyze conflicts using the shared conflict resolution module
+      const analysis = analyzeAssignmentConflict(currentLabels);
 
-      const labelsToRemove = currentLabels.filter(isConflicting);
-      const labelsToAdd: string[] = [payload.value];
-
-      // Build new labels: remove conflicting ones, add the new one, keep everything else
-      const newLabels = [...currentLabels.filter((l) => !isConflicting(l)), ...labelsToAdd];
+      // Build new label set using the shared module
+      const newLabels = buildNewLabels(currentLabels, payload.action, payload.value);
 
       // Update GitHub labels atomically via updateIssueLabels (replaces all)
       await updateIssueLabels(repoFullName, issueNumber, newLabels);
@@ -93,7 +91,24 @@ export async function POST(request: Request) {
         data: { labels: newLabels, lastSyncedAt: new Date() },
       });
 
-      // Write audit log
+      // Build audit log notes with conflict analysis and force_claim acknowledgment
+      const auditNotesParts: string[] = [];
+      if (analysis.hasAgentConflict || analysis.hasOwnerConflict) {
+        auditNotesParts.push(
+          `conflict: agent=${analysis.hasAgentConflict}, owner=${analysis.hasOwnerConflict}`,
+        );
+        if (analysis.existingAgents.length > 0) {
+          auditNotesParts.push(`existingAgents=[${analysis.existingAgents.join(", ")}]`);
+        }
+        if (analysis.existingOwners.length > 0) {
+          auditNotesParts.push(`existingOwners=[${analysis.existingOwners.join(", ")}]`);
+        }
+      }
+      // Acknowledge force_claim flag in audit trail (policy §4)
+      if (payload.force_claim === true) {
+        auditNotesParts.push("force_claim=true (accepted per policy §4, no additional blocking applied)");
+      }
+
       await prisma.auditLog.create({
         data: {
           actor: "user",
@@ -104,6 +119,7 @@ export async function POST(request: Request) {
           beforeLabels: currentLabels,
           afterLabels: newLabels,
           success: true,
+          notes: auditNotesParts.length > 0 ? auditNotesParts.join(" | ") : undefined,
         },
       });
 

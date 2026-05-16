@@ -58,6 +58,7 @@ describe("POST /api/issues/actions — validation", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog", "type/feature"],
     });
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -143,6 +144,18 @@ describe("POST /api/issues/actions — validation", () => {
     expect(body.error).toMatch(/Issue not found/);
   });
 
+  it("returns 400 when issue is closed", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "closed",
+      labels: ["status/backlog"],
+    });
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/Cannot assign to closed issue/);
+  });
+
   it("returns 400 on malformed JSON body", async () => {
     const res = await POST(
       new Request("http://localhost/api/issues/actions", {
@@ -171,6 +184,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog", "type/feature"],
     });
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -216,6 +230,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
   it("replaces existing agent label with new one", async () => {
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog", "agent/old-worker"],
     });
 
@@ -236,6 +251,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
   it("handles agent label that appears multiple times (replaces all)", async () => {
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog", "agent/dup", "agent/dup2"],
     });
 
@@ -246,6 +262,65 @@ describe("POST /api/issues/actions — assign_agent", () => {
     // Should only have one agent label in the result (the new one)
     expect(body.labels.filter((l: string) => l.startsWith("agent/")).length).toBe(1);
   });
+
+  it("preserves owner labels when assigning agent", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["owner/alice", "status/in-progress"],
+    });
+
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toContain("agent/worker");
+    expect(body.labels).toContain("owner/alice");
+    expect(body.labels).toContain("status/in-progress");
+
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["owner/alice", "status/in-progress", "agent/worker"]
+    );
+  });
+
+  it("handles force_claim flag without changing behavior", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog", "agent/other-agent"],
+    });
+
+    const res = await postRequest(makePayload({ force_claim: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.labels).toContain("agent/worker");
+    expect(body.labels).not.toContain("agent/other-agent");
+
+    // force_claim is accepted but doesn't change the replacement behavior
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["status/backlog", "agent/worker"]
+    );
+  });
+
+  it("preserves priority and type labels when assigning agent", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["priority/p1", "type/bug", "agent/old"],
+    });
+
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toContain("agent/worker");
+    expect(body.labels).toContain("priority/p1");
+    expect(body.labels).toContain("type/bug");
+    expect(body.labels).not.toContain("agent/old");
+  });
 });
 
 describe("POST /api/issues/actions — assign_owner", () => {
@@ -253,6 +328,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
+      state: "open",
       labels: ["status/in-progress", "type/bug"],
     });
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -281,6 +357,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
   it("replaces existing owner label with new one", async () => {
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
+      state: "open",
       labels: ["status/in-progress", "owner/bob"],
     });
 
@@ -303,6 +380,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
     // First assign agent
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog"],
     });
     let res = await postRequest(makePayload());
@@ -311,6 +389,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
     // Then assign owner — findIssue is called again, so mock updated state
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog", "agent/worker"],
     });
     res = await postRequest(
@@ -326,6 +405,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
   it("preserves status labels when assigning agent", async () => {
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
+      state: "open",
       labels: ["status/in-review", "priority/p1"],
     });
 
@@ -336,6 +416,29 @@ describe("POST /api/issues/actions — assign_owner", () => {
     expect(body.labels).toContain("priority/p1");
     expect(body.labels).toContain("agent/worker");
   });
+
+  it("preserves agent labels when assigning owner", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/worker", "status/in-progress"],
+    });
+
+    const res = await postRequest(
+      makePayload({ action: "assign_owner" as const, value: "owner/alice" })
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toContain("agent/worker");
+    expect(body.labels).toContain("owner/alice");
+    expect(body.labels).toContain("status/in-progress");
+
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["agent/worker", "status/in-progress", "owner/alice"]
+    );
+  });
 });
 
 describe("POST /api/issues/actions — error handling", () => {
@@ -343,6 +446,7 @@ describe("POST /api/issues/actions — error handling", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog"],
     });
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -377,6 +481,7 @@ describe("POST /api/issues/actions — error handling", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
+      state: "open",
       labels: ["status/backlog"],
     });
     // Second call fails on GitHub

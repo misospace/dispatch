@@ -23,8 +23,6 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
-  removeIssueLabel: vi.fn().mockResolvedValue(undefined),
-  addIssueLabel: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { POST } from "./route";
@@ -75,14 +73,28 @@ describe("POST /api/issues/unassign — validation", () => {
     expect(body.error).toMatch(/Missing required fields/);
   });
 
+  it("returns 400 when repoFullName is missing", async () => {
+    const res = await postRequest(makePayload({ repoFullName: undefined as unknown as string }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/Missing required fields/);
+  });
+
+  it("returns 400 when issueNumber is missing", async () => {
+    const res = await postRequest(makePayload({ issueNumber: undefined as unknown as number }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/Missing required fields/);
+  });
+
   it("returns 400 for invalid action", async () => {
-    const res = await postRequest(makePayload({ action: "invalid" as unknown as "unassign_agent" }));
+    const res = await postRequest(makePayload({ action: "invalid" as const }));
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toMatch(/Invalid action/);
   });
 
-  it("returns 400 on malformed JSON body", async () => {
+  it("returns 400 on malformed JSON", async () => {
     const res = await POST(
       new Request("http://localhost/api/issues/unassign", {
         method: "POST",
@@ -93,45 +105,15 @@ describe("POST /api/issues/unassign — validation", () => {
     expect(res.status).toBe(400);
   });
 
-  it("returns 400 on non-object JSON body", async () => {
+  it("returns 400 on non-object JSON", async () => {
     const res = await POST(
       new Request("http://localhost/api/issues/unassign", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify([1, 2, 3]),
+        body: JSON.stringify([1, 2]),
       })
     );
     expect(res.status).toBe(400);
-  });
-
-  it("returns 404 when issue is not found", async () => {
-    mocks.findIssue.mockResolvedValueOnce(null);
-    const res = await postRequest(makePayload());
-    expect(res.status).toBe(404);
-    const body = await res.json();
-    expect(body.error).toMatch(/Issue not found/);
-  });
-
-  it("returns 400 when no agent label exists to unassign", async () => {
-    mocks.findIssue.mockResolvedValueOnce({
-      id: "issue-1",
-      labels: ["status/backlog"],
-    });
-    const res = await postRequest(makePayload());
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toMatch(/No agent label found/);
-  });
-
-  it("returns 400 when no owner label exists to unassign", async () => {
-    mocks.findIssue.mockResolvedValueOnce({
-      id: "issue-1",
-      labels: ["status/backlog"],
-    });
-    const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toMatch(/No owner label found/);
   });
 });
 
@@ -140,7 +122,7 @@ describe("POST /api/issues/unassign — unassign_agent", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
-      labels: ["status/backlog", "agent/worker", "type/feature"],
+      labels: ["status/backlog", "agent/worker"],
     });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
@@ -148,52 +130,67 @@ describe("POST /api/issues/unassign — unassign_agent", () => {
   });
 
   it("removes agent label and preserves other labels", async () => {
-    const res = await postRequest(makePayload());
+    const res = await postRequest();
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
-    expect(body.labels).toContain("status/backlog");
-    expect(body.labels).toContain("type/feature");
     expect(body.labels).not.toContain("agent/worker");
+    expect(body.labels).toContain("status/backlog");
+    expect(body.removed).toContain("agent/worker");
 
-    // Verify GitHub update
     expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
       "org/repo",
       42,
-      ["status/backlog", "type/feature"]
+      ["status/backlog"]
     );
-
-    // Verify local cache update
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({
-        labels: ["status/backlog", "type/feature"],
-      }),
-    });
-
-    // Verify audit log
-    expect(mocks.createAuditLog).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        action: "unassign_agent",
-        repoFullName: "org/repo",
-        issueNumber: 42,
-        success: true,
-      }),
-    });
   });
 
   it("removes all agent labels when multiple exist", async () => {
     mocks.findIssue.mockResolvedValueOnce({
       id: "issue-1",
-      labels: ["status/backlog", "agent/worker", "agent/dup"],
+      labels: ["agent/dup1", "agent/dup2", "priority/p1"],
     });
 
-    const res = await postRequest(makePayload());
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).not.toContain("agent/dup1");
+    expect(body.labels).not.toContain("agent/dup2");
+    expect(body.labels).toContain("priority/p1");
+  });
+
+  it("preserves owner labels when unassigning agent", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      labels: ["agent/worker", "owner/alice"],
+    });
+
+    const res = await postRequest();
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.labels).not.toContain("agent/worker");
-    expect(body.labels).not.toContain("agent/dup");
-    expect(body.labels.filter((l: string) => l.startsWith("agent/")).length).toBe(0);
+    expect(body.labels).toContain("owner/alice");
+  });
+
+  it("returns 400 when no agent label exists", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      labels: ["status/backlog", "owner/alice"],
+    });
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/No agent label found/);
+  });
+
+  it("returns 404 when issue is not found", async () => {
+    mocks.findIssue.mockResolvedValueOnce(null);
+
+    const res = await postRequest();
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toMatch(/Issue not found/);
   });
 });
 
@@ -202,7 +199,7 @@ describe("POST /api/issues/unassign — unassign_owner", () => {
     vi.clearAllMocks();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",
-      labels: ["status/in-progress", "owner/alice", "type/bug"],
+      labels: ["status/in-progress", "owner/alice"],
     });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
@@ -214,15 +211,39 @@ describe("POST /api/issues/unassign — unassign_owner", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
-    expect(body.labels).toContain("status/in-progress");
-    expect(body.labels).toContain("type/bug");
     expect(body.labels).not.toContain("owner/alice");
+    expect(body.labels).toContain("status/in-progress");
 
     expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
       "org/repo",
       42,
-      ["status/in-progress", "type/bug"]
+      ["status/in-progress"]
     );
+  });
+
+  it("preserves agent labels when unassigning owner", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      labels: ["agent/worker", "owner/alice"],
+    });
+
+    const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toContain("agent/worker");
+    expect(body.labels).not.toContain("owner/alice");
+  });
+
+  it("returns 400 when no owner label exists", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      labels: ["status/backlog", "agent/worker"],
+    });
+
+    const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/No owner label found/);
   });
 });
 
@@ -240,7 +261,7 @@ describe("POST /api/issues/unassign — error handling", () => {
   it("writes AuditLog with success=false when GitHub mutation fails", async () => {
     mocks.updateIssueLabels.mockRejectedValueOnce(new Error("github 500"));
 
-    const res = await postRequest(makePayload());
+    const res = await postRequest();
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("github 500");

@@ -19,23 +19,23 @@ model Repository {
 }
 
 model Issue {
-  id             String    @id @default(cuid())
-  number         Int
-  repositoryId   String
-  repository     Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
-  title          String
-  body           String?
-  state          String
-  url            String
-  labels         String[]
-  assignees      String[]
-  commentsCount  Int       @default(0)
-  createdAt      DateTime
-  updatedAt      DateTime
-  closedAt       DateTime?
-  lastSyncedAt   DateTime  @default(now())
-  agentRuns      AgentRun[]
-  auditLogs      AuditLog[]
+  id            String     @id @default(cuid())
+  number        Int
+  repositoryId  String
+  repository    Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  title         String
+  body          String?
+  state         String
+  url           String
+  labels        String[]
+  assignees     String[]
+  commentsCount Int        @default(0)
+  createdAt     DateTime
+  updatedAt     DateTime
+  closedAt      DateTime?
+  lastSyncedAt  DateTime   @default(now())
+  agentRuns     AgentRun[]
+  auditLogs     AuditLog[]
 
   @@unique([repositoryId, number])
   @@index([state])
@@ -43,18 +43,19 @@ model Issue {
 }
 
 model AgentRun {
-  id          String    @id @default(cuid())
-  agentName   String
-  runType     String
-  status      String
-  startedAt   DateTime
-  finishedAt  DateTime?
-  summary     String?
-  errorMessage String?
+  id               String    @id @default(cuid())
+  agentName        String
+  runType          String
+  status           String
+  startedAt        DateTime
+  finishedAt       DateTime?
+  summary          String?
+  errorMessage     String?
+  notes            String?   @db.Text
   touchedIssueUrls String[]
-  createdAt   DateTime  @default(now())
-  issueId     String?
-  issue       Issue?    @relation(fields: [issueId], references: [id])
+  createdAt        DateTime  @default(now())
+  issueId          String?
+  issue            Issue?    @relation(fields: [issueId], references: [id])
 }
 
 model AuditLog {
@@ -69,6 +70,7 @@ model AuditLog {
   afterLabels  String[]
   success      Boolean
   errorMessage String?
+  notes        String? @db.Text
   createdAt    DateTime @default(now())
 
   @@index([repoFullName])
@@ -90,52 +92,52 @@ model AutomationRepo {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  workflows       GithubWorkflow[]
-  releases        GithubRelease[]
-  packages        GithubPackage[]
+  workflows        GithubWorkflow[]
+  releases         GithubRelease[]
+  packages         GithubPackage[]
   automationEvents AutomationEvent[]
-  syncRuns        AutomationSyncRun[]
-  pullRequests    GithubPullRequest[]
-  commits         GithubCommit[]
+  syncRuns         AutomationSyncRun[]
+  pullRequests     GithubPullRequest[]
+  commits          GithubCommit[]
 
   @@index([owner])
 }
 
 model GithubWorkflow {
-  id           String   @id @default(cuid())
-  repoId       String
-  repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  workflowId   BigInt   @unique
-  name         String
-  path         String
-  state        String
-  createdAt    DateTime
-  updatedAt    DateTime
-  lastRunAt    DateTime?
+  id         String         @id @default(cuid())
+  repoId     String
+  repo       AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  workflowId BigInt         @unique
+  name       String
+  path       String
+  state      String
+  createdAt  DateTime
+  updatedAt  DateTime
+  lastRunAt  DateTime?
 
-  runs         GithubWorkflowRun[]
+  runs GithubWorkflowRun[]
 
   @@index([repoId])
   @@index([state])
 }
 
 model GithubWorkflowRun {
-  id              String   @id @default(cuid())
-  workflowId      String
-  workflow        GithubWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
-  runId           BigInt   @unique
-  name            String
-  status          String
-  conclusion      String?
-  branch          String
-  headSha         String
-  actor           String
-  runStartedAt    DateTime
-  updatedAt       DateTime
-  durationSecs    Int?
+  id           String         @id @default(cuid())
+  workflowId   String
+  workflow     GithubWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  runId        BigInt         @unique
+  name         String
+  status       String
+  conclusion   String?
+  branch       String
+  headSha      String
+  actor        String
+  runStartedAt DateTime
+  updatedAt    DateTime
+  durationSecs Int?
 
-  jobs            GithubWorkflowJob[]
-  pullRequestUrl  String?
+  jobs           GithubWorkflowJob[]
+  pullRequestUrl String?
 
   @@index([workflowId])
   @@index([status])
@@ -144,7 +146,7 @@ model GithubWorkflowRun {
 }
 
 model GithubWorkflowJob {
-  id          String   @id @default(cuid())
+  id          String            @id @default(cuid())
   runId       String
   run         GithubWorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
   jobId       BigInt
@@ -159,7 +161,7 @@ model GithubWorkflowJob {
 }
 
 model GithubRelease {
-  id           String   @id @default(cuid())
+  id           String         @id @default(cuid())
   repoId       String
   repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
   releaseId    BigInt
@@ -170,7 +172,7 @@ model GithubRelease {
   targetCommit String?
   url          String
   publishedAt  DateTime
-  createdAt    DateTime @default(now())
+  createdAt    DateTime       @default(now())
 
   @@unique([repoId, releaseId])
   @@index([repoId])
@@ -178,35 +180,35 @@ model GithubRelease {
 }
 
 model GithubPackage {
-  id           String   @id @default(cuid())
-  repoId       String
-  repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  packageType   String
-  name         String
-  visibility    String
-  url          String
-  latestTag    String?
-  updatedAt    DateTime
+  id          String         @id @default(cuid())
+  repoId      String
+  repo        AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  packageType String
+  name        String
+  visibility  String
+  url         String
+  latestTag   String?
+  updatedAt   DateTime
 
-  @@index([repoId])
   @@unique([repoId, name])
+  @@index([repoId])
 }
 
 model GithubPullRequest {
-  id           String   @id @default(cuid())
-  repoId       String
-  repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  number       Int
-  url          String   @unique
-  title        String
-  state        String
-  author       String
-  branch       String
-  baseBranch   String
-  createdAt    DateTime
-  updatedAt    DateTime
-  mergedAt     DateTime?
-  isDraft      Boolean
+  id         String         @id @default(cuid())
+  repoId     String
+  repo       AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  number     Int
+  url        String         @unique
+  title      String
+  state      String
+  author     String
+  branch     String
+  baseBranch String
+  createdAt  DateTime
+  updatedAt  DateTime
+  mergedAt   DateTime?
+  isDraft    Boolean
 
   @@unique([repoId, number])
   @@index([repoId])
@@ -214,33 +216,33 @@ model GithubPullRequest {
 }
 
 model GithubCommit {
-  id           String   @id @default(cuid())
-  repoId       String
-  repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  sha          String   @unique
-  message      String
-  author       String
-  authorDate   DateTime
-  url          String
+  id         String         @id @default(cuid())
+  repoId     String
+  repo       AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  sha        String         @unique
+  message    String
+  author     String
+  authorDate DateTime
+  url        String
 
   @@index([repoId])
   @@index([authorDate])
 }
 
 model AutomationEvent {
-  id           String   @id @default(cuid())
-  repoId       String
-  repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  eventType    String
-  title        String
-  description  String?
-  actor        String?
-  url          String?
-  sha          String?
-  branch       String?
-  status       String?
-  metadata     Json?
-  createdAt    DateTime @default(now())
+  id          String         @id @default(cuid())
+  repoId      String
+  repo        AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  eventType   String
+  title       String
+  description String?
+  actor       String?
+  url         String?
+  sha         String?
+  branch      String?
+  status      String?
+  metadata    Json?
+  createdAt   DateTime       @default(now())
 
   @@index([repoId])
   @@index([eventType])
@@ -248,16 +250,17 @@ model AutomationEvent {
 }
 
 model AutomationSyncRun {
-  id           String   @id @default(cuid())
-  repoId       String
-  repo         AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  status       String
-  reposFetched Int      @default(0)
-  workflowsFetched Int  @default(0)
-  runsFetched  Int      @default(0)
-  errorMessage String?
-  startedAt    DateTime @default(now())
-  completedAt  DateTime?
+  id               String         @id @default(cuid())
+  repoId           String
+  repo             AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  status           String
+  reposFetched     Int            @default(0)
+  workflowsFetched Int            @default(0)
+  runsFetched      Int            @default(0)
+  errorMessage     String?
+  notes            String? @db.Text
+  startedAt        DateTime       @default(now())
+  completedAt      DateTime?
 
   @@index([repoId])
   @@index([startedAt])
