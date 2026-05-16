@@ -37,6 +37,18 @@ export interface Issue {
   repository: {
     fullName: string;
   };
+  lane?: string;
+  laneConfidence?: number | null;
+  laneReason?: string | null;
+  laneModel?: string | null;
+  laneJudgedAt?: Date | null;
+}
+
+export interface IssueLaneClassification {
+  lane: "NORMAL" | "GPT" | "BACKLOG";
+  confidence: number | null;
+  reason: string;
+  model: string;
 }
 
 export interface AgentRun {
@@ -70,6 +82,7 @@ export type OwnerLabel = `owner/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
+export type IssueLane = "NORMAL" | "GPT" | "BACKLOG";
 
 export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/in-progress", "status/in-review", "status/done"];
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
@@ -115,4 +128,23 @@ export const LABEL_COLORS: Record<string, string> = {
   "priority/p1": "f97316",
   "priority/p2": "eab308",
   "priority/p3": "22c55e",
+};
+
+// Lane classification constants and helpers
+export const VALID_LANES: IssueLane[] = ["NORMAL", "GPT", "BACKLOG"];
+
+export function isValidLane(lane: string): lane is IssueLane {
+  return VALID_LANES.includes(lane as IssueLane);
+}
+
+export const LANE_LABELS: Record<IssueLane, string> = {
+  NORMAL: "normal",
+  GPT: "gpt",
+  BACKLOG: "backlog",
+};
+
+export const LANE_COLORS: Record<IssueLane, string> = {
+  NORMAL: "22c55e",
+  GPT: "a855f7",
+  BACKLOG: "6b7280",
 };

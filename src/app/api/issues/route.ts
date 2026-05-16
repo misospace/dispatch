@@ -9,6 +9,7 @@ export async function GET(request: Request) {
   const owner = searchParams.get("owner");
   const project = searchParams.get("project");
   const priority = searchParams.get("priority");
+  const lane = searchParams.get("lane");
 
   try {
     const where: Record<string, unknown> = { repository: { enabled: true } };
@@ -19,6 +20,11 @@ export async function GET(request: Request) {
 
     const labels = buildLabelWhere([agent, owner, toProjectLabel(project), priority]);
     if (labels) where.labels = labels;
+
+    // Lane filter support
+    if (lane && ["NORMAL", "GPT", "BACKLOG"].includes(lane)) {
+      where.lane = lane;
+    }
 
     const issues = await prisma.issue.findMany({
       where,

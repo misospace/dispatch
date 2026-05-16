@@ -2,8 +2,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { buildAgentQueue } from "@/lib/agent-queue";
 
-export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ agentName: string }> },
+) {
   const { agentName } = await params;
+  const { searchParams } = new URL(request.url);
+  const lane = searchParams.get("lane");
 
   try {
     // Fetch all open issues from enabled repos, using GitHub Issues as source of truth
@@ -17,10 +22,13 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
         title: true,
         url: true,
         labels: true,
+        lane: true,
       },
     });
 
-    const queue = buildAgentQueue(issues, agentName);
+    const queue = buildAgentQueue(issues, agentName, {
+      lane: lane as "NORMAL" | "GPT" | "BACKLOG" | undefined,
+    });
 
     return NextResponse.json(queue);
   } catch (error) {
