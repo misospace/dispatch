@@ -1,3 +1,5 @@
+import { Prisma } from "@prisma/client";
+
 export interface GitHubIssue {
   number: number;
   title: string;
@@ -38,7 +40,7 @@ export interface Issue {
     fullName: string;
   };
   lane?: string;
-  laneConfidence?: number | null;
+  laneConfidence?: number | Prisma.Decimal | null;
   laneReason?: string | null;
   laneModel?: string | null;
   laneJudgedAt?: Date | null;

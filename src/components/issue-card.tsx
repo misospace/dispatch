@@ -259,7 +259,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
                       </div>
                     )}
 
-                    {/* Assign agent */}
+                   {/* Assign agent */}
                     <div className="mb-2 pb-2 border-b">
                       <p className="text-xs font-medium mb-1 text-muted-foreground flex items-center gap-1">
                         <Users className="h-3 w-3" /> Assign agent
