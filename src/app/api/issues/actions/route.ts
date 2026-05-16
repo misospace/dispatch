@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
+import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 
 type ActionPayload = {
   issueId?: string;
@@ -50,7 +51,7 @@ export async function POST(request: Request) {
     }
 
     // Validate value format: must match agent/<name> or owner/<name>
-    const expectedPrefix = payload.action === "assign_agent" ? "agent/" : "owner/";
+    const expectedPrefix = payload.action === "assign_agent" ? AGENT_PREFIX : OWNER_PREFIX;
     if (!payload.value.startsWith(expectedPrefix)) {
       return NextResponse.json(
         { error: `value must start with "${expectedPrefix}" (e.g. "${expectedPrefix}worker")` },
