@@ -36,10 +36,45 @@ model Issue {
   lastSyncedAt  DateTime   @default(now())
   agentRuns     AgentRun[]
   auditLogs     AuditLog[]
+  lane          IssueLane  @default(NORMAL)
+  laneConfidence Decimal?  @db.Decimal(3,2)
+  laneReason    String?    @db.Text
+  laneModel     String?
+  laneJudgedAt  DateTime?
+  laneHistory   IssueLaneEntry[]
+
+  // GPT-lane outcome tracking
+  decomposed    Boolean  @default(false)
+  decomposedAt  DateTime?
+  decomposedBy  String?  @db.Text
+  decomposedNote String? @db.Text
+  followUpUrls  String[] @default([])
 
   @@unique([repositoryId, number])
   @@index([state])
   @@index([labels])
+  @@index([lane])
+}
+
+model IssueLaneEntry {
+  id         String    @id @default(cuid())
+  issueId    String
+  issue      Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  lane       IssueLane
+  confidence Decimal?  @db.Decimal(3,2)
+  reason     String?   @db.Text
+  model      String?
+  judgedAt   DateTime  @default(now())
+  createdAt  DateTime  @default(now())
+
+  @@index([issueId])
+  @@index([judgedAt])
+}
+
+enum IssueLane {
+  NORMAL
+  GPT
+  BACKLOG
 }
 
 model AgentRun {
@@ -56,6 +91,23 @@ model AgentRun {
   createdAt        DateTime  @default(now())
   issueId          String?
   issue            Issue?    @relation(fields: [issueId], references: [id])
+
+  // GPT-lane outcome tracking
+  outcome          GptLaneOutcome?
+
+  @@index([agentName])
+  @@index([runType])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum GptLaneOutcome {
+  PR_OPENED
+  PR_UPDATED
+  FOLLOW_UP_CREATED
+  DESIGN_COMMENT_POSTED
+  DECOMPOSED_SKIPPED
+  STUCK
 }
 
 model AuditLog {
