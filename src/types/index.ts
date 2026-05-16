@@ -67,6 +67,7 @@ export interface AuditLog {
 export type StatusLabel = "status/backlog" | "status/in-progress" | "status/in-review" | "status/done";
 export type AgentLabel = `agent/${string}`;
 export type OwnerLabel = `owner/${string}`;
+export type AdminLabel = `admin/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
@@ -76,6 +77,7 @@ export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "
 export const PROJECT_PREFIX = "project/";
 export const AGENT_PREFIX = "agent/";
 export const OWNER_PREFIX = "owner/";
+export const ADMIN_PREFIX = "admin/";
 
 export function isAgentLabel(label: string): label is AgentLabel {
   return label.startsWith(AGENT_PREFIX);
@@ -83,6 +85,10 @@ export function isAgentLabel(label: string): label is AgentLabel {
 
 export function isOwnerLabel(label: string): label is OwnerLabel {
   return label.startsWith(OWNER_PREFIX);
+}
+
+export function isAdminLabel(label: string): label is AdminLabel {
+  return label.startsWith(ADMIN_PREFIX);
 }
 
 export function getStatusFromLabels(labels: string[]): StatusLabel | null {
