@@ -123,6 +123,10 @@ All 11 checks in the smoke checklist must pass (or be explicitly skipped with ju
 | `/api/automation/repos` | GET | None | List tracked repositories |
 | `/api/audit` | GET | None | Query audit log entries |
 
+## Worker Execution Contract
+
+For the detailed worker execution contract (PR fix queue precedence, duplicate PR avoidance, hard completion gates, branch naming conventions, failure response format), see [docs/worker-execution-contract.md](./worker-execution-contract.md). This supersedes ad-hoc behavior and applies to all agent workers.
+
 ## Migration Timeline
 
 ```
