@@ -164,4 +164,12 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(res.status).toBe(200);
     expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: "issue-1" }, data: expect.objectContaining({ labels: expect.arrayContaining(["agent/test-agent", "status/in-progress"]) }) });
   });
+
+  it("does not add status/in-progress when force=false", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    const res = await POST(makeRequest({ force: false }));
+    expect(res.status).toBe(200);
+    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+  });
 });

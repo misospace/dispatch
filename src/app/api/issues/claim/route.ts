@@ -1,11 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
-import { getAgentFromLabels, AGENT_PREFIX, STATUS_LABELS, StatusLabel } from "@/types";
-
-function isStatusLabel(label: string): label is StatusLabel {
-  return (STATUS_LABELS as readonly string[]).includes(label);
-}
+import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
@@ -81,7 +77,7 @@ export async function POST(request: Request) {
     }
 
     // Optionally move to in-progress
-    if ((force === undefined || force === true) && !currentStatus) {
+    if (force !== false && !currentStatus) {
       const inProgressLabel = "status/in-progress";
       if (!updatedLabels.includes(inProgressLabel)) {
         updatedLabels.push(inProgressLabel);
@@ -93,7 +89,7 @@ export async function POST(request: Request) {
       await addIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
 
       // Optionally add status/in-progress label
-      if ((force === undefined || force === true) && !currentStatus) {
+      if (force !== false && !currentStatus) {
         await addIssueLabel(repoFullName as string, issueNumber as number, "status/in-progress");
       }
 

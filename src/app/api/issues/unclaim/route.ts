@@ -1,11 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel } from "@/lib/github";
-import { getAgentFromLabels, AGENT_PREFIX, STATUS_LABELS, StatusLabel } from "@/types";
-
-function isStatusLabel(label: string): label is StatusLabel {
-  return (STATUS_LABELS as readonly string[]).includes(label);
-}
+import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
