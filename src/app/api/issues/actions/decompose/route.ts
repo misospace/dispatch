@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
 /**
- * Mark an issue as decomposed (GPT-lane audit parent tracking).
+ * Mark an issue as decomposed (escalated-lane audit parent tracking).
  *
  * This allows broad audit/umbrella issues to be marked as decomposed or
  * no longer actionable without closing child work. Follow-up issue URLs

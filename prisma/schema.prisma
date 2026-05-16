@@ -43,7 +43,7 @@ model Issue {
   laneJudgedAt  DateTime?
   laneHistory   IssueLaneEntry[]
 
-  // GPT-lane outcome tracking
+  // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
   decomposedAt  DateTime?
   decomposedBy  String?  @db.Text
@@ -73,7 +73,7 @@ model IssueLaneEntry {
 
 enum IssueLane {
   NORMAL
-  GPT
+  ESCALATED
   BACKLOG
 }
 
@@ -92,8 +92,8 @@ model AgentRun {
   issueId          String?
   issue            Issue?    @relation(fields: [issueId], references: [id])
 
-  // GPT-lane outcome tracking
-  outcome          GptLaneOutcome?
+  // Escalated lane outcome tracking
+  outcome          EscalatedOutcome?
 
   @@index([agentName])
   @@index([runType])
@@ -101,7 +101,7 @@ model AgentRun {
   @@index([createdAt])
 }
 
-enum GptLaneOutcome {
+enum EscalatedOutcome {
   PR_OPENED
   PR_UPDATED
   FOLLOW_UP_CREATED

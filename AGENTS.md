@@ -56,14 +56,14 @@ Labels follow a `category/value` pattern:
 Mission Control classifies issues into three execution lanes:
 
 - **NORMAL**: Concrete, scoped, testable implementation work suitable for a standard worker. Examples: bounded frontend/backend fixes, documentation, tests, CI/lint, release/version drift, dependency updates, concrete follow-up issues with clear acceptance criteria.
-- **GPT**: Requires higher-judgment model support. Examples: architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, audit parent decomposition.
+- **ESCALATED**: Requires higher-judgment model support (may be GPT-5.5, Claude Opus, GLM-5.1, or another provider). Examples: architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, audit parent decomposition.
 - **BACKLOG**: Not actionable yet — placeholder, missing enough detail, or a parent/umbrella item that hasn't been decomposed into concrete work.
 
 Each classification stores: `lane`, `confidence` (0.0–1.0), `reason`, and `model/source`. A full history of classifications is maintained in the `IssueLaneEntry` table.
 
 **Routing rules:**
-- Do NOT route to GPT only because labels include `needs-gpt`, `escalated`, or `priority/p1`.
-- DO route broad audit parent/umbrella issues to GPT for decomposition/design unless already decomposed.
+- Do NOT route to ESCALATED only because labels include `needs-gpt`, `escalated`, or `priority/p1`.
+- DO route broad audit parent/umbrella issues to ESCALATED for decomposition/design unless already decomposed.
 - If the issue has clear acceptance criteria, prefer NORMAL.
 - If confidence is low and the issue is not actionable, choose BACKLOG.
 
@@ -182,9 +182,9 @@ At the **end** of each heartbeat:
 
 3. **Read issues from `GET /api/issues`.** Do not query the Postgres cache directly — the API is the contract.
 4. **Prefer issues assigned via `agent/<agent-id>` label** if present. If no `agent/*` label exists, fall back to general backlog.
-5. **Filter by execution lane** using the `lane` query param on `GET /api/agents/[agentName]/queue` (values: `NORMAL`, `GPT`, `BACKLOG`). By default, BACKLOG issues are excluded from the normal agent queue.
-5. **Treat "no status label" or `status/backlog` as backlog work.** Both are valid entry states.
-7. **Respect execution lane classification** when present: NORMAL issues are the primary queue for agents; GPT issues may require higher-judgment support; BACKLOG issues are not actionable until decomposed.
+5. **Filter by execution lane** using the `lane` query param on `GET /api/agents/[agentName]/queue` (values: `NORMAL`, `ESCALATED`, `BACKLOG`). By default, BACKLOG issues are excluded from the normal agent queue.
+6. **Treat "no status label" or `status/backlog` as backlog work.** Both are valid entry states.
+7. **Respect execution lane classification** when present: NORMAL issues are the primary queue for agents; ESCALATED issues may require higher-judgment support; BACKLOG issues are not actionable until decomposed.
 
 ### Source of truth
 

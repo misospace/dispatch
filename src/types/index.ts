@@ -45,7 +45,7 @@ export interface Issue {
   laneModel?: string | null;
   laneJudgedAt?: Date | null;
 
-  // GPT-lane outcome tracking
+  // Escalated lane outcome tracking
   decomposed?: boolean;
   decomposedAt?: Date | null;
   decomposedBy?: string | null;
@@ -54,7 +54,7 @@ export interface Issue {
 }
 
 export interface IssueLaneClassification {
-  lane: "NORMAL" | "GPT" | "BACKLOG";
+  lane: "NORMAL" | "ESCALATED" | "BACKLOG";
   confidence: number | null;
   reason: string;
   model: string;
@@ -70,7 +70,7 @@ export interface AgentRun {
   summary: string | null;
   errorMessage: string | null;
   touchedIssueUrls: string[];
-  outcome?: GptLaneOutcome | null;
+  outcome?: EscalatedOutcome | null;
 }
 
 export interface AuditLog {
@@ -92,7 +92,7 @@ export type OwnerLabel = `owner/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
-export type IssueLane = "NORMAL" | "GPT" | "BACKLOG";
+export type IssueLane = "NORMAL" | "ESCALATED" | "BACKLOG";
 
 export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/in-progress", "status/in-review", "status/done"];
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
@@ -141,7 +141,7 @@ export const LABEL_COLORS: Record<string, string> = {
 };
 
 // Lane classification constants and helpers
-export const VALID_LANES: IssueLane[] = ["NORMAL", "GPT", "BACKLOG"];
+export const VALID_LANES: IssueLane[] = ["NORMAL", "ESCALATED", "BACKLOG"];
 
 export function isValidLane(lane: string): lane is IssueLane {
   return VALID_LANES.includes(lane as IssueLane);
@@ -149,19 +149,19 @@ export function isValidLane(lane: string): lane is IssueLane {
 
 export const LANE_LABELS: Record<IssueLane, string> = {
   NORMAL: "normal",
-  GPT: "gpt",
+  ESCALATED: "escalated",
   BACKLOG: "backlog",
 };
 
 export const LANE_COLORS: Record<IssueLane, string> = {
   NORMAL: "22c55e",
-  GPT: "a855f7",
+  ESCALATED: "a855f7",
   BACKLOG: "6b7280",
 };
 
-// ─── GPT-Lane Outcome Constants ──────────────────────────────────────────────
+// ─── Escalated-Lane Outcome Constants ────────────────────────────────────────
 
-export type GptLaneOutcome =
+export type EscalatedOutcome =
   | "PR_OPENED"
   | "PR_UPDATED"
   | "FOLLOW_UP_CREATED"
@@ -169,7 +169,7 @@ export type GptLaneOutcome =
   | "DECOMPOSED_SKIPPED"
   | "STUCK";
 
-export const VALID_GPT_OUTCOMES: GptLaneOutcome[] = [
+export const VALID_ESCALATED_OUTCOMES: EscalatedOutcome[] = [
   "PR_OPENED",
   "PR_UPDATED",
   "FOLLOW_UP_CREATED",
@@ -179,17 +179,17 @@ export const VALID_GPT_OUTCOMES: GptLaneOutcome[] = [
 ];
 
 /**
- * Returns true if the given outcome is a valid GPT-lane outcome.
+ * Returns true if the given outcome is a valid escalated-lane outcome.
  * No hardcoded agent or repo names — this applies to all agents and repos uniformly.
  */
-export function isValidGptOutcome(outcome: string): outcome is GptLaneOutcome {
-  return VALID_GPT_OUTCOMES.includes(outcome as GptLaneOutcome);
+export function isValidEscalatedOutcome(outcome: string): outcome is EscalatedOutcome {
+  return VALID_ESCALATED_OUTCOMES.includes(outcome as EscalatedOutcome);
 }
 
 /**
- * Human-readable label for a GPT-lane outcome.
+ * Human-readable label for an escalated-lane outcome.
  */
-export const GPT_OUTCOME_LABELS: Record<GptLaneOutcome, string> = {
+export const ESCALATED_OUTCOME_LABELS: Record<EscalatedOutcome, string> = {
   PR_OPENED: "PR opened",
   PR_UPDATED: "PR updated",
   FOLLOW_UP_CREATED: "Follow-up issues created",

@@ -95,7 +95,7 @@ function isActionable(issueLabels: string[]): boolean {
 
 /**
  * Build the agent queue: filter, rank, and return issues for a given agent.
- * Optionally filters by execution lane (normal | gpt | backlog).
+ * Optionally filters by execution lane (normal | escalated | backlog).
  * Optionally excludes decomposed audit parents.
  */
 export function buildAgentQueue(
@@ -109,7 +109,7 @@ export function buildAgentQueue(
   }>,
   agentName: string,
   options?: {
-    lane?: "NORMAL" | "GPT" | "BACKLOG";
+    lane?: "NORMAL" | "ESCALATED" | "BACKLOG";
     excludeDecomposed?: boolean;
   },
 ): RankedIssue[] {

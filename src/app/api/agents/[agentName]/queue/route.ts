@@ -26,7 +26,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     });
 
     const queue = buildAgentQueue(issues, agentName, {
-      lane: lane?.toUpperCase() as "NORMAL" | "GPT" | "BACKLOG" | undefined,
+      lane: (lane === "gpt" ? "escalated" : lane?.toUpperCase()) as "NORMAL" | "ESCALATED" | "BACKLOG" | undefined,
       excludeDecomposed: excludeDecomposed === "true",
     });
 

@@ -23,7 +23,7 @@ This document defines the generic execution contract for any agent worker consum
 A worker must handle **exactly one** queue item per execution:
 
 - Either one PR fix from the PR review-fix queue, or
-- One issue from the normal (or GPT) assignment queue.
+- One issue from the normal (or Escalated) assignment queue.
 
 Workers must not batch multiple issues or PR fixes into a single run.
 
@@ -149,9 +149,9 @@ The normal lane contains concrete, scoped, testable work items:
 
 Workers consume one item per run from the normal lane's queue endpoint.
 
-### GPT Lane
+### Escalated Lane
 
-The GPT lane contains work requiring higher-judgment model support:
+The Escalated lane contains work requiring higher-judgment model support:
 - Architecture, security, or API boundary design
 - Database/schema migration strategy
 - Distributed/cross-service design decisions
@@ -160,13 +160,13 @@ The GPT lane contains work requiring higher-judgment model support:
 - RFC/design/alternatives evaluation
 - Audit parent decomposition
 
-Workers consume one item per run from the GPT lane's queue endpoint.
+Workers consume one item per run from the Escalated lane's queue endpoint.
 
 ### Lane Selection
 
 Workers receive their lane via the queue endpoint's `lane` query parameter:
 - `GET /api/agents/<name>/queue?lane=normal`
-- `GET /api/agents/<name>/queue?lane=gpt`
+- `GET /api/agents/<name>/queue?lane=escalated` (also accepts `lane=gpt` as a deprecated alias)
 
 BACKLOG issues are excluded from the normal agent queue by default.
 

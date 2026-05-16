@@ -1,13 +1,13 @@
-# GPT-Lane Outcome Contract
+# Escalated-Lane Outcome Contract
 
 > **Issue:** [misospace/mission-control#66](https://github.com/misospace/mission-control/issues/66)
 > **Date:** 2026-05-16
 
-This document defines the operational contract for GPT-lane outcomes and audit parent decomposition in Mission Control. It enables agents to report non-code outcomes (design comments, follow-up issues, decompositions) beyond simple PR creation.
+This document defines the operational contract for escalated-lane outcomes and audit parent decomposition in Mission Control. It enables agents to report non-code outcomes (design comments, follow-up issues, decompositions) beyond simple PR creation.
 
 ## Overview
 
-The GPT lane handles work requiring higher-judgment model support — architecture decisions, security reviews, API boundary design, RFC evaluation, and broad audit parent decomposition. Unlike the NORMAL lane where agents primarily open or update PRs, GPT-lane work may produce several different outcome types.
+The Escalated lane handles work requiring higher-judgment model support — architecture decisions, security reviews, API boundary design, RFC evaluation, and broad audit parent decomposition. Unlike the NORMAL lane where agents primarily open or update PRs, escalated-lane work may produce several different outcome types. The specific model used for escalated work may vary (e.g., GPT-5.5, Claude Opus, GLM-5.1) depending on configuration; the lane concept is provider-neutral.
 
 Mission Control must understand these outcomes so agents can rely on it as the assignment layer.
 
@@ -128,7 +128,7 @@ By default, decomposed issues **are included** in the queue. This allows operato
 The queue endpoint supports an `exclude_decomposed=true` query parameter:
 
 ```
-GET /api/agents/saffron/queue?lane=gpt&exclude_decomposed=true
+GET /api/agents/saffron/queue?lane=escalated&exclude_decomposed=true
 ```
 
 This filters out issues where `decomposed` is `true`, so agents only see actionable work.
@@ -206,7 +206,7 @@ The `STUCK` outcome signals that the agent needs human intervention. The `summar
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/api/agent-runs` | POST | Bearer token | Submit agent run with optional GPT-lane outcome |
+| `/api/agent-runs` | POST | Bearer token | Submit agent run with optional escalated-lane outcome |
 | `/api/issues/actions/decompose` | POST | Bearer token | Mark audit parent as decomposed/reactivated |
 | `/api/agents/<name>/queue?exclude_decomposed=true` | GET | None | Get queue excluding decomposed audit parents |
 | `/api/issues?decomposed=true` | GET | None | Filter issues by decomposed status |
@@ -215,4 +215,4 @@ The `STUCK` outcome signals that the agent needs human intervention. The `summar
 
 ## History
 
-- **2026-05-16** — Created to support GPT-lane non-code outcomes and audit decomposition (Issue #66).
+- **2026-05-16** — Created to support Escalated lane non-code outcomes and audit decomposition (Issue #66).
