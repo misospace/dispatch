@@ -36,7 +36,7 @@ Authorization: Bearer <TOKEN>
 Content-Type: application/json
 
 {
-  "agentName": "saffron",
+  "agentName": "example-agent",
   "runType": "heartbeat",
   "status": "completed",
   "startedAt": "2026-05-16T10:00:00.000Z",
@@ -128,7 +128,7 @@ By default, decomposed issues **are included** in the queue. This allows operato
 The queue endpoint supports an `exclude_decomposed=true` query parameter:
 
 ```
-GET /api/agents/saffron/queue?lane=escalated&exclude_decomposed=true
+GET /api/agents/example-agent/queue?lane=escalated&exclude_decomposed=true
 ```
 
 This filters out issues where `decomposed` is `true`, so agents only see actionable work.
@@ -167,7 +167,7 @@ When an agent encounters a clear, unresolvable blocker:
 
 ```json
 {
-  "agentName": "saffron",
+  "agentName": "example-agent",
   "runType": "heartbeat",
   "status": "completed",
   "startedAt": "2026-05-16T10:00:00.000Z",

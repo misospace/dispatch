@@ -2,6 +2,37 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
 /**
+ * Resolve the actor name for decomposition attribution.
+ *
+ * Resolution order: actor > agentName > "agent" (default).
+ * Validates that the resolved value is a non-empty trimmed string <= 100 chars.
+ */
+function resolveActor(body: unknown): { actor: string; error?: string } {
+  const raw = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+  if (!raw) return { actor: "agent" };
+
+  // Prefer `actor`, fall back to `agentName`, then default to "agent"
+  let value: unknown;
+  if ("actor" in raw) value = raw.actor;
+  else if ("agentName" in raw) value = raw.agentName;
+  else return { actor: "agent" };
+
+  if (typeof value !== "string") {
+    return { actor: "", error: "'actor'/'agentName' must be a string" };
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return { actor: "", error: "'actor'/'agentName' must not be empty after trimming" };
+  }
+  if (trimmed.length > 100) {
+    return { actor: "", error: "'actor'/'agentName' must be at most 100 characters" };
+  }
+
+  return { actor: trimmed };
+}
+
+/**
  * Mark an issue as decomposed (escalated-lane audit parent tracking).
  *
  * This allows broad audit/umbrella issues to be marked as decomposed or
@@ -26,6 +57,12 @@ export async function POST(request: Request) {
 
     if (typeof decomposed !== "boolean") {
       return NextResponse.json({ error: "Field 'decomposed' must be a boolean" }, { status: 400 });
+    }
+
+    // Resolve attribution actor
+    const { actor, error: actorError } = resolveActor(body);
+    if (actorError) {
+      return NextResponse.json({ error: actorError }, { status: 400 });
     }
 
     // Parse repo as owner/repo format
@@ -56,7 +93,7 @@ export async function POST(request: Request) {
       data: {
         decomposed,
         decomposedAt: decomposed ? new Date() : null,
-        decomposedBy: decomposed ? "agent" : null,
+        decomposedBy: decomposed ? actor : null,
         decomposedNote: note ?? null,
         followUpUrls: followUpUrls ?? [],
       },
@@ -65,7 +102,7 @@ export async function POST(request: Request) {
     // Log the action in audit trail
     await prisma.auditLog.create({
       data: {
-        actor: "agent",
+        actor,
         action: decomposed ? "issue_decomposed" : "issue_reactivated",
         repoFullName: `${owner}/${name}`,
         issueNumber,

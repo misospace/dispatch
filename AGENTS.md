@@ -62,7 +62,7 @@ Mission Control classifies issues into three execution lanes:
 Each classification stores: `lane`, `confidence` (0.0–1.0), `reason`, and `model/source`. A full history of classifications is maintained in the `IssueLaneEntry` table.
 
 **Routing rules:**
-- Do NOT route to ESCALATED only because labels include `needs-gpt`, `escalated`, or `priority/p1`.
+- Do NOT route to ESCALATED only because labels include `needs-escalation`, legacy `needs-gpt`, `escalated`, or `priority/p1`.
 - DO route broad audit parent/umbrella issues to ESCALATED for decomposition/design unless already decomposed.
 - If the issue has clear acceptance criteria, prefer NORMAL.
 - If confidence is low and the issue is not actionable, choose BACKLOG.
