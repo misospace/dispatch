@@ -8,6 +8,11 @@ function isStatusLabel(label: string): label is StatusLabel {
 }
 
 export async function POST(request: Request) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     let body: unknown;
     try {
@@ -37,6 +42,17 @@ export async function POST(request: Request) {
 
     if (!issue) {
       return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+    }
+
+    // Refuse closed issues
+    if (issue.state === "closed") {
+      return NextResponse.json({ error: "Cannot unclaim a closed issue" }, { status: 400 });
+    }
+
+    // Refuse done issues
+    const currentStatus = issue.labels.find((l) => l.startsWith("status/"));
+    if (currentStatus === "status/done") {
+      return NextResponse.json({ error: "Cannot unclaim a done issue" }, { status: 400 });
     }
 
     // Check if the agent is actually assigned

@@ -8,6 +8,11 @@ function isStatusLabel(label: string): label is StatusLabel {
 }
 
 export async function POST(request: Request) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     let body: unknown;
     try {
@@ -57,7 +62,8 @@ export async function POST(request: Request) {
         // Force claim: remove the old agent label first
         try {
           await removeIssueLabel(repoFullName as string, issueNumber as number, currentAgent);
-        } catch {
+        } catch (e) {
+          console.error(`Failed to remove stale agent label ${currentAgent} during force claim:`, e);
           // Non-fatal: continue with force claim even if label removal fails
         }
       } else {

@@ -9,6 +9,9 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
+const mockToken = "test-agent-token";
+process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
@@ -37,15 +40,39 @@ function makePayload(overrides = {}) {
   };
 }
 
-function postRequest(payload = makePayload()) {
+function postRequest(payload = makePayload(), extraHeaders = {}) {
   return POST(
     new Request("http://localhost/api/issues/unclaim", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
       body: JSON.stringify(payload),
     })
   );
 }
+
+describe("POST /api/issues/unclaim — auth", () => {
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when token is incorrect", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+});
 
 describe("POST /api/issues/unclaim — validation", () => {
   beforeEach(() => {
@@ -80,7 +107,7 @@ describe("POST /api/issues/unclaim — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/unclaim", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: "not-json",
       })
     );
@@ -91,7 +118,7 @@ describe("POST /api/issues/unclaim — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/unclaim", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: JSON.stringify([1, 2, 3]),
       })
     );
@@ -143,6 +170,32 @@ describe("POST /api/issues/unclaim — business logic", () => {
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toBe("Issue not found in local cache");
+  });
+
+  it("refuses to unclaim closed issues", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "closed",
+      labels: ["agent/test-agent"],
+    } as never);
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Cannot unclaim a closed issue");
+  });
+
+  it("refuses to unclaim done issues", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/done"],
+    } as never);
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Cannot unclaim a done issue");
   });
 
   it("returns 400 when agent is not assigned to the issue", async () => {
