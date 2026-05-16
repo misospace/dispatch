@@ -200,3 +200,7 @@ At the **end** of each heartbeat:
 ### Auditability
 
 13. **Every state-changing move on Mission Control must produce an AuditLog row.** Operators trace agent activity through `/api/audit`. Drag-and-drop moves on the Kanban board already write audit entries via `POST /api/issues/move`; agents using the same endpoint inherit this behavior.
+
+### Worker execution contract
+
+For the detailed worker execution contract (PR fix queue precedence, duplicate PR avoidance, hard completion gates, branch naming conventions, failure response format), see [docs/worker-execution-contract.md](./docs/worker-execution-contract.md). This supersedes ad-hoc behavior and applies to all agent workers.
