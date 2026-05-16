@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
-import { buildUnassignedLabels } from "@/lib/assignment-conflicts";
+import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
 
 type UnassignPayload = {
   issueId: string;
@@ -52,15 +52,16 @@ export async function POST(request: Request) {
       }
 
       const currentLabels = issue.labels;
+
+      // Use shared conflict resolution module for both removal detection and label update
       const labelsToRemove = payload.action === "unassign_agent"
-        ? currentLabels.filter((l) => l.startsWith("agent/"))
-        : currentLabels.filter((l) => l.startsWith("owner/"));
+        ? getAgentLabels(currentLabels)
+        : getOwnerLabels(currentLabels);
 
       if (labelsToRemove.length === 0) {
         return NextResponse.json({ error: `No ${payload.action === "unassign_agent" ? "agent" : "owner"} label found on this issue` }, { status: 400 });
       }
 
-      // Use shared conflict resolution module
       const newLabels = buildUnassignedLabels(currentLabels, payload.action);
 
       // Update GitHub labels
