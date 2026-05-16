@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { isValidEscalatedOutcome, VALID_ESCALATED_OUTCOMES } from "@/types";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -35,10 +36,21 @@ export async function POST(request: Request) {
       errorMessage,
       touchedIssueUrls,
       issueId,
+      outcome,
     } = body;
 
     if (!agentName || !runType || !status || !startedAt) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+    }
+
+    // Validate escalated-lane outcome if provided
+    if (outcome !== undefined && outcome !== null) {
+      if (!isValidEscalatedOutcome(outcome)) {
+        return NextResponse.json(
+          { error: `Invalid outcome: "${outcome}". Valid values: ${VALID_ESCALATED_OUTCOMES.join(", ")}` },
+          { status: 400 },
+        );
+      }
     }
 
     const run = await prisma.agentRun.create({
@@ -52,6 +64,7 @@ export async function POST(request: Request) {
         errorMessage,
         touchedIssueUrls: touchedIssueUrls || [],
         issueId,
+        outcome: outcome ?? undefined,
       },
     });
 

@@ -9,12 +9,19 @@ export async function GET(request: Request) {
   const owner = searchParams.get("owner");
   const project = searchParams.get("project");
   const priority = searchParams.get("priority");
+  const decomposed = searchParams.get("decomposed");
 
   try {
     const where: Record<string, unknown> = { repository: { enabled: true } };
 
     if (repo) {
       where.repository = { ...(where.repository as object), fullName: repo };
+    }
+
+    // Filter by decomposed status if requested (default: exclude decomposed)
+    if (decomposed !== null) {
+      const parsed = decomposed === "true";
+      where.decomposed = parsed;
     }
 
     const labels = buildLabelWhere([agent, owner, toProjectLabel(project), priority]);

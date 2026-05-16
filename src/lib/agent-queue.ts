@@ -20,6 +20,8 @@ export interface RankedIssue {
   status: string | null;
   agentMatch: boolean;
   rankingReason: string;
+  lane?: string;
+  decomposed?: boolean;
 }
 
 /**
@@ -84,8 +86,6 @@ function isActionable(issueLabels: string[]): boolean {
   if (status === DONE_STATUS) return false;
 
   // Include: no status, backlog, in-progress
-  // Exclude: anything else that might be a status we don't recognize
-  // We allow in-progress and backlog (and no-status) as actionable
   if (status === null || status === BACKLOG_STATUS || status === IN_PROGRESS_STATUS) {
     return true;
   }
@@ -95,13 +95,39 @@ function isActionable(issueLabels: string[]): boolean {
 
 /**
  * Build the agent queue: filter, rank, and return issues for a given agent.
+ * Optionally filters by execution lane (normal | escalated | backlog).
+ * Optionally excludes decomposed audit parents.
  */
-export function buildAgentQueue(issues: Array<{ labels: string[]; number: number; title: string; url: string }>, agentName: string): RankedIssue[] {
+export function buildAgentQueue(
+  issues: Array<{
+    labels: string[];
+    number: number;
+    title: string;
+    url: string;
+    lane?: string;
+    decomposed?: boolean;
+  }>,
+  agentName: string,
+  options?: {
+    lane?: "NORMAL" | "ESCALATED" | "BACKLOG";
+    excludeDecomposed?: boolean;
+  },
+): RankedIssue[] {
   // Filter actionable issues (open, not done)
-  const actionable = issues.filter((issue) => isActionable(issue.labels));
+  let actionable = issues.filter((issue) => isActionable(issue.labels));
+
+  // Exclude decomposed audit parents if requested
+  if (options?.excludeDecomposed) {
+    actionable = actionable.filter((issue) => !issue.decomposed);
+  }
+
+  // Lane filter: exclude BACKLOG lane items from normal agent queue
+  const filtered = options?.lane
+    ? actionable.filter((issue) => issue.lane === options.lane)
+    : actionable.filter((issue) => issue.lane !== "BACKLOG");
 
   // Rank and filter out excluded items
-  const ranked = actionable
+  const ranked = filtered
     .map((issue) => {
       const { score, reason } = rankIssue(issue.labels, agentName);
       return { ...issue, score, reason };
@@ -128,6 +154,8 @@ export function buildAgentQueue(issues: Array<{ labels: string[]; number: number
       status,
       agentMatch,
       rankingReason: item.reason,
+      lane: item.lane,
+      decomposed: item.decomposed ?? false,
     };
   });
 }
