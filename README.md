@@ -98,18 +98,7 @@ Ensure it is only accessible within your trusted network via ingress rules.
 ## Phase 1 Features
 
 ### Implemented
-1. **Issue Execution Lane Classification**
-   - Generic lane model: `NORMAL`, `GPT`, `BACKLOG`
-   - Classification metadata stored on Issue: `lane`, `confidence`, `reason`, `model`, `judgedAt`
-   - Full classification history in `IssueLaneEntry` table (audit trail)
-   - API endpoint for single-issue classify/reclassify (`POST /api/issues/[id]/classify`)
-   - Bulk classify endpoint with rate limiting (`POST /api/issue-lanes/classify-bulk`)
-   - Lane-aware agent queue filtering (`GET /api/agents/[agentName]/queue?lane=`)
-   - Classification failures default to NORMAL — never break issue sync
-   - Generic, agent-agnostic classification prompt (no hardcoded agent names or repo names)
-   - Lane badge displayed on Kanban board issue cards
-
-2. **GitHub Repository Configuration**
+1. **GitHub Repository Configuration**
    - Support configuring multiple GitHub repos to sync
    - Use env vars for GitHub auth (PAT support)
 
@@ -195,7 +184,6 @@ The tests are intentionally lightweight and do not require Postgres, GitHub API 
 - issue sync response shaping and per-repo error handling
 - Kanban status grouping, including no-status issues appearing in Backlog
 - project grouping by repository boundaries
-- Issue lane classification: valid/invalid lane parsing, confidence validation, model response handling, routing rules (escalation label bypass, audit parent detection)
 - dark mode toggle class and localStorage behavior
 
 The `CI` workflow runs lint, typecheck, tests, and build. The image workflow builds the Docker image, publishes GHCR images on `main` and `v*` tags, and uploads advisory Trivy scan results.
@@ -240,19 +228,7 @@ Required secrets (via ExternalSecret):
 ## API Endpoints
 
 ### GET /api/issues
-List cached issues. Query params: `repo`, `agent`, `owner`, `project`, `priority`, `lane`
-
-### GET /api/issues/[id]/classify
-Get the current lane classification for a specific issue. Returns: `{ lane, confidence, reason, model, judgedAt, history }`.
-
-### POST /api/issues/[id]/classify
-Reclassify an issue. Body (optional): `{ forceLane: "NORMAL"|"GPT"|"BACKLOG", modelSource: string }`. Creates a new `IssueLaneEntry` history row and updates the issue's current lane.
-
-### POST /api/issue-lanes/classify-bulk
-Bulk classify unclassified or stale issues (last classified >24h ago). Body (optional): `{ limit: number, modelSource: string }`. Rate-limited to 200 issues per call. Classification failures default to NORMAL and do not break the batch.
-
-### GET /api/agents/[agentName]/queue
-Get the agent's issue queue. Query param: `lane` (optional) — filter by execution lane (`NORMAL`, `GPT`, `BACKLOG`). By default, BACKLOG issues are excluded from the normal agent queue.
+List cached issues. Query params: `repo`, `agent`, `owner`, `project`, `priority`
 
 ### POST /api/issues/move
 Move issue between status columns. Body: `{ issueId, repoFullName, issueNumber, oldLabels, newLabels }`
