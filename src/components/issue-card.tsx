@@ -4,7 +4,7 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, LANE_COLORS, LANE_LABELS } from "@/types";
+import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { GitPullRequest, MessageSquare, ExternalLink, MoreVertical, User, Users, X } from "lucide-react";
 import { useState, useCallback } from "react";
 
@@ -43,11 +43,6 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
   const ownerLabel = issue.labels.find((l) => l.startsWith("owner/"));
   const priorityLabel = issue.labels.find((l) => l.startsWith("priority/"));
 
-  // Lane display
-  const lane = issue.lane as "NORMAL" | "GPT" | "BACKLOG" | undefined;
-  const laneColor = lane ? LANE_COLORS[lane] : null;
-  const laneLabel = lane ? LANE_LABELS[lane] : null;
-
   // Fetch available agents on mount (once)
   const fetchAgents = useCallback(async () => {
     if (agents.length > 0 || fetchingAgents) return;
@@ -85,6 +80,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     }
 
     if (onIssueUpdate) {
+      // Re-fetch the issue data by triggering a board refresh
       onIssueUpdate(issue);
     }
 
@@ -263,22 +259,6 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
                       </div>
                     )}
 
-                    {/* Lane info */}
-                    {lane && laneLabel && (
-                      <div className="mb-2 pb-2 border-b">
-                        <p className="text-xs font-medium mb-1 text-muted-foreground">Execution lane</p>
-                        <span
-                          className="px-1.5 py-0.5 text-xs rounded"
-                          style={{ backgroundColor: `#${laneColor}20`, color: `#${laneColor}` }}
-                        >
-                          {laneLabel}
-                          {issue.laneConfidence !== null && issue.laneConfidence !== undefined && (
-                            <span className="ml-1 opacity-75">({Math.round(issue.laneConfidence * 100)}%)</span>
-                          )}
-                        </span>
-                      </div>
-                    )}
-
                     {/* Assign agent */}
                     <div className="mb-2 pb-2 border-b">
                       <p className="text-xs font-medium mb-1 text-muted-foreground flex items-center gap-1">
@@ -356,14 +336,6 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
           >
             {issue.labels.find((l) => l.startsWith("status/"))?.replace("status/", "") || "backlog"}
           </span>
-          {lane && laneLabel && (
-            <span
-              className="px-1.5 py-0.5 text-xs rounded"
-              style={{ backgroundColor: `#${laneColor}20`, color: `#${laneColor}` }}
-            >
-              {laneLabel}
-            </span>
-          )}
           {agentLabel && (
             <span className="px-1.5 py-0.5 text-xs rounded bg-purple-100 text-purple-700">
               {agentLabel.replace(AGENT_PREFIX, "")}

@@ -20,7 +20,6 @@ export interface RankedIssue {
   status: string | null;
   agentMatch: boolean;
   rankingReason: string;
-  lane?: string;
 }
 
 /**
@@ -85,6 +84,8 @@ function isActionable(issueLabels: string[]): boolean {
   if (status === DONE_STATUS) return false;
 
   // Include: no status, backlog, in-progress
+  // Exclude: anything else that might be a status we don't recognize
+  // We allow in-progress and backlog (and no-status) as actionable
   if (status === null || status === BACKLOG_STATUS || status === IN_PROGRESS_STATUS) {
     return true;
   }
@@ -94,23 +95,13 @@ function isActionable(issueLabels: string[]): boolean {
 
 /**
  * Build the agent queue: filter, rank, and return issues for a given agent.
- * Optionally filters by execution lane (normal | gpt | backlog).
  */
-export function buildAgentQueue(
-  issues: Array<{ labels: string[]; number: number; title: string; url: string; lane?: string }>,
-  agentName: string,
-  options?: { lane?: "NORMAL" | "GPT" | "BACKLOG" },
-): RankedIssue[] {
+export function buildAgentQueue(issues: Array<{ labels: string[]; number: number; title: string; url: string }>, agentName: string): RankedIssue[] {
   // Filter actionable issues (open, not done)
   const actionable = issues.filter((issue) => isActionable(issue.labels));
 
-  // Lane filter: exclude BACKLOG lane items from normal agent queue
-  const filtered = options?.lane
-    ? actionable.filter((issue) => issue.lane === options.lane)
-    : actionable.filter((issue) => issue.lane !== "BACKLOG");
-
   // Rank and filter out excluded items
-  const ranked = filtered
+  const ranked = actionable
     .map((issue) => {
       const { score, reason } = rankIssue(issue.labels, agentName);
       return { ...issue, score, reason };
@@ -137,7 +128,6 @@ export function buildAgentQueue(
       status,
       agentMatch,
       rankingReason: item.reason,
-      lane: item.lane,
     };
   });
 }
