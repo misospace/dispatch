@@ -34,8 +34,10 @@ model Issue {
   updatedAt     DateTime
   closedAt      DateTime?
   lastSyncedAt  DateTime   @default(now())
+  currentLane   String?    @default("normal")
   agentRuns     AgentRun[]
   auditLogs     AuditLog[]
+  laneHistory   IssueLane[]
 
   @@unique([repositoryId, number])
   @@index([state])
@@ -76,6 +78,20 @@ model AuditLog {
   @@index([repoFullName])
   @@index([issueId])
   @@index([createdAt])
+}
+
+model IssueLane {
+  id         String   @id @default(cuid())
+  issueId    String
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  lane       String
+  confidence String
+  reason     String?  @db.Text
+  model      String?
+  judgedAt   DateTime @default(now())
+
+  @@index([issueId])
+  @@index([lane])
 }
 
 model AutomationRepo {

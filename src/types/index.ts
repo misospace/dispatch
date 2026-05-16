@@ -34,9 +34,20 @@ export interface Issue {
   createdAt: Date;
   updatedAt: Date;
   closedAt: Date | null;
+  currentLane?: string | null;
   repository: {
     fullName: string;
   };
+}
+
+export interface IssueLane {
+  id: string;
+  issueId: string;
+  lane: string;
+  confidence: string;
+  reason: string | null;
+  model: string | null;
+  judgedAt: Date;
 }
 
 export interface AgentRun {
@@ -76,6 +87,13 @@ export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "
 export const PROJECT_PREFIX = "project/";
 export const AGENT_PREFIX = "agent/";
 export const OWNER_PREFIX = "owner/";
+
+// Lane classification types and constants
+export type IssueLaneValue = "normal" | "escalated" | "backlog";
+export type ConfidenceValue = "high" | "medium" | "low";
+
+export const VALID_LANES: IssueLaneValue[] = ["normal", "escalated", "backlog"];
+export const VALID_CONFIDENCE: ConfidenceValue[] = ["high", "medium", "low"];
 
 export function isAgentLabel(label: string): label is AgentLabel {
   return label.startsWith(AGENT_PREFIX);
