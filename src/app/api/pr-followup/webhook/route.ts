@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 
 /**
@@ -158,7 +158,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "No events to process" });
     }
 
-    const result = await processPrFollowupEvents(prisma, events);
+    const result = await processPrFollowupEvents(asPrFixQueueClient(prisma), events);
 
     return NextResponse.json({
       eventsReceived: events.length,

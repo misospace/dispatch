@@ -1,221 +1,187 @@
-/**
- * PR Fix Queue Module
- *
- * Core data access for the PR-fix assignment queue.
- * Used by PR follow-up ingestion and other components to manage
- * queued fix items and their history.
- */
+import { normalizePrFixLane, normalizePrFixStatus, PrFixLane, PrFixStatus } from "@/types";
 
-import { PrismaClient } from "@prisma/client";
-
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-export type PrFixLane = "NORMAL" | "NEEDS_HUMAN" | "ESCALATED";
-export type PrFixStatus = "QUEUED" | "IN_PROGRESS" | "FIXED" | "BLOCKED" | "STALE" | "CANCELLED";
-
-export interface EnqueuePrFixInput {
-  repo: string;
-  pr: number;
-  lane: PrFixLane;
-  reason: string;
-  feedback: string;
-  evidenceKey?: string;
-  issue?: number | null;
-  branch?: string | null;
-  url?: string | null;
-  title?: string | null;
-  author?: string | null;
-}
-
-/**
- * Minimal client interface for PR fix queue operations.
- * Accepts both the real PrismaClient and a mock for testing.
- */
-export interface PrFixQueueClient {
+export type PrFixQueueClient = {
   prFixQueueItem: {
     findUnique: (args: any) => Promise<any>;
+    findMany: (args?: any) => Promise<any[]>;
     create: (args: any) => Promise<any>;
     update: (args: any) => Promise<any>;
-    findMany: (args?: any) => Promise<any[]>;
   };
   prFixHistory: {
     create: (args: any) => Promise<any>;
   };
+  $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
+};
+
+export interface EnqueuePrFixInput {
+  repo: string;
+  pr: number;
+  lane?: string | null;
+  reason: string;
+  feedback: string;
+  evidenceKey: string;
+  issue?: number | null;
+  branch?: string | null;
+  url?: string | null;
+  title?: string | null;
+  headSha?: string | null;
+  author?: string | null;
 }
 
-// ─── Core Functions ─────────────────────────────────────────────────────────
+export interface MarkPrFixInput {
+  repo: string;
+  pr: number;
+  status: string;
+  note?: string | null;
+}
 
-/**
- * Enqueue a PR fix item. If an item for the same repo+pr already exists,
- * it is updated (merged feedback and evidence keys).
- * Returns the item ID.
- */
-export async function enqueuePrFixItem(
-  client: PrFixQueueClient,
-  input: EnqueuePrFixInput,
-): Promise<string> {
-  const where = { repo_pr: { repo: input.repo, pr: input.pr } };
+function nonEmpty(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
-  // Check if item already exists (dedup by repo+pr)
-  const existing = await client.prFixQueueItem.findUnique({ where });
+export function parseEnqueuePrFixInput(body: unknown): EnqueuePrFixInput | { error: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body" };
+  const input = body as Record<string, unknown>;
+  if (!nonEmpty(input.repo)) return { error: "Missing required field: repo" };
+  if (input.pr === undefined || input.pr === null || !Number.isInteger(Number(input.pr))) return { error: "Missing required field: pr" };
+  if (!nonEmpty(input.reason)) return { error: "Missing required field: reason" };
+  if (!nonEmpty(input.feedback)) return { error: "Missing required field: feedback" };
+  if (!nonEmpty(input.evidenceKey)) return { error: "Missing required field: evidenceKey" };
 
-  if (existing) {
-    // Update existing item — merge feedback and evidence keys
-    const updatedFeedback = [...new Set([...existing.feedback, input.feedback])];
-    const updatedEvidenceKeys = [
-      ...new Set([
-        ...(existing.evidenceKeys ?? []),
-        ...(input.evidenceKey ? [input.evidenceKey] : []),
-      ]),
-    ];
+  return {
+    repo: input.repo.trim(),
+    pr: Number(input.pr),
+    lane: typeof input.lane === "string" ? input.lane : undefined,
+    reason: input.reason.trim(),
+    feedback: input.feedback.trim(),
+    evidenceKey: input.evidenceKey.trim(),
+    issue: input.issue === undefined || input.issue === null ? null : Number(input.issue),
+    branch: typeof input.branch === "string" ? input.branch : null,
+    url: typeof input.url === "string" ? input.url : null,
+    title: typeof input.title === "string" ? input.title : null,
+    headSha: typeof input.headSha === "string" ? input.headSha : null,
+    author: typeof input.author === "string" ? input.author : null,
+  };
+}
 
-    const updated = await client.prFixQueueItem.update({
-      where: { id: existing.id },
+export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body" };
+  const input = body as Record<string, unknown>;
+  if (!nonEmpty(input.repo)) return { error: "Missing required field: repo" };
+  if (input.pr === undefined || input.pr === null || !Number.isInteger(Number(input.pr))) return { error: "Missing required field: pr" };
+  if (!nonEmpty(input.status)) return { error: "Missing required field: status" };
+  if (!normalizePrFixStatus(input.status)) return { error: "Invalid status" };
+  return {
+    repo: input.repo.trim(),
+    pr: Number(input.pr),
+    status: normalizePrFixStatus(input.status) as PrFixStatus,
+    note: typeof input.note === "string" ? input.note : null,
+  };
+}
+
+function uniqueAppend(values: string[], value: string, maxItems: number): string[] {
+  const next = values.includes(value) ? values : [...values, value];
+  return next.slice(-maxItems);
+}
+
+function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number> {
+  const patch: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries({
+    issue: input.issue ?? undefined,
+    branch: input.branch ?? undefined,
+    url: input.url ?? undefined,
+    title: input.title ?? undefined,
+    headSha: input.headSha ?? undefined,
+    author: input.author ?? undefined,
+  })) {
+    if (value !== undefined && value !== null && value !== "") patch[key] = value as string | number;
+  }
+  return patch;
+}
+
+export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueuePrFixInput) {
+  const lane = normalizePrFixLane(input.lane);
+  const status: PrFixStatus = lane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
+
+  return client.$transaction(async (tx) => {
+    const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
+    if (existing) {
+      const item = await tx.prFixQueueItem.update({
+        where: { id: existing.id },
+        data: {
+          lane,
+          status,
+          reason: input.reason,
+          feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
+          evidenceKeys: uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40),
+          ...metadataPatch(input),
+        },
+      });
+      await tx.prFixHistory.create({
+        data: { itemId: item.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
+      });
+      return item;
+    }
+
+    const item = await tx.prFixQueueItem.create({
       data: {
-        lane: input.lane,
-        status: input.lane === "NEEDS_HUMAN" ? ("BLOCKED" as any) : undefined,
+        repo: input.repo,
+        pr: input.pr,
+        lane,
+        status,
         reason: input.reason,
-        feedback: updatedFeedback,
-        evidenceKeys: updatedEvidenceKeys,
-        updatedAt: new Date(),
+        feedback: [input.feedback],
+        evidenceKeys: [input.evidenceKey],
+        ...metadataPatch(input),
       },
     });
-
-    // Record history
-    await client.prFixHistory.create({
-      data: {
-        itemId: existing.id,
-        action: "updated",
-        actor: "system",
-        details: `Updated lane to ${input.lane}: ${input.reason}`,
-      },
+    await tx.prFixHistory.create({
+      data: { itemId: item.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
     });
-
-    return existing.id;
-  }
-
-  // Create new item
-  const evidenceKeys = input.evidenceKey ? [input.evidenceKey] : [];
-
-  const item = await client.prFixQueueItem.create({
-    data: {
-      repo: input.repo,
-      pr: input.pr,
-      lane: input.lane,
-        status: input.lane === "NEEDS_HUMAN" ? ("BLOCKED" as any) : undefined,
-      reason: input.reason,
-      feedback: [input.feedback],
-      evidenceKeys,
-      issue: input.issue ?? undefined,
-      branch: input.branch ?? undefined,
-      url: input.url ?? undefined,
-      title: input.title ?? undefined,
-      author: input.author ?? undefined,
-    },
-  });
-
-  // Record history
-  await client.prFixHistory.create({
-    data: {
-      itemId: item.id,
-      action: "created",
-      actor: "system",
-      details: `Queued ${input.lane} lane: ${input.reason}`,
-    },
-  });
-
-  return item.id;
-}
-
-/**
- * Get a PR fix queue item by repo and PR number.
- */
-export async function getPrFixQueueItem(
-  client: PrFixQueueClient,
-  repo: string,
-  pr: number,
-): Promise<any | null> {
-  return client.prFixQueueItem.findUnique({
-    where: { repo_pr: { repo, pr } },
+    return item;
   });
 }
 
-/**
- * List PR fix queue items filtered by status.
- */
-export async function listPrFixQueueItems(
-  client: PrFixQueueClient,
-  filter?: { status?: PrFixStatus; lane?: PrFixLane },
-): Promise<any[]> {
-  const where: Record<string, any> = {};
-  if (filter?.status) where.status = filter.status;
-  if (filter?.lane) where.lane = filter.lane;
-
+export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean } = {}) {
+  const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
+  const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED"] } : "QUEUED";
   return client.prFixQueueItem.findMany({
-    where,
-    orderBy: { queuedAt: "asc" },
+    where: { status, ...(lane ? { lane } : {}) },
+    orderBy: [{ queuedAt: "asc" }, { repo: "asc" }, { pr: "asc" }],
   });
 }
 
-/**
- * Mark a PR fix queue item as fixed.
- */
-export async function markPrFixFixed(
-  client: PrFixQueueClient,
-  itemId: string,
-  note?: string,
-): Promise<any> {
-  const updated = await client.prFixQueueItem.update({
-    where: { id: itemId },
-    data: { status: "FIXED", updatedAt: new Date() },
+export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixInput) {
+  const status = normalizePrFixStatus(input.status) as PrFixStatus | null;
+  if (!status) throw new Error("Invalid status");
+  return client.$transaction(async (tx) => {
+    const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
+    if (!existing) return null;
+    const item = await tx.prFixQueueItem.update({ where: { id: existing.id }, data: { status } });
+    await tx.prFixHistory.create({ data: { itemId: item.id, action: "mark", status, note: input.note ?? undefined } });
+    return item;
   });
-
-  await client.prFixHistory.create({
-    data: {
-      itemId,
-      action: "fixed",
-      actor: "system",
-      details: note ?? "Marked as fixed",
-    },
-  });
-
-  return updated;
 }
 
-/**
- * Mark a PR fix queue item as blocked.
- */
-export async function markPrFixBlocked(
-  client: PrFixQueueClient,
-  itemId: string,
-  note?: string,
-): Promise<any> {
-  const updated = await client.prFixQueueItem.update({
-    where: { id: itemId },
-    data: { status: "BLOCKED", updatedAt: new Date() },
-  });
-
-  await client.prFixHistory.create({
-    data: {
-      itemId,
-      action: "blocked",
-      actor: "system",
-      details: note ?? "Marked as blocked",
-    },
-  });
-
-  return updated;
-}
-
-/**
- * Create a Prisma-backed client instance.
- * Lazy-loaded to avoid connecting during test imports.
- */
-let _prismaClient: PrismaClient | undefined;
-
-export function createPrismaQueueClient(): PrFixQueueClient {
-  if (!_prismaClient) {
-    _prismaClient = new PrismaClient();
-  }
-  return _prismaClient as unknown as PrFixQueueClient;
+export function toAgentQueuePrFixItem(item: any) {
+  return {
+    type: "pr-review-fix",
+    id: item.id,
+    repo: item.repo,
+    pr: item.pr,
+    issue: item.issue,
+    branch: item.branch,
+    url: item.url,
+    title: item.title,
+    lane: item.lane,
+    status: item.status,
+    reason: item.reason,
+    feedback: item.feedback ?? [],
+    evidenceKeys: item.evidenceKeys ?? [],
+    headSha: item.headSha,
+    author: item.author,
+    queuedAt: item.queuedAt,
+    updatedAt: item.updatedAt,
+    rankingReason: "queued PR review-fix item",
+  };
 }
