@@ -21,9 +21,38 @@ export async function POST(request: Request) {
 
     const item = await markPrFixItem(asPrFixQueueClient(prisma), input);
     if (!item) return NextResponse.json({ error: "PR fix queue item not found" }, { status: 404 });
+
+    const actor = request.headers.get("x-agent-name") ?? "agent";
+    await prisma.auditLog.create({
+      data: {
+        actor,
+        action: "pr_fix_mark",
+        repoFullName: input.repo,
+        issueNumber: null,
+        success: true,
+        beforeLabels: [],
+        afterLabels: [],
+        notes: `pr=${input.pr} status=${item.status}${input.note ? ` note=${input.note}` : ""}`,
+      },
+    });
+
     return NextResponse.json(item);
   } catch (error) {
     console.error("Failed to mark PR fix queue item:", error);
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+
+    await prisma.auditLog.create({
+      data: {
+        actor: request.headers.get("x-agent-name") ?? "agent",
+        action: "pr_fix_mark",
+        repoFullName: "unknown",
+        success: false,
+        errorMessage,
+        beforeLabels: [],
+        afterLabels: [],
+      },
+    });
+
     return NextResponse.json({ error: "Failed to mark PR fix queue item" }, { status: 500 });
   }
 }
