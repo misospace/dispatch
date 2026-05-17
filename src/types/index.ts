@@ -47,13 +47,6 @@ export interface Issue {
   followUpUrls?: string[];
 }
 
-export interface IssueLaneClassification {
-  lane: "NORMAL" | "ESCALATED" | "BACKLOG";
-  confidence: number | null;
-  reason: string;
-  model: string;
-}
-
 export interface StoredIssueLane {
   id: string;
   issueId: string;
@@ -148,24 +141,6 @@ export const LABEL_COLORS: Record<string, string> = {
   "priority/p1": "f97316",
   "priority/p2": "eab308",
   "priority/p3": "22c55e",
-};
-// Lane classification constants and helpers (uppercase, for API/Prisma compatibility)
-export const VALID_LANES_UPPER: string[] = ["NORMAL", "ESCALATED", "BACKLOG"];
-
-export function isValidLane(lane: string): lane is IssueLaneValue {
-  return [...VALID_LANES, ...VALID_LANES_UPPER].includes(lane as IssueLaneValue);
-}
-
-export const LANE_LABELS: Record<string, string> = {
-  NORMAL: "normal",
-  ESCALATED: "escalated",
-  BACKLOG: "backlog",
-};
-
-export const LANE_COLORS: Record<string, string> = {
-  NORMAL: "22c55e",
-  ESCALATED: "a855f7",
-  BACKLOG: "6b7280",
 };
 
 // ─── Escalated-Lane Outcome Constants ────────────────────────────────────────

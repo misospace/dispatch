@@ -109,10 +109,13 @@ export function buildAgentQueue(
   }>,
   agentName: string,
   options?: {
-    lane?: "NORMAL" | "ESCALATED" | "BACKLOG";
+    lane?: "normal" | "escalated" | "backlog" | "NORMAL" | "ESCALATED" | "BACKLOG";
     excludeDecomposed?: boolean;
   },
 ): RankedIssue[] {
+  // Normalize lane to lowercase for consistent comparison
+  const normalizedLane = options?.lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined;
+
   // Filter actionable issues (open, not done)
   let actionable = issues.filter((issue) => isActionable(issue.labels));
 
@@ -122,9 +125,9 @@ export function buildAgentQueue(
   }
 
   // Lane filter: exclude BACKLOG lane items from normal agent queue
-  const filtered = options?.lane
-    ? actionable.filter((issue) => issue.lane === options.lane)
-    : actionable.filter((issue) => issue.lane !== "BACKLOG");
+  const filtered = normalizedLane
+    ? actionable.filter((issue) => issue.lane?.toLowerCase() === normalizedLane)
+    : actionable.filter((issue) => issue.lane?.toLowerCase() !== "backlog");
 
   // Rank and filter out excluded items
   const ranked = filtered

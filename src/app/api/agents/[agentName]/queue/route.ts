@@ -20,13 +20,13 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
         title: true,
         url: true,
         labels: true,
-        lane: true,
+        currentLane: true,
         decomposed: true,
       },
     });
 
     const queue = buildAgentQueue(issues, agentName, {
-      lane: (lane === "gpt" ? "escalated" : lane?.toUpperCase()) as "NORMAL" | "ESCALATED" | "BACKLOG" | undefined,
+      lane: lane === "gpt" ? "escalated" : (lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined),
       excludeDecomposed: excludeDecomposed === "true",
     });
 
