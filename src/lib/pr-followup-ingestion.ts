@@ -78,12 +78,7 @@ export function isAllowedBranchOwner(
   }
   // Allowlisted: repo owner is always allowed, plus specific user logins.
   const [owner] = repoFullName.split("/");
-  if (config.branchOwnerAllowlist.includes(owner)) return true;
-  // Also check if the branch owner (repo owner) matches
-  return config.branchOwnerAllowlist.some((allowed) => {
-    if (allowed === owner) return true;
-    return false;
-  });
+  return config.branchOwnerAllowlist.includes(owner);
 }
 
 // ─── Feedback Classification ────────────────────────────────────────────────

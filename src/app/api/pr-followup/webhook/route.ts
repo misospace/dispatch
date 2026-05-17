@@ -98,25 +98,32 @@ export async function POST(request: Request) {
         const check = checkRun.check_run;
         if (!check) break;
 
-        // Try to find the PR number from check details
+        // Derive PR association from check.pull_requests (not checkRun.sender)
         let prNumber: number | undefined = undefined;
-        const issueUrls = check.pull_requests ?? [];
-        if (Array.isArray(issueUrls) && issueUrls.length > 0) {
-          const firstUrl = issueUrls[0]?.url as string | undefined;
-          if (firstUrl) {
-            const match = firstUrl.match(/\/pull\/(\d+)/);
-            if (match) prNumber = parseInt(match[1], 10);
+        let prAuthor: string | null = null;
+        const prList = check.pull_requests ?? [];
+        if (Array.isArray(prList) && prList.length > 0) {
+          const firstPr = prList[0] as Record<string, any> | undefined;
+          if (firstPr?.url) {
+            const match = firstPr.url.match(/\/pull\/(\d+)/);
+            if (match) {
+              prNumber = parseInt(match[1], 10);
+              prAuthor = firstPr.user?.login ?? null;
+            }
           }
         }
 
+        // Skip check runs that cannot be associated with a PR
+        if (prNumber === undefined || prNumber === 0) break;
+
         events.push({
           eventType: "check_run",
-          repoFullName: checkRun.repository?.full_name ?? null,
-          prNumber: prNumber ?? 0,
+          repoFullName: check.repository?.full_name ?? null,
+          prNumber,
           branch: check.head_branch ?? null,
           url: check.html_url,
           title: check.name,
-          author: checkRun.sender?.login ?? null,
+          author: prAuthor,
           body: check.details ?? check.output?.summary ?? "",
           id: String(check.id),
           conclusion: check.conclusion,
