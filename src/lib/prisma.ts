@@ -1,5 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { PrFixQueueClient } from "@/lib/pr-fix-queue";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgresql://mission-control:mission-control@localhost:5432/mission-control";
@@ -18,3 +19,11 @@ export const prisma =
   });
 
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+
+export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
+  return {
+    prFixQueueItem: client.prFixQueueItem,
+    prFixHistory: client.prFixHistory,
+    $transaction: (fn) => client.$transaction(fn as any) as any,
+  };
+}
