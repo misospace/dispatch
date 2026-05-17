@@ -34,7 +34,7 @@ export type FeedbackClassification = "actionable" | "needs_human";
 
 // ─── Default config (no hardcoded agent names or repo names) ────────────────
 
-const DEFAULT_BOT_IDENTITIES: BotIdentity[] = ["itsmiso-ai", "github-actions[bot]"];
+const DEFAULT_BOT_IDENTITIES: BotIdentity[] = ["github-actions[bot]"];
 
 function getConfig(): PrFollowupConfig {
   const rawIdentities = process.env.PR_FOLLOWUP_BOT_IDENTITIES;
