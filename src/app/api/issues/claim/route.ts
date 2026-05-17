@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
-import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
+import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
@@ -28,8 +28,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing required fields: issueId, repoFullName, issueNumber, agentName" }, { status: 400 });
     }
 
-    const agentLabel = `${AGENT_PREFIX}${agentName}` as const;
-
     // Fetch the issue from the local database to check its state and current labels
     const issue = await prisma.issue.findUnique({
       where: { id: issueId as string },
@@ -51,30 +49,30 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Cannot claim a done issue" }, { status: 400 });
     }
 
-    // Check if already assigned to another agent
-    const currentAgent = getAgentFromLabels(issue.labels);
-    if (currentAgent && currentAgent !== agentLabel) {
+    // Analyze assignment conflicts using the shared conflict resolution module
+    const analysis = analyzeAssignmentConflict(issue.labels);
+
+    // Check for agent conflict — if another agent is assigned, require force-claim
+    if (analysis.hasAgentConflict) {
       if (force === true) {
         // Force claim: remove the old agent label first
         try {
-          await removeIssueLabel(repoFullName as string, issueNumber as number, currentAgent);
+          await removeIssueLabel(repoFullName as string, issueNumber as number, analysis.existingAgents[0]);
         } catch (e) {
-          console.error(`Failed to remove stale agent label ${currentAgent} during force claim:`, e);
+          console.error(`Failed to remove stale agent label ${analysis.existingAgents[0]} during force claim:`, e);
           // Non-fatal: continue with force claim even if label removal fails
         }
       } else {
         return NextResponse.json(
-          { error: `Issue is already assigned to ${currentAgent.replace(AGENT_PREFIX, "")}. Use force=true to override.` },
+          { error: `Issue is already assigned to ${analysis.existingAgents[0].replace("agent/", "")}. Use force=true to override.` },
           { status: 409 },
         );
       }
     }
 
-    // Build updated labels list
-    const updatedLabels = [...issue.labels];
-    if (!updatedLabels.includes(agentLabel)) {
-      updatedLabels.push(agentLabel);
-    }
+    // Build updated labels using the shared conflict resolution module
+    const agentLabel = `agent/${agentName}`;
+    const updatedLabels = buildNewLabels(issue.labels, "assign_agent", agentLabel);
 
     // Optionally move to in-progress
     if (force !== false && !currentStatus) {
@@ -99,7 +97,23 @@ export async function POST(request: Request) {
         data: { labels: updatedLabels, lastSyncedAt: new Date() },
       });
 
-      // Write audit log
+      // Write audit log with conflict analysis details
+      const auditNotesParts: string[] = [];
+      if (analysis.hasAgentConflict || analysis.hasOwnerConflict) {
+        auditNotesParts.push(
+          `conflict: agent=${analysis.hasAgentConflict}, owner=${analysis.hasOwnerConflict}`,
+        );
+        if (analysis.existingAgents.length > 0) {
+          auditNotesParts.push(`existingAgents=[${analysis.existingAgents.join(", ")}]`);
+        }
+        if (analysis.existingOwners.length > 0) {
+          auditNotesParts.push(`existingOwners=[${analysis.existingOwners.join(", ")}]`);
+        }
+      }
+      if (force === true && analysis.hasAgentConflict) {
+        auditNotesParts.push("force_claim=true");
+      }
+
       await prisma.auditLog.create({
         data: {
           actor: agentName,
@@ -110,6 +124,7 @@ export async function POST(request: Request) {
           beforeLabels: issue.labels,
           afterLabels: updatedLabels,
           success: true,
+          notes: auditNotesParts.length > 0 ? auditNotesParts.join(" | ") : undefined,
         },
       });
 

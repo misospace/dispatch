@@ -173,3 +173,101 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
   });
 });
+
+describe("POST /api/issues/claim — owner label handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("preserves owner labels when claiming an issue with owner/*", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice", "status/in-progress"] });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.labels).toContain("agent/test-agent");
+    expect(body.labels).toContain("owner/alice");
+    expect(body.labels).toContain("status/in-progress");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+  });
+
+  it("allows claim when only owner label exists (no agent conflict)", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/bob", "priority/p1"] });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.labels).toContain("agent/test-agent");
+    expect(body.labels).toContain("owner/bob");
+  });
+
+  it("handles both agent and owner conflicts — refuses without force", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "owner/alice"] });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("already assigned to other-agent");
+  });
+
+  it("force claims when both agent and owner labels exist", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "owner/alice", "priority/p2"] });
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.labels).toContain("agent/test-agent");
+    expect(body.labels).toContain("owner/alice");
+    expect(body.labels).toContain("priority/p2");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/other-agent");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+  });
+});
+
+describe("POST /api/issues/claim — audit trail with conflict analysis", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("includes conflict details in audit log when agent conflict exists and force is used", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    await POST(makeRequest({ force: true }));
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: true,
+        notes: expect.stringContaining("conflict:"),
+      }),
+    });
+  });
+
+  it("includes owner conflict details in audit log when owner labels exist", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice"] });
+    await POST(makeRequest());
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: true,
+        notes: expect.stringContaining("conflict:"),
+      }),
+    });
+  });
+
+  it("no conflict notes when no existing assignments", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/backlog"] });
+    await POST(makeRequest());
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: true,
+        notes: undefined,
+      }),
+    });
+  });
+});
