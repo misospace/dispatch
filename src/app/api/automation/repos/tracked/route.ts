@@ -1,0 +1,58 @@
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { jsonSafe } from "@/lib/json";
+
+/**
+ * GET /api/automation/repos/tracked
+ *
+ * Returns the list of tracked repositories that are currently enabled,
+ * suitable for automation and audit consumers.
+ *
+ * Response shape:
+ *   { fullName, owner, name, enabled, source?, lastSyncedAt? }
+ *
+ * - `source` comes from the linked AutomationRepo row (e.g. "user", "env").
+ * - `lastSyncedAt` is only present when an AutomationRepo row exists.
+ */
+export async function GET(_request: Request) {
+  try {
+    const repos = await prisma.repository.findMany({
+      where: { enabled: true },
+      orderBy: { fullName: "asc" },
+    });
+
+    // Automations created both a Repository and an AutomationRepo row;
+    // join on fullName to surface source metadata.
+    const automationRepos = await prisma.automationRepo.findMany({
+      select: {
+        fullName: true,
+        source: true,
+        lastSyncedAt: true,
+      },
+    });
+
+    const automationMap = new Map(
+      automationRepos.map((ar) => [ar.fullName, ar]),
+    );
+
+    const result = repos.map((repo) => {
+      const automation = automationMap.get(repo.fullName);
+      return {
+        fullName: repo.fullName,
+        owner: repo.owner,
+        name: repo.name,
+        enabled: repo.enabled,
+        source: automation?.source ?? "unknown",
+        lastSyncedAt: automation?.lastSyncedAt ?? null,
+      };
+    });
+
+    return NextResponse.json(jsonSafe(result));
+  } catch (error) {
+    console.error("Failed to fetch tracked repos:", error);
+    return NextResponse.json(
+      { error: "Failed to fetch tracked repositories" },
+      { status: 500 },
+    );
+  }
+}
