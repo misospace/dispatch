@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 
@@ -21,10 +22,10 @@ import { processPrFollowupEvents, PrFollowupEvent } from "@/lib/pr-followup-inge
 function verifyWebhookSignature(secret: string, payload: Buffer, signature: string): boolean {
   if (!signature.startsWith("sha256=")) return false;
   const expected = signature.slice(9);
-  const hmac = crypto.createHmac("sha256", secret);
+  const hmac = createHmac("sha256", secret);
   hmac.update(payload);
   const computed = hmac.digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(expected));
+  return timingSafeEqual(Buffer.from(computed), Buffer.from(expected));
 }
 
 function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): PrFollowupEvent[] {
