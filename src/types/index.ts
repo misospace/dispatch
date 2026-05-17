@@ -181,3 +181,32 @@ export const ESCALATED_OUTCOME_LABELS: Record<EscalatedOutcome, string> = {
   DECOMPOSED_SKIPPED: "Decomposed/skipped",
   STUCK: "Stuck",
 };
+
+// ─── PR Review-Fix Queue Constants and Helpers ───────────────────────────────
+
+export type PrFixLane = "NORMAL" | "ESCALATED" | "NEEDS_HUMAN";
+export type PrFixStatus = "QUEUED" | "FIXED" | "BLOCKED" | "STALE" | "IGNORED";
+
+export const VALID_PR_FIX_LANES: PrFixLane[] = ["NORMAL", "ESCALATED", "NEEDS_HUMAN"];
+export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED", "STALE", "IGNORED"];
+
+export function isValidPrFixLane(lane: string): lane is PrFixLane {
+  return VALID_PR_FIX_LANES.includes(lane as PrFixLane);
+}
+
+export function isValidPrFixStatus(status: string): status is PrFixStatus {
+  return VALID_PR_FIX_STATUSES.includes(status as PrFixStatus);
+}
+
+export function normalizePrFixLane(lane?: string | null): PrFixLane {
+  if (!lane) return "NORMAL";
+  const normalized = lane.trim().toUpperCase().replace(/-/g, "_");
+  if (normalized === "GPT") return "ESCALATED";
+  if (normalized === "NEEDS_HUMAN" || normalized === "NEEDS-HUMAN") return "NEEDS_HUMAN";
+  return isValidPrFixLane(normalized) ? normalized : "NEEDS_HUMAN";
+}
+
+export function normalizePrFixStatus(status: string): PrFixStatus | null {
+  const normalized = status.trim().toUpperCase();
+  return isValidPrFixStatus(normalized) ? normalized : null;
+}
