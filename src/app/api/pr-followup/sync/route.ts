@@ -168,7 +168,7 @@ export async function POST() {
           const checksData: any = await fetchWithGithub(checksUrl, token);
 
           for (const checkRun of (checksData.check_runs ?? [])) {
-            if (["failure", "cancelled", "timed_out"].includes(checkRun.conclusion ?? "")) {
+            if (["failure", "cancelled", "timed_out", "action_required"].includes(checkRun.conclusion ?? "")) {
               allEvents.push({
                 eventType: "check_run" as const,
                 repoFullName,
