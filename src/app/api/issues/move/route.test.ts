@@ -11,6 +11,9 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
+const mockToken = "test-agent-token";
+process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+
 // Mock dependencies — return the mock functions directly
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -44,15 +47,48 @@ function makePayload(overrides = {}) {
   };
 }
 
-function postRequest(payload = makePayload()) {
+function postRequest(payload = makePayload(), extraHeaders = {}) {
   return POST(
     new Request("http://localhost/api/issues/move", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
       body: JSON.stringify(payload),
     })
   );
 }
+
+describe("POST /api/issues/move — auth", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findIssue.mockResolvedValue(null);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when token is incorrect", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+});
 
 describe("POST /api/issues/move — validation", () => {
   beforeEach(() => {
@@ -198,7 +234,7 @@ describe("POST /api/issues/move — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/move", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: "not-json",
       })
     );

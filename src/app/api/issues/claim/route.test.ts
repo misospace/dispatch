@@ -86,13 +86,14 @@ describe("POST /api/issues/claim — business logic", () => {
     mocks.removeIssueLabel.mockResolvedValue(undefined);
   });
 
-  it("adds agent label and moves to in-progress for a fresh claim", async () => {
+  it("adds agent label without changing status for a fresh claim", async () => {
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+    // Claim does not add status/in-progress — status transitions are explicit via /api/issues/status
+    expect(mocks.addIssueLabel).not.toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: true, actor: "test-agent" }) });
   });
 
@@ -118,7 +119,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("force claims by removing old agent label when force=true", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "status/in-progress"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -129,7 +130,7 @@ describe("POST /api/issues/claim — business logic", () => {
 
   it("logs error when force claim label removal fails but continues", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockReturnValue();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "status/in-progress"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
     mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
@@ -152,23 +153,26 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false, errorMessage: "github 500" }) });
   });
 
-  it("does not add status/in-progress if already has a status label", async () => {
+  it("adds only agent label regardless of existing status", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review"] });
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
+    // Claim only adds agent label, never status labels
     expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
   });
 
-  it("updates local cache with new labels after claim", async () => {
+  it("updates local cache with agent label after claim", async () => {
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
-    expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: "issue-1" }, data: expect.objectContaining({ labels: expect.arrayContaining(["agent/test-agent", "status/in-progress"]) }) });
+    expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: "issue-1" }, data: expect.objectContaining({ labels: expect.arrayContaining(["agent/test-agent"]) }) });
   });
 
-  it("does not add status/in-progress when force=false", async () => {
+  it("adds only agent label regardless of force when no status exists", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
     const res = await POST(makeRequest({ force: false }));
     expect(res.status).toBe(200);
+    // Claim always adds only agent label, never status labels
     expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
   });
@@ -184,14 +188,13 @@ describe("POST /api/issues/claim — owner label handling", () => {
   });
 
   it("preserves owner labels when claiming an issue with owner/*", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice", "status/in-progress"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice"] });
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
     expect(body.labels).toContain("agent/test-agent");
     expect(body.labels).toContain("owner/alice");
-    expect(body.labels).toContain("status/in-progress");
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
   });
 
