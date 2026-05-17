@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { getTrackedRepos } from "@/lib/config";
 import { processPrFollowupEvents, isAllowedBotAuthor } from "@/lib/pr-followup-ingestion";
 
@@ -168,7 +168,7 @@ export async function POST() {
           const checksData: any = await fetchWithGithub(checksUrl, token);
 
           for (const checkRun of (checksData.check_runs ?? [])) {
-            if (["failure", "cancelled", "timed_out"].includes(checkRun.conclusion ?? "")) {
+            if (["failure", "cancelled", "timed_out", "action_required"].includes(checkRun.conclusion ?? "")) {
               allEvents.push({
                 eventType: "check_run" as const,
                 repoFullName,
@@ -210,7 +210,7 @@ export async function POST() {
     // Process all collected events through the ingestion pipeline
     let result = { enqueued: 0, skipped: 0 };
     if (allEvents.length > 0) {
-      result = await processPrFollowupEvents(prisma, allEvents);
+      result = await processPrFollowupEvents(asPrFixQueueClient(prisma), allEvents);
     }
 
     return NextResponse.json({

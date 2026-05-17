@@ -51,6 +51,60 @@ model Issue {
   @@index([labels])
 }
 
+enum PrFixLane {
+  NORMAL
+  ESCALATED
+  NEEDS_HUMAN
+}
+
+enum PrFixStatus {
+  QUEUED
+  FIXED
+  BLOCKED
+  STALE
+  IGNORED
+}
+
+model PrFixQueueItem {
+  id           String         @id @default(cuid())
+  repo         String
+  pr           Int
+  issue        Int?
+  branch       String?
+  lane         PrFixLane      @default(NORMAL)
+  reason       String         @db.Text
+  feedback     String[]       @default([])
+  evidenceKeys String[]       @default([])
+  status       PrFixStatus    @default(QUEUED)
+  queuedAt     DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  url          String?
+  title        String?
+  headSha      String?
+  author       String?
+  history      PrFixHistory[]
+
+  @@unique([repo, pr])
+  @@index([status])
+  @@index([lane])
+  @@index([status, lane])
+}
+
+model PrFixHistory {
+  id          String         @id @default(cuid())
+  itemId      String
+  item        PrFixQueueItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  at          DateTime       @default(now())
+  action      String
+  status      String?
+  reason      String?        @db.Text
+  note        String?        @db.Text
+  evidenceKey String?
+
+  @@index([itemId])
+  @@index([at])
+}
+
 model AgentRun {
   id               String    @id @default(cuid())
   agentName        String
@@ -304,57 +358,4 @@ model AutomationSyncRun {
 
   @@index([repoId])
   @@index([startedAt])
-}
-
-// ─── PR Fix Queue Models ──────────────────────────────────────────────────────
-
-enum PrFixLane {
-  NORMAL
-  NEEDS_HUMAN
-  ESCALATED
-}
-
-enum PrFixStatus {
-  QUEUED
-  IN_PROGRESS
-  FIXED
-  BLOCKED
-  STALE
-  CANCELLED
-}
-
-model PrFixQueueItem {
-  id           String         @id @default(cuid())
-  repo         String
-  pr           Int
-  issue        Int?
-  branch       String?
-  lane         PrFixLane      @default(NORMAL)
-  reason       String         @db.Text
-  feedback     String[]       @default([])
-  evidenceKeys String[]       @default([])
-  status       PrFixStatus    @default(QUEUED)
-  queuedAt     DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
-  url          String?
-  title        String?
-  headSha      String?
-  author       String?
-  history      PrFixHistory[]
-
-  @@unique([repo, pr])
-  @@index([status])
-  @@index([lane])
-}
-
-model PrFixHistory {
-  id            String     @id @default(cuid())
-  itemId        String
-  item          PrFixQueueItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  action        String
-  actor         String?
-  details       String?    @db.Text
-  createdAt     DateTime   @default(now())
-
-  @@index([itemId])
 }
