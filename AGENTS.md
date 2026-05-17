@@ -204,3 +204,7 @@ At the **end** of each heartbeat:
 ### Worker execution contract
 
 For the detailed worker execution contract (PR fix queue precedence, duplicate PR avoidance, hard completion gates, branch naming conventions, failure response format), see [docs/worker-execution-contract.md](./docs/worker-execution-contract.md). This supersedes ad-hoc behavior and applies to all agent workers.
+
+### Worker cron prompt migration
+
+Worker cron prompts have been migrated from GitHub Project board readers to Mission Control queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](./docs/worker-cron-prompt-migration.md).
