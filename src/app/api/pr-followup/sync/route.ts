@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getTrackedRepos, parseAgentList } from "@/lib/config";
-import { processPrFollowupEvents, PrFollowupEvent, isAllowedBotAuthor } from "@/lib/pr-followup-ingestion";
+import { getTrackedRepos } from "@/lib/config";
+import { processPrFollowupEvents, isAllowedBotAuthor } from "@/lib/pr-followup-ingestion";
 
 /**
  * PR Follow-up Sync Endpoint (Pull-based)
@@ -17,6 +17,7 @@ import { processPrFollowupEvents, PrFollowupEvent, isAllowedBotAuthor } from "@/
  */
 
 interface GithubPR {
+  id: number;
   number: number;
   url: string;
   title: string;
@@ -86,15 +87,10 @@ export async function POST() {
       return NextResponse.json({ message: "No tracked repos configured", enqueued: 0, skipped: 0 });
     }
 
-    // Get bot identities from config
-    const rawIdentities = process.env.PR_FOLLOWUP_BOT_IDENTITIES;
-    const botIdentities = rawIdentities
-      ? rawIdentities.split(",").map((s) => s.trim()).filter(Boolean)
-      : ["itsmiso-ai", "github-actions[bot]"];
-
     let totalEnqueued = 0;
     let totalSkipped = 0;
     let prsScanned = 0;
+    const allEvents: any[] = [];
 
     for (const repoFullName of repoFullNames) {
       const [owner, repo] = repoFullName.split("/");
@@ -114,7 +110,7 @@ export async function POST() {
       prsScanned += botPrs.length;
 
       for (const pr of botPrs) {
-        // Fetch comments on this PR
+        // Fetch comments on this PR and collect events
         try {
           const commentsUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`;
           const comments: GithubComment[] = await fetchWithGithub(commentsUrl, token);
@@ -123,20 +119,41 @@ export async function POST() {
             // Ignore self-comments from the same bot identity
             if (comment.user.login === pr.user.login) continue;
 
-            totalEnqueued++; // Will be deduped by ingestion logic
+            allEvents.push({
+              eventType: "comment" as const,
+              repoFullName,
+              prNumber: pr.number,
+              branch: pr.head.ref ?? null,
+              url: pr.url,
+              title: pr.title,
+              author: pr.user.login,
+              body: comment.body,
+              id: String(comment.id),
+            });
           }
         } catch {
           // Best effort — don't fail on a single repo
         }
 
-        // Fetch reviews on this PR
+        // Fetch reviews on this PR and collect events
         try {
           const reviewsUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/pulls/${pr.number}/reviews?per_page=100`;
           const reviews: GithubReview[] = await fetchWithGithub(reviewsUrl, token);
 
           for (const review of reviews) {
             if (review.state === "CHANGES_REQUESTED") {
-              totalEnqueued++; // Will be deduped by ingestion logic
+              allEvents.push({
+                eventType: "review" as const,
+                repoFullName,
+                prNumber: pr.number,
+                branch: pr.head.ref ?? null,
+                url: pr.url,
+                title: pr.title,
+                author: pr.user.login,
+                body: review.body,
+                id: String(review.id),
+                state: review.state,
+              });
             } else {
               totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
             }
@@ -145,14 +162,26 @@ export async function POST() {
           // Best effort
         }
 
-        // Fetch failing check runs for this PR's branch
+        // Fetch failing check runs for this PR's branch and collect events
         try {
           const checksUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=end&per_page=100`;
           const checksData: any = await fetchWithGithub(checksUrl, token);
 
           for (const checkRun of (checksData.check_runs ?? [])) {
             if (["failure", "cancelled", "timed_out"].includes(checkRun.conclusion ?? "")) {
-              totalEnqueued++; // Will be deduped by ingestion logic
+              allEvents.push({
+                eventType: "check_run" as const,
+                repoFullName,
+                prNumber: pr.number,
+                branch: pr.head.ref ?? null,
+                url: checkRun.html_url,
+                title: checkRun.name,
+                author: pr.user.login,
+                body: checkRun.output?.summary ?? "",
+                id: String(checkRun.id),
+                conclusion: checkRun.conclusion,
+                checkName: checkRun.name,
+              });
             } else {
               totalSkipped++;
             }
@@ -163,17 +192,33 @@ export async function POST() {
 
         // Track merge state
         if (pr.mergeable_state && pr.mergeable_state !== "clean") {
-          totalEnqueued++; // Will be deduped by ingestion logic
+          allEvents.push({
+            eventType: "merge_state" as const,
+            repoFullName,
+            prNumber: pr.number,
+            branch: pr.head.ref ?? null,
+            url: pr.url,
+            title: pr.title,
+            author: pr.user.login,
+            mergeStateStatus: pr.mergeable_state,
+            id: String(pr.id ?? Date.now()),
+          });
         }
       }
+    }
+
+    // Process all collected events through the ingestion pipeline
+    let result = { enqueued: 0, skipped: 0 };
+    if (allEvents.length > 0) {
+      result = await processPrFollowupEvents(prisma, allEvents);
     }
 
     return NextResponse.json({
       message: "PR follow-up sync complete",
       reposScanned: repoFullNames.length,
       prsScanned,
-      enqueued: totalEnqueued,
-      skipped: totalSkipped,
+      enqueued: result.enqueued,
+      skipped: totalSkipped + result.skipped,
     });
   } catch (error) {
     console.error("PR follow-up sync failed:", error);

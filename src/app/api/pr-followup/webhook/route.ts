@@ -99,7 +99,7 @@ export async function POST(request: Request) {
         if (!check) break;
 
         // Try to find the PR number from check details
-        let prNumber: number | null = null;
+        let prNumber: number | undefined = undefined;
         const issueUrls = check.pull_requests ?? [];
         if (Array.isArray(issueUrls) && issueUrls.length > 0) {
           const firstUrl = issueUrls[0]?.url as string | undefined;
@@ -112,7 +112,7 @@ export async function POST(request: Request) {
         events.push({
           eventType: "check_run",
           repoFullName: checkRun.repository?.full_name ?? null,
-          prNumber: prNumber ?? null,
+          prNumber: prNumber ?? 0,
           branch: check.head_branch ?? null,
           url: check.html_url,
           title: check.name,
@@ -126,18 +126,19 @@ export async function POST(request: Request) {
       }
 
       case "pull_request": {
-        const pr = body.pull_request;
+        const pr = body.pull_request as Record<string, any> | undefined;
         if (!pr) break;
 
         events.push({
           eventType: "merge_state",
           repoFullName: pr.base?.repo?.full_name ?? null,
-          prNumber: pr.number,
+          prNumber: pr.number ?? 0,
           branch: pr.head?.ref ?? null,
           url: pr.html_url,
           title: pr.title,
           author: pr.user?.login ?? null,
           mergeStateStatus: pr.mergeable_state,
+          id: String(pr.id ?? Date.now()),
         });
         break;
       }
