@@ -59,7 +59,7 @@ Mission Control classifies issues into three execution lanes:
 - **ESCALATED**: Requires higher-judgment model support (may be GPT-5.5, Claude Opus, GLM-5.1, or another provider). Examples: architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, audit parent decomposition.
 - **BACKLOG**: Not actionable yet — placeholder, missing enough detail, or a parent/umbrella item that hasn't been decomposed into concrete work.
 
-Each classification stores: `lane`, `confidence` (0.0–1.0), `reason`, and `model/source`. A full history of classifications is maintained in the `IssueLaneEntry` table.
+Each classification stores: `lane`, `confidence` (`high`/`medium`/`low`), `reason`, and `model/source`. A full history of classifications is maintained in the `IssueLane` table.
 
 **Routing rules:**
 - Do NOT route to ESCALATED only because labels include `needs-escalation`, legacy `needs-gpt`, `escalated`, or `priority/p1`.

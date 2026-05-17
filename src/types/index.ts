@@ -1,5 +1,3 @@
-import { Prisma } from "@prisma/client";
-
 export interface GitHubIssue {
   number: number;
   title: string;
@@ -36,14 +34,10 @@ export interface Issue {
   createdAt: Date;
   updatedAt: Date;
   closedAt: Date | null;
+  currentLane?: string | null;
   repository: {
     fullName: string;
   };
-  lane?: string;
-  laneConfidence?: number | Prisma.Decimal | null;
-  laneReason?: string | null;
-  laneModel?: string | null;
-  laneJudgedAt?: Date | null;
 
   // Escalated lane outcome tracking
   decomposed?: boolean;
@@ -58,6 +52,16 @@ export interface IssueLaneClassification {
   confidence: number | null;
   reason: string;
   model: string;
+}
+
+export interface StoredIssueLane {
+  id: string;
+  issueId: string;
+  lane: string;
+  confidence: string;
+  reason: string | null;
+  model: string | null;
+  judgedAt: Date;
 }
 
 export interface AgentRun {
@@ -92,13 +96,19 @@ export type OwnerLabel = `owner/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
-export type IssueLane = "NORMAL" | "ESCALATED" | "BACKLOG";
 
 export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/in-progress", "status/in-review", "status/done"];
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
 export const PROJECT_PREFIX = "project/";
 export const AGENT_PREFIX = "agent/";
 export const OWNER_PREFIX = "owner/";
+
+// Lane classification types and constants
+export type IssueLaneValue = "normal" | "escalated" | "backlog";
+export type ConfidenceValue = "high" | "medium" | "low";
+
+export const VALID_LANES: IssueLaneValue[] = ["normal", "escalated", "backlog"];
+export const VALID_CONFIDENCE: ConfidenceValue[] = ["high", "medium", "low"];
 
 export function isAgentLabel(label: string): label is AgentLabel {
   return label.startsWith(AGENT_PREFIX);
@@ -139,21 +149,20 @@ export const LABEL_COLORS: Record<string, string> = {
   "priority/p2": "eab308",
   "priority/p3": "22c55e",
 };
+// Lane classification constants and helpers (uppercase, for API/Prisma compatibility)
+export const VALID_LANES_UPPER: string[] = ["NORMAL", "ESCALATED", "BACKLOG"];
 
-// Lane classification constants and helpers
-export const VALID_LANES: IssueLane[] = ["NORMAL", "ESCALATED", "BACKLOG"];
-
-export function isValidLane(lane: string): lane is IssueLane {
-  return VALID_LANES.includes(lane as IssueLane);
+export function isValidLane(lane: string): lane is IssueLaneValue {
+  return [...VALID_LANES, ...VALID_LANES_UPPER].includes(lane as IssueLaneValue);
 }
 
-export const LANE_LABELS: Record<IssueLane, string> = {
+export const LANE_LABELS: Record<string, string> = {
   NORMAL: "normal",
   ESCALATED: "escalated",
   BACKLOG: "backlog",
 };
 
-export const LANE_COLORS: Record<IssueLane, string> = {
+export const LANE_COLORS: Record<string, string> = {
   NORMAL: "22c55e",
   ESCALATED: "a855f7",
   BACKLOG: "6b7280",

@@ -34,14 +34,10 @@ model Issue {
   updatedAt     DateTime
   closedAt      DateTime?
   lastSyncedAt  DateTime   @default(now())
+  currentLane   String?    @default("normal")
   agentRuns     AgentRun[]
   auditLogs     AuditLog[]
-  lane          IssueLane  @default(NORMAL)
-  laneConfidence Decimal?  @db.Decimal(3,2)
-  laneReason    String?    @db.Text
-  laneModel     String?
-  laneJudgedAt  DateTime?
-  laneHistory   IssueLaneEntry[]
+  laneHistory   IssueLane[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -53,28 +49,6 @@ model Issue {
   @@unique([repositoryId, number])
   @@index([state])
   @@index([labels])
-  @@index([lane])
-}
-
-model IssueLaneEntry {
-  id         String    @id @default(cuid())
-  issueId    String
-  issue      Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
-  lane       IssueLane
-  confidence Decimal?  @db.Decimal(3,2)
-  reason     String?   @db.Text
-  model      String?
-  judgedAt   DateTime  @default(now())
-  createdAt  DateTime  @default(now())
-
-  @@index([issueId])
-  @@index([judgedAt])
-}
-
-enum IssueLane {
-  NORMAL
-  ESCALATED
-  BACKLOG
 }
 
 model AgentRun {
@@ -128,6 +102,20 @@ model AuditLog {
   @@index([repoFullName])
   @@index([issueId])
   @@index([createdAt])
+}
+
+model IssueLane {
+  id         String   @id @default(cuid())
+  issueId    String
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  lane       String
+  confidence String
+  reason     String?  @db.Text
+  model      String?
+  judgedAt   DateTime @default(now())
+
+  @@index([issueId])
+  @@index([lane])
 }
 
 model AutomationRepo {
