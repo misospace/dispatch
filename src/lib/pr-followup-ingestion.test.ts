@@ -128,18 +128,18 @@ describe("isAllowedBotAuthor", () => {
 describe("isAllowedBranchOwner", () => {
   it("allows repo owner when allowlist includes owner", () => {
     process.env.PR_FOLLOWUP_BRANCH_OWNERS = "misospace";
-    expect(isAllowedBranchOwner("misospace/mission-control", "fix/a")).toBe(true);
+    expect(isAllowedBranchOwner("misospace/mission-control")).toBe(true);
   });
 
   it("rejects unknown owners when allowlist is configured", () => {
     process.env.PR_FOLLOWUP_BRANCH_OWNERS = "misospace";
-    expect(isAllowedBranchOwner("other-org/repo", "fix/a")).toBe(false);
+    expect(isAllowedBranchOwner("other-org/repo")).toBe(false);
   });
 
   it("allows any owner when no allowlist is configured (opt-in safety)", () => {
     delete process.env.PR_FOLLOWUP_BRANCH_OWNERS;
     // Without an explicit allowlist, the default behavior allows repo owners
-    expect(isAllowedBranchOwner("some-org/repo", "fix/a")).toBe(true);
+    expect(isAllowedBranchOwner("some-org/repo")).toBe(true);
   });
 
   afterEach(() => {
@@ -500,7 +500,7 @@ describe("no hardcoded agent or repo names", () => {
 
   it("uses configurable branch owners, not hardcoded repo names", async () => {
     process.env.PR_FOLLOWUP_BRANCH_OWNERS = "any-owner";
-    expect(isAllowedBranchOwner("any-owner/repo", "fix/a")).toBe(true);
+    expect(isAllowedBranchOwner("any-owner/repo")).toBe(true);
     // Should not be tied to misospace specifically
   });
 

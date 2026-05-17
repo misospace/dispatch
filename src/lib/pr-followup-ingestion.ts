@@ -62,21 +62,16 @@ export function isAllowedBotAuthor(author: string | null | undefined): boolean {
 }
 
 /**
- * Check if the branch owner is in the allowlist.
+ * Check if the repo owner is in the allowlist.
  * If no allowlist is configured, all owners are allowed (opt-in safety).
- * If an allowlist is configured, the repo owner or listed user logins are allowed.
  */
-export function isAllowedBranchOwner(
-  repoFullName: string,
-  branch: string | null | undefined,
-): boolean {
+export function isAllowedBranchOwner(repoFullName: string): boolean {
   const config = getConfig();
   if (config.branchOwnerAllowlist.length === 0) {
     // No explicit allowlist — default to repo owner only (safe default).
     const [owner] = repoFullName.split("/");
     return Boolean(owner);
   }
-  // Allowlisted: repo owner is always allowed, plus specific user logins.
   const [owner] = repoFullName.split("/");
   return config.branchOwnerAllowlist.includes(owner);
 }
@@ -194,8 +189,8 @@ export async function ingestCommentEvent(
   // Check author eligibility
   if (!isAllowedBotAuthor(opts.author)) return null;
 
-  // Check branch owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName, opts.branch)) return null;
+  // Check repo owner eligibility
+  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
 
   // Classify feedback
   const classification = classifyFeedback(opts.commentBody);
@@ -244,8 +239,8 @@ export async function ingestReviewEvent(
   // Check author eligibility
   if (!isAllowedBotAuthor(opts.author)) return null;
 
-  // Check branch owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName, opts.branch)) return null;
+  // Check repo owner eligibility
+  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
 
   const classification = classifyFeedback(opts.reviewBody);
   const lane = classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
@@ -295,8 +290,8 @@ export async function ingestCheckRunEvent(
   // Check author eligibility
   if (!isAllowedBotAuthor(opts.author)) return null;
 
-  // Check branch owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName, opts.branch)) return null;
+  // Check repo owner eligibility
+  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
 
   const classification = classifyFeedback(opts.checkDetails ?? `Check "${opts.checkName}" ${opts.conclusion}`);
   const lane = classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
@@ -343,8 +338,8 @@ export async function ingestMergeStateEvent(
   // Check author eligibility
   if (!isAllowedBotAuthor(opts.author)) return null;
 
-  // Check branch owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName, opts.branch)) return null;
+  // Check repo owner eligibility
+  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
 
   const evidenceKey = computeEvidenceKey("merge_state", opts.mergeStateStatus, opts.repoFullName, opts.prNumber);
 
