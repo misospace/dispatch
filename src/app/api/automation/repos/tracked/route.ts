@@ -14,7 +14,7 @@ import { jsonSafe } from "@/lib/json";
  * - `source` comes from the linked AutomationRepo row (e.g. "user", "env").
  * - `lastSyncedAt` is only present when an AutomationRepo row exists.
  */
-export async function GET() {
+export async function GET(_request: Request) {
   try {
     const repos = await prisma.repository.findMany({
       where: { enabled: true },
