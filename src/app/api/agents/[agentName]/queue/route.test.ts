@@ -46,12 +46,14 @@ describe("GET /api/agents/[agentName]/queue", () => {
     ]);
     mocks.issueFindMany.mockResolvedValue([
       {
+        id: "issue-abc",
         number: 99,
         title: "Regular issue",
         url: "https://github.com/org/repo/issues/99",
         labels: ["priority/p0", "status/backlog"],
         currentLane: "normal",
         decomposed: false,
+        repository: { fullName: "org/repo" },
       },
     ]);
 
@@ -64,5 +66,95 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(body[0]).toMatchObject({ type: "pr-review-fix", repo: "org/repo", pr: 12 });
     expect(body[1]).toMatchObject({ number: 99, title: "Regular issue" });
     expect(mocks.prFixFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ status: "QUEUED", lane: "NORMAL" }) }));
+  });
+
+  it("returns issueId and repoFullName on issue items", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-def",
+        number: 50,
+        title: "Another issue",
+        url: "https://github.com/org/repo/issues/50",
+        labels: ["priority/p1"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0]).toHaveProperty("issueId", "issue-def");
+    expect(body[0]).toHaveProperty("repoFullName", "org/repo");
+  });
+
+  it("returns type: issue on issue items", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-ghi",
+        number: 51,
+        title: "Test issue",
+        url: "https://github.com/org/repo/issues/51",
+        labels: [],
+        currentLane: "escalated",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=escalated"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0]).toHaveProperty("type", "issue");
+  });
+
+  it("keeps PR-fix items first when both types are present", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-2",
+        repo: "org/repo",
+        pr: 20,
+        issue: 10,
+        branch: "fix/issue-10",
+        url: "https://github.com/org/repo/pull/20",
+        title: "Fix PR",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "review requested",
+        feedback: [],
+        evidenceKeys: [],
+        author: "bot",
+        queuedAt: new Date("2026-01-02T00:00:00Z"),
+        updatedAt: new Date("2026-01-02T00:00:00Z"),
+      },
+    ]);
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-jkl",
+        number: 5,
+        title: "Issue work",
+        url: "https://github.com/org/repo/issues/5",
+        labels: [],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].type).toBe("pr-review-fix");
+    expect(body[1].type).toBe("issue");
   });
 });

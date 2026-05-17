@@ -8,6 +8,11 @@ function isStatusLabel(label: string): label is StatusLabel {
 }
 
 export async function POST(request: Request) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     let body: unknown;
     try {
@@ -20,7 +25,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
 
-    const { issueId, repoFullName, issueNumber, oldLabels, newLabels } = body as Record<string, unknown>;
+    const { issueId, repoFullName, issueNumber, oldLabels, newLabels, actor: bodyActor } = body as Record<string, unknown>;
+    const moveActor = typeof bodyActor === "string" ? bodyActor : "agent";
 
     // Validate required fields with explicit type checks
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !oldLabels || !newLabels) {
@@ -67,7 +73,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: "user",
+          actor: moveActor,
           action: "move_issue",
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
@@ -84,7 +90,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: "user",
+          actor: moveActor,
           action: "move_issue",
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,

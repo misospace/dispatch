@@ -74,22 +74,9 @@ export async function POST(request: Request) {
     const agentLabel = `agent/${agentName}`;
     const updatedLabels = buildNewLabels(issue.labels, "assign_agent", agentLabel);
 
-    // Optionally move to in-progress
-    if (force !== false && !currentStatus) {
-      const inProgressLabel = "status/in-progress";
-      if (!updatedLabels.includes(inProgressLabel)) {
-        updatedLabels.push(inProgressLabel);
-      }
-    }
-
     try {
-      // Add labels on GitHub
+      // Add agent label on GitHub
       await addIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
-
-      // Optionally add status/in-progress label
-      if (force !== false && !currentStatus) {
-        await addIssueLabel(repoFullName as string, issueNumber as number, "status/in-progress");
-      }
 
       // Update local cache
       await prisma.issue.update({

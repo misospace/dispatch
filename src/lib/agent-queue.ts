@@ -12,6 +12,7 @@ const IN_PROGRESS_STATUS: string = "status/in-progress";
 const BACKLOG_STATUS: string = "status/backlog";
 
 export interface RankedIssue {
+  type?: "issue";
   number: number;
   title: string;
   url: string;
@@ -22,6 +23,8 @@ export interface RankedIssue {
   rankingReason: string;
   lane?: string;
   decomposed?: boolean;
+  issueId?: string;
+  repoFullName?: string;
 }
 
 /**
@@ -106,6 +109,8 @@ export function buildAgentQueue(
     url: string;
     lane?: string;
     decomposed?: boolean;
+    issueId?: string;
+    repoFullName?: string;
   }>,
   agentName: string,
   options?: {
@@ -149,6 +154,7 @@ export function buildAgentQueue(
     const status = getStatusFromLabels(item.labels);
 
     return {
+      type: "issue" as const,
       number: item.number,
       title: item.title,
       url: item.url,
@@ -159,6 +165,8 @@ export function buildAgentQueue(
       rankingReason: item.reason,
       lane: item.lane,
       decomposed: item.decomposed ?? false,
+      issueId: item.issueId,
+      repoFullName: item.repoFullName,
     };
   });
 }

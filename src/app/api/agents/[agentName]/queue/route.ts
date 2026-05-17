@@ -17,12 +17,14 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
         repository: { enabled: true },
       },
       select: {
+        id: true,
         number: true,
         title: true,
         url: true,
         labels: true,
         currentLane: true,
         decomposed: true,
+        repository: { select: { fullName: true } },
       },
     });
 
@@ -31,7 +33,12 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
 
     const prFixItems = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: prFixLane });
     const queue = buildAgentQueue(
-      issues.map((issue) => ({ ...issue, lane: issue.currentLane ?? undefined })),
+      issues.map((issue) => ({
+        ...issue,
+        lane: issue.currentLane ?? undefined,
+        issueId: issue.id,
+        repoFullName: issue.repository.fullName,
+      })),
       agentName,
       {
         lane: issueLane,
