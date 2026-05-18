@@ -24,8 +24,8 @@ Dispatch is a harness-agnostic Kanban and work dispatch layer for AI agents. It 
     - Agent runs
     - Audit logs
 3. **Dispatch does NOT**:
-   - Mount OpenClaw config files
-   - Require access to OpenClaw's local filesystem
+    - Mount agent harness configuration files
+    - Require access to an agent harness local workspace
    - Use GitHub Projects
    - Require cluster-admin or broad Kubernetes RBAC
    - Automatically close or complete tasks
@@ -86,7 +86,7 @@ To get started with Dispatch:
 1. **Configure repos**: Set `GITHUB_REPOSITORIES` env var (comma or newline separated) _or_ add tracked repos via the UI after boot. `GITHUB_REPOSITORIES` is a **one-time bootstrap seed** — it is read only when the tracked-repos table is empty. Once any repo exists (seeded or added via UI), the env var is not consulted again, so updates must go through the UI or canonical API (`POST /api/automation/repos`). Env-seeded repos are tagged `source: "env"` and shown with a `seed` badge in `/automation`; user-added repos are tagged `source: "user"`.
 2. **Deploy** with your database and GitHub token configured.
 3. **Sync automation data**: `POST /api/automation/sync` (or use the Sync button on the Automation page).
-4. **Sync issues**: `POST /api/sync` (or use the Sync Issues action in the board UI). OpenClaw agent heartbeats also trigger best-effort issue sync automatically.
+4. **Sync issues**: `POST /api/sync` (or use the Sync Issues action in the board UI). Agent harnesses or worker heartbeats may also trigger best-effort issue sync automatically.
 5. **View results**: The Kanban Board shows synced issues; the Projects view groups them by repository.
 
 Production database migrations (`prisma migrate deploy`) run automatically on container startup — no manual intervention needed.
@@ -256,7 +256,7 @@ Stop tracking a repository. `[repo]` is the URL-encoded `owner/repo` fullName. H
 Sync all issues from configured repositories. Intended callers are:
 
 - the board UI's manual **Sync Issues** action
-- openclaw agent heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
+- agent harness or worker heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
 
 ### GET /api/agent-runs
 List agent runs. Query params: `limit`
@@ -268,7 +268,7 @@ Create agent run. Requires `MISSION_CONTROL_AGENT_TOKEN` bearer auth.
 List audit logs. Query params: `limit`, `repo`
 
 **Note: Issue sync and automation sync are separate concerns.**
-- **Issue sync** (`POST /api/sync`) refreshes GitHub issues into the Kanban board. It is heartbeat-driven (best-effort via openclaw agent) or manual via UI.
+- **Issue sync** (`POST /api/sync`) refreshes GitHub issues into the Kanban board. It is heartbeat-driven (best-effort via agent harness) or manual via UI.
 - **Automation sync** (`POST /api/automation/sync`) refreshes CI/CD, workflow runs, releases, and packages data. It is managed independently on the Automation page.
 - Each sync operates on its own data models and caching layer.
 
@@ -349,7 +349,7 @@ For control actions (rerun, dispatch):
 
 ## Pre-migration Smoke Checklist
 
-Run this checklist before pointing an OpenClaw agent at Dispatch as its task-visibility layer (instead of a GitHub Project board). Every step should pass; stop and investigate on the first failure.
+Run this checklist before pointing an agent harness at Dispatch as its task-visibility layer (instead of a GitHub Project board). Every step should pass; stop and investigate on the first failure.
 
 Set `BASE` to your Dispatch URL (e.g. `BASE=https://dispatch.internal`) before running.
 
@@ -362,7 +362,7 @@ Set `BASE` to your Dispatch URL (e.g. `BASE=https://dispatch.internal`) before r
 | 5 | `curl -fsS "$BASE/api/issues"` | JSON array, length > 0 |
 | 6 | Open `/board` in a browser | Issues render — no "no issues synced yet" empty state |
 | 7 | Open `/projects` | Repo groups render |
-| 8 | Open `/agents` | Recent OpenClaw agent heartbeat visible with agent name |
+| 8 | Open `/agents` | Recent agent heartbeat visible with agent name |
 | 9 | Move a low-risk test issue between columns | GitHub label changes; AuditLog row appears in `GET /api/audit` |
 | 10 | `kubectl logs -n <ns> <pod>` (or equivalent) | No Prisma / BigInt / FK errors |
 
@@ -370,10 +370,10 @@ Only flip the agent's workflow over once all ten steps pass.
 
 ## Scheduled Issue Sync Strategy
 
-Dispatch keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **openclaw agent heartbeat sync** rather than by a Dispatch background worker or new cluster CronJob.
+Dispatch keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **agent harness heartbeat sync** rather than by a Dispatch background worker or new cluster CronJob.
 
 Decision:
-- At the start of each openclaw agent heartbeat, the agent should make a best-effort `POST` request to Dispatch's `/api/sync` endpoint.
+- At the start of each heartbeat, the agent harness should make a best-effort `POST` request to Dispatch's `/api/sync` endpoint.
 - The request must be non-blocking for heartbeat work: log/report a warning if the sync fails or times out, then continue the heartbeat.
 - Manual UI sync remains supported for immediate refreshes and troubleshooting.
 
@@ -387,7 +387,7 @@ Rejected alternatives for the first implementation:
 - **Dispatch internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
 
 Operational notes:
-- Configure the openclaw agent with `MISSION_CONTROL_URL` and any required network access to reach Dispatch.
+- Configure the agent harness with `MISSION_CONTROL_URL` and any required network access to reach Dispatch.
 - `/api/sync` currently does not require `MISSION_CONTROL_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
 - Treat sync failures as freshness warnings, not heartbeat failures, unless the heartbeat itself cannot complete.
 

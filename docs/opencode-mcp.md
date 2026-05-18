@@ -147,7 +147,7 @@ Natural language request:
 > Claim and work issue #103 in misospace/mission-control.
 
 OpenCode will:
-1. Call `claim_work` with `repoFullName: "misodev/mission-control"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
+1. Call `claim_work` with `repoFullName: "misospace/mission-control"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
 2. Receive the task contract with issue context
 3. Work on the issue following the contract
 
