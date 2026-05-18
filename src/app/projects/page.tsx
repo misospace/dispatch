@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 async function getProjects() {
   const issues = await prisma.issue.findMany({
     where: { repository: { enabled: true } },
-    include: { repository: true, labels: true },
+    include: { repository: true },
   });
 
   return {
