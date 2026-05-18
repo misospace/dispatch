@@ -1,6 +1,6 @@
 # Tracked Repos API — Automation & Audit Consumer Guide
 
-> **Issue:** [misospace/mission-control#69](https://github.com/misospace/mission-control/issues/69)
+> **Issue:** [misospace/dispatch#69](https://github.com/misospace/dispatch/issues/69)
 > **Date:** 2026-05-17
 
 ## Overview

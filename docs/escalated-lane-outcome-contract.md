@@ -1,6 +1,6 @@
 # Escalated-Lane Outcome Contract
 
-> **Issue:** [misospace/mission-control#66](https://github.com/misospace/mission-control/issues/66)
+> **Issue:** [misospace/dispatch#66](https://github.com/misospace/dispatch/issues/66)
 > **Date:** 2026-05-16
 
 This document defines the operational contract for escalated-lane outcomes and audit parent decomposition in Dispatch. It enables agents to report non-code outcomes (design comments, follow-up issues, decompositions) beyond simple PR creation.

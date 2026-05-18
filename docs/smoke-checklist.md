@@ -1,6 +1,6 @@
 # Assignment-Layer Runtime Smoke Checklist
 
-> **Issue:** [misospace/mission-control#60](https://github.com/misospace/mission-control/issues/60)
+> **Issue:** [misospace/dispatch#60](https://github.com/misospace/dispatch/issues/60)
 > **Date:** 2026-05-16
 > **Purpose:** Verify Dispatch is healthy before agents rely on it for assignment.
 

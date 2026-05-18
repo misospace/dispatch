@@ -1,6 +1,6 @@
 # Worker Execution Contract
 
-> **Issue:** [misospace/mission-control#65](https://github.com/misospace/mission-control/issues/65)
+> **Issue:** [misospace/dispatch#65](https://github.com/misospace/dispatch/issues/65)
 > **Date:** 2026-05-16
 
 This document defines the generic execution contract for any agent worker consuming work from Dispatch queues. It supersedes ad-hoc behavior and ensures consistency across all workers regardless of identity or repository.
