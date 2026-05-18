@@ -170,8 +170,6 @@ Workers receive their lane via the queue endpoint's `lane` query parameter:
 
 BACKLOG issues are excluded from the normal agent queue by default.
 
-> **v0.2.1 compatibility:** `MISSION_CONTROL_AGENT_TOKEN` is accepted as a deprecated fallback through v0.2.1. It will be removed in v0.2.2. Prefer `DISPATCH_AGENT_TOKEN`.
-
 ---
 
 ## Linking

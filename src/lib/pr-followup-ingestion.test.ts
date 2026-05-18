@@ -128,7 +128,7 @@ describe("isAllowedBotAuthor", () => {
 describe("isAllowedBranchOwner", () => {
   it("allows repo owner when allowlist includes owner", () => {
     process.env.PR_FOLLOWUP_BRANCH_OWNERS = "misospace";
-    expect(isAllowedBranchOwner("misospace/mission-control")).toBe(true);
+    expect(isAllowedBranchOwner("misospace/dispatch")).toBe(true);
   });
 
   it("rejects unknown owners when allowlist is configured", () => {
@@ -155,10 +155,10 @@ describe("ingestCommentEvent", () => {
     const client = makeClient();
 
     await ingestCommentEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       commentBody: "Test failed: expected 200 but got 404",
@@ -175,10 +175,10 @@ describe("ingestCommentEvent", () => {
     const client = makeClient();
 
     await ingestCommentEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       commentBody: "Looks wrong to me",
@@ -195,10 +195,10 @@ describe("ingestCommentEvent", () => {
     const client = makeClient();
 
     const result = await ingestCommentEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "human-developer",
       commentBody: "Test failed",
@@ -220,10 +220,10 @@ describe("ingestReviewEvent", () => {
     const client = makeClient();
 
     await ingestReviewEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       reviewBody: "Change `fetch` to `axios` for better error handling",
@@ -240,10 +240,10 @@ describe("ingestReviewEvent", () => {
     const client = makeClient();
 
     const result = await ingestReviewEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       reviewBody: "Looks good!",
@@ -260,10 +260,10 @@ describe("ingestReviewEvent", () => {
     const client = makeClient();
 
     const result = await ingestReviewEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       reviewBody: "Just a comment",
@@ -286,10 +286,10 @@ describe("ingestCheckRunEvent", () => {
     const client = makeClient();
 
     await ingestCheckRunEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/actions/runs/123",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
       title: "Fix test issue",
       author: "itsmiso-ai",
       checkName: "lint",
@@ -307,10 +307,10 @@ describe("ingestCheckRunEvent", () => {
     const client = makeClient();
 
     await ingestCheckRunEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/actions/runs/123",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
       title: "Fix test issue",
       author: "itsmiso-ai",
       checkName: "test",
@@ -326,10 +326,10 @@ describe("ingestCheckRunEvent", () => {
     const client = makeClient();
 
     const result = await ingestCheckRunEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/actions/runs/123",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
       title: "Fix test issue",
       author: "itsmiso-ai",
       checkName: "lint",
@@ -352,10 +352,10 @@ describe("ingestMergeStateEvent", () => {
     const client = makeClient();
 
     await ingestMergeStateEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       mergeStateStatus: "behind",
@@ -370,10 +370,10 @@ describe("ingestMergeStateEvent", () => {
     const client = makeClient();
 
     const result = await ingestMergeStateEvent(client, {
-      repoFullName: "misospace/mission-control",
+      repoFullName: "misospace/dispatch",
       prNumber: 42,
       branch: "fix/test",
-      url: "https://github.com/misospace/mission-control/pull/42",
+      url: "https://github.com/misospace/dispatch/pull/42",
       title: "Fix test issue",
       author: "itsmiso-ai",
       mergeStateStatus: "clean",

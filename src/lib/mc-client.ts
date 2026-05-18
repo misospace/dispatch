@@ -70,13 +70,13 @@ export function getDispatchConfig(): { baseUrl: string; token: string } {
 
   if (!baseUrl) {
     throw new DispatchClientError(
-      "DISPATCH_URL is not set. Set it to your Dispatch instance URL. (MISSION_CONTROL_URL is accepted as a deprecated fallback through v0.2.1.)",
+      "DISPATCH_URL is not set. Set it to your Dispatch instance URL.",
     );
   }
 
   if (!token) {
     throw new DispatchClientError(
-      "DISPATCH_AGENT_TOKEN is not set. Set it to your agent bearer token. (MISSION_CONTROL_AGENT_TOKEN is accepted as a deprecated fallback through v0.2.1.)",
+      "DISPATCH_AGENT_TOKEN is not set. Set it to your agent bearer token.",
     );
   }
 

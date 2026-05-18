@@ -83,19 +83,7 @@ Agent Runs → Dispatch → Agent Activity Page
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
 
-### Legacy Variables (v0.2.1 compatibility — deprecated)
-
-The following variables are accepted through v0.2.1 but **deprecated** and scheduled for removal in v0.2.2:
-
-| Variable | Description |
-|----------|-------------|
-| `MISSION_CONTROL_DATABASE_URL` | Legacy alias for database URL — falls back to `DATABASE_URL` or `DISPATCH_DATABASE_URL` if set |
-| `MISSION_CONTROL_AGENT_TOKEN` | Legacy alias for agent token — falls back to `DISPATCH_AGENT_TOKEN` if set |
-| `MISSION_CONTROL_URL` | Legacy alias for instance URL — falls back to `DISPATCH_URL` if set |
-
-**Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` > `MISSION_CONTROL_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` > `MISSION_CONTROL_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` > `MISSION_CONTROL_URL` (for instance URL).
-
-**v0.2.2 will remove all `MISSION_CONTROL_*` env var support.**
+**Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` (for instance URL).
 
 ## First-Run Flow
 
@@ -238,14 +226,12 @@ npm run db:push
 
 ## Deployment
 
-The app uses the bjw-s/app-template Helm chart. See `home-ops/kubernetes/apps/base/llm/mission-control/` for manifests.
+The app uses the bjw-s/app-template Helm chart. See `home-ops/kubernetes/apps/base/llm/dispatch/` for manifests.
 
 Required secrets (via ExternalSecret):
 - `DATABASE_URL` - PostgreSQL connection string (canonical)
 - `GITHUB_TOKEN` - GitHub authentication
 - `DISPATCH_AGENT_TOKEN` - Agent API bearer token
-
-**Note for v0.2.1:** If you still use `MISSION_CONTROL_DATABASE_URL`, the container startup shim will derive `DATABASE_URL` from it. Update your manifests to use `DATABASE_URL` before upgrading to v0.2.2.
 
 ## API Endpoints
 
@@ -440,7 +426,7 @@ The Dispatch Docker image is built and published via GitHub Actions CI/CD.
 ### Image Name
 
 ```
-ghcr.io/misospace/mission-control
+ghcr.io/misospace/dispatch
 ```
 
 ### Workflow
@@ -491,7 +477,7 @@ The Kubernetes deployment references the image:
 ```yaml
 spec:
   containers:
-    - image: ghcr.io/misospace/mission-control:main
+    - image: ghcr.io/misospace/dispatch:main
 ```
 
 The image tag `main` is updated on each push to the `main` branch via the CI workflow.
@@ -500,12 +486,12 @@ The image tag `main` is updated on each push to the `main` branch via the CI wor
 
 ```bash
 # Build locally
-docker build -t ghcr.io/misospace/mission-control:local .
+docker build -t ghcr.io/misospace/dispatch:local .
 
 # Run locally
 docker run -p 3000:3000 \
   -e DATABASE_URL="postgresql://..." \
   -e GITHUB_TOKEN="ghp_..." \
   -e DISPATCH_AGENT_TOKEN="..." \
-  ghcr.io/misospace/mission-control:local
+  ghcr.io/misospace/dispatch:local
 ```

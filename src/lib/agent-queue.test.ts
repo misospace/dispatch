@@ -97,7 +97,7 @@ describe("buildAgentQueue", () => {
 
   it("works across multiple repos (no hardcoded repo names)", () => {
     const issues = [
-      makeIssue({ number: 1, url: "https://github.com/misospace/mission-control/issues/1", labels: ["priority/p1"] }),
+      makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", labels: ["priority/p1"] }),
       makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", labels: ["priority/p1"] }),
     ];
     const result = buildAgentQueue(issues, "saffron");

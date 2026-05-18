@@ -26,8 +26,6 @@ npx prisma generate
 
 The token is **never** printed or logged. Missing variables produce a clear error on startup.
 
-> **v0.2.1 compatibility:** `MISSION_CONTROL_URL` and `MISSION_CONTROL_AGENT_TOKEN` are accepted as deprecated fallbacks through v0.2.1. They will be removed in v0.2.2. Prefer `DISPATCH_URL` and `DISPATCH_AGENT_TOKEN`.
-
 ## Running the Server
 
 ```bash
@@ -146,10 +144,10 @@ The `taskContract` field contains a structured prompt telling the agent to work 
 
 Natural language request:
 
-> Claim and work issue #103 in misospace/mission-control.
+> Claim and work issue #103 in misospace/dispatch.
 
 OpenCode will:
-1. Call `claim_work` with `repoFullName: "misospace/mission-control"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
+1. Call `claim_work` with `repoFullName: "misospace/dispatch"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
 2. Receive the task contract with issue context
 3. Work on the issue following the contract
 

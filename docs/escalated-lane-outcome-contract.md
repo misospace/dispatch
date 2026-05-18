@@ -72,12 +72,12 @@ Authorization: Bearer <TOKEN>
 Content-Type: application/json
 
 {
-  "repo": "misospace/mission-control",
+  "repo": "misospace/dispatch",
   "issueNumber": 66,
   "decomposed": true,
   "followUpUrls": [
-    "https://github.com/misospace/mission-control/issues/100",
-    "https://github.com/misospace/mission-control/issues/101"
+    "https://github.com/misospace/dispatch/issues/100",
+    "https://github.com/misospace/dispatch/issues/101"
   ],
   "note": "Decomposed into two concrete auth boundary review tasks"
 }
@@ -87,7 +87,7 @@ Content-Type: application/json
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `repo` | string | Yes | Owner/repo format (e.g., `"misospace/mission-control"`) |
+| `repo` | string | Yes | Owner/repo format (e.g., `"misospace/dispatch"`) |
 | `issueNumber` | number | Yes | GitHub issue number |
 | `decomposed` | boolean | Yes | `true` to mark as decomposed, `false` to reactivate |
 | `followUpUrls` | string[] | No | URLs of concrete follow-up issues created from this parent |
@@ -102,8 +102,8 @@ Content-Type: application/json
   "decomposed": true,
   "decomposedAt": "2026-05-16T10:05:00.000Z",
   "followUpUrls": [
-    "https://github.com/misospace/mission-control/issues/100",
-    "https://github.com/misospace/mission-control/issues/101"
+    "https://github.com/misospace/dispatch/issues/100",
+    "https://github.com/misospace/dispatch/issues/101"
   ]
 }
 ```

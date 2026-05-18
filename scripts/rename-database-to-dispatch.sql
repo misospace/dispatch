@@ -1,14 +1,14 @@
 -- ============================================================================
 -- scripts/rename-database-to-dispatch.sql
 -- ============================================================================
--- Safe PostgreSQL database rename helper for the v0.2.1 Dispatch compatibility
--- release. This script renames a legacy Mission Control database to Dispatch.
+-- Safe PostgreSQL database rename helper for the Dispatch migration from
+-- Mission Control (v0.2.1) to Dispatch (v0.2.2).
 --
 -- IMPORTANT: This script must NOT run during normal app startup. It is an
 -- admin-invoked, opt-in helper only.
 --
--- v0.2.1 = compatibility release (legacy env vars still work)
--- v0.2.2 = hard cutover (legacy support removed)
+-- v0.2.1 = compatibility release (legacy MISSION_CONTROL_* env vars still worked)
+-- v0.2.2 = hard cutover (legacy support removed, only Dispatch naming used)
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -33,13 +33,7 @@
 --    After renaming, any DATABASE_URL pointing at the old name must be updated
 --    to the new name, or the app will fail to connect.
 --
---    v0.2.1 compatibility shim derives DATABASE_URL from MISSION_CONTROL_DATABASE_URL,
---    so if you use that env var it will continue working after the rename only if
---    you update MISSION_CONTROL_DATABASE_URL to point at the new name.
---
--- 5. THIS IS v0.2.1 — NO DATABASES ARE DROPPED
---    This script only renames. It does NOT DROP any database.
---    The hard cutover (v0.2.2) will remove legacy env var support entirely.
+-- 5. THIS SCRIPT ONLY RENAMES — NO DATABASES ARE DROPPED
 -- ============================================================================
 
 -- Example: rename 'mission-control' to 'dispatch'
@@ -74,8 +68,7 @@
 -- If something goes wrong after renaming:
 --
 -- 1. The old database no longer exists under its old name.
--- 2. Update your DATABASE_URL or MISSION_CONTROL_DATABASE_URL env var to point
---    at the new database name.
+-- 2. Update your DATABASE_URL env var to point at the new database name.
 -- 3. Restart the Dispatch container/pod.
 --
 -- To rename back (if needed):

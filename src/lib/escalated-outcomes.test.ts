@@ -132,7 +132,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
     const issues = [
       makeIssue({
         number: 1,
-        url: "https://github.com/misospace/mission-control/issues/1",
+        url: "https://github.com/misospace/dispatch/issues/1",
         labels: ["priority/p1"],
         decomposed: true,
       }),
