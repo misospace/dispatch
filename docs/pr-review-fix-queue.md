@@ -1,6 +1,6 @@
 # PR review-fix queue integration
 
-Mission Control represents PR review-fix work as first-class assignment-layer queue items in the `PrFixQueueItem` model, with `PrFixHistory` preserving audit events.
+Dispatch represents PR review-fix work as first-class assignment-layer queue items in the `PrFixQueueItem` model, with `PrFixHistory` preserving audit events.
 
 ## Queue item fields
 
@@ -28,4 +28,4 @@ The implementation is generic: there are no hardcoded agent names or repository 
 
 ## Compatibility path
 
-The legacy workspace-local JSON queue is not replaced yet. It remains a compatibility preflight for existing cron workers while Mission Control exposes the database-backed queue contract. Producers can migrate to `/api/pr-fix-queue/enqueue`, and workers can migrate to the Mission Control agent queue endpoint without changing prioritization semantics.
+The legacy workspace-local JSON queue is not replaced yet. It remains a compatibility preflight for existing cron workers while Dispatch exposes the database-backed queue contract. Producers can migrate to `/api/pr-fix-queue/enqueue`, and workers can migrate to the Dispatch agent queue endpoint without changing prioritization semantics.

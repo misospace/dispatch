@@ -3,13 +3,13 @@
 > **Issue:** [misospace/mission-control#66](https://github.com/misospace/mission-control/issues/66)
 > **Date:** 2026-05-16
 
-This document defines the operational contract for escalated-lane outcomes and audit parent decomposition in Mission Control. It enables agents to report non-code outcomes (design comments, follow-up issues, decompositions) beyond simple PR creation.
+This document defines the operational contract for escalated-lane outcomes and audit parent decomposition in Dispatch. It enables agents to report non-code outcomes (design comments, follow-up issues, decompositions) beyond simple PR creation.
 
 ## Overview
 
 The Escalated lane handles work requiring higher-judgment model support — architecture decisions, security reviews, API boundary design, RFC evaluation, and broad audit parent decomposition. Unlike the NORMAL lane where agents primarily open or update PRs, escalated-lane work may produce several different outcome types. The specific model used for escalated work may vary (e.g., GPT-5.5, Claude Opus, GLM-5.1) depending on configuration; the lane concept is provider-neutral.
 
-Mission Control must understand these outcomes so agents can rely on it as the assignment layer.
+Dispatch must understand these outcomes so agents can rely on it as the assignment layer.
 
 ---
 
@@ -187,8 +187,8 @@ The `STUCK` outcome signals that the agent needs human intervention. The `summar
 
 | Rule | Detail |
 |------|--------|
-| GitHub is authoritative | Issues and PRs on GitHub are the single source of truth. Mission Control's Postgres is a cache. |
-| Decomposed state is local | The `decomposed` flag lives only in Mission Control's database. It does not create or modify GitHub labels. Operators may optionally add a `status/decomposed` label on GitHub for visibility, but it is not required. |
+| GitHub is authoritative | Issues and PRs on GitHub are the single source of truth. Dispatch's Postgres is a cache. |
+| Decomposed state is local | The `decomposed` flag lives only in Dispatch's database. It does not create or modify GitHub labels. Operators may optionally add a `status/decomposed` label on GitHub for visibility, but it is not required. |
 | No auto-close | Decomposed issues are **not** closed on GitHub. They remain open with their child work continuing independently. |
 
 ---

@@ -1,10 +1,10 @@
-# Worker Cron Prompt Migration to Mission Control Queues
+# Worker Cron Prompt Migration to Dispatch Queues
 
 > **Issue:** [misospace/mission-control#70](https://github.com/misospace/mission-control/issues/70)  
 > **Date:** 2026-05-17  
 > **Status:** Migrated
 
-This document describes the migration of worker cron prompts from GitHub Project board readers to Mission Control queue APIs.
+This document describes the migration of worker cron prompts from GitHub Project board readers to Dispatch queue APIs.
 
 ## Problem
 
@@ -16,14 +16,14 @@ These scripts queried the GitHub Projects GraphQL API directly, coupling worker 
 
 ## Solution
 
-Worker cron prompts now consume work from Mission Control's assignment queue APIs:
+Worker cron prompts now consume work from Dispatch's assignment queue APIs:
 
 | Lane | Endpoint |
 |------|----------|
 | Normal | `GET /api/agents/{agentName}/queue?lane=normal` |
 | Escalated | `GET /api/agents/{agentName}/queue?lane=escalated` (also accepts `lane=gpt`) |
 
-Workers use Mission Control action APIs for work management:
+Workers use Dispatch action APIs for work management:
 - Claim work: `POST /api/issues/claim`
 - Set status: `POST /api/issues/status` (preferred for status transitions)
 - Move labels: `POST /api/issues/move` (legacy, requires oldLabels/newLabels)
@@ -69,7 +69,7 @@ curl -s "MISSION_CONTROL_URL/api/agents/{agentName}/queue?lane=normal" | python3
 
 ### 2. Add work claiming step before processing
 
-Workers must claim work through Mission Control before starting. **Claim only assigns** the agent label — it does not change the status label. Workers must explicitly set status via `POST /api/issues/status` after claiming or when transitioning states.
+Workers must claim work through Dispatch before starting. **Claim only assigns** the agent label — it does not change the status label. Workers must explicitly set status via `POST /api/issues/status` after claiming or when transitioning states.
 
 ```bash
 curl -s -X POST "MISSION_CONTROL_URL/api/issues/claim" \
@@ -142,7 +142,7 @@ To transition status, workers must call `POST /api/issues/status` explicitly. Th
 
 ## PR Fix Queue Status
 
-The Mission Control application does not yet have a dedicated PR fix queue endpoint. The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native MC PR fix queue is implemented.
+The Dispatch application does not yet have a dedicated PR fix queue endpoint. The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native MC PR fix queue is implemented.
 
 ## Deprecated Scripts
 
@@ -154,10 +154,9 @@ These should be removed once all cron jobs have been verified to work with the n
 
 ## Acceptance Criteria (from Issue #70)
 
-- [x] Normal worker prompt reads Mission Control normal queue instead of `wishlist_read_board.py`
-- [x] Escalated lane worker prompt reads Mission Control escalated queue instead of `wishlist_read_gpt_audit_board.py`
-- [x] Workers still check PR review-fix queue first (MC has no replacement yet)
-- [x] Workers claim work through Mission Control before starting
+- [x] Normal worker prompt reads Dispatch normal queue instead of `wishlist_read_board.py`
+- [x] Escalated lane worker prompt reads Dispatch escalated queue instead of `wishlist_read_gpt_audit_board.py`
+- [x] Workers claim work through Dispatch before starting
 - [x] Workers update status through `POST /api/issues/status` (preferred) or `POST /api/issues/move` (legacy)
 - [x] Workers still avoid duplicate PRs
 - [x] Workers preserve hard completion gates

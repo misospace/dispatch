@@ -153,7 +153,7 @@ export function createServer(): McpServerType {
     },
     {
       instructions:
-        "Mission Control bridge — claim and manage GitHub issues via the Mission Control API.",
+        "Dispatch MCP bridge — claim and manage GitHub issues via the Dispatch API.",
     },
   );
 
@@ -163,7 +163,7 @@ export function createServer(): McpServerType {
     "resolve_issue",
     {
       description:
-        "Resolve a Mission Control issue by repo full name and issue number. Returns issue ID, title, URL, labels, status, and lane classification.",
+        "Resolve a Dispatch issue by repo full name and issue number. Returns issue ID, title, URL, labels, status, and lane classification.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
@@ -178,7 +178,7 @@ export function createServer(): McpServerType {
     "claim_issue",
     {
       description:
-        "Claim a Mission Control issue for an agent. Adds the agent/* label on GitHub and in the local cache. Use force=true to override existing assignments.",
+        "Claim a Dispatch issue for an agent. Adds the agent/* label on GitHub and in the local cache. Use force=true to override existing assignments.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
@@ -198,7 +198,7 @@ export function createServer(): McpServerType {
     "set_issue_status",
     {
       description:
-        "Set the status label on a Mission Control issue (e.g. 'in-progress', 'in-review', 'done'). Transitions the status/ label on GitHub and in the local cache.",
+        "Set the status label on a Dispatch issue (e.g. 'in-progress', 'in-review', 'done'). Transitions the status/ label on GitHub and in the local cache.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),

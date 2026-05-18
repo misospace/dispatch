@@ -7,8 +7,8 @@ import { ThemeToggle } from "@/components/theme-toggle";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Mission Control",
-  description: "OpenClaw Mission Control Dashboard",
+  title: "Dispatch",
+  description: "Kanban for AI agent work",
 };
 
 export default function RootLayout({
@@ -33,7 +33,7 @@ export default function RootLayout({
           <header className="border-b bg-card">
             <div className="container flex items-center gap-6 py-4">
               <Link href="/" className="font-bold text-lg">
-                Mission Control
+                Dispatch
               </Link>
               <nav className="flex gap-4 text-sm">
                 <Link href="/" className="text-muted-foreground hover:text-foreground">

@@ -2,11 +2,11 @@
 
 > **Issue:** [misospace/mission-control#60](https://github.com/misospace/mission-control/issues/60)
 > **Date:** 2026-05-16
-> **Purpose:** Verify Mission Control is healthy before agents rely on it for assignment.
+> **Purpose:** Verify Dispatch is healthy before agents rely on it for assignment.
 
-This checklist documents the runtime smoke checks an operator or agent should run against a Mission Control instance to confirm the assignment layer is fully operational. Each check maps to a specific API endpoint, UI page, or log signal.
+This checklist documents the runtime smoke checks an operator or agent should run against a Dispatch instance to confirm the assignment layer is fully operational. Each check maps to a specific API endpoint, UI page, or log signal.
 
-Run all checks against the target instance (local dev, staging, or production) before cutover or after any deployment. Mark each as **PASS**, **FAIL**, or **SKIP** (with justification). All 14 checks must pass — or be explicitly skipped with documented reason — before trusting Mission Control for assignment decisions.
+Run all checks against the target instance (local dev, staging, or production) before cutover or after any deployment. Mark each as **PASS**, **FAIL**, or **SKIP** (with justification). All 14 checks must pass — or be explicitly skipped with documented reason — before trusting Dispatch for assignment decisions.
 
 ---
 
@@ -36,7 +36,7 @@ Run all checks against the target instance (local dev, staging, or production) b
 
 **Status code:** `200 OK`
 
-**Failure signal:** Any response with `ok: false`, `database: "error"`, or status `503`. This means the PostgreSQL database is unreachable but Mission Control itself is still running.
+**Failure signal:** Any response with `ok: false`, `database: "error"`, or status `503`. This means the PostgreSQL database is unreachable but Dispatch itself is still running.
 
 ---
 
@@ -205,7 +205,7 @@ where `N > 0`.
 
 ### 13. Logs show no Prisma, BigInt, or FK errors
 
-**Method:** Inspect Mission Control logs after running all checks above.
+**Method:** Inspect Dispatch logs after running all checks above.
 
 **Expected:** No lines containing `PrismaClientKnownRequestError`, `PrismaClientUnknownRequestError`, `BigInt`, `ForeignKey`, `FK constraint`, `relation "X" does not exist`, or `column "Y" does not exist`.
 
@@ -213,19 +213,19 @@ where `N > 0`.
 
 ---
 
-### 14. Mission Control failures do not break agent runs
+### 14. Dispatch failures do not break agent runs
 
-**Method:** Simulate failure by stopping Mission Control or making an endpoint return errors, then verify an agent can continue operating using GitHub as fallback.
+**Method:** Simulate failure by stopping Dispatch or making an endpoint return errors, then verify an agent can continue operating using GitHub as fallback.
 
 **Steps:**
-1. Stop Mission Control (or block network to it).
+1. Stop Dispatch (or block network to it).
 2. Attempt the heartbeat workflow: `POST /api/sync` fails, `GET /api/issues` fails.
 3. Verify the agent falls back to GitHub Issues API directly and continues processing.
 4. Restart Mission Control. Verify the next heartbeat succeeds with `/api/sync`.
 
-**Expected:** Agent continues working through fallback path; no crash or hang when Mission Control is unavailable.
+**Expected:** Agent continues working through fallback path; no crash or hang when Dispatch is unavailable.
 
-**Failure signal:** Agent crashes, hangs, or fails its heartbeat entirely when Mission Control is down.
+**Failure signal:** Agent crashes, hangs, or fails its heartbeat entirely when Dispatch is down.
 
 ---
 
@@ -233,7 +233,7 @@ where `N > 0`.
 
 | Result | Action |
 |--------|--------|
-| All PASS | Mission Control is ready for assignment. Proceed with cutover. |
+| All PASS | Dispatch is ready for assignment. Proceed with cutover. |
 | 1–2 FAIL | Investigate failures. Re-run after fixes. Do not proceed to cutover. |
 | 3+ FAIL | Do not proceed. Block on critical failures (health, sync, issues, audit). |
 | Any SKIP | Document justification. Verify skipped checks were handled by alternative means. |

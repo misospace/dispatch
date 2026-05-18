@@ -1,16 +1,16 @@
-# OpenCode MCP Bridge
+# Dispatch MCP Bridge
 
-Local stdio MCP server that bridges OpenCode to Mission Control issue APIs.
+Local stdio MCP server that bridges OpenCode to Dispatch issue APIs.
 
 ## Prerequisites
 
 - Node.js 18+ (the repo ships with Node 24)
-- A running Mission Control instance
+- A running Dispatch instance
 - `MISSION_CONTROL_URL` and `MISSION_CONTROL_AGENT_TOKEN` set in your environment
 
 ## Installation
 
-No additional packages are needed — the MCP server lives in the Mission Control repo and uses the existing dependencies:
+No additional packages are needed — the MCP server lives in the Dispatch repo and uses the existing dependencies:
 
 ```bash
 npm ci
@@ -21,7 +21,7 @@ npx prisma generate
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MISSION_CONTROL_URL` | Yes | Base URL of your Mission Control instance (e.g. `http://localhost:3000`) |
+| `MISSION_CONTROL_URL` | Yes | Base URL of your Dispatch instance (e.g. `http://localhost:3000`) |
 | `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 
 The token is **never** printed or logged. Missing variables produce a clear error on startup.
@@ -93,7 +93,7 @@ If your OpenCode config supports env var interpolation (e.g. `$VAR`), you can re
 
 ### `resolve_issue`
 
-Resolve a Mission Control issue by repo full name and issue number.
+Resolve a Dispatch issue by repo full name and issue number.
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name (e.g. `'org/repo'`)
@@ -103,7 +103,7 @@ Resolve a Mission Control issue by repo full name and issue number.
 
 ### `claim_issue`
 
-Claim a Mission Control issue for an agent. Adds the `agent/*` label on GitHub and in the local cache.
+Claim a Dispatch issue for an agent. Adds the `agent/*` label on GitHub and in the local cache.
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
@@ -115,7 +115,7 @@ Claim a Mission Control issue for an agent. Adds the `agent/*` label on GitHub a
 
 ### `set_issue_status`
 
-Set the status label on a Mission Control issue (e.g. `'in-progress'`, `'in-review'`, `'done'`).
+Set the status label on a Dispatch issue (e.g. `'in-progress'`, `'in-review'`, `'done'`).
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
@@ -185,19 +185,19 @@ Or add it to your OpenCode MCP config `env` block (see configuration above).
 
 ### "MISSION_CONTROL_AGENT_TOKEN is not set"
 
-Same as above — ensure the token is set. Verify your Mission Control instance has an agent token configured.
+Same as above — ensure the token is set. Verify your Dispatch instance has an agent token configured.
 
 ### "Issue #N not found in org/repo"
 
-The issue may not be synced to Mission Control yet. Try:
-1. Running a sync: `POST /api/sync` on your Mission Control instance
+The issue may not be synced to Dispatch yet. Try:
+1. Running a sync: `POST /api/sync` on your Dispatch instance
 2. Verifying the repo is tracked (check `/api/repos` or the UI)
 3. Confirming the issue number and repo full name are correct
 
 ### Token not logged — how to verify it's set?
 
-The server will throw a descriptive `McClientError` if the token is missing. If you're getting 401 responses from the Mission Control API, verify:
-1. The token in your env matches the one configured in Mission Control
+The server will throw a descriptive `McClientError` if the token is missing. If you're getting 401 responses from the Dispatch API, verify:
+1. The token in your env matches the one configured in Dispatch
 2. The token hasn't been rotated or expired
 3. The `MISSION_CONTROL_URL` points to the correct instance
 

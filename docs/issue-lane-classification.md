@@ -2,11 +2,11 @@
 
 ## Overview
 
-Mission Control classifies synced GitHub issues into execution lanes to help queues and agents distinguish between normal local-worker tasks, elevated level tasks requiring higher-judgment support, and non-actionable backlog items.
+Dispatch classifies synced GitHub issues into execution lanes to help queues and agents distinguish between normal local-worker tasks, elevated level tasks requiring higher-judgment support, and non-actionable backlog items.
 
 Lane classification is stored as operational metadata in the `IssueLane` table. Multiple classifications may exist for an issue (history), with the most recent one used for routing decisions.
 
-> **Mission Control remains generic.** This feature supports any agent/workflow, not a specific named agent. No hardcoded agent names, repo names, or owner names appear in classification prompts or logic.
+> **Dispatch remains generic.** This feature supports any agent/workflow, not a specific named agent. No hardcoded agent names, repo names, or owner names appear in classification prompts or logic.
 
 ---
 

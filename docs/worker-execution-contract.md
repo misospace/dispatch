@@ -3,7 +3,7 @@
 > **Issue:** [misospace/mission-control#65](https://github.com/misospace/mission-control/issues/65)
 > **Date:** 2026-05-16
 
-This document defines the generic execution contract for any agent worker consuming work from Mission Control queues. It supersedes ad-hoc behavior and ensures consistency across all workers regardless of identity or repository.
+This document defines the generic execution contract for any agent worker consuming work from Dispatch queues. It supersedes ad-hoc behavior and ensures consistency across all workers regardless of identity or repository.
 
 ## Table of Contents
 
@@ -176,7 +176,7 @@ BACKLOG issues are excluded from the normal agent queue by default.
 
 This contract is referenced from:
 - [AGENTS.md](../AGENTS.md) — OpenClaw Agent Workflow Contract section
-- [OpenClaw Agent — Mission Control Phase 1 Workflow Contract](./openclaw-agent-mc-workflow.md) — linked as the detailed worker execution reference
+- [OpenClaw Agent — Dispatch Phase 1 Workflow Contract](./openclaw-agent-mc-workflow.md) — linked as the detailed worker execution reference
 
 ---
 
