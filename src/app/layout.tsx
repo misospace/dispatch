@@ -22,6 +22,14 @@ export default function RootLayout({
         <script dangerouslySetInnerHTML={{ __html: `
           (function() {
             var theme = localStorage.getItem('dispatch-theme');
+            if (!theme) {
+              var legacy = localStorage.getItem('mission-control-theme');
+              if (legacy) {
+                localStorage.setItem('dispatch-theme', legacy);
+                localStorage.removeItem('mission-control-theme');
+                theme = legacy;
+              }
+            }
             if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
               document.documentElement.classList.add('dark');
             }

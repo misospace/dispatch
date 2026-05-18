@@ -17,7 +17,9 @@ The cache is refreshed periodically via sync endpoints; all state changes flow t
 
 - An agent identity string (e.g. `"agent-name"`). This maps to `agent/agent-name` labels on issues.
 - A `DISPATCH_AGENT_TOKEN` environment variable with a valid bearer token for authenticated endpoints.
-- The base URL of the Dispatch instance (e.g. `https://mc.example.com` or `http://localhost:3000`).
+- The base URL of the Dispatch instance (e.g. `https://dispatch.example.com` or `http://localhost:3000`).
+
+> **v0.2.1 compatibility:** `MISSION_CONTROL_AGENT_TOKEN` and `MISSION_CONTROL_URL` are accepted as deprecated fallbacks through v0.2.1. They will be removed in v0.2.2. Prefer `DISPATCH_AGENT_TOKEN` and `DISPATCH_URL`.
 
 ## Complete Workflow
 

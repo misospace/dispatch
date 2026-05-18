@@ -1,0 +1,86 @@
+-- ============================================================================
+-- scripts/rename-database-to-dispatch.sql
+-- ============================================================================
+-- Safe PostgreSQL database rename helper for the v0.2.1 Dispatch compatibility
+-- release. This script renames a legacy Mission Control database to Dispatch.
+--
+-- IMPORTANT: This script must NOT run during normal app startup. It is an
+-- admin-invoked, opt-in helper only.
+--
+-- v0.2.1 = compatibility release (legacy env vars still work)
+-- v0.2.2 = hard cutover (legacy support removed)
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- BEFORE RUNNING THIS SCRIPT:
+--
+-- 1. BACKUP YOUR DATABASE
+--    Run a full PostgreSQL backup before proceeding:
+--      pg_dump -U <admin_user> -d <old_database_name> > dispatch_backup.sql
+--
+-- 2. STOP ALL APPLICATION CONNECTIONS
+--    This database must have NO active connections before renaming.
+--    Stop all Dispatch containers/pods and any other apps connecting to it.
+--
+-- 3. CONNECT TO A MAINTENANCE DATABASE
+--    You MUST connect to a different database (e.g., 'postgres' or 'template1'),
+--    NOT the database being renamed. PostgreSQL will reject the RENAME if you
+--    are connected to the target database.
+--
+--      psql -U <admin_user> -d postgres
+--
+-- 4. UNDERSTAND THE IMPLICATIONS
+--    After renaming, any DATABASE_URL pointing at the old name must be updated
+--    to the new name, or the app will fail to connect.
+--
+--    v0.2.1 compatibility shim derives DATABASE_URL from MISSION_CONTROL_DATABASE_URL,
+--    so if you use that env var it will continue working after the rename only if
+--    you update MISSION_CONTROL_DATABASE_URL to point at the new name.
+--
+-- 5. THIS IS v0.2.1 — NO DATABASES ARE DROPPED
+--    This script only renames. It does NOT DROP any database.
+--    The hard cutover (v0.2.2) will remove legacy env var support entirely.
+-- ============================================================================
+
+-- Example: rename 'mission-control' to 'dispatch'
+-- Replace the identifiers below with your actual database names.
+-- Use double quotes for names with special characters or lowercase.
+
+-- ALTER DATABASE "mission-control" RENAME TO "dispatch";
+
+-- Example: rename 'mission_control' (underscore) to 'dispatch'
+-- ALTER DATABASE "mission_control" RENAME TO "dispatch";
+
+-- Example: rename a database with mixed case
+-- ALTER DATABASE "MissionControl" RENAME TO "dispatch";
+
+-- ---------------------------------------------------------------------------
+-- VALIDATION (run before renaming):
+--
+-- Check what databases exist:
+--   \l
+--
+-- Check active connections to the target database:
+--   SELECT pid, usename, application_name, state
+--   FROM pg_stat_activity
+--   WHERE datname = 'mission-control';
+--
+-- If any rows are returned, stop those connections before renaming.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- ROLLBACK / RECOVERY
+--
+-- If something goes wrong after renaming:
+--
+-- 1. The old database no longer exists under its old name.
+-- 2. Update your DATABASE_URL or MISSION_CONTROL_DATABASE_URL env var to point
+--    at the new database name.
+-- 3. Restart the Dispatch container/pod.
+--
+-- To rename back (if needed):
+--   ALTER DATABASE "dispatch" RENAME TO "mission-control";
+--
+-- If you have a backup, you can restore from it:
+--   psql -U <admin_user> -d <new_name> -f dispatch_backup.sql
+-- ============================================================================

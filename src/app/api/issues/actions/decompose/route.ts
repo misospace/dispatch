@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 /**
  * Resolve the actor name for decomposition attribution.

@@ -29,14 +29,30 @@ npm run db:deploy    # Deploy migrations (prod)
 
 ### Environment Variables
 
+#### Preferred (v0.2.1+)
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `DATABASE_URL` | Yes | PostgreSQL connection string (canonical) |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token |
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API |
 | `GITHUB_REPOSITORIES` | Yes | **One-time** bootstrap seed for tracked repos (comma or newline separated). Read only when `AutomationRepo` is empty. After first seed, manage via `/automation` UI or `POST /api/repos` / `POST /api/automation/repos`. Seeded repos carry `source: "env"`; UI-added repos carry `source: "user"`. |
+| `DISPATCH_URL` | No | Base URL of your Dispatch instance (used by outbound clients and MCP bridge) |
+| `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
+
+#### Legacy (v0.2.1 compatibility — deprecated, removed in v0.2.2)
+
+| Variable | Description |
+|----------|-------------|
+| `MISSION_CONTROL_DATABASE_URL` | Legacy database URL alias |
+| `MISSION_CONTROL_AGENT_TOKEN` | Legacy agent token alias |
+| `MISSION_CONTROL_URL` | Legacy instance URL alias |
+
+Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL` > `MISSION_CONTROL_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` > `MISSION_CONTROL_AGENT_TOKEN`. `DISPATCH_URL` > `MISSION_CONTROL_URL`.
+
+The container startup shim (`docker-entrypoint.sh`) maps legacy vars to preferred names at container start. API routes accept both preferred and legacy tokens for bearer auth during v0.2.1.
 
 ### Label Conventions
 

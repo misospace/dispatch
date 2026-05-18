@@ -26,6 +26,8 @@ npx prisma generate
 
 The token is **never** printed or logged. Missing variables produce a clear error on startup.
 
+> **v0.2.1 compatibility:** `MISSION_CONTROL_URL` and `MISSION_CONTROL_AGENT_TOKEN` are accepted as deprecated fallbacks through v0.2.1. They will be removed in v0.2.2. Prefer `DISPATCH_URL` and `DISPATCH_AGENT_TOKEN`.
+
 ## Running the Server
 
 ```bash

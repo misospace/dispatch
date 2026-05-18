@@ -62,24 +62,26 @@ export class DispatchClientError extends Error {
   }
 }
 
+import { getDispatchUrl, getDispatchAgentToken } from "./dispatch-env";
+
 export function getDispatchConfig(): { baseUrl: string; token: string } {
-  const baseUrl = process.env.DISPATCH_URL;
-  const token = process.env.DISPATCH_AGENT_TOKEN;
+  const baseUrl = getDispatchUrl();
+  const token = getDispatchAgentToken();
 
   if (!baseUrl) {
     throw new DispatchClientError(
-      "DISPATCH_URL is not set. Set it to your Dispatch instance URL.",
+      "DISPATCH_URL is not set. Set it to your Dispatch instance URL. (MISSION_CONTROL_URL is accepted as a deprecated fallback through v0.2.1.)",
     );
   }
 
   if (!token) {
     throw new DispatchClientError(
-      "DISPATCH_AGENT_TOKEN is not set. Set it to your agent bearer token.",
+      "DISPATCH_AGENT_TOKEN is not set. Set it to your agent bearer token. (MISSION_CONTROL_AGENT_TOKEN is accepted as a deprecated fallback through v0.2.1.)",
     );
   }
 
   return {
-    baseUrl: baseUrl.replace(/\/+$/, ""),
+    baseUrl,
     token,
   };
 }

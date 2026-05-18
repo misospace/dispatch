@@ -30,6 +30,8 @@ Workers use Dispatch action APIs for work management:
 
 All worker-facing mutation endpoints require bearer authentication via `DISPATCH_AGENT_TOKEN`.
 
+> **v0.2.1 compatibility:** The legacy `MISSION_CONTROL_AGENT_TOKEN` is accepted as a fallback through v0.2.1. It will be removed in v0.2.2. Prefer `DISPATCH_AGENT_TOKEN`.
+
 ## Queue Response Format
 
 Issue items returned from the queue include:
@@ -142,7 +144,7 @@ To transition status, workers must call `POST /api/issues/status` explicitly. Th
 
 ## PR Fix Queue Status
 
-The Dispatch application does not yet have a dedicated PR fix queue endpoint. The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native MC PR fix queue is implemented.
+The Dispatch application has a dedicated PR fix queue (`/api/pr-fix-queue/*`). The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native Dispatch PR fix queue is fully implemented.
 
 ## Deprecated Scripts
 

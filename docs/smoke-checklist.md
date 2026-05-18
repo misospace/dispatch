@@ -248,6 +248,10 @@ where `N > 0`.
 
 ---
 
+## v0.2.1 Compatibility
+
+This checklist uses Dispatch terminology throughout. If your environment still references `MISSION_CONTROL_*` env vars (deprecated through v0.2.1), the container startup shim maps them to preferred names automatically. Update manifests before upgrading to v0.2.2.
+
 ## History
 
 - **2026-05-16** — Created as assignment-layer runtime smoke checklist (Issue #60). Documents all 14 checks covering health, sync, repos, issues, board UI, projects UI, agent runs, queue, claim/unclaim lifecycle, audit trail, log errors, and failure resilience.

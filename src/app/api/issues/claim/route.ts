@@ -2,10 +2,11 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.DISPATCH_AGENT_TOKEN) {
+  if (!isAuthorizedAgentToken(token)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
