@@ -8,7 +8,7 @@ export function ThemeToggle() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
 
   useEffect(() => {
-    const saved = localStorage.getItem("mission-control-theme") as "light" | "dark" | null;
+    const saved = localStorage.getItem("dispatch-theme") as "light" | "dark" | null;
     if (saved === "dark" || saved === "light") {
       setTheme(saved);
       document.documentElement.classList.toggle("dark", saved === "dark");
@@ -21,7 +21,7 @@ export function ThemeToggle() {
   function toggle() {
     const next = theme === "light" ? "dark" : "light";
     setTheme(next);
-    localStorage.setItem("mission-control-theme", next);
+    localStorage.setItem("dispatch-theme", next);
     document.documentElement.classList.toggle("dark", next === "dark");
   }
 

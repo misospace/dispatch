@@ -1,16 +1,16 @@
-# OpenCode MCP Bridge
+# Dispatch MCP Bridge
 
-Local stdio MCP server that bridges OpenCode to Mission Control issue APIs.
+Local stdio MCP server that bridges OpenCode to Dispatch issue APIs.
 
 ## Prerequisites
 
 - Node.js 18+ (the repo ships with Node 24)
-- A running Mission Control instance
-- `MISSION_CONTROL_URL` and `MISSION_CONTROL_AGENT_TOKEN` set in your environment
+- A running Dispatch instance
+- `DISPATCH_URL` and `DISPATCH_AGENT_TOKEN` set in your environment
 
 ## Installation
 
-No additional packages are needed — the MCP server lives in the Mission Control repo and uses the existing dependencies:
+No additional packages are needed — the MCP server lives in the Dispatch repo and uses the existing dependencies:
 
 ```bash
 npm ci
@@ -21,10 +21,12 @@ npx prisma generate
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MISSION_CONTROL_URL` | Yes | Base URL of your Mission Control instance (e.g. `http://localhost:3000`) |
-| `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `DISPATCH_URL` | Yes | Base URL of your Dispatch instance (e.g. `http://localhost:3000` or `https://dispatch.example.com`) |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 
 The token is **never** printed or logged. Missing variables produce a clear error on startup.
+
+> **v0.2.1 compatibility:** `MISSION_CONTROL_URL` and `MISSION_CONTROL_AGENT_TOKEN` are accepted as deprecated fallbacks through v0.2.1. They will be removed in v0.2.2. Prefer `DISPATCH_URL` and `DISPATCH_AGENT_TOKEN`.
 
 ## Running the Server
 
@@ -41,12 +43,12 @@ Add the following to your OpenCode configuration (e.g. `.opencode.json` or `open
 ```json
 {
   "mcpServers": {
-    "mission-control": {
+    "dispatch": {
       "command": "npx",
       "args": ["tsx", "./src/mcp/server.ts"],
       "env": {
-        "MISSION_CONTROL_URL": "http://localhost:3000",
-        "MISSION_CONTROL_AGENT_TOKEN": "your-agent-token-here"
+        "DISPATCH_URL": "http://localhost:3000",
+        "DISPATCH_AGENT_TOKEN": "your-agent-token-here"
       }
     }
   }
@@ -58,12 +60,12 @@ Or if you have the repo cloned locally and want to use an absolute path:
 ```json
 {
   "mcpServers": {
-    "mission-control": {
+    "dispatch": {
       "command": "npx",
-      "args": ["tsx", "/absolute/path/to/mission-control/src/mcp/server.ts"],
+      "args": ["tsx", "/absolute/path/to/dispatch/src/mcp/server.ts"],
       "env": {
-        "MISSION_CONTROL_URL": "https://mc.yourdomain.com",
-        "MISSION_CONTROL_AGENT_TOKEN": "$MISSION_CONTROL_AGENT_TOKEN"
+        "DISPATCH_URL": "https://dispatch.example.com",
+        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN"
       }
     }
   }
@@ -77,12 +79,12 @@ If your OpenCode config supports env var interpolation (e.g. `$VAR`), you can re
 ```json
 {
   "mcpServers": {
-    "mission-control": {
+    "dispatch": {
       "command": "npx",
       "args": ["tsx", "./src/mcp/server.ts"],
       "env": {
-        "MISSION_CONTROL_URL": "https://mc.yourdomain.com",
-        "MISSION_CONTROL_AGENT_TOKEN": "$MISSION_CONTROL_AGENT_TOKEN"
+        "DISPATCH_URL": "https://dispatch.example.com",
+        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN"
       }
     }
   }
@@ -93,7 +95,7 @@ If your OpenCode config supports env var interpolation (e.g. `$VAR`), you can re
 
 ### `resolve_issue`
 
-Resolve a Mission Control issue by repo full name and issue number.
+Resolve a Dispatch issue by repo full name and issue number.
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name (e.g. `'org/repo'`)
@@ -103,7 +105,7 @@ Resolve a Mission Control issue by repo full name and issue number.
 
 ### `claim_issue`
 
-Claim a Mission Control issue for an agent. Adds the `agent/*` label on GitHub and in the local cache.
+Claim a Dispatch issue for an agent. Adds the `agent/*` label on GitHub and in the local cache.
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
@@ -115,7 +117,7 @@ Claim a Mission Control issue for an agent. Adds the `agent/*` label on GitHub a
 
 ### `set_issue_status`
 
-Set the status label on a Mission Control issue (e.g. `'in-progress'`, `'in-review'`, `'done'`).
+Set the status label on a Dispatch issue (e.g. `'in-progress'`, `'in-review'`, `'done'`).
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
@@ -147,13 +149,13 @@ Natural language request:
 > Claim and work issue #103 in misospace/mission-control.
 
 OpenCode will:
-1. Call `claim_work` with `repoFullName: "misodev/mission-control"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
+1. Call `claim_work` with `repoFullName: "misospace/mission-control"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
 2. Receive the task contract with issue context
 3. Work on the issue following the contract
 
 ## Security
 
-- The `MISSION_CONTROL_AGENT_TOKEN` is used for bearer auth on all mutating API calls.
+- The `DISPATCH_AGENT_TOKEN` is used for bearer auth on all mutating API calls.
 - The token is **never** printed, echoed, or persisted to disk by the MCP server.
 - Missing environment variables produce a clear error message at startup.
 - All tools that mutate state (claim, set status, claim_work) require valid bearer authentication.
@@ -172,34 +174,34 @@ Tests cover:
 
 ## Troubleshooting
 
-### "MISSION_CONTROL_URL is not set"
+### "DISPATCH_URL is not set"
 
 Set the environment variable before starting OpenCode or the MCP server:
 
 ```bash
-export MISSION_CONTROL_URL="http://localhost:3000"
-export MISSION_CONTROL_AGENT_TOKEN="your-token-here"
+export DISPATCH_URL="http://localhost:3000"
+export DISPATCH_AGENT_TOKEN="your-token-here"
 ```
 
 Or add it to your OpenCode MCP config `env` block (see configuration above).
 
-### "MISSION_CONTROL_AGENT_TOKEN is not set"
+### "DISPATCH_AGENT_TOKEN is not set"
 
-Same as above — ensure the token is set. Verify your Mission Control instance has an agent token configured.
+Same as above — ensure the token is set. Verify your Dispatch instance has an agent token configured.
 
 ### "Issue #N not found in org/repo"
 
-The issue may not be synced to Mission Control yet. Try:
-1. Running a sync: `POST /api/sync` on your Mission Control instance
+The issue may not be synced to Dispatch yet. Try:
+1. Running a sync: `POST /api/sync` on your Dispatch instance
 2. Verifying the repo is tracked (check `/api/repos` or the UI)
 3. Confirming the issue number and repo full name are correct
 
 ### Token not logged — how to verify it's set?
 
-The server will throw a descriptive `McClientError` if the token is missing. If you're getting 401 responses from the Mission Control API, verify:
-1. The token in your env matches the one configured in Mission Control
+The server will throw a descriptive `McClientError` if the token is missing. If you're getting 401 responses from the Dispatch API, verify:
+1. The token in your env matches the one configured in Dispatch
 2. The token hasn't been rotated or expired
-3. The `MISSION_CONTROL_URL` points to the correct instance
+3. The `DISPATCH_URL` points to the correct instance
 
 ### TypeScript errors when running
 

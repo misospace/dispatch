@@ -1,22 +1,21 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
-  getMcConfig,
-  resolveIssue,
-  claimIssue,
-  setIssueStatus,
-  claimWork,
-  McClientError,
+  DispatchClientError,
 } from "./mc-client";
 
 const mockToken = "test-agent-token";
 const mockBaseUrl = "http://localhost:3000";
+const legacyToken = "legacy-agent-token";
+const legacyBaseUrl = "http://legacy-localhost:3000";
 
 function setEnv() {
-  process.env.MISSION_CONTROL_URL = mockBaseUrl;
-  process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+  process.env.DISPATCH_URL = mockBaseUrl;
+  process.env.DISPATCH_AGENT_TOKEN = mockToken;
 }
 
 function clearEnv() {
+  delete process.env.DISPATCH_URL;
+  delete process.env.DISPATCH_AGENT_TOKEN;
   delete process.env.MISSION_CONTROL_URL;
   delete process.env.MISSION_CONTROL_AGENT_TOKEN;
 }
@@ -53,45 +52,92 @@ function errorResponse(message: string, status = 500) {
   });
 }
 
-describe("getMcConfig", () => {
-  beforeEach(() => { clearEnv(); vi.restoreAllMocks(); });
+describe("getDispatchConfig", () => {
+  beforeEach(async () => {
+    clearEnv();
+    vi.resetModules();
+    await import("./mc-client");
+  });
 
-  it("returns baseUrl and token when both are set", () => {
-    setEnv();
-    const config = getMcConfig();
+  it("returns baseUrl and token when both are set", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    process.env.DISPATCH_URL = mockBaseUrl;
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    const config = getDispatchConfig();
     expect(config.baseUrl).toBe(mockBaseUrl);
     expect(config.token).toBe(mockToken);
   });
 
-  it("strips trailing slashes from baseUrl", () => {
-    process.env.MISSION_CONTROL_URL = "http://localhost:3000/";
-    process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
-    const config = getMcConfig();
+  it("strips trailing slashes from baseUrl", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    process.env.DISPATCH_URL = "http://localhost:3000/";
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    const config = getDispatchConfig();
     expect(config.baseUrl).toBe("http://localhost:3000");
   });
 
-  it("throws when MISSION_CONTROL_URL is missing", () => {
+  it("throws when DISPATCH_URL is missing", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
     clearEnv();
-    expect(() => getMcConfig()).toThrow(McClientError);
-    expect(() => getMcConfig()).toThrow("MISSION_CONTROL_URL");
+    expect(() => getDispatchConfig()).toThrow(/DISPATCH_URL/);
   });
 
-  it("throws when MISSION_CONTROL_AGENT_TOKEN is missing", () => {
-    process.env.MISSION_CONTROL_URL = mockBaseUrl;
+  it("throws when DISPATCH_AGENT_TOKEN is missing", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
     clearEnv();
-    process.env.MISSION_CONTROL_URL = mockBaseUrl;
-    expect(() => getMcConfig()).toThrow(McClientError);
-    expect(() => getMcConfig()).toThrow("MISSION_CONTROL_AGENT_TOKEN");
+    process.env.DISPATCH_URL = mockBaseUrl;
+    expect(() => getDispatchConfig()).toThrow(/DISPATCH_AGENT_TOKEN/);
+  });
+
+  it("falls back to MISSION_CONTROL_URL when DISPATCH_URL is not set", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    clearEnv();
+    process.env.MISSION_CONTROL_URL = legacyBaseUrl;
+    process.env.MISSION_CONTROL_AGENT_TOKEN = legacyToken;
+    const config = getDispatchConfig();
+    expect(config.baseUrl).toBe(legacyBaseUrl);
+    expect(config.token).toBe(legacyToken);
+  });
+
+  it("prefers DISPATCH_URL over MISSION_CONTROL_URL", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    process.env.DISPATCH_URL = mockBaseUrl;
+    process.env.MISSION_CONTROL_URL = legacyBaseUrl;
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    const config = getDispatchConfig();
+    expect(config.baseUrl).toBe(mockBaseUrl);
+  });
+
+  it("prefers DISPATCH_AGENT_TOKEN over MISSION_CONTROL_AGENT_TOKEN", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    process.env.DISPATCH_URL = mockBaseUrl;
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    process.env.MISSION_CONTROL_AGENT_TOKEN = legacyToken;
+    const config = getDispatchConfig();
+    expect(config.token).toBe(mockToken);
+  });
+
+  it("includes deprecation hint in error when DISPATCH_URL is missing", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    clearEnv();
+    process.env.MISSION_CONTROL_URL = legacyBaseUrl;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    process.env.DISPATCH_URL = mockBaseUrl;
+    expect(() => getDispatchConfig()).toThrow("deprecated fallback");
   });
 });
 
 describe("resolveIssue", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    clearEnv();
     setEnv();
+    vi.resetModules();
+    await import("./mc-client");
     vi.restoreAllMocks();
   });
 
   it("returns issue data when found", async () => {
+    const { resolveIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([mockIssue]),
     );
@@ -109,6 +155,7 @@ describe("resolveIssue", () => {
   });
 
   it("returns null status when no status label exists", async () => {
+    const { resolveIssue } = await import("./mc-client");
     const issueNoStatus = { ...mockIssue, labels: ["priority/p1"] };
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([issueNoStatus]),
@@ -119,6 +166,7 @@ describe("resolveIssue", () => {
   });
 
   it("returns null lane when currentLane is undefined", async () => {
+    const { resolveIssue } = await import("./mc-client");
     const issueNoLane = { ...mockIssue, currentLane: undefined };
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([issueNoLane]),
@@ -129,14 +177,16 @@ describe("resolveIssue", () => {
   });
 
   it("throws 404 when issue not found in repo", async () => {
+    const { resolveIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([]),
     );
 
-    await expect(resolveIssue("org/repo", 99)).rejects.toThrow(McClientError);
+    await expect(resolveIssue("org/repo", 99)).rejects.toThrow(/not found/);
   });
 
   it("throws 404 with correct message when issue not found", async () => {
+    const { resolveIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([]),
     );
@@ -145,14 +195,16 @@ describe("resolveIssue", () => {
   });
 
   it("throws when API returns error", async () => {
+    const { resolveIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       errorResponse("Internal server error", 500),
     );
 
-    await expect(resolveIssue("org/repo", 42)).rejects.toThrow(McClientError);
+    await expect(resolveIssue("org/repo", 42)).rejects.toThrow(/Internal server error/);
   });
 
   it("passes repo filter in query params", async () => {
+    const { resolveIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([mockIssue]),
     );
@@ -167,12 +219,16 @@ describe("resolveIssue", () => {
 });
 
 describe("claimIssue", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    clearEnv();
     setEnv();
+    vi.resetModules();
+    await import("./mc-client");
     vi.restoreAllMocks();
   });
 
   it("calls resolve then POST /api/issues/claim", async () => {
+    const { claimIssue } = await import("./mc-client");
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock
       .mockResolvedValueOnce(jsonResponse([mockIssue])) // resolve
@@ -198,6 +254,7 @@ describe("claimIssue", () => {
   });
 
   it("passes force=true when specified", async () => {
+    const { claimIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }));
@@ -209,28 +266,34 @@ describe("claimIssue", () => {
     expect(body.force).toBe(true);
   });
 
-  it("throws McClientError when resolve fails", async () => {
+  it("throws when resolve fails", async () => {
+    const { claimIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
 
-    await expect(claimIssue("org/repo", 99, "test-agent")).rejects.toThrow(McClientError);
+    await expect(claimIssue("org/repo", 99, "test-agent")).rejects.toThrow(/not found/);
   });
 
-  it("throws McClientError when claim API returns error", async () => {
+  it("throws when claim API returns error", async () => {
+    const { claimIssue } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(errorResponse("Conflict", 409));
 
-    await expect(claimIssue("org/repo", 42, "test-agent")).rejects.toThrow(McClientError);
+    await expect(claimIssue("org/repo", 42, "test-agent")).rejects.toThrow(/Conflict/);
   });
 });
 
 describe("setIssueStatus", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    clearEnv();
     setEnv();
+    vi.resetModules();
+    await import("./mc-client");
     vi.restoreAllMocks();
   });
 
   it("calls resolve then POST /api/issues/status", async () => {
+    const { setIssueStatus } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(
@@ -244,6 +307,7 @@ describe("setIssueStatus", () => {
   });
 
   it("includes agentName in request when provided", async () => {
+    const { setIssueStatus } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] }));
@@ -256,6 +320,7 @@ describe("setIssueStatus", () => {
   });
 
   it("omits agentName when not provided", async () => {
+    const { setIssueStatus } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] }));
@@ -270,12 +335,16 @@ describe("setIssueStatus", () => {
 });
 
 describe("claimWork", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    clearEnv();
     setEnv();
+    vi.resetModules();
+    await import("./mc-client");
     vi.restoreAllMocks();
   });
 
   it("resolves, claims, and sets status in sequence", async () => {
+    const { claimWork } = await import("./mc-client");
     // claimWork calls resolveIssue 3 times (once directly + once inside claimIssue + once inside setIssueStatus)
     // plus one POST to /api/issues/claim and one POST to /api/issues/status = 5 fetch calls total
     const fetchMock = vi.spyOn(globalThis, "fetch");
@@ -305,6 +374,7 @@ describe("claimWork", () => {
   });
 
   it("uses custom status when provided", async () => {
+    const { claimWork } = await import("./mc-client");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
@@ -324,6 +394,7 @@ describe("claimWork", () => {
   });
 
   it("passes force to claimIssue", async () => {
+    const { claimWork } = await import("./mc-client");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
@@ -340,6 +411,7 @@ describe("claimWork", () => {
   });
 
   it("includes lane in task contract", async () => {
+    const { claimWork } = await import("./mc-client");
     const escalatedIssue = { ...mockIssue, currentLane: "escalated" };
     // claimWork calls resolveIssue 3 times + POST claim + POST status = 5 fetch calls
     const fetchSpy = vi.spyOn(globalThis, "fetch");
@@ -355,16 +427,16 @@ describe("claimWork", () => {
   });
 });
 
-describe("McClientError", () => {
+describe("DispatchClientError", () => {
   it("stores message and statusCode", () => {
-    const err = new McClientError("something failed", 500);
+    const err = new DispatchClientError("something failed", 500);
     expect(err.message).toBe("something failed");
     expect(err.statusCode).toBe(500);
-    expect(err.name).toBe("McClientError");
+    expect(err.name).toBe("DispatchClientError");
   });
 
   it("defaults statusCode to null", () => {
-    const err = new McClientError("oops");
+    const err = new DispatchClientError("oops");
     expect(err.statusCode).toBeNull();
   });
 });

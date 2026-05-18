@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels, removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, StatusLabel } from "@/types";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 function isStatusLabel(label: string): label is StatusLabel {
   return (STATUS_LABELS as readonly string[]).includes(label);
@@ -9,7 +10,7 @@ function isStatusLabel(label: string): label is StatusLabel {
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+  if (!isAuthorizedAgentToken(token)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -1,6 +1,8 @@
-# Mission Control
+# Dispatch
 
-OpenClaw Mission Control is a self-hosted dashboard that visualizes GitHub issues and OpenClaw agent activity. It replaces dependency on GitHub Projects while keeping GitHub Issues and PRs as the public collaboration surface.
+Kanban for AI agent work.
+
+Dispatch is a harness-agnostic Kanban and work dispatch layer for AI agents. It turns GitHub Issues and PR follow-ups into claimable queues, tracks agent runs, manages status transitions, and keeps an audit trail while GitHub remains the source of truth.
 
 ## Tech Stack
 
@@ -16,14 +18,14 @@ OpenClaw Mission Control is a self-hosted dashboard that visualizes GitHub issue
 ### Source of Truth Rules
 
 1. **GitHub is the authoritative source** for all issue/PR data
-2. **Mission Control Postgres** stores:
-   - Cached issue metadata (not the authoritative source)
-   - Local project metadata
-   - Agent runs
-   - Audit logs
-3. **Mission Control does NOT**:
-   - Mount OpenClaw config files
-   - Require access to OpenClaw's local filesystem
+2. **Dispatch Postgres** stores:
+    - Cached issue metadata (not the authoritative source)
+    - Local project metadata
+    - Agent runs
+    - Audit logs
+3. **Dispatch does NOT**:
+    - Mount agent harness configuration files
+    - Require access to an agent harness local workspace
    - Use GitHub Projects
    - Require cluster-admin or broad Kubernetes RBAC
    - Automatically close or complete tasks
@@ -31,9 +33,9 @@ OpenClaw Mission Control is a self-hosted dashboard that visualizes GitHub issue
 ### Data Flow
 
 ```
-GitHub API → Mission Control (cache) → UI
+GitHub API → Dispatch (cache) → UI
 GitHub Labels ↔ Kanban Board ↔ Audit Log
-Agent Runs → Mission Control → Agent Activity Page
+Agent Runs → Dispatch → Agent Activity Page
 ```
 
 ## Required Labels
@@ -51,7 +53,7 @@ Agent Runs → Mission Control → Agent Activity Page
 - `agent/*` - Issue is assigned to or being worked on by an agent (e.g., `agent/alpha`, `agent/beta`). The Board Agent filter is derived only from synced `agent/*` labels, not `AgentRun` names, configured agents, or GitHub assignees.
 
 ### Project Labels
-- Optional: `project/*` labels may exist on issues, but Mission Control Projects group issues by repository by default.
+- Optional: `project/*` labels may exist on issues, but Dispatch Projects groups issues by repository by default.
 
 ### Priority Labels
 - `priority/p0` - Critical
@@ -68,30 +70,48 @@ Agent Runs → Mission Control → Agent Activity Page
 
 ## Environment Variables
 
+### Preferred Variables (v0.2.1+)
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `DATABASE_URL` | Yes | PostgreSQL connection string (canonical) |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
-| `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
-| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Mission Control UI or `/api/automation/repos` after initial setup. |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Dispatch UI or `/api/automation/repos` after initial setup. |
+| `DISPATCH_URL` | No | Base URL of your Dispatch instance (used by outbound clients and MCP bridge) |
+| `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
 
+### Legacy Variables (v0.2.1 compatibility — deprecated)
+
+The following variables are accepted through v0.2.1 but **deprecated** and scheduled for removal in v0.2.2:
+
+| Variable | Description |
+|----------|-------------|
+| `MISSION_CONTROL_DATABASE_URL` | Legacy alias for database URL — falls back to `DATABASE_URL` or `DISPATCH_DATABASE_URL` if set |
+| `MISSION_CONTROL_AGENT_TOKEN` | Legacy alias for agent token — falls back to `DISPATCH_AGENT_TOKEN` if set |
+| `MISSION_CONTROL_URL` | Legacy alias for instance URL — falls back to `DISPATCH_URL` if set |
+
+**Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` > `MISSION_CONTROL_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` > `MISSION_CONTROL_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` > `MISSION_CONTROL_URL` (for instance URL).
+
+**v0.2.2 will remove all `MISSION_CONTROL_*` env var support.**
+
 ## First-Run Flow
 
-To get started with Mission Control:
+To get started with Dispatch:
 
 1. **Configure repos**: Set `GITHUB_REPOSITORIES` env var (comma or newline separated) _or_ add tracked repos via the UI after boot. `GITHUB_REPOSITORIES` is a **one-time bootstrap seed** — it is read only when the tracked-repos table is empty. Once any repo exists (seeded or added via UI), the env var is not consulted again, so updates must go through the UI or canonical API (`POST /api/automation/repos`). Env-seeded repos are tagged `source: "env"` and shown with a `seed` badge in `/automation`; user-added repos are tagged `source: "user"`.
 2. **Deploy** with your database and GitHub token configured.
 3. **Sync automation data**: `POST /api/automation/sync` (or use the Sync button on the Automation page).
-4. **Sync issues**: `POST /api/sync` (or use the Sync Issues action in the board UI). OpenClaw agent heartbeats also trigger best-effort issue sync automatically.
+4. **Sync issues**: `POST /api/sync` (or use the Sync Issues action in the board UI). Agent harnesses or worker heartbeats may also trigger best-effort issue sync automatically.
 5. **View results**: The Kanban Board shows synced issues; the Projects view groups them by repository.
 
 Production database migrations (`prisma migrate deploy`) run automatically on container startup — no manual intervention needed.
 
 ## Security
 
-Mission Control is designed as an **internal-only** application. It does not include public-facing authentication in Phase 1 (NextAuth.js is a stub for local development). The app remains internal unless external auth integration (e.g., OIDC/Authentik) is added later.
+Dispatch is designed as an **internal-only** application. It does not include public-facing authentication in Phase 1 (NextAuth.js is a stub for local development). The app remains internal unless external auth integration (e.g., OIDC/Authentik) is added later.
 
 Ensure it is only accessible within your trusted network via ingress rules.
 
@@ -197,7 +217,7 @@ Recommended Renovate flow:
 
 ## Database Setup
 
-Mission Control uses Prisma with PostgreSQL. Migrations are used for production; `db push` is for local development only.
+Dispatch uses Prisma with PostgreSQL. Migrations are used for production; `db push` is for local development only.
 
 ### Local Development
 - Use `npm run db:push` to apply schema changes without migrations.
@@ -221,9 +241,11 @@ npm run db:push
 The app uses the bjw-s/app-template Helm chart. See `home-ops/kubernetes/apps/base/llm/mission-control/` for manifests.
 
 Required secrets (via ExternalSecret):
-- `MISSION_CONTROL_DATABASE_URL` - PostgreSQL connection string
+- `DATABASE_URL` - PostgreSQL connection string (canonical)
 - `GITHUB_TOKEN` - GitHub authentication
-- `MISSION_CONTROL_AGENT_TOKEN` - Agent API bearer token
+- `DISPATCH_AGENT_TOKEN` - Agent API bearer token
+
+**Note for v0.2.1:** If you still use `MISSION_CONTROL_DATABASE_URL`, the container startup shim will derive `DATABASE_URL` from it. Update your manifests to use `DATABASE_URL` before upgrading to v0.2.2.
 
 ## API Endpoints
 
@@ -254,25 +276,25 @@ Stop tracking a repository. `[repo]` is the URL-encoded `owner/repo` fullName. H
 Sync all issues from configured repositories. Intended callers are:
 
 - the board UI's manual **Sync Issues** action
-- openclaw agent heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
+- agent harness or worker heartbeat best-effort cache refresh (see Scheduled Issue Sync Strategy below)
 
 ### GET /api/agent-runs
 List agent runs. Query params: `limit`
 
 ### POST /api/agent-runs
-Create agent run. Requires `MISSION_CONTROL_AGENT_TOKEN` bearer auth.
+Create agent run. Requires `DISPATCH_AGENT_TOKEN` bearer auth.
 
 ### GET /api/audit
 List audit logs. Query params: `limit`, `repo`
 
 **Note: Issue sync and automation sync are separate concerns.**
-- **Issue sync** (`POST /api/sync`) refreshes GitHub issues into the Kanban board. It is heartbeat-driven (best-effort via openclaw agent) or manual via UI.
+- **Issue sync** (`POST /api/sync`) refreshes GitHub issues into the Kanban board. It is heartbeat-driven (best-effort via agent harness) or manual via UI.
 - **Automation sync** (`POST /api/automation/sync`) refreshes CI/CD, workflow runs, releases, and packages data. It is managed independently on the Automation page.
 - Each sync operates on its own data models and caching layer.
 
 ## Automation Section
 
-Mission Control includes an Automation section that discovers and visualizes CI/CD, builds, tests, security scans, releases, and scheduled workflows from GitHub repositories.
+Dispatch includes an Automation section that discovers and visualizes CI/CD, builds, tests, security scans, releases, and scheduled workflows from GitHub repositories.
 
 ### Data Sources Used
 
@@ -347,9 +369,9 @@ For control actions (rerun, dispatch):
 
 ## Pre-migration Smoke Checklist
 
-Run this checklist before pointing an OpenClaw agent at Mission Control as its task-visibility layer (instead of a GitHub Project board). Every step should pass; stop and investigate on the first failure.
+Run this checklist before pointing an agent harness at Dispatch as its task-visibility layer (instead of a GitHub Project board). Every step should pass; stop and investigate on the first failure.
 
-Set `BASE` to your Mission Control URL (e.g. `BASE=https://mission-control.internal`) before running.
+Set `BASE` to your Dispatch URL (e.g. `BASE=https://dispatch.internal`) before running.
 
 | # | Check | Expected |
 |---|-------|----------|
@@ -360,7 +382,7 @@ Set `BASE` to your Mission Control URL (e.g. `BASE=https://mission-control.inter
 | 5 | `curl -fsS "$BASE/api/issues"` | JSON array, length > 0 |
 | 6 | Open `/board` in a browser | Issues render — no "no issues synced yet" empty state |
 | 7 | Open `/projects` | Repo groups render |
-| 8 | Open `/agents` | Recent OpenClaw agent heartbeat visible with agent name |
+| 8 | Open `/agents` | Recent agent heartbeat visible with agent name |
 | 9 | Move a low-risk test issue between columns | GitHub label changes; AuditLog row appears in `GET /api/audit` |
 | 10 | `kubectl logs -n <ns> <pod>` (or equivalent) | No Prisma / BigInt / FK errors |
 
@@ -368,25 +390,25 @@ Only flip the agent's workflow over once all ten steps pass.
 
 ## Scheduled Issue Sync Strategy
 
-Mission Control keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **openclaw agent heartbeat sync** rather than by a Mission Control background worker or new cluster CronJob.
+Dispatch keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **agent harness heartbeat sync** rather than by a Dispatch background worker or new cluster CronJob.
 
 Decision:
-- At the start of each openclaw agent heartbeat, the agent should make a best-effort `POST` request to Mission Control's `/api/sync` endpoint.
+- At the start of each heartbeat, the agent harness should make a best-effort `POST` request to Dispatch's `/api/sync` endpoint.
 - The request must be non-blocking for heartbeat work: log/report a warning if the sync fails or times out, then continue the heartbeat.
 - Manual UI sync remains supported for immediate refreshes and troubleshooting.
 
 Rationale:
-- Reuses the existing heartbeat that already reports to Mission Control, so no new Kubernetes manifests, images, queues, or background scheduler are required.
+- Reuses the existing heartbeat that already reports to Dispatch, so no new Kubernetes manifests, images, queues, or background scheduler are required.
 - Keeps cache freshness close to the agent workflow that consumes the board.
-- Preserves Mission Control's simple app model: it serves API/UI requests and does not need long-running in-process scheduling state.
+- Preserves Dispatch's simple app model: it serves API/UI requests and does not need long-running in-process scheduling state.
 
 Rejected alternatives for the first implementation:
 - **Kubernetes CronJob**: valid later if heartbeat-driven sync is too sparse, but it adds deployment and auth plumbing for little immediate benefit.
-- **Mission Control internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
+- **Dispatch internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
 
 Operational notes:
-- Configure the openclaw agent with `MISSION_CONTROL_URL` and any required network access to reach Mission Control.
-- `/api/sync` currently does not require `MISSION_CONTROL_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
+- Configure the agent harness with `DISPATCH_URL` and any required network access to reach Dispatch.
+- `/api/sync` currently does not require `DISPATCH_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
 - Treat sync failures as freshness warnings, not heartbeat failures, unless the heartbeat itself cannot complete.
 
 ### Known Limitations
@@ -413,7 +435,7 @@ Operational notes:
 
 ## Container Image
 
-The Mission Control Docker image is built and published via GitHub Actions CI/CD.
+The Dispatch Docker image is built and published via GitHub Actions CI/CD.
 
 ### Image Name
 
@@ -423,7 +445,7 @@ ghcr.io/misospace/mission-control
 
 ### Workflow
 
-`.github/workflows/image.yaml` - Build Mission Control Image
+`.github/workflows/image.yaml` - Build Dispatch Image
 
 ### Triggers
 
@@ -446,7 +468,7 @@ ghcr.io/misospace/mission-control
 # Via GitHub CLI
 gh workflow run image.yaml
 
-# Via web: Actions > Build Mission Control Image > Run workflow
+# Via web: Actions > Build Dispatch Image > Run workflow
 ```
 
 ### Required GitHub Settings
@@ -484,6 +506,6 @@ docker build -t ghcr.io/misospace/mission-control:local .
 docker run -p 3000:3000 \
   -e DATABASE_URL="postgresql://..." \
   -e GITHUB_TOKEN="ghp_..." \
-  -e MISSION_CONTROL_AGENT_TOKEN="..." \
+  -e DISPATCH_AGENT_TOKEN="..." \
   ghcr.io/misospace/mission-control:local
 ```

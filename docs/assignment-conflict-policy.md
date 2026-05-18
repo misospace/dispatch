@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document defines the rules governing how agents claim issues through Mission Control's assignment system.
+This document defines the rules governing how agents claim issues through Dispatch's assignment system.
 It applies to all `agent/<name>` and `owner/<name>` labels on synced GitHub issues.
 
 > **No specific agent or owner names are hardcoded.** All rules use generic prefixes (`agent/`, `owner/`)

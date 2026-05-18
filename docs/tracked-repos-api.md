@@ -5,7 +5,7 @@
 
 ## Overview
 
-Mission Control exposes tracked repositories through a stable API endpoint so that
+Dispatch exposes tracked repositories through a stable API endpoint so that
 automation jobs and audit consumers can discover repos without hardcoded names or
 dependency on the legacy `project_groom.py` script.
 

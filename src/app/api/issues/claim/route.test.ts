@@ -8,7 +8,7 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 const mockToken = "test-agent-token";
-process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: { issue: { findUnique: mocks.findUnique, update: mocks.updateIssue }, auditLog: { create: mocks.createAuditLog } },

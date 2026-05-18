@@ -1,10 +1,10 @@
-# Worker Cron Prompt Migration to Mission Control Queues
+# Worker Cron Prompt Migration to Dispatch Queues
 
 > **Issue:** [misospace/mission-control#70](https://github.com/misospace/mission-control/issues/70)  
 > **Date:** 2026-05-17  
 > **Status:** Migrated
 
-This document describes the migration of worker cron prompts from GitHub Project board readers to Mission Control queue APIs.
+This document describes the migration of worker cron prompts from GitHub Project board readers to Dispatch queue APIs.
 
 ## Problem
 
@@ -16,19 +16,21 @@ These scripts queried the GitHub Projects GraphQL API directly, coupling worker 
 
 ## Solution
 
-Worker cron prompts now consume work from Mission Control's assignment queue APIs:
+Worker cron prompts now consume work from Dispatch's assignment queue APIs:
 
 | Lane | Endpoint |
 |------|----------|
 | Normal | `GET /api/agents/{agentName}/queue?lane=normal` |
 | Escalated | `GET /api/agents/{agentName}/queue?lane=escalated` (also accepts `lane=gpt`) |
 
-Workers use Mission Control action APIs for work management:
+Workers use Dispatch action APIs for work management:
 - Claim work: `POST /api/issues/claim`
 - Set status: `POST /api/issues/status` (preferred for status transitions)
 - Move labels: `POST /api/issues/move` (legacy, requires oldLabels/newLabels)
 
-All worker-facing mutation endpoints require bearer authentication via `MISSION_CONTROL_AGENT_TOKEN`.
+All worker-facing mutation endpoints require bearer authentication via `DISPATCH_AGENT_TOKEN`.
+
+> **v0.2.1 compatibility:** The legacy `MISSION_CONTROL_AGENT_TOKEN` is accepted as a fallback through v0.2.1. It will be removed in v0.2.2. Prefer `DISPATCH_AGENT_TOKEN`.
 
 ## Queue Response Format
 
@@ -64,16 +66,16 @@ python3 /home/node/.openclaw/workspace-saffron/scripts/wishlist_read_board.py
 
 **After:**
 ```bash
-curl -s "MISSION_CONTROL_URL/api/agents/{agentName}/queue?lane=normal" | python3 -c "import json,sys; items=json.load(sys.stdin); [print(json.dumps(i)) for i in items[:10]]"
+curl -s "DISPATCH_URL/api/agents/{agentName}/queue?lane=normal" | python3 -c "import json,sys; items=json.load(sys.stdin); [print(json.dumps(i)) for i in items[:10]]"
 ```
 
 ### 2. Add work claiming step before processing
 
-Workers must claim work through Mission Control before starting. **Claim only assigns** the agent label — it does not change the status label. Workers must explicitly set status via `POST /api/issues/status` after claiming or when transitioning states.
+Workers must claim work through Dispatch before starting. **Claim only assigns** the agent label — it does not change the status label. Workers must explicitly set status via `POST /api/issues/status` after claiming or when transitioning states.
 
 ```bash
-curl -s -X POST "MISSION_CONTROL_URL/api/issues/claim" \
-  -H "Authorization: Bearer $MISSION_CONTROL_AGENT_TOKEN" \
+curl -s -X POST "DISPATCH_URL/api/issues/claim" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"issueId":"{mc_issue_id}","repoFullName":"{repo}","issueNumber":{number},"agentName":"{agentName}"}'
 ```
@@ -83,8 +85,8 @@ curl -s -X POST "MISSION_CONTROL_URL/api/issues/claim" \
 After claiming, workers should transition to in-progress:
 
 ```bash
-curl -s -X POST "MISSION_CONTROL_URL/api/issues/status" \
-  -H "Authorization: Bearer $MISSION_CONTROL_AGENT_TOKEN" \
+curl -s -X POST "DISPATCH_URL/api/issues/status" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"issueId":"{mc_issue_id}","repoFullName":"{repo}","issueNumber":{number},"status":"in-progress"}'
 ```
@@ -98,8 +100,8 @@ When the issue is complete, set status to `done` **only** after verifying comple
 The `/api/issues/move` endpoint requires `oldLabels` and `newLabels` arrays:
 
 ```bash
-curl -s -X POST "MISSION_CONTROL_URL/api/issues/move" \
-  -H "Authorization: Bearer $MISSION_CONTROL_AGENT_TOKEN" \
+curl -s -X POST "DISPATCH_URL/api/issues/move" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"issueId":"{mc_issue_id}","repoFullName":"{repo}","issueNumber":{number},"oldLabels":["status/backlog"],"newLabels":["status/in-progress"]}'
 ```
@@ -142,7 +144,7 @@ To transition status, workers must call `POST /api/issues/status` explicitly. Th
 
 ## PR Fix Queue Status
 
-The Mission Control application does not yet have a dedicated PR fix queue endpoint. The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native MC PR fix queue is implemented.
+The Dispatch application has a dedicated PR fix queue (`/api/pr-fix-queue/*`). The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native Dispatch PR fix queue is fully implemented.
 
 ## Deprecated Scripts
 
@@ -154,10 +156,9 @@ These should be removed once all cron jobs have been verified to work with the n
 
 ## Acceptance Criteria (from Issue #70)
 
-- [x] Normal worker prompt reads Mission Control normal queue instead of `wishlist_read_board.py`
-- [x] Escalated lane worker prompt reads Mission Control escalated queue instead of `wishlist_read_gpt_audit_board.py`
-- [x] Workers still check PR review-fix queue first (MC has no replacement yet)
-- [x] Workers claim work through Mission Control before starting
+- [x] Normal worker prompt reads Dispatch normal queue instead of `wishlist_read_board.py`
+- [x] Escalated lane worker prompt reads Dispatch escalated queue instead of `wishlist_read_gpt_audit_board.py`
+- [x] Workers claim work through Dispatch before starting
 - [x] Workers update status through `POST /api/issues/status` (preferred) or `POST /api/issues/move` (legacy)
 - [x] Workers still avoid duplicate PRs
 - [x] Workers preserve hard completion gates
