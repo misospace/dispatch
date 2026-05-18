@@ -1,6 +1,6 @@
 # Generic Agent Workflow — Dispatch Assignment Layer
 
-> **Issue:** [misospace/mission-control#59](https://github.com/misospace/mission-control/issues/59)
+> **Issue:** [misospace/dispatch#59](https://github.com/misospace/dispatch/issues/59)
 > **Date:** 2026-05-16
 
 This document defines the operational workflow for any agent using Dispatch's assignment layer.

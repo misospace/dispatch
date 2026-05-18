@@ -1,6 +1,6 @@
 # Worker Cron Prompt Migration to Dispatch Queues
 
-> **Issue:** [misospace/mission-control#70](https://github.com/misospace/mission-control/issues/70)  
+> **Issue:** [misospace/dispatch#70](https://github.com/misospace/dispatch/issues/70)  
 > **Date:** 2026-05-17  
 > **Status:** Migrated
 

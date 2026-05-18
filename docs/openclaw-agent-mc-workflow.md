@@ -1,7 +1,7 @@
 # OpenClaw Agent — Dispatch Phase 1 Workflow Contract
 
 > **Status:** Pre-cutover documentation
-> **Issue:** [misospace/mission-control#53](https://github.com/misospace/mission-control/issues/53)
+> **Issue:** [misospace/dispatch#53](https://github.com/misospace/dispatch/issues/53)
 > **Date:** 2026-05-15
 
 This document defines the operational contract between an OpenClaw agent and Dispatch during Phase 1 of the migration from GitHub Projects to Dispatch-backed visibility.
@@ -46,7 +46,7 @@ Content-Type: application/json
   "finishedAt": "2026-05-15T13:47:00.000Z",
   "summary": "Processed 3 issues, opened 1 PR",
   "touchedIssueUrls": [
-    "https://github.com/misospace/mission-control/pull/74",
+    "https://github.com/misospace/dispatch/pull/74",
     "https://github.com/misospace/miso-gallery/issues/143"
   ]
 }
