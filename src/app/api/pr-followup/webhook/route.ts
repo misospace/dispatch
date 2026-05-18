@@ -4,6 +4,17 @@ import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 
 /**
+ * Extract linked issue numbers from PR metadata (title/body).
+ */
+function extractLinkedIssueFromPr(pr: Record<string, unknown>): number | null {
+  const title = (pr.title as string) ?? "";
+  const body = (pr.body as string) ?? "";
+  const text = [title, body].filter(Boolean).join("\n");
+  const match = text.match(/#(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+/**
  * GitHub Webhook Handler for PR Follow-up Events
  *
  * Receives push events for:
@@ -48,6 +59,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         body: prReview.review?.body ?? "",
         id: String(prReview.review?.id),
         state: prReview.review?.state,
+        linkedIssue: extractLinkedIssueFromPr(pr),
       });
       break;
     }
@@ -67,6 +79,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         author: pr.user?.login ?? null,
         body: comment.comment?.body ?? "",
         id: String(comment.comment?.id),
+        linkedIssue: extractLinkedIssueFromPr(pr),
       });
       break;
     }
@@ -86,6 +99,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         author: issue.user?.login ?? null,
         body: issueComment.comment?.body ?? "",
         id: String(issueComment.comment?.id),
+        linkedIssue: extractLinkedIssueFromPr(issue as Record<string, unknown>),
       });
       break;
     }
@@ -98,6 +112,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
       // Derive PR association from check.pull_requests (not checkRun.sender)
       let prNumber: number | undefined = undefined;
       let prAuthor: string | null = null;
+      let prLinkedIssue: number | null = null;
       const prList = check.pull_requests ?? [];
       if (Array.isArray(prList) && prList.length > 0) {
         const firstPr = prList[0] as Record<string, any> | undefined;
@@ -106,6 +121,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
           if (match) {
             prNumber = parseInt(match[1], 10);
             prAuthor = firstPr.user?.login ?? null;
+            prLinkedIssue = extractLinkedIssueFromPr(firstPr);
           }
         }
       }
@@ -125,6 +141,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         id: String(check.id),
         conclusion: check.conclusion,
         checkName: check.name,
+        linkedIssue: prLinkedIssue,
       });
       break;
     }
@@ -143,6 +160,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         author: pr.user?.login ?? null,
         mergeStateStatus: pr.mergeable_state,
         id: String(pr.id ?? Date.now()),
+        linkedIssue: extractLinkedIssueFromPr(pr),
       });
       break;
     }

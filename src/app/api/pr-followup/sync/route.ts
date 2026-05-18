@@ -21,6 +21,7 @@ interface GithubPR {
   number: number;
   url: string;
   title: string;
+  body: string | null;
   state: string;
   user: { login: string };
   head: { ref: string };
@@ -30,6 +31,16 @@ interface GithubPR {
   merged_at: string | null;
   draft: boolean;
   mergeable_state?: string;
+}
+
+/**
+ * Extract linked issue numbers from a PR's title and body.
+ * Matches patterns like "#42", "Fixes #42", "Closes #42", etc.
+ */
+function extractLinkedIssue(pr: GithubPR): number | null {
+  const text = [pr.title, pr.body].filter(Boolean).join("\n");
+  const match = text.match(/#(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
 }
 
 interface GithubComment {
@@ -110,6 +121,8 @@ export async function POST() {
       prsScanned += botPrs.length;
 
       for (const pr of botPrs) {
+        const linkedIssue = extractLinkedIssue(pr);
+
         // Fetch comments on this PR and collect events
         try {
           const commentsUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`;
@@ -129,6 +142,7 @@ export async function POST() {
               author: pr.user.login,
               body: comment.body,
               id: String(comment.id),
+              linkedIssue,
             });
           }
         } catch {
@@ -153,6 +167,7 @@ export async function POST() {
                 body: review.body,
                 id: String(review.id),
                 state: review.state,
+                linkedIssue,
               });
             } else {
               totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
@@ -181,6 +196,7 @@ export async function POST() {
                 id: String(checkRun.id),
                 conclusion: checkRun.conclusion,
                 checkName: checkRun.name,
+                linkedIssue,
               });
             } else {
               totalSkipped++;
@@ -202,6 +218,7 @@ export async function POST() {
             author: pr.user.login,
             mergeStateStatus: pr.mergeable_state,
             id: String(pr.id ?? Date.now()),
+            linkedIssue,
           });
         }
       }
