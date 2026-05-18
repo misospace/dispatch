@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { parseLaneClassification, classifyByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 interface LaneRequestBody {
   force?: boolean;
@@ -13,7 +14,7 @@ interface LaneRequestBody {
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+  if (!isAuthorizedAgentToken(token)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -134,7 +135,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
  */
 export async function GET(_request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const token = _request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+  if (!isAuthorizedAgentToken(token)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

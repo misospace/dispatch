@@ -1,23 +1,25 @@
-# Generic Agent Workflow — Mission Control Assignment Layer
+# Generic Agent Workflow — Dispatch Assignment Layer
 
 > **Issue:** [misospace/mission-control#59](https://github.com/misospace/mission-control/issues/59)
 > **Date:** 2026-05-16
 
-This document defines the operational workflow for any agent using Mission Control's assignment layer.
+This document defines the operational workflow for any agent using Dispatch's assignment layer.
 It is intentionally generic — no specific agent names or implementations are referenced.
 
 ## Overview
 
-Mission Control provides a Postgres-backed cache of GitHub Issues that agents use to discover, claim, and track work.
+Dispatch provides a Postgres-backed cache of GitHub Issues that agents use to discover, claim, and track work.
 The cache is refreshed periodically via sync endpoints; all state changes flow through the API, which writes back to GitHub.
 
-> **GitHub Issues and PRs remain the source of truth.** Mission Control's database is a cache, not authoritative storage.
+> **GitHub Issues and PRs remain the source of truth.** Dispatch's database is a cache, not authoritative storage.
 
 ## Prerequisites
 
 - An agent identity string (e.g. `"agent-name"`). This maps to `agent/agent-name` labels on issues.
-- A `MISSION_CONTROL_AGENT_TOKEN` environment variable with a valid bearer token for authenticated endpoints.
-- The base URL of the Mission Control instance (e.g. `https://mc.example.com` or `http://localhost:3000`).
+- A `DISPATCH_AGENT_TOKEN` environment variable with a valid bearer token for authenticated endpoints.
+- The base URL of the Dispatch instance (e.g. `https://dispatch.example.com` or `http://localhost:3000`).
+
+> **v0.2.1 compatibility:** `MISSION_CONTROL_AGENT_TOKEN` and `MISSION_CONTROL_URL` are accepted as deprecated fallbacks through v0.2.1. They will be removed in v0.2.2. Prefer `DISPATCH_AGENT_TOKEN` and `DISPATCH_URL`.
 
 ## Complete Workflow
 
@@ -27,7 +29,7 @@ Before doing any work, start an agent run record. This creates an audit trail en
 
 ```
 POST /api/agent-runs
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -49,7 +51,7 @@ Content-Type: application/json
 
 ### 2. Sync Issue State
 
-Refresh Mission Control's cache of GitHub Issues before selecting work. This fetches the latest issue state from GitHub.
+Refresh Dispatch's cache of GitHub Issues before selecting work. This fetches the latest issue state from GitHub.
 
 ```
 POST /api/sync
@@ -83,11 +85,11 @@ Issues with an existing `agent/<other>` label remain visible in the queue so age
 
 ### 4. Claim Work
 
-Claim an issue by requesting an agent assignment through Mission Control. This adds an `agent/<name>` label to the issue on GitHub and optionally moves it to `status/in-progress`.
+Claim an issue by requesting an agent assignment through Dispatch. This adds an `agent/<name>` label to the issue on GitHub and optionally moves it to `status/in-progress`.
 
 ```
 POST /api/issues/claim
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -120,7 +122,7 @@ When the agent finishes its work cycle, report run status to close out the run r
 
 ```
 POST /api/agent-runs
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -149,7 +151,7 @@ Release an issue back to the pool when the agent can no longer work on it.
 
 ```
 POST /api/issues/unclaim
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -178,7 +180,7 @@ Move an issue between board columns by updating its status label.
 
 ```
 POST /api/issues/move
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -190,7 +192,7 @@ This endpoint writes to the audit log and updates both GitHub labels and the loc
 
 | Rule | Detail |
 |------|--------|
-| GitHub is authoritative | Issues and PRs on GitHub are the single source of truth. Mission Control's Postgres is a cache. |
+| GitHub is authoritative | Issues and PRs on GitHub are the single source of truth. Dispatch's Postgres is a cache. |
 | No direct DB writes | Never query or write to the Postgres cache directly — use the API. |
 | No auto-close | Do not auto-close issues without explicit evidence of completion (green pipeline, merged PR, or human approval). |
 
@@ -198,21 +200,21 @@ This endpoint writes to the audit log and updates both GitHub labels and the loc
 
 | Constraint | Detail |
 |------------|--------|
-| Never log agent tokens | `MISSION_CONTROL_AGENT_TOKEN` must never be logged, echoed, or persisted to disk. |
+| Never log agent tokens | `DISPATCH_AGENT_TOKEN` must never be logged, echoed, or persisted to disk. |
 | Never log GitHub tokens | Same constraint applies to all GitHub authentication tokens. |
-| Audit trail required | Every state-changing move on Mission Control produces an `AuditLog` row. Operators trace agent activity through `/api/audit`. |
+| Audit trail required | Every state-changing move on Dispatch produces an `AuditLog` row. Operators trace agent activity through `/api/audit`. |
 
 ## Failure Modes
 
-All Mission Control interactions are best-effort from the agent's perspective:
+All Dispatch interactions are best-effort from the agent's perspective:
 
 1. **Sync failure** → Log warning, continue workflow.
 2. **Run POST failure** → Log warning, continue. The run record is a visibility aid, not a gating dependency.
 3. **Queue fetch failure** → Fall back to GitHub Issues API directly.
 4. **Claim failure** → Retry with `force: true` if appropriate, or skip the issue and try the next one.
-5. **Health check failure** → If `/api/health` returns `{ ok: false }` with 503, the database may be unreachable but Mission Control itself is still responsive.
+5. **Health check failure** → If `/api/health` returns `{ ok: false }` with 503, the database may be unreachable but Dispatch itself is still responsive.
 
-**Critical principle:** Mission Control failures must never crash agent heartbeat or workflow runs. The agent should always fall back to GitHub as the source of truth.
+**Critical principle:** Dispatch failures must never crash agent heartbeat or workflow runs. The agent should always fall back to GitHub as the source of truth.
 
 ## API Reference Summary
 
@@ -220,7 +222,7 @@ All Mission Control interactions are best-effort from the agent's perspective:
 |----------|--------|------|---------|
 | `/api/health` | GET | None | Health check — `{ ok: true, database: "ok" }` |
 | `/api/sync` | POST | None | Trigger issue sync from GitHub |
-| `/api/issues` | GET | None | List all issues in Mission Control cache |
+| `/api/issues` | GET | None | List all issues in Dispatch cache |
 | `/api/agents/<name>/queue` | GET | None | Agent-specific issue queue |
 | `/api/issues/claim` | POST | Bearer token | Claim an issue (adds agent label) |
 | `/api/issues/unclaim` | POST | Bearer token | Release an issue (removes agent label) |

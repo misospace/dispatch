@@ -18,13 +18,13 @@ describe("ThemeToggle", () => {
     await user.click(button);
 
     expect(document.documentElement).toHaveClass("dark");
-    expect(localStorage.getItem("mission-control-theme")).toBe("dark");
+    expect(localStorage.getItem("dispatch-theme")).toBe("dark");
     expect(screen.getByRole("button", { name: "Switch to light mode" })).toBeInTheDocument();
   });
 
   it("toggles back to light mode", async () => {
     const user = userEvent.setup();
-    localStorage.setItem("mission-control-theme", "dark");
+    localStorage.setItem("dispatch-theme", "dark");
 
     render(React.createElement(ThemeToggle));
 
@@ -32,6 +32,6 @@ describe("ThemeToggle", () => {
     await user.click(button);
 
     expect(document.documentElement).not.toHaveClass("dark");
-    expect(localStorage.getItem("mission-control-theme")).toBe("light");
+    expect(localStorage.getItem("dispatch-theme")).toBe("light");
   });
 });

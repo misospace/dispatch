@@ -52,40 +52,42 @@ export interface ClaimWorkResult {
   taskContract: string;
 }
 
-export class McClientError extends Error {
+export class DispatchClientError extends Error {
   constructor(
     message: string,
     public readonly statusCode: number | null = null,
   ) {
     super(message);
-    this.name = "McClientError";
+    this.name = "DispatchClientError";
   }
 }
 
-export function getMcConfig(): { baseUrl: string; token: string } {
-  const baseUrl = process.env.MISSION_CONTROL_URL;
-  const token = process.env.MISSION_CONTROL_AGENT_TOKEN;
+import { getDispatchUrl, getDispatchAgentToken } from "./dispatch-env";
+
+export function getDispatchConfig(): { baseUrl: string; token: string } {
+  const baseUrl = getDispatchUrl();
+  const token = getDispatchAgentToken();
 
   if (!baseUrl) {
-    throw new McClientError(
-      "MISSION_CONTROL_URL is not set. Set it to your Mission Control instance URL.",
+    throw new DispatchClientError(
+      "DISPATCH_URL is not set. Set it to your Dispatch instance URL. (MISSION_CONTROL_URL is accepted as a deprecated fallback through v0.2.1.)",
     );
   }
 
   if (!token) {
-    throw new McClientError(
-      "MISSION_CONTROL_AGENT_TOKEN is not set. Set it to your agent bearer token.",
+    throw new DispatchClientError(
+      "DISPATCH_AGENT_TOKEN is not set. Set it to your agent bearer token. (MISSION_CONTROL_AGENT_TOKEN is accepted as a deprecated fallback through v0.2.1.)",
     );
   }
 
   return {
-    baseUrl: baseUrl.replace(/\/+$/, ""),
+    baseUrl,
     token,
   };
 }
 
 async function mcFetch(path: string, options: RequestInit): Promise<Response> {
-  const { baseUrl, token } = getMcConfig();
+  const { baseUrl, token } = getDispatchConfig();
   const url = `${baseUrl}${path}`;
 
   const headers: Record<string, string> = {
@@ -118,7 +120,7 @@ async function mcJson<T>(path: string, options: RequestInit): Promise<T> {
     } catch {
       errorMessage = text || `HTTP ${response.status}`;
     }
-    throw new McClientError(errorMessage, response.status);
+    throw new DispatchClientError(errorMessage, response.status);
   }
 
   if (!text) {
@@ -139,7 +141,7 @@ export async function resolveIssue(
   const issue = issues.find((i) => i.number === issueNumber);
 
   if (!issue) {
-    throw new McClientError(
+    throw new DispatchClientError(
       `Issue #${issueNumber} not found in ${repoFullName}. Sync the repo first or verify the issue number.`,
       404,
     );

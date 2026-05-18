@@ -1,8 +1,8 @@
 # AGENTS.md
 
-## Mission Control Overview
+## Dispatch Overview
 
-Mission Control is a self-hosted Next.js/TypeScript dashboard that visualizes GitHub issues and agent activity. It uses Prisma with PostgreSQL as its database.
+Dispatch is a self-hosted Next.js/TypeScript Kanban and work dispatch layer for AI agents. It uses Prisma with PostgreSQL as its database.
 
 ## Tech Stack
 
@@ -29,14 +29,30 @@ npm run db:deploy    # Deploy migrations (prod)
 
 ### Environment Variables
 
+#### Preferred (v0.2.1+)
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `DATABASE_URL` | Yes | PostgreSQL connection string (canonical) |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token |
-| `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API |
 | `GITHUB_REPOSITORIES` | Yes | **One-time** bootstrap seed for tracked repos (comma or newline separated). Read only when `AutomationRepo` is empty. After first seed, manage via `/automation` UI or `POST /api/repos` / `POST /api/automation/repos`. Seeded repos carry `source: "env"`; UI-added repos carry `source: "user"`. |
+| `DISPATCH_URL` | No | Base URL of your Dispatch instance (used by outbound clients and MCP bridge) |
+| `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
+
+#### Legacy (v0.2.1 compatibility — deprecated, removed in v0.2.2)
+
+| Variable | Description |
+|----------|-------------|
+| `MISSION_CONTROL_DATABASE_URL` | Legacy database URL alias |
+| `MISSION_CONTROL_AGENT_TOKEN` | Legacy agent token alias |
+| `MISSION_CONTROL_URL` | Legacy instance URL alias |
+
+Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL` > `MISSION_CONTROL_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` > `MISSION_CONTROL_AGENT_TOKEN`. `DISPATCH_URL` > `MISSION_CONTROL_URL`.
+
+The container startup shim (`docker-entrypoint.sh`) maps legacy vars to preferred names at container start. API routes accept both preferred and legacy tokens for bearer auth during v0.2.1.
 
 ### Label Conventions
 
@@ -53,7 +69,7 @@ Labels follow a `category/value` pattern:
 
 ### Issue Execution Lane Classification
 
-Mission Control classifies issues into three execution lanes:
+Dispatch classifies issues into three execution lanes:
 
 - **NORMAL**: Concrete, scoped, testable implementation work suitable for a standard worker. Examples: bounded frontend/backend fixes, documentation, tests, CI/lint, release/version drift, dependency updates, concrete follow-up issues with clear acceptance criteria.
 - **ESCALATED**: Requires higher-judgment model support (may be GPT-5.5, Claude Opus, GLM-5.1, or another provider). Examples: architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, audit parent decomposition.
@@ -166,17 +182,17 @@ Returns 503 if database is unreachable.
 
 ## OpenClaw Agent Workflow Contract
 
-This section is the source of truth for how an OpenClaw agent should interact with Mission Control. Agents should follow this contract instead of grooming a GitHub Project board.
+This section is the source of truth for how an OpenClaw agent should interact with Dispatch. Agents should follow this contract instead of grooming a GitHub Project board.
 
 ### Heartbeat lifecycle
 
 At the **start** of each heartbeat:
 
-1. **Best-effort `POST /api/sync`** to refresh Mission Control's issue cache. Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
+1. **Best-effort `POST /api/sync`** to refresh Dispatch's issue cache. Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
 
 At the **end** of each heartbeat:
 
-2. **`POST /api/agent-runs`** (bearer-auth with `MISSION_CONTROL_AGENT_TOKEN`) with run metadata: `agentName`, `runType`, `status`, `startedAt`, `finishedAt`, `summary`, `touchedIssueUrls`.
+2. **`POST /api/agent-runs`** (bearer-auth with `DISPATCH_AGENT_TOKEN`) with run metadata: `agentName`, `runType`, `status`, `startedAt`, `finishedAt`, `summary`, `touchedIssueUrls`.
 
 ### Reading work
 
@@ -188,18 +204,18 @@ At the **end** of each heartbeat:
 
 ### Source of truth
 
-8. **GitHub Issues and PRs remain the source of truth.** Mission Control's Postgres is a cache; do not write back to it as if it were authoritative.
+8. **GitHub Issues and PRs remain the source of truth.** Dispatch's Postgres is a cache; do not write back to it as if it were authoritative.
 9. **Do not rely on GitHub Projects.** The Projects board is deprecated for this workflow — group by repository instead.
-10. **Do not auto-close issues without explicit evidence of completion.** Mission Control's audit log is not a license to close — a green pipeline, merged PR, or human approval is.
+10. **Do not auto-close issues without explicit evidence of completion.** Dispatch's audit log is not a license to close — a green pipeline, merged PR, or human approval is.
 
 ### Failure modes
 
-11. **Mission Control failures must not fail the heartbeat.** Sync, agent-run POST, and issue read are all best-effort from the heartbeat's perspective. Log a warning, continue.
-12. **Tokens are secrets.** `MISSION_CONTROL_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
+11. **Dispatch failures must not fail the heartbeat.** Sync, agent-run POST, and issue read are all best-effort from the heartbeat's perspective. Log a warning, continue.
+12. **Tokens are secrets.** `DISPATCH_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
 
 ### Auditability
 
-13. **Every state-changing move on Mission Control must produce an AuditLog row.** Operators trace agent activity through `/api/audit`. Drag-and-drop moves on the Kanban board already write audit entries via `POST /api/issues/move`; agents using the same endpoint inherit this behavior.
+13. **Every state-changing move on Dispatch must produce an AuditLog row.** Operators trace agent activity through `/api/audit`. Drag-and-drop moves on the Kanban board already write audit entries via `POST /api/issues/move`; agents using the same endpoint inherit this behavior.
 
 ### Worker execution contract
 
@@ -207,4 +223,4 @@ For the detailed worker execution contract (PR fix queue precedence, duplicate P
 
 ### Worker cron prompt migration
 
-Worker cron prompts have been migrated from GitHub Project board readers to Mission Control queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](./docs/worker-cron-prompt-migration.md).
+Worker cron prompts have been migrated from GitHub Project board readers to Dispatch queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](./docs/worker-cron-prompt-migration.md).

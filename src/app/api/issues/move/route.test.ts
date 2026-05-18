@@ -12,7 +12,7 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 const mockToken = "test-agent-token";
-process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 // Mock dependencies — return the mock functions directly
 vi.mock("@/lib/prisma", () => ({

@@ -10,8 +10,8 @@ import {
 const mockToken = "test-agent-token";
 const mockBaseUrl = "http://localhost:3000";
 
-process.env.MISSION_CONTROL_URL = mockBaseUrl;
-process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_URL = mockBaseUrl;
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {

@@ -3,7 +3,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrFixQueueClient } from "@/lib/pr-fix-queue";
 
 const databaseUrl =
-  process.env.DATABASE_URL ?? "postgresql://mission-control:mission-control@localhost:5432/mission-control";
+  process.env.DATABASE_URL ?? "postgresql://dispatch:dispatch@localhost:5432/dispatch";
 
 const adapter = new PrismaPg(databaseUrl);
 
