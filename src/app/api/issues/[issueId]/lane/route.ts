@@ -13,7 +13,7 @@ interface LaneRequestBody {
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+  if (token !== process.env.DISPATCH_AGENT_TOKEN) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -134,7 +134,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
  */
 export async function GET(_request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const token = _request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+  if (token !== process.env.DISPATCH_AGENT_TOKEN) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

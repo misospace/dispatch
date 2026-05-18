@@ -33,7 +33,7 @@ npm run db:deploy    # Deploy migrations (prod)
 |----------|----------|-------------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token |
-| `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API |
 | `GITHUB_REPOSITORIES` | Yes | **One-time** bootstrap seed for tracked repos (comma or newline separated). Read only when `AutomationRepo` is empty. After first seed, manage via `/automation` UI or `POST /api/repos` / `POST /api/automation/repos`. Seeded repos carry `source: "env"`; UI-added repos carry `source: "user"`. |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
@@ -176,7 +176,7 @@ At the **start** of each heartbeat:
 
 At the **end** of each heartbeat:
 
-2. **`POST /api/agent-runs`** (bearer-auth with `MISSION_CONTROL_AGENT_TOKEN`) with run metadata: `agentName`, `runType`, `status`, `startedAt`, `finishedAt`, `summary`, `touchedIssueUrls`.
+2. **`POST /api/agent-runs`** (bearer-auth with `DISPATCH_AGENT_TOKEN`) with run metadata: `agentName`, `runType`, `status`, `startedAt`, `finishedAt`, `summary`, `touchedIssueUrls`.
 
 ### Reading work
 
@@ -195,7 +195,7 @@ At the **end** of each heartbeat:
 ### Failure modes
 
 11. **Dispatch failures must not fail the heartbeat.** Sync, agent-run POST, and issue read are all best-effort from the heartbeat's perspective. Log a warning, continue.
-12. **Tokens are secrets.** `MISSION_CONTROL_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
+12. **Tokens are secrets.** `DISPATCH_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
 
 ### Auditability
 

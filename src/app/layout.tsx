@@ -21,7 +21,7 @@ export default function RootLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: `
           (function() {
-            var theme = localStorage.getItem('mission-control-theme');
+            var theme = localStorage.getItem('dispatch-theme');
             if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
               document.documentElement.classList.add('dark');
             }

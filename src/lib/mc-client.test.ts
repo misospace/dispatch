@@ -1,24 +1,24 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
-  getMcConfig,
+  getDispatchConfig,
   resolveIssue,
   claimIssue,
   setIssueStatus,
   claimWork,
-  McClientError,
+  DispatchClientError,
 } from "./mc-client";
 
 const mockToken = "test-agent-token";
 const mockBaseUrl = "http://localhost:3000";
 
 function setEnv() {
-  process.env.MISSION_CONTROL_URL = mockBaseUrl;
-  process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
+  process.env.DISPATCH_URL = mockBaseUrl;
+  process.env.DISPATCH_AGENT_TOKEN = mockToken;
 }
 
 function clearEnv() {
-  delete process.env.MISSION_CONTROL_URL;
-  delete process.env.MISSION_CONTROL_AGENT_TOKEN;
+  delete process.env.DISPATCH_URL;
+  delete process.env.DISPATCH_AGENT_TOKEN;
 }
 
 const mockIssue = {
@@ -53,35 +53,35 @@ function errorResponse(message: string, status = 500) {
   });
 }
 
-describe("getMcConfig", () => {
+describe("getDispatchConfig", () => {
   beforeEach(() => { clearEnv(); vi.restoreAllMocks(); });
 
   it("returns baseUrl and token when both are set", () => {
     setEnv();
-    const config = getMcConfig();
+    const config = getDispatchConfig();
     expect(config.baseUrl).toBe(mockBaseUrl);
     expect(config.token).toBe(mockToken);
   });
 
   it("strips trailing slashes from baseUrl", () => {
-    process.env.MISSION_CONTROL_URL = "http://localhost:3000/";
-    process.env.MISSION_CONTROL_AGENT_TOKEN = mockToken;
-    const config = getMcConfig();
+    process.env.DISPATCH_URL = "http://localhost:3000/";
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    const config = getDispatchConfig();
     expect(config.baseUrl).toBe("http://localhost:3000");
   });
 
-  it("throws when MISSION_CONTROL_URL is missing", () => {
+  it("throws when DISPATCH_URL is missing", () => {
     clearEnv();
-    expect(() => getMcConfig()).toThrow(McClientError);
-    expect(() => getMcConfig()).toThrow("MISSION_CONTROL_URL");
+    expect(() => getDispatchConfig()).toThrow(DispatchClientError);
+    expect(() => getDispatchConfig()).toThrow("DISPATCH_URL");
   });
 
-  it("throws when MISSION_CONTROL_AGENT_TOKEN is missing", () => {
-    process.env.MISSION_CONTROL_URL = mockBaseUrl;
+  it("throws when DISPATCH_AGENT_TOKEN is missing", () => {
+    process.env.DISPATCH_URL = mockBaseUrl;
     clearEnv();
-    process.env.MISSION_CONTROL_URL = mockBaseUrl;
-    expect(() => getMcConfig()).toThrow(McClientError);
-    expect(() => getMcConfig()).toThrow("MISSION_CONTROL_AGENT_TOKEN");
+    process.env.DISPATCH_URL = mockBaseUrl;
+    expect(() => getDispatchConfig()).toThrow(DispatchClientError);
+    expect(() => getDispatchConfig()).toThrow("DISPATCH_AGENT_TOKEN");
   });
 });
 
@@ -133,7 +133,7 @@ describe("resolveIssue", () => {
       jsonResponse([]),
     );
 
-    await expect(resolveIssue("org/repo", 99)).rejects.toThrow(McClientError);
+    await expect(resolveIssue("org/repo", 99)).rejects.toThrow(DispatchClientError);
   });
 
   it("throws 404 with correct message when issue not found", async () => {
@@ -149,7 +149,7 @@ describe("resolveIssue", () => {
       errorResponse("Internal server error", 500),
     );
 
-    await expect(resolveIssue("org/repo", 42)).rejects.toThrow(McClientError);
+    await expect(resolveIssue("org/repo", 42)).rejects.toThrow(DispatchClientError);
   });
 
   it("passes repo filter in query params", async () => {
@@ -209,18 +209,18 @@ describe("claimIssue", () => {
     expect(body.force).toBe(true);
   });
 
-  it("throws McClientError when resolve fails", async () => {
+  it("throws DispatchClientError when resolve fails", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
 
-    await expect(claimIssue("org/repo", 99, "test-agent")).rejects.toThrow(McClientError);
+    await expect(claimIssue("org/repo", 99, "test-agent")).rejects.toThrow(DispatchClientError);
   });
 
-  it("throws McClientError when claim API returns error", async () => {
+  it("throws DispatchClientError when claim API returns error", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(errorResponse("Conflict", 409));
 
-    await expect(claimIssue("org/repo", 42, "test-agent")).rejects.toThrow(McClientError);
+    await expect(claimIssue("org/repo", 42, "test-agent")).rejects.toThrow(DispatchClientError);
   });
 });
 
@@ -355,16 +355,16 @@ describe("claimWork", () => {
   });
 });
 
-describe("McClientError", () => {
+describe("DispatchClientError", () => {
   it("stores message and statusCode", () => {
-    const err = new McClientError("something failed", 500);
+    const err = new DispatchClientError("something failed", 500);
     expect(err.message).toBe("something failed");
     expect(err.statusCode).toBe(500);
-    expect(err.name).toBe("McClientError");
+    expect(err.name).toBe("DispatchClientError");
   });
 
   it("defaults statusCode to null", () => {
-    const err = new McClientError("oops");
+    const err = new DispatchClientError("oops");
     expect(err.statusCode).toBeNull();
   });
 });

@@ -7,7 +7,7 @@ import {
   claimWork,
   resolveIssue,
   setIssueStatus,
-  McClientError,
+  DispatchClientError,
 } from "../lib/mc-client.js";
 
 type ExtraArgs = Record<string, unknown>;
@@ -31,7 +31,7 @@ export async function resolveIssueHandler(args: ExtraArgs) {
       ],
     };
   } catch (error) {
-    if (error instanceof McClientError) {
+    if (error instanceof DispatchClientError) {
       return {
         content: [
           {
@@ -63,7 +63,7 @@ export async function claimIssueHandler(args: ExtraArgs) {
       ],
     };
   } catch (error) {
-    if (error instanceof McClientError) {
+    if (error instanceof DispatchClientError) {
       return {
         content: [
           {
@@ -95,7 +95,7 @@ export async function setIssueStatusHandler(args: ExtraArgs) {
       ],
     };
   } catch (error) {
-    if (error instanceof McClientError) {
+    if (error instanceof DispatchClientError) {
       return {
         content: [
           {
@@ -130,7 +130,7 @@ export async function claimWorkHandler(args: ExtraArgs) {
       ],
     };
   } catch (error) {
-    if (error instanceof McClientError) {
+    if (error instanceof DispatchClientError) {
       return {
         content: [
           {
@@ -148,7 +148,7 @@ export async function claimWorkHandler(args: ExtraArgs) {
 export function createServer(): McpServerType {
   const server = new McpServer(
     {
-      name: "mission-control",
+      name: "dispatch",
       version: "1.0.0",
     },
     {

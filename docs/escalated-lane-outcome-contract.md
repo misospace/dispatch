@@ -197,7 +197,7 @@ The `STUCK` outcome signals that the agent needs human intervention. The `summar
 
 | Constraint | Detail |
 |------------|--------|
-| Auth required | Both `POST /api/agent-runs` and `POST /api/issues/actions/decompose` require a valid `MISSION_CONTROL_AGENT_TOKEN`. |
+| Auth required | Both `POST /api/agent-runs` and `POST /api/issues/actions/decompose` require a valid `DISPATCH_AGENT_TOKEN`. |
 | No hardcoded names | Outcome validation, lane filtering, and decomposed exclusion apply uniformly across all agents and repositories. |
 
 ---

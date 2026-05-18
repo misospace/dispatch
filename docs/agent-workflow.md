@@ -16,7 +16,7 @@ The cache is refreshed periodically via sync endpoints; all state changes flow t
 ## Prerequisites
 
 - An agent identity string (e.g. `"agent-name"`). This maps to `agent/agent-name` labels on issues.
-- A `MISSION_CONTROL_AGENT_TOKEN` environment variable with a valid bearer token for authenticated endpoints.
+- A `DISPATCH_AGENT_TOKEN` environment variable with a valid bearer token for authenticated endpoints.
 - The base URL of the Dispatch instance (e.g. `https://mc.example.com` or `http://localhost:3000`).
 
 ## Complete Workflow
@@ -27,7 +27,7 @@ Before doing any work, start an agent run record. This creates an audit trail en
 
 ```
 POST /api/agent-runs
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -87,7 +87,7 @@ Claim an issue by requesting an agent assignment through Dispatch. This adds an 
 
 ```
 POST /api/issues/claim
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -120,7 +120,7 @@ When the agent finishes its work cycle, report run status to close out the run r
 
 ```
 POST /api/agent-runs
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -149,7 +149,7 @@ Release an issue back to the pool when the agent can no longer work on it.
 
 ```
 POST /api/issues/unclaim
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -178,7 +178,7 @@ Move an issue between board columns by updating its status label.
 
 ```
 POST /api/issues/move
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -198,7 +198,7 @@ This endpoint writes to the audit log and updates both GitHub labels and the loc
 
 | Constraint | Detail |
 |------------|--------|
-| Never log agent tokens | `MISSION_CONTROL_AGENT_TOKEN` must never be logged, echoed, or persisted to disk. |
+| Never log agent tokens | `DISPATCH_AGENT_TOKEN` must never be logged, echoed, or persisted to disk. |
 | Never log GitHub tokens | Same constraint applies to all GitHub authentication tokens. |
 | Audit trail required | Every state-changing move on Dispatch produces an `AuditLog` row. Operators trace agent activity through `/api/audit`. |
 

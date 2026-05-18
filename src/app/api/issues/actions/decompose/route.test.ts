@@ -21,7 +21,7 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 // Store the original env so we can restore it
-const originalAgentToken = process.env.MISSION_CONTROL_AGENT_TOKEN;
+const originalAgentToken = process.env.DISPATCH_AGENT_TOKEN;
 
 import { POST } from "./route";
 
@@ -41,7 +41,7 @@ function decomposeRequest(payload: Record<string, unknown>) {
 describe("POST /api/issues/actions/decompose — actor attribution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    process.env.MISSION_CONTROL_AGENT_TOKEN = "test-token";
+    process.env.DISPATCH_AGENT_TOKEN = "test-token";
     mocks.findFirstIssue.mockResolvedValue({
       id: "issue-1",
       number: 66,
@@ -59,7 +59,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
   });
 
   afterEach(() => {
-    process.env.MISSION_CONTROL_AGENT_TOKEN = originalAgentToken;
+    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
   });
 
   it("defaults actor to 'agent' when no actor or agentName supplied", async () => {
@@ -204,7 +204,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 describe("POST /api/issues/actions/decompose — reactivity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    process.env.MISSION_CONTROL_AGENT_TOKEN = "test-token";
+    process.env.DISPATCH_AGENT_TOKEN = "test-token";
     mocks.findFirstIssue.mockResolvedValue({
       id: "issue-1",
       number: 66,
@@ -222,7 +222,7 @@ describe("POST /api/issues/actions/decompose — reactivity", () => {
   });
 
   afterEach(() => {
-    process.env.MISSION_CONTROL_AGENT_TOKEN = originalAgentToken;
+    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
   });
 
   it("stores null decomposedBy when reactivating (decomposed=false)", async () => {

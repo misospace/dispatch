@@ -67,7 +67,7 @@ The `IssueLane` model stores classification metadata:
 
 ### POST `/api/issues/[issueId]/lane` — Classify or reclassify an issue
 
-Classifies an issue's execution lane. Requires Bearer token authentication via `MISSION_CONTROL_AGENT_TOKEN`.
+Classifies an issue's execution lane. Requires Bearer token authentication via `DISPATCH_AGENT_TOKEN`.
 
 **Request body:**
 ```json

@@ -28,7 +28,7 @@ Workers use Dispatch action APIs for work management:
 - Set status: `POST /api/issues/status` (preferred for status transitions)
 - Move labels: `POST /api/issues/move` (legacy, requires oldLabels/newLabels)
 
-All worker-facing mutation endpoints require bearer authentication via `MISSION_CONTROL_AGENT_TOKEN`.
+All worker-facing mutation endpoints require bearer authentication via `DISPATCH_AGENT_TOKEN`.
 
 ## Queue Response Format
 
@@ -64,7 +64,7 @@ python3 /home/node/.openclaw/workspace-saffron/scripts/wishlist_read_board.py
 
 **After:**
 ```bash
-curl -s "MISSION_CONTROL_URL/api/agents/{agentName}/queue?lane=normal" | python3 -c "import json,sys; items=json.load(sys.stdin); [print(json.dumps(i)) for i in items[:10]]"
+curl -s "DISPATCH_URL/api/agents/{agentName}/queue?lane=normal" | python3 -c "import json,sys; items=json.load(sys.stdin); [print(json.dumps(i)) for i in items[:10]]"
 ```
 
 ### 2. Add work claiming step before processing
@@ -72,8 +72,8 @@ curl -s "MISSION_CONTROL_URL/api/agents/{agentName}/queue?lane=normal" | python3
 Workers must claim work through Dispatch before starting. **Claim only assigns** the agent label — it does not change the status label. Workers must explicitly set status via `POST /api/issues/status` after claiming or when transitioning states.
 
 ```bash
-curl -s -X POST "MISSION_CONTROL_URL/api/issues/claim" \
-  -H "Authorization: Bearer $MISSION_CONTROL_AGENT_TOKEN" \
+curl -s -X POST "DISPATCH_URL/api/issues/claim" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"issueId":"{mc_issue_id}","repoFullName":"{repo}","issueNumber":{number},"agentName":"{agentName}"}'
 ```
@@ -83,8 +83,8 @@ curl -s -X POST "MISSION_CONTROL_URL/api/issues/claim" \
 After claiming, workers should transition to in-progress:
 
 ```bash
-curl -s -X POST "MISSION_CONTROL_URL/api/issues/status" \
-  -H "Authorization: Bearer $MISSION_CONTROL_AGENT_TOKEN" \
+curl -s -X POST "DISPATCH_URL/api/issues/status" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"issueId":"{mc_issue_id}","repoFullName":"{repo}","issueNumber":{number},"status":"in-progress"}'
 ```
@@ -98,8 +98,8 @@ When the issue is complete, set status to `done` **only** after verifying comple
 The `/api/issues/move` endpoint requires `oldLabels` and `newLabels` arrays:
 
 ```bash
-curl -s -X POST "MISSION_CONTROL_URL/api/issues/move" \
-  -H "Authorization: Bearer $MISSION_CONTROL_AGENT_TOKEN" \
+curl -s -X POST "DISPATCH_URL/api/issues/move" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"issueId":"{mc_issue_id}","repoFullName":"{repo}","issueNumber":{number},"oldLabels":["status/backlog"],"newLabels":["status/in-progress"]}'
 ```

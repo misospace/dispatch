@@ -31,7 +31,7 @@ POST /api/sync
 
 ```
 POST /api/agent-runs
-Authorization: Bearer <MISSION_CONTROL_AGENT_TOKEN>
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
@@ -83,7 +83,7 @@ GET /api/issues
 
 | Constraint | Detail |
 |------------|--------|
-| Never log `MISSION_CONTROL_AGENT_TOKEN` | Tokens must never be logged, echoed, or persisted to disk. |
+| Never log `DISPATCH_AGENT_TOKEN` | Tokens must never be logged, echoed, or persisted to disk. |
 | Never log `GITHUB_TOKEN` | Same constraint applies to GitHub tokens. |
 | Audit trail required | Every state-changing move on Dispatch produces an `AuditLog` row. Operators trace agent activity through `/api/audit`. |
 

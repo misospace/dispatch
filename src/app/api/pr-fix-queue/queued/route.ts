@@ -5,7 +5,7 @@ import { isValidPrFixLane, VALID_PR_FIX_LANES } from "@/types";
 
 export async function GET(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (token !== process.env.MISSION_CONTROL_AGENT_TOKEN) {
+  if (token !== process.env.DISPATCH_AGENT_TOKEN) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -12,7 +12,7 @@ Run all checks against the target instance (local dev, staging, or production) b
 
 ## Prerequisites
 
-- Mission Control instance is running and reachable at `<base-url>`.
+- Dispatch instance is running and reachable at `<base-url>`.
 - At least one repository is tracked (`GET /api/automation/repos` returns items, or `GITHUB_REPOSITORIES` env var was set).
 - At least one issue has been synced (`POST /api/sync` was run successfully at least once).
 - A test agent identity is available (e.g. `"smoke-test"`).
@@ -221,7 +221,7 @@ where `N > 0`.
 1. Stop Dispatch (or block network to it).
 2. Attempt the heartbeat workflow: `POST /api/sync` fails, `GET /api/issues` fails.
 3. Verify the agent falls back to GitHub Issues API directly and continues processing.
-4. Restart Mission Control. Verify the next heartbeat succeeds with `/api/sync`.
+4. Restart Dispatch. Verify the next heartbeat succeeds with `/api/sync`.
 
 **Expected:** Agent continues working through fallback path; no crash or hang when Dispatch is unavailable.
 

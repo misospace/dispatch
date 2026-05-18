@@ -74,7 +74,7 @@ Agent Runs → Dispatch → Agent Activity Page
 |----------|----------|-------------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
-| `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 | `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Dispatch UI or `/api/automation/repos` after initial setup. |
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
 | `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
@@ -225,7 +225,7 @@ The app uses the bjw-s/app-template Helm chart. See `home-ops/kubernetes/apps/ba
 Required secrets (via ExternalSecret):
 - `MISSION_CONTROL_DATABASE_URL` - PostgreSQL connection string
 - `GITHUB_TOKEN` - GitHub authentication
-- `MISSION_CONTROL_AGENT_TOKEN` - Agent API bearer token
+- `DISPATCH_AGENT_TOKEN` - Agent API bearer token
 
 ## API Endpoints
 
@@ -262,7 +262,7 @@ Sync all issues from configured repositories. Intended callers are:
 List agent runs. Query params: `limit`
 
 ### POST /api/agent-runs
-Create agent run. Requires `MISSION_CONTROL_AGENT_TOKEN` bearer auth.
+Create agent run. Requires `DISPATCH_AGENT_TOKEN` bearer auth.
 
 ### GET /api/audit
 List audit logs. Query params: `limit`, `repo`
@@ -387,8 +387,8 @@ Rejected alternatives for the first implementation:
 - **Dispatch internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
 
 Operational notes:
-- Configure the agent harness with `MISSION_CONTROL_URL` and any required network access to reach Dispatch.
-- `/api/sync` currently does not require `MISSION_CONTROL_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
+- Configure the agent harness with `DISPATCH_URL` and any required network access to reach Dispatch.
+- `/api/sync` currently does not require `DISPATCH_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
 - Treat sync failures as freshness warnings, not heartbeat failures, unless the heartbeat itself cannot complete.
 
 ### Known Limitations
@@ -486,6 +486,6 @@ docker build -t ghcr.io/misospace/mission-control:local .
 docker run -p 3000:3000 \
   -e DATABASE_URL="postgresql://..." \
   -e GITHUB_TOKEN="ghp_..." \
-  -e MISSION_CONTROL_AGENT_TOKEN="..." \
+  -e DISPATCH_AGENT_TOKEN="..." \
   ghcr.io/misospace/mission-control:local
 ```

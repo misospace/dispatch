@@ -6,7 +6,7 @@ Local stdio MCP server that bridges OpenCode to Dispatch issue APIs.
 
 - Node.js 18+ (the repo ships with Node 24)
 - A running Dispatch instance
-- `MISSION_CONTROL_URL` and `MISSION_CONTROL_AGENT_TOKEN` set in your environment
+- `DISPATCH_URL` and `DISPATCH_AGENT_TOKEN` set in your environment
 
 ## Installation
 
@@ -21,8 +21,8 @@ npx prisma generate
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MISSION_CONTROL_URL` | Yes | Base URL of your Dispatch instance (e.g. `http://localhost:3000`) |
-| `MISSION_CONTROL_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `DISPATCH_URL` | Yes | Base URL of your Dispatch instance (e.g. `http://localhost:3000` or `https://dispatch.example.com`) |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 
 The token is **never** printed or logged. Missing variables produce a clear error on startup.
 
@@ -41,12 +41,12 @@ Add the following to your OpenCode configuration (e.g. `.opencode.json` or `open
 ```json
 {
   "mcpServers": {
-    "mission-control": {
+    "dispatch": {
       "command": "npx",
       "args": ["tsx", "./src/mcp/server.ts"],
       "env": {
-        "MISSION_CONTROL_URL": "http://localhost:3000",
-        "MISSION_CONTROL_AGENT_TOKEN": "your-agent-token-here"
+        "DISPATCH_URL": "http://localhost:3000",
+        "DISPATCH_AGENT_TOKEN": "your-agent-token-here"
       }
     }
   }
@@ -58,12 +58,12 @@ Or if you have the repo cloned locally and want to use an absolute path:
 ```json
 {
   "mcpServers": {
-    "mission-control": {
+    "dispatch": {
       "command": "npx",
-      "args": ["tsx", "/absolute/path/to/mission-control/src/mcp/server.ts"],
+      "args": ["tsx", "/absolute/path/to/dispatch/src/mcp/server.ts"],
       "env": {
-        "MISSION_CONTROL_URL": "https://mc.yourdomain.com",
-        "MISSION_CONTROL_AGENT_TOKEN": "$MISSION_CONTROL_AGENT_TOKEN"
+        "DISPATCH_URL": "https://dispatch.example.com",
+        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN"
       }
     }
   }
@@ -77,12 +77,12 @@ If your OpenCode config supports env var interpolation (e.g. `$VAR`), you can re
 ```json
 {
   "mcpServers": {
-    "mission-control": {
+    "dispatch": {
       "command": "npx",
       "args": ["tsx", "./src/mcp/server.ts"],
       "env": {
-        "MISSION_CONTROL_URL": "https://mc.yourdomain.com",
-        "MISSION_CONTROL_AGENT_TOKEN": "$MISSION_CONTROL_AGENT_TOKEN"
+        "DISPATCH_URL": "https://dispatch.example.com",
+        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN"
       }
     }
   }
@@ -153,7 +153,7 @@ OpenCode will:
 
 ## Security
 
-- The `MISSION_CONTROL_AGENT_TOKEN` is used for bearer auth on all mutating API calls.
+- The `DISPATCH_AGENT_TOKEN` is used for bearer auth on all mutating API calls.
 - The token is **never** printed, echoed, or persisted to disk by the MCP server.
 - Missing environment variables produce a clear error message at startup.
 - All tools that mutate state (claim, set status, claim_work) require valid bearer authentication.
@@ -172,18 +172,18 @@ Tests cover:
 
 ## Troubleshooting
 
-### "MISSION_CONTROL_URL is not set"
+### "DISPATCH_URL is not set"
 
 Set the environment variable before starting OpenCode or the MCP server:
 
 ```bash
-export MISSION_CONTROL_URL="http://localhost:3000"
-export MISSION_CONTROL_AGENT_TOKEN="your-token-here"
+export DISPATCH_URL="http://localhost:3000"
+export DISPATCH_AGENT_TOKEN="your-token-here"
 ```
 
 Or add it to your OpenCode MCP config `env` block (see configuration above).
 
-### "MISSION_CONTROL_AGENT_TOKEN is not set"
+### "DISPATCH_AGENT_TOKEN is not set"
 
 Same as above — ensure the token is set. Verify your Dispatch instance has an agent token configured.
 
@@ -199,7 +199,7 @@ The issue may not be synced to Dispatch yet. Try:
 The server will throw a descriptive `McClientError` if the token is missing. If you're getting 401 responses from the Dispatch API, verify:
 1. The token in your env matches the one configured in Dispatch
 2. The token hasn't been rotated or expired
-3. The `MISSION_CONTROL_URL` points to the correct instance
+3. The `DISPATCH_URL` points to the correct instance
 
 ### TypeScript errors when running
 
