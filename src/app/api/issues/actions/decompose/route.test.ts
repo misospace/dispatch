@@ -64,7 +64,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("defaults actor to 'agent' when no actor or agentName supplied", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
     });
@@ -82,7 +82,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("uses actor when provided", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: "example-agent",
@@ -101,7 +101,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("uses agentName as fallback when actor is not provided", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       agentName: "fallback-agent",
@@ -120,7 +120,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("prefers actor over agentName when both are provided", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: "primary-agent",
@@ -140,7 +140,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("returns 400 when actor is not a string", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: 123 as unknown as string,
@@ -152,7 +152,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("returns 400 when actor is empty string", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: "",
@@ -164,7 +164,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("returns 400 when actor is whitespace only", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: "   ",
@@ -176,7 +176,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("returns 400 when actor exceeds 100 characters", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: "a".repeat(101),
@@ -188,7 +188,7 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
 
   it("trims actor value before storing", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: true,
       actor: "  trimmed-agent  ",
@@ -227,7 +227,7 @@ describe("POST /api/issues/actions/decompose — reactivity", () => {
 
   it("stores null decomposedBy when reactivating (decomposed=false)", async () => {
     const res = await decomposeRequest({
-      repo: "misospace/mission-control",
+      repo: "misospace/dispatch",
       issueNumber: 66,
       decomposed: false,
       actor: "example-agent",

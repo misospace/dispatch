@@ -108,7 +108,7 @@ where `N > 0`.
 
 **URL:** `<base-url>/projects`
 
-**Expected:** The Projects view renders with cards grouped by repository (e.g., `misospace/mission-control`, `misospace/miso-gallery`). Each card shows issue count and status breakdown columns.
+**Expected:** The Projects view renders with cards grouped by repository (e.g., `misospace/dispatch`, `misospace/miso-gallery`). Each card shows issue count and status breakdown columns.
 
 **Failure signal:** Empty state message ("No issues have been synced yet") when issues are expected, or error overlay.
 
@@ -247,10 +247,6 @@ where `N > 0`.
 - **BigInt errors in logs:** Prisma version mismatch or schema using `BigInt` without proper type handling. Check `prisma/schema.prisma` for `@db.BigInt` fields.
 
 ---
-
-## v0.2.1 Compatibility
-
-This checklist uses Dispatch terminology throughout. If your environment still references `MISSION_CONTROL_*` env vars (deprecated through v0.2.1), the container startup shim maps them to preferred names automatically. Update manifests before upgrading to v0.2.2.
 
 ## History
 

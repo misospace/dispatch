@@ -30,8 +30,6 @@ Workers use Dispatch action APIs for work management:
 
 All worker-facing mutation endpoints require bearer authentication via `DISPATCH_AGENT_TOKEN`.
 
-> **v0.2.1 compatibility:** The legacy `MISSION_CONTROL_AGENT_TOKEN` is accepted as a fallback through v0.2.1. It will be removed in v0.2.2. Prefer `DISPATCH_AGENT_TOKEN`.
-
 ## Queue Response Format
 
 Issue items returned from the queue include:

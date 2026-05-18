@@ -1,5 +1,5 @@
 ---
-name: Build Mission Control Image
+name: Build Dispatch Image
 
 on:
   push:
@@ -66,7 +66,7 @@ jobs:
 
       - name: Validate Prisma CLI runtime
         run: |
-          IMAGE="mission-control:prisma-cli-runtime"
+          IMAGE="dispatch:prisma-cli-runtime"
           docker build -t "$IMAGE" .
           echo "Validating Prisma CLI in image: $IMAGE"
           docker run --rm --entrypoint ./node_modules/.bin/prisma "$IMAGE" --version

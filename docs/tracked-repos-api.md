@@ -37,9 +37,9 @@ Each item contains:
 ```json
 [
   {
-    "fullName": "misospace/mission-control",
+    "fullName": "misospace/dispatch",
     "owner": "misospace",
-    "name": "mission-control",
+    "name": "dispatch",
     "enabled": true,
     "source": "user",
     "lastSyncedAt": "2026-05-17T09:00:00.000Z"

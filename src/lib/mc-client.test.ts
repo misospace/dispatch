@@ -5,8 +5,6 @@ import {
 
 const mockToken = "test-agent-token";
 const mockBaseUrl = "http://localhost:3000";
-const legacyToken = "legacy-agent-token";
-const legacyBaseUrl = "http://legacy-localhost:3000";
 
 function setEnv() {
   process.env.DISPATCH_URL = mockBaseUrl;
@@ -16,8 +14,6 @@ function setEnv() {
 function clearEnv() {
   delete process.env.DISPATCH_URL;
   delete process.env.DISPATCH_AGENT_TOKEN;
-  delete process.env.MISSION_CONTROL_URL;
-  delete process.env.MISSION_CONTROL_AGENT_TOKEN;
 }
 
 const mockIssue = {
@@ -89,41 +85,32 @@ describe("getDispatchConfig", () => {
     expect(() => getDispatchConfig()).toThrow(/DISPATCH_AGENT_TOKEN/);
   });
 
-  it("falls back to MISSION_CONTROL_URL when DISPATCH_URL is not set", async () => {
+  it("throws when both are missing", async () => {
     const { getDispatchConfig } = await import("./mc-client");
     clearEnv();
-    process.env.MISSION_CONTROL_URL = legacyBaseUrl;
-    process.env.MISSION_CONTROL_AGENT_TOKEN = legacyToken;
-    const config = getDispatchConfig();
-    expect(config.baseUrl).toBe(legacyBaseUrl);
-    expect(config.token).toBe(legacyToken);
+    expect(() => getDispatchConfig()).toThrow(/DISPATCH_URL/);
   });
 
-  it("prefers DISPATCH_URL over MISSION_CONTROL_URL", async () => {
-    const { getDispatchConfig } = await import("./mc-client");
-    process.env.DISPATCH_URL = mockBaseUrl;
-    process.env.MISSION_CONTROL_URL = legacyBaseUrl;
-    process.env.DISPATCH_AGENT_TOKEN = mockToken;
-    const config = getDispatchConfig();
-    expect(config.baseUrl).toBe(mockBaseUrl);
-  });
-
-  it("prefers DISPATCH_AGENT_TOKEN over MISSION_CONTROL_AGENT_TOKEN", async () => {
-    const { getDispatchConfig } = await import("./mc-client");
-    process.env.DISPATCH_URL = mockBaseUrl;
-    process.env.DISPATCH_AGENT_TOKEN = mockToken;
-    process.env.MISSION_CONTROL_AGENT_TOKEN = legacyToken;
-    const config = getDispatchConfig();
-    expect(config.token).toBe(mockToken);
-  });
-
-  it("includes deprecation hint in error when DISPATCH_URL is missing", async () => {
+  it("does not accept MISSION_CONTROL_URL as fallback", async () => {
     const { getDispatchConfig } = await import("./mc-client");
     clearEnv();
-    process.env.MISSION_CONTROL_URL = legacyBaseUrl;
-    delete process.env.DISPATCH_AGENT_TOKEN;
-    process.env.DISPATCH_URL = mockBaseUrl;
-    expect(() => getDispatchConfig()).toThrow("deprecated fallback");
+    process.env.MISSION_CONTROL_URL = "http://legacy-localhost:3000";
+    process.env.MISSION_CONTROL_AGENT_TOKEN = "legacy-agent-token";
+    expect(() => getDispatchConfig()).toThrow(/DISPATCH_URL/);
+  });
+
+  it("does not include legacy fallback hint in error message", async () => {
+    const { getDispatchConfig } = await import("./mc-client");
+    clearEnv();
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    try {
+      getDispatchConfig();
+      expect.fail("should have thrown");
+    } catch (err: unknown) {
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).not.toMatch(/deprecated/i);
+      expect((err as Error).message).toMatch(/DISPATCH_URL/);
+    }
   });
 });
 
