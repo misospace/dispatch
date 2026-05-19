@@ -384,6 +384,11 @@ export interface PrFollowupEvent {
 }
 
 /**
+ * linkedIssue flow: extracted in sync/webhook routes → stored on PrFollowupEvent →
+ * passed as `issue` to enqueuePrFixItem → written to Prisma PrFixQueueItem.issue field.
+ */
+
+/**
  * Process a batch of PR follow-up events.
  * Returns counts for tracking.
  */
