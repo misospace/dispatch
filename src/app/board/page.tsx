@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { KanbanBoard } from "@/components/kanban-board";
+import { KanbanBoardClient } from "./kanban-board-client";
 import { FilterBar } from "@/components/filter-bar";
 import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -86,7 +86,10 @@ export default async function BoardPage({ searchParams }: PageProps) {
             {syncStatus.lastSyncedAt ? `, last synced ${syncStatus.lastSyncedAt.toLocaleString()}` : ""}.
           </p>
         </div>
-        <SyncIssuesButton />
+        <div className="flex items-center gap-2">
+          <KanbanBoardClient initialIssues={issues} />
+          <SyncIssuesButton />
+        </div>
       </div>
 
       <FilterBar
@@ -122,7 +125,7 @@ export default async function BoardPage({ searchParams }: PageProps) {
           </CardContent>
         </Card>
       ) : (
-        <KanbanBoard initialIssues={issues} />
+        <KanbanBoardClient initialIssues={issues} />
       )}
     </div>
   );
