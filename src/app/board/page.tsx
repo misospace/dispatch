@@ -8,8 +8,13 @@ import { buildLabelWhere, discoverLabelFilterOptions } from "@/lib/issue-filters
 
 export const dynamic = "force-dynamic";
 
-async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string) {
+async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string, includeClosed?: boolean) {
   const where: Record<string, unknown> = { repository: { enabled: true } };
+
+  // Default to open issues only; include closed when explicitly requested
+  if (includeClosed !== true) {
+    where.state = "open";
+  }
 
   if (repo) where.repository = { ...(where.repository as object), fullName: repo };
 
@@ -57,13 +62,14 @@ async function getIssueSyncStatus() {
 }
 
 interface PageProps {
-  searchParams: Promise<{ repo?: string; agent?: string; owner?: string; priority?: string }>;
+  searchParams: Promise<{ repo?: string; agent?: string; owner?: string; priority?: string; includeClosed?: string }>;
 }
 
 export default async function BoardPage({ searchParams }: PageProps) {
   const params = await searchParams;
+  const includeClosed = params.includeClosed === "true";
   const [issues, repos, filterOptions, syncStatus] = await Promise.all([
-    getIssues(params.repo, params.agent, params.owner, params.priority),
+    getIssues(params.repo, params.agent, params.owner, params.priority, includeClosed),
     getRepos(),
     getFilterOptions(),
     getIssueSyncStatus(),
@@ -106,7 +112,7 @@ export default async function BoardPage({ searchParams }: PageProps) {
                 {syncStatus.cachedIssueCount > 0
                   ? "Clear or adjust the filters to see synced issues."
                   : syncStatus.trackedRepoCount > 0
-                  ? "Click Sync Issues to import open GitHub issues from tracked repositories."
+                  ? "Click Sync Issues to import open GitHub issues from tracked repositories. Closed issues are excluded by default."
                   : "No tracked repositories are configured yet. Add tracked repositories before syncing issues."}
               </p>
             </div>

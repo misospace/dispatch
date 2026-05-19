@@ -10,9 +10,15 @@ export async function GET(request: Request) {
   const project = searchParams.get("project");
   const priority = searchParams.get("priority");
   const decomposed = searchParams.get("decomposed");
+  const includeClosed = searchParams.get("includeClosed");
 
   try {
     const where: Record<string, unknown> = { repository: { enabled: true } };
+
+    // Default to open issues only; include closed when explicitly requested
+    if (includeClosed !== "true") {
+      where.state = "open";
+    }
 
     if (repo) {
       where.repository = { ...(where.repository as object), fullName: repo };

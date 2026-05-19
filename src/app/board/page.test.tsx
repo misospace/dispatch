@@ -58,6 +58,20 @@ describe("BoardPage searchParams handling (Next 16 async)", () => {
     mocks.filterBar.mockClear();
   });
 
+  it("defaults to filtering open issues only", async () => {
+    await BoardPage({ searchParams: Promise.resolve({}) });
+
+    const filteredCall = mocks.findManyIssues.mock.calls[0][0];
+    expect(filteredCall.where.state).toBe("open");
+  });
+
+  it("includes closed issues when includeClosed=true", async () => {
+    await BoardPage({ searchParams: Promise.resolve({ includeClosed: "true" }) });
+
+    const filteredCall = mocks.findManyIssues.mock.calls[0][0];
+    expect(filteredCall.where.state).toBeUndefined();
+  });
+
   it("awaits searchParams and applies repo filter to the issue query", async () => {
     await BoardPage({ searchParams: Promise.resolve({ repo: "myorg/repo1" }) });
 
@@ -114,10 +128,10 @@ describe("BoardPage searchParams handling (Next 16 async)", () => {
     );
   });
 
-  it("applies no extra filters when searchParams resolves empty", async () => {
+  it("applies state filter when searchParams resolves empty", async () => {
     await BoardPage({ searchParams: Promise.resolve({}) });
 
     const filteredCall = mocks.findManyIssues.mock.calls[0][0];
-    expect(filteredCall.where).toEqual({ repository: { enabled: true } });
+    expect(filteredCall.where).toEqual(expect.objectContaining({ state: "open" }));
   });
 });
