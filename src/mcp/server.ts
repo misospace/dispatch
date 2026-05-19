@@ -5,6 +5,8 @@ import { z } from "zod";
 import {
   claimIssue,
   claimWork,
+  refreshIssue,
+  syncRepo,
   resolveIssue,
   setIssueStatus,
   DispatchClientError,
@@ -119,7 +121,67 @@ export async function claimWorkHandler(args: ExtraArgs) {
       {
         status: (getArg(args, "status") as string) ?? "in-progress",
         force: getArg(args, "force") as boolean | undefined,
+        refreshBeforeClaim: getArg(args, "refreshBeforeClaim") as boolean | undefined,
       },
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
+  } catch (error) {
+    if (error instanceof DispatchClientError) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Error: ${error.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    throw error;
+  }
+}
+
+export async function refreshIssueHandler(args: ExtraArgs) {
+  try {
+    const result = await refreshIssue(
+      getArg(args, "repoFullName") as string,
+      getArg(args, "issueNumber") as number,
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    };
+  } catch (error) {
+    if (error instanceof DispatchClientError) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Error: ${error.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    throw error;
+  }
+}
+
+export async function syncRepoHandler(args: ExtraArgs) {
+  try {
+    const result = await syncRepo(
+      getArg(args, "repoFullName") as string,
     );
     return {
       content: [
@@ -220,7 +282,7 @@ export function createServer(): McpServerType {
     "claim_work",
     {
       description:
-        "Convenience tool that resolves, claims, and sets status on an issue in one call. Returns a compact task contract with issue context for the agent to work against.",
+        "Convenience tool that resolves, claims, and sets status on an issue in one call. Returns a compact task contract with issue context for the agent to work against. Automatically refreshes the issue from GitHub if not found in cache (refreshBeforeClaim defaults to true).",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
@@ -233,9 +295,42 @@ export function createServer(): McpServerType {
           .boolean()
           .optional()
           .describe("Force claim even if another agent is already assigned"),
+        refreshBeforeClaim: z
+          .boolean()
+          .optional()
+          .describe("Auto-refresh the issue from GitHub if not found in cache (default: true)"),
       },
     },
     claimWorkHandler,
+  );
+
+  // ── refresh_issue ────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "refresh_issue",
+    {
+      description:
+        "Refresh a single issue from GitHub and upsert it into the Dispatch cache. Useful for syncing newly-created issues before claiming them.",
+      inputSchema: {
+        repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+        issueNumber: z.number().int().positive().describe("GitHub issue number"),
+      },
+    },
+    refreshIssueHandler,
+  );
+
+  // ── sync_repo ────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "sync_repo",
+    {
+      description:
+        "Sync all open issues for a specific tracked repository. Faster than a full sync when you only need one repo updated.",
+      inputSchema: {
+        repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+      },
+    },
+    syncRepoHandler,
   );
 
   return server;

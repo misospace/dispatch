@@ -4,6 +4,8 @@ import {
   claimIssueHandler,
   setIssueStatusHandler,
   claimWorkHandler,
+  refreshIssueHandler,
+  syncRepoHandler,
   createServer,
 } from "./server";
 
@@ -400,6 +402,150 @@ describe("claimWorkHandler", () => {
     const call = (vi.mocked(fetch).mock.calls[2] as [string, RequestInit])[1];
     const body = JSON.parse(call.body as string) as Record<string, unknown>;
     expect(body.force).toBe(true);
+  });
+
+  it("passes refreshBeforeClaim through to client", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: [],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "normal",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: [],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "normal",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: [],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "normal",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      );
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] }));
+
+    await claimWorkHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent", refreshBeforeClaim: false }));
+
+    // With refreshBeforeClaim: false and issue already found, should complete without refresh calls
+    // Total calls: resolve + resolve(inside claim) + claim POST + resolve(inside setStatus) + status POST = 5
+    expect(fetchSpy).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe("refreshIssueHandler", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("returns refresh result as JSON text", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
+    );
+
+    const result = await refreshIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toHaveLength(1);
+    const parsed = JSON.parse(result.content[0].text as string);
+    expect(parsed.success).toBe(true);
+    expect(parsed.action).toBe("created");
+    expect(parsed.repo).toBe("org/repo");
+    expect(parsed.issueNumber).toBe(42);
+  });
+
+  it("returns error when refresh fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      errorResponse("Issue not found on GitHub", 404),
+    );
+
+    const result = await refreshIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 99 }));
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error:");
+    expect(result.content[0].text).toContain("not found");
+  });
+});
+
+describe("syncRepoHandler", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("returns sync result as JSON text", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        success: true,
+        repos: 1,
+        syncedCount: 5,
+        results: [{ repo: "org/repo", synced: 5, error: null }],
+      }),
+    );
+
+    const result = await syncRepoHandler(makeArgs({ repoFullName: "org/repo" }));
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toHaveLength(1);
+    const parsed = JSON.parse(result.content[0].text as string);
+    expect(parsed.success).toBe(true);
+    expect(parsed.repos).toBe(1);
+    expect(parsed.syncedCount).toBe(5);
+  });
+
+  it("returns error when repo is not tracked", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      errorResponse("Repo not tracked", 404),
+    );
+
+    const result = await syncRepoHandler(makeArgs({ repoFullName: "unknown/repo" }));
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error:");
+    expect(result.content[0].text).toContain("not tracked");
   });
 });
 

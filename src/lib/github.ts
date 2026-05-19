@@ -29,6 +29,25 @@ export async function fetchIssues(repoFullName: string, options?: { includeClose
   return data.filter((issue: GitHubIssue) => !issue.pull_request);
 }
 
+export async function fetchIssue(repoFullName: string, issueNumber: number): Promise<GitHubIssue> {
+  const [owner, repo] = repoFullName.split("/");
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
+  const response = await fetch(url, { headers: getHeaders() });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API error for ${repoFullName}#${issueNumber}: ${response.status} ${text}`);
+  }
+
+  const data: GitHubIssue = await response.json();
+
+  if (data.pull_request) {
+    throw new Error(`#${issueNumber} is a pull request, not an issue`);
+  }
+
+  return data;
+}
+
 export async function updateIssueLabels(
   repoFullName: string,
   issueNumber: number,

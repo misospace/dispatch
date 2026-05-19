@@ -135,10 +135,32 @@ Resolves, claims, and sets status on an issue in one call. Returns a compact tas
 - `agentName` (string) — Agent identifier claiming the work
 - `status` (string, optional) — Status to set after claiming (default: `'in-progress'`)
 - `force` (boolean, optional) — Force claim even if another agent is already assigned
+- `refreshBeforeClaim` (boolean, optional) — Auto-refresh the issue from GitHub if not found in cache (default: `true`)
 
 **Returns:** `issueId`, `repoFullName`, `issueNumber`, `title`, `url`, `labels`, `lane`, `status`, `taskContract`
 
-The `taskContract` field contains a structured prompt telling the agent to work only on this issue.
+The `taskContract` field contains a structured prompt telling the agent to work only on this issue. If `refreshBeforeClaim` is enabled (default) and the issue was not in the cache, the task contract includes a note about the refresh.
+
+**Auto-refresh behavior:** When `refreshBeforeClaim` is `true` (the default), if `resolveIssue` fails because the issue is not in the Dispatch cache, the tool automatically calls `refreshIssue` to fetch the issue from GitHub before retrying. This allows agents to claim newly-created GitHub issues without requiring a manual sync first. Set `refreshBeforeClaim: false` to disable this behavior.
+
+### `refresh_issue`
+
+Refreshes a single issue from GitHub and upserts it into the Dispatch cache. Useful for syncing newly-created issues before claiming them.
+
+**Inputs:**
+- `repoFullName` (string) — GitHub repo full name
+- `issueNumber` (number) — GitHub issue number
+
+**Returns:** `success`, `repo`, `issueNumber`, `action` (`"created"` or `"updated"`), `error`
+
+### `sync_repo`
+
+Syncs all open issues for a specific tracked repository. Faster than a full sync when you only need one repo updated.
+
+**Inputs:**
+- `repoFullName` (string) — GitHub repo full name
+
+**Returns:** `success`, `repos`, `syncedCount`, `results` (array of per-repo sync results)
 
 ## Example Usage in OpenCode
 
@@ -150,6 +172,14 @@ OpenCode will:
 1. Call `claim_work` with `repoFullName: "misospace/dispatch"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
 2. Receive the task contract with issue context
 3. Work on the issue following the contract
+
+### Handling newly-created issues
+
+When a GitHub issue is created but not yet synced to Dispatch, `claim_work` automatically refreshes it before claiming (since `refreshBeforeClaim` defaults to `true`). This means agents can claim freshly-created issues without any manual sync step.
+
+If auto-refresh is not desired (e.g., for performance-critical flows), set `refreshBeforeClaim: false`:
+
+> Claim issue #103 in misospace/dispatch but don't refresh first.
 
 ## Security
 
@@ -167,8 +197,8 @@ npm run test
 ```
 
 Tests cover:
-- `src/lib/mc-client.test.ts` — HTTP client: config validation, resolve, claim, set status, claim work, error handling
-- `src/mcp/server.test.ts` — MCP tool handlers: input/output shapes, error propagation, task contract generation
+- `src/lib/mc-client.test.ts` — HTTP client: config validation, resolve, claim, set status, claim work (with refreshBeforeClaim), refreshIssue, syncRepo, error handling
+- `src/mcp/server.test.ts` — MCP tool handlers: input/output shapes, error propagation, task contract generation, refresh_issue, sync_repo tools
 
 ## Troubleshooting
 
@@ -189,10 +219,14 @@ Same as above — ensure the token is set. Verify your Dispatch instance has an 
 
 ### "Issue #N not found in org/repo"
 
-The issue may not be synced to Dispatch yet. Try:
-1. Running a sync: `POST /api/sync` on your Dispatch instance
-2. Verifying the repo is tracked (check `/api/repos` or the UI)
-3. Confirming the issue number and repo full name are correct
+With `refreshBeforeClaim: true` (default), `claim_work` automatically refreshes the issue from GitHub before failing. If you still see this error:
+
+1. Verify the repo is tracked (check `/api/repos` or the UI)
+2. Confirm the issue number and repo full name are correct
+3. Try calling `refresh_issue` manually to diagnose the issue
+4. If the issue exists on GitHub but refresh fails, check your `GITHUB_TOKEN` permissions
+
+To disable auto-refresh and get immediate errors, set `refreshBeforeClaim: false`.
 
 ### Token not logged — how to verify it's set?
 
