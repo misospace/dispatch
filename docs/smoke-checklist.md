@@ -152,7 +152,7 @@ where `N > 0`.
 
 **Expected response:** `{ "success": true, "labels": ["...", "agent/smoke-test", ...] }`
 
-**GitHub verification:** The issue on GitHub should have the `agent/smoke-test` label added. Optionally `status/in-progress` if no status label was present.
+**GitHub verification:** The issue on GitHub should have the `agent/smoke-test` label added and be moved to `status/in-progress`.
 
 **Failure signal:** HTTP error, or labels not reflected on GitHub after a few seconds.
 

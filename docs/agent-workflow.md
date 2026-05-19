@@ -74,16 +74,15 @@ GET /api/agents/<agent-name>/queue
 
 **Response:** Array of issue objects containing `number`, `title`, `url`, and `labels`.
 
-**Selection priority:**
-1. Prefer issues labeled `agent/<agent-name>` if present.
-2. Fall back to general backlog if no agent-specific label exists.
+**Selection behavior:**
+1. Default queue requests return unclaimed actionable work only.
+2. Issues with any `agent/*` label are excluded by default, including issues claimed by the requesting agent.
 3. Treat "no status label" or `status/backlog` as backlog work — both are valid entry states.
-
-Issues with an existing `agent/<other>` label remain visible in the queue so agents can see what others are working on.
+4. Pass `includeClaimed=true` to include claimed work for dashboards or manual recovery.
 
 ### 4. Claim Work
 
-Claim an issue by requesting an agent assignment through Dispatch. This adds an `agent/<name>` label to the issue on GitHub and optionally moves it to `status/in-progress`.
+Claim an issue by requesting an agent assignment through Dispatch. This adds an `agent/<name>` label to the issue on GitHub and moves it to `status/in-progress`.
 
 ```
 POST /api/issues/claim
@@ -107,8 +106,9 @@ Content-Type: application/json
 **Optional fields:** `force` (boolean, default `false`)
 
 **Behavior:**
-- **Normal claim (`force: false`):** Succeeds if the issue is open and not already assigned to another agent. Adds `agent/<name>` label and optionally `status/in-progress`.
+- **Normal claim (`force: false`):** Succeeds if the issue is open and not already assigned to another agent. Adds `agent/<name>` label and sets `status/in-progress`.
 - **Force claim (`force: true`):** Removes any existing `agent/<other>` label before adding the new one. Useful for reassignment.
+- **Status update:** Replaces any existing status label with `status/in-progress` as part of the claim.
 - **Rejected (409):** Issue is already assigned to a different agent and `force` is not set.
 - **Rejected (400):** Issue is closed or has `status/done`.
 

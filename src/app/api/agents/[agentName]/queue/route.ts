@@ -8,6 +8,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   const { searchParams } = new URL(request.url);
   const lane = searchParams.get("lane");
   const excludeDecomposed = searchParams.get("exclude_decomposed");
+  const includeClaimed = searchParams.get("includeClaimed") === "true";
 
   try {
     // Fetch all open issues from enabled repos, using GitHub Issues as source of truth
@@ -43,6 +44,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       {
         lane: issueLane,
         excludeDecomposed: excludeDecomposed === "true",
+        includeClaimed,
       },
     );
 

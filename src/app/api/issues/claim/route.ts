@@ -4,6 +4,8 @@ import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
+const IN_PROGRESS_STATUS = "status/in-progress";
+
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
   if (!isAuthorizedAgentToken(token)) {
@@ -73,11 +75,19 @@ export async function POST(request: Request) {
 
     // Build updated labels using the shared conflict resolution module
     const agentLabel = `agent/${agentName}`;
-    const updatedLabels = buildNewLabels(issue.labels, "assign_agent", agentLabel);
+    const labelsWithAgent = buildNewLabels(issue.labels, "assign_agent", agentLabel);
+    const updatedLabels = [...labelsWithAgent.filter((label) => !label.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
       // Add agent label on GitHub
       await addIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
+
+      if (currentStatus && currentStatus !== IN_PROGRESS_STATUS) {
+        await removeIssueLabel(repoFullName as string, issueNumber as number, currentStatus);
+      }
+      if (currentStatus !== IN_PROGRESS_STATUS) {
+        await addIssueLabel(repoFullName as string, issueNumber as number, IN_PROGRESS_STATUS);
+      }
 
       // Update local cache
       await prisma.issue.update({
