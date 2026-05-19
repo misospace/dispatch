@@ -14,9 +14,10 @@ function getHeaders(): HeadersInit {
   };
 }
 
-export async function fetchIssues(repoFullName: string): Promise<GitHubIssue[]> {
+export async function fetchIssues(repoFullName: string, options?: { includeClosed?: boolean }): Promise<GitHubIssue[]> {
   const [owner, repo] = repoFullName.split("/");
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=all&per_page=100`;
+  const state = options?.includeClosed ? "all" : "open";
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=${state}&per_page=100`;
   const response = await fetch(url, { headers: getHeaders() });
 
   if (!response.ok) {

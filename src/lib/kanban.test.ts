@@ -11,21 +11,26 @@ const issues = [
 ];
 
 describe("getIssueStatus", () => {
-  it("treats closed issues as Done regardless of labels", () => {
-    expect(getIssueStatus({ labels: [], state: "closed" })).toBe("status/done");
-  });
-
-  it("treats closed issues with explicit backlog label as Done", () => {
-    expect(getIssueStatus({ labels: ["status/backlog"], state: "closed" })).toBe("status/done");
+  it("respects explicit status labels regardless of issue state", () => {
+    expect(getIssueStatus({ labels: ["status/in-review"], state: "open" })).toBe("status/in-review");
+    expect(getIssueStatus({ labels: ["status/done"], state: "closed" })).toBe("status/done");
   });
 
   it("returns Backlog for open issues with no status label", () => {
     expect(getIssueStatus({ labels: [], state: "open" })).toBe("status/backlog");
   });
 
-  it("respects explicit status labels for open issues", () => {
-    expect(getIssueStatus({ labels: ["status/in-review"], state: "open" })).toBe("status/in-review");
-    expect(getIssueStatus({ labels: ["status/done"], state: "open" })).toBe("status/done");
+  it("returns Backlog for closed issues with no status label (not Done)", () => {
+    expect(getIssueStatus({ labels: [], state: "closed" })).toBe("status/backlog");
+  });
+
+  it("respects explicit status labels on closed issues", () => {
+    expect(getIssueStatus({ labels: ["status/backlog"], state: "closed" })).toBe("status/backlog");
+    expect(getIssueStatus({ labels: ["status/in-progress"], state: "closed" })).toBe("status/in-progress");
+  });
+
+  it("ignores non-status labels and defaults to Backlog", () => {
+    expect(getIssueStatus({ labels: ["type/bug", "priority/p1"], state: "open" })).toBe("status/backlog");
   });
 });
 
@@ -46,19 +51,26 @@ describe("getIssuesByStatus", () => {
     expect(getIssuesByStatus(issues, "status/backlog").map((issue) => issue.id)).toContain("unrelated");
   });
 
-  it("classifies closed issues without status label as Done", () => {
+  it("does not put closed issues without status label in Done", () => {
     const doneIssues = getIssuesByStatus(issues, "status/done");
-    expect(doneIssues.map((issue) => issue.id)).toContain("closed-no-status");
+    expect(doneIssues.map((issue) => issue.id)).not.toContain("closed-no-status");
   });
 
-  it("does not pollute Backlog with closed issues", () => {
+  it("puts closed issues with no status label in Backlog, not Done", () => {
+    const backlogIssues = getIssuesByStatus(issues, "status/backlog");
+    expect(backlogIssues.map((issue) => issue.id)).toContain("closed-no-status");
+  });
+
+  it("respects explicit labels on closed issues", () => {
+    const doneIssues = getIssuesByStatus(issues, "status/done");
+    expect(doneIssues.map((issue) => issue.id)).not.toContain("closed-with-labels");
+    const backlogIssues = getIssuesByStatus(issues, "status/backlog");
+    expect(backlogIssues.map((issue) => issue.id)).toContain("closed-with-labels");
+  });
+
+  it("does not pollute Backlog with closed issues that have explicit status labels", () => {
+    // closed-with-labels has status/backlog so it should be in backlog
     const backlog = getIssuesByStatus(issues, "status/backlog");
-    expect(backlog.map((issue) => issue.id)).not.toContain("closed-no-status");
-    expect(backlog.map((issue) => issue.id)).not.toContain("closed-with-labels");
-  });
-
-  it("moves closed backlog issues to Done instead of Backlog", () => {
-    const doneIssues = getIssuesByStatus(issues, "status/done");
-    expect(doneIssues.map((issue) => issue.id)).toContain("closed-with-labels");
+    expect(backlog.map((issue) => issue.id)).toContain("closed-with-labels");
   });
 });
