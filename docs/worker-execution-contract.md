@@ -197,6 +197,22 @@ Workers receive their lane via the queue endpoint's `lane` query parameter:
 
 BACKLOG issues are excluded from the normal agent queue by default.
 
+### Renovate Issue Exclusion
+
+Renovate-created issues (dependency dashboards, update PRs, etc.) are **visible in Dispatch** but **excluded from agent queues by default**. This prevents agents from consuming cycles on dependency bookkeeping instead of normal issue work.
+
+Detection heuristics (author detection is not available since the Issue model does not store author):
+- Title contains `Dependency Dashboard`
+- Title starts with `Update dependency`, `Update image`, or similar Renovate patterns
+- Labels: `renovate`, `dependencies`, `automated`
+
+To explicitly include Renovate issues in queue results, pass `includeRenovate=true`:
+```bash
+GET /api/agents/<name>/queue?lane=normal&includeRenovate=true
+```
+
+Renovate exclusion applies to issue queue items only, not PR review-fix queue items. Issues excluded as Renovate remain visible on the Board and Projects pages.
+
 ---
 
 ## Linking
@@ -210,3 +226,4 @@ This contract is referenced from:
 ## History
 
 - **2026-05-16** — Created to document generic worker execution contract and PR completion gates (Issue #65). Consolidates existing normal-worker behavior into a reusable, agent-agnostic specification.
+- **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are visible in Dispatch but excluded from agent queues by default; `includeRenovate=true` opt-in available (Issue #129).
