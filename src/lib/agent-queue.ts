@@ -28,6 +28,27 @@ export interface RankedIssue {
 }
 
 /**
+ * Detect Renovate issues by title/label heuristics.
+ * Author detection is not available since the Issue model does not store author.
+ */
+export function isRenovateIssue(issue: { title: string; labels: string[] }): boolean {
+  const title = issue.title.toLowerCase();
+  const labels = issue.labels.map((l) => l.toLowerCase());
+
+  // Title-based heuristics
+  if (title.includes("dependency dashboard")) return true;
+  if (/^update (?:dependency|image|deps?)/.test(title)) return true;
+
+  // Label-based heuristics
+  const renovateLabels = ["renovate", "dependencies", "automated"];
+  for (const label of labels) {
+    if (renovateLabels.includes(label)) return true;
+  }
+
+  return false;
+}
+
+/**
  * Score an issue for a given agent. Lower score = higher priority.
  */
 function rankIssue(issueLabels: string[], agentName: string): { score: number; reason: string } {
@@ -101,6 +122,7 @@ function isActionable(issueLabels: string[]): boolean {
  * Optionally filters by execution lane (normal | escalated | backlog).
  * Optionally excludes decomposed audit parents.
  * Excludes claimed issues by default; pass includeClaimed to include agent/* labels.
+ * Excludes Renovate issues by default; pass includeRenovate=true to include them.
  */
 export function buildAgentQueue(
   issues: Array<{
@@ -118,6 +140,7 @@ export function buildAgentQueue(
     lane?: "normal" | "escalated" | "backlog" | "NORMAL" | "ESCALATED" | "BACKLOG";
     excludeDecomposed?: boolean;
     includeClaimed?: boolean;
+    includeRenovate?: boolean;
   },
 ): RankedIssue[] {
   // Normalize lane to lowercase for consistent comparison
@@ -128,6 +151,11 @@ export function buildAgentQueue(
 
   if (!options?.includeClaimed) {
     actionable = actionable.filter((issue) => !issue.labels.some((label) => label.startsWith(AGENT_PREFIX)));
+  }
+
+  // Exclude Renovate issues by default (unless explicitly included)
+  if (!options?.includeRenovate) {
+    actionable = actionable.filter((issue) => !isRenovateIssue(issue));
   }
 
   // Exclude decomposed audit parents if requested

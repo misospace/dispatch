@@ -213,4 +213,163 @@ describe("GET /api/agents/[agentName]/queue", () => {
     const body = await res.json();
     expect(body[0]).toMatchObject({ number: 52, agentMatch: true });
   });
+
+  // ── Renovate exclusion tests ──────────────────────────────────────
+
+  it("excludes Renovate issues from agent queue by default", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-renovate",
+        number: 10,
+        title: "Dependency Dashboard",
+        url: "https://github.com/org/repo/issues/10",
+        labels: ["priority/p1"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-normal",
+        number: 20,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/20",
+        labels: ["priority/p1"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([20]);
+  });
+
+  it("includes Renovate issues when includeRenovate=true", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-renovate",
+        number: 10,
+        title: "Dependency Dashboard",
+        url: "https://github.com/org/repo/issues/10",
+        labels: ["priority/p1"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-normal",
+        number: 20,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/20",
+        labels: ["priority/p1"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal&includeRenovate=true"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const numbers = body.map((item: { number: number }) => item.number);
+    expect(numbers).toContain(10);
+    expect(numbers).toContain(20);
+  });
+
+  it("excludes Renovate issues with renovate label by default", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-renovate",
+        number: 10,
+        title: "Bump lodash",
+        url: "https://github.com/org/repo/issues/10",
+        labels: ["renovate"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-normal",
+        number: 20,
+        title: "Fix crash",
+        url: "https://github.com/org/repo/issues/20",
+        labels: ["bug"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([20]);
+  });
+
+  it("excludes Renovate issues with Update dependency title by default", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-renovate",
+        number: 10,
+        title: "Update dependency lodash to v4.18.0",
+        url: "https://github.com/org/repo/issues/10",
+        labels: [],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-normal",
+        number: 20,
+        title: "Add dark mode",
+        url: "https://github.com/org/repo/issues/20",
+        labels: ["enhancement"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([20]);
+  });
+
+  it("does not exclude non-Renovate issues", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-normal",
+        number: 20,
+        title: "Update README",
+        url: "https://github.com/org/repo/issues/20",
+        labels: ["documentation"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([20]);
+  });
 });
