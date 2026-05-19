@@ -359,3 +359,35 @@ model AutomationSyncRun {
   @@index([repoId])
   @@index([startedAt])
 }
+
+// ---------------------------------------------------------------------------
+// Issue sync run tracking (for scheduled sync endpoint)
+// ---------------------------------------------------------------------------
+
+model IssueSyncRun {
+  id               String   @id @default(cuid())
+  status           String
+  reposFetched     Int      @default(0)
+  syncedCount      Int      @default(0)
+  errorMessage     String?
+  notes            String?  @db.Text
+  syncType         String   @default("scheduled") // "scheduled" | "manual" | "pre-claim"
+  startedAt        DateTime @default(now())
+  completedAt      DateTime?
+
+  @@index([startedAt])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Sync lock — single-row table to prevent overlapping scheduled sync runs.
+// Uses a single row (id = "global") with atomic upsert for lock acquisition.
+// ---------------------------------------------------------------------------
+
+model SyncLock {
+  id          String   @id
+  syncRunId   String?
+  acquiredAt  DateTime @default(now())
+
+  @@map("sync_lock")
+}

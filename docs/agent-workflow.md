@@ -9,7 +9,9 @@ It is intentionally generic — no specific agent names or implementations are r
 ## Overview
 
 Dispatch provides a Postgres-backed cache of GitHub Issues that agents use to discover, claim, and track work.
-The cache is refreshed periodically via sync endpoints; all state changes flow through the API, which writes back to GitHub.
+The cache is refreshed primarily through a **scheduled sync runner** (`POST /api/sync/scheduled`); general cache freshness is owned by Dispatch, not by individual agent heartbeats.
+
+Agent/worker heartbeats may still trigger best-effort sync, but they are no longer the primary freshness mechanism.
 
 > **GitHub Issues and PRs remain the source of truth.** Dispatch's database is a cache, not authoritative storage.
 
@@ -47,7 +49,7 @@ Content-Type: application/json
 
 **Response:** `201 Created` with the created run object.
 
-### 2. Sync Issue State
+### 2. Sync Issue State (Best-Effort)
 
 Refresh Dispatch's cache of GitHub Issues before selecting work. This fetches the latest issue state from GitHub.
 
@@ -62,6 +64,8 @@ Content-Type: application/json
 
 **Failure handling:** Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the workflow on a sync failure.**
 
+> **Note:** General cache freshness is now owned by the scheduled sync runner (`POST /api/sync/scheduled`), which runs on a regular cadence (recommended: every 10–30 minutes). Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but they should not rely on it as the primary freshness mechanism.
+
 ### 3. Request Agent Queue
 
 Fetch the list of issues actionable for this agent, ranked by priority and status.
@@ -74,15 +78,16 @@ GET /api/agents/<agent-name>/queue
 
 **Response:** Array of issue objects containing `number`, `title`, `url`, and `labels`.
 
-**Selection behavior:**
-1. Default queue requests return unclaimed actionable work only.
-2. Issues with any `agent/*` label are excluded by default, including issues claimed by the requesting agent.
+**Selection priority:**
+1. Prefer issues labeled `agent/<agent-name>` if present.
+2. Fall back to general backlog if no agent-specific label exists.
 3. Treat "no status label" or `status/backlog` as backlog work — both are valid entry states.
-4. Pass `includeClaimed=true` to include claimed work for dashboards or manual recovery.
+
+Issues with an existing `agent/<other>` label remain visible in the queue so agents can see what others are working on.
 
 ### 4. Claim Work
 
-Claim an issue by requesting an agent assignment through Dispatch. This adds an `agent/<name>` label to the issue on GitHub and moves it to `status/in-progress`.
+Claim an issue by requesting an agent assignment through Dispatch. This adds an `agent/<name>` label to the issue on GitHub and optionally moves it to `status/in-progress`.
 
 ```
 POST /api/issues/claim
@@ -106,9 +111,8 @@ Content-Type: application/json
 **Optional fields:** `force` (boolean, default `false`)
 
 **Behavior:**
-- **Normal claim (`force: false`):** Succeeds if the issue is open and not already assigned to another agent. Adds `agent/<name>` label and sets `status/in-progress`.
+- **Normal claim (`force: false`):** Succeeds if the issue is open and not already assigned to another agent. Adds `agent/<name>` label and optionally `status/in-progress`.
 - **Force claim (`force: true`):** Removes any existing `agent/<other>` label before adding the new one. Useful for reassignment.
-- **Status update:** Replaces any existing status label with `status/in-progress` as part of the claim.
 - **Rejected (409):** Issue is already assigned to a different agent and `force` is not set.
 - **Rejected (400):** Issue is closed or has `status/done`.
 
@@ -219,7 +223,8 @@ All Dispatch interactions are best-effort from the agent's perspective:
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/api/health` | GET | None | Health check — `{ ok: true, database: "ok" }` |
-| `/api/sync` | POST | None | Trigger issue sync from GitHub |
+| `/api/sync` | POST | None | Trigger issue sync from GitHub (best-effort) |
+| `/api/sync/scheduled` | POST | Bearer token | Scheduled sync runner — primary freshness mechanism |
 | `/api/issues` | GET | None | List all issues in Dispatch cache |
 | `/api/agents/<name>/queue` | GET | None | Agent-specific issue queue |
 | `/api/issues/claim` | POST | Bearer token | Claim an issue (adds agent label) |
@@ -234,4 +239,5 @@ All Dispatch interactions are best-effort from the agent's perspective:
 
 ## History
 
+- **2026-05-19** — Updated to reflect that scheduled sync (`POST /api/sync/scheduled`) is now the primary freshness mechanism. Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but are no longer responsible for general cache freshness.
 - **2026-05-16** — Created as part of generic agent workflow documentation (Issue #59). Covers the complete lifecycle: start run, sync state, request queue, claim work, report status. Includes failure handling and security constraints. Replaces section-specific notes scattered across other docs with a single authoritative reference.

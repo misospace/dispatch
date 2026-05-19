@@ -13,19 +13,22 @@ The OpenClaw agent gradually moves from GitHub Projects grooming to Dispatch as 
 - **GitHub Issues and PRs remain the source of truth.** Dispatch's Postgres database is a cache, not authoritative storage.
 - **GitHub Projects board is deprecated for this workflow** — group by repository instead.
 - All Dispatch interactions are **best-effort**; failures must never break the agent heartbeat.
+- General cache freshness is owned by Dispatch's scheduled sync runner (`POST /api/sync/scheduled`). Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but they are no longer the primary freshness mechanism.
 
 ## Heartbeat Lifecycle
 
-### Start of Heartbeat
+### Start of Heartbeat (Best-Effort Sync)
 
 ```
 POST /api/sync
 ```
 
-- **Purpose:** Refresh Dispatch's issue cache before selecting work.
+- **Purpose:** Refresh Dispatch's issue cache before selecting work (best-effort).
 - **Auth:** None required.
 - **Expected response:** `{ syncedCount: N }` (N may be 0 if no repos configured).
 - **Failure handling:** Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
+
+> **Note:** General cache freshness is now owned by the scheduled sync runner (`POST /api/sync/scheduled`), which runs on a regular cadence (recommended: every 10–30 minutes). Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but they should not rely on it as the primary freshness mechanism.
 
 ### End of Heartbeat
 
@@ -115,7 +118,8 @@ All 11 checks in the smoke checklist must pass (or be explicitly skipped with ju
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/api/health` | GET | None | Health check — `{ ok: true, database: "ok" }` |
-| `/api/sync` | POST | None | Trigger issue sync from GitHub |
+| `/api/sync` | POST | None | Trigger issue sync from GitHub (best-effort) |
+| `/api/sync/scheduled` | POST | Bearer token | Scheduled sync runner — primary freshness mechanism |
 | `/api/issues` | GET | None | List all issues in Dispatch cache |
 | `/api/agent-runs` | GET | None | List recent agent runs |
 | `/api/agent-runs` | POST | Bearer token | Submit a new agent run record |
@@ -137,4 +141,5 @@ Phase 3 (future)       → Evaluate whether GitHub Projects board can be fully r
 
 ## History
 
+- **2026-05-19** — Updated to reflect that scheduled sync (`POST /api/sync/scheduled`) is now the primary freshness mechanism. Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but are no longer responsible for general cache freshness.
 - **2026-05-15** — Created as part of OpenClaw agent Phase 1 pre-cutover validation (Issue #53). Consolidates workflow contract from AGENTS.md and smoke checklist into a single operational reference.
