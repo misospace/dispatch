@@ -46,6 +46,8 @@ Before selecting any work from the assignment queue, the worker **must** check t
    - End the run — do not process additional items.
 3. If no item is returned (queue is clear), proceed to normal issue selection.
 
+Issue queue responses exclude claimed issues by default. Any issue with an `agent/*` label is treated as claimed and is omitted from `GET /api/agents/{agentName}/queue?lane=normal` unless the request includes `includeClaimed=true` for manual recovery or dashboard views.
+
 > **Never open a new PR for a queued PR fix.** The worker only pushes to the existing branch.
 
 ---

@@ -157,4 +157,60 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(body[0].type).toBe("pr-review-fix");
     expect(body[1].type).toBe("issue");
   });
+
+  it("excludes claimed issues by default", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-claimed",
+        number: 52,
+        title: "Claimed issue",
+        url: "https://github.com/org/repo/issues/52",
+        labels: ["agent/saffron", "status/backlog"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-unclaimed",
+        number: 53,
+        title: "Unclaimed issue",
+        url: "https://github.com/org/repo/issues/53",
+        labels: ["status/backlog"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([53]);
+  });
+
+  it("includes claimed issues when includeClaimed=true", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-claimed",
+        number: 52,
+        title: "Claimed issue",
+        url: "https://github.com/org/repo/issues/52",
+        labels: ["agent/saffron", "status/backlog"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal&includeClaimed=true"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0]).toMatchObject({ number: 52, agentMatch: true });
+  });
 });

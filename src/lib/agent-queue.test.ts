@@ -22,16 +22,28 @@ describe("buildAgentQueue", () => {
 
   it("excludes done issues even with agent label", () => {
     const issues = [makeIssue({ labels: ["agent/saffron", "status/done"] })];
+    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    expect(result).toHaveLength(0);
+  });
+
+  it("excludes same-agent claimed backlog issues by default", () => {
+    const issues = [makeIssue({ labels: ["agent/saffron", "status/backlog", "priority/p1"] })];
     const result = buildAgentQueue(issues, "saffron");
     expect(result).toHaveLength(0);
   });
 
-  it("includes backlog issues for the agent", () => {
+  it("includes same-agent claimed backlog issues when includeClaimed is true", () => {
     const issues = [makeIssue({ labels: ["agent/saffron", "status/backlog", "priority/p1"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(1);
     expect(result[0].agentMatch).toBe(true);
+  });
+
+  it("excludes other-agent claimed issues by default", () => {
+    const issues = [makeIssue({ labels: ["agent/beta", "status/backlog", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "saffron");
+    expect(result).toHaveLength(0);
   });
 
   it("includes issues with no status label", () => {
@@ -53,7 +65,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, labels: ["priority/p1"] }),
       makeIssue({ number: 2, labels: ["priority/p1", "agent/saffron"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
     expect(result[0].number).toBe(2); // agent-specific first
     expect(result[1].number).toBe(1);
   });
@@ -81,15 +93,15 @@ describe("buildAgentQueue", () => {
 
   it("includes ranking reason metadata", () => {
     const issues = [makeIssue({ labels: ["agent/saffron", "priority/p1", "status/backlog"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
     expect(result[0].rankingReason).toContain("p1");
     expect(result[0].rankingReason).toContain("agent/saffron");
   });
 
   it("does not hardcode agent names in logic", () => {
     const issues = [makeIssue({ labels: ["agent/beta", "priority/p1"] })];
-    const resultBeta = buildAgentQueue(issues, "beta");
-    const resultSaffron = buildAgentQueue(issues, "saffron");
+    const resultBeta = buildAgentQueue(issues, "beta", { includeClaimed: true });
+    const resultSaffron = buildAgentQueue(issues, "saffron", { includeClaimed: true });
 
     expect(resultBeta[0].agentMatch).toBe(true);
     expect(resultSaffron[0].agentMatch).toBe(false);
@@ -106,7 +118,7 @@ describe("buildAgentQueue", () => {
 
   it("returns correct type shape with all fields", () => {
     const issues = [makeIssue({ number: 42, title: "Fix bug", url: "https://gh.io/42", labels: ["priority/p0", "agent/saffron"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
     expect(result).toHaveLength(1);
     const issue = result[0];
     expect(issue).toHaveProperty("number", 42);

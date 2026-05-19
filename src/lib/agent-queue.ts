@@ -100,6 +100,7 @@ function isActionable(issueLabels: string[]): boolean {
  * Build the agent queue: filter, rank, and return issues for a given agent.
  * Optionally filters by execution lane (normal | escalated | backlog).
  * Optionally excludes decomposed audit parents.
+ * Excludes claimed issues by default; pass includeClaimed to include agent/* labels.
  */
 export function buildAgentQueue(
   issues: Array<{
@@ -116,6 +117,7 @@ export function buildAgentQueue(
   options?: {
     lane?: "normal" | "escalated" | "backlog" | "NORMAL" | "ESCALATED" | "BACKLOG";
     excludeDecomposed?: boolean;
+    includeClaimed?: boolean;
   },
 ): RankedIssue[] {
   // Normalize lane to lowercase for consistent comparison
@@ -123,6 +125,10 @@ export function buildAgentQueue(
 
   // Filter actionable issues (open, not done)
   let actionable = issues.filter((issue) => isActionable(issue.labels));
+
+  if (!options?.includeClaimed) {
+    actionable = actionable.filter((issue) => !issue.labels.some((label) => label.startsWith(AGENT_PREFIX)));
+  }
 
   // Exclude decomposed audit parents if requested
   if (options?.excludeDecomposed) {
