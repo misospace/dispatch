@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardRef } from "react";
 import { cn } from "@/lib/utils";
 import {
   DndContext,
@@ -30,15 +30,31 @@ const COLUMNS: { id: StatusLabel; title: string }[] = [
   { id: "status/done", title: "Done" },
 ];
 
+const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
+
 interface KanbanBoardProps {
   initialIssues: Issue[];
 }
 
-export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
+export interface KanbanBoardRef {
+  refresh: () => void;
+}
+
+export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function KanbanBoard(
+  { initialIssues },
+  ref
+) {
   const [issues, setIssues] = useState<Issue[]>(initialIssues);
   const [activeIssue, setActiveIssue] = useState<Issue | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Store latest issues in a ref for doRefresh to always use current state
+  const issuesRef = useRef(issues);
+  useEffect(() => {
+    issuesRef.current = issues;
+  }, [issues]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -57,9 +73,51 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
     }
   }, [notification]);
 
+  const doRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const query = params.toString();
+      const url = `/api/issues${query ? `?${query}` : ""}`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setIssues(data);
+      }
+    } catch {
+      // If refresh fails, silently ignore — user can manually sync
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
+
+  // Auto-refresh every 30 seconds
+  useEffect(() => {
+    const intervalId = setInterval(async () => {
+      await doRefresh();
+    }, AUTO_REFRESH_INTERVAL_MS);
+    return () => clearInterval(intervalId);
+  }, [doRefresh]);
+
+  // Refresh when tab/window regains focus
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void doRefresh();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [doRefresh]);
+
+  // Expose refresh method via ref
+  useImperativeHandle(ref, () => ({
+    refresh: doRefresh,
+  }), [doRefresh]);
+
   function handleDragStart(event: DragStartEvent) {
     const { active } = event;
-    const issue = issues.find((i) => i.id === active.id);
+    const issue = issuesRef.current.find((i) => i.id === active.id);
     if (issue) setActiveIssue(issue);
   }
 
@@ -74,7 +132,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
 
     const overColumn = COLUMNS.find((c) => c.id === overId);
     if (!overColumn) {
-      const overIssue = issues.find((i) => i.id === overId);
+      const overIssue = issuesRef.current.find((i) => i.id === overId);
       if (!overIssue) return;
 
       await moveIssue(activeId, getIssueStatus(overIssue));
@@ -84,7 +142,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
   }
 
   async function moveIssue(issueId: string, newStatus: StatusLabel) {
-    const issue = issues.find((i) => i.id === issueId);
+    const issue = issuesRef.current.find((i) => i.id === issueId);
     if (!issue) return;
 
     const oldLabels = [...issue.labels];
@@ -129,27 +187,6 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
     }
   }
 
-  // Refresh the board by re-fetching issues from the API
-  async function refreshBoard() {
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const query = params.toString();
-      const url = `/api/issues${query ? `?${query}` : ""}`;
-      const res = await fetch(url);
-      if (res.ok) {
-        const data = await res.json();
-        setIssues(data);
-      }
-    } catch {
-      // If refresh fails, just sync to pick up changes
-      try {
-        await fetch("/api/sync", { method: "POST" });
-      } catch {
-        // Silent fail — user can manually sync
-      }
-    }
-  }
-
   return (
     <div className="space-y-4">
       {error && (
@@ -185,7 +222,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
       >
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {COLUMNS.map((column) => {
-            const columnIssues = getIssuesByStatus(issues, column.id);
+            const columnIssues = getIssuesByStatus(issuesRef.current, column.id);
             return (
               <KanbanColumn
                 key={column.id}
@@ -202,7 +239,7 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
                       <IssueCard
                         key={issue.id}
                         issue={issue}
-                        onIssueUpdate={() => refreshBoard()}
+                        onIssueUpdate={() => doRefresh()}
                       />
                     ))}
                   </div>
@@ -221,4 +258,4 @@ export function KanbanBoard({ initialIssues }: KanbanBoardProps) {
       </DndContext>
     </div>
   );
-}
+});
