@@ -414,6 +414,161 @@ describe("claimWork", () => {
   });
 });
 
+describe("claimWork with refreshBeforeClaim", () => {
+  beforeEach(async () => {
+    clearEnv();
+    setEnv();
+    vi.resetModules();
+    await import("./mc-client");
+    vi.restoreAllMocks();
+  });
+
+  it("refreshes issue when not found and refreshBeforeClaim is true (default)", async () => {
+    const { claimWork } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    // First call fails (issue not in cache)
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    // Refresh succeeds
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
+    );
+    // Resolve after refresh succeeds
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue]));
+    // Resolve inside claimIssue
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue]));
+    // Claim POST
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }));
+    // Resolve inside setIssueStatus
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue]));
+    // Set status POST
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, status: "status/in-progress", labels: [] }));
+
+    const result = await claimWork("org/repo", 42, "test-agent");
+
+    expect(result.issueId).toBe("issue-cuid-1");
+    expect(result.taskContract).toContain("was not in cache");
+  });
+
+  it("does not refresh when refreshBeforeClaim is false", async () => {
+    const { claimWork } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse([]));
+
+    await expect(claimWork("org/repo", 42, "test-agent", { refreshBeforeClaim: false })).rejects.toThrow(/not found/);
+  });
+
+  it("throws clear error when refresh also fails", async () => {
+    const { claimWork } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse([])) // resolve fails
+      .mockResolvedValueOnce(errorResponse("Issue not found on GitHub", 404)); // refresh fails
+
+    await expect(claimWork("org/repo", 42, "test-agent")).rejects.toThrow(/not found in.*after refresh/);
+  });
+
+  it("includes refresh note in task contract when issue was refreshed", async () => {
+    const { claimWork } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([])) // resolve fails
+      .mockResolvedValueOnce(
+        jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
+      ); // refresh succeeds
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve after refresh
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve inside claimIssue
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, labels: [] })); // claim
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve inside setIssueStatus
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] })); // set status
+
+    const result = await claimWork("org/repo", 42, "test-agent");
+    expect(result.taskContract).toContain("was refreshed from GitHub");
+  });
+});
+
+describe("refreshIssue", () => {
+  beforeEach(async () => {
+    clearEnv();
+    setEnv();
+    vi.resetModules();
+    await import("./mc-client");
+    vi.restoreAllMocks();
+  });
+
+  it("calls POST /api/issues/refresh with correct body", async () => {
+    const { refreshIssue } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
+    );
+
+    const result = await refreshIssue("org/repo", 42);
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("created");
+    expect(result.repo).toBe("org/repo");
+    expect(result.issueNumber).toBe(42);
+    expect(result.error).toBeNull();
+
+    const call = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect(call[0]).toContain("/api/issues/refresh");
+    expect(call[1].method).toBe("POST");
+    const body = JSON.parse(call[1].body as string);
+    expect(body.repoFullName).toBe("org/repo");
+    expect(body.issueNumber).toBe(42);
+  });
+
+  it("throws when refresh API returns error", async () => {
+    const { refreshIssue } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      errorResponse("Issue not found on GitHub", 404),
+    );
+
+    await expect(refreshIssue("org/repo", 99)).rejects.toThrow(/not found/);
+  });
+});
+
+describe("syncRepo", () => {
+  beforeEach(async () => {
+    clearEnv();
+    setEnv();
+    vi.resetModules();
+    await import("./mc-client");
+    vi.restoreAllMocks();
+  });
+
+  it("calls POST /api/sync with repoFullName body", async () => {
+    const { syncRepo } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        success: true,
+        repos: 1,
+        syncedCount: 5,
+        results: [{ repo: "org/repo", synced: 5, error: null }],
+      }),
+    );
+
+    const result = await syncRepo("org/repo");
+
+    expect(result.success).toBe(true);
+    expect(result.repos).toBe(1);
+    expect(result.syncedCount).toBe(5);
+
+    const call = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect(call[0]).toContain("/api/sync");
+    expect(call[1].method).toBe("POST");
+    const body = JSON.parse(call[1].body as string);
+    expect(body.repoFullName).toBe("org/repo");
+  });
+
+  it("throws when sync API returns error", async () => {
+    const { syncRepo } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      errorResponse("Repo not tracked", 404),
+    );
+
+    await expect(syncRepo("unknown/repo")).rejects.toThrow(/not tracked/);
+  });
+});
+
 describe("DispatchClientError", () => {
   it("stores message and statusCode", () => {
     const err = new DispatchClientError("something failed", 500);

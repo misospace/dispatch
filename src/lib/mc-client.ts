@@ -52,6 +52,21 @@ export interface ClaimWorkResult {
   taskContract: string;
 }
 
+export interface RefreshIssueResult {
+  success: boolean;
+  repo: string;
+  issueNumber: number;
+  action: "created" | "updated";
+  error: string | null;
+}
+
+export interface SyncRepoResult {
+  success: boolean;
+  repos: number;
+  syncedCount: number;
+  results: { repo: string; synced: number; error: string | null }[];
+}
+
 export class DispatchClientError extends Error {
   constructor(
     message: string,
@@ -205,10 +220,40 @@ export async function claimWork(
   repoFullName: string,
   issueNumber: number,
   agentName: string,
-  options?: { status?: string; force?: boolean },
+  options?: { status?: string; force?: boolean; refreshBeforeClaim?: boolean },
 ): Promise<ClaimWorkResult> {
-  const resolved = await resolveIssue(repoFullName, issueNumber);
+  const refreshEnabled = options?.refreshBeforeClaim ?? true;
   const status = options?.status ?? "in-progress";
+
+  let resolved: ResolveIssueResult;
+  let refreshSucceeded = false;
+
+  try {
+    resolved = await resolveIssue(repoFullName, issueNumber);
+  } catch (error) {
+    if (!refreshEnabled || !(error instanceof DispatchClientError)) {
+      throw error;
+    }
+
+    try {
+      await refreshIssue(repoFullName, issueNumber);
+      refreshSucceeded = true;
+
+      try {
+        resolved = await resolveIssue(repoFullName, issueNumber);
+      } catch {
+        throw new DispatchClientError(
+          `Issue #${issueNumber} not found in ${repoFullName} after refresh. The issue may not exist or the repo may not be tracked.`,
+          404,
+        );
+      }
+    } catch {
+      throw new DispatchClientError(
+        `Issue #${issueNumber} not found in ${repoFullName} after refresh. The issue may not exist or the repo may not be tracked.`,
+        404,
+      );
+    }
+  }
 
   await claimIssue(repoFullName, issueNumber, agentName, options?.force);
   await setIssueStatus(repoFullName, issueNumber, status, agentName);
@@ -220,6 +265,7 @@ URL: ${resolved.url}
 Lane: ${resolved.lane || "normal"}
 Status: ${status}
 Labels: ${resolved.labels.join(", ") || "none"}
+${refreshSucceeded ? "\nNote: Issue was refreshed from GitHub before claiming (was not in cache).\n" : ""}
 
 Scope of work:
 - Only work on this specific issue. Do not pick up other issues.
@@ -238,4 +284,23 @@ Scope of work:
     status,
     taskContract,
   };
+}
+
+export async function refreshIssue(
+  repoFullName: string,
+  issueNumber: number,
+): Promise<RefreshIssueResult> {
+  return mcJson<RefreshIssueResult>("/api/issues/refresh", {
+    method: "POST",
+    body: JSON.stringify({ repoFullName, issueNumber }),
+  });
+}
+
+export async function syncRepo(
+  repoFullName: string,
+): Promise<SyncRepoResult> {
+  return mcJson<SyncRepoResult>("/api/sync", {
+    method: "POST",
+    body: JSON.stringify({ repoFullName }),
+  });
 }
