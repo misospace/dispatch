@@ -117,7 +117,7 @@ All worker prompts must no longer reference:
 ### 6. Preserve existing behaviors
 
 The following must remain unchanged in worker prompts:
-- PR review-fix queue check (via `pr_fix_queue.py next --lane {lane}`) — still the first step
+- PR review-fix queue check (via `GET /api/agents/{agentName}/queue?lane=normal`) — PR-fix items are returned first, still the first step
 - Duplicate PR avoidance (`gh pr list --state open --search "{number}"`)
 - Hard completion gates (git push → gh pr create → gh pr view → final response with PR URL)
 - Branch naming convention (`fix/issue-{number}-{short-description}`)
@@ -142,7 +142,9 @@ To transition status, workers must call `POST /api/issues/status` explicitly. Th
 
 ## PR Fix Queue Status
 
-The Dispatch application has a dedicated PR fix queue (`/api/pr-fix-queue/*`). The existing `pr_fix_queue.py` helper continues to be used by workers to check for queued PR fixes before consuming from the assignment queue. This is a temporary arrangement until a native Dispatch PR fix queue is fully implemented.
+The Dispatch application has a dedicated, fully-implemented PR fix queue (`/api/pr-fix-queue/*`) with native ingestion via both pull-based sync (`POST /api/pr-followup/sync`) and real-time webhooks (`POST /api/pr-followup/webhook`). PR-fix items are automatically prepended to the agent queue response from `GET /api/agents/{agentName}/queue`.
+
+Workers should consume PR-fix items from the Dispatch agent queue endpoint or the dedicated `/api/pr-fix-queue/queued` endpoint. The local `pr_fix_queue.py` helper is no longer required.
 
 ## Deprecated Scripts
 

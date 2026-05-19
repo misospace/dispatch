@@ -31,20 +31,27 @@ Workers must not batch multiple issues or PR fixes into a single run.
 
 ## PR Fix Queue Precedence
 
-Before selecting any work from the assignment queue, the worker **must** check the PR review-fix queue:
+Before selecting any work from the assignment queue, the worker **must** check the PR review-fix queue via Dispatch APIs:
 
-1. Query the PR fix queue for the next available item in the worker's lane (e.g., `normal`).
-2. If an item is returned:
+1. Query `GET /api/agents/{agentName}/queue?lane=normal` — PR-fix items are returned first in the response array (before ranked issue work).
+   - Alternatively, query `GET /api/pr-fix-queue/queued?lane=normal` directly for PR-fix items only.
+2. For each item with `type: "pr-review-fix"`:
    - Verify the PR is still open and authored by the expected bot account.
    - Verify the head owner matches the trusted owner (`misospace` or `joryirving`).
    - Fetch origin, checkout the queued branch, pull/rebase as appropriate.
-   - Read PR comments, reviews, and check failures to determine the requested fix.
+   - Read the item's `feedback[]` array to determine the requested fix (from PR comments, reviews, and check failures).
    - Apply the smallest possible change that satisfies the feedback.
    - Validate locally (lint, typecheck, tests).
    - Commit, push to the **same** branch, comment on the PR with what changed and validation results.
-   - Mark the queue item `fixed` with a note.
+   - Mark the queue item `fixed` via `POST /api/pr-fix-queue/mark`:
+     ```bash
+     curl -s -X POST "DISPATCH_URL/api/pr-fix-queue/mark" \
+       -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+       -H "Content-Type: application/json" \
+       -d '{"repo":"org/repo","pr":42,"status":"fixed","note":"Pushed fix + validation passed"}'
+     ```
    - End the run — do not process additional items.
-3. If no item is returned (queue is clear), proceed to normal issue selection.
+3. If no PR-fix items remain, proceed to normal issue selection from the agent queue.
 
 Issue queue responses exclude claimed issues by default. Any issue with an `agent/*` label is treated as claimed and is omitted from `GET /api/agents/{agentName}/queue?lane=normal` unless the request includes `includeClaimed=true` for manual recovery or dashboard views.
 
@@ -138,6 +145,24 @@ Do not include stack traces, tokens, or debug output in the final response.
 ---
 
 ## Queue Consumption Rules
+
+### PR Fix Queue
+
+PR review-fix items take precedence over all issue work. Workers must check for pending PR-fix items before consuming from the issue queue.
+
+PR-fix items are returned via:
+- `GET /api/agents/{agentName}/queue?lane=normal` — PR-fix items prepended to response array
+- `GET /api/pr-fix-queue/queued?lane=normal` — PR-fix items only
+
+Mark completion via `POST /api/pr-fix-queue/mark`:
+```bash
+curl -s -X POST "DISPATCH_URL/api/pr-fix-queue/mark" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"repo":"org/repo","pr":42,"status":"fixed"}'
+```
+
+Valid statuses: `FIXED`, `BLOCKED`, `STALE`, `IGNORED`.
 
 ### Normal Lane
 

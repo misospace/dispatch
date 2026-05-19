@@ -84,6 +84,10 @@ function uniqueAppend(values: string[], value: string, maxItems: number): string
   return next.slice(-maxItems);
 }
 
+/**
+ * Build a Prisma update patch from enqueue input.
+ * `issue` maps to Prisma PrFixQueueItem.issue (Int?) which stores the linked GitHub issue number.
+ */
 function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number> {
   const patch: Record<string, string | number> = {};
   for (const [key, value] of Object.entries({
