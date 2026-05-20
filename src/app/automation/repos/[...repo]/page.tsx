@@ -98,8 +98,9 @@ function Duration({ seconds }: { seconds: number | null }) {
   return <span>{Math.floor(seconds / 3600)}h {Math.floor((seconds % 3600) / 60)}m</span>;
 }
 
-export default function RepoDetailPage({ params }: { params: Promise<{ repo: string }> }) {
-  const { repo: repoFullName } = use(params);
+export default function RepoDetailPage({ params }: { params: Promise<{ repo: string[] }> }) {
+  const { repo: repoSegments } = use(params);
+  const repoFullName = repoSegments.join("/");
   const [repo, setRepo] = useState<RepoDetail | null>(null);
   const [loading, setLoading] = useState(true);
 

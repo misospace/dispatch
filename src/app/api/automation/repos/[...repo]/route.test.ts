@@ -24,14 +24,14 @@ vi.mock("@/lib/prisma", () => ({
 
 import { DELETE } from "./route";
 
-function deleteRequest(repoEncoded: string) {
+function deleteRequest(repoSegments: string[]) {
   return DELETE(
-    new Request(`http://localhost/api/automation/repos/${repoEncoded}`, { method: "DELETE" }),
-    { params: Promise.resolve({ repo: repoEncoded }) },
+    new Request(`http://localhost/api/automation/repos/${repoSegments.join("/")}`, { method: "DELETE" }),
+    { params: Promise.resolve({ repo: repoSegments }) },
   );
 }
 
-describe("DELETE /api/automation/repos/[repo]", () => {
+describe("DELETE /api/automation/repos/[...repo]", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.findUniqueAutomationRepo.mockResolvedValue({ id: "repo-1", source: "user" });
@@ -42,13 +42,13 @@ describe("DELETE /api/automation/repos/[repo]", () => {
 
   it("returns 404 when the repo is not tracked", async () => {
     mocks.findUniqueAutomationRepo.mockResolvedValueOnce(null);
-    const res = await deleteRequest(encodeURIComponent("myorg/missing"));
+    const res = await deleteRequest(["myorg", "missing"]);
     expect(res.status).toBe(404);
     expect(mocks.deleteAutomationRepo).not.toHaveBeenCalled();
   });
 
   it("deletes the AutomationRepo, soft-disables Repository, and writes an audit row", async () => {
-    const res = await deleteRequest(encodeURIComponent("myorg/myrepo"));
+    const res = await deleteRequest(["myorg", "myrepo"]);
     expect(res.status).toBe(200);
 
     expect(mocks.deleteAutomationRepo).toHaveBeenCalledWith({
@@ -70,7 +70,7 @@ describe("DELETE /api/automation/repos/[repo]", () => {
 
   it("writes a failure audit row when delete throws", async () => {
     mocks.deleteAutomationRepo.mockRejectedValueOnce(new Error("db down"));
-    const res = await deleteRequest(encodeURIComponent("myorg/myrepo"));
+    const res = await deleteRequest(["myorg", "myrepo"]);
     expect(res.status).toBe(500);
 
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
