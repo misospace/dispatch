@@ -14,6 +14,7 @@ function setEnv() {
 function clearEnv() {
   delete process.env.DISPATCH_URL;
   delete process.env.DISPATCH_AGENT_TOKEN;
+  delete process.env.DISPATCH_AGENT_NAME;
 }
 
 const mockIssue = {
@@ -111,6 +112,64 @@ describe("getDispatchConfig", () => {
       expect((err as Error).message).not.toMatch(/deprecated/i);
       expect((err as Error).message).toMatch(/DISPATCH_URL/);
     }
+  });
+});
+
+describe("resolveAgentName", () => {
+  beforeEach(async () => {
+    clearEnv();
+    vi.resetModules();
+    await import("./mc-client");
+  });
+
+  it("returns explicit agentName when provided", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    expect(resolveAgentName("my-agent")).toBe("my-agent");
+  });
+
+  it("trims whitespace from explicit agentName", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    expect(resolveAgentName("  my-agent  ")).toBe("my-agent");
+  });
+
+  it("falls back to DISPATCH_AGENT_NAME when agentName is omitted", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    expect(resolveAgentName(undefined)).toBe("env-agent");
+  });
+
+  it("prefers explicit agentName over DISPATCH_AGENT_NAME", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    expect(resolveAgentName("explicit-agent")).toBe("explicit-agent");
+  });
+
+  it("returns undefined when both are missing", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    delete process.env.DISPATCH_AGENT_NAME;
+    expect(resolveAgentName(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined when agentName is empty string", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    expect(resolveAgentName("")).toBeUndefined();
+  });
+
+  it("returns undefined when agentName is whitespace only", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    expect(resolveAgentName("   ")).toBeUndefined();
+  });
+
+  it("uses DISPATCH_AGENT_NAME when explicit agentName is empty", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    expect(resolveAgentName("")).toBe("env-agent");
+  });
+
+  it("trims whitespace from DISPATCH_AGENT_NAME", async () => {
+    const { resolveAgentName } = await import("./mc-client");
+    process.env.DISPATCH_AGENT_NAME = "  env-agent  ";
+    expect(resolveAgentName(undefined)).toBe("env-agent");
   });
 });
 
@@ -411,6 +470,67 @@ describe("claimWork", () => {
 
     const result = await claimWork("org/repo", 42, "test-agent");
     expect(result.taskContract).toContain("escalated");
+  });
+
+  it("includes resolvedAgentName in result", async () => {
+    const { claimWork } = await import("./mc-client");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (inside claimIssue)
+      .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // claim
+      .mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve (inside setIssueStatus)
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] })); // set status
+
+    const result = await claimWork("org/repo", 42, "test-agent");
+    expect(result.resolvedAgentName).toBe("test-agent");
+  });
+
+  it("includes resolved agent name in task contract", async () => {
+    const { claimWork } = await import("./mc-client");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))
+      .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))
+      .mockResolvedValueOnce(jsonResponse([mockIssue]));
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] }));
+
+    const result = await claimWork("org/repo", 42, "test-agent");
+    expect(result.taskContract).toContain("Agent: test-agent");
+  });
+
+  it("fails when no agentName and DISPATCH_AGENT_NAME not set", async () => {
+    const { claimWork } = await import("./mc-client");
+    clearEnv();
+    process.env.DISPATCH_URL = mockBaseUrl;
+    process.env.DISPATCH_AGENT_TOKEN = mockToken;
+    delete process.env.DISPATCH_AGENT_NAME;
+
+    await expect(claimWork("org/repo", 42, undefined)).rejects.toThrow(/agentName is required/);
+    await expect(claimWork("org/repo", 42, undefined)).rejects.toThrow(/DISPATCH_AGENT_NAME/);
+    await expect(claimWork("org/repo", 42, undefined)).rejects.toThrow(/Dispatch MCP/i);
+  });
+
+  it("uses DISPATCH_AGENT_NAME when agentName is omitted", async () => {
+    const { claimWork } = await import("./mc-client");
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (inside claimIssue)
+      .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // claim
+      .mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve (inside setIssueStatus)
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] })); // set status
+
+    const result = await claimWork("org/repo", 42, undefined);
+
+    expect(result.resolvedAgentName).toBe("env-agent");
+    expect(result.taskContract).toContain("Agent: env-agent");
+    // Verify the claim request used the env agent name
+    const call = vi.mocked(fetch).mock.calls[2] as [string, RequestInit];
+    const body = JSON.parse(call[1].body as string);
+    expect(body.agentName).toBe("env-agent");
   });
 });
 

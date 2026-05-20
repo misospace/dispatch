@@ -1,7 +1,8 @@
 /**
  * Dispatch environment variable resolution.
  *
- * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN, DATABASE_URL, DISPATCH_DATABASE_URL
+ * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN, DISPATCH_AGENT_NAME,
+ *                     DATABASE_URL, DISPATCH_DATABASE_URL
  */
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,34 @@ export function getDispatchAgentToken(): string | undefined {
 
   _cachedToken = process.env.DISPATCH_AGENT_TOKEN;
   return _cachedToken;
+}
+
+// ---------------------------------------------------------------------------
+// Agent name resolution (default identity for MCP clients)
+// ---------------------------------------------------------------------------
+
+let _cachedAgentName: string | undefined;
+
+/**
+ * Resolve the default agent name used when MCP tools do not receive an explicit
+ * `agentName` argument.
+ *
+ * This prevents models from inventing poor identities like "Dispatch MCP" when
+ * claiming work. Callers should set this to a stable operator identity such as
+ * `jory-opencode`.
+ *
+ * Resolution order:
+ * 1. DISPATCH_AGENT_NAME
+ *
+ * Returns undefined if not configured — callers must then require an explicit
+ * agentName argument.
+ */
+export function getDispatchAgentName(): string | undefined {
+  if (_cachedAgentName !== undefined) return _cachedAgentName;
+
+  const name = process.env.DISPATCH_AGENT_NAME;
+  _cachedAgentName = name || undefined;
+  return _cachedAgentName;
 }
 
 // ---------------------------------------------------------------------------
