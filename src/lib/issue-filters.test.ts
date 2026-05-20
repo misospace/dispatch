@@ -4,7 +4,7 @@ import { buildLabelWhere, discoverLabelFilterOptions, toProjectLabel } from "./i
 describe("issue filter helpers", () => {
   it("discovers sorted agent and owner options from labels only", () => {
     const options = discoverLabelFilterOptions([
-      { labels: ["agent/beta", "owner/alice", "assignee/saffron"] },
+      { labels: ["agent/beta", "owner/alice", "assignee/example-agent"] },
       { labels: ["agent/alpha", "owner/bob", "agent/beta"] },
       { labels: ["priority/p1", "status/backlog"] },
     ]);

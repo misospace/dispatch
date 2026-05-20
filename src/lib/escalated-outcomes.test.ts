@@ -63,7 +63,7 @@ describe("Escalated outcome validation", () => {
 describe("buildAgentQueue with decomposed audit parents", () => {
   it("includes decomposed issues when excludeDecomposed is false (default)", () => {
     const issues = [makeIssue({ number: 1, labels: ["priority/p1"], decomposed: true })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].decomposed).toBe(true);
   });
@@ -73,7 +73,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
       makeIssue({ number: 1, labels: ["priority/p1"], decomposed: true }),
       makeIssue({ number: 2, labels: ["priority/p1"], decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { excludeDecomposed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -85,7 +85,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
       makeIssue({ number: 3, labels: ["priority/p0"], lane: "ESCALATED", decomposed: true }),
       makeIssue({ number: 4, labels: ["priority/p0"], lane: "ESCALATED", decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { lane: "ESCALATED", excludeDecomposed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "ESCALATED", excludeDecomposed: true });
     expect(result).toHaveLength(2);
     expect(result.map((i) => i.number)).toEqual([4, 2]); // p0 first, then p1
   });
@@ -95,14 +95,14 @@ describe("buildAgentQueue with decomposed audit parents", () => {
       makeIssue({ number: 1, labels: ["priority/p1"], decomposed: true }),
       makeIssue({ number: 2, labels: ["priority/p1"], decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result[0].decomposed).toBe(true);
     expect(result[1].decomposed).toBe(false);
   });
 
   it("defaults decomposed to false when not provided", () => {
     const issues = [makeIssue({ number: 1, labels: ["priority/p1"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result[0].decomposed).toBe(false);
   });
 
@@ -113,7 +113,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
       makeIssue({ number: 11, title: "Review auth module", labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
       makeIssue({ number: 12, title: "Update CI config", labels: ["priority/p2"], lane: "ESCALATED", decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { lane: "ESCALATED", excludeDecomposed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "ESCALATED", excludeDecomposed: true });
     expect(result).toHaveLength(2);
     expect(result[0].number).toBe(11); // p1 first
     expect(result[1].number).toBe(12); // p2 second
@@ -121,10 +121,10 @@ describe("buildAgentQueue with decomposed audit parents", () => {
 
   it("does not hardcode agent names in decomposed filtering", () => {
     const issues = [makeIssue({ number: 1, labels: ["priority/p1"], lane: "ESCALATED", decomposed: true })];
-    const resultSaffron = buildAgentQueue(issues, "saffron", { excludeDecomposed: true });
+    const resultWorker = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     const resultBeta = buildAgentQueue(issues, "beta", { excludeDecomposed: true });
 
-    expect(resultSaffron).toHaveLength(0);
+    expect(resultWorker).toHaveLength(0);
     expect(resultBeta).toHaveLength(0);
   });
 
@@ -143,7 +143,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
         decomposed: false,
       }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { excludeDecomposed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -159,7 +159,7 @@ describe("Combined lane and decomposed filtering", () => {
       makeIssue({ number: 3, labels: ["priority/p1"], lane: "NORMAL", decomposed: true }),
       makeIssue({ number: 4, labels: ["priority/p0"], lane: "ESCALATED", decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { lane: "ESCALATED", excludeDecomposed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "ESCALATED", excludeDecomposed: true });
     expect(result).toHaveLength(2);
     expect(result.map((i) => i.number)).toEqual([4, 2]);
   });
@@ -169,7 +169,7 @@ describe("Combined lane and decomposed filtering", () => {
       makeIssue({ number: 1, labels: ["priority/p1"], lane: "BACKLOG", decomposed: true }),
       makeIssue({ number: 2, labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -179,7 +179,7 @@ describe("Combined lane and decomposed filtering", () => {
       makeIssue({ number: 1, labels: ["priority/p1"], lane: "BACKLOG", decomposed: false }),
       makeIssue({ number: 2, labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { excludeDecomposed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
