@@ -16,12 +16,19 @@ interface AgentRun {
   errorMessage?: string;
 }
 
+interface AgentStats {
+  assigned: number;
+  ready: number;
+  inProgress: number;
+  inReview: number;
+}
+
 async function getAgentStats() {
   const issues = await prisma.issue.findMany({
     where: { state: "open", repository: { enabled: true } },
   });
 
-  const agentMap: Record<string, { assigned: number; inProgress: number; inReview: number }> = {};
+  const agentMap: Record<string, AgentStats> = {};
 
   const agentIssues = await prisma.issue.findMany({
     where: { repository: { enabled: true } },
@@ -31,8 +38,9 @@ async function getAgentStats() {
   for (const issue of agentIssues) {
     for (const label of issue.labels) {
       if (label.startsWith(AGENT_PREFIX)) {
-        if (!agentMap[label]) agentMap[label] = { assigned: 0, inProgress: 0, inReview: 0 };
+        if (!agentMap[label]) agentMap[label] = { assigned: 0, ready: 0, inProgress: 0, inReview: 0 };
         agentMap[label].assigned++;
+        if (issue.labels.includes("status/ready")) agentMap[label].ready++;
         if (issue.labels.includes("status/in-progress")) agentMap[label].inProgress++;
         if (issue.labels.includes("status/in-review")) agentMap[label].inReview++;
       }
@@ -88,7 +96,7 @@ export default async function AgentsPage() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {discoveredAgents.map((agentName: string) => {
             const label = `${AGENT_PREFIX}${agentName}`;
-            const stats = agentStats[label] || { assigned: 0, inProgress: 0, inReview: 0 };
+            const stats = agentStats[label] || { assigned: 0, ready: 0, inProgress: 0, inReview: 0 };
             return (
               <Card key={agentName}>
                 <CardHeader className="pb-2">
@@ -101,6 +109,10 @@ export default async function AgentsPage() {
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">Assigned</span>
                       <span className="font-medium">{stats.assigned}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Ready</span>
+                      <span className="font-medium">{stats.ready}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">In Progress</span>
