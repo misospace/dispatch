@@ -657,7 +657,7 @@ describe("claimWorkHandler", () => {
     expect(parsed.taskContract).toContain("Agent: env-agent");
     // Verify the claim request used env-agent
     const call = vi.mocked(fetch).mock.calls[2] as [string, RequestInit];
-    const body = JSON.parse(call.body as string);
+    const body = JSON.parse(call[1].body as string);
     expect(body.agentName).toBe("env-agent");
     delete process.env.DISPATCH_AGENT_NAME;
   });
