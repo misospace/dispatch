@@ -187,9 +187,9 @@ At the **end** of each heartbeat:
 ### Reading work
 
 3. **Read issues from `GET /api/issues`.** Do not query the Postgres cache directly — the API is the contract.
-4. **Prefer issues assigned via `agent/<agent-id>` label** if present. If no `agent/*` label exists, fall back to general backlog.
+4. **Prefer issues assigned via `agent/<agent-id>` label** if present. If no `agent/*` label exists, pick from **Ready** by default. Agents pick `status/ready` issues — `status/backlog` and unlabeled issues need triage and are excluded from the default queue.
 5. **Filter by execution lane** using the `lane` query param on `GET /api/agents/[agentName]/queue` (values: `NORMAL`, `ESCALATED`, `BACKLOG`). By default, BACKLOG issues are excluded from the normal agent queue.
-6. **Treat "no status label" or `status/backlog` as backlog work.** Both are valid entry states.
+6. **Agents pick from Ready by default.** `status/backlog` or unlabeled issues are not queueable unless triage marks them Ready — they need grooming before being actionable.
 7. **Respect execution lane classification** when present: NORMAL issues are the primary queue for agents; ESCALATED issues may require higher-judgment support; BACKLOG issues are not actionable until decomposed.
 
 ### Source of truth
