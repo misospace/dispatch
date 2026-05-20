@@ -269,7 +269,7 @@ ${refreshSucceeded ? "\nNote: Issue was refreshed from GitHub before claiming (w
 
 Scope of work:
 - Only work on this specific issue. Do not pick up other issues.
-- Update the issue status as you progress (backlog -> in-progress -> in-review -> done).
+- Update the issue status as you progress (backlog -> ready -> in-progress -> in-review -> done).
 - Push commits and PRs referencing the issue number (${issueNumber}).
 - When complete, set status to done.`;
 

@@ -266,7 +266,7 @@ export function createServer(): McpServerType {
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
         status: z
           .string()
-          .describe("Status label value: backlog, in-progress, in-review, or done"),
+          .describe("Status label value: backlog, ready, in-progress, in-review, or done"),
         agentName: z
           .string()
           .optional()

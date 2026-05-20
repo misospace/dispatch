@@ -10,6 +10,7 @@ import {
 const DONE_STATUS: string = "status/done";
 const IN_PROGRESS_STATUS: string = "status/in-progress";
 const BACKLOG_STATUS: string = "status/backlog";
+const READY_STATUS: string = "status/ready";
 
 export interface RankedIssue {
   type?: "issue";
@@ -83,13 +84,16 @@ function rankIssue(issueLabels: string[], agentName: string): { score: number; r
     parts.push(`${AGENT_PREFIX}${agentName}`);
   }
 
-  // Status component: in-progress before backlog before no-status
+  // Status component: in-progress before ready before backlog before no-status
   let statusScore = 2;
   if (status === IN_PROGRESS_STATUS) {
     statusScore = 0;
     parts.push("in-progress");
-  } else if (status === BACKLOG_STATUS || status === null) {
+  } else if (status === READY_STATUS) {
     statusScore = 1;
+    parts.push("ready");
+  } else if (status === BACKLOG_STATUS || status === null) {
+    statusScore = 2;
     parts.push(status ?? "no-status");
   }
 
@@ -109,8 +113,8 @@ function isActionable(issueLabels: string[]): boolean {
   // Exclude done
   if (status === DONE_STATUS) return false;
 
-  // Include: no status, backlog, in-progress
-  if (status === null || status === BACKLOG_STATUS || status === IN_PROGRESS_STATUS) {
+  // Include: no status, backlog, ready, in-progress
+  if (status === null || status === BACKLOG_STATUS || status === READY_STATUS || status === IN_PROGRESS_STATUS) {
     return true;
   }
 

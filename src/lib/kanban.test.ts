@@ -3,7 +3,9 @@ import { getIssuesByStatus, getIssueStatus } from "./kanban";
 
 const issues = [
   { id: "backlog", labels: ["status/backlog"], state: "open" },
+  { id: "ready", labels: ["status/ready"], state: "open" },
   { id: "in-progress", labels: ["status/in-progress"], state: "open" },
+  { id: "in-review", labels: ["status/in-review"], state: "open" },
   { id: "no-status", labels: [], state: "open" },
   { id: "unrelated", labels: ["type/bug", "project/test"], state: "open" },
   { id: "closed-no-status", labels: [], state: "closed" },
@@ -24,6 +26,11 @@ describe("getIssueStatus", () => {
     expect(getIssueStatus({ labels: [], state: "closed" })).toBe("status/backlog");
   });
 
+  it("respects explicit ready and in-review status labels", () => {
+    expect(getIssueStatus({ labels: ["status/ready"], state: "open" })).toBe("status/ready");
+    expect(getIssueStatus({ labels: ["status/in-review"], state: "open" })).toBe("status/in-review");
+  });
+
   it("respects explicit status labels on closed issues", () => {
     expect(getIssueStatus({ labels: ["status/backlog"], state: "closed" })).toBe("status/backlog");
     expect(getIssueStatus({ labels: ["status/in-progress"], state: "closed" })).toBe("status/in-progress");
@@ -37,6 +44,14 @@ describe("getIssueStatus", () => {
 describe("getIssuesByStatus", () => {
   it("keeps explicitly backlog issues in Backlog", () => {
     expect(getIssuesByStatus(issues, "status/backlog").map((issue) => issue.id)).toContain("backlog");
+  });
+
+  it("keeps ready issues in Ready", () => {
+    expect(getIssuesByStatus(issues, "status/ready").map((issue) => issue.id)).toEqual(["ready"]);
+  });
+
+  it("keeps in-review issues in In Review", () => {
+    expect(getIssuesByStatus(issues, "status/in-review").map((issue) => issue.id)).toEqual(["in-review"]);
   });
 
   it("keeps in-progress issues in In Progress", () => {

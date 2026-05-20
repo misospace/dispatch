@@ -41,10 +41,11 @@ Agent Runs → Dispatch → Agent Activity Page
 ## Required Labels
 
 ### Status Labels
-- `status/backlog` - Issue is in backlog
+- `status/backlog` - Issue needs triage/grooming; not yet ready for agents
+- `status/ready` - Issue is groomed and actionable; available for agents to claim
 - `status/in-progress` - Issue is being worked on
-- `status/in-review` - Issue is under review
-- `status/done` - Issue is completed
+- `status/in-review` - Issue has an open PR pending review/merge
+- `status/done` - Issue is completed (closed)
 
 ### Owner Labels
 - `owner/*` - Issue is owned by a specific person (e.g., `owner/alice`, `owner/bob`). The Board Owner filter is derived only from synced `owner/*` labels, not GitHub assignees.
@@ -116,7 +117,7 @@ Ensure it is only accessible within your trusted network via ingress rules.
    - Store: number, repo, title, state, labels, assignees, URL, timestamps
 
 3. **Kanban Board**
-   - Columns: Backlog, In Progress, In Review, Done
+   - Columns: Backlog, Ready, In Progress, In Review, Done
    - Drag-and-drop between columns updates GitHub labels
    - Audit log entry on every mutation
    - Visible error on GitHub mutation failure
