@@ -57,8 +57,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -82,8 +82,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -106,8 +106,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=escalated"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=escalated"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -148,8 +148,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -165,7 +165,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
         number: 52,
         title: "Claimed issue",
         url: "https://github.com/org/repo/issues/52",
-        labels: ["agent/saffron", "status/backlog"],
+        labels: ["agent/example-agent", "status/backlog"],
         currentLane: "normal",
         decomposed: false,
         repository: { fullName: "org/repo" },
@@ -182,8 +182,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -198,15 +198,15 @@ describe("GET /api/agents/[agentName]/queue", () => {
         number: 52,
         title: "Claimed issue",
         url: "https://github.com/org/repo/issues/52",
-        labels: ["agent/saffron", "status/backlog"],
+        labels: ["agent/example-agent", "status/backlog"],
         currentLane: "normal",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal&includeClaimed=true"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -240,8 +240,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -273,8 +273,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal&includeRenovate=true"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeRenovate=true"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -308,8 +308,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -341,8 +341,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
@@ -364,8 +364,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);

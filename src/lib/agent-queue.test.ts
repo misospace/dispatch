@@ -56,31 +56,31 @@ describe("isRenovateIssue", () => {
 
 describe("buildAgentQueue", () => {
   it("returns empty for no issues", () => {
-    const result = buildAgentQueue([], "saffron");
+    const result = buildAgentQueue([], "worker-agent");
     expect(result).toEqual([]);
   });
 
   it("excludes closed (status/done) issues", () => {
     const issues = [makeIssue({ labels: ["status/done", "priority/p1"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(0);
   });
 
   it("excludes done issues even with agent label", () => {
-    const issues = [makeIssue({ labels: ["agent/saffron", "status/done"] })];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const issues = [makeIssue({ labels: ["agent/worker-agent", "status/done"] })];
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
     expect(result).toHaveLength(0);
   });
 
   it("excludes same-agent claimed backlog issues by default", () => {
-    const issues = [makeIssue({ labels: ["agent/saffron", "status/backlog", "priority/p1"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const issues = [makeIssue({ labels: ["agent/worker-agent", "status/backlog", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(0);
   });
 
   it("includes same-agent claimed backlog issues when includeClaimed is true", () => {
-    const issues = [makeIssue({ labels: ["agent/saffron", "status/backlog", "priority/p1"] })];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const issues = [makeIssue({ labels: ["agent/worker-agent", "status/backlog", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(1);
     expect(result[0].agentMatch).toBe(true);
@@ -88,20 +88,20 @@ describe("buildAgentQueue", () => {
 
   it("excludes other-agent claimed issues by default", () => {
     const issues = [makeIssue({ labels: ["agent/beta", "status/backlog", "priority/p1"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(0);
   });
 
   it("includes issues with no status label", () => {
     const issues = [makeIssue({ labels: ["priority/p2"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].status).toBeNull();
   });
 
   it("includes in-progress issues", () => {
     const issues = [makeIssue({ labels: ["status/in-progress", "priority/p0"] })];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].status).toBe("status/in-progress");
   });
@@ -109,9 +109,9 @@ describe("buildAgentQueue", () => {
   it("prioritizes agent-specific issues over others at same priority", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["priority/p1"] }),
-      makeIssue({ number: 2, labels: ["priority/p1", "agent/saffron"] }),
+      makeIssue({ number: 2, labels: ["priority/p1", "agent/worker-agent"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
     expect(result[0].number).toBe(2); // agent-specific first
     expect(result[1].number).toBe(1);
   });
@@ -121,7 +121,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, labels: ["priority/p1", "status/backlog"] }),
       makeIssue({ number: 2, labels: ["priority/p1", "status/in-progress"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result[0].number).toBe(2); // in-progress first
     expect(result[1].number).toBe(1);
   });
@@ -133,24 +133,24 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 3, labels: ["priority/p2"] }),
       makeIssue({ number: 2, labels: ["priority/p1"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result.map((i) => i.number)).toEqual([1, 2, 3, 4]);
   });
 
   it("includes ranking reason metadata", () => {
-    const issues = [makeIssue({ labels: ["agent/saffron", "priority/p1", "status/backlog"] })];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const issues = [makeIssue({ labels: ["agent/worker-agent", "priority/p1", "status/backlog"] })];
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
     expect(result[0].rankingReason).toContain("p1");
-    expect(result[0].rankingReason).toContain("agent/saffron");
+    expect(result[0].rankingReason).toContain("agent/worker-agent");
   });
 
   it("does not hardcode agent names in logic", () => {
     const issues = [makeIssue({ labels: ["agent/beta", "priority/p1"] })];
     const resultBeta = buildAgentQueue(issues, "beta", { includeClaimed: true });
-    const resultSaffron = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const resultWorker = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
 
     expect(resultBeta[0].agentMatch).toBe(true);
-    expect(resultSaffron[0].agentMatch).toBe(false);
+    expect(resultWorker[0].agentMatch).toBe(false);
   });
 
   it("works across multiple repos (no hardcoded repo names)", () => {
@@ -158,13 +158,13 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", labels: ["priority/p1"] }),
       makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", labels: ["priority/p1"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(2);
   });
 
   it("returns correct type shape with all fields", () => {
-    const issues = [makeIssue({ number: 42, title: "Fix bug", url: "https://gh.io/42", labels: ["priority/p0", "agent/saffron"] })];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const issues = [makeIssue({ number: 42, title: "Fix bug", url: "https://gh.io/42", labels: ["priority/p0", "agent/worker-agent"] })];
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
     expect(result).toHaveLength(1);
     const issue = result[0];
     expect(issue).toHaveProperty("number", 42);
@@ -184,7 +184,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1"] }),
       makeIssue({ number: 2, title: "Fix login bug", labels: ["priority/p1"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -194,7 +194,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Update dependency lodash to v4.18.0", labels: [] }),
       makeIssue({ number: 2, title: "Add dark mode", labels: ["enhancement"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -204,7 +204,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Bump lodash", labels: ["renovate"] }),
       makeIssue({ number: 2, title: "Fix crash on startup", labels: ["bug"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -214,7 +214,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1"] }),
       makeIssue({ number: 2, title: "Fix login bug", labels: ["priority/p1"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { includeRenovate: true });
+    const result = buildAgentQueue(issues, "worker-agent", { includeRenovate: true });
     expect(result).toHaveLength(2);
   });
 
@@ -223,7 +223,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Update README", labels: ["documentation"] }),
       makeIssue({ number: 2, title: "Fix null pointer", labels: ["bug", "priority/p0"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(2);
   });
 
@@ -232,7 +232,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Update image node to v20", labels: [] }),
       makeIssue({ number: 2, title: "Implement search", labels: ["enhancement"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -242,7 +242,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Bump all deps", labels: ["dependencies"] }),
       makeIssue({ number: 2, title: "Fix API timeout", labels: ["bug"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -252,7 +252,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, title: "Bump eslint", labels: ["automated"] }),
       makeIssue({ number: 2, title: "Add unit tests", labels: ["testing"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -263,27 +263,27 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 2, title: "Fix crash", labels: ["priority/p0"], lane: "normal" }),
       makeIssue({ number: 3, title: "Escalated issue", labels: ["priority/p0"], lane: "escalated" }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { lane: "normal" });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "normal" });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
 
   it("excludes Renovate issues even when agent-specific", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["agent/saffron", "priority/p1"] }),
-      makeIssue({ number: 2, title: "Fix critical bug", labels: ["agent/saffron", "priority/p0"] }),
+      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["agent/worker-agent", "priority/p1"] }),
+      makeIssue({ number: 2, title: "Fix critical bug", labels: ["agent/worker-agent", "priority/p0"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
 
   it("includes Renovate issues when agent-specific and includeRenovate=true", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["agent/saffron", "priority/p1"] }),
-      makeIssue({ number: 2, title: "Fix critical bug", labels: ["agent/saffron", "priority/p0"] }),
+      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["agent/worker-agent", "priority/p1"] }),
+      makeIssue({ number: 2, title: "Fix critical bug", labels: ["agent/worker-agent", "priority/p0"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron", { includeClaimed: true, includeRenovate: true });
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true, includeRenovate: true });
     expect(result).toHaveLength(2);
   });
 
@@ -292,7 +292,7 @@ describe("buildAgentQueue", () => {
       makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", title: "Dependency Dashboard", labels: ["priority/p1"] }),
       makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", title: "Fix bug", labels: ["bug"] }),
     ];
-    const result = buildAgentQueue(issues, "saffron");
+    const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
