@@ -102,7 +102,7 @@ Lane filtering applies to both PR-fix items and issue work:
 | `lane` param | PR-fix filter | Issue filter |
 |--------------|---------------|--------------|
 | `normal` | `NORMAL` lane, `QUEUED` status only | `normal` lane, excludes `backlog` |
-| `escalated` (or `gpt`) | `ESCALATED` lane, `QUEUED` status only | `escalated` lane |
+| `escalated` (or `gpt` as a deprecated compatibility alias) | `ESCALATED` lane, `QUEUED` status only | `escalated` lane |
 | *(none)* | All lanes, `QUEUED` status only | Excludes `backlog` and `done` |
 
 The implementation is generic: there are no hardcoded agent names or repository names.
