@@ -41,3 +41,9 @@ Object.defineProperty(window, "matchMedia", {
     dispatchEvent: () => false,
   }),
 });
+
+// Reset module-level caches between tests for deterministic isolation
+import { resetCaches } from "./src/lib/dispatch-env";
+beforeEach(() => {
+  resetCaches();
+});

@@ -50,6 +50,7 @@ export interface ClaimWorkResult {
   lane: string | null;
   status: string;
   taskContract: string;
+  resolvedAgentName: string;
 }
 
 export interface RefreshIssueResult {
@@ -77,7 +78,7 @@ export class DispatchClientError extends Error {
   }
 }
 
-import { getDispatchUrl, getDispatchAgentToken } from "./dispatch-env";
+import { getDispatchUrl, getDispatchAgentToken, getDispatchAgentName } from "./dispatch-env";
 
 export function getDispatchConfig(): { baseUrl: string; token: string } {
   const baseUrl = getDispatchUrl();
@@ -145,6 +146,29 @@ async function mcJson<T>(path: string, options: RequestInit): Promise<T> {
   return JSON.parse(text) as T;
 }
 
+/**
+ * Resolve the effective agent name for a claim operation.
+ *
+ * Resolution order:
+ * 1. Explicit `agentName` argument (if provided and non-empty)
+ * 2. `DISPATCH_AGENT_NAME` environment variable
+ *
+ * Returns undefined when neither is available — callers should treat this as
+ * a validation error rather than silently using a default like "Dispatch MCP".
+ */
+export function resolveAgentName(agentName: string | undefined): string | undefined {
+  if (agentName && agentName.trim().length > 0) {
+    return agentName.trim();
+  }
+
+  const envName = getDispatchAgentName();
+  if (envName && envName.trim().length > 0) {
+    return envName.trim();
+  }
+
+  return undefined;
+}
+
 export async function resolveIssue(
   repoFullName: string,
   issueNumber: number,
@@ -179,7 +203,7 @@ export async function resolveIssue(
 export async function claimIssue(
   repoFullName: string,
   issueNumber: number,
-  agentName: string,
+  agentName: string | undefined,
   force?: boolean,
 ): Promise<ClaimIssueResult> {
   const resolved = await resolveIssue(repoFullName, issueNumber);
@@ -219,9 +243,16 @@ export async function setIssueStatus(
 export async function claimWork(
   repoFullName: string,
   issueNumber: number,
-  agentName: string,
+  agentName: string | undefined,
   options?: { status?: string; force?: boolean; refreshBeforeClaim?: boolean },
 ): Promise<ClaimWorkResult> {
+  const resolvedAgent = resolveAgentName(agentName);
+  if (!resolvedAgent) {
+    throw new DispatchClientError(
+      "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
+    );
+  }
+
   const refreshEnabled = options?.refreshBeforeClaim ?? true;
   const status = options?.status ?? "in-progress";
 
@@ -255,8 +286,8 @@ export async function claimWork(
     }
   }
 
-  await claimIssue(repoFullName, issueNumber, agentName, options?.force);
-  await setIssueStatus(repoFullName, issueNumber, status, agentName);
+  await claimIssue(repoFullName, issueNumber, resolvedAgent, options?.force);
+  await setIssueStatus(repoFullName, issueNumber, status, resolvedAgent);
 
   const taskContract = `[Task Contract] Work on issue #${issueNumber} in ${repoFullName}.
 
@@ -265,6 +296,7 @@ URL: ${resolved.url}
 Lane: ${resolved.lane || "normal"}
 Status: ${status}
 Labels: ${resolved.labels.join(", ") || "none"}
+Agent: ${resolvedAgent}
 ${refreshSucceeded ? "\nNote: Issue was refreshed from GitHub before claiming (was not in cache).\n" : ""}
 
 Scope of work:
@@ -283,6 +315,7 @@ Scope of work:
     lane: resolved.lane,
     status,
     taskContract,
+    resolvedAgentName: resolvedAgent,
   };
 }
 

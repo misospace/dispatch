@@ -162,6 +162,114 @@ describe("claimIssueHandler", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("Error:");
   });
+
+  it("uses DISPATCH_AGENT_NAME when agentName is omitted", async () => {
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: [],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "normal",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ success: true, labels: ["agent/env-agent"] }),
+      );
+
+    const result = await claimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text as string);
+    expect(parsed.success).toBe(true);
+    // Verify the claim request used env-agent
+    const call = vi.mocked(fetch).mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(call[1].body as string);
+    expect(body.agentName).toBe("env-agent");
+    delete process.env.DISPATCH_AGENT_NAME;
+  });
+
+  it("prefers explicit agentName over DISPATCH_AGENT_NAME", async () => {
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: [],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "normal",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ success: true, labels: ["agent/explicit-agent"] }),
+      );
+
+    const result = await claimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "explicit-agent" }));
+
+    expect(result.isError).toBeUndefined();
+    const call = vi.mocked(fetch).mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(call[1].body as string);
+    expect(body.agentName).toBe("explicit-agent");
+    delete process.env.DISPATCH_AGENT_NAME;
+  });
+
+  it("returns error when both agentName and DISPATCH_AGENT_NAME are missing", async () => {
+    delete process.env.DISPATCH_AGENT_NAME;
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse([
+        {
+          id: "issue-cuid-1",
+          number: 42,
+          title: "Fix the thing",
+          body: null,
+          state: "open",
+          url: "https://github.com/org/repo/issues/42",
+          labels: [],
+          assignees: [],
+          commentsCount: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          closedAt: null,
+          lastSyncedAt: new Date(),
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]),
+    );
+
+    const result = await claimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("agentName is required");
+    expect(result.content[0].text).toContain("DISPATCH_AGENT_NAME");
+  });
 });
 
 describe("setIssueStatusHandler", () => {
@@ -478,6 +586,80 @@ describe("claimWorkHandler", () => {
     // With refreshBeforeClaim: false and issue already found, should complete without refresh calls
     // Total calls: resolve + resolve(inside claim) + claim POST + resolve(inside setStatus) + status POST = 5
     expect(fetchSpy).toHaveBeenCalledTimes(5);
+  });
+
+  it("returns error when agentName is missing and DISPATCH_AGENT_NAME not set", async () => {
+    delete process.env.DISPATCH_AGENT_NAME;
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse([
+        {
+          id: "issue-cuid-1",
+          number: 42,
+          title: "Fix the thing",
+          body: null,
+          state: "open",
+          url: "https://github.com/org/repo/issues/42",
+          labels: [],
+          assignees: [],
+          commentsCount: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          closedAt: null,
+          lastSyncedAt: new Date(),
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]),
+    );
+
+    const result = await claimWorkHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("agentName is required");
+    expect(result.content[0].text).toContain("DISPATCH_AGENT_NAME");
+  });
+
+  it("uses DISPATCH_AGENT_NAME when agentName is omitted", async () => {
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    const issue = {
+      id: "issue-cuid-1",
+      number: 42,
+      title: "Fix the thing",
+      body: null,
+      state: "open",
+      url: "https://github.com/org/repo/issues/42",
+      labels: ["priority/p1"],
+      assignees: [],
+      commentsCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      closedAt: null,
+      lastSyncedAt: new Date(),
+      currentLane: "normal",
+      repository: { fullName: "org/repo" },
+    };
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse([issue])) // resolve (claimWork)
+      .mockResolvedValueOnce(jsonResponse([issue])) // resolve (claimIssue -> resolveIssue)
+      .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))       // POST claim
+      .mockResolvedValueOnce(jsonResponse([issue])); // resolve (setIssueStatus)
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({ success: true, status: "status/in-progress", labels: [] }),
+    ); // POST status
+
+    const result = await claimWorkHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text as string);
+    expect(parsed.resolvedAgentName).toBe("env-agent");
+    expect(parsed.taskContract).toContain("Agent: env-agent");
+    // Verify the claim request used env-agent
+    const call = vi.mocked(fetch).mock.calls[2] as [string, RequestInit];
+    const body = JSON.parse(call[1].body as string);
+    expect(body.agentName).toBe("env-agent");
+    delete process.env.DISPATCH_AGENT_NAME;
   });
 });
 

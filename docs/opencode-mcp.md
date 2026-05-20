@@ -23,6 +23,7 @@ npx prisma generate
 |----------|----------|-------------|
 | `DISPATCH_URL` | Yes | Base URL of your Dispatch instance (e.g. `http://localhost:3000` or `https://dispatch.example.com`) |
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `DISPATCH_AGENT_NAME` | No | Default agent identity used when MCP tools omit `agentName`. Set this to a stable operator identity such as `jory-opencode` for manual OpenCode usage. **Do not use generic identities like `Dispatch MCP`.** |
 
 The token is **never** printed or logged. Missing variables produce a clear error on startup.
 
@@ -46,7 +47,8 @@ Add the following to your OpenCode configuration (e.g. `.opencode.json` or `open
       "args": ["tsx", "./src/mcp/server.ts"],
       "env": {
         "DISPATCH_URL": "http://localhost:3000",
-        "DISPATCH_AGENT_TOKEN": "your-agent-token-here"
+        "DISPATCH_AGENT_TOKEN": "your-agent-token-here",
+        "DISPATCH_AGENT_NAME": "jory-opencode"
       }
     }
   }
@@ -63,7 +65,8 @@ Or if you have the repo cloned locally and want to use an absolute path:
       "args": ["tsx", "/absolute/path/to/dispatch/src/mcp/server.ts"],
       "env": {
         "DISPATCH_URL": "https://dispatch.example.com",
-        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN"
+        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN",
+        "DISPATCH_AGENT_NAME": "jory-opencode"
       }
     }
   }
@@ -82,7 +85,8 @@ If your OpenCode config supports env var interpolation (e.g. `$VAR`), you can re
       "args": ["tsx", "./src/mcp/server.ts"],
       "env": {
         "DISPATCH_URL": "https://dispatch.example.com",
-        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN"
+        "DISPATCH_AGENT_TOKEN": "$DISPATCH_AGENT_TOKEN",
+        "DISPATCH_AGENT_NAME": "$DISPATCH_AGENT_NAME"
       }
     }
   }
@@ -105,10 +109,12 @@ Resolve a Dispatch issue by repo full name and issue number.
 
 Claim a Dispatch issue for an agent. Adds the `agent/*` label on GitHub and in the local cache.
 
+⚠️ **Important:** Do not use generic identities like `"Dispatch MCP"` as your agent name. Set `DISPATCH_AGENT_NAME=jory-opencode` (or your operator identity) to avoid this.
+
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
 - `issueNumber` (number) — GitHub issue number
-- `agentName` (string) — Agent identifier to claim the issue
+- `agentName` (string, optional) — Agent identifier claiming the issue. Falls back to `DISPATCH_AGENT_NAME` env var if omitted. Required unless `DISPATCH_AGENT_NAME` is set.
 - `force` (boolean, optional) — Force claim even if another agent is already assigned
 
 **Returns:** `success`, `labels`
@@ -129,15 +135,17 @@ Set the status label on a Dispatch issue (e.g. `'in-progress'`, `'in-review'`, `
 
 Resolves, claims, and sets status on an issue in one call. Returns a compact task contract with issue context.
 
+⚠️ **Important:** Do not use generic identities like `"Dispatch MCP"` as your agent name. Set `DISPATCH_AGENT_NAME=jory-opencode` (or your operator identity) to avoid this.
+
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
 - `issueNumber` (number) — GitHub issue number
-- `agentName` (string) — Agent identifier claiming the work
+- `agentName` (string, optional) — Agent identifier claiming the work. Falls back to `DISPATCH_AGENT_NAME` env var if omitted. Required unless `DISPATCH_AGENT_NAME` is set.
 - `status` (string, optional) — Status to set after claiming (default: `'in-progress'`)
 - `force` (boolean, optional) — Force claim even if another agent is already assigned
 - `refreshBeforeClaim` (boolean, optional) — Auto-refresh the issue from GitHub if not found in cache (default: `true`)
 
-**Returns:** `issueId`, `repoFullName`, `issueNumber`, `title`, `url`, `labels`, `lane`, `status`, `taskContract`
+**Returns:** `issueId`, `repoFullName`, `issueNumber`, `title`, `url`, `labels`, `lane`, `status`, `taskContract`, `resolvedAgentName`
 
 The `taskContract` field contains a structured prompt telling the agent to work only on this issue. If `refreshBeforeClaim` is enabled (default) and the issue was not in the cache, the task contract includes a note about the refresh.
 
@@ -169,8 +177,8 @@ Natural language request:
 > Claim and work issue #103 in misospace/dispatch.
 
 OpenCode will:
-1. Call `claim_work` with `repoFullName: "misospace/dispatch"`, `issueNumber: 103`, `agentName: "<your-agent-id>"`
-2. Receive the task contract with issue context
+1. Call `claim_work` with `repoFullName: "misospace/dispatch"`, `issueNumber: 103`, `agentName: "<your-agent-id>"` (or use the configured `DISPATCH_AGENT_NAME`)
+2. Receive the task contract with issue context and the resolved agent name
 3. Work on the issue following the contract
 
 ### Handling newly-created issues
@@ -181,12 +189,23 @@ If auto-refresh is not desired (e.g., for performance-critical flows), set `refr
 
 > Claim issue #103 in misospace/dispatch but don't refresh first.
 
+## Agent Identity Best Practices
+
+When using the Dispatch MCP bridge, always use a stable operator identity rather than letting the model invent one:
+
+- ✅ **Recommended:** Set `DISPATCH_AGENT_NAME=jory-opencode` (or your operator identity) in your MCP config
+- ✅ **Also fine:** Pass an explicit `agentName` argument to each tool call
+- ❌ **Never use:** `"Dispatch MCP"`, `"AI Assistant"`, or other generic identities
+
+Generic agent names create bad assignment labels and make audit trails unreliable. If neither `agentName` nor `DISPATCH_AGENT_NAME` is set, the tools will return a clear validation error instead of silently using a placeholder identity.
+
 ## Security
 
 - The `DISPATCH_AGENT_TOKEN` is used for bearer auth on all mutating API calls.
 - The token is **never** printed, echoed, or persisted to disk by the MCP server.
 - Missing environment variables produce a clear error message at startup.
 - All tools that mutate state (claim, set status, claim_work) require valid bearer authentication.
+- Agent names are never inferred from the MCP server name or silently defaulted to generic values.
 
 ## Testing
 
@@ -197,7 +216,7 @@ npm run test
 ```
 
 Tests cover:
-- `src/lib/mc-client.test.ts` — HTTP client: config validation, resolve, claim, set status, claim work (with refreshBeforeClaim), refreshIssue, syncRepo, error handling
+- `src/lib/mc-client.test.ts` — HTTP client: config validation, resolve, claim, set status, claim work (with refreshBeforeClaim), agent name resolution, refreshIssue, syncRepo, error handling
 - `src/mcp/server.test.ts` — MCP tool handlers: input/output shapes, error propagation, task contract generation, refresh_issue, sync_repo tools
 
 ## Troubleshooting
@@ -216,6 +235,17 @@ Or add it to your OpenCode MCP config `env` block (see configuration above).
 ### "DISPATCH_AGENT_TOKEN is not set"
 
 Same as above — ensure the token is set. Verify your Dispatch instance has an agent token configured.
+
+### "agentName is required" or "agentName must be a string"
+
+If you see this error, either:
+1. Set `DISPATCH_AGENT_NAME` in your environment (recommended):
+   ```bash
+   export DISPATCH_AGENT_NAME=jory-opencode
+   ```
+2. Or pass an explicit `agentName` argument to the tool call
+
+**Do not use generic identities like "Dispatch MCP" as agent names.** This creates unreliable audit trails and bad assignment labels.
 
 ### "Issue #N not found in org/repo"
 

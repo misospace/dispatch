@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   claimIssue,
   claimWork,
+  resolveAgentName,
   refreshIssue,
   syncRepo,
   resolveIssue,
@@ -50,10 +51,28 @@ export async function resolveIssueHandler(args: ExtraArgs) {
 
 export async function claimIssueHandler(args: ExtraArgs) {
   try {
+    const explicitAgentName = getArg(args, "agentName") as string | undefined;
+    const resolvedAgentName = resolveAgentName(explicitAgentName);
+
+    if (!resolvedAgentName) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
+            }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
+
     const result = await claimIssue(
       getArg(args, "repoFullName") as string,
       getArg(args, "issueNumber") as number,
-      getArg(args, "agentName") as string,
+      resolvedAgentName,
       getArg(args, "force") as boolean | undefined,
     );
     return {
@@ -114,10 +133,11 @@ export async function setIssueStatusHandler(args: ExtraArgs) {
 
 export async function claimWorkHandler(args: ExtraArgs) {
   try {
+    const explicitAgentName = getArg(args, "agentName") as string | undefined;
     const result = await claimWork(
       getArg(args, "repoFullName") as string,
       getArg(args, "issueNumber") as number,
-      getArg(args, "agentName") as string,
+      explicitAgentName,
       {
         status: (getArg(args, "status") as string) ?? "in-progress",
         force: getArg(args, "force") as boolean | undefined,
@@ -240,11 +260,11 @@ export function createServer(): McpServerType {
     "claim_issue",
     {
       description:
-        "Claim a Dispatch issue for an agent. Adds the agent/* label on GitHub and in the local cache. Use force=true to override existing assignments.",
+        "Claim a Dispatch issue for an agent. Adds the agent/* label on GitHub and in the local cache. Use force=true to override existing assignments. If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var. Error if neither is set — do not use generic identities like 'Dispatch MCP'.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
-        agentName: z.string().describe("Agent identifier to claim the issue"),
+        agentName: z.string().optional().describe("Agent identifier claiming the issue. Falls back to DISPATCH_AGENT_NAME env var if omitted. Required unless DISPATCH_AGENT_NAME is set."),
         force: z
           .boolean()
           .optional()
@@ -282,11 +302,11 @@ export function createServer(): McpServerType {
     "claim_work",
     {
       description:
-        "Convenience tool that resolves, claims, and sets status on an issue in one call. Returns a compact task contract with issue context for the agent to work against. Automatically refreshes the issue from GitHub if not found in cache (refreshBeforeClaim defaults to true).",
+        "Convenience tool that resolves, claims, and sets status on an issue in one call. Returns a compact task contract with issue context for the agent to work against. Automatically refreshes the issue from GitHub if not found in cache (refreshBeforeClaim defaults to true). If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var. Error if neither is set — do not use generic identities like 'Dispatch MCP'.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
-        agentName: z.string().describe("Agent identifier claiming the work"),
+        agentName: z.string().optional().describe("Agent identifier claiming the work. Falls back to DISPATCH_AGENT_NAME env var if omitted. Required unless DISPATCH_AGENT_NAME is set."),
         status: z
           .string()
           .optional()
