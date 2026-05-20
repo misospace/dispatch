@@ -3,13 +3,14 @@ import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 
 interface RouteContext {
-  params: Promise<{ repo: string }>;
+  params: Promise<{ repo: string[] }>;
 }
 
 export async function GET(request: Request, context: RouteContext) {
   const { searchParams } = new URL(request.url);
   const queryRepo = searchParams.get("repo");
-  const { repo: pathRepo } = await context.params;
+  const repoSegments = await context.params;
+  const pathRepo = repoSegments.repo.join("/");
   const repoFullName = queryRepo ?? decodeURIComponent(pathRepo);
 
   if (!repoFullName) {
@@ -82,7 +83,8 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 export async function DELETE(_request: Request, context: RouteContext) {
-  const { repo: pathRepo } = await context.params;
+  const repoSegments = await context.params;
+  const pathRepo = repoSegments.repo.join("/");
   const repoFullName = decodeURIComponent(pathRepo);
 
   if (!repoFullName) {
