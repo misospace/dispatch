@@ -25,6 +25,7 @@ import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
 
 const COLUMNS: { id: StatusLabel; title: string }[] = [
   { id: "status/backlog", title: "Backlog" },
+  { id: "status/ready", title: "Ready" },
   { id: "status/in-progress", title: "In Progress" },
   { id: "status/in-review", title: "In Review" },
   { id: "status/done", title: "Done" },
@@ -220,7 +221,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
           {COLUMNS.map((column) => {
             const columnIssues = getIssuesByStatus(issuesRef.current, column.id);
             return (

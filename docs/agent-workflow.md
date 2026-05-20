@@ -13,6 +13,25 @@ The cache is refreshed primarily through a **scheduled sync runner** (`POST /api
 
 Agent/worker heartbeats may still trigger best-effort sync, but they are no longer the primary freshness mechanism.
 
+### Five-Column Board Workflow
+
+Dispatch uses a five-column board to manage issue lifecycle:
+
+| Column | Label | Meaning |
+|--------|-------|---------|
+| Backlog | `status/backlog` | Needs triage/grooming; not yet ready for agents |
+| Ready | `status/ready` | Groomed and actionable; available for agents to claim |
+| In Progress | `status/in-progress` | Claimed or implementation started |
+| In Review | `status/in-review` | PR opened, checks/review pending, issue still open |
+| Done | `status/done` | Issue is closed (terminal completion) |
+
+**Agent queue behavior:**
+- Agent queues pick from **Ready** by default, not Backlog.
+- Backlog issues are excluded from normal agent queues unless explicitly requested.
+- Claiming work moves an issue to **In Progress**.
+- Opening a PR moves the issue to **In Review**, not Done.
+- Agents should never mark an open issue as Done — only closed issues can be Done.
+
 > **GitHub Issues and PRs remain the source of truth.** Dispatch's database is a cache, not authoritative storage.
 
 ## Prerequisites
@@ -80,8 +99,8 @@ GET /api/agents/<agent-name>/queue
 
 **Selection priority:**
 1. Prefer issues labeled `agent/<agent-name>` if present.
-2. Fall back to general backlog if no agent-specific label exists.
-3. Treat "no status label" or `status/backlog` as backlog work — both are valid entry states.
+2. Fall back to Ready (groomed, actionable work) for agents to claim.
+3. Backlog issues (`status/backlog` or no status label) are excluded from the default agent queue.
 
 Issues with an existing `agent/<other>` label remain visible in the queue so agents can see what others are working on.
 
@@ -111,7 +130,7 @@ Content-Type: application/json
 **Optional fields:** `force` (boolean, default `false`)
 
 **Behavior:**
-- **Normal claim (`force: false`):** Succeeds if the issue is open and not already assigned to another agent. Adds `agent/<name>` label and optionally `status/in-progress`.
+- **Normal claim (`force: false`):** Succeeds if the issue is open and not already assigned to another agent. Adds `agent/<name>` label and sets `status/in-progress`.
 - **Force claim (`force: true`):** Removes any existing `agent/<other>` label before adding the new one. Useful for reassignment.
 - **Rejected (409):** Issue is already assigned to a different agent and `force` is not set.
 - **Rejected (400):** Issue is closed or has `status/done`.
@@ -237,7 +256,27 @@ All Dispatch interactions are best-effort from the agent's perspective:
 | `/api/automation/repos` | GET | None | List tracked repositories |
 | `/api/audit` | GET | None | Query audit log entries |
 
+## Five-Column Workflow Details
+
+The five-column workflow defines clear status transitions:
+
+```
+Backlog → Ready → In Progress → In Review → Done
+```
+
+**Transitions:**
+- **Backlog → Ready:** Triage/grooming complete, issue is actionable
+- **Ready → In Progress:** Agent claims the issue
+- **In Progress → In Review:** PR opened, awaiting merge/review
+- **In Review → Done:** Issue closed (typically after PR merge)
+
+**Invariants:**
+- Agents pick from Ready by default, not Backlog
+- Open issues with unmerged PRs must be In Review, never Done
+- Done is reserved exclusively for closed/terminal issues
+
 ## History
 
+- **2026-05-19** — Added five-column workflow documentation with Ready status and In Review semantics (Issue #140).
 - **2026-05-19** — Updated to reflect that scheduled sync (`POST /api/sync/scheduled`) is now the primary freshness mechanism. Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but are no longer responsible for general cache freshness.
 - **2026-05-16** — Created as part of generic agent workflow documentation (Issue #59). Covers the complete lifecycle: start run, sync state, request queue, claim work, report status. Includes failure handling and security constraints. Replaces section-specific notes scattered across other docs with a single authoritative reference.

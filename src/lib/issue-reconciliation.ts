@@ -169,6 +169,7 @@ export interface ReconciliationAction {
   type: "close_issue" | "update_lane" | "add_label" | "remove_label";
   issueNumber: number;
   repoFullName: string;
+  label?: string;
   reason: string;
 }
 
@@ -255,6 +256,7 @@ export function reconcileIssue(
             type: "add_label",
             issueNumber: issue.number,
             repoFullName: "",
+            label: "status/in-progress",
             reason: `Open PR #${matchingOpenPr.number} needs work: ${health.reason}`,
           });
         }
@@ -271,6 +273,7 @@ export function reconcileIssue(
             type: "add_label",
             issueNumber: issue.number,
             repoFullName: "",
+            label: "status/in-review",
             reason: `Open PR #${matchingOpenPr.number} is healthy/pending`,
           });
         }
