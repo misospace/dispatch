@@ -242,7 +242,7 @@ describe("claimIssueHandler", () => {
 
   it("returns error when both agentName and DISPATCH_AGENT_NAME are missing", async () => {
     delete process.env.DISPATCH_AGENT_NAME;
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       jsonResponse([
         {
           id: "issue-cuid-1",
@@ -590,7 +590,7 @@ describe("claimWorkHandler", () => {
 
   it("returns error when agentName is missing and DISPATCH_AGENT_NAME not set", async () => {
     delete process.env.DISPATCH_AGENT_NAME;
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       jsonResponse([
         {
           id: "issue-cuid-1",

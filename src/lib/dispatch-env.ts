@@ -154,3 +154,19 @@ export function ensureDatabaseUrl(): void {
     process.env.DATABASE_URL = process.env.DISPATCH_DATABASE_URL;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Cache reset (for testing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reset all internal caches. Intended for test isolation — call in beforeEach.
+ */
+export function resetCaches(): void {
+  _cachedUrl = undefined;
+  _cachedToken = undefined;
+  _cachedAgentName = undefined;
+  _acceptedTokens = undefined;
+  _cachedDbUrl = undefined;
+  _shimApplied = false;
+}
