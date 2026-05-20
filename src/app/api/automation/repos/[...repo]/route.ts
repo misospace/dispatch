@@ -9,9 +9,8 @@ interface RouteContext {
 export async function GET(request: Request, context: RouteContext) {
   const { searchParams } = new URL(request.url);
   const queryRepo = searchParams.get("repo");
-  const repoSegments = await context.params;
-  const pathRepo = repoSegments.repo.join("/");
-  const repoFullName = queryRepo ?? decodeURIComponent(pathRepo);
+  const { repo: pathRepo } = await context.params;
+  const repoFullName = queryRepo ?? decodeURIComponent(pathRepo.join("/"));
 
   if (!repoFullName) {
     return NextResponse.json({ error: "repo parameter required" }, { status: 400 });
@@ -83,9 +82,8 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 export async function DELETE(_request: Request, context: RouteContext) {
-  const repoSegments = await context.params;
-  const pathRepo = repoSegments.repo.join("/");
-  const repoFullName = decodeURIComponent(pathRepo);
+  const { repo: pathRepo } = await context.params;
+  const repoFullName = decodeURIComponent(pathRepo.join("/"));
 
   if (!repoFullName) {
     return NextResponse.json({ error: "repo parameter required" }, { status: 400 });
