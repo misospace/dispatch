@@ -67,4 +67,8 @@ describe("getProjectIssueStatus", () => {
   it("treats open issues with no status as backlog", () => {
     expect(getProjectIssueStatus({ labels: ["type/bug"], state: "open" })).toBe("status/backlog");
   });
+
+  it("uses ready status when present", () => {
+    expect(getProjectIssueStatus({ labels: ["status/ready"], state: "open" })).toBe("status/ready");
+  });
 });

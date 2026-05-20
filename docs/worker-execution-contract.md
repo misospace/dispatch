@@ -227,3 +227,4 @@ This contract is referenced from:
 
 - **2026-05-16** — Created to document generic worker execution contract and PR completion gates (Issue #65). Consolidates existing normal-worker behavior into a reusable, agent-agnostic specification.
 - **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are visible in Dispatch but excluded from agent queues by default; `includeRenovate=true` opt-in available (Issue #129).
+- **2026-05-19** — Added five-column workflow with Ready status (Issue #140): Backlog → Ready → In Progress → In Review → Done. Agents pick from Ready by default; Backlog excluded unless explicitly requested.

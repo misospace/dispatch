@@ -297,3 +297,52 @@ describe("buildAgentQueue", () => {
     expect(result[0].number).toBe(2);
   });
 });
+
+describe("buildAgentQueue with status/ready", () => {
+  it("includes ready issues as actionable", () => {
+    const issues = [makeIssue({ labels: ["status/ready", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].status).toBe("status/ready");
+  });
+
+  it("prioritizes ready over backlog at same priority", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p1", "status/backlog"] }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result[0].number).toBe(2); // ready first
+    expect(result[1].number).toBe(1); // backlog second
+  });
+
+  it("prioritizes in-progress over ready", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"] }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/in-progress"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result[0].number).toBe(2); // in-progress first
+    expect(result[1].number).toBe(1); // ready second
+  });
+
+  it("includes ready issues across multiple priorities", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p0", "status/ready"] }),
+      makeIssue({ number: 2, labels: ["priority/p2", "status/backlog"] }),
+      makeIssue({ number: 3, labels: ["priority/p1", "status/in-progress"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result.map((i) => i.number)).toEqual([1, 3, 2]); // p0 ready > p1 in-progress > p2 backlog
+  });
+
+  it("excludes ready issues only when explicitly filtered by lane=backlog", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/backlog"], lane: "backlog" }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "backlog" });
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(2); // only backlog lane item
+  });
+});

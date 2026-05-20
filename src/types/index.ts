@@ -83,14 +83,14 @@ export interface AuditLog {
   createdAt: Date;
 }
 
-export type StatusLabel = "status/backlog" | "status/in-progress" | "status/in-review" | "status/done";
+export type StatusLabel = "status/backlog" | "status/ready" | "status/in-progress" | "status/in-review" | "status/done";
 export type AgentLabel = `agent/${string}`;
 export type OwnerLabel = `owner/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
 
-export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/in-progress", "status/in-review", "status/done"];
+export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"];
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
 export const PROJECT_PREFIX = "project/";
 export const AGENT_PREFIX = "agent/";
@@ -134,6 +134,7 @@ export function getPriorityFromLabels(labels: string[]): PriorityLabel | null {
 
 export const LABEL_COLORS: Record<string, string> = {
   "status/backlog": "6b7280",
+  "status/ready": "f59e0b",
   "status/in-progress": "3b82f6",
   "status/in-review": "a855f7",
   "status/done": "22c55e",
