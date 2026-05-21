@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   classifyLaneByHeuristics,
   extractFixingIssueNumbers,
@@ -6,7 +6,11 @@ import {
   checkPrHealth,
   reconcileIssue,
   prReferencesIssue,
+  executeAction,
+  executeActions,
 } from "./issue-reconciliation";
+
+const githubModule = await import("./github");
 
 describe("classifyLaneByHeuristics", () => {
   it("classifies architecture/design issues as escalated", () => {
@@ -249,5 +253,217 @@ describe("prReferencesIssue", () => {
     };
     expect(prReferencesIssue(pr, 42)).toBe(true);
     expect(prReferencesIssue(pr, 43)).toBe(false);
+  });
+});
+
+describe("executeAction", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("closes an issue successfully", async () => {
+    const closeMock = vi.spyOn(githubModule, "closeIssue").mockResolvedValue(undefined);
+    const action = {
+      type: "close_issue" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      reason: "Fixed by merged PR #100",
+    };
+
+    const result = await executeAction(action, ["bug", "priority/p1"]);
+
+    expect(closeMock).toHaveBeenCalledWith("test/repo", 42);
+    expect(result.success).toBe(true);
+    expect(result.beforeLabels).toEqual(["bug", "priority/p1"]);
+    expect(result.afterLabels).toEqual([]);
+    expect(result.error).toBeUndefined();
+  });
+
+  it("adds a label successfully", async () => {
+    const addLabelMock = vi.spyOn(githubModule, "addIssueLabel").mockResolvedValue(undefined);
+    const action = {
+      type: "add_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/in-review",
+      reason: "PR is healthy",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(addLabelMock).toHaveBeenCalledWith("test/repo", 42, "status/in-review");
+    expect(result.success).toBe(true);
+    expect(result.afterLabels).toEqual(["bug", "status/in-review"]);
+  });
+
+  it("skips adding a label that already exists", async () => {
+    const addLabelMock = vi.spyOn(githubModule, "addIssueLabel").mockResolvedValue(undefined);
+    const action = {
+      type: "add_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/in-progress",
+      reason: "PR needs work",
+    };
+
+    const result = await executeAction(action, ["bug", "status/in-progress"]);
+
+    expect(addLabelMock).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.afterLabels).toEqual(["bug", "status/in-progress"]);
+  });
+
+  it("removes a label successfully", async () => {
+    const removeLabelMock = vi.spyOn(githubModule, "removeIssueLabel").mockResolvedValue(undefined);
+    const action = {
+      type: "remove_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/backlog",
+      reason: "Issue is now actionable",
+    };
+
+    const result = await executeAction(action, ["bug", "status/backlog"]);
+
+    expect(removeLabelMock).toHaveBeenCalledWith("test/repo", 42, "status/backlog");
+    expect(result.success).toBe(true);
+    expect(result.afterLabels).toEqual(["bug"]);
+  });
+
+  it("skips removing a label that does not exist", async () => {
+    const removeLabelMock = vi.spyOn(githubModule, "removeIssueLabel").mockResolvedValue(undefined);
+    const action = {
+      type: "remove_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/done",
+      reason: "Cleanup",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(removeLabelMock).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+  });
+
+  it("captures error when close fails", async () => {
+    vi.spyOn(githubModule, "closeIssue").mockRejectedValue(new Error("API rate limit"));
+    const action = {
+      type: "close_issue" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      reason: "Fixed by merged PR #100",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("API rate limit");
+    expect(result.afterLabels).toEqual(["bug"]);
+  });
+
+  it("captures error when add label fails", async () => {
+    vi.spyOn(githubModule, "addIssueLabel").mockRejectedValue(new Error("Forbidden"));
+    const action = {
+      type: "add_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/in-review",
+      reason: "PR is healthy",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Forbidden");
+    expect(result.afterLabels).toEqual(["bug"]);
+  });
+
+  it("handles update_lane as no-op", async () => {
+    const action = {
+      type: "update_lane" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      reason: "Lane update",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(result.success).toBe(true);
+    expect(result.afterLabels).toEqual(["bug"]);
+  });
+});
+
+describe("executeActions", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("executes multiple actions sequentially with label propagation", async () => {
+    const addLabelMock = vi.spyOn(githubModule, "addIssueLabel").mockResolvedValue(undefined);
+    const closeMock = vi.spyOn(githubModule, "closeIssue").mockResolvedValue(undefined);
+
+    const actions = [
+      {
+        type: "add_label" as const,
+        issueNumber: 42,
+        repoFullName: "test/repo",
+        label: "status/in-progress",
+        reason: "PR detected",
+      },
+      {
+        type: "add_label" as const,
+        issueNumber: 42,
+        repoFullName: "test/repo",
+        label: "status/in-review",
+        reason: "PR healthy",
+      },
+    ];
+
+    const results = await executeActions(actions, ["bug"]);
+
+    expect(results).toHaveLength(2);
+    expect(results[0].success).toBe(true);
+    expect(results[0].afterLabels).toEqual(["bug", "status/in-progress"]);
+    expect(results[1].success).toBe(true);
+    expect(results[1].afterLabels).toEqual(["bug", "status/in-progress", "status/in-review"]);
+    expect(addLabelMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops propagating labels after a failed action", async () => {
+    vi.spyOn(githubModule, "addIssueLabel")
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("Rate limited"));
+    const closeMock = vi.spyOn(githubModule, "closeIssue").mockResolvedValue(undefined);
+
+    const actions = [
+      {
+        type: "add_label" as const,
+        issueNumber: 42,
+        repoFullName: "test/repo",
+        label: "status/in-progress",
+        reason: "PR detected",
+      },
+      {
+        type: "add_label" as const,
+        issueNumber: 42,
+        repoFullName: "test/repo",
+        label: "status/in-review",
+        reason: "PR healthy",
+      },
+      {
+        type: "close_issue" as const,
+        issueNumber: 42,
+        repoFullName: "test/repo",
+        reason: "Fixed by merged PR",
+      },
+    ];
+
+    const results = await executeActions(actions, ["bug"]);
+
+    expect(results).toHaveLength(3);
+    expect(results[0].success).toBe(true);
+    expect(results[1].success).toBe(false);
+    expect(results[2].success).toBe(true);
   });
 });

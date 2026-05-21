@@ -8,6 +8,7 @@ import {
   checkPrHealth,
   reconcileIssue,
   classifyLaneByHeuristics,
+  executeActions,
 } from "@/lib/issue-reconciliation";
 import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
@@ -16,8 +17,8 @@ import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
  * 
  * This endpoint replaces the grooming logic that previously lived in
  * Saffron's project_groom.py scripts. It:
- * 1. Detects merged PRs that fix issues → marks them done/close-candidate
- * 2. Detects open PRs and checks their health → updates issue lanes/labels
+ * 1. Detects merged PRs that fix issues → closes them on GitHub
+ * 2. Detects open PRs and checks their health → applies labels via GitHub API
  * 3. Classifies lanes using heuristics when model calls are unavailable
  * 
  * Dispatch calls this periodically (e.g., every 5 minutes) to keep issue
@@ -55,16 +56,9 @@ export async function POST(request: Request) {
     let totalMergedPrsFound = 0;
     let totalOpenPrsChecked = 0;
     let totalIssuesClosed = 0;
-    let totalLanesUpdated = 0;
+    let totalLabelsChanged = 0;
+    let totalLaneClassified = 0;
     const errors: string[] = [];
-
-    // Track actions for audit logging
-    const actionsToLog: {
-      repoFullName: string;
-      issueNumber: number;
-      action: string;
-      reason: string;
-    }[] = [];
 
     for (const repo of repos) {
       try {
@@ -120,31 +114,53 @@ export async function POST(request: Request) {
         for (const issue of issues) {
           if (issue.state !== "open") continue;
 
+          const currentLabels = issue.labels.map((l) => l.name);
           const result = reconcileIssue(
             {
               number: issue.number,
               title: issue.title,
               body: issue.body,
-              labels: issue.labels.map((l) => l.name),
+              labels: currentLabels,
               state: issue.state,
             },
             mergedFixingIssues,
             openPrToIssue,
           );
 
-          // Apply actions
-          for (const action of result.actions) {
-            actionsToLog.push({
-              repoFullName: repo.fullName,
-              issueNumber: action.issueNumber,
-              action: action.type,
-              reason: action.reason,
-            });
+          // Execute actions against GitHub
+          if (result.actions.length > 0) {
+            const executed = await executeActions(
+              result.actions.map((a) => ({ ...a, repoFullName: repo.fullName })),
+              currentLabels,
+            );
 
-            if (action.type === "close_issue") {
-              totalIssuesClosed++;
-            } else if (action.type === "add_label") {
-              totalLanesUpdated++;
+            // Log each executed action to audit with real label deltas
+            for (const exec of executed) {
+              const labelsChanged = exec.action.type === "close_issue"
+                ? exec.beforeLabels.length > 0
+                : exec.beforeLabels.join(",") !== exec.afterLabels.join(",");
+
+              if (labelsChanged) {
+                totalLabelsChanged++;
+              }
+
+              await prisma.auditLog.create({
+                data: {
+                  actor: "reconciler",
+                  action: `reconcile_${exec.action.type}`,
+                  repoFullName: repo.fullName,
+                  issueNumber: exec.action.issueNumber,
+                  beforeLabels: exec.beforeLabels,
+                  afterLabels: exec.afterLabels,
+                  success: exec.success,
+                  errorMessage: exec.error,
+                  notes: exec.action.reason,
+                },
+              });
+
+              if (exec.action.type === "close_issue" && exec.success) {
+                totalIssuesClosed++;
+              }
             }
           }
 
@@ -157,13 +173,13 @@ export async function POST(request: Request) {
             const classification = classifyLaneByHeuristics(
               issue.title,
               issue.body,
-              issue.labels.map((l) => l.name),
+              currentLabels,
             );
             await prisma.issue.update({
               where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
               data: { currentLane: classification.lane },
             });
-            totalLanesUpdated++;
+            totalLaneClassified++;
           }
 
           totalIssuesReconciled++;
@@ -175,22 +191,6 @@ export async function POST(request: Request) {
       }
     }
 
-    // Log reconciliation actions to audit log
-    for (const action of actionsToLog) {
-      await prisma.auditLog.create({
-        data: {
-          actor: "reconciler",
-          action: `reconcile_${action.action}`,
-          repoFullName: action.repoFullName,
-          issueNumber: action.issueNumber,
-          beforeLabels: [],
-          afterLabels: [],
-          success: true,
-          notes: action.reason,
-        },
-      });
-    }
-
     return NextResponse.json({
       success: errors.length === 0,
       reposProcessed: repos.length,
@@ -198,7 +198,8 @@ export async function POST(request: Request) {
       mergedPrsFound: totalMergedPrsFound,
       openPrsChecked: totalOpenPrsChecked,
       issuesClosed: totalIssuesClosed,
-      lanesUpdated: totalLanesUpdated,
+      labelsChanged: totalLabelsChanged,
+      lanesClassified: totalLaneClassified,
       errors,
     });
   } catch (error) {
@@ -232,6 +233,9 @@ export async function GET(request: Request) {
         issueNumber: log.issueNumber,
         action: log.action,
         reason: log.notes,
+        success: log.success,
+        beforeLabels: log.beforeLabels,
+        afterLabels: log.afterLabels,
         timestamp: log.createdAt,
       })),
     });

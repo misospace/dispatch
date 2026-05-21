@@ -1,5 +1,5 @@
 import { GitHubIssue } from "@/types";
-import { GithubPR } from "@/lib/github";
+import { GithubPR, closeIssue as githubCloseIssue, addIssueLabel as githubAddIssueLabel, removeIssueLabel as githubRemoveIssueLabel } from "@/lib/github";
 
 // ─── Lane Classification Helpers ──────────────────────────────────────────────
 
@@ -174,6 +174,17 @@ export interface ReconciliationAction {
 }
 
 /**
+ * Result of executing a single reconciliation action against GitHub.
+ */
+export interface ExecutedAction {
+  action: ReconciliationAction;
+  success: boolean;
+  error?: string;
+  beforeLabels: string[];
+  afterLabels: string[];
+}
+
+/**
  * Result of reconciling a single issue against PR state.
  */
 export interface IssueReconciliationResult {
@@ -194,7 +205,7 @@ export interface ReconciliationResult {
   mergedPrsFound: number;
   openPrsChecked: number;
   issuesClosed: number;
-  lanesUpdated: number;
+  labelsChanged: number;
   errors: string[];
 }
 
@@ -304,4 +315,85 @@ export function prReferencesIssue(pr: GithubPR, issueNumber: number): boolean {
   // Note: For full PR body matching, we'd need the PR body which isn't in GithubPR.
   // The branch-based check covers the majority of cases used by wishlist workers.
   return false;
+}
+
+// ─── Action Execution ────────────────────────────────────────────────────────
+
+/**
+ * Execute a single reconciliation action against GitHub.
+ * Returns before/after label state for audit logging.
+ */
+export async function executeAction(
+  action: ReconciliationAction,
+  currentLabels: string[],
+): Promise<ExecutedAction> {
+  const result: ExecutedAction = {
+    action,
+    success: false,
+    beforeLabels: [...currentLabels],
+    afterLabels: [...currentLabels],
+  };
+
+  try {
+    switch (action.type) {
+      case "close_issue":
+        await githubCloseIssue(action.repoFullName, action.issueNumber);
+        result.afterLabels = [];
+        result.success = true;
+        break;
+
+      case "add_label":
+        if (action.label && !currentLabels.includes(action.label)) {
+          await githubAddIssueLabel(action.repoFullName, action.issueNumber, action.label);
+          result.afterLabels = [...currentLabels, action.label];
+          result.success = true;
+        } else {
+          result.success = true;
+        }
+        break;
+
+      case "remove_label":
+        if (action.label && currentLabels.includes(action.label)) {
+          await githubRemoveIssueLabel(action.repoFullName, action.issueNumber, action.label);
+          result.afterLabels = currentLabels.filter((l) => l !== action.label);
+          result.success = true;
+        } else {
+          result.success = true;
+        }
+        break;
+
+      case "update_lane":
+        // update_lane is not yet produced by reconcileIssue() but the handler
+        // may produce it in future. Silently skip for now.
+        result.success = true;
+        break;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    result.error = message;
+    console.error(`Failed to execute ${action.type} on ${action.repoFullName}#${action.issueNumber}:`, message);
+  }
+
+  return result;
+}
+
+/**
+ * Execute all reconciliation actions for an issue, tracking execution results.
+ */
+export async function executeActions(
+  actions: ReconciliationAction[],
+  currentLabels: string[],
+): Promise<ExecutedAction[]> {
+  const results: ExecutedAction[] = [];
+  let labels = [...currentLabels];
+
+  for (const action of actions) {
+    const result = await executeAction({ ...action, repoFullName: action.repoFullName || "" }, labels);
+    if (result.success && !result.error) {
+      labels = result.afterLabels;
+    }
+    results.push(result);
+  }
+
+  return results;
 }
