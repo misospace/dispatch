@@ -3,14 +3,15 @@ import { prisma } from "@/lib/prisma";
 import { rerunWorkflow, triggerWorkflowDispatch } from "@/lib/github";
 import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
-export async function POST(request: Request) {
+export async function POST(request: Request, { params }: { params: Promise<{ runId: string }> }) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
   if (!isAuthorizedAgentToken(token)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const { searchParams } = new URL(request.url);
-  const runId = searchParams.get("runId");
+  const pathRunId = (await params).runId;
+  const runId = pathRunId || searchParams.get("runId");
   const repoFullName = searchParams.get("repo");
   const action = searchParams.get("action");
 
