@@ -31,18 +31,18 @@ import { POST } from "./route";
 
 describe("POST /api/automation/runs/[runId] — auth", () => {
   it("returns 401 when no authorization header is provided", async () => {
-    const res = await POST(new Request("http://localhost/api/automation/runs?runId=123&repo=org/repo&action=rerun", {
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=rerun", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-    }));
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(res.status).toBe(401);
   });
 
   it("returns 401 when token is incorrect", async () => {
-    const res = await POST(new Request("http://localhost/api/automation/runs?runId=123&repo=org/repo&action=rerun", {
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=rerun", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
-    }));
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(res.status).toBe(401);
   });
 });
@@ -50,37 +50,38 @@ describe("POST /api/automation/runs/[runId] — auth", () => {
 describe("POST /api/automation/runs/[runId] — validation", () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it("returns 400 when runId is missing", async () => {
-    const res = await POST(new Request("http://localhost/api/automation/runs?repo=org/repo&action=rerun", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
-    }));
-    expect(res.status).toBe(400);
-  });
-
   it("returns 400 when repo is missing", async () => {
-    const res = await POST(new Request("http://localhost/api/automation/runs?runId=123&action=rerun", {
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?action=rerun", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
-    }));
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(res.status).toBe(400);
   });
 
   it("returns 404 when run not found", async () => {
     mocks.findUnique.mockResolvedValueOnce(null);
-    const res = await POST(new Request("http://localhost/api/automation/runs?runId=999&repo=org/repo&action=rerun", {
+    const res = await POST(new Request("http://localhost/api/automation/runs/999?repo=org/repo&action=rerun", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
-    }));
+    }), { params: Promise.resolve({ runId: "999" }) });
+    expect(res.status).toBe(404);
+  });
+
+  it("reads runId from path param, not query param", async () => {
+    mocks.findUnique.mockResolvedValueOnce(null);
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?runId=999&repo=org/repo&action=rerun", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(res.status).toBe(404);
   });
 
   it("returns 200 for rerun action", async () => {
     mocks.findUnique.mockResolvedValueOnce({ id: "wr-1", workflowId: "gw-1" });
-    const res = await POST(new Request("http://localhost/api/automation/runs?runId=123&repo=org/repo&action=rerun", {
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=rerun", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
-    }));
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
@@ -88,10 +89,10 @@ describe("POST /api/automation/runs/[runId] — validation", () => {
 
   it("returns 200 for dispatch action", async () => {
     mocks.findUnique.mockResolvedValueOnce({ id: "wr-1", workflowId: "gw-1" });
-    const res = await POST(new Request("http://localhost/api/automation/runs?runId=123&repo=org/repo&action=dispatch", {
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
-    }));
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
@@ -99,10 +100,10 @@ describe("POST /api/automation/runs/[runId] — validation", () => {
 
   it("writes audit log on success", async () => {
     mocks.findUnique.mockResolvedValueOnce({ id: "wr-1", workflowId: "gw-1" });
-    await POST(new Request("http://localhost/api/automation/runs?runId=123&repo=org/repo&action=rerun", {
+    await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=rerun", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
-    }));
+    }), { params: Promise.resolve({ runId: "123" }) });
     expect(mocks.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         action: "workflow_rerun",
@@ -110,5 +111,16 @@ describe("POST /api/automation/runs/[runId] — validation", () => {
         success: true,
       }),
     });
+  });
+
+  it("preserves query-param fallback when path param is absent", async () => {
+    mocks.findUnique.mockResolvedValueOnce({ id: "wr-1", workflowId: "gw-1" });
+    const res = await POST(new Request("http://localhost/api/automation/runs/0?runId=456&repo=org/repo&action=rerun", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+    }), { params: Promise.resolve({ runId: "" }) });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
   });
 });
