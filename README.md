@@ -26,7 +26,7 @@ Dispatch is a harness-agnostic Kanban and work dispatch layer for AI agents. It 
 3. **Dispatch does NOT**:
     - Mount agent harness configuration files
     - Require access to an agent harness local workspace
-   - Use GitHub Projects
+    - Use GitHub Projects
    - Require cluster-admin or broad Kubernetes RBAC
    - Automatically close or complete tasks
 
