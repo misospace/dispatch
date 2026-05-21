@@ -17,6 +17,8 @@ vi.mock("@/lib/prisma", () => ({
 
 import { GET } from "./route";
 
+const TEST_AGENT = "test-agent";
+
 describe("GET /api/agents/[agentName]/work-summary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -25,13 +27,13 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
   });
 
   it("returns agent name and empty lane counts when no issues or PR fixes exist", async () => {
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.agentName).toBe("saffron");
+    expect(body.agentName).toBe(TEST_AGENT);
     expect(body.issues).toEqual({
       normal: { queued: 0, inProgress: 0 },
       escalated: { queued: 0, inProgress: 0 },
@@ -56,8 +58,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
@@ -73,8 +75,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["type/bug"], currentLane: "normal" },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
@@ -92,8 +94,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { lane: "NORMAL", status: "BLOCKED" },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
@@ -108,8 +110,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { lane: null, status: "QUEUED" },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
@@ -122,8 +124,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["status/ready"], currentLane: null },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
@@ -136,8 +138,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["status/done"], currentLane: "normal" },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(200);
@@ -148,8 +150,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
   it("returns 500 on database error", async () => {
     mocks.issueFindMany.mockRejectedValue(new Error("connection refused"));
 
-    const res = await GET(new Request("http://localhost/api/agents/saffron/work-summary"), {
-      params: Promise.resolve({ agentName: "saffron" }),
+    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
+      params: Promise.resolve({ agentName: TEST_AGENT }),
     });
 
     expect(res.status).toBe(500);
