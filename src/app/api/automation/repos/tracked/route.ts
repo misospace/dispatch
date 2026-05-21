@@ -38,12 +38,18 @@ export async function GET(_request: Request) {
 
     const result = repos.map((repo) => {
       const automation = automationMap.get(repo.fullName);
+      const defaultBranch = automation?.defaultBranch ?? "main";
+      if (!automation && defaultBranch === "main") {
+        console.warn(
+          `Tracked repos: no AutomationRepo row for ${repo.fullName}, defaulting defaultBranch to "main" — verify this is correct`,
+        );
+      }
       return {
         fullName: repo.fullName,
         owner: repo.owner,
         name: repo.name,
         enabled: repo.enabled,
-        defaultBranch: automation?.defaultBranch ?? "main",
+        defaultBranch,
         source: automation?.source ?? "unknown",
         lastSyncedAt: automation?.lastSyncedAt ?? null,
       };
