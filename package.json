@@ -2,15 +2,18 @@
   "name": "dispatch",
   "version": "0.2.2",
   "private": true,
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint .",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc --noEmit",
+    "lint": "NODE_ENV=development eslint .",
+    "test": "NODE_ENV=development vitest run",
+    "test:watch": "NODE_ENV=development vitest",
+    "test:coverage": "NODE_ENV=development vitest run --coverage",
+    "typecheck": "NODE_ENV=development tsc --noEmit",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
