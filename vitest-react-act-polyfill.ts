@@ -1,4 +1,4 @@
-import type { Plugin } from "vitest";
+import type { Plugin } from "vite";
 
 /**
  * Placeholder vitest plugin for React 19 + @testing-library/react v16 compat.
