@@ -107,6 +107,25 @@ export async function removeIssueLabel(
   }
 }
 
+export async function closeIssue(
+  repoFullName: string,
+  issueNumber: number
+): Promise<void> {
+  const [owner, repo] = repoFullName.split("/");
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
+
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: getHeaders(),
+    body: JSON.stringify({ state: "closed" }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API error: ${response.status} ${text}`);
+  }
+}
+
 export async function validateGitHubToken(): Promise<boolean> {
   try {
     const response = await fetch(`${GITHUB_API}/user`, {
