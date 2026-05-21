@@ -3,6 +3,7 @@ import { Inter } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { getVersionLabel } from "@/lib/version";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -52,6 +53,7 @@ export default function RootLayout({
                   Automation
                 </Link>
               </nav>
+              <span className="text-xs text-muted-foreground/60">{getVersionLabel()}</span>
               <div className="ml-auto">
                 <ThemeToggle />
               </div>
