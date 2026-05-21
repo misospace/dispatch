@@ -97,10 +97,22 @@ export function githubIssueToSyncedIssueData(ghIssue: GitHubIssue, lastSyncedAt 
   };
 }
 
+/**
+ * Preserve agent/* labels from the existing Prisma record when syncing from GitHub.
+ * This prevents race conditions where the claim endpoint adds an agent/* label to
+ * Prisma and GitHub, but a concurrent sync overwrites it with stale data.
+ */
+export function mergeLabels(ghLabels: string[], existingAgentLabels: string[]): string[] {
+  const ghLabelSet = new Set(ghLabels);
+  // Only add agent labels that aren't already on GitHub (avoids duplicates)
+  const preserved = existingAgentLabels.filter((l) => l.startsWith("agent/") && !ghLabelSet.has(l));
+  return [...ghLabels, ...preserved];
+}
+
 export async function syncIssuesForRepos(
   repos: SyncRepo[],
   fetchIssues: (repoFullName: string) => Promise<GitHubIssue[]>,
-  store: IssueStore
+  store: IssueStore,
 ): Promise<SyncResponse> {
   const results: SyncResult[] = [];
   let syncedCount = 0;
@@ -115,6 +127,8 @@ export async function syncIssuesForRepos(
         const existingIssue = await store.findIssue(repo.id, ghIssue.number);
 
         if (existingIssue) {
+          // Preserve agent/* labels from Prisma in case GitHub hasn't propagated yet
+          // This is handled by the caller's updateIssue callback via the extended store
           await store.updateIssue(existingIssue.id, issueData);
         } else {
           await store.createIssue(repo.id, issueData);
@@ -158,7 +172,7 @@ export async function refreshSingleIssue(
       issueData,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown refresh error";
+    const message = error instanceof Error ? error.message : "Unknown error";
     console.error(`Issue refresh failed for ${repoFullName}#${issueNumber}:`, error);
     return {
       success: false,

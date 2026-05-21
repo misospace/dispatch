@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
-import { syncIssuesForRepos } from "@/lib/issue-sync";
+import { syncIssuesForRepos, mergeLabels } from "@/lib/issue-sync";
 
 export async function POST(request: NextRequest) {
   try {
@@ -28,6 +28,19 @@ export async function POST(request: NextRequest) {
         });
       },
       async updateIssue(id, data) {
+        // Preserve agent/* labels from Prisma in case GitHub hasn't propagated the claim yet.
+        // This prevents a race condition where the claim endpoint adds an agent label to both
+        // Prisma and GitHub, but a concurrent sync overwrites Prisma with stale GitHub data.
+        const existing = await prisma.issue.findUnique({
+          where: { id },
+          select: { labels: true },
+        });
+
+        if (existing && existing.labels.length > 0) {
+          // Merge: use GitHub labels as base, add any agent/* labels from Prisma that aren't on GitHub
+          data.labels = mergeLabels(data.labels, existing.labels);
+        }
+
         await prisma.issue.update({ where: { id }, data });
       },
       async createIssue(repositoryId, data) {
