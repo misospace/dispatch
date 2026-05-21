@@ -320,12 +320,65 @@ export function prReferencesIssue(pr: GithubPR, issueNumber: number): boolean {
 // ─── Action Execution ────────────────────────────────────────────────────────
 
 /**
+ * Sleep for a given number of milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Retry an async operation with exponential backoff.
+ * Retries on transient errors (rate limits, network failures).
+ * Stops retrying on non-transient errors (404, auth failures, etc.).
+ */
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelayMs: number = 1000,
+  maxDelayMs: number = 30000,
+): Promise<T> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      const message = lastError.message.toLowerCase();
+
+      // Don't retry on non-transient errors
+      if (
+        message.includes("404") ||
+        message.includes("not found") ||
+        message.includes("authentication") ||
+        message.includes("forbidden") ||
+        message.includes("unauthorized")
+      ) {
+        throw lastError;
+      }
+
+      if (attempt === maxRetries) {
+        throw lastError;
+      }
+
+      // Exponential backoff with jitter
+      const delay = Math.min(baseDelayMs * 2 ** attempt + Math.random() * 500, maxDelayMs);
+      console.warn(`GitHub API call failed (attempt ${attempt + 1}/${maxRetries + 1}):`, lastError.message);
+      await sleep(delay);
+    }
+  }
+
+  throw lastError!;
+}
+
+/**
  * Execute a single reconciliation action against GitHub.
  * Returns before/after label state for audit logging.
  */
 export async function executeAction(
   action: ReconciliationAction,
   currentLabels: string[],
+  options?: { maxRetries?: number },
 ): Promise<ExecutedAction> {
   const result: ExecutedAction = {
     action,
@@ -334,33 +387,39 @@ export async function executeAction(
     afterLabels: [...currentLabels],
   };
 
+  const maxRetries = options?.maxRetries ?? 3;
+
   try {
     switch (action.type) {
       case "close_issue":
-        await githubCloseIssue(action.repoFullName, action.issueNumber);
+        await retryWithBackoff(() => githubCloseIssue(action.repoFullName, action.issueNumber), maxRetries);
         result.afterLabels = [];
         result.success = true;
         break;
 
-      case "add_label":
-        if (action.label && !currentLabels.includes(action.label)) {
-          await githubAddIssueLabel(action.repoFullName, action.issueNumber, action.label);
-          result.afterLabels = [...currentLabels, action.label];
+      case "add_label": {
+        const label = action.label;
+        if (label && !currentLabels.includes(label)) {
+          await retryWithBackoff(() => githubAddIssueLabel(action.repoFullName, action.issueNumber, label), maxRetries);
+          result.afterLabels = [...currentLabels, label];
           result.success = true;
         } else {
           result.success = true;
         }
         break;
+      }
 
-      case "remove_label":
-        if (action.label && currentLabels.includes(action.label)) {
-          await githubRemoveIssueLabel(action.repoFullName, action.issueNumber, action.label);
-          result.afterLabels = currentLabels.filter((l) => l !== action.label);
+      case "remove_label": {
+        const label = action.label;
+        if (label && currentLabels.includes(label)) {
+          await retryWithBackoff(() => githubRemoveIssueLabel(action.repoFullName, action.issueNumber, label), maxRetries);
+          result.afterLabels = currentLabels.filter((l) => l !== label);
           result.success = true;
         } else {
           result.success = true;
         }
         break;
+      }
 
       case "update_lane":
         // update_lane is not yet produced by reconcileIssue() but the handler
@@ -383,16 +442,22 @@ export async function executeAction(
 export async function executeActions(
   actions: ReconciliationAction[],
   currentLabels: string[],
+  options?: { maxRetries?: number },
 ): Promise<ExecutedAction[]> {
   const results: ExecutedAction[] = [];
   let labels = [...currentLabels];
 
   for (const action of actions) {
-    const result = await executeAction({ ...action, repoFullName: action.repoFullName || "" }, labels);
+    const result = await executeAction({ ...action, repoFullName: action.repoFullName || "" }, labels, options);
     if (result.success && !result.error) {
       labels = result.afterLabels;
     }
     results.push(result);
+
+    // Small delay between actions to spread out GitHub API requests
+    if (results.length < actions.length) {
+      await sleep(250);
+    }
   }
 
   return results;

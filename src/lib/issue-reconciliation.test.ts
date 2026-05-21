@@ -355,7 +355,7 @@ describe("executeAction", () => {
       reason: "Fixed by merged PR #100",
     };
 
-    const result = await executeAction(action, ["bug"]);
+    const result = await executeAction(action, ["bug"], { maxRetries: 0 });
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("API rate limit");
@@ -372,7 +372,7 @@ describe("executeAction", () => {
       reason: "PR is healthy",
     };
 
-    const result = await executeAction(action, ["bug"]);
+    const result = await executeAction(action, ["bug"], { maxRetries: 0 });
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("Forbidden");
@@ -433,7 +433,7 @@ describe("executeActions", () => {
   it("stops propagating labels after a failed action", async () => {
     vi.spyOn(githubModule, "addIssueLabel")
       .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new Error("Rate limited"));
+      .mockRejectedValue(new Error("404 Not Found"));
     const closeMock = vi.spyOn(githubModule, "closeIssue").mockResolvedValue(undefined);
 
     const actions = [
@@ -459,11 +459,50 @@ describe("executeActions", () => {
       },
     ];
 
-    const results = await executeActions(actions, ["bug"]);
+    const results = await executeActions(actions, ["bug"], { maxRetries: 0 });
 
     expect(results).toHaveLength(3);
     expect(results[0].success).toBe(true);
     expect(results[1].success).toBe(false);
     expect(results[2].success).toBe(true);
+  });
+
+  it("retries on transient failure then succeeds", async () => {
+    const addLabelMock = vi.spyOn(githubModule, "addIssueLabel")
+      .mockRejectedValueOnce(new Error("403 API rate limit exceeded"))
+      .mockRejectedValueOnce(new Error("403 API rate limit exceeded"))
+      .mockResolvedValue(undefined);
+
+    const action = {
+      type: "add_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/in-review",
+      reason: "PR is healthy",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(result.success).toBe(true);
+    expect(addLabelMock).toHaveBeenCalledTimes(3);
+    expect(result.afterLabels).toEqual(["bug", "status/in-review"]);
+  });
+
+  it("does not retry on non-transient failure", async () => {
+    const addLabelMock = vi.spyOn(githubModule, "addIssueLabel")
+      .mockRejectedValue(new Error("404 Not Found"));
+
+    const action = {
+      type: "add_label" as const,
+      issueNumber: 42,
+      repoFullName: "test/repo",
+      label: "status/in-review",
+      reason: "PR is healthy",
+    };
+
+    const result = await executeAction(action, ["bug"]);
+
+    expect(result.success).toBe(false);
+    expect(addLabelMock).toHaveBeenCalledTimes(1);
   });
 });
