@@ -23,28 +23,23 @@ async function acquireLock(): Promise<{ locked: true; runId: string } | { locked
     await prisma.syncLock.delete({ where: { id: "global" } });
   }
 
-  const runId = `sync-run-${Date.now()}`;
-
   try {
-    // Atomically create the lock row. If another concurrent request already
-    // created it, this will throw a unique constraint error and we'll return
-    // { locked: false }.
-    await prisma.$transaction(async (tx) => {
+    const runId = await prisma.$transaction(async (tx) => {
       // Double-check inside the transaction for race safety
       const stillExisting = await tx.syncLock.findUnique({ where: { id: "global" } });
       if (stillExisting && stillExisting.syncRunId) {
         throw new Error("already_locked");
       }
 
-      await tx.syncLock.create({
-        data: { id: "global", syncRunId: runId, acquiredAt: new Date() },
-      });
-
-      const created = await tx.issueSyncRun.create({
+      const run = await tx.issueSyncRun.create({
         data: { status: "running", syncType: "scheduled", startedAt: new Date() },
       });
 
-      return created.id;
+      await tx.syncLock.create({
+        data: { id: "global", syncRunId: run.id, acquiredAt: new Date() },
+      });
+
+      return run.id;
     });
 
     return { locked: true, runId };
@@ -58,9 +53,8 @@ async function acquireLock(): Promise<{ locked: true; runId: string } | { locked
 }
 
 async function releaseLock(runId: string): Promise<void> {
-  await prisma.syncLock.updateMany({
+  await prisma.syncLock.deleteMany({
     where: { id: "global", syncRunId: runId },
-    data: { syncRunId: null, acquiredAt: new Date() },
   });
 }
 
