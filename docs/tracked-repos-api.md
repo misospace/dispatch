@@ -29,6 +29,7 @@ Each item contains:
 | `owner`        | string | Repository owner/organization                    |
 | `name`         | string | Repository name (without owner)                  |
 | `enabled`      | boolean | Always `true` — only enabled repos are returned  |
+| `defaultBranch`| string | Default branch (e.g. `"main"`, `"develop"`)      |
 | `source`       | string | Origin of tracking: `"user"`, `"env"`, or `"unknown"` |
 | `lastSyncedAt` | string/null | ISO-8601 timestamp of last automation sync, or `null` if none |
 
@@ -82,6 +83,7 @@ const repos = await res.json() as Array<{
   owner: string;
   name: string;
   enabled: boolean;
+  defaultBranch: string;
   source: string;
   lastSyncedAt: string | null;
 }>;
