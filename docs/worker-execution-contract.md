@@ -193,7 +193,7 @@ Workers consume one item per run from the Escalated lane's queue endpoint.
 
 Workers receive their lane via the queue endpoint's `lane` query parameter:
 - `GET /api/agents/<name>/queue?lane=normal`
-- `GET /api/agents/<name>/queue?lane=escalated` (also accepts `lane=gpt` as a deprecated alias)
+- `GET /api/agents/<name>/queue?lane=escalated` (also accepts `lane=gpt` as a **deprecated compatibility alias** — do not use in new docs)
 
 BACKLOG issues are excluded from the normal agent queue by default.
 
@@ -219,7 +219,7 @@ Renovate exclusion applies to issue queue items only, not PR review-fix queue it
 
 This contract is referenced from:
 - [AGENTS.md](../AGENTS.md) — OpenClaw Agent Workflow Contract section
-- [OpenClaw Agent — Dispatch Phase 1 Workflow Contract](./openclaw-agent-mc-workflow.md) — linked as the detailed worker execution reference
+- [OpenClaw Agent — Dispatch Phase 1 Workflow Contract](./openclaw-agent-mc-workflow.md) — historical pre-cutover reference (marked as archived)
 
 ---
 
@@ -228,3 +228,4 @@ This contract is referenced from:
 - **2026-05-16** — Created to document generic worker execution contract and PR completion gates (Issue #65). Consolidates existing normal-worker behavior into a reusable, agent-agnostic specification.
 - **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are visible in Dispatch but excluded from agent queues by default; `includeRenovate=true` opt-in available (Issue #129).
 - **2026-05-19** — Added five-column workflow with Ready status (Issue #140): Backlog → Ready → In Progress → In Review → Done. Agents pick from Ready by default; Backlog excluded unless explicitly requested.
+- **2026-05-20** — Marked `lane=gpt` as deprecated compatibility alias in canonical docs; linked openclaw-agent-mc-workflow.md as historical (Issue #117).
