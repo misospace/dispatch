@@ -14,19 +14,57 @@ function getHeaders(): HeadersInit {
   };
 }
 
+/**
+ * Parse the Link header from a GitHub API response to extract pagination URLs.
+ * Returns the "next" URL if available, otherwise null.
+ */
+function getNextLink(response: Response): string | null {
+  const link = response.headers.get("Link");
+  if (!link) return null;
+  const match = link.match(/<([^>]+)>;\s*rel="next"/);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Fetch a paginated GitHub REST endpoint, following Link headers until exhausted
+ * or until `maxItems` items have been collected.
+ *
+ * @param url       - Initial API URL (must include per_page query param).
+ * @param maxItems  - Hard cap on total items returned. Defaults to Infinity (exhaust all pages).
+ * @returns All collected items across pages.
+ */
+export async function fetchPaginated<T>(url: string, maxItems = Infinity): Promise<T[]> {
+  const all: T[] = [];
+  let currentUrl: string | null = url;
+
+  while (currentUrl && all.length < maxItems) {
+    const response = await fetch(currentUrl, { headers: getHeaders() });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub API error: ${response.status} ${text}`);
+    }
+
+    const page = (await response.json()) as T[];
+    const remaining = maxItems - all.length;
+    all.push(...page.slice(0, remaining));
+
+    if (all.length >= maxItems) break;
+
+    currentUrl = getNextLink(response);
+  }
+
+  return all;
+}
+
 export async function fetchIssues(repoFullName: string, options?: { includeClosed?: boolean }): Promise<GitHubIssue[]> {
   const [owner, repo] = repoFullName.split("/");
   const state = options?.includeClosed ? "all" : "open";
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=${state}&per_page=100`;
-  const response = await fetch(url, { headers: getHeaders() });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`GitHub API error for ${repoFullName}: ${response.status} ${text}`);
-  }
-
-  const data = await response.json();
-  return data.filter((issue: GitHubIssue) => !issue.pull_request);
+  // Fetch all pages of issues, then filter out PRs (GitHub returns PRs as issues)
+  const all = await fetchPaginated<GitHubIssue>(url);
+  return all.filter((issue: GitHubIssue) => !issue.pull_request);
 }
 
 export async function fetchIssue(repoFullName: string, issueNumber: number): Promise<GitHubIssue> {
@@ -193,29 +231,15 @@ export interface GithubWorkflowRun {
 }
 
 export async function fetchWorkflowRuns(repoFullName: string, workflowId: number, perPage = 20): Promise<GithubWorkflowRun[]> {
-  const response = await fetch(
-    `${GITHUB_API}/repos/${repoFullName}/actions/workflows/${workflowId}/runs?per_page=${perPage}`,
-    { headers: getHeaders() }
-  );
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch workflow runs for ${repoFullName}: ${response.status} ${text}`);
-  }
-  const data = await response.json();
-  return data.workflow_runs;
+  // Bounded to 50 runs — enough to see recent history without excessive API usage.
+  const url = `${GITHUB_API}/repos/${repoFullName}/actions/workflows/${workflowId}/runs?per_page=${perPage}`;
+  return fetchPaginated<GithubWorkflowRun>(url, 50);
 }
 
 export async function fetchRecentRunsAllWorkflows(repoFullName: string, perPage = 30): Promise<GithubWorkflowRun[]> {
-  const response = await fetch(
-    `${GITHUB_API}/repos/${repoFullName}/actions/runs?per_page=${perPage}`,
-    { headers: getHeaders() }
-  );
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch recent runs for ${repoFullName}: ${response.status} ${text}`);
-  }
-  const data = await response.json();
-  return data.workflow_runs;
+  // Bounded to 100 runs across all workflows — recent history cap.
+  const url = `${GITHUB_API}/repos/${repoFullName}/actions/runs?per_page=${perPage}`;
+  return fetchPaginated<GithubWorkflowRun>(url, 100);
 }
 
 export interface GithubJob {
@@ -252,15 +276,9 @@ export interface GithubRelease {
 }
 
 export async function fetchReleases(repoFullName: string, perPage = 10): Promise<GithubRelease[]> {
-  const response = await fetch(
-    `${GITHUB_API}/repos/${repoFullName}/releases?per_page=${perPage}`,
-    { headers: getHeaders() }
-  );
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch releases for ${repoFullName}: ${response.status} ${text}`);
-  }
-  return response.json();
+  // Bounded to 50 releases — enough for recent release history.
+  const url = `${GITHUB_API}/repos/${repoFullName}/releases?per_page=${perPage}`;
+  return fetchPaginated<GithubRelease>(url, 50);
 }
 
 export interface GithubPR {
@@ -277,16 +295,11 @@ export interface GithubPR {
   draft: boolean;
 }
 
-export async function fetchPullRequests(repoFullName: string, perPage = 20): Promise<GithubPR[]> {
-  const response = await fetch(
-    `${GITHUB_API}/repos/${repoFullName}/pulls?state=all&per_page=${perPage}`,
-    { headers: getHeaders() }
-  );
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch PRs for ${repoFullName}: ${response.status} ${text}`);
-  }
-  return response.json();
+export async function fetchPullRequests(repoFullName: string, perPage = 100): Promise<GithubPR[]> {
+  // Fetch open PRs across all pages — these are the ones that affect current board state.
+  // Closed/merged PRs are history and bounded separately by the sync pipeline.
+  const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=open&per_page=${perPage}`;
+  return fetchPaginated<GithubPR>(url, 200);
 }
 
 export interface GithubPackageInfo {
@@ -299,16 +312,14 @@ export interface GithubPackageInfo {
 }
 
 export async function fetchPackages(repoFullName: string): Promise<GithubPackageInfo[]> {
-  const response = await fetch(
-    `${GITHUB_API}/repos/${repoFullName}/packages?per_page=100`,
-    { headers: getHeaders() }
-  );
-  if (!response.ok) {
-    if (response.status === 404) return [];
-    const text = await response.text();
-    throw new Error(`Failed to fetch packages for ${repoFullName}: ${response.status} ${text}`);
+  // Fetch all pages — we need complete package inventory.
+  const url = `${GITHUB_API}/repos/${repoFullName}/packages?per_page=100`;
+  try {
+    return fetchPaginated<GithubPackageInfo>(url);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("404")) return [];
+    throw error;
   }
-  return response.json();
 }
 
 export async function rerunWorkflow(repoFullName: string, runId: number): Promise<void> {
