@@ -3,8 +3,14 @@ import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import { syncIssuesForRepos, mergeLabels } from "@/lib/issue-sync";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 export async function POST(request: NextRequest) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (!isAuthorizedAgentToken(token)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     const body = await request.json();
     const { repoFullName } = body as { repoFullName?: string };

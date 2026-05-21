@@ -11,6 +11,7 @@ import {
   fetchRunJobs,
 } from "@/lib/github";
 import { getTrackedRepos } from "@/lib/config";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 async function syncRepo(repoFullName: string) {
   const parts = repoFullName.split("/");
@@ -326,6 +327,11 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (!isAuthorizedAgentToken(token)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const body = await request.json().catch(() => ({}));
   const repoFullName = body.repo || body.fullName;
 

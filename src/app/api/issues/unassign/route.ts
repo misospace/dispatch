@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 type UnassignPayload = {
   issueId: string;
@@ -17,6 +18,11 @@ type UnassignPayload = {
  * - unassign_owner: removes all owner/* labels
  */
 export async function POST(request: Request) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (!isAuthorizedAgentToken(token)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     let body: unknown;
     try {

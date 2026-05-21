@@ -23,6 +23,10 @@ vi.mock("@/lib/prisma", () => ({
 // Store the original env so we can restore it
 const originalAgentToken = process.env.DISPATCH_AGENT_TOKEN;
 
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token: string | null | undefined) => token === "test-token"),
+}));
+
 import { POST } from "./route";
 
 function decomposeRequest(payload: Record<string, unknown>) {

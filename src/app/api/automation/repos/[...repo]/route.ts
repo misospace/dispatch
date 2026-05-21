@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 interface RouteContext {
   params: Promise<{ repo: string[] }>;
@@ -81,7 +82,12 @@ export async function GET(request: Request, context: RouteContext) {
   }
 }
 
-export async function DELETE(_request: Request, context: RouteContext) {
+export async function DELETE(request: Request, context: RouteContext) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (!isAuthorizedAgentToken(token)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const { repo: pathRepo } = await context.params;
   const repoFullName = decodeURIComponent(pathRepo.join("/"));
 

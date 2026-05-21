@@ -25,6 +25,13 @@ vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
 }));
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+}));
+
 import { POST } from "./route";
 
 function makePayload(overrides = {}) {
@@ -37,29 +44,44 @@ function makePayload(overrides = {}) {
   };
 }
 
-function postRequest(payload = makePayload()) {
+function postRequest(payload = makePayload(), includeAuth = true) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
   return POST(
     new Request("http://localhost/api/issues/unassign", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
     })
   );
 }
 
-describe("POST /api/issues/unassign — validation", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.findIssue.mockResolvedValue({
-      id: "issue-1",
-      labels: ["status/backlog", "agent/worker"],
-    });
-    mocks.updateIssue.mockResolvedValue(undefined);
-    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.updateIssueLabels.mockResolvedValue(undefined);
+describe("POST /api/issues/unassign — auth", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/unassign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(makePayload()),
+      }),
+    );
+    expect(res.status).toBe(401);
   });
 
-  it("returns 400 when action is missing", async () => {
+  it("returns 401 when token is incorrect", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/unassign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
+        body: JSON.stringify(makePayload()),
+      }),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 400 when action is missing (with valid auth)", async () => {
     const res = await postRequest(makePayload({ action: undefined as unknown as "unassign_agent" }));
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -98,7 +120,7 @@ describe("POST /api/issues/unassign — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/unassign", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: "not-json",
       })
     );
@@ -109,7 +131,7 @@ describe("POST /api/issues/unassign — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/unassign", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: JSON.stringify([1, 2]),
       })
     );

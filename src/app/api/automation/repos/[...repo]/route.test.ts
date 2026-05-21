@@ -30,11 +30,20 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+}));
+
 import { GET, DELETE } from "./route";
 
-function deleteRequest(repoSegments: string[]) {
+function deleteRequest(repoSegments: string[], includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
   return DELETE(
-    new Request(`http://localhost/api/automation/repos/${repoSegments.join("/")}`, { method: "DELETE" }),
+    new Request(`http://localhost/api/automation/repos/${repoSegments.join("/")}`, { method: "DELETE", headers }),
     { params: Promise.resolve({ repo: repoSegments }) },
   );
 }
@@ -108,6 +117,29 @@ describe("GET /api/automation/repos/[...repo]", () => {
         where: { fullName: "myorg/my repo" },
       }),
     );
+  });
+});
+
+describe("DELETE /api/automation/repos/[...repo] — auth", () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await DELETE(
+      new Request(`http://localhost/api/automation/repos/myorg/myrepo`, { method: "DELETE" }),
+      { params: Promise.resolve({ repo: ["myorg", "myrepo"] }) },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when token is incorrect", async () => {
+    const res = await DELETE(
+      new Request(`http://localhost/api/automation/repos/myorg/myrepo`, {
+        method: "DELETE",
+        headers: { Authorization: "Bearer wrong-token" },
+      }),
+      { params: Promise.resolve({ repo: ["myorg", "myrepo"] }) },
+    );
+    expect(res.status).toBe(401);
   });
 });
 

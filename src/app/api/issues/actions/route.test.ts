@@ -30,6 +30,13 @@ vi.mock("@/lib/github", () => ({
 }));
 
 // Import the route after mocks are set up
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+}));
+
 import { POST } from "./route";
 
 function makePayload(overrides = {}) {
@@ -43,15 +50,41 @@ function makePayload(overrides = {}) {
   };
 }
 
-function postRequest(payload = makePayload()) {
+function postRequest(payload = makePayload(), includeAuth = true) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
   return POST(
     new Request("http://localhost/api/issues/actions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
     })
   );
 }
+
+describe("POST /api/issues/actions — auth", () => {
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when token is incorrect", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+});
 
 describe("POST /api/issues/actions — validation", () => {
   beforeEach(() => {
@@ -160,7 +193,7 @@ describe("POST /api/issues/actions — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/actions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: "not-json",
       })
     );
@@ -171,7 +204,7 @@ describe("POST /api/issues/actions — validation", () => {
     const res = await POST(
       new Request("http://localhost/api/issues/actions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: JSON.stringify([1, 2, 3]),
       })
     );

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     createAutomationRepo: vi.fn(),
@@ -24,6 +27,10 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+}));
+
 // Real Prisma error shape so the `instanceof` check in the route triggers.
 vi.mock("@prisma/client", () => ({
   Prisma: {
@@ -42,15 +49,35 @@ vi.mock("@prisma/client", () => ({
 import { POST } from "./route";
 import { Prisma } from "@prisma/client";
 
-function postRequest(body: unknown) {
+function postRequest(body: unknown, includeAuth = true) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
   return POST(
     new Request("http://localhost/api/automation/repos", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: typeof body === "string" ? body : JSON.stringify(body),
     }),
   );
 }
+
+describe("POST /api/automation/repos — auth", () => {
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await postRequest({ fullName: "org/repo" }, false);
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when token is incorrect", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/automation/repos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
+        body: JSON.stringify({ fullName: "org/repo" }),
+      }),
+    );
+    expect(res.status).toBe(401);
+  });
+});
 
 describe("POST /api/automation/repos", () => {
   beforeEach(() => {

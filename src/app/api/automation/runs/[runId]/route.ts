@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { rerunWorkflow, triggerWorkflowDispatch } from "@/lib/github";
+import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
 
 export async function POST(request: Request) {
+  const token = request.headers.get("authorization")?.replace("Bearer ", "");
+  if (!isAuthorizedAgentToken(token)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const runId = searchParams.get("runId");
   const repoFullName = searchParams.get("repo");
