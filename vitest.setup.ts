@@ -1,3 +1,4 @@
+// Import @testing-library/jest-dom/vitest for custom matchers
 import "@testing-library/jest-dom/vitest";
 
 const localStorageStore = new Map<string, string>();
@@ -18,28 +19,31 @@ const localStorageMock = {
   },
 };
 
-Object.defineProperty(window, "localStorage", {
-  writable: true,
-  value: localStorageMock,
-});
+// Environment-aware: only patch window in browser environments.
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "localStorage", {
+    writable: true,
+    value: localStorageMock,
+  });
+
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
 
 Object.defineProperty(globalThis, "localStorage", {
   writable: true,
   value: localStorageMock,
-});
-
-Object.defineProperty(window, "matchMedia", {
-  writable: true,
-  value: (query: string) => ({
-    matches: false,
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  }),
 });
 
 // Reset module-level caches between tests for deterministic isolation

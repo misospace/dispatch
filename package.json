@@ -16,7 +16,8 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
-    "mcp:stdio": "tsx src/mcp/server.ts"
+    "mcp:stdio": "tsx src/mcp/server.ts",
+    "postinstall": "node scripts/patch-react-act.js"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.1.0",
