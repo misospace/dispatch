@@ -211,3 +211,38 @@ export function normalizePrFixStatus(status: string): PrFixStatus | null {
   const normalized = status.trim().toUpperCase();
   return isValidPrFixStatus(normalized) ? normalized : null;
 }
+
+// ─── Agent Work Lease / Checkpoint Constants and Helpers ─────────────────────
+
+export type AgentWorkState = "CLAIMED" | "IN_PROGRESS" | "BLOCKED" | "DONE" | "RELEASED" | "STALE";
+export type AgentWorkCheckpoint = "CLAIMED" | "REPO_PREPARED" | "BRANCH_CREATED" | "CHANGES_MADE" | "TESTS_RUNNING" | "PR_OPENED" | "DONE" | "BLOCKED";
+
+export const VALID_AGENT_WORK_STATES: AgentWorkState[] = ["CLAIMED", "IN_PROGRESS", "BLOCKED", "DONE", "RELEASED", "STALE"];
+export const VALID_AGENT_WORK_CHECKPOINTS: AgentWorkCheckpoint[] = ["CLAIMED", "REPO_PREPARED", "BRANCH_CREATED", "CHANGES_MADE", "TESTS_RUNNING", "PR_OPENED", "DONE", "BLOCKED"];
+
+export function isValidAgentWorkState(state: string): state is AgentWorkState {
+  return VALID_AGENT_WORK_STATES.includes(state as AgentWorkState);
+}
+
+export function isValidAgentWorkCheckpoint(checkpoint: string): checkpoint is AgentWorkCheckpoint {
+  return VALID_AGENT_WORK_CHECKPOINTS.includes(checkpoint as AgentWorkCheckpoint);
+}
+
+export function normalizeAgentWorkState(state: string): AgentWorkState | null {
+  const normalized = state.trim().toUpperCase().replace(/-/g, "_");
+  if (normalized === "INPROGRESS" || normalized === "IN_PROGRESS") return "IN_PROGRESS";
+  if (normalized === "DONE" || normalized === "COMPLETED" || normalized === "COMPLETE") return "DONE";
+  if (normalized === "BLOCKED" || normalized === "STUCK") return "BLOCKED";
+  if (normalized === "RELEASED" || normalized === "RELEASE") return "RELEASED";
+  if (normalized === "STALE" || normalized === "EXPIRED") return "STALE";
+  if (normalized === "CLAIMED" || normalized === "CLAIM") return "CLAIMED";
+  return null;
+}
+
+export function normalizeAgentWorkCheckpoint(checkpoint: string): AgentWorkCheckpoint | null {
+  const normalized = checkpoint.trim().toUpperCase().replace(/-/g, "_");
+  if (normalized === "INPROGRESS" || normalized === "IN_PROGRESS") return "CLAIMED"; // map to first active checkpoint
+  if (normalized === "DONE" || normalized === "COMPLETED" || normalized === "COMPLETE") return "DONE";
+  if (normalized === "BLOCKED" || normalized === "STUCK") return "BLOCKED";
+  return isValidAgentWorkCheckpoint(normalized) ? normalized : null;
+}
