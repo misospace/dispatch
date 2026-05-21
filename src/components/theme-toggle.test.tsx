@@ -14,12 +14,13 @@ describe("ThemeToggle", () => {
     const user = userEvent.setup();
     render(React.createElement(ThemeToggle));
 
-    const button = screen.getByRole("button", { name: "Switch to dark mode" });
+    // Use findByRole for React 19 concurrent rendering compatibility
+    const button = await screen.findByRole("button", { name: "Switch to dark mode" });
     await user.click(button);
 
     expect(document.documentElement).toHaveClass("dark");
     expect(localStorage.getItem("dispatch-theme")).toBe("dark");
-    expect(screen.getByRole("button", { name: "Switch to light mode" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Switch to light mode" })).toBeInTheDocument();
   });
 
   it("toggles back to light mode", async () => {
