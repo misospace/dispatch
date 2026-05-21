@@ -148,6 +148,8 @@ src/
       sync/        # Issue sync
       audit/       # Audit log
       health/      # Health check endpoint
+      pr-fix-queue/ # PR review-fix queue (enqueue, queued, mark)
+      pr-followup/  # PR follow-up ingestion (sync, webhook)
     automation/    # Automation UI pages
     board/         # Kanban board
     projects/      # Project view
@@ -155,6 +157,8 @@ src/
   lib/
     prisma.ts      # Prisma client singleton
     github.ts      # GitHub API helpers
+    pr-fix-queue.ts       # PR fix queue client and utilities
+    pr-followup-ingestion.ts  # PR follow-up event ingestion
 ```
 
 ## Health Endpoint
@@ -191,6 +195,13 @@ At the **end** of each heartbeat:
 5. **Filter by execution lane** using the `lane` query param on `GET /api/agents/[agentName]/queue` (values: `NORMAL`, `ESCALATED`, `BACKLOG`). By default, BACKLOG issues are excluded from the normal agent queue.
 6. **Agents pick from Ready by default.** `status/backlog` or unlabeled issues are not queueable unless triage marks them Ready — they need grooming before being actionable.
 7. **Respect execution lane classification** when present: NORMAL issues are the primary queue for agents; ESCALATED issues may require higher-judgment support; BACKLOG issues are not actionable until decomposed.
+
+### PR review-fix queue
+
+8. **PR-fix items take precedence over issue work.** Before consuming from the assignment queue, query `GET /api/agents/[agentName]/queue?lane=normal` — `type: "pr-review-fix"` items appear first in the response array.
+9. **For each PR-fix item:** verify the PR is open and authored by the expected bot account, checkout the queued branch, apply minimal changes based on `feedback[]`, validate locally, push to the same branch, then mark via `POST /api/pr-fix-queue/mark` with status `fixed`, `blocked`, `stale`, or `ignored`.
+10. **Never open a new PR for a queued PR fix.** Workers only push to the existing branch.
+11. **PR-fix queue is the sole source of truth.** Do not use workspace-local scripts (e.g., `pr_fix_queue.py`) or state files (e.g., `.state/pr_fix_queue.json`) for PR-fix orchestration — all queue operations go through Dispatch APIs.
 
 ### Source of truth
 
