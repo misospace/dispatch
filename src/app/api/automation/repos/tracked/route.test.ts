@@ -41,8 +41,8 @@ describe("GET /api/automation/repos/tracked", () => {
       );
     });
     mocks.automationRepoFindMany.mockResolvedValue([
-      { fullName: "org/a", source: "user", lastSyncedAt: new Date("2026-01-01") },
-      { fullName: "org/b", source: "env", lastSyncedAt: null },
+      { fullName: "org/a", defaultBranch: "main", source: "user", lastSyncedAt: new Date("2026-01-01") },
+      { fullName: "org/b", defaultBranch: "develop", source: "env", lastSyncedAt: null },
     ]);
 
     const res = await getRequest();
@@ -57,12 +57,12 @@ describe("GET /api/automation/repos/tracked", () => {
     expect(body.every((r: { fullName: string }) => r.fullName !== "org/c")).toBe(true);
   });
 
-  it("includes source and lastSyncedAt from AutomationRepo when available", async () => {
+  it("includes source, lastSyncedAt and defaultBranch from AutomationRepo when available", async () => {
     mocks.repositoryFindMany.mockResolvedValue([
       { fullName: "org/x", owner: "org", name: "x", enabled: true },
     ]);
     mocks.automationRepoFindMany.mockResolvedValue([
-      { fullName: "org/x", source: "user", lastSyncedAt: new Date("2026-05-17") },
+      { fullName: "org/x", defaultBranch: "main", source: "user", lastSyncedAt: new Date("2026-05-17") },
     ]);
 
     const res = await getRequest();
@@ -74,12 +74,13 @@ describe("GET /api/automation/repos/tracked", () => {
       owner: "org",
       name: "x",
       enabled: true,
+      defaultBranch: "main",
       source: "user",
       lastSyncedAt: "2026-05-17T00:00:00.000Z",
     });
   });
 
-  it("falls back to source 'unknown' and null lastSyncedAt when no AutomationRepo exists", async () => {
+  it("falls back to source 'unknown', null lastSyncedAt and defaultBranch 'main' when no AutomationRepo exists", async () => {
     mocks.repositoryFindMany.mockResolvedValue([
       { fullName: "org/y", owner: "org", name: "y", enabled: true },
     ]);
@@ -94,6 +95,7 @@ describe("GET /api/automation/repos/tracked", () => {
       owner: "org",
       name: "y",
       enabled: true,
+      defaultBranch: "main",
       source: "unknown",
       lastSyncedAt: null,
     });

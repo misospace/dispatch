@@ -9,7 +9,7 @@ import { jsonSafe } from "@/lib/json";
  * suitable for automation and audit consumers.
  *
  * Response shape:
- *   { fullName, owner, name, enabled, source?, lastSyncedAt? }
+ *   { fullName, owner, name, enabled, defaultBranch, source?, lastSyncedAt? }
  *
  * - `source` comes from the linked AutomationRepo row (e.g. "user", "env").
  * - `lastSyncedAt` is only present when an AutomationRepo row exists.
@@ -26,6 +26,7 @@ export async function GET(_request: Request) {
     const automationRepos = await prisma.automationRepo.findMany({
       select: {
         fullName: true,
+        defaultBranch: true,
         source: true,
         lastSyncedAt: true,
       },
@@ -37,11 +38,18 @@ export async function GET(_request: Request) {
 
     const result = repos.map((repo) => {
       const automation = automationMap.get(repo.fullName);
+      const defaultBranch = automation?.defaultBranch ?? "main";
+      if (!automation && defaultBranch === "main") {
+        console.warn(
+          `Tracked repos: no AutomationRepo row for ${repo.fullName}, defaulting defaultBranch to "main" — verify this is correct`,
+        );
+      }
       return {
         fullName: repo.fullName,
         owner: repo.owner,
         name: repo.name,
         enabled: repo.enabled,
+        defaultBranch,
         source: automation?.source ?? "unknown",
         lastSyncedAt: automation?.lastSyncedAt ?? null,
       };
