@@ -1,9 +1,8 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
-import { vitestReactActPolyfill } from "./vitest-react-act-polyfill";
 
 export default defineConfig({
-  plugins: [react(), vitestReactActPolyfill()],
+  plugins: [react()],
   test: {
     environment: "jsdom",
     globals: true,

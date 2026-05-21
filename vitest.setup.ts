@@ -1,6 +1,20 @@
 // Import @testing-library/jest-dom/vitest for custom matchers
 import "@testing-library/jest-dom/vitest";
 
+// Patch React.act for React 19 + @testing-library/react v16 compat.
+// React 19 removed React.act, but older react-dom/test-utils still calls it.
+const React = require("react");
+if (typeof React.act !== "function") {
+  Object.defineProperty(React, "act", {
+    value: function act(cb) {
+      return typeof cb === "function" ? cb() : cb;
+    },
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+}
+
 const localStorageStore = new Map<string, string>();
 const localStorageMock = {
   getItem: (key: string) => localStorageStore.get(key) ?? null,
