@@ -13,6 +13,17 @@ The cache is refreshed primarily through a **scheduled sync runner** (`POST /api
 
 Agent/worker heartbeats may still trigger best-effort sync, but they are no longer the primary freshness mechanism.
 
+
+### Resumable Work and Next-Action Contract
+
+Dispatch supports resumable agent work through a `nextAction` contract. When an agent resumes from a checkpoint (e.g., after a gateway restart or timeout), Dispatch returns a `nextAction` field that tells the agent exactly what bounded step to perform next — no inference required.
+
+- **Contract doc:** [docs/next-action-contract.md](./next-action-contract.md)
+- **Source:** `src/lib/next-action.ts`
+- **Tests:** `src/lib/next-action.test.ts` (23 tests)
+
+The contract defines 6 checkpoint values and 9 next-action values, mapped deterministically. Agents should perform exactly one bounded step per run and report back to Dispatch before stopping.
+
 ### Five-Column Board Workflow
 
 Dispatch uses a five-column board to manage issue lifecycle:
@@ -276,6 +287,8 @@ Backlog → Ready → In Progress → In Review → Done
 - Done is reserved exclusively for closed/terminal issues
 
 ## History
+- **2026-05-21** — Added resumable work section with next-action contract reference (Issue #167).
+
 
 - **2026-05-19** — Added five-column workflow documentation with Ready status and In Review semantics (Issue #140).
 - **2026-05-19** — Updated to reflect that scheduled sync (`POST /api/sync/scheduled`) is now the primary freshness mechanism. Agent heartbeats may still call `POST /api/sync` for best-effort freshness, but are no longer responsible for general cache freshness.
