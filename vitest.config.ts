@@ -8,6 +8,9 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./vitest.setup.ts"],
   },
+  ssr: {
+    noExternal: ["react", "react-dom", "@testing-library/react"],
+  },
   resolve: {
     alias: {
       "@": new URL("./src", import.meta.url).pathname,
