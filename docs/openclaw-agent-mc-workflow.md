@@ -1,8 +1,12 @@
 # OpenClaw Agent — Dispatch Phase 1 Workflow Contract
 
-> **Status:** Pre-cutover documentation
+> **⚠️ HISTORICAL** — This document describes pre-cutover Phase 1 workflow.
+> The cutover is complete. See [docs/worker-execution-contract.md](./worker-execution-contract.md) for the current canonical worker contract.
+>
 > **Issue:** [misospace/dispatch#53](https://github.com/misospace/dispatch/issues/53)
 > **Date:** 2026-05-15
+
+---
 
 This document defines the operational contract between an OpenClaw agent and Dispatch during Phase 1 of the migration from GitHub Projects to Dispatch-backed visibility.
 

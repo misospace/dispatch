@@ -1,8 +1,13 @@
 # Worker Cron Prompt Migration to Dispatch Queues
 
-> **Issue:** [misospace/dispatch#70](https://github.com/misospace/dispatch/issues/70)  
-> **Date:** 2026-05-17  
+> **⚠️ HISTORICAL** — Cutover complete. All worker cron jobs now use Dispatch queue APIs.
+> See [docs/worker-execution-contract.md](./worker-execution-contract.md) for the current canonical contract.
+>
+> **Issue:** [misospace/dispatch#70](https://github.com/misospace/dispatch/issues/70)
+> **Date:** 2026-05-17
 > **Status:** Migrated
+
+---
 
 This document describes the migration of worker cron prompts from GitHub Project board readers to Dispatch queue APIs.
 
@@ -21,7 +26,7 @@ Worker cron prompts now consume work from Dispatch's assignment queue APIs:
 | Lane | Endpoint |
 |------|----------|
 | Normal | `GET /api/agents/{agentName}/queue?lane=normal` |
-| Escalated | `GET /api/agents/{agentName}/queue?lane=escalated` (also accepts `lane=gpt`) |
+| Escalated | `GET /api/agents/{agentName}/queue?lane=escalated` (also accepts `lane=gpt` as a deprecated compatibility alias) |
 
 Workers use Dispatch action APIs for work management:
 - Claim work: `POST /api/issues/claim`
@@ -135,8 +140,8 @@ To transition status, workers must call `POST /api/issues/status` explicitly. Th
 
 ## Affected Cron Jobs
 
-| Cron ID | Name | Lane | MC Queue Endpoint |
-|---------|------|------|-------------------|
+| Cron ID | Name | Lane | Dispatch Queue Endpoint |
+|---------|------|------|------------------------|
 | `6b09bed4-cfbe-4c35-bbee-2b66c5ef17aa` | (Saffron): 35B Wishlist Chip | normal | `/api/agents/saffron/queue?lane=normal` |
 | `1723278d-2eaa-435b-9fda-0efe8febb30b` | (Saffron): GPT-5.5 Wishlist Chip | escalated | `/api/agents/saffron/queue?lane=escalated` |
 
@@ -149,8 +154,8 @@ Workers should consume PR-fix items from the Dispatch agent queue endpoint or th
 ## Deprecated Scripts
 
 The following scripts are deprecated and kept only for reference:
-- `wishlist_read_board.py` — replaced by MC normal queue API
-- `wishlist_read_gpt_audit_board.py` — replaced by MC escalated lane API
+- `wishlist_read_board.py` — replaced by normal queue API
+- `wishlist_read_gpt_audit_board.py` — replaced by escalated lane API
 
 These should be removed once all cron jobs have been verified to work with the new queue-based approach.
 
