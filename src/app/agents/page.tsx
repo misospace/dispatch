@@ -3,6 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { AGENT_PREFIX } from "@/types";
+import AgentWorkPanel from "@/app/agents/agent-work-panel";
 
 export const dynamic = "force-dynamic";
 
@@ -130,6 +131,8 @@ export default async function AgentsPage() {
         </div>
       )}
 
+      <AgentWorkPanel />
+
       <Card>
         <CardHeader>
           <CardTitle>Recent Agent Runs</CardTitle>
@@ -170,6 +173,7 @@ export default async function AgentsPage() {
           )}
         </CardContent>
       </Card>
+
     </div>
   );
 }

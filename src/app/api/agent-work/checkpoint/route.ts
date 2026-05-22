@@ -20,6 +20,19 @@ export async function POST(request: Request) {
     if (!work) {
       return NextResponse.json({ error: "No active work found for agent" }, { status: 404 });
     }
+
+    await prisma.auditLog.create({
+      data: {
+        actor: parsed.agentName,
+        action: "agent_work_checkpoint",
+        repoFullName: "",
+        issueNumber: undefined,
+        issueId: work.issueId ?? undefined,
+        success: true,
+        notes: `Agent ${parsed.agentName} checkpointed (${parsed.checkpoint}): ${parsed.summary ?? parsed.blockerReason ?? "-"}`,
+      },
+    });
+
     return NextResponse.json(work);
   } catch (error) {
     console.error("Failed to checkpoint agent work:", error);
