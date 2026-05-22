@@ -4,6 +4,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
     prFixFindMany: vi.fn(),
+    findLeasedIssueIds: vi.fn(),
   },
 }));
 
@@ -15,6 +16,10 @@ vi.mock("@/lib/prisma", () => ({
   asPrFixQueueClient: (client: any) => client,
 }));
 
+vi.mock("@/lib/lease", () => ({
+  findLeasedIssueIds: mocks.findLeasedIssueIds,
+}));
+
 import { GET } from "./route";
 
 describe("GET /api/agents/[agentName]/queue", () => {
@@ -22,6 +27,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
     mocks.issueFindMany.mockResolvedValue([]);
+    mocks.findLeasedIssueIds.mockResolvedValue([]);
   });
 
   it("prioritizes queued PR review-fix items before new issue work", async () => {
@@ -212,6 +218,78 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0]).toMatchObject({ number: 52, agentMatch: true });
+  });
+
+  // ── Lease-aware filtering tests (issue #166) ───────────────────────
+
+  it("excludes issues leased by other agents", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-leased",
+        number: 54,
+        title: "Leased issue",
+        url: "https://github.com/org/repo/issues/54",
+        labels: ["agent/opencode", "status/backlog"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-open",
+        number: 55,
+        title: "Open issue",
+        url: "https://github.com/org/repo/issues/55",
+        labels: ["status/backlog"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+    // issue-leased is leased by another agent
+    mocks.findLeasedIssueIds.mockResolvedValue(["issue-leased"]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([55]);
+  });
+
+  it("includes issues when the requesting agent holds the lease", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-my-lease",
+        number: 56,
+        title: "My leased issue",
+        url: "https://github.com/org/repo/issues/56",
+        labels: ["agent/example-agent", "status/backlog"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+    // example-agent holds the lease, so findLeasedIssueIds returns empty for them
+    mocks.findLeasedIssueIds.mockResolvedValue([]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.map((item: { number: number }) => item.number)).toEqual([56]);
+  });
+
+  it("calls findLeasedIssueIds with the requesting agent name", async () => {
+    mocks.issueFindMany.mockResolvedValue([]);
+
+    await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "saffron" }),
+    });
+
+    expect(mocks.findLeasedIssueIds).toHaveBeenCalledWith("saffron");
   });
 
   // ── Renovate exclusion tests ──────────────────────────────────────

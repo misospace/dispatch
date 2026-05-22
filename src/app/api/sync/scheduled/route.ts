@@ -107,10 +107,19 @@ export async function POST(request: Request) {
         findIssue(repositoryId, number) {
           return prisma.issue.findUnique({
             where: { repositoryId_number: { repositoryId, number } },
+            select: { id: true, labels: true },
           });
         },
         async updateIssue(id, data) {
-          await prisma.issue.update({ where: { id }, data });
+          // Preserve agent/* labels from existing record (prevents race condition with claim endpoint)
+          const mergedData = { ...data };
+          const existing = await prisma.issue.findUnique({ where: { id }, select: { labels: true } });
+          if (existing?.labels) {
+            const ghLabels = new Set(mergedData.labels);
+            const preserved = existing.labels.filter((l) => l.startsWith("agent/") && !ghLabels.has(l));
+            mergedData.labels = [...mergedData.labels, ...preserved];
+          }
+          await prisma.issue.update({ where: { id }, data: mergedData });
         },
         async createIssue(repositoryId, data) {
           await prisma.issue.create({ data: { ...data, repositoryId } });

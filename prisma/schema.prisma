@@ -39,6 +39,7 @@ model Issue {
   auditLogs     AuditLog[]
   laneHistory   IssueLane[]
   agentWork     AgentWork[]
+  leases        Lease[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -453,4 +454,29 @@ model AgentWorkHistory {
 
   @@index([workId])
   @@index([at])
+}
+
+// ---------------------------------------------------------------------------
+// Agent work leases — durable checkpointing for resumable agent work.
+//
+// A Lease represents an agent's active ownership of a specific issue. It is
+// created or renewed on claim, checked on active-work queries, and expired
+// after a configurable TTL so that stale work can be recovered by other agents.
+// ---------------------------------------------------------------------------
+
+model Lease {
+  id         String   @id @default(cuid())
+  agentName  String
+  issueId    String
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  checkpoint String   // e.g. "issue_claimed", "branch_created", etc.
+  branch     String?  // working branch name
+  prUrl      String?  // associated PR URL if one exists
+  expiredAt  DateTime // absolute expiry; default TTL is set at creation time
+  renewedAt  DateTime?
+  createdAt  DateTime @default(now())
+
+  @@unique([agentName, issueId])
+  @@index([expiredAt])
+  @@index([issueId])
 }
