@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { AgentWorkClient } from "@/lib/agent-work";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgresql://dispatch:dispatch@localhost:5432/dispatch";
@@ -24,6 +25,14 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
   return {
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
+    $transaction: (fn) => client.$transaction(fn as any) as any,
+  };
+}
+
+export function asAgentWorkClient(client: PrismaClient): AgentWorkClient {
+  return {
+    agentWork: client.agentWork,
+    agentWorkHistory: client.agentWorkHistory,
     $transaction: (fn) => client.$transaction(fn as any) as any,
   };
 }
