@@ -152,6 +152,12 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
 
   if (!lease) return null;
 
+  // Defensive check: skip expired leases (should already be filtered by query)
+  if (isLeaseExpired(lease)) {
+    await releaseLease(lease.id);
+    return null;
+  }
+
   // Validate checkpoint before building context
   if (!isValidCheckpoint(lease.checkpoint)) {
     // Corrupted checkpoint — release the lease and return no active work

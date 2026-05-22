@@ -1,16 +1,24 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-const mockAgentWork = {
-  findMany: vi.fn(),
-};
+const { mocks } = vi.hoisted(() => ({
+  mocks: {
+    leaseFindFirst: vi.fn(),
+    leaseDelete: vi.fn(),
+  },
+}));
 
 vi.mock("@/lib/prisma", () => ({
-  prisma: {},
-  asAgentWorkClient: (client: any) => ({
-    agentWork: mockAgentWork,
-    agentWorkHistory: {},
-    $transaction: vi.fn(),
-  }),
+  prisma: {
+    lease: {
+      findFirst: mocks.leaseFindFirst,
+      delete: mocks.leaseDelete,
+    },
+  },
+}));
+
+vi.mock("@/lib/next-action", () => ({
+  buildResumeContext: vi.fn((input) => ({ ...input, nextAction: "inspect_issue" })),
+  isValidCheckpoint: vi.fn((cp) => ["issue_claimed", "branch_created", "changes_made"].includes(cp)),
 }));
 
 import { GET as handleActiveWork } from "./route";
@@ -27,48 +35,82 @@ describe("GET /api/agents/:agentName/active-work", () => {
     vi.clearAllMocks();
   });
 
-  it("returns active work for the agent", async () => {
-    mockAgentWork.findMany.mockResolvedValue([
-      {
-        id: "work-1",
-        agentName: "test-agent",
-        state: "IN_PROGRESS",
-        checkpoint: "CHANGES_MADE",
-        issueId: "issue-abc",
-        branch: "feat/my-feature",
-        lastHeartbeatAt: new Date(),
+  it("returns hasActiveWork: true with context when agent has an active lease", async () => {
+    mocks.leaseFindFirst.mockResolvedValue({
+      id: "l-1",
+      agentName: "test-agent",
+      issueId: "issue-abc",
+      checkpoint: "issue_claimed",
+      branch: "feat/my-feature",
+      prUrl: null,
+      expiredAt: new Date(Date.now() + 60000),
+      renewedAt: new Date(),
+      issue: {
+        number: 42,
+        repository: { fullName: "org/repo" },
       },
-    ]);
+    });
 
     const res = await makeActiveWorkRequest("test-agent");
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(Array.isArray(body)).toBe(true);
-    expect(body.length).toBe(1);
-    expect(body[0].id).toBe("work-1");
+    expect(body.hasActiveWork).toBe(true);
+    expect(body.context.issueId).toBe("issue-abc");
+    expect(body.context.repoFullName).toBe("org/repo");
+    expect(body.context.issueNumber).toBe(42);
+    expect(body.context.branch).toBe("feat/my-feature");
   });
 
-  it("returns empty array when no active work", async () => {
-    mockAgentWork.findMany.mockResolvedValue([]);
+  it("returns hasActiveWork: false when no active lease exists", async () => {
+    mocks.leaseFindFirst.mockResolvedValue(null);
 
     const res = await makeActiveWorkRequest("unknown-agent");
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(Array.isArray(body)).toBe(true);
-    expect(body.length).toBe(0);
+    expect(body.hasActiveWork).toBe(false);
   });
 
-  it("only returns active states (CLAIMED, IN_PROGRESS, BLOCKED)", async () => {
-    mockAgentWork.findMany.mockResolvedValue([]);
-
-    await makeActiveWorkRequest("test-agent");
-
-    expect(mockAgentWork.findMany).toHaveBeenCalledWith({
-      where: {
-        agentName: "test-agent",
-        state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+  it("returns hasActiveWork: false when all leases are expired", async () => {
+    mocks.leaseFindFirst.mockResolvedValue({
+      id: "l-1",
+      agentName: "test-agent",
+      issueId: "issue-abc",
+      checkpoint: "issue_claimed",
+      branch: null,
+      prUrl: null,
+      expiredAt: new Date(Date.now() - 60000),
+      renewedAt: new Date(Date.now() - 120000),
+      issue: {
+        number: 42,
+        repository: { fullName: "org/repo" },
       },
-      orderBy: { lastHeartbeatAt: "desc" },
     });
+
+    const res = await makeActiveWorkRequest("test-agent");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.hasActiveWork).toBe(false);
+  });
+
+  it("returns hasActiveWork: false when checkpoint is invalid", async () => {
+    mocks.leaseFindFirst.mockResolvedValue({
+      id: "l-1",
+      agentName: "test-agent",
+      issueId: "issue-abc",
+      checkpoint: "invalid_checkpoint",
+      branch: null,
+      prUrl: null,
+      expiredAt: new Date(Date.now() + 60000),
+      renewedAt: new Date(),
+      issue: {
+        number: 42,
+        repository: { fullName: "org/repo" },
+      },
+    });
+
+    const res = await makeActiveWorkRequest("test-agent");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.hasActiveWork).toBe(false);
   });
 });
