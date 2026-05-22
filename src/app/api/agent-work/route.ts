@@ -25,6 +25,10 @@ interface AgentWorkItem {
   repoFullName: string | null;
 }
 
+// Intentionally unauthenticated — consistent with other read-only endpoints
+// such as GET /api/agents/[agentName]/active-work and GET /api/issues.
+// The board UI and operator dashboards need to query active/stale work without
+// requiring a DISPATCH_AGENT_TOKEN. POST mutations remain auth-gated below.
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const stateFilter = searchParams.get("state");
