@@ -16,7 +16,11 @@ const mockTransaction = vi.fn((fn: (tx: any) => Promise<any>) => fn({
 }));
 
 vi.mock("@/lib/prisma", () => ({
-  prisma: {},
+  prisma: {
+    auditLog: {
+      create: vi.fn(async () => ({ id: "audit-1" })),
+    },
+  },
   asAgentWorkClient: (client: any) => ({
     agentWork: mockAgentWork,
     agentWorkHistory: mockAgentWorkHistory,
