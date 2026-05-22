@@ -17,6 +17,19 @@ export async function POST(request: Request) {
     }
 
     const work = await startAgentWork(asAgentWorkClient(prisma), parsed);
+
+    await prisma.auditLog.create({
+      data: {
+        actor: parsed.agentName,
+        action: "agent_work_started",
+        repoFullName: "",
+        issueNumber: undefined,
+        issueId: parsed.issueId ?? undefined,
+        success: true,
+        notes: `Agent ${parsed.agentName} started work on issue ${parsed.issueId ?? "unassigned"}`,
+      },
+    });
+
     return NextResponse.json(work, { status: 201 });
   } catch (error) {
     console.error("Failed to start agent work:", error);

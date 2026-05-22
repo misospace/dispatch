@@ -20,6 +20,19 @@ export async function POST(request: Request) {
     if (!work) {
       return NextResponse.json({ error: "No active work found for agent" }, { status: 404 });
     }
+
+    await prisma.auditLog.create({
+      data: {
+        actor: parsed.agentName,
+        action: "agent_work_finished",
+        repoFullName: "",
+        issueNumber: undefined,
+        issueId: work.issueId ?? undefined,
+        success: true,
+        notes: `Agent ${parsed.agentName} finished work (${parsed.state}): ${parsed.summary ?? "-"}`,
+      },
+    });
+
     return NextResponse.json(work);
   } catch (error) {
     console.error("Failed to finish agent work:", error);
