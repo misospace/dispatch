@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { removeIssueLabel } from "@/lib/github";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { releaseLease } from "@/lib/lease";
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace("Bearer ", "");
@@ -61,8 +62,8 @@ export async function POST(request: Request) {
       );
     }
 
-    // Remove the agent label from GitHub
     try {
+      // Remove the agent label from GitHub
       await removeIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
 
       // Update local cache
@@ -72,10 +73,13 @@ export async function POST(request: Request) {
         data: { labels: updatedLabels, lastSyncedAt: new Date() },
       });
 
+      // Release the lease (issue #166)
+      await releaseLeaseByAgent(issueId as string, agentName as string);
+
       // Write audit log
       await prisma.auditLog.create({
         data: {
-          actor: agentName,
+          actor: agentName as string,
           action: "unclaim_issue",
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
@@ -110,5 +114,17 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("Unclaim issue failed:", error);
     return NextResponse.json({ error: "Failed to unclaim issue" }, { status: 500 });
+  }
+}
+
+/**
+ * Release the lease for a specific agent on an issue.
+ */
+async function releaseLeaseByAgent(issueId: string, agentName: string): Promise<void> {
+  const lease = await prisma.lease.findUnique({
+    where: { agentName_issueId: { agentName, issueId } },
+  });
+  if (lease) {
+    await prisma.lease.delete({ where: { id: lease.id } });
   }
 }

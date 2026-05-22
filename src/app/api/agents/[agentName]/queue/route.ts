@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { buildAgentQueue } from "@/lib/agent-queue";
 import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
+import { findLeasedIssueIds } from "@/lib/lease";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
@@ -33,9 +34,19 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     const issueLane = lane === "gpt" ? "escalated" : (lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined);
     const prFixLane = lane === "gpt" ? "ESCALATED" : lane;
 
+    // Find issues that have active leases from OTHER agents — exclude them
+    // so other agents don't overlap on leased work.
+    const leasedIssueIds = await findLeasedIssueIds(agentName);
+
     const prFixItems = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: prFixLane });
+
+    // Filter out leased issue IDs before building the queue
+    const filteredIssues = issues.filter(
+      (issue) => !leasedIssueIds.includes(issue.id),
+    );
+
     const queue = buildAgentQueue(
-      issues.map((issue) => ({
+      filteredIssues.map((issue) => ({
         ...issue,
         lane: issue.currentLane ?? undefined,
         issueId: issue.id,

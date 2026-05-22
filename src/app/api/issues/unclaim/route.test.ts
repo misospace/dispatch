@@ -6,6 +6,8 @@ const { mocks } = vi.hoisted(() => ({
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
+    leaseFindUnique: vi.fn(),
+    leaseDelete: vi.fn(),
   },
 }));
 
@@ -17,6 +19,10 @@ vi.mock("@/lib/prisma", () => ({
     issue: {
       findUnique: mocks.findUnique,
       update: mocks.updateIssue,
+    },
+    lease: {
+      findUnique: mocks.leaseFindUnique,
+      delete: mocks.leaseDelete,
     },
     auditLog: {
       create: mocks.createAuditLog,
@@ -137,6 +143,8 @@ describe("POST /api/issues/unclaim — business logic", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindUnique.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseDelete.mockResolvedValue({ id: "l-1" });
   });
 
   it("removes agent label and updates local cache", async () => {

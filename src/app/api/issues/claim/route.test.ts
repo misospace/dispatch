@@ -4,6 +4,9 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn(), updateIssue: vi.fn(), createAuditLog: vi.fn(),
     addIssueLabel: vi.fn(), removeIssueLabel: vi.fn(),
+    leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
+    leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
+    leaseCreate: vi.fn(), leaseUpdate: vi.fn(), leaseDelete: vi.fn(), leaseFindFirst: vi.fn(),
   },
 }));
 
@@ -11,7 +14,20 @@ const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/prisma", () => ({
-  prisma: { issue: { findUnique: mocks.findUnique, update: mocks.updateIssue }, auditLog: { create: mocks.createAuditLog } },
+  prisma: {
+    issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
+    auditLog: { create: mocks.createAuditLog },
+    lease: { 
+      findMany: mocks.leaseFindMany, 
+      deleteMany: mocks.leaseDeleteMany, 
+      findUnique: mocks.leaseFindUnique,
+      findUniqueOrThrow: mocks.leaseFindUniqueOrThrow,
+      create: mocks.leaseCreate,
+      update: mocks.leaseUpdate,
+      delete: mocks.leaseDelete,
+      findFirst: mocks.leaseFindFirst,
+    },
+  },
 }));
 
 vi.mock("@/lib/github", () => ({ addIssueLabel: mocks.addIssueLabel, removeIssueLabel: mocks.removeIssueLabel }));
@@ -41,7 +57,13 @@ describe("POST /api/issues/claim — auth", () => {
 });
 
 describe("POST /api/issues/claim — validation", () => {
-  beforeEach(() => { vi.clearAllMocks(); mocks.findUnique.mockResolvedValue(null); });
+  beforeEach(() => { vi.clearAllMocks(); mocks.findUnique.mockResolvedValue(null); mocks.leaseFindMany.mockResolvedValue([]); mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseFindUniqueOrThrow.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseCreate.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseUpdate.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseDelete.mockResolvedValue({ id: "l-1" });
+    mocks.leaseFindFirst.mockResolvedValue(null); });
 
   it("returns 400 when agentName is missing", async () => {
     const res = await POST(makeRequest(makePayload({agentName: undefined})));
@@ -83,7 +105,11 @@ describe("POST /api/issues/claim — business logic", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
   });
 
   it("adds agent label and moves a fresh claim to in-progress", async () => {
@@ -184,6 +210,8 @@ describe("POST /api/issues/claim — owner label handling", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
   });
 
   it("preserves owner labels when claiming an issue with owner/*", async () => {
@@ -235,6 +263,8 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
   });
 
   it("includes conflict details in audit log when agent conflict exists and force is used", async () => {

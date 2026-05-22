@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 
@@ -52,6 +53,23 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Cannot claim a done issue" }, { status: 400 });
     }
 
+    // Check for active leases from OTHER agents — refuse unless force=true
+    const activeLeases = await findActiveLeasesForIssue(issueId as string);
+    const otherAgentLeases = activeLeases.filter((l) => l.agentName !== agentName);
+
+    if (otherAgentLeases.length > 0 && force !== true) {
+      return NextResponse.json(
+        { error: `Issue is actively leased to ${otherAgentLeases[0].agentName}. Use force=true to override.` },
+        { status: 409 },
+      );
+    }
+
+    // Always clean up expired leases (stale recovery)
+    const expiredCount = await releaseExpiredLeases(issueId as string);
+    if (expiredCount > 0) {
+      console.warn(`Released ${expiredCount} expired lease(s) for issue #${issueNumber}`);
+    }
+
     // Analyze assignment conflicts using the shared conflict resolution module
     const analysis = analyzeAssignmentConflict(issue.labels);
 
@@ -76,7 +94,7 @@ export async function POST(request: Request) {
     // Build updated labels using the shared conflict resolution module
     const agentLabel = `agent/${agentName}`;
     const labelsWithAgent = buildNewLabels(issue.labels, "assign_agent", agentLabel);
-    const updatedLabels = [...labelsWithAgent.filter((label) => !label.startsWith("status/")), IN_PROGRESS_STATUS];
+    const updatedLabels = [...labelsWithAgent.filter((l) => !l.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
       // Add agent label on GitHub
@@ -93,6 +111,13 @@ export async function POST(request: Request) {
       await prisma.issue.update({
         where: { id: issueId as string },
         data: { labels: updatedLabels, lastSyncedAt: new Date() },
+      });
+
+      // Create or renew a lease for this agent (issue #166)
+      await upsertLease({
+        agentName: agentName as string,
+        issueId: issueId as string,
+        checkpoint: "issue_claimed",
       });
 
       // Write audit log with conflict analysis details
@@ -114,7 +139,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: agentName,
+          actor: agentName as string,
           action: "claim_issue",
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
