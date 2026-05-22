@@ -82,6 +82,10 @@ export async function GET(request: Request) {
     }));
 
     if (includeStale) {
+      // Stale-work sweep: marks CLAIMED/IN_PROGRESS work as STALE when heartbeat
+      // or lease TTL has expired. Idempotent — once marked STALE, work no longer
+      // matches the WHERE clause, so repeated calls are safe. Also creates history
+      // entries for audit trail. Returns affected IDs so we can re-query.
       const potentiallyStale = await releaseStaleWork(prisma, 5 * 60 * 1000);
       if (potentiallyStale.length > 0) {
         const refreshedWhere: Record<string, unknown> = {
@@ -210,7 +214,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
         return NextResponse.json({ error: "Work is already completed or released" }, { status: 400 });
       }
 
-     work = await prisma.$transaction(async (tx) => {
+      work = await prisma.$transaction(async (tx) => {
         const updated = await tx.agentWork.update({
           where: { id: workId },
           data: { state: "RELEASED", leaseExpiresAt: new Date() },
@@ -235,8 +239,8 @@ async function releaseAgentWork(body: Record<string, unknown>) {
       });
     }
 
-    if (leaseId) {
-     const lease = await prisma.lease.findUnique({ where: { id: leaseId }, include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } } });
+  if (leaseId) {
+      const lease = await prisma.lease.findUnique({ where: { id: leaseId }, include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } } });
       if (!lease) {
         return NextResponse.json({ error: "Lease not found" }, { status: 404 });
       }
