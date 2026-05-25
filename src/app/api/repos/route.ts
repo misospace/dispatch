@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isValidRepoName } from "@/lib/config";
 import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 export async function GET() {
   try {
@@ -20,8 +20,7 @@ export async function GET() {
 // Deprecated compatibility endpoint. Use POST /api/automation/repos for
 // tracked repository management.
 export async function POST(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

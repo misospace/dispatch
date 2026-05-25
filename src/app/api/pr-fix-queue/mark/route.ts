@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput } from "@/lib/pr-fix-queue";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 export async function POST(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

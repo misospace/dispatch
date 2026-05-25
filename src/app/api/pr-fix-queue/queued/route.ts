@@ -2,11 +2,10 @@ import { NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
 import { isValidPrFixLane, VALID_PR_FIX_LANES } from "@/types";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 export async function GET(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 type ActionPayload = {
   issueId?: string;
@@ -15,8 +15,7 @@ type ActionPayload = {
 };
 
 export async function POST(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

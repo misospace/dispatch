@@ -10,7 +10,7 @@ import {
   classifyLaneByHeuristics,
   executeActions,
 } from "@/lib/issue-reconciliation";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 /**
  * Reconcile issue state against PR state for all tracked repos.
@@ -25,8 +25,7 @@ import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
  * state current without relying on GitHub ProjectV2 columns.
  */
 export async function POST(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -212,8 +211,7 @@ export async function POST(request: Request) {
  * GET endpoint to check reconciliation status and last run time.
  */
 export async function GET(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

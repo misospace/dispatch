@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { fetchIssues, fetchRepo, fetchWorkflows, fetchRecentRunsAllWorkflows, fetchReleases, fetchPullRequests, fetchLatestCommit, fetchPackages, fetchRunJobs } from "@/lib/github";
 import { getSyncRepos, getTrackedRepos } from "@/lib/config";
 import { syncIssuesForRepos, SyncResponse } from "@/lib/issue-sync";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 // ---------------------------------------------------------------------------
 // Lock acquisition — DB-backed single-row guard to prevent overlapping runs.
@@ -64,8 +64,7 @@ async function releaseLock(runId: string): Promise<void> {
 
 export async function POST(request: Request) {
   // Auth check — require Bearer token matching DISPATCH_AGENT_TOKEN
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
