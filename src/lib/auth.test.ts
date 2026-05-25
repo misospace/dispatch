@@ -31,6 +31,11 @@ describe("getAuthMode", () => {
     expect(getAuthMode()).toBe("disabled");
   });
 
+  it('returns "oidc" when DISPATCH_AUTH_MODE=oidc', () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    expect(getAuthMode()).toBe("oidc");
+  });
+
   it("returns undefined when DISPATCH_AUTH_MODE is not set", () => {
     expect(getAuthMode()).toBeUndefined();
   });
@@ -259,6 +264,40 @@ describe("isAuthorized (unified entry point)", () => {
     const request = new Request("http://localhost/api/test");
     expect(isAuthorized(request)).toBe(true);
   });
+
+  it("rejects unauthenticated request in oidc mode (via isAuthorized)", () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    const request = new Request("http://localhost/api/test");
+    expect(isAuthorized(request)).toBe(false);
+  });
+
+  it("accepts Bearer token in oidc mode (agent compatibility)", () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer agent-token" },
+    });
+    expect(isAuthorized(request)).toBe(true);
+  });
+
+  it("rejects wrong Bearer token in oidc mode", () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(isAuthorized(request)).toBe(false);
+  });
+
+  it("rejects Basic Auth in oidc mode (only Bearer accepted via isAuthorized)", () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
+    });
+    expect(isAuthorized(request)).toBe(false);
+  });
 });
 
 describe("authenticateRequest (typed entry point)", () => {
@@ -302,6 +341,30 @@ describe("authenticateRequest (typed entry point)", () => {
     const request = new Request("http://localhost/api/test", {
       headers: { Authorization: "Bearer wrong-token" },
     });
+    expect(authenticateRequest(request)).toEqual({ authorized: false });
+  });
+
+  it('returns { authorized: true, type: "bearer" } for valid Bearer in oidc mode', () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer agent-token" },
+    });
+    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer" });
+  });
+
+  it("returns { authorized: false } for invalid Bearer in oidc mode", () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(authenticateRequest(request)).toEqual({ authorized: false });
+  });
+
+  it("returns { authorized: false } for unauthenticated request in oidc mode", () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    const request = new Request("http://localhost/api/test");
     expect(authenticateRequest(request)).toEqual({ authorized: false });
   });
 });

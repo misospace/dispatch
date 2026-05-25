@@ -1,20 +1,28 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { getAuthMode, isAuthorizedBasicAuth, getBasicAuthCredentials } from "@/lib/auth";
+import { getAuthMode, isAuthorizedBasicAuth } from "@/lib/auth";
 
 /**
  * Next.js middleware that enforces Basic Auth when DISPATCH_AUTH_MODE="basic".
  *
- * - API routes (`/api/*`) return 401 JSON for unauthenticated requests.
- * - UI pages (`/board`, `/projects`, `/agents`, `/automation`) trigger the
- *   browser's native Basic Auth dialog via a 401 response with
- *   `WWW-Authenticate` header.
+ * Auth mode behavior:
+ * - "basic"    : HTTP Basic Auth required for all routes. API routes return 401 JSON;
+ *                UI pages trigger the browser's native auth dialog via WWW-Authenticate.
+ * - "oidc"     : No middleware enforcement. OIDC sessions are handled by NextAuth.
+ *                Route handlers use requireSession() to gate access.
+ * - "disabled" : No auth enforcement at all.
+ * - undefined  : Legacy mode — no middleware enforcement; routes handle their own auth.
  */
 export function middleware(request: NextRequest) {
   const authMode = getAuthMode();
 
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
+    return NextResponse.next();
+  }
+
+  // OIDC mode — no middleware enforcement; NextAuth handles session checks via requireSession()
+  if (authMode === "oidc") {
     return NextResponse.next();
   }
 
@@ -65,11 +73,13 @@ export const config = {
   matcher: [
     /*
      * Match all request paths except for the ones starting with:
+     * - api/auth/* (NextAuth OIDC routes)
      * - api/health (health check, always public)
      * - _next/static (static files)
      * - _next/image (image optimization files)
      * - favicon.ico (favicon file)
+     * - /login (public login page)
      */
-    "/((?!api/health|_next/static|_next/image|favicon\\.ico).*)",
+    "/((?!api/auth|api/health|_next/static|_next/image|favicon\\.ico|login).*)",
   ],
 };

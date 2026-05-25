@@ -1,8 +1,9 @@
 /**
  * Shared authentication helpers for Dispatch.
  *
- * Supports two auth modes (controlled by DISPATCH_AUTH_MODE):
+ * Supports four auth modes (controlled by DISPATCH_AUTH_MODE):
  *   - "basic"    : HTTP Basic Auth for operator/browser UI access
+ *   - "oidc"     : OIDC provider authentication with session cookies
  *   - "disabled" : No auth enforcement (full open access)
  *
  * When DISPATCH_AUTH_MODE is not set, the legacy behavior is preserved:
@@ -11,6 +12,10 @@
  * All mutating routes should use `isAuthorized(request)` instead of
  * duplicating auth parsing logic. The middleware enforces Basic Auth at
  * the request level when DISPATCH_AUTH_MODE="basic".
+ *
+ * For OIDC mode, use `requireSession()` from `@/lib/session` in route
+ * handlers that need operator identity (audit logs, etc.). Agent routes
+ * should continue using `isAuthorized(request)` which accepts Bearer tokens.
  */
 
 import { getAcceptedAgentTokens, isAuthorizedBearerToken as _isAuthed, resetCaches as _resetEnvCaches } from "./dispatch-env";
@@ -20,21 +25,24 @@ import { timingSafeEqual } from "node:crypto";
 // Auth mode resolution
 // ---------------------------------------------------------------------------
 
-let _cachedAuthMode: "basic" | "disabled" | undefined;
+let _cachedAuthMode: "basic" | "oidc" | "disabled" | undefined;
 
 /**
  * Resolve the authentication mode.
  *
  * - "basic"    : Require HTTP Basic Auth for all requests
+ * - "oidc"     : OIDC session-based auth (enforced by NextAuth, not middleware)
  * - "disabled" : No auth enforcement (open access)
  * - undefined  : Legacy mode — no middleware enforcement; routes use Bearer token checks
  */
-export function getAuthMode(): "basic" | "disabled" | undefined {
+export function getAuthMode(): "basic" | "oidc" | "disabled" | undefined {
   if (_cachedAuthMode !== undefined) return _cachedAuthMode;
 
   const mode = process.env.DISPATCH_AUTH_MODE;
   if (mode === "basic") {
     _cachedAuthMode = "basic";
+  } else if (mode === "oidc") {
+    _cachedAuthMode = "oidc";
   } else if (mode === "disabled") {
     _cachedAuthMode = "disabled";
   } else {
@@ -156,6 +164,8 @@ export function isAuthorizedBasicAuth(username: string, password: string): boole
  * Check if a request is authorized.
  *
  * In "basic" mode: only Basic Auth credentials are accepted.
+ * In "oidc" mode: Bearer token via DISPATCH_AGENT_TOKEN is accepted
+ *   (for agent/API compatibility). OIDC session auth is handled by NextAuth.
  * In default/legacy mode: Bearer token via DISPATCH_AGENT_TOKEN is accepted.
  * In "disabled" mode: all requests are authorized.
  *
@@ -166,6 +176,13 @@ export function isAuthorized(request: Request): boolean {
 
   // Disabled mode — allow everything
   if (authMode === "disabled") return true;
+
+  // OIDC mode — accept Bearer token for agent compatibility
+  // OIDC session auth is handled separately via NextAuth in route handlers
+  if (authMode === "oidc") {
+    const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+    return isAuthorizedBearerToken(bearerToken);
+  }
 
   // Basic auth mode — only accept Basic Auth credentials
   if (authMode === "basic") {
@@ -190,6 +207,13 @@ export function authenticateRequest(request: Request):
 
   // Disabled mode — allow everything as bearer (no-op, just for type safety)
   if (authMode === "disabled") return { authorized: true, type: "bearer" };
+
+  // OIDC mode — accept Bearer token for agent compatibility
+  if (authMode === "oidc") {
+    const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+    if (!isAuthorizedBearerToken(bearerToken)) return { authorized: false };
+    return { authorized: true, type: "bearer" };
+  }
 
   // Basic auth mode
   if (authMode === "basic") {
