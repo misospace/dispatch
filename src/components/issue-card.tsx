@@ -4,8 +4,8 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX } from "@/types";
-import { GitPullRequest, MessageSquare, ExternalLink, MoreVertical, User, Users, X } from "lucide-react";
+import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction } from "@/types";
+import { GitPullRequest, MessageSquare, ExternalLink, MoreVertical, User, Users, X, Scissors, AlertTriangle, Info, Ban } from "lucide-react";
 import { useState, useCallback } from "react";
 
 interface IssueCardProps {
@@ -34,6 +34,11 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
   const [agents, setAgents] = useState<string[]>([]);
   const [fetchingAgents, setFetchingAgents] = useState(false);
   const [ownerNameInput, setOwnerNameInput] = useState("");
+
+  // Groom state
+  const [groomAction, setGroomAction] = useState<GroomAction | null>(null);
+  const [groomSummary, setGroomSummary] = useState("");
+  const [groomReason, setGroomReason] = useState("");
 
   const statusColor = issue.labels
     .filter((l) => l.startsWith("status/"))
@@ -155,6 +160,70 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     const trimmed = ownerNameInput.trim();
     if (!trimmed) return;
     await handleAssign("owner", trimmed);
+  }
+
+  async function handleGroom(action: GroomAction) {
+    const reasonField = action === "mark_not_ready" ? "notReadyReason"
+      : action === "mark_blocked" ? "blockedReason"
+      : action === "mark_needs_info" ? "needsInfoReason"
+      : undefined;
+
+    const reasonValue = reasonField ? groomReason.trim() : undefined;
+    if (reasonField && (!reasonValue || reasonValue.length === 0)) {
+      setError(`A ${reasonField.replace(/([A-Z])/g, " $1").toLowerCase()} is required for this action`);
+      return;
+    }
+
+    setLoadingAction(`groom-${action}`);
+    setError(null);
+    try {
+      const res = await fetch("/api/issues/groom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          issueId: issue.id,
+          repoFullName: issue.repository.fullName,
+          issueNumber: issue.number,
+          action,
+          groomingSummary: groomSummary.trim() || undefined,
+          ...(reasonField && reasonValue ? { [reasonField]: reasonValue } : {}),
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+
+      setGroomAction(null);
+      setGroomSummary("");
+      setGroomReason("");
+
+      // Build updated issue with grooming state for reactivity
+      const groomedIssue: Issue = {
+        ...issue,
+        ...(action === "promote_to_ready" ? { labels: ["status/ready", ...issue.labels.filter((l) => !l.startsWith("status/"))] } : {}),
+        groomedAt: new Date(),
+        groomingSummary: groomSummary.trim() || undefined || null,
+        ...(action === "mark_not_ready" ? { notReadyReason: groomReason.trim() } : {}),
+        ...(action === "mark_blocked" ? { blockedReason: groomReason.trim() } : {}),
+        ...(action === "mark_needs_info" ? { needsInfoReason: groomReason.trim() } : {}),
+      };
+
+      await handleSuccess(`groom-${action}`);
+      onIssueUpdate?.(groomedIssue);
+    } catch (err) {
+      handleError(err instanceof Error ? err.message : "Grooming failed");
+    } finally {
+      setLoadingAction(null);
+    }
+  }
+
+  function resetGroomForm() {
+    setGroomAction(null);
+    setGroomSummary("");
+    setGroomReason("");
+    setError(null);
   }
 
   return (
@@ -320,6 +389,116 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
                         Owner labels are applied as <code>owner/{ownerNameInput || "name"}</code>.
                       </p>
                     </div>
+
+                    {/* Groom section */}
+                    <div className="pt-2 border-t">
+                      <p className="text-xs font-medium mb-1 text-muted-foreground flex items-center gap-1">
+                        <Scissors className="h-3 w-3" /> Groom issue
+                      </p>
+                      {issue.labels.includes("status/backlog") && !groomAction && (
+                        <div className="flex flex-wrap gap-1">
+                          <button
+                            className="px-2 py-0.5 text-xs rounded bg-green-100 text-green-700 hover:bg-green-200 disabled:opacity-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleGroom("promote_to_ready");
+                            }}
+                            disabled={loadingAction !== null}
+                          >
+                            Promote to Ready
+                          </button>
+                          <button
+                            className="px-2 py-0.5 text-xs rounded bg-amber-100 text-amber-700 hover:bg-amber-200 disabled:opacity-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setGroomAction("mark_not_ready");
+                            }}
+                            disabled={loadingAction !== null}
+                          >
+                            Not Ready
+                          </button>
+                          <button
+                            className="px-2 py-0.5 text-xs rounded bg-blue-100 text-blue-700 hover:bg-blue-200 disabled:opacity-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setGroomAction("mark_needs_info");
+                            }}
+                            disabled={loadingAction !== null}
+                          >
+                            Needs Info
+                          </button>
+                          <button
+                            className="px-2 py-0.5 text-xs rounded bg-red-100 text-red-700 hover:bg-red-200 disabled:opacity-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setGroomAction("mark_blocked");
+                            }}
+                            disabled={loadingAction !== null}
+                          >
+                            Blocked
+                          </button>
+                        </div>
+                      )}
+                      {!issue.labels.includes("status/backlog") && !groomAction && (
+                        <div className="flex flex-wrap gap-1">
+                          <button
+                            className="px-2 py-0.5 text-xs rounded bg-purple-100 text-purple-700 hover:bg-purple-200 disabled:opacity-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setGroomAction("escalate");
+                            }}
+                            disabled={loadingAction !== null}
+                          >
+                            Escalate
+                          </button>
+                        </div>
+                      )}
+                      {groomAction && (
+                        <div className="space-y-2">
+                          <p className="text-xs font-medium">{GROOM_ACTION_LABELS[groomAction]}</p>
+                          <input
+                            type="text"
+                            placeholder="Grooming summary (optional)"
+                            value={groomSummary}
+                            onChange={(e) => setGroomSummary(e.target.value)}
+                            disabled={loadingAction !== null}
+                            className="w-full px-2 py-0.5 text-xs rounded border bg-background text-popover-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                          />
+                          {(groomAction === "mark_not_ready" || groomAction === "mark_blocked" || groomAction === "mark_needs_info") && (
+                            <input
+                              type="text"
+                              placeholder={groomAction === "mark_not_ready" ? "Why is this not ready?" : groomAction === "mark_blocked" ? "What is blocking this?" : "What information is needed?"}
+                              value={groomReason}
+                              onChange={(e) => setGroomReason(e.target.value)}
+                              disabled={loadingAction !== null}
+                              className="w-full px-2 py-0.5 text-xs rounded border bg-background text-popover-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                            />
+                          )}
+                          <div className="flex gap-1">
+                            <button
+                              className="flex-1 px-2 py-0.5 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (groomAction) void handleGroom(groomAction);
+                              }}
+                              disabled={loadingAction !== null}
+                            >
+                              Confirm
+                            </button>
+                            <button
+                              className="px-2 py-0.5 text-xs rounded bg-muted hover:bg-muted-foreground/20 disabled:opacity-50"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                resetGroomForm();
+                              }}
+                              disabled={loadingAction !== null}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </>
               )}
@@ -352,6 +531,31 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
             </span>
           )}
         </div>
+        {(issue.notReadyReason || issue.blockedReason || issue.needsInfoReason || issue.groomingSummary) && (
+          <div className="mt-2 space-y-1">
+            {issue.notReadyReason && (
+              <div className="flex items-start gap-1 text-xs text-amber-700">
+                <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                <span>{issue.notReadyReason}</span>
+              </div>
+            )}
+            {issue.blockedReason && (
+              <div className="flex items-start gap-1 text-xs text-red-700">
+                <Ban className="h-3 w-3 mt-0.5 shrink-0" />
+                <span>{issue.blockedReason}</span>
+              </div>
+            )}
+            {issue.needsInfoReason && (
+              <div className="flex items-start gap-1 text-xs text-blue-700">
+                <Info className="h-3 w-3 mt-0.5 shrink-0" />
+                <span>{issue.needsInfoReason}</span>
+              </div>
+            )}
+            {issue.groomingSummary && issue.groomingSummary.length > 0 && (
+              <p className="text-xs text-muted-foreground italic">{issue.groomingSummary}</p>
+            )}
+          </div>
+        )}
         <div className="flex items-center mt-2 text-xs text-muted-foreground">
           <span>{issue.repository.fullName}</span>
           {issue.assignees.length > 0 && (

@@ -45,6 +45,15 @@ export interface Issue {
   decomposedBy?: string | null;
   decomposedNote?: string | null;
   followUpUrls?: string[];
+
+  // Backlog grooming state
+  groomedAt?: Date | null;
+  groomedBy?: string | null;
+  groomingSummary?: string | null;
+  notReadyReason?: string | null;
+  blockedReason?: string | null;
+  needsInfoReason?: string | null;
+  nextGroomingAction?: string | null;
 }
 
 export interface StoredIssueLane {
@@ -246,3 +255,31 @@ export function normalizeAgentWorkCheckpoint(checkpoint: string): AgentWorkCheck
   if (normalized === "BLOCKED" || normalized === "STUCK") return "BLOCKED";
   return isValidAgentWorkCheckpoint(normalized) ? normalized : null;
 }
+
+// ─── Backlog Grooming Constants and Helpers ──────────────────────────────────
+
+export type GroomAction = "promote_to_ready" | "escalate" | "mark_not_ready" | "mark_needs_info" | "mark_blocked";
+
+export const VALID_GROOM_ACTIONS: GroomAction[] = ["promote_to_ready", "escalate", "mark_not_ready", "mark_needs_info", "mark_blocked"];
+
+export function isValidGroomAction(action: string): action is GroomAction {
+  return VALID_GROOM_ACTIONS.includes(action as GroomAction);
+}
+
+export function normalizeGroomAction(action: string): GroomAction | null {
+  const normalized = action.trim().toLowerCase().replace(/_/g, "_");
+  if (normalized === "promote" || normalized === "ready" || normalized === "promote_to_ready") return "promote_to_ready";
+  if (normalized === "escalate" || normalized === "escalated") return "escalate";
+  if (normalized === "not_ready" || normalized === "notready" || normalized === "keep_backlog") return "mark_not_ready";
+  if (normalized === "needs_info" || normalized === "needsinfo" || normalized === "needs_info") return "mark_needs_info";
+  if (normalized === "blocked" || normalized === "stuck") return "mark_blocked";
+  return isValidGroomAction(normalized) ? normalized : null;
+}
+
+export const GROOM_ACTION_LABELS: Record<GroomAction, string> = {
+  promote_to_ready: "Promote to Ready",
+  escalate: "Escalate",
+  mark_not_ready: "Keep in Backlog (not ready)",
+  mark_needs_info: "Mark Needs Info",
+  mark_blocked: "Mark Blocked",
+};
