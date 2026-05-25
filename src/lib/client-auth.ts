@@ -5,8 +5,10 @@
  * must include an `Authorization: Basic ...` header with the operator's
  * credentials.
  *
- * This module provides a hook that reads credentials from sessionStorage
- * (set by a login prompt) and attaches them to every outgoing request.
+ * When DISPATCH_AUTH_MODE="oidc", session cookies are managed by NextAuth
+ * and sent automatically by the browser — no manual header attachment needed.
+ *
+ * This module provides hooks and utilities for both auth modes.
  */
 
 import { useState, useEffect, useCallback } from "react";
