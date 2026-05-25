@@ -49,6 +49,13 @@ function issue(overrides: Partial<Issue> = {}): Issue {
   };
 }
 
+function expectedRefreshLabel(date: Date) {
+  return `Last refreshed ${date.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  })}`;
+}
+
 describe("KanbanBoard refresh status", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -64,7 +71,9 @@ describe("KanbanBoard refresh status", () => {
   it("shows the last successful refresh time", async () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
-    expect(await screen.findByText(/Last refreshed/)).toHaveTextContent("Last refreshed 7:22 PM");
+    expect(await screen.findByText(/Last refreshed/)).toHaveTextContent(
+      expectedRefreshLabel(new Date("2026-05-25T19:22:00.000Z"))
+    );
   });
 
   it("updates issues and last refreshed time after a successful manual refresh", async () => {
@@ -81,7 +90,11 @@ describe("KanbanBoard refresh status", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh board" }));
 
     expect(await screen.findByText("Fresh issue")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText(/Last refreshed/)).toHaveTextContent("Last refreshed 7:30 PM"));
+    await waitFor(() =>
+      expect(screen.getByText(/Last refreshed/)).toHaveTextContent(
+        expectedRefreshLabel(new Date("2026-05-25T19:30:00.000Z"))
+      )
+    );
   });
 
   it("shows a stale-state warning and keeps current issues after refresh failure", async () => {

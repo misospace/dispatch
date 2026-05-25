@@ -10,7 +10,7 @@ import {
   classifyLaneByHeuristics,
   executeActions,
 } from "@/lib/issue-reconciliation";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 
 /**
  * Reconcile issue state against PR state for all tracked repos.
@@ -25,7 +25,7 @@ import { isAuthorized } from "@/lib/auth";
  * state current without relying on GitHub ProjectV2 columns.
  */
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -211,7 +211,7 @@ export async function POST(request: Request) {
  * GET endpoint to check reconciliation status and last run time.
  */
 export async function GET(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

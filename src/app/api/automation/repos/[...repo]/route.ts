@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 interface RouteContext {
   params: Promise<{ repo: string[] }>;
@@ -83,9 +83,11 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 export async function DELETE(request: Request, context: RouteContext) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const auditActor = getAuthorizedActor(auth, request);
 
   const { repo: pathRepo } = await context.params;
   const repoFullName = decodeURIComponent(pathRepo.join("/"));
@@ -117,7 +119,7 @@ export async function DELETE(request: Request, context: RouteContext) {
 
     await prisma.auditLog.create({
       data: {
-        actor: "user",
+        actor: auditActor,
         action: "remove_tracked_repo",
         repoFullName,
         beforeLabels: [existing.source],
@@ -131,7 +133,7 @@ export async function DELETE(request: Request, context: RouteContext) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     await prisma.auditLog.create({
       data: {
-        actor: "user",
+        actor: auditActor,
         action: "remove_tracked_repo",
         repoFullName,
         beforeLabels: [],

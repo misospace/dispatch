@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { rerunWorkflow, triggerWorkflowDispatch } from "@/lib/github";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 export async function POST(request: Request, { params }: { params: Promise<{ runId: string }> }) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const auditActor = getAuthorizedActor(auth, request);
 
   const { searchParams } = new URL(request.url);
   const pathRunId = (await params).runId;
@@ -47,7 +49,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
 
     await prisma.auditLog.create({
       data: {
-        actor: "user",
+        actor: auditActor,
         action: `workflow_${action}`,
         repoFullName,
         success,
@@ -63,7 +65,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
 
     await prisma.auditLog.create({
       data: {
-        actor: "user",
+        actor: auditActor,
         action: `workflow_${action}`,
         repoFullName,
         success: false,

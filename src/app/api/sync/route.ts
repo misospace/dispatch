@@ -3,10 +3,10 @@ import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import { syncIssuesForRepos, mergeLabels } from "@/lib/issue-sync";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 
 export async function POST(request: NextRequest) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

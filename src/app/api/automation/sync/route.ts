@@ -11,7 +11,7 @@ import {
   fetchRunJobs,
 } from "@/lib/github";
 import { getTrackedRepos } from "@/lib/config";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 
 async function syncRepo(repoFullName: string) {
   const parts = repoFullName.split("/");
@@ -327,7 +327,7 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

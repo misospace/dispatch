@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 type UnassignPayload = {
   issueId: string;
@@ -18,9 +18,11 @@ type UnassignPayload = {
  * - unassign_owner: removes all owner/* labels
  */
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const auditActor = getAuthorizedActor(auth, request);
 
   try {
     let body: unknown;
@@ -81,7 +83,7 @@ export async function POST(request: Request) {
       // Write audit log
       await prisma.auditLog.create({
         data: {
-          actor: "user",
+          actor: auditActor,
           action: payload.action,
           repoFullName: payload.repoFullName,
           issueNumber: payload.issueNumber,
@@ -102,7 +104,7 @@ export async function POST(request: Request) {
 
         await prisma.auditLog.create({
           data: {
-            actor: "user",
+            actor: auditActor,
             action: payload.action,
             repoFullName: payload.repoFullName,
             issueNumber: payload.issueNumber,

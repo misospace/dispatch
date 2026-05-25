@@ -8,6 +8,7 @@ const { mocks } = vi.hoisted(() => ({
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
+    auth: vi.fn(),
   },
 }));
 
@@ -33,8 +34,13 @@ vi.mock("@/lib/github", () => ({
   addIssueLabel: mocks.addIssueLabel,
 }));
 
+vi.mock("@/lib/auth-next", () => ({
+  auth: mocks.auth,
+}));
+
 // Import the route after mocks are set up
 import { POST } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
 
 function makePayload(overrides = {}) {
   return {
@@ -59,7 +65,12 @@ function postRequest(payload = makePayload(), extraHeaders = {}) {
 
 describe("POST /api/issues/move — auth", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
     vi.clearAllMocks();
+    mocks.auth.mockReset();
     mocks.findIssue.mockResolvedValue(null);
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
@@ -88,11 +99,66 @@ describe("POST /api/issues/move — auth", () => {
     );
     expect(res.status).toBe(401);
   });
+
+  it("accepts valid Basic Auth in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    resetAuthCaches();
+
+    const res = await postRequest(makePayload(), {
+      Authorization: "Basic b3BlcmF0b3I6czNjcmV0",
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts valid Bearer auth in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    resetAuthCaches();
+
+    const res = await postRequest(makePayload());
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts valid OIDC session cookies in oidc mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    resetAuthCaches();
+    mocks.auth.mockResolvedValue({ user: { email: "operator@example.com" } });
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts valid Bearer auth in oidc mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    resetAuthCaches();
+
+    const res = await postRequest(makePayload());
+
+    expect(res.status).toBe(200);
+    expect(mocks.auth).not.toHaveBeenCalled();
+  });
 });
 
 describe("POST /api/issues/move — validation", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
     vi.clearAllMocks();
+    mocks.auth.mockReset();
     mocks.findIssue.mockResolvedValue(null);
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
@@ -194,8 +260,53 @@ describe("POST /api/issues/move — validation", () => {
         action: "move_issue",
         repoFullName: "org/repo",
         issueNumber: 42,
+        actor: "agent",
         success: true,
       }),
+    });
+  });
+
+  it("uses Basic Auth username as audit actor", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    resetAuthCaches();
+
+    const res = await postRequest(makePayload({ actor: "body-actor" }), {
+      Authorization: "Basic b3BlcmF0b3I6czNjcmV0",
+    });
+
+    expect(res.status).toBe(200);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ actor: "operator", success: true }),
+    });
+  });
+
+  it("uses OIDC email as audit actor", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    resetAuthCaches();
+    mocks.auth.mockResolvedValue({ user: { email: "operator@example.com", name: "Operator" } });
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(makePayload({ actor: "body-actor" })),
+      })
+    );
+
+    expect(res.status).toBe(200);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ actor: "operator@example.com", success: true }),
+    });
+  });
+
+  it("uses body actor as audit actor for Bearer auth fallback", async () => {
+    const res = await postRequest(makePayload({ actor: "worker-1" }));
+
+    expect(res.status).toBe(200);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ actor: "worker-1", success: true }),
     });
   });
 

@@ -82,14 +82,13 @@ Agent Runs → Dispatch → Agent Activity Page
 | `DISPATCH_AUTH_MODE` | No | Authentication mode: `"basic"` (HTTP Basic Auth), `"oidc"` (OIDC/SSO), `"disabled"` (no auth), or unset (legacy mode) |
 | `DISPATCH_AUTH_USERNAME` | Conditional | Username for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
 | `DISPATCH_AUTH_PASSWORD` | Conditional | Password for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
-| `DISPATCH_OIDC_ISSUER` | Conditional | OIDC provider issuer URL (e.g., `https://auth.example.com/.well-known/openid-configuration`) — required when `DISPATCH_AUTH_MODE=oidc` |
+| `DISPATCH_OIDC_ISSUER` | Conditional | OIDC provider issuer URL (e.g., `https://auth.example.com`). Discovery URLs ending in `/.well-known/openid-configuration` are also accepted for compatibility. Required when `DISPATCH_AUTH_MODE=oidc` |
 | `DISPATCH_OIDC_CLIENT_ID` | Conditional | OIDC client ID — required when `DISPATCH_AUTH_MODE=oidc` |
 | `DISPATCH_OIDC_CLIENT_SECRET` | Conditional | OIDC client secret — required when `DISPATCH_AUTH_MODE=oidc`. Never exposed to the browser. |
-| `DISPATCH_OIDC_REDIRECT_URI` | No | OIDC redirect URI (defaults to `<DISPATCH_URL>/api/auth/callback/oidc`) — required when `DISPATCH_AUTH_MODE=oidc` |
 | `DISPATCH_URL` | No | Base URL of your Dispatch instance (used by outbound clients and MCP bridge) |
 | `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | Conditional | Secret for NextAuth.js JWT signing — required when `DISPATCH_AUTH_MODE=oidc`. Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
-| `NEXTAUTH_URL` | No | URL for NextAuth.js (stub in Phase 1) |
+| `NEXTAUTH_URL` | Conditional | Public Dispatch base URL used by NextAuth to derive callback URLs. Set this in OIDC deployments. |
 
 **Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` (for instance URL).
 
@@ -124,14 +123,14 @@ Dispatch supports three authentication models:
 | `DISPATCH_AUTH_MODE` | Behavior |
 |---|---|
 | *(not set)* | Legacy mode — no middleware enforcement. Agent routes use Bearer token auth via `DISPATCH_AGENT_TOKEN`. Browser UI has no separate auth model. |
-| `basic` | HTTP Basic Auth required for all routes (enforced by middleware). Agents continue to use `DISPATCH_AGENT_TOKEN` bearer auth. |
-| `oidc` | OIDC session-based authentication. NextAuth handles login/callback/logout. Route handlers use `requireSession()` to gate access. Agents continue to use `DISPATCH_AGENT_TOKEN` bearer auth. |
+| `basic` | HTTP Basic Auth required for operator UI routes. API routes also accept `DISPATCH_AGENT_TOKEN` bearer auth for agents and workers. |
+| `oidc` | OIDC session-based authentication for operator UI routes. Route handlers accept either a valid NextAuth session cookie or `DISPATCH_AGENT_TOKEN` bearer auth. |
 | `disabled` | No auth enforcement — full open access. Use for local development only. |
 
 ### How it works
 
-- **Middleware** (`src/middleware.ts`) enforces Basic Auth at the request level when `DISPATCH_AUTH_MODE="basic"`. API routes return `401 JSON`; UI pages trigger the browser's native auth dialog. In OIDC mode, the middleware passes through and NextAuth handles session checks.
-- **Route handlers** use a shared `isAuthorized(request)` helper from `src/lib/auth.ts` that supports Basic Auth, Bearer token auth, and OIDC-compatible modes depending on the configured auth mode.
+- **Middleware** (`src/middleware.ts`) protects operator UI pages. In Basic mode, UI pages require Basic Auth; API routes also allow agent Bearer auth. In OIDC mode, UI pages require a NextAuth session and unauthenticated users are redirected to `/login`; API routes are authorized by route handlers.
+- **Route handlers** use a shared `authorizeRequest(request)` helper from `src/lib/auth.ts` that supports Basic Auth, Bearer token auth, and OIDC session cookies depending on the configured auth mode.
 - **OIDC flow**: Operators visit `/login`, click "Sign in with SSO", are redirected to the OIDC provider, and return via `/api/auth/callback/oidc`. NextAuth issues a signed JWT session cookie.
 - **Client components** (`kanban-board.tsx`, `sync-issues-button.tsx`) use `authedFetch()` which automatically attaches stored Basic Auth credentials to outgoing requests. In OIDC mode, cookies are sent automatically by the browser.
 
@@ -142,7 +141,7 @@ Dispatch supports three authentication models:
 | **Header/Cookie** | `Authorization: Bearer <token>` | `Authorization: Basic <base64(user:pass)>` | Session cookie (NextAuth JWT) |
 | **Config** | `DISPATCH_AGENT_TOKEN` | `DISPATCH_AUTH_USERNAME` + `DISPATCH_AUTH_PASSWORD` | `DISPATCH_OIDC_ISSUER`, `DISPATCH_OIDC_CLIENT_ID`, `DISPATCH_OIDC_CLIENT_SECRET` |
 | **Used by** | Agents, MCP clients, cron workers | Browser UI (human operators) | Browser UI (human operators) |
-| **Protected routes** | All mutating API endpoints | All routes (UI + API) | All routes requiring session (via `requireSession()`) |
+| **Protected routes** | Mutating API endpoints | Operator UI + mutating browser API calls | Operator UI + mutating browser API calls |
 
 ### OIDC Setup
 
@@ -156,10 +155,11 @@ To enable OIDC authentication:
 2. **Set the required environment variables**:
    ```bash
    DISPATCH_AUTH_MODE="oidc"
-   DISPATCH_OIDC_ISSUER="https://your-issuer.example.com/.well-known/openid-configuration"
+   DISPATCH_OIDC_ISSUER="https://your-issuer.example.com"
    DISPATCH_OIDC_CLIENT_ID="your-client-id"
    DISPATCH_OIDC_CLIENT_SECRET="your-client-secret"
    NEXTAUTH_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
+   NEXTAUTH_URL="https://your-dispatch-url.example.com"
    ```
 
 3. **Restart Dispatch**. Operators will see a login page at `/login` with a "Sign in with SSO" button.
@@ -566,7 +566,7 @@ docker run -p 3000:3000 \
 
   # Or enable OIDC/SSO for browser UI
   # -e DISPATCH_AUTH_MODE="oidc" \
-  # -e DISPATCH_OIDC_ISSUER="https://auth.example.com/.well-known/openid-configuration" \
+  # -e DISPATCH_OIDC_ISSUER="https://auth.example.com" \
   # -e DISPATCH_OIDC_CLIENT_ID="your-client-id" \
   # -e DISPATCH_OIDC_CLIENT_SECRET="your-client-secret" \
   # -e NEXTAUTH_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")" \

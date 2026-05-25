@@ -9,13 +9,9 @@
  * When DISPATCH_AUTH_MODE is not set, the legacy behavior is preserved:
  * Bearer token auth via DISPATCH_AGENT_TOKEN is used for route-level checks.
  *
- * All mutating routes should use `isAuthorized(request)` instead of
- * duplicating auth parsing logic. The middleware enforces Basic Auth at
- * the request level when DISPATCH_AUTH_MODE="basic".
- *
- * For OIDC mode, use `requireSession()` from `@/lib/session` in route
- * handlers that need operator identity (audit logs, etc.). Agent routes
- * should continue using `isAuthorized(request)` which accepts Bearer tokens.
+ * All mutating routes should use `authorizeRequest(request)` instead of
+ * duplicating auth parsing logic. The middleware protects operator UI routes;
+ * route handlers authorize API access for browsers and agents.
  */
 
 import { getAcceptedAgentTokens, isAuthorizedBearerToken as _isAuthed, resetCaches as _resetEnvCaches } from "./dispatch-env";
@@ -163,9 +159,10 @@ export function isAuthorizedBasicAuth(username: string, password: string): boole
 /**
  * Check if a request is authorized.
  *
- * In "basic" mode: only Basic Auth credentials are accepted.
+ * In "basic" mode: Basic Auth credentials or DISPATCH_AGENT_TOKEN Bearer auth
+ *   are accepted. Middleware only allows Bearer auth through to API routes.
  * In "oidc" mode: Bearer token via DISPATCH_AGENT_TOKEN is accepted
- *   (for agent/API compatibility). OIDC session auth is handled by NextAuth.
+ *   (for agent/API compatibility). OIDC session auth requires authorizeRequest.
  * In default/legacy mode: Bearer token via DISPATCH_AGENT_TOKEN is accepted.
  * In "disabled" mode: all requests are authorized.
  *
@@ -173,28 +170,37 @@ export function isAuthorizedBasicAuth(username: string, password: string): boole
  */
 export function isAuthorized(request: Request): boolean {
   const authMode = getAuthMode();
+  const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
 
   // Disabled mode — allow everything
   if (authMode === "disabled") return true;
 
+  if (parsed?.type === "bearer" && isAuthorizedBearerToken(parsed.token)) {
+    return true;
+  }
+
   // OIDC mode — accept Bearer token for agent compatibility
   // OIDC session auth is handled separately via NextAuth in route handlers
   if (authMode === "oidc") {
-    const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-    return isAuthorizedBearerToken(bearerToken);
+    return false;
   }
 
-  // Basic auth mode — only accept Basic Auth credentials
+  // Basic auth mode — accept Basic Auth credentials and agent Bearer tokens
   if (authMode === "basic") {
-    const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
     if (!parsed || parsed.type !== "basic") return false;
     return isAuthorizedBasicAuth(parsed.username, parsed.password);
   }
 
   // Legacy mode — accept Bearer token
-  const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-  return isAuthorizedBearerToken(bearerToken);
+  return false;
 }
+
+export type AuthorizedRequest =
+  | { authorized: true; type: "basic"; username: string; actor: string }
+  | { authorized: true; type: "bearer"; actor: string }
+  | { authorized: true; type: "oidc"; actor: string }
+  | { authorized: true; type: "disabled"; actor: string }
+  | { authorized: false };
 
 /**
  * Type-safe version of isAuthorized that also returns the parsed auth info.
@@ -208,16 +214,17 @@ export function authenticateRequest(request: Request):
   // Disabled mode — allow everything as bearer (no-op, just for type safety)
   if (authMode === "disabled") return { authorized: true, type: "bearer" };
 
-  // OIDC mode — accept Bearer token for agent compatibility
-  if (authMode === "oidc") {
-    const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-    if (!isAuthorizedBearerToken(bearerToken)) return { authorized: false };
+  const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
+
+  if (parsed?.type === "bearer" && isAuthorizedBearerToken(parsed.token)) {
     return { authorized: true, type: "bearer" };
   }
 
+  // OIDC mode — route handlers must call authorizeRequest for session cookies
+  if (authMode === "oidc") return { authorized: false };
+
   // Basic auth mode
   if (authMode === "basic") {
-    const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
     if (!parsed || parsed.type !== "basic") return { authorized: false };
     if (!isAuthorizedBasicAuth(parsed.username, parsed.password)) {
       return { authorized: false };
@@ -226,9 +233,61 @@ export function authenticateRequest(request: Request):
   }
 
   // Legacy mode — Bearer token
-  const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-  if (!isAuthorizedBearerToken(bearerToken)) return { authorized: false };
-  return { authorized: true, type: "bearer" };
+  return { authorized: false };
+}
+
+function resolveBearerActor(request: Request): string {
+  return request.headers.get("x-agent-name")?.trim() || "agent";
+}
+
+function resolveSessionActor(user: { email?: string | null; name?: string | null } | undefined): string {
+  return user?.email?.trim() || user?.name?.trim() || "operator";
+}
+
+/**
+ * Authorize a route handler request and return the authenticated actor.
+ *
+ * Accepts:
+ * - valid DISPATCH_AGENT_TOKEN Bearer auth in basic, oidc, and legacy modes
+ * - valid Basic Auth operator credentials in basic mode
+ * - valid NextAuth/OIDC session cookies in oidc mode
+ */
+export async function authorizeRequest(request: Request): Promise<AuthorizedRequest> {
+  const authMode = getAuthMode();
+
+  if (authMode === "disabled") {
+    return { authorized: true, type: "disabled", actor: "operator" };
+  }
+
+  const headerAuth = authenticateRequest(request);
+  if (headerAuth.authorized) {
+    if (headerAuth.type === "basic") {
+      return { ...headerAuth, actor: headerAuth.username };
+    }
+    return { ...headerAuth, actor: resolveBearerActor(request) };
+  }
+
+  if (authMode === "oidc") {
+    const { auth } = await import("@/lib/auth-next");
+    const session = await auth();
+    if (session?.user) {
+      return { authorized: true, type: "oidc", actor: resolveSessionActor(session.user) };
+    }
+  }
+
+  return { authorized: false };
+}
+
+export function getAuthorizedActor(
+  auth: AuthorizedRequest,
+  request: Request,
+  fallback?: unknown,
+): string {
+  if (!auth.authorized) return "unknown";
+  if (auth.type === "basic" || auth.type === "oidc" || auth.type === "disabled") {
+    return auth.actor;
+  }
+  return (typeof fallback === "string" && fallback.trim()) || resolveBearerActor(request);
 }
 
 // ---------------------------------------------------------------------------

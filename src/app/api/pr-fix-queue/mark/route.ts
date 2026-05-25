@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput } from "@/lib/pr-fix-queue";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const auditActor = getAuthorizedActor(auth, request);
 
   try {
     let body: unknown;
@@ -22,10 +24,9 @@ export async function POST(request: Request) {
     const item = await markPrFixItem(asPrFixQueueClient(prisma), input);
     if (!item) return NextResponse.json({ error: "PR fix queue item not found" }, { status: 404 });
 
-    const actor = request.headers.get("x-agent-name") ?? "agent";
     await prisma.auditLog.create({
       data: {
-        actor,
+        actor: auditActor,
         action: "pr_fix_mark",
         repoFullName: input.repo,
         issueNumber: null,
@@ -43,7 +44,7 @@ export async function POST(request: Request) {
 
     await prisma.auditLog.create({
       data: {
-        actor: request.headers.get("x-agent-name") ?? "agent",
+        actor: auditActor,
         action: "pr_fix_mark",
         repoFullName: "unknown",
         success: false,
