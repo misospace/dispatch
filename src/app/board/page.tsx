@@ -87,7 +87,6 @@ export default async function BoardPage({ searchParams }: PageProps) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <KanbanBoardClient initialIssues={issues} />
           <SyncIssuesButton />
         </div>
       </div>
