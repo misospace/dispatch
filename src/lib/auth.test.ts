@@ -7,8 +7,19 @@ import {
   isAuthorizedBasicAuth,
   isAuthorized,
   authenticateRequest,
+  authorizeRequest,
   resetAuthCaches,
 } from "./auth";
+
+const { mocks } = vi.hoisted(() => ({
+  mocks: {
+    auth: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/auth-next", () => ({
+  auth: mocks.auth,
+}));
 
 function clearAll() {
   delete process.env.DISPATCH_AUTH_MODE;
@@ -188,7 +199,7 @@ describe("isAuthorizedBasicAuth", () => {
 });
 
 describe("isAuthorized (unified entry point)", () => {
-  beforeEach(() => { clearAll(); resetAuthCaches(); });
+  beforeEach(() => { clearAll(); resetAuthCaches(); mocks.auth.mockReset(); });
   afterEach(() => { clearAll(); });
 
   it('returns true when DISPATCH_AUTH_MODE=disabled', () => {
@@ -212,6 +223,17 @@ describe("isAuthorized (unified entry point)", () => {
     // base64("operator:s3cret") = "b3BlcmF0b3I6czNjcmV0"
     const request = new Request("http://localhost/api/test", {
       headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
+    });
+    expect(isAuthorized(request)).toBe(true);
+  });
+
+  it("accepts Bearer token in basic mode for agents and workers", () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer agent-token" },
     });
     expect(isAuthorized(request)).toBe(true);
   });
@@ -301,7 +323,7 @@ describe("isAuthorized (unified entry point)", () => {
 });
 
 describe("authenticateRequest (typed entry point)", () => {
-  beforeEach(() => { clearAll(); resetAuthCaches(); });
+  beforeEach(() => { clearAll(); resetAuthCaches(); mocks.auth.mockReset(); });
   afterEach(() => { clearAll(); });
 
   it('returns { authorized: true, type: "bearer" } in disabled mode', () => {
@@ -318,6 +340,17 @@ describe("authenticateRequest (typed entry point)", () => {
       headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
     });
     expect(authenticateRequest(request)).toEqual({ authorized: true, type: "basic", username: "operator" });
+  });
+
+  it('returns { authorized: true, type: "bearer" } for valid Bearer in basic mode', () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer agent-token" },
+    });
+    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer" });
   });
 
   it("returns { authorized: false } for invalid Basic Auth", () => {
@@ -366,6 +399,83 @@ describe("authenticateRequest (typed entry point)", () => {
     process.env.DISPATCH_AUTH_MODE = "oidc";
     const request = new Request("http://localhost/api/test");
     expect(authenticateRequest(request)).toEqual({ authorized: false });
+  });
+});
+
+describe("authorizeRequest (route helper)", () => {
+  beforeEach(() => { clearAll(); resetAuthCaches(); mocks.auth.mockReset(); });
+  afterEach(() => { clearAll(); });
+
+  it("returns disabled authorization when auth mode is disabled", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+    const request = new Request("http://localhost/api/test");
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: true,
+      type: "disabled",
+      actor: "operator",
+    });
+  });
+
+  it("authorizes Basic Auth and uses the username as actor", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
+    });
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: true,
+      type: "basic",
+      username: "operator",
+      actor: "operator",
+    });
+  });
+
+  it("authorizes Bearer auth in basic mode and uses x-agent-name as actor", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer agent-token", "x-agent-name": "worker-1" },
+    });
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: true,
+      type: "bearer",
+      actor: "worker-1",
+    });
+  });
+
+  it("authorizes OIDC sessions and uses email as actor", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    mocks.auth.mockResolvedValue({ user: { email: "operator@example.com", name: "Operator" } });
+    const request = new Request("http://localhost/api/test");
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: true,
+      type: "oidc",
+      actor: "operator@example.com",
+    });
+  });
+
+  it("authorizes Bearer auth in oidc mode without calling NextAuth", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/test", {
+      headers: { Authorization: "Bearer agent-token" },
+    });
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: true,
+      type: "bearer",
+      actor: "agent",
+    });
+    expect(mocks.auth).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthenticated OIDC requests with no session", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    mocks.auth.mockResolvedValue(null);
+    const request = new Request("http://localhost/api/test");
+    await expect(authorizeRequest(request)).resolves.toEqual({ authorized: false });
   });
 });
 

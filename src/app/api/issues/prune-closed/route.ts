@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const retentionDays = parseInt(process.env.DISPATCH_CLOSED_ISSUE_RETENTION_DAYS ?? "30", 10);

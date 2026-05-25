@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 type ActionPayload = {
   issueId?: string;
@@ -15,9 +15,11 @@ type ActionPayload = {
 };
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const auditActor = getAuthorizedActor(auth, request);
 
   try {
     let body: unknown;
@@ -116,7 +118,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: "user",
+          actor: auditActor,
           action: payload.action,
           repoFullName,
           issueNumber,
@@ -139,7 +141,7 @@ export async function POST(request: Request) {
 
         await prisma.auditLog.create({
           data: {
-            actor: "user",
+            actor: auditActor,
             action: payload.action,
             repoFullName: repoFullName!,
             issueNumber: issueNumber!,

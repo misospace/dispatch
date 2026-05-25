@@ -2,11 +2,11 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel } from "@/lib/github";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 import { releaseLease } from "@/lib/lease";
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

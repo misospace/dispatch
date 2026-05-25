@@ -2,13 +2,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 
 /**
  * Resolve the actor name for decomposition attribution.
@@ -43,7 +43,7 @@ function resolveActor(body: unknown): { actor: string; error?: string } {
  * No hardcoded agent names or repo names — applies uniformly.
  */
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  if (!(await authorizeRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

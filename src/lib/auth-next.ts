@@ -9,13 +9,12 @@ import NextAuth from "next-auth";
 import type { OIDCConfig } from "@auth/core/providers/oauth";
 
 function getOidcProvider(): OIDCConfig<Record<string, unknown>> {
-  const issuer = process.env.DISPATCH_OIDC_ISSUER;
-  return {
+  const issuerOrDiscovery = process.env.DISPATCH_OIDC_ISSUER;
+  const isDiscoveryUrl = issuerOrDiscovery?.includes("/.well-known/openid-configuration") ?? false;
+  const provider: OIDCConfig<Record<string, unknown>> = {
     id: "oidc",
-    name: issuer ? (() => { try { return new URL(issuer).hostname; } catch { return "OIDC"; } })() : "OIDC",
+    name: issuerOrDiscovery ? (() => { try { return new URL(issuerOrDiscovery).hostname; } catch { return "OIDC"; } })() : "OIDC",
     type: "oidc",
-    wellKnown: issuer,
-    issuer,
     clientId: process.env.DISPATCH_OIDC_CLIENT_ID,
     clientSecret: process.env.DISPATCH_OIDC_CLIENT_SECRET,
     authorization: {
@@ -25,6 +24,16 @@ function getOidcProvider(): OIDCConfig<Record<string, unknown>> {
     },
     checks: ["pkce"],
   };
+
+  if (issuerOrDiscovery) {
+    if (isDiscoveryUrl) {
+      provider.wellKnown = issuerOrDiscovery;
+    } else {
+      provider.issuer = issuerOrDiscovery;
+    }
+  }
+
+  return provider;
 }
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
@@ -35,21 +44,8 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   },
   providers: [getOidcProvider()],
   callbacks: {
-    async jwt({ token, account }) {
-      // Initial sign in — store access token in JWT
-      if (account) {
-        token.access_token = account.access_token;
-        token.id_token = account.id_token;
-        token.session_id = account.session_id;
-      }
-      return token;
-    },
     async session({ token, session }) {
       if (token) {
-        // @ts-expect-error — next-auth adds custom fields to session.user
-        session.user.access_token = token.access_token;
-        // @ts-expect-error — next-auth adds custom fields to session.user
-        session.user.id_token = token.id_token;
         // Ensure sub (subject) is available from OIDC id_token
         if (token.sub) {
           // @ts-expect-error — next-auth adds custom fields to session.user

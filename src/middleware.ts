@@ -1,29 +1,95 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { getAuthMode, isAuthorizedBasicAuth } from "@/lib/auth";
+import { getToken } from "next-auth/jwt";
+
+type AuthMode = "basic" | "oidc" | "disabled" | undefined;
+
+function getAuthMode(): AuthMode {
+  const mode = process.env.DISPATCH_AUTH_MODE;
+  if (mode === "basic" || mode === "oidc" || mode === "disabled") return mode;
+  return undefined;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+function isBearerAuthorized(authHeader: string | null): boolean {
+  const token = process.env.DISPATCH_AGENT_TOKEN;
+  if (!token) return false;
+
+  const match = /^Bearer\s+(.+)$/i.exec(authHeader ?? "");
+  return match ? safeEqual(match[1].trim(), token) : false;
+}
+
+function parseBasicCredentials(authHeader: string | null): { username: string; password: string } | null {
+  const match = /^Basic\s+(.+)$/i.exec(authHeader ?? "");
+  if (!match) return null;
+
+  try {
+    const decoded = atob(match[1]);
+    const colonIndex = decoded.indexOf(":");
+    if (colonIndex === -1) return null;
+    return {
+      username: decoded.slice(0, colonIndex),
+      password: decoded.slice(colonIndex + 1),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isBasicAuthorized(authHeader: string | null): boolean {
+  const expectedUsername = process.env.DISPATCH_AUTH_USERNAME;
+  const expectedPassword = process.env.DISPATCH_AUTH_PASSWORD;
+  if (!expectedUsername || !expectedPassword) return false;
+
+  const credentials = parseBasicCredentials(authHeader);
+  return Boolean(
+    credentials &&
+    safeEqual(credentials.username, expectedUsername) &&
+    safeEqual(credentials.password, expectedPassword)
+  );
+}
 
 /**
  * Next.js middleware that enforces Basic Auth when DISPATCH_AUTH_MODE="basic".
  *
  * Auth mode behavior:
- * - "basic"    : HTTP Basic Auth required for all routes. API routes return 401 JSON;
- *                UI pages trigger the browser's native auth dialog via WWW-Authenticate.
- * - "oidc"     : No middleware enforcement. OIDC sessions are handled by NextAuth.
- *                Route handlers use requireSession() to gate access.
+ * - "basic"    : HTTP Basic Auth required for UI routes. API routes also allow
+ *                DISPATCH_AGENT_TOKEN Bearer auth for agents and workers.
+ * - "oidc"     : OIDC session required for UI routes. API routes authorize via
+ *                route handlers so Bearer auth and session cookies both work.
  * - "disabled" : No auth enforcement at all.
  * - undefined  : Legacy mode — no middleware enforcement; routes handle their own auth.
  */
-export function middleware(request: NextRequest) {
+export async function middleware(request: NextRequest) {
   const authMode = getAuthMode();
+  const isApiRoute = request.nextUrl.pathname.startsWith("/api/");
 
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
     return NextResponse.next();
   }
 
-  // OIDC mode — no middleware enforcement; NextAuth handles session checks via requireSession()
   if (authMode === "oidc") {
-    return NextResponse.next();
+    if (isApiRoute) {
+      return NextResponse.next();
+    }
+
+    const token = await getToken({ req: request, secret: process.env.NEXTAUTH_SECRET });
+    if (token) {
+      return NextResponse.next();
+    }
+
+    const loginUrl = new URL("/login", request.url);
+    loginUrl.searchParams.set("callbackUrl", request.nextUrl.pathname + request.nextUrl.search);
+    return NextResponse.redirect(loginUrl);
   }
 
   // No auth mode set (legacy) — no middleware enforcement; routes handle their own auth
@@ -31,27 +97,14 @@ export function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // "basic" mode — enforce Basic Auth on all routes
   const authHeader = request.headers.get("authorization");
-  const isBasicAuth = authHeader && /^Basic\s+/i.test(authHeader);
 
-  if (isBasicAuth) {
-    try {
-      const decoded = Buffer.from(authHeader!.replace(/^Basic\s+/i, ""), "base64").toString("utf-8");
-      const colonIndex = decoded.indexOf(":");
-      if (colonIndex === -1) {
-        return unauthorizedResponse(request);
-      }
-      const username = decoded.slice(0, colonIndex);
-      const password = decoded.slice(colonIndex + 1);
+  if (isApiRoute && (isBearerAuthorized(authHeader) || isBasicAuthorized(authHeader))) {
+    return NextResponse.next();
+  }
 
-      if (!isAuthorizedBasicAuth(username, password)) {
-        return unauthorizedResponse(request);
-      }
-    } catch {
-      return unauthorizedResponse(request);
-    }
-
+  // "basic" mode — enforce Basic Auth on operator UI routes
+  if (isBasicAuthorized(authHeader)) {
     return NextResponse.next();
   }
 

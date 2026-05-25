@@ -1,13 +1,23 @@
 "use client";
 
 import { signIn } from "next-auth/react";
-import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 
 export default function LoginPage() {
+  return (
+    <Suspense>
+      <LoginContent />
+    </Suspense>
+  );
+}
+
+function LoginContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const callbackUrl = searchParams.get("callbackUrl") || "/board";
 
   useEffect(() => {
     // Check if already logged in
@@ -15,11 +25,11 @@ export default function LoginPage() {
       .then((res) => res.json())
       .then((data) => {
         if (data?.user) {
-          router.replace("/board");
+          router.replace(callbackUrl);
         }
       })
       .catch(() => {});
-  }, [router]);
+  }, [callbackUrl, router]);
 
   const handleSignIn = async () => {
     setLoading(true);
@@ -27,7 +37,7 @@ export default function LoginPage() {
     try {
       await signIn("oidc", {
         redirect: true,
-        redirectTo: "/board",
+        redirectTo: callbackUrl,
       });
     } catch (err) {
       setError("Failed to sign in. Please try again.");

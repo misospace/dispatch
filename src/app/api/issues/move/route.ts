@@ -2,14 +2,15 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels, removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, StatusLabel } from "@/types";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 function isStatusLabel(label: string): label is StatusLabel {
   return (STATUS_LABELS as readonly string[]).includes(label);
 }
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -26,7 +27,7 @@ export async function POST(request: Request) {
     }
 
     const { issueId, repoFullName, issueNumber, oldLabels, newLabels, actor: bodyActor } = body as Record<string, unknown>;
-    const moveActor = typeof bodyActor === "string" ? bodyActor : "agent";
+    const moveActor = getAuthorizedActor(auth, request, bodyActor);
 
     // Validate required fields with explicit type checks
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !oldLabels || !newLabels) {

@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { enqueuePrFixItem, parseEnqueuePrFixInput } from "@/lib/pr-fix-queue";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const auditActor = getAuthorizedActor(auth, request);
 
   try {
     let body: unknown;
@@ -20,11 +22,9 @@ export async function POST(request: Request) {
     if ("error" in input) return NextResponse.json({ error: input.error }, { status: 400 });
 
     const item = await enqueuePrFixItem(asPrFixQueueClient(prisma), input);
-    const actor = request.headers.get("x-agent-name") ?? "agent";
-
     await prisma.auditLog.create({
       data: {
-        actor,
+        actor: auditActor,
         action: "pr_fix_enqueue",
         repoFullName: input.repo,
         issueNumber: input.issue ?? null,
@@ -42,7 +42,7 @@ export async function POST(request: Request) {
 
     await prisma.auditLog.create({
       data: {
-        actor: request.headers.get("x-agent-name") ?? "agent",
+        actor: auditActor,
         action: "pr_fix_enqueue",
         repoFullName: "unknown",
         success: false,

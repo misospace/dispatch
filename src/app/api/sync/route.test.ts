@@ -15,7 +15,12 @@ const { mocks } = vi.hoisted(() => ({
     findUnique: vi.fn(),
     update: vi.fn().mockResolvedValue(undefined),
     create: vi.fn().mockResolvedValue({ id: "issue-1" }),
+    auth: vi.fn(),
   },
+}));
+
+vi.mock("@/lib/auth-next", () => ({
+  auth: mocks.auth,
 }));
 
 vi.mock("@/lib/prisma", () => ({
@@ -45,10 +50,12 @@ vi.mock("@/lib/issue-sync", () => ({
 }));
 
 import { POST } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
 
-function makeRequest(body?: Record<string, unknown>, includeAuth = true) {
+function makeRequest(body?: Record<string, unknown>, includeAuth = true, extraHeaders: Record<string, string> = {}) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  Object.assign(headers, extraHeaders);
   return new Request("http://localhost/api/sync", {
     method: "POST",
     headers,
@@ -57,6 +64,13 @@ function makeRequest(body?: Record<string, unknown>, includeAuth = true) {
 }
 
 describe("POST /api/sync — auth", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.auth.mockReset();
+  });
+
   it("returns 401 when no authorization header is provided", async () => {
     const res = await POST(makeRequest({}, false));
     expect(res.status).toBe(401);
@@ -66,10 +80,56 @@ describe("POST /api/sync — auth", () => {
     const res = await POST(makeRequest({}, false));
     expect(res.status).toBe(401);
   });
+
+  it("accepts valid Basic Auth in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    resetAuthCaches();
+
+    const res = await POST(makeRequest({}, false, { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" }));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts valid Bearer auth in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    resetAuthCaches();
+
+    const res = await POST(makeRequest({}));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts valid OIDC session cookies in oidc mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    resetAuthCaches();
+    mocks.auth.mockResolvedValue({ user: { email: "operator@example.com" } });
+
+    const res = await POST(makeRequest({}, false));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts valid Bearer auth in oidc mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    resetAuthCaches();
+
+    const res = await POST(makeRequest({}));
+
+    expect(res.status).toBe(200);
+    expect(mocks.auth).not.toHaveBeenCalled();
+  });
 });
 
 describe("POST /api/sync — validation", () => {
-  beforeEach(() => { vi.clearAllMocks(); });
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
 
   it("syncs all repos by default", async () => {
     const res = await POST(makeRequest({}));
