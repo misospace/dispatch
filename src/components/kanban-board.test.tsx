@@ -1,0 +1,122 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import React from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Issue } from "@/types";
+import { KanbanBoard } from "./kanban-board";
+
+vi.mock("@dnd-kit/core", () => ({
+  DndContext: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DragOverlay: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  KeyboardSensor: vi.fn(),
+  PointerSensor: vi.fn(),
+  closestCorners: vi.fn(),
+  useSensor: vi.fn(() => ({})),
+  useSensors: vi.fn(() => []),
+}));
+
+vi.mock("@dnd-kit/sortable", () => ({
+  SortableContext: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  sortableKeyboardCoordinates: vi.fn(),
+  verticalListSortingStrategy: {},
+}));
+
+vi.mock("./kanban-column", () => ({
+  KanbanColumn: ({ children, title }: { children: React.ReactNode; title: string }) => (
+    <section aria-label={title}>{children}</section>
+  ),
+}));
+
+vi.mock("./issue-card", () => ({
+  IssueCard: ({ issue }: { issue: Issue }) => <article>{issue.title}</article>,
+}));
+
+function issue(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: "issue-1",
+    number: 1,
+    title: "Existing issue",
+    body: null,
+    state: "open",
+    url: "https://github.com/misospace/dispatch/issues/1",
+    labels: ["status/ready"],
+    assignees: [],
+    commentsCount: 0,
+    createdAt: new Date("2026-05-25T16:00:00.000Z"),
+    updatedAt: new Date("2026-05-25T16:00:00.000Z"),
+    closedAt: null,
+    repository: { fullName: "misospace/dispatch" },
+    ...overrides,
+  };
+}
+
+describe("KanbanBoard refresh status", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-05-25T19:22:00.000Z"));
+    window.history.replaceState(null, "", "/board");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("shows the last successful refresh time", async () => {
+    render(<KanbanBoard initialIssues={[issue()]} />);
+
+    expect(await screen.findByText(/Last refreshed/)).toHaveTextContent("Last refreshed 1:22 PM");
+  });
+
+  it("updates issues and last refreshed time after a successful manual refresh", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([issue({ id: "issue-2", title: "Fresh issue" })]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    vi.setSystemTime(new Date("2026-05-25T19:30:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh board" }));
+
+    expect(await screen.findByText("Fresh issue")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/Last refreshed/)).toHaveTextContent("Last refreshed 1:30 PM"));
+  });
+
+  it("shows a stale-state warning and keeps current issues after refresh failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }));
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh board" }));
+
+    expect(await screen.findByText("Board refresh failed. Showing previous state.")).toBeInTheDocument();
+    expect(screen.getByText("Existing issue")).toBeInTheDocument();
+  });
+
+  it("retries from the stale-state warning", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ id: "issue-2", title: "Recovered issue" })]),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh board" }));
+    expect(await screen.findByText("Board refresh failed. Showing previous state.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByText("Recovered issue")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText("Board refresh failed. Showing previous state.")).not.toBeInTheDocument()
+    );
+  });
+});

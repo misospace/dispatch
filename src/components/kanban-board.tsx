@@ -20,6 +20,7 @@ import {
 } from "@dnd-kit/sortable";
 import { KanbanColumn } from "./kanban-column";
 import { IssueCard } from "./issue-card";
+import { Button } from "@/components/ui/button";
 import { Issue, StatusLabel } from "@/types";
 import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
 
@@ -50,6 +51,8 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
   const [error, setError] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
 
   // Store latest issues in a ref for doRefresh to always use current state
   const issuesRef = useRef(issues);
@@ -66,6 +69,10 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
     setIssues(initialIssues);
   }, [initialIssues]);
 
+  useEffect(() => {
+    setLastRefreshedAt(new Date());
+  }, []);
+
   // Auto-dismiss notification after 5 seconds
   useEffect(() => {
     if (notification) {
@@ -81,12 +88,15 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
       const query = params.toString();
       const url = `/api/issues${query ? `?${query}` : ""}`;
       const res = await fetch(url);
-      if (res.ok) {
-        const data = await res.json();
-        setIssues(data);
+      if (!res.ok) {
+        throw new Error("Failed to refresh board");
       }
+      const data = await res.json();
+      setIssues(data);
+      setLastRefreshedAt(new Date());
+      setRefreshError(null);
     } catch {
-      // If refresh fails, silently ignore — user can manually sync
+      setRefreshError("Board refresh failed. Showing previous state.");
     } finally {
       setRefreshing(false);
     }
@@ -190,6 +200,29 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
 
   return (
     <div className="space-y-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="text-sm text-muted-foreground">
+          {lastRefreshedAt ? `Last refreshed ${lastRefreshedAt.toLocaleTimeString([], {
+            hour: "numeric",
+            minute: "2-digit",
+          })}` : "Last refreshed after page load"}
+        </div>
+        <Button onClick={() => void doRefresh()} disabled={refreshing}>
+          {refreshing ? "Refreshing..." : "Refresh board"}
+        </Button>
+      </div>
+      {refreshError && (
+        <div className="bg-yellow-50 text-yellow-900 text-sm p-3 rounded flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <span>{refreshError}</span>
+          <button
+            className="font-medium underline-offset-2 hover:underline"
+            onClick={() => void doRefresh()}
+            disabled={refreshing}
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {error && (
         <div className="bg-destructive/10 text-destructive text-sm p-3 rounded flex items-center justify-between">
           <span>{error}</span>
@@ -223,7 +256,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
       >
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
           {COLUMNS.map((column) => {
-            const columnIssues = getIssuesByStatus(issuesRef.current, column.id);
+            const columnIssues = getIssuesByStatus(issues, column.id);
             return (
               <KanbanColumn
                 key={column.id}
