@@ -137,13 +137,16 @@ export async function releaseExpiredLeases(issueId: string): Promise<number> {
  *
  * Returns a ResumeContext with checkpoint, branch, PR URL, and nextAction
  * if the agent has an active (non-expired) lease on any issue.
- * Returns null if no active lease exists.
+ * Returns null if no active lease exists or the referenced issue is orphaned.
+ *
+ * Orphan detection: if the lease references an Issue that no longer exists in
+ * Dispatch's database, the lease is released and null is returned so the agent
+ * can pick up new work instead of being blocked by a ghost assignment.
  */
 export async function resolveActiveWork(agentName: string): Promise<ResumeContext | null> {
   const now = new Date();
 
   // Find the agent's non-expired lease (most recently renewed first)
-  // Include repository to get repoFullName for ResumeContext
   const lease = await prisma.lease.findFirst({
     where: { agentName, expiredAt: { gt: now } },
     orderBy: { renewedAt: "desc" },
@@ -160,8 +163,40 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
 
   // Validate checkpoint before building context
   if (!isValidCheckpoint(lease.checkpoint)) {
-    // Corrupted checkpoint — release the lease and return no active work
     await releaseLease(lease.id);
+    await prisma.auditLog.create({
+      data: {
+        actor: lease.agentName,
+        action: "orphan_lease_released",
+        repoFullName: "",
+        issueId: lease.issueId ?? undefined,
+        success: true,
+        notes: `Released lease with corrupted checkpoint for agent ${lease.agentName}: ${lease.checkpoint}`,
+      },
+    });
+    return null;
+  }
+
+  // Orphan detection: verify the referenced issue exists in Dispatch.
+  // If the issue has been deleted or never synced, release the lease so the
+  // agent is not permanently blocked by a ghost assignment.
+  const issueExists = await prisma.issue.findUnique({
+    where: { id: lease.issueId },
+    select: { id: true },
+  });
+
+  if (!issueExists) {
+    await releaseLease(lease.id);
+    await prisma.auditLog.create({
+      data: {
+        actor: lease.agentName,
+        action: "orphan_lease_released",
+        repoFullName: "",
+        issueId: lease.issueId ?? undefined,
+        success: true,
+        notes: `Released orphaned lease for agent ${lease.agentName} — referenced issue ${lease.issueId} not found in Dispatch`,
+      },
+    });
     return null;
   }
 
@@ -189,4 +224,61 @@ export async function findLeasedIssueIds(agentName: string): Promise<string[]> {
     select: { issueId: true },
   });
   return leases.map((l: any) => l.issueId);
+}
+
+/**
+ * Release (delete) all active leases for a given agent on a specific issue.
+ * Used by the operator release endpoint and orphan cleanup.
+ */
+export async function releaseLeaseByAgentAndIssue(agentName: string, issueId: string): Promise<number> {
+  const now = new Date();
+  const result = await prisma.lease.deleteMany({
+    where: { agentName, issueId, expiredAt: { gt: now } },
+  });
+  return result.count;
+}
+
+/**
+ * Release (delete) all active leases for a given agent (any issue).
+ * Used by operator release endpoint with agentName only.
+ */
+export async function releaseAllLeasesByAgent(agentName: string): Promise<number> {
+  const now = new Date();
+  const result = await prisma.lease.deleteMany({
+    where: { agentName, expiredAt: { gt: now } },
+  });
+  return result.count;
+}
+
+/**
+ * Release AgentWork records for a given agent on a specific issue.
+ * Marks them as RELEASED and creates history entries.
+ */
+export async function releaseAgentWorkByAgentAndIssue(agentName: string, issueId: string): Promise<number> {
+  const now = new Date();
+  const active = await prisma.agentWork.findMany({
+    where: { agentName, issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
+    select: { id: true },
+  });
+
+  if (active.length === 0) return 0;
+
+  await prisma.$transaction(
+    active.map((w: any) =>
+      prisma.agentWork.update({
+        where: { id: w.id },
+        data: { state: "RELEASED", leaseExpiresAt: now },
+      })
+    )
+  );
+
+  await prisma.$transaction(
+    active.map((w: any) =>
+      prisma.agentWorkHistory.create({
+        data: { workId: w.id, action: "released_by_operator", summary: "Released by operator via agentName+issueId" },
+      })
+    )
+  );
+
+  return active.length;
 }

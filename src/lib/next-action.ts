@@ -103,6 +103,7 @@ export interface ResumeContext {
   branch?: string;
   prUrl?: string;
   nextAction: NextActionValue;
+  leaseId?: string;
 }
 
 // ─── Resume Context Builder ─────────────────────────────────────────────────
