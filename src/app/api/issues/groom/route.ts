@@ -2,11 +2,6 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { isAuthorized } from "@/lib/auth";
-import { STATUS_LABELS } from "@/types";
-
-function isStatusLabel(label: string): boolean {
-  return (STATUS_LABELS as readonly string[]).includes(label);
-}
 
 /**
  * Resolve the actor name for grooming attribution.
@@ -183,7 +178,7 @@ export async function POST(request: Request) {
         }
       }
 
-      // Update GitHub labels if status changed
+      // Update GitHub labels if status changed; always refresh lastSyncedAt
       if (action === "promote_to_ready") {
         await prisma.issue.update({
           where: { id: issueId as string },
@@ -192,7 +187,7 @@ export async function POST(request: Request) {
       } else {
         await prisma.issue.update({
           where: { id: issueId as string },
-          data: groomingData,
+          data: { ...groomingData, lastSyncedAt: new Date() },
         });
       }
 

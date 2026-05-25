@@ -198,7 +198,20 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
       setGroomAction(null);
       setGroomSummary("");
       setGroomReason("");
+
+      // Build updated issue with grooming state for reactivity
+      const groomedIssue: Issue = {
+        ...issue,
+        ...(action === "promote_to_ready" ? { labels: ["status/ready", ...issue.labels.filter((l) => !l.startsWith("status/"))] } : {}),
+        groomedAt: new Date(),
+        groomingSummary: groomSummary.trim() || undefined || null,
+        ...(action === "mark_not_ready" ? { notReadyReason: groomReason.trim() } : {}),
+        ...(action === "mark_blocked" ? { blockedReason: groomReason.trim() } : {}),
+        ...(action === "mark_needs_info" ? { needsInfoReason: groomReason.trim() } : {}),
+      };
+
       await handleSuccess(`groom-${action}`);
+      onIssueUpdate?.(groomedIssue);
     } catch (err) {
       handleError(err instanceof Error ? err.message : "Grooming failed");
     } finally {
