@@ -26,6 +26,7 @@ export interface RankedIssue {
   decomposed?: boolean;
   issueId?: string;
   repoFullName?: string;
+  claimable?: boolean;
 }
 
 /**
@@ -127,6 +128,8 @@ function isActionable(issueLabels: string[]): boolean {
  * Optionally excludes decomposed audit parents.
  * Excludes claimed issues by default; pass includeClaimed to include agent/* labels.
  * Excludes Renovate issues by default; pass includeRenovate=true to include them.
+ * By default, only claimable work is returned (excludes status/backlog).
+ * Pass claimableOnly=false to include all actionable issues including backlog.
  */
 export function buildAgentQueue(
   issues: Array<{
@@ -145,13 +148,22 @@ export function buildAgentQueue(
     excludeDecomposed?: boolean;
     includeClaimed?: boolean;
     includeRenovate?: boolean;
+    claimableOnly?: boolean;
   },
 ): RankedIssue[] {
   // Normalize lane to lowercase for consistent comparison
   const normalizedLane = options?.lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined;
 
+  // Default claimableOnly to true per the worker contract (backlog is triage-only)
+  const claimableOnly = options?.claimableOnly ?? true;
+
   // Filter actionable issues (open, not done)
   let actionable = issues.filter((issue) => isActionable(issue.labels));
+
+  // Exclude non-claimable work by default (status/backlog is triage-only)
+  if (claimableOnly) {
+    actionable = actionable.filter((issue) => getStatusFromLabels(issue.labels) !== BACKLOG_STATUS);
+  }
 
   if (!options?.includeClaimed) {
     actionable = actionable.filter((issue) => !issue.labels.some((label) => label.startsWith(AGENT_PREFIX)));
@@ -205,6 +217,7 @@ export function buildAgentQueue(
       decomposed: item.decomposed ?? false,
       issueId: item.issueId,
       repoFullName: item.repoFullName,
+      claimable: status !== BACKLOG_STATUS,
     };
   });
 }
