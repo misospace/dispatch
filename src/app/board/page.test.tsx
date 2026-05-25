@@ -58,17 +58,27 @@ describe("BoardPage searchParams handling (Next 16 async)", () => {
     mocks.filterBar.mockClear();
   });
 
-  it("defaults to filtering open issues only", async () => {
+  it("defaults to open issues + recently closed Done issues", async () => {
     await BoardPage({ searchParams: Promise.resolve({}) });
 
     const filteredCall = mocks.findManyIssues.mock.calls[0][0];
-    expect(filteredCall.where.state).toBe("open");
+    // Should use OR clause, not a simple state filter
+    expect(filteredCall.where.OR).toBeDefined();
+    expect(Array.isArray(filteredCall.where.OR)).toBe(true);
+    expect(filteredCall.where.OR.length).toBe(2);
+    // First OR branch: open issues
+    expect(filteredCall.where.OR[0]).toEqual({ state: "open" });
+    // Second OR branch: recently closed with status/done
+    expect(filteredCall.where.OR[1].state).toBe("closed");
+    expect(filteredCall.where.OR[1].labels.has).toBe("status/done");
+    expect(filteredCall.where.OR[1].closedAt.gte).toBeDefined();
   });
 
-  it("includes closed issues when includeClosed=true", async () => {
+  it("includes all issues when includeClosed=true", async () => {
     await BoardPage({ searchParams: Promise.resolve({ includeClosed: "true" }) });
 
     const filteredCall = mocks.findManyIssues.mock.calls[0][0];
+    expect(filteredCall.where.OR).toBeUndefined();
     expect(filteredCall.where.state).toBeUndefined();
   });
 
@@ -128,10 +138,10 @@ describe("BoardPage searchParams handling (Next 16 async)", () => {
     );
   });
 
-  it("applies state filter when searchParams resolves empty", async () => {
+  it("uses OR clause instead of simple state filter by default", async () => {
     await BoardPage({ searchParams: Promise.resolve({}) });
 
     const filteredCall = mocks.findManyIssues.mock.calls[0][0];
-    expect(filteredCall.where).toEqual(expect.objectContaining({ state: "open" }));
+    expect(filteredCall.where).toEqual(expect.objectContaining({ OR: expect.any(Array) }));
   });
 });
