@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { isValidRepoName } from "@/lib/config";
 import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
-import { isAuthorizedAgentToken } from "@/lib/dispatch-env";
+import { isAuthorized } from "@/lib/auth";
 
 export async function GET() {
   try {
@@ -70,8 +70,7 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const token = request.headers.get("authorization")?.replace("Bearer ", "");
-  if (!isAuthorizedAgentToken(token)) {
+  if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

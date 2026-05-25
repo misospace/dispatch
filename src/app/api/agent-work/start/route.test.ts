@@ -30,6 +30,9 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/dispatch-env", () => ({
   isAuthorizedAgentToken: vi.fn((token: string | null | undefined) => token === "test-token"),
+  isAuthorizedBearerToken: vi.fn((token: string | null | undefined) => token === "test-token"),
+  getAcceptedAgentTokens: vi.fn(() => ["test-token"]),
+  resetCaches: vi.fn(),
 }));
 
 import { POST as handleStart } from "./route";

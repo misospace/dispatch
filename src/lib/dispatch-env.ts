@@ -2,8 +2,11 @@
  * Dispatch environment variable resolution.
  *
  * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN, DISPATCH_AGENT_NAME,
- *                     DATABASE_URL, DISPATCH_DATABASE_URL
+ *                     DATABASE_URL, DISPATCH_DATABASE_URL, DISPATCH_AUTH_MODE,
+ *                     DISPATCH_AUTH_USERNAME, DISPATCH_AUTH_PASSWORD
  */
+
+import { timingSafeEqual } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // URL resolution
@@ -93,12 +96,33 @@ export function getAcceptedAgentTokens(): string[] {
 }
 
 /**
- * Check if a request token is authorized.
+ * Check if a bearer token is authorized. Uses timing-safe comparison.
  */
-export function isAuthorizedAgentToken(token: string | null | undefined): boolean {
+export function isAuthorizedBearerToken(token: string | null | undefined): boolean {
   if (!token) return false;
   const accepted = getAcceptedAgentTokens();
-  return accepted.includes(token);
+
+  for (const acceptedToken of accepted) {
+    if (safeEqual(acceptedToken, token)) return true;
+  }
+  return false;
+}
+
+/**
+ * Backward-compatible alias — check if a request token is authorized.
+ */
+export function isAuthorizedAgentToken(token: string | null | undefined): boolean {
+  return isAuthorizedBearerToken(token);
+}
+
+/**
+ * Timing-safe string comparison to prevent timing attacks.
+ */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  return timingSafeEqual(aBuf, bBuf);
 }
 
 // ---------------------------------------------------------------------------

@@ -35,6 +35,9 @@ process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => ({
   isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
 }));
 
 import { GET, DELETE } from "./route";

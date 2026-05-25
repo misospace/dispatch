@@ -29,6 +29,9 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/dispatch-env", () => ({
   isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
 }));
 
 // Real Prisma error shape so the `instanceof` check in the route triggers.

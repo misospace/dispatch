@@ -79,6 +79,9 @@ Agent Runs → Dispatch → Agent Activity Page
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 | `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Dispatch UI or `/api/automation/repos` after initial setup. |
+| `DISPATCH_AUTH_MODE` | No | Authentication mode: `"basic"` (require HTTP Basic Auth), `"disabled"` (no auth), or unset (legacy mode) |
+| `DISPATCH_AUTH_USERNAME` | Conditional | Username for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
+| `DISPATCH_AUTH_PASSWORD` | Conditional | Password for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
 | `DISPATCH_URL` | No | Base URL of your Dispatch instance (used by outbound clients and MCP bridge) |
 | `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | No | Secret for NextAuth.js (stub in Phase 1) |
@@ -100,9 +103,38 @@ Production database migrations (`prisma migrate deploy`) run automatically on co
 
 ## Security
 
-Dispatch is designed as an **internal-only** application. It does not include public-facing authentication in Phase 1 (NextAuth.js is a stub for local development). The app remains internal unless external auth integration (e.g., OIDC/Authentik) is added later.
+### Authentication
 
-Ensure it is only accessible within your trusted network via ingress rules.
+Dispatch supports two authentication models:
+
+1. **Agent/Worker Auth** (`DISPATCH_AGENT_TOKEN`): Bearer token authentication for API calls from agents, MCP clients, and scheduled workers. This is required for all mutating API endpoints.
+
+2. **Operator UI Auth** (`DISPATCH_AUTH_MODE=basic`): HTTP Basic Auth for browser UI access. When enabled, the browser will prompt for a username and password when accessing the Dispatch UI. Mutating API calls from the browser (e.g., drag-and-drop moves, sync) automatically include these credentials.
+
+### Auth Modes
+
+| `DISPATCH_AUTH_MODE` | Behavior |
+|---|---|
+| *(not set)* | Legacy mode — no middleware enforcement. Agent routes use Bearer token auth via `DISPATCH_AGENT_TOKEN`. Browser UI has no separate auth model. |
+| `basic` | HTTP Basic Auth required for all routes. Agents continue to use `DISPATCH_AGENT_TOKEN` bearer auth. |
+| `disabled` | No auth enforcement — full open access. Use for local development only. |
+
+### How it works
+
+- **Middleware** (`src/middleware.ts`) enforces Basic Auth at the request level when `DISPATCH_AUTH_MODE="basic"`. API routes return `401 JSON`; UI pages trigger the browser's native auth dialog.
+- **Route handlers** use a shared `isAuthorized(request)` helper from `src/lib/auth.ts` that supports both Basic Auth and Bearer token auth depending on the configured mode.
+- **Client components** (`kanban-board.tsx`, `sync-issues-button.tsx`) use `authedFetch()` which automatically attaches stored Basic Auth credentials to outgoing requests.
+
+### Agent Token vs Operator Auth
+
+| | Agent/Worker Auth | Operator UI Auth |
+|---|---|---|
+| **Header** | `Authorization: Bearer <token>` | `Authorization: Basic <base64(user:pass)>` |
+| **Config** | `DISPATCH_AGENT_TOKEN` | `DISPATCH_AUTH_USERNAME` + `DISPATCH_AUTH_PASSWORD` |
+| **Used by** | Agents, MCP clients, cron workers | Browser UI (human operators) |
+| **Protected routes** | All mutating API endpoints | All routes (UI + API) |
+
+## Required Labels
 
 ## Phase 1 Features
 
@@ -153,7 +185,7 @@ Ensure it is only accessible within your trusted network via ingress rules.
 ### Intentionally Not Included in Phase 1
 
 - GitHub Projects integration
-- Full OIDC/Authentik authentication (stub for local dev only)
+- Full OIDC/Authentik authentication (Basic Auth is the first step; OIDC is deferred)
 - Automatic task completion
 - Broad Kubernetes RBAC
 - S3/PVC storage
@@ -365,15 +397,17 @@ Set `BASE` to your Dispatch URL (e.g. `BASE=https://dispatch.internal`) before r
 | 1 | `curl -fsS "$BASE/api/health"` | `{"ok":true,"database":"ok",...}` |
 | 2 | `curl -fsS -X POST "$BASE/api/automation/sync"` | 2xx, no error body |
 | 3 | `curl -fsS "$BASE/api/automation/repos"` | JSON array, non-empty if repos are configured |
-| 4 | `curl -fsS -X POST "$BASE/api/sync"` | `syncedCount > 0` |
+| 4 | `curl -fsS -X POST "$BASE/api/sync" -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN"` | `syncedCount > 0` |
 | 5 | `curl -fsS "$BASE/api/issues"` | JSON array, length > 0 |
-| 6 | Open `/board` in a browser | Issues render — no "no issues synced yet" empty state |
+| 6 | Open `/board` in a browser | Issues render — no "no issues synced yet" empty state (or auth dialog if Basic Auth is enabled) |
 | 7 | Open `/projects` | Repo groups render |
 | 8 | Open `/agents` | Recent agent heartbeat visible with agent name |
 | 9 | Move a low-risk test issue between columns | GitHub label changes; AuditLog row appears in `GET /api/audit` |
 | 10 | `kubectl logs -n <ns> <pod>` (or equivalent) | No Prisma / BigInt / FK errors |
 
 Only flip the agent's workflow over once all ten steps pass.
+
+**When Basic Auth is enabled**, add `-u "$DISPATCH_AUTH_USERNAME:$DISPATCH_AUTH_PASSWORD"` to browser and curl requests, or use the browser's native auth dialog.
 
 ## Scheduled Issue Sync Strategy
 
@@ -494,5 +528,9 @@ docker run -p 3000:3000 \
   -e DATABASE_URL="postgresql://..." \
   -e GITHUB_TOKEN="ghp_..." \
   -e DISPATCH_AGENT_TOKEN="..." \
+  # Optional: Enable Basic Auth for browser UI
+  # -e DISPATCH_AUTH_MODE="basic" \
+  # -e DISPATCH_AUTH_USERNAME="admin" \
+  # -e DISPATCH_AUTH_PASSWORD="secure-password" \
   ghcr.io/misospace/dispatch:local
 ```

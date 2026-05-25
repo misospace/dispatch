@@ -23,6 +23,7 @@ import { IssueCard } from "./issue-card";
 import { Button } from "@/components/ui/button";
 import { Issue, StatusLabel } from "@/types";
 import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
+import { authedFetch } from "@/lib/client-auth";
 
 const COLUMNS: { id: StatusLabel; title: string }[] = [
   { id: "status/backlog", title: "Backlog" },
@@ -87,7 +88,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
       const params = new URLSearchParams(window.location.search);
       const query = params.toString();
       const url = `/api/issues${query ? `?${query}` : ""}`;
-      const res = await fetch(url);
+      const res = await authedFetch(url);
       if (!res.ok) {
         throw new Error("Failed to refresh board");
       }
@@ -170,7 +171,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
     setError(null);
 
     try {
-      const response = await fetch("/api/issues/move", {
+      const response = await authedFetch("/api/issues/move", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -187,7 +188,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
         throw new Error(data.error || "Failed to move issue");
       }
 
-      await fetch("/api/sync", { method: "POST" });
+      await authedFetch("/api/sync", { method: "POST" });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to move issue");
       setIssues((prev) =>

@@ -3,6 +3,7 @@
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { authedFetch } from "@/lib/client-auth";
 
 interface SyncResult {
   repo: string;
@@ -31,7 +32,7 @@ export function SyncIssuesButton() {
     setError(null);
 
     try {
-      const response = await fetch("/api/sync", { method: "POST" });
+      const response = await authedFetch("/api/sync", { method: "POST" });
       const data = (await response.json()) as SyncResponse;
 
       if (!response.ok) {
