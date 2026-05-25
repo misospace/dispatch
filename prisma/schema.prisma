@@ -48,6 +48,15 @@ model Issue {
   decomposedNote String? @db.Text
   followUpUrls  String[] @default([])
 
+  // Backlog grooming state
+  groomedAt        DateTime?
+  groomedBy        String?  @db.Text
+  groomingSummary  String?  @db.Text
+  notReadyReason   String?  @db.Text
+  blockedReason    String?  @db.Text
+  needsInfoReason  String?  @db.Text
+  nextGroomingAction String? @db.Text
+
   @@unique([repositoryId, number])
   @@index([state])
   @@index([labels])
