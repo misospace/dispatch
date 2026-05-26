@@ -1,11 +1,18 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Issue } from "@/types";
 import { KanbanBoard } from "./kanban-board";
 
+const dnd = vi.hoisted(() => ({
+  latestProps: null as null | { onDragEnd: (event: { active: { id: string }; over: { id: string } | null }) => Promise<void> },
+}));
+
 vi.mock("@dnd-kit/core", () => ({
-  DndContext: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DndContext: ({ children, onDragEnd }: { children: React.ReactNode; onDragEnd: (event: { active: { id: string }; over: { id: string } | null }) => Promise<void> }) => {
+    dnd.latestProps = { onDragEnd };
+    return <div>{children}</div>;
+  },
   DragOverlay: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   KeyboardSensor: vi.fn(),
   PointerSensor: vi.fn(),
@@ -131,6 +138,163 @@ describe("KanbanBoard refresh status", () => {
     await waitFor(() =>
       expect(screen.queryByText("Board refresh failed. Showing previous state.")).not.toBeInTheDocument()
     );
+  });
+
+  it("refreshes after a card move and debounces repo-scoped GitHub sync", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ success: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ labels: ["status/in-progress"] })]),
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ syncedCount: 1 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "issue-1" },
+        over: { id: "status/in-progress" },
+      });
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/issues", expect.any(Object)));
+    expect(fetchMock).not.toHaveBeenCalledWith("/api/sync", expect.any(Object));
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sync",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ repoFullName: "misospace/dispatch" }),
+        })
+      )
+    );
+  });
+
+  it("batches multiple moves in one debounce window into one sync per repo", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ success: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ labels: ["status/in-progress"] })]),
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ success: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ labels: ["status/in-review"] })]),
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ syncedCount: 1 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "issue-1" },
+        over: { id: "status/in-progress" },
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "issue-1" },
+        over: { id: "status/in-review" },
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      vi.advanceTimersByTime(9_999);
+    });
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/sync")).toHaveLength(0);
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+    });
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => url === "/api/sync")).toHaveLength(1));
+  });
+
+  it("shows a warning when debounced GitHub sync fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ success: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ labels: ["status/in-progress"] })]),
+      })
+      .mockResolvedValueOnce({ ok: false, json: () => Promise.resolve({ error: "nope" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "issue-1" },
+        over: { id: "status/in-progress" },
+      });
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    expect(await screen.findByText("GitHub sync failed. Board changes were saved; try Sync Issues or refresh later.")).toBeInTheDocument();
+  });
+
+  it("does not expose agent token in the debounced GitHub sync request", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ success: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ labels: ["status/in-progress"] })]),
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ syncedCount: 1 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "issue-1" },
+        over: { id: "status/in-progress" },
+      });
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sync",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ repoFullName: "misospace/dispatch" }),
+        })
+      )
+    );
+
+    const syncCall = fetchMock.mock.calls.find(([url]) => url === "/api/sync");
+    expect(syncCall).toBeDefined();
+    const headers = (syncCall![1] as RequestInit).headers as Record<string, string> | undefined;
+    expect(headers).not.toHaveProperty("Authorization", expect.stringContaining("Bearer"));
   });
 });
 
