@@ -3,6 +3,7 @@ import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { buildAgentQueue } from "@/lib/agent-queue";
 import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
 import { findLeasedIssueIds } from "@/lib/lease";
+import { buildVisibleIssueWhere } from "@/lib/issue-filters";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
@@ -13,12 +14,14 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   const includeRenovate = searchParams.get("includeRenovate") === "true";
 
   try {
-    // Fetch all open issues from enabled repos, using GitHub Issues as source of truth
+    // Centralized visibility filter — replaces open-only query.
+    const where: Record<string, unknown> = {
+      repository: { enabled: true },
+      ...buildVisibleIssueWhere(),
+    };
+
     const issues = await prisma.issue.findMany({
-      where: {
-        state: "open",
-        repository: { enabled: true },
-      },
+      where,
       select: {
         id: true,
         number: true,

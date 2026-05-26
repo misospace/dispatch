@@ -4,35 +4,17 @@ import { FilterBar } from "@/components/filter-bar";
 import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getTrackedRepos } from "@/lib/config";
-import { buildLabelWhere, discoverLabelFilterOptions } from "@/lib/issue-filters";
+import { buildLabelWhere, buildVisibleIssueWhere, discoverLabelFilterOptions, getDoneRetentionCutoff } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
 
 const DONE_RETENTION_DAYS = parseInt(process.env.DISPATCH_DONE_RETENTION_DAYS ?? "7", 10) || 7;
 
-function getDoneRetentionCutoff(): Date {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - DONE_RETENTION_DAYS);
-  return cutoff;
-}
-
 async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string, includeClosed?: boolean) {
   const where: Record<string, unknown> = { repository: { enabled: true } };
 
-  if (includeClosed === true) {
-    // Show all issues regardless of state or age
-    // No state filter — let Kanban grouping sort them by status label
-  } else {
-    // Default: open issues + recently closed Done issues (within retention window)
-    where.OR = [
-      { state: "open" },
-      {
-        state: "closed",
-        labels: { has: "status/done" },
-        closedAt: { gte: getDoneRetentionCutoff() },
-      },
-    ];
-  }
+  // Centralized visibility filter — Board and Projects share this logic.
+  Object.assign(where, buildVisibleIssueWhere({ includeClosed, doneRetentionDays: DONE_RETENTION_DAYS }));
 
   if (repo) where.repository = { ...(where.repository as object), fullName: repo };
 
