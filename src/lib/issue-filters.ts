@@ -1,5 +1,10 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX } from "@/types";
 
+export interface VisibleIssueWhereOptions {
+  includeClosed?: boolean;
+  doneRetentionDays?: number;
+}
+
 export interface LabelFilterOptions {
   agents: string[];
   owners: string[];
@@ -33,6 +38,35 @@ export function buildLabelWhere(labels: Array<string | null | undefined>) {
 
 export function toProjectLabel(project: string | null | undefined) {
   return project ? `project/${project}` : undefined;
+}
+
+export const DEFAULT_DONE_RETENTION_DAYS = 7;
+
+export function getDoneRetentionDays(): number {
+  const parsed = parseInt(process.env.DISPATCH_DONE_RETENTION_DAYS ?? String(DEFAULT_DONE_RETENTION_DAYS), 10);
+  return parsed > 0 ? parsed : DEFAULT_DONE_RETENTION_DAYS;
+}
+
+export function buildVisibleIssueWhere(where: Record<string, unknown>, options?: VisibleIssueWhereOptions): void {
+  const { includeClosed = false, doneRetentionDays } = options ?? {};
+  const retentionDays = doneRetentionDays ?? getDoneRetentionDays();
+
+  if (includeClosed) {
+    // Show all issues regardless of state or age — no state filter
+    return;
+  }
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - retentionDays);
+
+  where.OR = [
+    { state: "open" },
+    {
+      state: "closed",
+      labels: { has: "status/done" },
+      closedAt: { gte: cutoff },
+    },
+  ];
 }
 
 export const LABEL_FILTER_HELP = {
