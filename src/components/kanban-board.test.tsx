@@ -149,24 +149,26 @@ describe("KanbanBoard horizontal scroll layout", () => {
   it("wraps the column grid in an overflow-x-auto container", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
-    const scrollContainer = screen.getByRole("grid");
-    // The grid wrapper div should have overflow-x-auto class
-    expect(scrollContainer.parentElement?.className).toContain("overflow-x-auto");
+    // The grid is a div.grid; its parent is the overflow-x-auto wrapper
+    const grid = document.querySelector("div.grid");
+    expect(grid?.parentElement?.className).toContain("overflow-x-auto");
   });
 
   it("sets minWidth fit-content on the column grid to enable horizontal scrolling", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
-    const scrollContainer = screen.getByRole("grid").parentElement;
-    expect(scrollContainer).toHaveStyle({ minWidth: "fit-content" });
+    // The min-width: fit-content style is directly on the grid div
+    const grid = document.querySelector("div.grid");
+    expect(grid).toHaveStyle({ minWidth: "fit-content" });
   });
 
   it("renders all five columns in canonical order", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
+    // Column titles are in aria-label of section elements, not visible text
     const columnTitles = ["Backlog", "Ready", "In Progress", "In Review", "Done"];
     columnTitles.forEach((title) => {
-      expect(screen.getByText(title)).toBeInTheDocument();
+      expect(screen.getByRole("region", { name: title })).toBeInTheDocument();
     });
   });
 
@@ -174,7 +176,7 @@ describe("KanbanBoard horizontal scroll layout", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
     // Each KanbanColumn renders as a section with aria-label
-    const sections = document.querySelectorAll('section[aria-label]');
+    const sections = document.querySelectorAll("section[aria-label]");
     expect(sections).toHaveLength(5);
   });
 });
