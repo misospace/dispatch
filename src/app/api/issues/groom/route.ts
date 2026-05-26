@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, addIssueLabel } from "@/lib/github";
-import { isAuthorized } from "@/lib/auth";
+import { authorizeRequest } from "@/lib/auth";
 
 /**
  * Resolve the actor name for grooming attribution.
@@ -33,7 +33,8 @@ function resolveActor(body: unknown): { actor: string; error?: string } {
 }
 
 export async function POST(request: Request) {
-  if (!isAuthorized(request)) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -58,7 +59,7 @@ export async function POST(request: Request) {
       notReadyReason,
       blockedReason,
       needsInfoReason,
-      actor,
+      actor: bodyActor,
       agentName,
     } = body as Record<string, unknown>;
 
@@ -77,9 +78,23 @@ export async function POST(request: Request) {
       );
     }
 
-    const { actor: actorName, error: actorError } = resolveActor(body);
+    const { actor: bodyActorName, error: actorError } = resolveActor(body);
     if (actorError) {
       return NextResponse.json({ error: actorError }, { status: 400 });
+    }
+
+    // Authenticated operator identity (basic/oidc) overrides body actor.
+    // Bearer mode falls back to x-agent-name header, then body actor.
+    // Disabled mode falls back to the body's actor.
+    let auditActor: string;
+    if (auth.type === "basic" || auth.type === "oidc") {
+      auditActor = auth.actor;
+    } else if (auth.type === "bearer") {
+      const headerActor = request.headers.get("x-agent-name")?.trim();
+      auditActor = (headerActor && headerActor.length > 0) ? headerActor : bodyActorName;
+    } else {
+      // disabled mode
+      auditActor = bodyActorName;
     }
 
     try {
@@ -101,7 +116,7 @@ export async function POST(request: Request) {
       // Build grooming data
       const groomingData: Record<string, unknown> = {
         groomedAt,
-        groomedBy: actorName,
+        groomedBy: auditActor,
         groomingSummary: (groomingSummary as string | undefined) ?? null,
       };
 
@@ -202,7 +217,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: actorName,
+          actor: auditActor,
           action: actionLabels[action],
           repoFullName: effectiveRepo,
           issueNumber: effectiveNumber,
@@ -225,7 +240,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: actorName,
+          actor: auditActor,
           action: `issue_groomed_${action}`,
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,

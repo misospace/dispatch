@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { resetAuthCaches } from "@/lib/auth";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -7,6 +8,7 @@ const { mocks } = vi.hoisted(() => ({
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
+    auth: vi.fn(),
   },
 }));
 
@@ -27,8 +29,9 @@ vi.mock("@/lib/github", () => ({
   addIssueLabel: mocks.addIssueLabel,
 }));
 
-const originalAgentToken = process.env.DISPATCH_AGENT_TOKEN;
-const originalAuthMode = process.env.DISPATCH_AUTH_MODE;
+vi.mock("@/lib/auth-next", () => ({
+  auth: mocks.auth,
+}));
 
 import { POST } from "./route";
 
@@ -69,8 +72,11 @@ describe("POST /api/issues/groom — auth", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("allows all requests when auth mode is disabled", async () => {
@@ -87,8 +93,11 @@ describe("POST /api/issues/groom — validation", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("rejects missing required fields", async () => {
@@ -148,8 +157,11 @@ describe("POST /api/issues/groom — actor resolution", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("defaults actor to 'agent' when no actor or agentName supplied", async () => {
@@ -224,8 +236,11 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("removes backlog and adds ready label", async () => {
@@ -331,8 +346,11 @@ describe("POST /api/issues/groom — escalate", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("sets currentLane to escalated", async () => {
@@ -382,8 +400,11 @@ describe("POST /api/issues/groom — mark_not_ready", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("requires notReadyReason", async () => {
@@ -453,8 +474,11 @@ describe("POST /api/issues/groom — mark_needs_info", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("requires needsInfoReason", async () => {
@@ -510,8 +534,11 @@ describe("POST /api/issues/groom — mark_blocked", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("requires blockedReason", async () => {
@@ -564,8 +591,11 @@ describe("POST /api/issues/groom — error handling", () => {
   });
 
   afterEach(() => {
-    process.env.DISPATCH_AGENT_TOKEN = originalAgentToken;
-    process.env.DISPATCH_AUTH_MODE = originalAuthMode;
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
   });
 
   it("writes audit log on DB error", async () => {
@@ -581,5 +611,231 @@ describe("POST /api/issues/groom — error handling", () => {
         data: expect.objectContaining({ success: false, errorMessage: "DB connection failed" }),
       })
     );
+  });
+});
+
+describe("POST /api/issues/groom — auth modes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetAuthCaches();
+    mocks.findIssue.mockResolvedValue({
+      id: "issue-1",
+      number: 42,
+      labels: ["status/backlog"],
+      repository: { fullName: "misospace/dispatch" },
+    });
+    mocks.updateIssue.mockResolvedValue({ id: "issue-1", number: 42, labels: ["status/ready"] });
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+  });
+
+  afterEach(() => {
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
+  });
+
+  it("rejects unauthenticated request in legacy mode (no token, no auth mode)", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 1, action: "promote_to_ready" }),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts valid bearer token in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer agent-token",
+          "x-agent-name": "worker-1",
+        },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts Basic Auth in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic b3BlcmF0b3I6czNjcmV0",
+        },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects wrong Basic Auth credentials in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic d3Jvbmc6Y3JlZA==",
+        },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts OIDC session auth in oidc mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    mocks.auth.mockResolvedValue({ user: { email: "alice@example.com", name: "Alice" } });
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects unauthenticated OIDC request with no session", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    mocks.auth.mockResolvedValue(null);
+
+    const res = await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("writes groomedBy from authenticated operator in basic mode (Basic Auth)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic b3BlcmF0b3I6czNjcmV0",
+        },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+
+    const updateCall = mocks.updateIssue.mock.calls[0][0];
+    expect(updateCall.data.groomedBy).toBe("operator");
+
+    const auditCall = mocks.createAuditLog.mock.calls[0][0];
+    expect(auditCall.data.actor).toBe("operator");
+  });
+
+  it("writes groomedBy from bearer actor in basic mode", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+
+    await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer agent-token",
+          "x-agent-name": "worker-1",
+        },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+
+    const updateCall = mocks.updateIssue.mock.calls[0][0];
+    expect(updateCall.data.groomedBy).toBe("worker-1");
+
+    const auditCall = mocks.createAuditLog.mock.calls[0][0];
+    expect(auditCall.data.actor).toBe("worker-1");
+  });
+
+  it("writes groomedBy from OIDC session actor", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    mocks.auth.mockResolvedValue({ user: { email: "alice@example.com", name: "Alice" } });
+
+    await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" }),
+      })
+    );
+
+    const updateCall = mocks.updateIssue.mock.calls[0][0];
+    expect(updateCall.data.groomedBy).toBe("alice@example.com");
+
+    const auditCall = mocks.createAuditLog.mock.calls[0][0];
+    expect(auditCall.data.actor).toBe("alice@example.com");
+  });
+
+  it("body actor is ignored when authenticated operator exists (basic mode)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Basic b3BlcmF0b3I6czNjcmV0",
+        },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready", actor: "body-agent" }),
+      })
+    );
+
+    const updateCall = mocks.updateIssue.mock.calls[0][0];
+    expect(updateCall.data.groomedBy).toBe("operator");
+
+    const auditCall = mocks.createAuditLog.mock.calls[0][0];
+    expect(auditCall.data.actor).toBe("operator");
+  });
+
+  it("falls back to body actor when auth provides no specific actor (disabled mode)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    await POST(
+      new Request("http://localhost/api/issues/groom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready", actor: "body-agent" }),
+      })
+    );
+
+    const updateCall = mocks.updateIssue.mock.calls[0][0];
+    expect(updateCall.data.groomedBy).toBe("body-agent");
+
+    const auditCall = mocks.createAuditLog.mock.calls[0][0];
+    expect(auditCall.data.actor).toBe("body-agent");
   });
 });
