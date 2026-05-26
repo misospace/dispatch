@@ -3,6 +3,15 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
+const DEFAULT_CALLBACK_URL = "/board";
+
+function safeCallbackUrl(raw: string | null): string {
+  if (!raw || raw.trim() === "") return DEFAULT_CALLBACK_URL;
+  if (raw.startsWith("//") || /^https?:\/\//i.test(raw)) return DEFAULT_CALLBACK_URL;
+  if (raw.startsWith("/")) return raw;
+  return DEFAULT_CALLBACK_URL;
+}
+
 export default function LoginPage() {
   return (
     <Suspense>
@@ -16,7 +25,7 @@ function LoginContent() {
   const searchParams = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const callbackUrl = searchParams.get("callbackUrl") || "/board";
+  const callbackUrl = safeCallbackUrl(searchParams.get("callbackUrl"));
 
   useEffect(() => {
     // Check if already logged in

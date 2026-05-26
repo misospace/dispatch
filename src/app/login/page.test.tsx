@@ -103,4 +103,24 @@ describe("LoginPage", () => {
     expect(button).toHaveTextContent("Signing in...");
     expect(button).toBeDisabled();
   });
+
+  it("rejects absolute https callbackUrl from query string and falls back to /board", async () => {
+    getLoginPage("https://evil.example.com");
+    const { default: LoginPage } = await import("./page");
+    render(<LoginPage />);
+
+    await userEvent.click(screen.getByRole("button", { name: /sign in with sso/i }));
+
+    expect(trackedHref).toBe("/api/login?callbackUrl=%2Fboard");
+  });
+
+  it("rejects protocol-relative callbackUrl from query string and falls back to /board", async () => {
+    getLoginPage("//evil.example.com");
+    const { default: LoginPage } = await import("./page");
+    render(<LoginPage />);
+
+    await userEvent.click(screen.getByRole("button", { name: /sign in with sso/i }));
+
+    expect(trackedHref).toBe("/api/login?callbackUrl=%2Fboard");
+  });
 });
