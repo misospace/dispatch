@@ -1,6 +1,5 @@
 "use client";
 
-import { signIn } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
@@ -31,18 +30,10 @@ function LoginContent() {
       .catch(() => {});
   }, [callbackUrl, router]);
 
-  const handleSignIn = async () => {
+  const handleSignIn = () => {
     setLoading(true);
     setError(null);
-    try {
-      await signIn("oidc", {
-        redirect: true,
-        redirectTo: callbackUrl,
-      });
-    } catch (err) {
-      setError("Failed to sign in. Please try again.");
-      setLoading(false);
-    }
+    window.location.href = `/api/login?callbackUrl=${encodeURIComponent(callbackUrl)}`;
   };
 
   return (
