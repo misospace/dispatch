@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { BOARD_COLUMNS, STATUS_LABELS } from "@/types";
+import { buildVisibleIssueWhere } from "@/lib/issue-filters";
 import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
@@ -10,30 +11,14 @@ interface PageProps {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }
 
-const DONE_RETENTION_DAYS = parseInt(process.env.DISPATCH_DONE_RETENTION_DAYS ?? "7", 10) || 7;
-
-function getDoneRetentionCutoff(): Date {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - DONE_RETENTION_DAYS);
-  return cutoff;
-}
-
 async function getProjects() {
   // Fetch open issues + recently closed Done issues (within retention window)
   // to match Board page retention semantics.
-  const doneCutoff = getDoneRetentionCutoff();
+  const where: Record<string, unknown> = { repository: { enabled: true } };
+  buildVisibleIssueWhere(where);
+
   const issues = await prisma.issue.findMany({
-    where: {
-      repository: { enabled: true },
-      OR: [
-        { state: "open" },
-        {
-          state: "closed",
-          labels: { has: "status/done" },
-          closedAt: { gte: doneCutoff },
-        },
-      ],
-    },
+    where,
     include: { repository: true },
   });
 

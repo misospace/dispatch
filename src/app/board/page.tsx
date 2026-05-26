@@ -4,35 +4,14 @@ import { FilterBar } from "@/components/filter-bar";
 import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getTrackedRepos } from "@/lib/config";
-import { buildLabelWhere, discoverLabelFilterOptions } from "@/lib/issue-filters";
+import { buildLabelWhere, buildVisibleIssueWhere, discoverLabelFilterOptions, getDoneRetentionDays } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
-
-const DONE_RETENTION_DAYS = parseInt(process.env.DISPATCH_DONE_RETENTION_DAYS ?? "7", 10) || 7;
-
-function getDoneRetentionCutoff(): Date {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - DONE_RETENTION_DAYS);
-  return cutoff;
-}
 
 async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string, includeClosed?: boolean) {
   const where: Record<string, unknown> = { repository: { enabled: true } };
 
-  if (includeClosed === true) {
-    // Show all issues regardless of state or age
-    // No state filter — let Kanban grouping sort them by status label
-  } else {
-    // Default: open issues + recently closed Done issues (within retention window)
-    where.OR = [
-      { state: "open" },
-      {
-        state: "closed",
-        labels: { has: "status/done" },
-        closedAt: { gte: getDoneRetentionCutoff() },
-      },
-    ];
-  }
+  buildVisibleIssueWhere(where, { includeClosed });
 
   if (repo) where.repository = { ...(where.repository as object), fullName: repo };
 
@@ -132,7 +111,7 @@ export default async function BoardPage({ searchParams }: PageProps) {
                 {syncStatus.cachedIssueCount > 0
                   ? "Clear or adjust the filters to see synced issues."
                   : syncStatus.trackedRepoCount > 0
-                  ? "Click Sync Issues to import open GitHub issues from tracked repositories. Recently completed Done issues are shown for " + DONE_RETENTION_DAYS + " days."
+                  ? `Click Sync Issues to import open GitHub issues from tracked repositories. Recently completed Done issues are shown for ${getDoneRetentionDays()} days.`
                   : "No tracked repositories are configured yet. Add tracked repositories before syncing issues."}
               </p>
             </div>

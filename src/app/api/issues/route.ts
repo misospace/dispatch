@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { buildLabelWhere, toProjectLabel } from "@/lib/issue-filters";
+import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel } from "@/lib/issue-filters";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -15,10 +15,7 @@ export async function GET(request: Request) {
   try {
     const where: Record<string, unknown> = { repository: { enabled: true } };
 
-    // Default to open issues only; include closed when explicitly requested
-    if (includeClosed !== "true") {
-      where.state = "open";
-    }
+    buildVisibleIssueWhere(where, { includeClosed: includeClosed === "true" });
 
     if (repo) {
       where.repository = { ...(where.repository as object), fullName: repo };
