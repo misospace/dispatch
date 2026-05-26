@@ -34,6 +34,9 @@ const COLUMNS: { id: StatusLabel; title: string }[] = [
 ];
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
+// 10s debounce balances responsiveness with rate-limiting: long enough to batch
+// rapid drag-and-drop moves on the same repo into a single sync, short enough
+// that stale board state is reconciled with GitHub within a typical user session.
 const MOVE_SYNC_DEBOUNCE_MS = 10_000;
 
 interface KanbanBoardProps {

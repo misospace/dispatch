@@ -255,4 +255,45 @@ describe("KanbanBoard refresh status", () => {
 
     expect(await screen.findByText("GitHub sync failed. Board changes were saved; try Sync Issues or refresh later.")).toBeInTheDocument();
   });
+
+  it("does not expose agent token in the debounced GitHub sync request", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ success: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve([issue({ labels: ["status/in-progress"] })]),
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ syncedCount: 1 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<KanbanBoard initialIssues={[issue()]} />);
+    await screen.findByText("Existing issue");
+
+    await act(async () => {
+      await dnd.latestProps?.onDragEnd({
+        active: { id: "issue-1" },
+        over: { id: "status/in-progress" },
+      });
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sync",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ repoFullName: "misospace/dispatch" }),
+        })
+      )
+    );
+
+    const syncCall = fetchMock.mock.calls.find(([url]) => url === "/api/sync");
+    expect(syncCall).toBeDefined();
+    const headers = (syncCall![1] as RequestInit).headers as Record<string, string> | undefined;
+    expect(headers).not.toHaveProperty("Authorization", expect.stringContaining("Bearer"));
+  });
 });
