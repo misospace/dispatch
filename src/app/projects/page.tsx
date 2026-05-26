@@ -6,9 +6,34 @@ import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
 
+interface PageProps {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}
+
+const DONE_RETENTION_DAYS = parseInt(process.env.DISPATCH_DONE_RETENTION_DAYS ?? "7", 10) || 7;
+
+function getDoneRetentionCutoff(): Date {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - DONE_RETENTION_DAYS);
+  return cutoff;
+}
+
 async function getProjects() {
+  // Fetch open issues + recently closed Done issues (within retention window)
+  // to match Board page retention semantics.
+  const doneCutoff = getDoneRetentionCutoff();
   const issues = await prisma.issue.findMany({
-    where: { repository: { enabled: true } },
+    where: {
+      repository: { enabled: true },
+      OR: [
+        { state: "open" },
+        {
+          state: "closed",
+          labels: { has: "status/done" },
+          closedAt: { gte: doneCutoff },
+        },
+      ],
+    },
     include: { repository: true },
   });
 
@@ -18,7 +43,7 @@ async function getProjects() {
   };
 }
 
-export default async function ProjectsPage() {
+export default async function ProjectsPage(_props: PageProps) {
   const { projects } = await getProjects();
 
   if (projects.length === 0) {
@@ -54,39 +79,45 @@ export default async function ProjectsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                {STATUS_LABELS.map((status) => {
-                  const statusIssues = project.issues.filter(
-                    (i: any) => getProjectIssueStatus(i as any) === status
-                  );
-                  return (
-                    <div key={status} className="space-y-2">
-                      <h4 className="text-sm font-medium text-muted-foreground">
-                        {status.replace("status/", "")}
-                      </h4>
-                      {statusIssues.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">No issues</p>
-                      ) : (
-                        <div className="space-y-1">
-                          {(statusIssues as any).map((issue: any) => (
-                            <a
-                              key={issue.id}
-                              href={issue.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="block text-sm p-2 rounded bg-muted hover:bg-muted/80"
-                            >
-                              <span className="font-mono text-xs text-muted-foreground">
-                                #{issue.number}
-                              </span>{" "}
-                              {issue.title}
-                            </a>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+              {/* Horizontal scroll wrapper for status columns on narrow screens */}
+              <div className="overflow-x-auto pb-2">
+                <div
+                  className="grid grid-cols-1 lg:grid-cols-5 gap-4"
+                  style={{ minWidth: "fit-content" }}
+                >
+                  {STATUS_LABELS.map((status) => {
+                    const statusIssues = project.issues.filter(
+                      (i: any) => getProjectIssueStatus(i as any) === status
+                    );
+                    return (
+                      <div key={status} className="space-y-2">
+                        <h4 className="text-sm font-medium text-muted-foreground">
+                          {status.replace("status/", "")}
+                        </h4>
+                        {statusIssues.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">No issues</p>
+                        ) : (
+                          <div className="space-y-1">
+                            {(statusIssues as any).map((issue: any) => (
+                              <a
+                                key={issue.id}
+                                href={issue.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="block text-sm p-2 rounded bg-muted hover:bg-muted/80"
+                              >
+                                <span className="font-mono text-xs text-muted-foreground">
+                                  #{issue.number}
+                                </span>{" "}
+                                {issue.title}
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             </CardContent>
           </Card>
