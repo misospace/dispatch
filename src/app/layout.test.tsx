@@ -128,13 +128,14 @@ describe("RootLayout app shell", () => {
     expect(screen.getByText("Automation")).toBeInTheDocument();
   });
 
-  it("renders theme toggle", () => {
-    render(
+  it("renders theme toggle in desktop header", () => {
+    const { container } = render(
       <RootLayout>
         <span />
       </RootLayout>,
     );
-    expect(screen.getByLabelText("Switch to dark mode")).toBeInTheDocument();
+    const desktopToggle = container.querySelector(".ml-auto button[aria-label='Switch to dark mode']");
+    expect(desktopToggle).toBeTruthy();
   });
 
   it("renders version label", () => {
