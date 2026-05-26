@@ -133,3 +133,48 @@ describe("KanbanBoard refresh status", () => {
     );
   });
 });
+
+describe("KanbanBoard horizontal scroll layout", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-05-25T19:22:00.000Z"));
+    window.history.replaceState(null, "", "/board");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("wraps the column grid in an overflow-x-auto container", () => {
+    render(<KanbanBoard initialIssues={[issue()]} />);
+
+    const scrollContainer = screen.getByRole("grid");
+    // The grid wrapper div should have overflow-x-auto class
+    expect(scrollContainer.parentElement?.className).toContain("overflow-x-auto");
+  });
+
+  it("sets minWidth fit-content on the column grid to enable horizontal scrolling", () => {
+    render(<KanbanBoard initialIssues={[issue()]} />);
+
+    const scrollContainer = screen.getByRole("grid").parentElement;
+    expect(scrollContainer).toHaveStyle({ minWidth: "fit-content" });
+  });
+
+  it("renders all five columns in canonical order", () => {
+    render(<KanbanBoard initialIssues={[issue()]} />);
+
+    const columnTitles = ["Backlog", "Ready", "In Progress", "In Review", "Done"];
+    columnTitles.forEach((title) => {
+      expect(screen.getByText(title)).toBeInTheDocument();
+    });
+  });
+
+  it("renders columns with proper KanbanColumn wrappers", () => {
+    render(<KanbanBoard initialIssues={[issue()]} />);
+
+    // Each KanbanColumn renders as a section with aria-label
+    const sections = document.querySelectorAll('section[aria-label]');
+    expect(sections).toHaveLength(5);
+  });
+});

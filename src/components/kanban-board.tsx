@@ -255,33 +255,39 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-          {COLUMNS.map((column) => {
-            const columnIssues = getIssuesByStatus(issues, column.id);
-            return (
-              <KanbanColumn
-                key={column.id}
-                id={column.id}
-                title={column.title}
-                count={columnIssues.length}
-              >
-                <SortableContext
-                  items={columnIssues.map((i) => i.id)}
-                  strategy={verticalListSortingStrategy}
+        {/* Horizontal scroll wrapper for 5-column grid on narrow screens */}
+        <div className="overflow-x-auto pb-2">
+          <div
+            className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4"
+            style={{ minWidth: "fit-content" }}
+          >
+            {COLUMNS.map((column) => {
+              const columnIssues = getIssuesByStatus(issues, column.id);
+              return (
+                <KanbanColumn
+                  key={column.id}
+                  id={column.id}
+                  title={column.title}
+                  count={columnIssues.length}
                 >
-                  <div className="space-y-2">
-                    {columnIssues.map((issue) => (
-                      <IssueCard
-                        key={issue.id}
-                        issue={issue}
-                        onIssueUpdate={() => doRefresh()}
-                      />
-                    ))}
-                  </div>
-                </SortableContext>
-              </KanbanColumn>
-            );
-          })}
+                  <SortableContext
+                    items={columnIssues.map((i) => i.id)}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    <div className="space-y-2">
+                      {columnIssues.map((issue) => (
+                        <IssueCard
+                          key={issue.id}
+                          issue={issue}
+                          onIssueUpdate={() => doRefresh()}
+                        />
+                      ))}
+                    </div>
+                  </SortableContext>
+                </KanbanColumn>
+              );
+            })}
+          </div>
         </div>
         <DragOverlay>
           {activeIssue ? (
