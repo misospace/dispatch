@@ -34,6 +34,7 @@ const COLUMNS: { id: StatusLabel; title: string }[] = [
 ];
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
+const MOVE_SYNC_DEBOUNCE_MS = 10_000;
 
 interface KanbanBoardProps {
   initialIssues: Issue[];
@@ -54,6 +55,8 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
+  const pendingSyncReposRef = useRef<Set<string>>(new Set());
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Store latest issues in a ref for doRefresh to always use current state
   const issuesRef = useRef(issues);
@@ -101,6 +104,47 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
     } finally {
       setRefreshing(false);
     }
+  }, []);
+
+  const scheduleSync = useCallback((repoFullName: string) => {
+    pendingSyncReposRef.current.add(repoFullName);
+
+    if (syncTimerRef.current) {
+      clearTimeout(syncTimerRef.current);
+    }
+
+    syncTimerRef.current = setTimeout(() => {
+      const repos = Array.from(pendingSyncReposRef.current);
+      pendingSyncReposRef.current.clear();
+      syncTimerRef.current = null;
+
+      void Promise.all(
+        repos.map(async (repo) => {
+          const response = await authedFetch("/api/sync", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ repoFullName: repo }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Sync failed for ${repo}`);
+          }
+        })
+      ).catch(() => {
+        setNotification({
+          type: "error",
+          message: "GitHub sync failed. Board changes were saved; try Sync Issues or refresh later.",
+        });
+      });
+    }, MOVE_SYNC_DEBOUNCE_MS);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+      }
+    };
   }, []);
 
   // Auto-refresh every 30 seconds
@@ -188,7 +232,8 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
         throw new Error(data.error || "Failed to move issue");
       }
 
-      await authedFetch("/api/sync", { method: "POST" });
+      await doRefresh();
+      scheduleSync(issue.repository.fullName);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to move issue");
       setIssues((prev) =>
