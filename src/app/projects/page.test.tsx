@@ -78,11 +78,11 @@ describe("ProjectsPage five-column layout", () => {
     // Collect all text content from the rendered page
     const allText = extractAllText(page);
 
-    // STATUS_LABELS order: backlog, ready, in-progress, in-review, done
+    // BOARD_COLUMNS order: Backlog, Ready, In Progress, In Review, Done
     expect(allText.toLowerCase()).toContain("backlog");
     expect(allText.toLowerCase()).toContain("ready");
-    expect(allText.toLowerCase()).toContain("in-progress");
-    expect(allText.toLowerCase()).toContain("in-review");
+    expect(allText.toLowerCase()).toContain("in progress");
+    expect(allText.toLowerCase()).toContain("in review");
     expect(allText.toLowerCase()).toContain("done");
   });
 

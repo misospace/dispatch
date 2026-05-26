@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { STATUS_LABELS } from "@/types";
+import { BOARD_COLUMNS, STATUS_LABELS } from "@/types";
 import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
@@ -85,14 +85,14 @@ export default async function ProjectsPage(_props: PageProps) {
                   className="grid grid-cols-1 lg:grid-cols-5 gap-4"
                   style={{ minWidth: "fit-content" }}
                 >
-                  {STATUS_LABELS.map((status) => {
+                  {BOARD_COLUMNS.map((column) => {
                     const statusIssues = project.issues.filter(
-                      (i: any) => getProjectIssueStatus(i as any) === status
+                      (i: any) => getProjectIssueStatus(i as any) === column.id
                     );
                     return (
-                      <div key={status} className="space-y-2">
+                      <div key={column.id} className="space-y-2">
                         <h4 className="text-sm font-medium text-muted-foreground">
-                          {status.replace("status/", "")}
+                          {column.title}
                         </h4>
                         {statusIssues.length === 0 ? (
                           <p className="text-xs text-muted-foreground">No issues</p>

@@ -21,17 +21,9 @@ import {
 import { KanbanColumn } from "./kanban-column";
 import { IssueCard } from "./issue-card";
 import { Button } from "@/components/ui/button";
-import { Issue, StatusLabel } from "@/types";
+import { BOARD_COLUMNS, Issue, StatusLabel } from "@/types";
 import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
 import { authedFetch } from "@/lib/client-auth";
-
-const COLUMNS: { id: StatusLabel; title: string }[] = [
-  { id: "status/backlog", title: "Backlog" },
-  { id: "status/ready", title: "Ready" },
-  { id: "status/in-progress", title: "In Progress" },
-  { id: "status/in-review", title: "In Review" },
-  { id: "status/done", title: "Done" },
-];
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
 // 10s debounce balances responsiveness with rate-limiting: long enough to batch
@@ -189,7 +181,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
     const activeId = active.id as string;
     const overId = over.id as string;
 
-    const overColumn = COLUMNS.find((c) => c.id === overId);
+    const overColumn = BOARD_COLUMNS.find((c) => c.id === overId);
     if (!overColumn) {
       const overIssue = issuesRef.current.find((i) => i.id === overId);
       if (!overIssue) return;
@@ -309,7 +301,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
             className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4"
             style={{ minWidth: "fit-content" }}
           >
-            {COLUMNS.map((column) => {
+            {BOARD_COLUMNS.map((column) => {
               const columnIssues = getIssuesByStatus(issues, column.id);
               return (
                 <KanbanColumn

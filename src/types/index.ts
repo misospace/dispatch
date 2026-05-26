@@ -99,7 +99,20 @@ export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "pri
 export type TypeLabel = "type/bug" | "type/feature" | "type/chore" | "type/research" | "type/security";
 export type ProjectLabel = `project/${string}`;
 
-export const STATUS_LABELS: StatusLabel[] = ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"];
+export interface BoardColumn {
+  id: StatusLabel;
+  title: string;
+}
+
+export const BOARD_COLUMNS: BoardColumn[] = [
+  { id: "status/backlog", title: "Backlog" },
+  { id: "status/ready", title: "Ready" },
+  { id: "status/in-progress", title: "In Progress" },
+  { id: "status/in-review", title: "In Review" },
+  { id: "status/done", title: "Done" },
+];
+
+export const STATUS_LABELS: StatusLabel[] = BOARD_COLUMNS.map((col) => col.id);
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
 export const PROJECT_PREFIX = "project/";
 export const AGENT_PREFIX = "agent/";
