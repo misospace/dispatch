@@ -6,6 +6,10 @@ import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
 
+interface PageProps {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}
+
 const DONE_RETENTION_DAYS = parseInt(process.env.DISPATCH_DONE_RETENTION_DAYS ?? "7", 10) || 7;
 
 function getDoneRetentionCutoff(): Date {
@@ -39,7 +43,7 @@ async function getProjects() {
   };
 }
 
-export default async function ProjectsPage() {
+export default async function ProjectsPage(_props: PageProps) {
   const { projects } = await getProjects();
 
   if (projects.length === 0) {
