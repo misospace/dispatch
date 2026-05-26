@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import React from "react";
 
 const versionLabel = "v0.2.1";
@@ -99,15 +99,29 @@ describe("RootLayout app shell", () => {
     expect(mobileToggle).toBeTruthy();
   });
 
-  it("mobile nav contains all primary nav links", () => {
+  it("mobile nav toggle is inside a sm:hidden container", () => {
     const { container } = render(
       <RootLayout>
         <span />
       </RootLayout>,
     );
-    const mobileNav = container.querySelector('nav[class*="sm:hidden"]');
-    expect(mobileNav).toBeTruthy();
-    expect(mobileNav?.querySelectorAll("a").length).toBe(5);
+    const mobileContainer = container.querySelector('div[class*="sm:hidden"]');
+    expect(mobileContainer).toBeTruthy();
+  });
+
+  it("mobile nav contains all primary nav links when open", () => {
+    const { container } = render(
+      <RootLayout>
+        <span />
+      </RootLayout>,
+    );
+    const checkbox = container.querySelector<HTMLInputElement>("#mobile-nav-toggle")!;
+    fireEvent.change(checkbox, { target: { checked: true } });
+    expect(screen.getByText("Overview")).toBeInTheDocument();
+    expect(screen.getByText("Board")).toBeInTheDocument();
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.getByText("Agents")).toBeInTheDocument();
+    expect(screen.getByText("Automation")).toBeInTheDocument();
   });
 
   it("renders theme toggle", () => {
