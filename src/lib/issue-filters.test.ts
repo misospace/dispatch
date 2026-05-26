@@ -49,6 +49,9 @@ describe("buildVisibleIssueWhere", () => {
   });
 
   it("defaults to open issues + recently closed Done issues (7-day retention)", () => {
+    const now = new Date();
+    const expectedCutoff = new Date();
+    expectedCutoff.setDate(expectedCutoff.getDate() - 7);
     const where: Record<string, unknown> = { repository: { enabled: true } };
     buildVisibleIssueWhere(where);
 
@@ -60,7 +63,10 @@ describe("buildVisibleIssueWhere", () => {
     const branch1 = or[1] as Record<string, unknown>;
     expect(branch1.state).toBe("closed");
     expect((branch1.labels as Record<string, string>).has).toBe("status/done");
-    expect((branch1.closedAt as Record<string, Date>).gte).toBeDefined();
+    const gte = (branch1.closedAt as Record<string, Date>).gte as Date;
+    expect(gte).toBeInstanceOf(Date);
+    expect(gte.getTime()).toBeGreaterThanOrEqual(expectedCutoff.getTime() - 1000);
+    expect(gte.getTime()).toBeLessThanOrEqual(now.getTime());
   });
 
   it("shows all issues when includeClosed is true", () => {
@@ -71,16 +77,37 @@ describe("buildVisibleIssueWhere", () => {
     expect(where.state).toBeUndefined();
   });
 
-  it("respects custom doneRetentionDays option", () => {
+  it("respects custom doneRetentionDays option with exact cutoff", () => {
+    const now = new Date();
+    const expectedCutoff = new Date();
+    expectedCutoff.setDate(expectedCutoff.getDate() - 30);
     const where: Record<string, unknown> = { repository: { enabled: true } };
     buildVisibleIssueWhere(where, { includeClosed: false, doneRetentionDays: 30 });
 
     const or = where.OR as Array<Record<string, unknown>>;
     expect(or).toBeDefined();
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 30);
     const branch1 = or[1] as Record<string, unknown>;
-    expect((branch1.closedAt as Record<string, Date>).gte).toBeTruthy();
+    const gte = (branch1.closedAt as Record<string, Date>).gte as Date;
+    expect(gte).toBeInstanceOf(Date);
+    expect(gte.getTime()).toBeGreaterThanOrEqual(expectedCutoff.getTime() - 1000);
+    expect(gte.getTime()).toBeLessThanOrEqual(now.getTime());
+  });
+
+  it("respects DISPATCH_DONE_RETENTION_DAYS env var with exact cutoff", () => {
+    const now = new Date();
+    const expectedCutoff = new Date();
+    expectedCutoff.setDate(expectedCutoff.getDate() - 14);
+    process.env.DISPATCH_DONE_RETENTION_DAYS = "14";
+    const where: Record<string, unknown> = { repository: { enabled: true } };
+    buildVisibleIssueWhere(where);
+
+    const or = where.OR as Array<Record<string, unknown>>;
+    const branch1 = or[1] as Record<string, unknown>;
+    const gte = (branch1.closedAt as Record<string, Date>).gte as Date;
+    expect(gte).toBeInstanceOf(Date);
+    expect(gte.getTime()).toBeGreaterThanOrEqual(expectedCutoff.getTime() - 1000);
+    expect(gte.getTime()).toBeLessThanOrEqual(now.getTime());
+    delete process.env.DISPATCH_DONE_RETENTION_DAYS;
   });
 
   it("does not set OR when includeClosed is true", () => {
