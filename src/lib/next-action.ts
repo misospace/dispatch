@@ -105,6 +105,10 @@ export interface ResumeContext {
   nextAction: NextActionValue;
 }
 
+export interface ResumeContextWithLease extends ResumeContext {
+  leaseId: string;
+}
+
 // ─── Resume Context Builder ─────────────────────────────────────────────────
 // Constructs a ResumeContext from raw checkpoint data. Validates inputs and
 // computes the deterministic next action.

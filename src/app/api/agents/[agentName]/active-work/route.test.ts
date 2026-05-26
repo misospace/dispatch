@@ -4,6 +4,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     leaseFindFirst: vi.fn(),
     leaseDelete: vi.fn(),
+    issueFindUnique: vi.fn(),
   },
 }));
 
@@ -12,6 +13,12 @@ vi.mock("@/lib/prisma", () => ({
     lease: {
       findFirst: mocks.leaseFindFirst,
       delete: mocks.leaseDelete,
+    },
+    issue: {
+      findUnique: mocks.issueFindUnique,
+    },
+    auditLog: {
+      create: vi.fn(),
     },
   },
 }));
@@ -33,9 +40,7 @@ function makeActiveWorkRequest(agentName: string) {
 describe("GET /api/agents/:agentName/active-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-  });
-
-  it("returns hasActiveWork: true with context when agent has an active lease", async () => {
+    // Default: return the same lease for both findFirst calls (resolveActiveWork and leaseId fetch)
     mocks.leaseFindFirst.mockResolvedValue({
       id: "l-1",
       agentName: "test-agent",
@@ -50,7 +55,10 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
       },
     });
+    mocks.issueFindUnique.mockResolvedValue({ id: "issue-abc" });
+  });
 
+  it("returns hasActiveWork: true with context and leaseId when agent has an active lease", async () => {
     const res = await makeActiveWorkRequest("test-agent");
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -59,10 +67,11 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(body.context.repoFullName).toBe("org/repo");
     expect(body.context.issueNumber).toBe(42);
     expect(body.context.branch).toBe("feat/my-feature");
+    expect(body.context.leaseId).toBe("l-1");
   });
 
   it("returns hasActiveWork: false when no active lease exists", async () => {
-    mocks.leaseFindFirst.mockResolvedValue(null);
+    mocks.leaseFindFirst.mockResolvedValueOnce(null);
 
     const res = await makeActiveWorkRequest("unknown-agent");
     expect(res.status).toBe(200);
@@ -71,7 +80,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
   });
 
   it("returns hasActiveWork: false when all leases are expired", async () => {
-    mocks.leaseFindFirst.mockResolvedValue({
+    mocks.leaseFindFirst.mockResolvedValueOnce({
       id: "l-1",
       agentName: "test-agent",
       issueId: "issue-abc",
@@ -93,7 +102,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
   });
 
   it("returns hasActiveWork: false when checkpoint is invalid", async () => {
-    mocks.leaseFindFirst.mockResolvedValue({
+    mocks.leaseFindFirst.mockResolvedValueOnce({
       id: "l-1",
       agentName: "test-agent",
       issueId: "issue-abc",
@@ -107,6 +116,30 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
       },
     });
+
+    const res = await makeActiveWorkRequest("test-agent");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.hasActiveWork).toBe(false);
+  });
+
+  it("returns hasActiveWork: false when referenced issue is missing (orphaned lease)", async () => {
+    mocks.leaseFindFirst.mockResolvedValueOnce({
+      id: "l-1",
+      agentName: "test-agent",
+      issueId: "issue-missing",
+      checkpoint: "issue_claimed",
+      branch: null,
+      prUrl: null,
+      expiredAt: new Date(Date.now() + 60000),
+      renewedAt: new Date(),
+      issue: {
+        number: 999,
+        repository: { fullName: "org/repo" },
+      },
+    });
+
+    mocks.issueFindUnique.mockResolvedValueOnce(null);
 
     const res = await makeActiveWorkRequest("test-agent");
     expect(res.status).toBe(200);

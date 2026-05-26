@@ -19,6 +19,12 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: {
       create: vi.fn(async () => ({ id: "audit-1" })),
     },
+    lease: {
+      findFirst: vi.fn(async () => null),
+    },
+    issue: {
+      findUnique: vi.fn(async () => null),
+    },
   },
   asAgentWorkClient: (client: any) => ({
     agentWork: mockAgentWork,

@@ -40,8 +40,16 @@ vi.mock("@/lib/prisma", () => ({
     agentWorkHistory: {
       create: vi.fn(),
     },
-    $transaction: vi.fn(async (fn: (tx: any) => Promise<any>) => {
-      return fn({
+    issue: {
+      findUnique: vi.fn(),
+    },
+    $transaction: vi.fn(async (arg: any) => {
+      // Handle array of promises (parallel execution used in release by agentName+issueId)
+      if (Array.isArray(arg)) {
+        return Promise.all(arg);
+      }
+      // Handle function argument (used in original release path)
+      return arg({
         agentWork: {
           findFirst: vi.fn(),
           update: vi.fn(),
@@ -65,7 +73,14 @@ vi.mock("@/lib/agent-work", () => ({
   releaseStaleWork: vi.fn(async () => []),
 }));
 
+vi.mock("@/lib/lease", () => ({
+  releaseLeaseByAgentAndIssue: vi.fn(async () => 1),
+  releaseAllLeasesByAgent: vi.fn(async () => 1),
+  releaseAgentWorkByAgentAndIssue: vi.fn(async () => 0),
+}));
+
 import { prisma } from "@/lib/prisma";
+import * as leaseModule from "@/lib/lease";
 import { GET, POST } from "./route";
 
 const agentWork = prisma.agentWork as any;
@@ -73,6 +88,12 @@ const lease = prisma.lease as any;
 const auditLog = prisma.auditLog as any;
 const agentWorkHistory = prisma.agentWorkHistory as any;
 const transaction = prisma.$transaction as any;
+const issueFindUnique = prisma.issue.findUnique as any;
+
+// Access the mocked lease module functions (they are vi.fn() mocks)
+const releaseLeaseByAgentAndIssueMock = leaseModule.releaseLeaseByAgentAndIssue as any;
+const releaseAllLeasesByAgentMock = leaseModule.releaseAllLeasesByAgent as any;
+const releaseAgentWorkByAgentAndIssueMock = leaseModule.releaseAgentWorkByAgentAndIssue as any;
 
 // ─── GET Tests ───────────────────────────────────────────────────────────────
 
@@ -201,7 +222,7 @@ describe("POST /api/agent-work", () => {
     vi.clearAllMocks();
 
     // Default mock for transaction's agentWork.update
-    transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+    transaction.mockImplementation(async (arg: any) => {
       const txAgentWorkUpdate = vi.fn(async () => ({
         id: "work-1",
         agentName: "old-agent",
@@ -222,7 +243,12 @@ describe("POST /api/agent-work", () => {
       const txAgentWorkFindFirst = vi.fn();
       const txAgentWorkHistoryCreate = vi.fn(async () => ({ id: "hist-1" }));
 
-      return fn({
+      // Handle array of promises (parallel execution)
+      if (Array.isArray(arg)) {
+        return Promise.all(arg);
+      }
+
+      return arg({
         agentWork: {
           update: txAgentWorkUpdate,
           findFirst: txAgentWorkFindFirst,
@@ -290,7 +316,7 @@ describe("POST /api/agent-work", () => {
       const res = await makePostRequest({ action: "release" });
       expect(res.status).toBe(400);
       const body = await res.json();
-      expect(body.error).toBe("Missing workId or leaseId");
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
     });
 
     it("creates audit log on successful release", async () => {
@@ -565,6 +591,120 @@ describe("POST /api/agent-work", () => {
             action: "agent_work_reassigned",
             success: true,
             notes: expect.stringContaining("Reassigned work from old-agent to new-agent"),
+          }),
+        })
+      );
+    });
+  });
+
+  describe("release by agentName + issueId", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      releaseLeaseByAgentAndIssueMock.mockResolvedValue(1);
+      releaseAgentWorkByAgentAndIssueMock.mockResolvedValue(0);
+      auditLog.create.mockResolvedValue({ id: "audit-1" });
+    });
+
+    it("returns 400 when agentName is missing", async () => {
+      const res = await makePostRequest({ action: "release", issueId: "issue-1" });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
+    });
+
+    it("returns 400 when neither issueId nor releaseAll is provided", async () => {
+      const res = await makePostRequest({ action: "release", agentName: "test-agent" });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing required field: issueId, or set releaseAll: true");
+    });
+
+    it("releases leases and work by agentName + issueId", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(null);
+      issueFindUnique.mockResolvedValueOnce({ number: 42, repository: { fullName: "org/repo" } });
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        issueId: "issue-orphaned",
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.releasedLeases).toBe(1);
+      expect(body.releasedWork).toBe(0);
+    });
+
+    it("creates audit log with orphan_work_released action", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(null);
+      issueFindUnique.mockResolvedValueOnce({ number: 42, repository: { fullName: "org/repo" } });
+      await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        issueId: "issue-orphaned",
+      });
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "orphan_work_released",
+            success: true,
+            notes: expect.stringContaining("Released 1 lease(s)"),
+          }),
+        })
+      );
+    });
+
+    it("returns 400 when issueId is missing and releaseAll is false", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        releaseAll: false,
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing required field: issueId, or set releaseAll: true");
+    });
+  });
+
+  describe("release all by agentName", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      releaseAllLeasesByAgentMock.mockResolvedValue(1);
+      auditLog.create.mockResolvedValue({ id: "audit-1" });
+    });
+
+    it("releases all leases and work for an agent when releaseAll is true", async () => {
+      // Mock findMany to return a work item, then findFirst to get repo info
+      agentWork.findMany.mockResolvedValueOnce([{ id: "work-1", issueId: "issue-1" }]);
+      agentWork.findFirst.mockResolvedValueOnce({
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        releaseAll: true,
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.releasedLeases).toBe(1);
+    });
+
+    it("creates audit log with orphan_work_released action for releaseAll", async () => {
+      agentWork.findMany.mockResolvedValueOnce([{ id: "work-1", issueId: "issue-1" }]);
+      agentWork.findFirst.mockResolvedValueOnce({
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+      await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        releaseAll: true,
+      });
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "orphan_work_released",
+            success: true,
+            notes: expect.stringContaining("Released 1 lease(s)"),
           }),
         })
       );

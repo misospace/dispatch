@@ -10,6 +10,8 @@ const { mocks } = vi.hoisted(() => ({
     leaseDeleteMany: vi.fn(),
     leaseFindFirst: vi.fn(),
     leaseFindMany: vi.fn(),
+    issueFindUnique: vi.fn(),
+    auditLogCreate: vi.fn(),
   },
 }));
 
@@ -24,6 +26,12 @@ vi.mock("@/lib/prisma", () => ({
       deleteMany: mocks.leaseDeleteMany,
       findFirst: mocks.leaseFindFirst,
       findMany: mocks.leaseFindMany,
+    },
+    issue: {
+      findUnique: mocks.issueFindUnique,
+    },
+    auditLog: {
+      create: mocks.auditLogCreate,
     },
   },
 }));
@@ -238,13 +246,13 @@ describe("resolveActiveWork", () => {
       issue: { number: 42, repository: { fullName: "misospace/dispatch" } },
     }));
 
+    mocks.issueFindUnique.mockImplementation(() => Promise.resolve({ id: "i-1" }));
+
     const result = await resolveActiveWork("saffron");
 
     expect(result).not.toBeNull();
     expect(result!.issueNumber).toBe(42);
     expect(result!.repoFullName).toBe("misospace/dispatch");
-    expect(result!.agentName).toBe("saffron");
-    expect(result!.checkpoint).toBe("issue_claimed");
   });
 
   it("returns null when agent has no active lease", async () => {
@@ -268,6 +276,8 @@ describe("resolveActiveWork", () => {
       createdAt: makeNow(),
       issue: { number: 123, repository: { fullName: "org/repo" } },
     }));
+
+    mocks.issueFindUnique.mockImplementation(() => Promise.resolve({ id: "i-2" }));
 
     const result = await resolveActiveWork("saffron");
 
@@ -295,6 +305,59 @@ describe("resolveActiveWork", () => {
 
     expect(result).toBeNull();
     expect(mocks.leaseDelete).toHaveBeenCalledWith({ where: { id: "l-1" } });
+  });
+
+  it("releases and returns null when referenced issue is missing (orphaned lease)", async () => {
+    mocks.leaseFindFirst.mockImplementation(() => Promise.resolve({
+      id: "l-1",
+      agentName: "saffron",
+      issueId: "i-missing",
+      checkpoint: "issue_claimed",
+      branch: null,
+      prUrl: null,
+      expiredAt: new Date(Date.now() + 60_000),
+      renewedAt: makeNow(),
+      createdAt: makeNow(),
+      issue: { number: 999, repository: { fullName: "misospace/dispatch" } },
+    }));
+
+    mocks.issueFindUnique.mockImplementation(() => Promise.resolve(null));
+
+    const result = await resolveActiveWork("saffron");
+
+    expect(result).toBeNull();
+    expect(mocks.leaseDelete).toHaveBeenCalledWith({ where: { id: "l-1" } });
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "orphan_lease_released",
+          notes: expect.stringContaining("referenced issue i-missing not found in Dispatch"),
+        }),
+      })
+    );
+  });
+
+  it("returns context and does not release when referenced issue exists", async () => {
+    mocks.leaseFindFirst.mockImplementation(() => Promise.resolve({
+      id: "l-1",
+      agentName: "saffron",
+      issueId: "i-1",
+      checkpoint: "issue_claimed",
+      branch: null,
+      prUrl: null,
+      expiredAt: new Date(Date.now() + 60_000),
+      renewedAt: makeNow(),
+      createdAt: makeNow(),
+      issue: { number: 42, repository: { fullName: "misospace/dispatch" } },
+    }));
+
+    mocks.issueFindUnique.mockImplementation(() => Promise.resolve({ id: "i-1" }));
+
+    const result = await resolveActiveWork("saffron");
+
+    expect(result).not.toBeNull();
+    expect(result!.issueNumber).toBe(42);
+    expect(mocks.leaseDelete).not.toHaveBeenCalled();
   });
 });
 

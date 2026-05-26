@@ -13,7 +13,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ age
       return NextResponse.json(response);
     }
 
-    const response: ActiveWorkResult = { hasActiveWork: true, context };
+    const response: ActiveWorkResult = {
+      hasActiveWork: true,
+      context,
+    };
     return NextResponse.json(response);
   } catch (error) {
     console.error("Failed to fetch active work:", error);

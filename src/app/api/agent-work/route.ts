@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { releaseStaleWork } from "@/lib/agent-work";
+import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
 
 export const dynamic = "force-dynamic";
 
@@ -195,77 +196,189 @@ export async function POST(request: Request) {
 async function releaseAgentWork(body: Record<string, unknown>) {
   const workId = typeof body.workId === "string" ? body.workId : null;
   const leaseId = typeof body.leaseId === "string" ? body.leaseId : null;
+  const agentName = typeof body.agentName === "string" ? body.agentName : null;
+  const issueId = typeof body.issueId === "string" ? body.issueId : null;
+  const releaseAll = body.releaseAll === true;
   const reason = typeof body.reason === "string" ? body.reason : "Released by operator";
 
-  if (!workId && !leaseId) {
-    return NextResponse.json({ error: "Missing workId or leaseId" }, { status: 400 });
+  // Original release path by workId or leaseId (backward compatible)
+  if (workId || leaseId) {
+    if (!workId && !leaseId) {
+      return NextResponse.json({ error: "Missing workId or leaseId" }, { status: 400 });
+    }
+
+    try {
+      let work = null;
+
+      if (workId) {
+        const existing = await prisma.agentWork.findUnique({ where: { id: workId } });
+        if (!existing) {
+          return NextResponse.json({ error: "Work item not found" }, { status: 404 });
+        }
+        if (existing.state === "DONE" || existing.state === "RELEASED") {
+          return NextResponse.json({ error: "Work is already completed or released" }, { status: 400 });
+        }
+
+        work = await prisma.$transaction(async (tx) => {
+          const updated = await tx.agentWork.update({
+            where: { id: workId },
+            data: { state: "RELEASED", leaseExpiresAt: new Date() },
+            include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } },
+          });
+          await tx.agentWorkHistory.create({
+            data: { workId, action: "released", summary: reason },
+          });
+          return updated;
+        });
+
+        await prisma.auditLog.create({
+          data: {
+            actor: "operator",
+            action: "agent_work_released",
+            repoFullName: work.issue?.repository?.fullName ?? "",
+            issueNumber: work.issue?.number,
+            issueId: work.issueId,
+            success: true,
+            notes: `Released work for agent ${work.agentName}: ${reason}`,
+          },
+        });
+      }
+
+    if (leaseId) {
+        const lease = await prisma.lease.findUnique({ where: { id: leaseId }, include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } } });
+        if (!lease) {
+          return NextResponse.json({ error: "Lease not found" }, { status: 404 });
+        }
+
+        await prisma.lease.delete({ where: { id: leaseId } });
+
+        await prisma.auditLog.create({
+          data: {
+            actor: "operator",
+            action: "lease_released",
+            repoFullName: lease.issue?.repository?.fullName ?? "",
+            issueNumber: lease.issue?.number,
+            issueId: lease.issueId,
+            success: true,
+            notes: `Released lease for agent ${lease.agentName}: ${reason}`,
+          },
+        });
+      }
+
+      return NextResponse.json({ success: true, reason });
+    } catch (error) {
+      console.error("Failed to release agent work:", error);
+      await prisma.auditLog.create({
+        data: {
+          actor: "operator",
+          action: "agent_work_release_failed",
+          repoFullName: "",
+          success: false,
+          errorMessage: String(error),
+        },
+      });
+      return NextResponse.json({ error: "Failed to release agent work" }, { status: 500 });
+    }
+  }
+
+  // New release path by agentName + issueId (operator recovery for orphaned work)
+  if (!agentName) {
+    return NextResponse.json({ error: "Missing workId, leaseId, or agentName" }, { status: 400 });
   }
 
   try {
-    let work = null;
+    let releasedLeases = 0;
+    let releasedWork = 0;
+    let repoFullName = "";
+    let issueNumber: number | null = null;
 
-    if (workId) {
-      const existing = await prisma.agentWork.findUnique({ where: { id: workId } });
-      if (!existing) {
-        return NextResponse.json({ error: "Work item not found" }, { status: 404 });
-      }
-      if (existing.state === "DONE" || existing.state === "RELEASED") {
-        return NextResponse.json({ error: "Work is already completed or released" }, { status: 400 });
-      }
+    if (issueId) {
+      // Release by agentName + issueId
+      const [leasesReleased, workReleased] = await Promise.all([
+        releaseLeaseByAgentAndIssue(agentName, issueId),
+        releaseAgentWorkByAgentAndIssue(agentName, issueId),
+      ]);
+      releasedLeases = leasesReleased;
+      releasedWork = workReleased;
 
-      work = await prisma.$transaction(async (tx) => {
-        const updated = await tx.agentWork.update({
-          where: { id: workId },
-          data: { state: "RELEASED", leaseExpiresAt: new Date() },
+      // Get issue details for audit log
+      const issue = await prisma.issue.findUnique({
+        where: { id: issueId },
+        select: { number: true, repository: { select: { fullName: true } } },
+      });
+      if (issue) {
+        repoFullName = issue.repository.fullName;
+        issueNumber = issue.number;
+      }
+    } else if (releaseAll) {
+      // Release all active work for an agent
+      const [leasesReleased, workItems] = await Promise.all([
+        releaseAllLeasesByAgent(agentName),
+        prisma.agentWork.findMany({
+          where: { agentName, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
+          select: { id: true, issueId: true },
+        }),
+      ]);
+      releasedLeases = leasesReleased;
+
+      // Release each work item and collect repo info from the first one
+      if (workItems.length > 0) {
+        const now = new Date();
+        await prisma.$transaction(
+          workItems.map((w: any) =>
+            prisma.agentWork.update({
+              where: { id: w.id },
+              data: { state: "RELEASED", leaseExpiresAt: now },
+            })
+          )
+        );
+        await prisma.$transaction(
+          workItems.map((w: any) =>
+            prisma.agentWorkHistory.create({
+              data: { workId: w.id, action: "released_by_operator", summary: `Released all work for agent ${agentName}: ${reason}` },
+            })
+          )
+        );
+        releasedWork = workItems.length;
+
+        // Get repo info from the first issue that has one
+        const firstIssue = await prisma.agentWork.findFirst({
+          where: { id: workItems[0].id },
           include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } },
         });
-        await tx.agentWorkHistory.create({
-          data: { workId, action: "released", summary: reason },
-        });
-        return updated;
-      });
-
-      await prisma.auditLog.create({
-        data: {
-          actor: "operator",
-          action: "agent_work_released",
-          repoFullName: work.issue?.repository?.fullName ?? "",
-          issueNumber: work.issue?.number,
-          issueId: work.issueId,
-          success: true,
-          notes: `Released work for agent ${work.agentName}: ${reason}`,
-        },
-      });
-    }
-
-  if (leaseId) {
-      const lease = await prisma.lease.findUnique({ where: { id: leaseId }, include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } } });
-      if (!lease) {
-        return NextResponse.json({ error: "Lease not found" }, { status: 404 });
+        if (firstIssue?.issue) {
+          repoFullName = firstIssue.issue.repository.fullName;
+          issueNumber = firstIssue.issue.number;
+        }
       }
-
-      await prisma.lease.delete({ where: { id: leaseId } });
-
-      await prisma.auditLog.create({
-        data: {
-          actor: "operator",
-          action: "lease_released",
-          repoFullName: lease.issue?.repository?.fullName ?? "",
-          issueNumber: lease.issue?.number,
-          issueId: lease.issueId,
-          success: true,
-          notes: `Released lease for agent ${lease.agentName}: ${reason}`,
-        },
-      });
+    } else {
+      return NextResponse.json({ error: "Missing required field: issueId, or set releaseAll: true" }, { status: 400 });
     }
 
-    return NextResponse.json({ success: true, reason });
+    await prisma.auditLog.create({
+      data: {
+        actor: "operator",
+        action: "orphan_work_released",
+        repoFullName,
+        issueNumber: issueNumber ?? undefined,
+        issueId: issueId ?? undefined,
+        success: true,
+        notes: `Released ${releasedLeases} lease(s) and ${releasedWork} work item(s) for agent ${agentName}: ${reason}`,
+      },
+    });
+
+    return NextResponse.json({
+      success: true,
+      reason,
+      releasedLeases,
+      releasedWork,
+    });
   } catch (error) {
     console.error("Failed to release agent work:", error);
     await prisma.auditLog.create({
       data: {
         actor: "operator",
-        action: "agent_work_release_failed",
+        action: "orphan_work_release_failed",
         repoFullName: "",
         success: false,
         errorMessage: String(error),
