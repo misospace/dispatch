@@ -1,8 +1,16 @@
 "use client";
 
-import { signIn } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+
+const DEFAULT_CALLBACK_URL = "/board";
+
+function safeCallbackUrl(raw: string | null): string {
+  if (!raw || raw.trim() === "") return DEFAULT_CALLBACK_URL;
+  if (raw.startsWith("//") || /^https?:\/\//i.test(raw)) return DEFAULT_CALLBACK_URL;
+  if (raw.startsWith("/")) return raw;
+  return DEFAULT_CALLBACK_URL;
+}
 
 export default function LoginPage() {
   return (
@@ -17,7 +25,7 @@ function LoginContent() {
   const searchParams = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const callbackUrl = searchParams.get("callbackUrl") || "/board";
+  const callbackUrl = safeCallbackUrl(searchParams.get("callbackUrl"));
 
   useEffect(() => {
     // Check if already logged in
@@ -31,18 +39,10 @@ function LoginContent() {
       .catch(() => {});
   }, [callbackUrl, router]);
 
-  const handleSignIn = async () => {
+  const handleSignIn = () => {
     setLoading(true);
     setError(null);
-    try {
-      await signIn("oidc", {
-        redirect: true,
-        redirectTo: callbackUrl,
-      });
-    } catch (err) {
-      setError("Failed to sign in. Please try again.");
-      setLoading(false);
-    }
+    window.location.href = `/api/login?callbackUrl=${encodeURIComponent(callbackUrl)}`;
   };
 
   return (
