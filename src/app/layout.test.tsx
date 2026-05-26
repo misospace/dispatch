@@ -17,6 +17,10 @@ vi.mock("@/lib/version", () => ({
   getVersionLabel: () => versionLabel,
 }));
 
+vi.mock("@/lib/version-client", () => ({
+  getClientVersionLabel: () => versionLabel,
+}));
+
 vi.mock("@/components/theme-toggle", () => ({
   ThemeToggle: function ThemeToggle() {
     return React.createElement("button", { "aria-label": "Switch to dark mode" }, "theme-toggle");

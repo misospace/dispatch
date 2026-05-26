@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
-import { getVersionLabel } from "@/lib/version";
+import { getClientVersionLabel } from "@/lib/version-client";
 
 const navLinks = [
   { href: "/", label: "Overview" },
@@ -71,7 +71,7 @@ export function MobileNav() {
             </Link>
           ))}
           <div className="pt-2 flex items-center justify-between border-t mt-1">
-            <span className="text-xs text-muted-foreground/60">{getVersionLabel()}</span>
+            <span className="text-xs text-muted-foreground/60">{getClientVersionLabel()}</span>
           </div>
         </nav>
       )}
