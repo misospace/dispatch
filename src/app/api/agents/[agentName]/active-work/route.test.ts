@@ -140,7 +140,6 @@ describe("GET /api/agents/:agentName/active-work", () => {
     });
 
     mocks.issueFindUnique.mockResolvedValueOnce(null);
-    mocks.leaseDelete.mockResolvedValue({ id: "l-1" });
 
     const res = await makeActiveWorkRequest("test-agent");
     expect(res.status).toBe(200);

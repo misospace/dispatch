@@ -316,7 +316,7 @@ describe("POST /api/agent-work", () => {
       const res = await makePostRequest({ action: "release" });
       expect(res.status).toBe(400);
       const body = await res.json();
-      expect(body.error).toBe("Missing workId or leaseId");
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
     });
 
     it("creates audit log on successful release", async () => {
@@ -609,7 +609,7 @@ describe("POST /api/agent-work", () => {
       const res = await makePostRequest({ action: "release", issueId: "issue-1" });
       expect(res.status).toBe(400);
       const body = await res.json();
-      expect(body.error).toBe("Missing workId or leaseId");
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
     });
 
     it("returns 400 when neither issueId nor releaseAll is provided", async () => {

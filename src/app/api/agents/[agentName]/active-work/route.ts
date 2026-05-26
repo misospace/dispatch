@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { resolveActiveWork, findActiveLeasesForIssue } from "@/lib/lease";
+import { resolveActiveWork } from "@/lib/lease";
 import type { ActiveWorkResult } from "@/lib/next-action";
 
 export async function GET(_request: Request, { params }: { params: Promise<{ agentName: string }> }) {
@@ -13,17 +13,9 @@ export async function GET(_request: Request, { params }: { params: Promise<{ age
       return NextResponse.json(response);
     }
 
-    // Fetch the leaseId so operators can use it for recovery via POST /api/agent-work
-    const now = new Date();
-    const lease = await (await import("@/lib/prisma")).prisma.lease.findFirst({
-      where: { agentName, expiredAt: { gt: now } },
-      orderBy: { renewedAt: "desc" },
-      select: { id: true },
-    });
-
     const response: ActiveWorkResult = {
       hasActiveWork: true,
-      context: lease ? { ...context, leaseId: lease.id } : context,
+      context,
     };
     return NextResponse.json(response);
   } catch (error) {

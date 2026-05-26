@@ -7,7 +7,7 @@
 // another agent's claimed work.
 
 import { prisma } from "@/lib/prisma";
-import type { CheckpointValue, ResumeContext } from "./next-action";
+import type { CheckpointValue, ResumeContext, ResumeContextWithLease } from "./next-action";
 import { buildResumeContext, isValidCheckpoint } from "./next-action";
 
 // ─── Lease TTL defaults ─────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ export async function releaseExpiredLeases(issueId: string): Promise<number> {
  * Dispatch's database, the lease is released and null is returned so the agent
  * can pick up new work instead of being blocked by a ghost assignment.
  */
-export async function resolveActiveWork(agentName: string): Promise<ResumeContext | null> {
+export async function resolveActiveWork(agentName: string): Promise<ResumeContextWithLease | null> {
   const now = new Date();
 
   // Find the agent's non-expired lease (most recently renewed first)
@@ -200,15 +200,18 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
     return null;
   }
 
-  return buildResumeContext({
-    issueId: lease.issueId,
-    repoFullName: lease.issue.repository.fullName,
-    issueNumber: lease.issue.number,
-    agentName: lease.agentName,
-    checkpoint: lease.checkpoint as CheckpointValue,
-    branch: lease.branch ?? undefined,
-    prUrl: lease.prUrl ?? undefined,
-  });
+  return {
+    ...buildResumeContext({
+      issueId: lease.issueId,
+      repoFullName: lease.issue.repository.fullName,
+      issueNumber: lease.issue.number,
+      agentName: lease.agentName,
+      checkpoint: lease.checkpoint as CheckpointValue,
+      branch: lease.branch ?? undefined,
+      prUrl: lease.prUrl ?? undefined,
+    }),
+    leaseId: lease.id,
+  };
 }
 
 /**

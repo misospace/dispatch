@@ -283,7 +283,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
 
   // New release path by agentName + issueId (operator recovery for orphaned work)
   if (!agentName) {
-    return NextResponse.json({ error: "Missing workId or leaseId" }, { status: 400 });
+    return NextResponse.json({ error: "Missing workId, leaseId, or agentName" }, { status: 400 });
   }
 
   try {
