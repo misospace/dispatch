@@ -128,6 +128,19 @@ describe("RootLayout app shell", () => {
     expect(screen.getByText("Automation")).toBeInTheDocument();
   });
 
+  it("mobile nav contains theme toggle and version label when open", () => {
+    const { container } = render(
+      <RootLayout>
+        <span />
+      </RootLayout>,
+    );
+    const checkbox = container.querySelector<HTMLInputElement>("#mobile-nav-toggle")!;
+    fireEvent.click(checkbox);
+    const mobileNav = container.querySelector("nav.border-t");
+    expect(mobileNav?.querySelector("button[aria-label='Switch to dark mode']")).toBeTruthy();
+    expect(mobileNav?.querySelector("span")).toBeTruthy();
+  });
+
   it("renders theme toggle in desktop header", () => {
     const { container } = render(
       <RootLayout>
