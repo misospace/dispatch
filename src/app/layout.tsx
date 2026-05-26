@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import Image from "next/image";
 import Link from "next/link";
 import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -11,6 +12,13 @@ const inter = Inter({ subsets: ["latin"] });
 export const metadata: Metadata = {
   title: "Dispatch",
   description: "Kanban for AI agent work",
+  icons: {
+    icon: [
+      { url: "/images/favicon-16.png", sizes: "16x16", type: "image/png" },
+      { url: "/images/favicon-32.png", sizes: "32x32", type: "image/png" },
+    ],
+    apple: "/images/apple-touch-icon.png",
+  },
 };
 
 export default function RootLayout({
@@ -21,6 +29,10 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
+        <link rel="icon" href="/images/favicon-16.png" sizes="16x16" type="image/png" />
+        <link rel="icon" href="/images/favicon-32.png" sizes="32x32" type="image/png" />
+        <link rel="apple-touch-icon" href="/images/apple-touch-icon.png" />
+        <meta name="theme-color" content="#000000" />
         <script dangerouslySetInnerHTML={{ __html: `
           (function() {
             var theme = localStorage.getItem('dispatch-theme');
@@ -34,8 +46,15 @@ export default function RootLayout({
         <div className="min-h-screen flex flex-col bg-background">
           <header className="border-b bg-card">
             <div className="mx-auto w-full max-w-screen-2xl px-4 sm:px-6 lg:px-8 flex items-center gap-6 py-4">
-              <Link href="/" className="font-bold text-lg shrink-0">
-                Dispatch
+              <Link href="/" className="flex items-center gap-3 shrink-0">
+                <Image
+                  src="/images/logo.png"
+                  alt="Dispatch"
+                  width={28}
+                  height={28}
+                  className="shrink-0"
+                />
+                <span className="font-bold text-lg">Dispatch</span>
               </Link>
 
               {/* Desktop navigation */}

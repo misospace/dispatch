@@ -1,5 +1,9 @@
 # Dispatch
 
+<p align="center">
+  <img src="public/images/logo.png" alt="Dispatch Logo" width="120" height="120" />
+</p>
+
 Kanban for AI agent work.
 
 Dispatch is a harness-agnostic Kanban and work dispatch layer for AI agents. It turns GitHub Issues and PR follow-ups into claimable queues, tracks agent runs, manages status transitions, and keeps an audit trail while GitHub remains the source of truth.
