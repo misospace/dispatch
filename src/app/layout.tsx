@@ -3,7 +3,7 @@ import { Inter } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
-import { getVersionLabel } from "@/lib/version";
+import { MobileNav } from "@/components/mobile-nav";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -59,7 +59,6 @@ export default function RootLayout({
               {/* Mobile menu button */}
               <MobileNav />
 
-              <span className="text-xs text-muted-foreground/60 shrink-0">{getVersionLabel()}</span>
               <div className="ml-auto shrink-0">
                 <ThemeToggle />
               </div>
@@ -69,52 +68,5 @@ export default function RootLayout({
         </div>
       </body>
     </html>
-  );
-}
-
-function MobileNav() {
-  return (
-    <>
-      <input type="checkbox" id="mobile-nav-toggle" className="peer hidden" />
-      <label
-        htmlFor="mobile-nav-toggle"
-        role="button"
-        className="sm:hidden flex items-center gap-1 text-muted-foreground hover:text-foreground cursor-pointer"
-        aria-label="Toggle navigation menu"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="20"
-          height="20"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <line x1="4" x2="20" y1="12" y2="12" />
-          <line x1="4" x2="20" y1="6" y2="6" />
-          <line x1="4" x2="20" y1="18" y2="18" />
-        </svg>
-      </label>
-      <nav className="sm:hidden hidden peer-checked:block border-t py-3 px-4 flex flex-col gap-2 text-sm bg-card">
-        <Link href="/" className="text-muted-foreground hover:text-foreground py-1">
-          Overview
-        </Link>
-        <Link href="/board" className="text-muted-foreground hover:text-foreground py-1">
-          Board
-        </Link>
-        <Link href="/projects" className="text-muted-foreground hover:text-foreground py-1">
-          Projects
-        </Link>
-        <Link href="/agents" className="text-muted-foreground hover:text-foreground py-1">
-          Agents
-        </Link>
-        <Link href="/automation" className="text-muted-foreground hover:text-foreground py-1">
-          Automation
-        </Link>
-      </nav>
-    </>
   );
 }
