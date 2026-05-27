@@ -11,7 +11,8 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const body = await request.json();
+    const text = await request.text();
+    const body = text ? JSON.parse(text) : {};
     const { repoFullName } = body as { repoFullName?: string };
 
     let repos = await getSyncRepos();
