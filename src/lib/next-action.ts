@@ -107,6 +107,9 @@ export interface ResumeContext {
 
 export interface ResumeContextWithLease extends ResumeContext {
   leaseId: string;
+  lane: string;
+  status: string;
+  labels: string[];
 }
 
 // ─── Resume Context Builder ─────────────────────────────────────────────────
