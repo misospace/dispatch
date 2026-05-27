@@ -52,14 +52,22 @@ vi.mock("@/lib/issue-sync", () => ({
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 
-function makeRequest(body?: Record<string, unknown>, includeAuth = true, extraHeaders: Record<string, string> = {}) {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+function makeRequest(
+  body?: Record<string, unknown> | string,
+  includeAuth = true,
+  extraHeaders: Record<string, string> = {},
+) {
+  const headers: Record<string, string> = {};
   if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
   Object.assign(headers, extraHeaders);
+  const bodyValue = typeof body === "string" ? body : JSON.stringify(body ?? {});
+  if (typeof body === "string" || body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
   return new Request("http://localhost/api/sync", {
     method: "POST",
     headers,
-    body: JSON.stringify(body ?? {}),
+    body: typeof body === "string" ? body : body !== undefined ? JSON.stringify(body) : undefined,
   }) as unknown as Parameters<typeof POST>[0];
 }
 
@@ -145,5 +153,15 @@ describe("POST /api/sync — validation", () => {
     vi.mocked(await import("@/lib/config")).getSyncRepos.mockResolvedValue([]);
     const res = await POST(makeRequest({ repoFullName: "unknown/repo" }));
     expect(res.status).toBe(404);
+  });
+
+  it("succeeds with no body (truly empty request)", async () => {
+    const res = await POST(makeRequest(undefined));
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 400 when body is malformed JSON", async () => {
+    const res = await POST(makeRequest("{bad json}"));
+    expect(res.status).toBe(400);
   });
 });

@@ -11,7 +11,15 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const body = await request.json();
+    const text = await request.text();
+    let body: Record<string, unknown> = {};
+    if (text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return NextResponse.json({ error: "Malformed JSON in request body" }, { status: 400 });
+      }
+    }
     const { repoFullName } = body as { repoFullName?: string };
 
     let repos = await getSyncRepos();
