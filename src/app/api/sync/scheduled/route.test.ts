@@ -57,6 +57,7 @@ function createPrismaMock() {
         findUnique: vi.fn(),
         update: vi.fn().mockResolvedValue(undefined),
         create: vi.fn().mockResolvedValue(undefined),
+        findMany: vi.fn().mockResolvedValue([]),
       },
       $transaction: vi.fn(async (fn: (tx: any) => Promise<string>) => {
         const tx = {
@@ -81,6 +82,12 @@ function createPrismaMock() {
 function createGithubMock() {
   return {
     fetchIssues: vi.fn().mockResolvedValue([]),
+    fetchIssue: vi.fn().mockResolvedValue({
+      number: 1,
+      state: "open",
+      labels: [],
+      closed_at: null,
+    }),
     fetchRepo: vi.fn().mockResolvedValue({
       name: "test-repo",
       owner: { login: "test-owner" },
@@ -403,9 +410,166 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
 
   it("includes startedAt and finishedAt in response", async () => {
     const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
     const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.startedAt).toBeDefined();
     expect(body.finishedAt).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Closed issue reconciliation tests
+// ---------------------------------------------------------------------------
+
+describe("POST /api/sync/scheduled — closed issue reconciliation", () => {
+  let prismaMock: ReturnType<typeof createPrismaMock>;
+  let githubMock: ReturnType<typeof createGithubMock>;
+  let configMock: ReturnType<typeof createConfigMock>;
+
+  beforeEach(() => {
+    vi.resetModules();
+    prismaMock = createPrismaMock();
+    githubMock = createGithubMock();
+    configMock = createConfigMock();
+    setupModules(prismaMock, githubMock, configMock);
+  });
+
+  it("reconciles a closed GitHub issue cached as status/in-review to status/done", async () => {
+    const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
+    prismaMock.prisma.issue.findMany.mockResolvedValue([
+      { id: "issue-1", number: 42, labels: ["status/in-review", "type/bug"], state: "open" },
+    ]);
+
+    githubMock.fetchIssue.mockResolvedValue({
+      number: 42,
+      state: "closed",
+      closed_at: "2025-01-15T10:00:00Z",
+      labels: [],
+    });
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closedIssueReconcile).toBeDefined();
+    expect(body.closedIssueReconcile.issuesReconciled).toBe(1);
+    expect(prismaMock.prisma.issue.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "issue-1" },
+        data: expect.objectContaining({
+          state: "closed",
+          labels: expect.arrayContaining(["status/done"]),
+        }),
+      }),
+    );
+  });
+
+  it("reconciles a closed GitHub issue cached as status/ready to status/done", async () => {
+    const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
+    prismaMock.prisma.issue.findMany.mockResolvedValue([
+      { id: "issue-2", number: 99, labels: ["status/ready", "type/feature"], state: "closed" },
+    ]);
+
+    githubMock.fetchIssue.mockResolvedValue({
+      number: 99,
+      state: "closed",
+      closed_at: null,
+      labels: [],
+    });
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closedIssueReconcile.issuesReconciled).toBe(1);
+    expect(prismaMock.prisma.issue.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "issue-2" },
+        data: expect.objectContaining({
+          state: "closed",
+          labels: expect.arrayContaining(["status/done"]),
+        }),
+      }),
+    );
+  });
+
+  it("leaves open issues that are still open on GitHub", async () => {
+    const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
+    prismaMock.prisma.issue.findMany.mockResolvedValue([
+      { id: "issue-3", number: 10, labels: ["status/in-progress"], state: "open" },
+    ]);
+
+    githubMock.fetchIssue.mockResolvedValue({
+      number: 10,
+      state: "open",
+      labels: ["status/in-progress"],
+    });
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closedIssueReconcile.issuesReconciled).toBe(0);
+    expect(prismaMock.prisma.issue.update).not.toHaveBeenCalled();
+  });
+
+  it("skips issues without active status labels", async () => {
+    const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
+    prismaMock.prisma.issue.findMany.mockResolvedValue([
+      { id: "issue-4", number: 5, labels: ["type/bug"], state: "open" },
+    ]);
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closedIssueReconcile.issuesChecked).toBe(0);
+  });
+
+  it("preserves agent/* labels during reconciliation", async () => {
+    const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
+    prismaMock.prisma.issue.findMany.mockResolvedValue([
+      { id: "issue-5", number: 7, labels: ["status/in-progress", "agent/alpha"], state: "open" },
+    ]);
+
+    githubMock.fetchIssue.mockResolvedValue({
+      number: 7,
+      state: "closed",
+      closed_at: "2025-06-01T12:00:00Z",
+      labels: [],
+    });
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(prismaMock.prisma.issue.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "issue-5" },
+        data: expect.objectContaining({
+          labels: expect.arrayContaining(["agent/alpha", "status/done"]),
+        }),
+      }),
+    );
+  });
+
+  it("includes closedIssueReconcile in response when reconciliation runs", async () => {
+    const { POST } = await import("./route");
+    prismaMock.prisma.syncLock.findUnique.mockResolvedValue(null);
+
+    prismaMock.prisma.issue.findMany.mockResolvedValue([]);
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.closedIssueReconcile).toBeDefined();
+    expect(body.closedIssueReconcile.issuesChecked).toBe(0);
   });
 });
