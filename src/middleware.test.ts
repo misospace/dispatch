@@ -18,6 +18,8 @@ function clearAll() {
   delete process.env.DISPATCH_AUTH_USERNAME;
   delete process.env.DISPATCH_AUTH_PASSWORD;
   delete process.env.DISPATCH_AGENT_TOKEN;
+  delete process.env.AUTH_URL;
+  delete process.env.NEXTAUTH_URL;
   delete process.env.NEXTAUTH_SECRET;
 }
 
@@ -92,6 +94,36 @@ describe("middleware auth protection", () => {
     const res = await middleware(makeRequest("/board"));
 
     expect(res.status).toBe(200);
+  });
+
+  it("reads the secure Auth.js session cookie for HTTPS OIDC deployments", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    process.env.NEXTAUTH_URL = "https://dispatch.example.com";
+    mocks.getToken.mockResolvedValue({ sub: "user-1" });
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.status).toBe(200);
+    expect(mocks.getToken).toHaveBeenCalledWith(expect.objectContaining({
+      secret: "secret",
+      secureCookie: true,
+    }));
+  });
+
+  it("reads the unprefixed Auth.js session cookie for HTTP OIDC deployments", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    process.env.NEXTAUTH_URL = "http://localhost:3000";
+    mocks.getToken.mockResolvedValue({ sub: "user-1" });
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.status).toBe(200);
+    expect(mocks.getToken).toHaveBeenCalledWith(expect.objectContaining({
+      secret: "secret",
+      secureCookie: false,
+    }));
   });
 
   it("passes API routes through in oidc mode for route-level auth", async () => {
