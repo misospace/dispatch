@@ -41,6 +41,22 @@ export interface RefreshIssueResult {
   issueData?: SingleIssueData;
 }
 
+export interface ReconcileClosedIssueResult {
+  repo: string;
+  issueNumber: number;
+  reconciled: boolean;
+  action: "marked_done" | "released_lease" | "no_change";
+  error: string | null;
+}
+
+export interface ClosedIssueReconcileResponse {
+  success: boolean;
+  reposProcessed: number;
+  issuesChecked: number;
+  issuesReconciled: number;
+  results: ReconcileClosedIssueResult[];
+}
+
 export interface SyncResponse {
   success: boolean;
   repos: number;
@@ -150,6 +166,106 @@ export async function syncIssuesForRepos(
     success: results.every((result) => result.error === null),
     repos: repos.length,
     syncedCount,
+    results,
+  };
+}
+
+/**
+ * Status labels that indicate an issue is actively being worked on.
+ * Closed issues with these labels in Dispatch need reconciliation.
+ */
+const ACTIVE_STATUS_LABELS = ["status/ready", "status/in-progress", "status/in-review"] as const;
+
+export async function reconcileClosedIssues(
+  repos: SyncRepo[],
+  fetchIssueFn: (repoFullName: string, issueNumber: number) => Promise<GitHubIssue>,
+  store: {
+    findActiveCachedIssues(repositoryId: string): Promise<Array<{ id: string; number: number; labels: string[]; state: string }>>;
+    updateIssue(id: string, data: { labels: string[]; state: string; closedAt: Date | null }): Promise<void>;
+  },
+): Promise<ClosedIssueReconcileResponse> {
+  const results: ReconcileClosedIssueResult[] = [];
+  let issuesReconciled = 0;
+
+  for (const repo of repos) {
+    try {
+      const cachedIssues = await store.findActiveCachedIssues(repo.id);
+      let repoReconciled = 0;
+
+      for (const cached of cachedIssues) {
+        const hasActiveStatus = ACTIVE_STATUS_LABELS.some((s) => cached.labels.includes(s));
+        if (!hasActiveStatus) continue;
+
+        try {
+          const ghIssue = await fetchIssueFn(repo.fullName, cached.number);
+
+          if (ghIssue.state === "closed") {
+            // Determine the new label: close any active status, add status/done
+            const newLabels = cached.labels
+              .filter((l) => !ACTIVE_STATUS_LABELS.includes(l as typeof ACTIVE_STATUS_LABELS[number]))
+              .concat(["status/done"]);
+
+            await store.updateIssue(cached.id, {
+              labels: newLabels,
+              state: "closed",
+              closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
+            });
+
+            repoReconciled++;
+            results.push({
+              repo: repo.fullName,
+              issueNumber: cached.number,
+              reconciled: true,
+              action: "marked_done",
+              error: null,
+            });
+
+            // If the issue had in-progress status, that implies a lease was active.
+            // Mark it as released for observability (actual lease release is handled separately).
+            if (cached.labels.includes("status/in-progress")) {
+              results[results.length - 1].action = "released_lease";
+            }
+          } else {
+            results.push({
+              repo: repo.fullName,
+              issueNumber: cached.number,
+              reconciled: false,
+              action: "no_change",
+              error: null,
+            });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown error";
+          console.error(`Reconcile failed for ${repo.fullName}#${cached.number}:`, error);
+          results.push({
+            repo: repo.fullName,
+            issueNumber: cached.number,
+            reconciled: false,
+            action: "no_change",
+            error: message,
+          });
+        }
+      }
+
+      issuesReconciled += repoReconciled;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Closed issue reconciliation failed for ${repo.fullName}:`, error);
+      results.push({
+        repo: repo.fullName,
+        issueNumber: 0,
+        reconciled: false,
+        action: "no_change",
+        error: message,
+      });
+    }
+  }
+
+  return {
+    success: results.every((r) => r.error === null || !r.reconciled),
+    reposProcessed: repos.length,
+    issuesChecked: results.length,
+    issuesReconciled,
     results,
   };
 }
