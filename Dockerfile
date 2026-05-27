@@ -36,6 +36,8 @@ COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 
+RUN mkdir -p /app/.next/cache && chown -R nextjs:nodejs /app/.next/cache
+
 RUN chmod +x /docker-entrypoint.sh
 
 USER nextjs
