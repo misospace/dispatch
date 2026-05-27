@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
-import Image from "next/image";
 import Link from "next/link";
 import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -14,8 +13,8 @@ export const metadata: Metadata = {
   description: "Kanban for AI agent work",
   icons: {
     icon: [
-      { url: "/images/favicon-16.png", sizes: "16x16", type: "image/png" },
-      { url: "/images/favicon-32.png", sizes: "32x32", type: "image/png" },
+      { url: "/images/favicon-16.png", sizes="16x16", type="image/png" },
+      { url: "/images/favicon-32.png", sizes="32x32", type="image/png" },
     ],
     apple: "/images/apple-touch-icon.png",
   },
@@ -47,13 +46,18 @@ export default function RootLayout({
           <header className="border-b bg-card">
             <div className="mx-auto w-full max-w-screen-2xl px-4 sm:px-6 lg:px-8 flex items-center gap-6 py-4">
               <Link href="/" className="flex items-center gap-3 shrink-0">
-                <Image
-                  src="/images/logo.png"
-                  alt="Dispatch"
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
                   width={28}
                   height={28}
+                  viewBox="0 0 28 28"
+                  fill="none"
                   className="shrink-0"
-                />
+                  aria-label="Dispatch"
+                >
+                  <rect width="28" height="28" rx="6" fill="hsl(var(--primary))" />
+                  <path d="M8 14L12 18L20 10" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
                 <span className="font-bold text-lg">Dispatch</span>
               </Link>
 
