@@ -126,14 +126,14 @@ describe("POST /api/agent-work/checkpoint", () => {
     const res = await makeCheckpointRequest({ checkpoint: "CHANGES_MADE" });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.error).toBe("Missing required field: agentName");
+    expect(body.error).toBe("Missing required field: agentName (string)");
   });
 
   it("returns 400 when checkpoint is missing", async () => {
     const res = await makeCheckpointRequest({ agentName: "test-agent" });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.error).toBe("Missing required field: checkpoint");
+    expect(body.error).toContain("expected a string");
   });
 
   it("returns 400 when checkpoint is invalid", async () => {
@@ -143,7 +143,8 @@ describe("POST /api/agent-work/checkpoint", () => {
     });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.error).toBe("Invalid checkpoint value");
+    expect(body.error).toContain("Invalid checkpoint value");
+    expect(body.error).toContain("INVALID_CHECKPOINT");
   });
 
   it("returns 401 when token is invalid", async () => {
@@ -172,5 +173,168 @@ describe("POST /api/agent-work/checkpoint", () => {
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toBe("No active work found for agent");
+  });
+
+  it("returns 400 when body is null", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify(null),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected an object");
+  });
+
+  it("returns 400 when body is an array", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify([{ agentName: "test-agent", checkpoint: "CHANGES_MADE" }]),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected an object");
+  });
+
+  it("returns 400 when body is a string", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify("not-an-object"),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected an object");
+  });
+
+  it("returns 400 when checkpoint is a nested object", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify({ agentName: "test-agent", checkpoint: { nested: "value" } }),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected a string");
+  });
+
+  it("returns 400 when checkpoint is a number", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify({ agentName: "test-agent", checkpoint: 42 }),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("Invalid checkpoint value");
+  });
+
+  it("returns 400 when agentName is an empty string", async () => {
+    const res = await makeCheckpointRequest({ agentName: "", checkpoint: "CHANGES_MADE" });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing required field: agentName (string)");
+  });
+
+  it("returns 400 when checkpoint is an empty string", async () => {
+    const res = await makeCheckpointRequest({ agentName: "test-agent", checkpoint: "" });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("Missing required field: checkpoint");
+  });
+
+  it("returns 400 when checkpoint is an array", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify({ agentName: "test-agent", checkpoint: ["CHANGES_MADE"] }),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected a string");
+  });
+
+  it("includes valid checkpoint values in the error message", async () => {
+    const res = await makeCheckpointRequest({
+      agentName: "test-agent",
+      checkpoint: "WRONG_VALUE",
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("CLAIMED");
+    expect(body.error).toContain("CHANGES_MADE");
+    expect(body.error).toContain("WRONG_VALUE");
+  });
+
+  it("returns 400 when blockerReason is not a string", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify({ agentName: "test-agent", checkpoint: "BLOCKED", blockerReason: 123 }),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("blockerReason");
+  });
+
+  it("accepts checkpoint with hyphens and normalizes to underscores", async () => {
+    mockAgentWork.update.mockResolvedValue({
+      id: "work-1",
+      agentName: "test-agent",
+      state: "IN_PROGRESS",
+      checkpoint: "BRANCH_CREATED",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: new Date(),
+    });
+
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify({ agentName: "test-agent", checkpoint: "branch-created" }),
+      })
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.checkpoint).toBe("BRANCH_CREATED");
   });
 });
