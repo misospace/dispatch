@@ -10,6 +10,19 @@ function getAuthMode(): AuthMode {
   return undefined;
 }
 
+function shouldUseSecureAuthCookie(request: NextRequest): boolean {
+  const authUrl = process.env.AUTH_URL ?? process.env.NEXTAUTH_URL;
+  if (authUrl) {
+    try {
+      return new URL(authUrl).protocol === "https:";
+    } catch {
+      return false;
+    }
+  }
+
+  return request.nextUrl.protocol === "https:";
+}
+
 function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let result = 0;
@@ -82,7 +95,11 @@ export async function middleware(request: NextRequest) {
       return NextResponse.next();
     }
 
-    const token = await getToken({ req: request, secret: process.env.NEXTAUTH_SECRET });
+    const token = await getToken({
+      req: request,
+      secret: process.env.NEXTAUTH_SECRET,
+      secureCookie: shouldUseSecureAuthCookie(request),
+    });
     if (token) {
       return NextResponse.next();
     }
