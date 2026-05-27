@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
-import Image from "next/image";
 import Link from "next/link";
 import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -47,7 +46,8 @@ export default function RootLayout({
           <header className="border-b bg-card">
             <div className="mx-auto w-full max-w-screen-2xl px-4 sm:px-6 lg:px-8 flex items-center gap-6 py-4">
               <Link href="/" className="flex items-center gap-3 shrink-0">
-                <Image
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
                   src="/images/logo.png"
                   alt="Dispatch"
                   width={28}
