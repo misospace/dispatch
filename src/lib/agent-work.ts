@@ -261,3 +261,54 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
     return stale;
   });
 }
+
+/**
+ * Find and release AgentWork records for the given issue that have no
+ * matching active Lease. This covers the crash/oom-kill scenario where an
+ * agent leaves a CLAIMED/IN_PROGRESS AgentWork behind with no live lease.
+ *
+ * Returns the count of released records.
+ */
+export async function findAndReleaseStaleAgentWorkForIssue(
+  prisma: any,
+  issueId: string,
+): Promise<number> {
+  // Active lease IDs for this issue (non-expired)
+  const activeLeases = await prisma.lease.findMany({
+    where: { issueId, expiredAt: { gt: new Date() } },
+    select: { agentName: true },
+  });
+
+  const activeAgentNames = new Set(activeLeases.map((l: any) => l.agentName));
+
+  // Find active AgentWork records for this issue whose agent has no active lease
+  const staleWorks = await prisma.agentWork.findMany({
+    where: {
+      issueId,
+      state: { in: ["CLAIMED", "IN_PROGRESS"] },
+      agentName: { notIn: Array.from(activeAgentNames) },
+    },
+  });
+
+  if (staleWorks.length === 0) return 0;
+
+  const now = new Date();
+  await prisma.$transaction(
+    staleWorks.map((w: any) =>
+      prisma.agentWork.update({
+        where: { id: w.id },
+        data: { state: "STALE", leaseExpiresAt: now },
+      })
+    )
+  );
+
+  await prisma.$transaction(
+    staleWorks.map((w: any) =>
+      prisma.agentWorkHistory.create({
+        data: { workId: w.id, action: "released_by_claim_cleanup" },
+      })
+    )
+  );
+
+  return staleWorks.length;
+}
