@@ -118,7 +118,7 @@ export function isAuthorizedAgentToken(token: string | null | undefined): boolea
 /**
  * Timing-safe string comparison to prevent timing attacks.
  */
-function safeEqual(a: string, b: string): boolean {
+export function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   const aBuf = Buffer.from(a);
   const bBuf = Buffer.from(b);
