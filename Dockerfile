@@ -16,6 +16,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN npx prisma generate
+ENV DATABASE_URL=postgresql://localhost:5432/dispatch
 RUN npm run build
 
 FROM base AS runner
