@@ -1,6 +1,8 @@
 import { defineConfig } from "prisma/config";
 
-if (!process.env.DATABASE_URL) {
+const databaseUrl = process.env.DATABASE_URL;
+
+if (process.env.NODE_ENV === "production" && !databaseUrl) {
   throw new Error(
     "DATABASE_URL is not set. Please set the DATABASE_URL environment variable before starting the application.",
   );
@@ -9,6 +11,6 @@ if (!process.env.DATABASE_URL) {
 export default defineConfig({
   schema: "prisma/schema.prisma",
   datasource: {
-    url: process.env.DATABASE_URL,
+    url: databaseUrl ?? "postgresql://localhost:5432/dispatch",
   },
 });

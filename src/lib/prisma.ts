@@ -3,13 +3,13 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { AgentWorkClient } from "@/lib/agent-work";
 
-if (!process.env.DATABASE_URL) {
+if (process.env.NODE_ENV === "production" && !process.env.DATABASE_URL) {
   throw new Error(
     "DATABASE_URL is not set. Please set the DATABASE_URL environment variable before starting the application.",
   );
 }
 
-const adapter = new PrismaPg(process.env.DATABASE_URL);
+const adapter = new PrismaPg(process.env.DATABASE_URL!);
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
