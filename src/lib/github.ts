@@ -36,8 +36,11 @@ function base64urlEncode(data: string): string {
 function pemToArrayBuffer(pem: string): ArrayBuffer {
   const lines = pem.split("\n").filter((line) => !line.startsWith("-----"));
   const base64 = lines.join("");
-  const buffer = Buffer.from(base64, "base64");
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  const bytes = Buffer.from(base64, "base64");
+  // Create a clean copy to avoid shared buffer issues
+  const copy = Buffer.alloc(bytes.length);
+  copy.set(bytes);
+  return copy.buffer as ArrayBuffer;
 }
 
 /**
@@ -75,6 +78,14 @@ async function generateAppJwt(privateKey: string): Promise<string> {
  * Fetch an installation access token from GitHub App auth.
  */
 async function getInstallationToken(): Promise<string> {
+  const result = await getInstallationTokenWithExpiry();
+  return result.token;
+}
+
+/**
+ * Fetch an installation access token with its expiry timestamp.
+ */
+async function getInstallationTokenWithExpiry(): Promise<CachedToken> {
   const appId = process.env.GITHUB_APP_ID;
   const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
   let privateKey = process.env.GITHUB_APP_PRIVATE_KEY || "";
@@ -106,30 +117,37 @@ async function getInstallationToken(): Promise<string> {
   }
 
   const data = (await response.json()) as { token: string; expires_at: number };
-  return data.token;
+
+  // Cache with a safety buffer before the actual GitHub expiry.
+  // GitHub defaults to 1 hour but allows 10min–1h; use whichever is smaller.
+  const githubExpiresAt = data.expires_at;
+  const safeTtl = Math.min(3300, githubExpiresAt - Math.floor(Date.now() / 1000) - 60);
+
+  return { token: data.token, expiresAt: Date.now() / 1000 + safeTtl };
 }
 
 /**
  * Initialize GitHub App token cache if all required env vars are present.
- * This is called once at module load time.
+ * Called lazily on first use of getGitHubToken().
  */
-async function initGitHubAppAuth(): Promise<void> {
+async function ensureInit(): Promise<void> {
+  if (useGitHubApp) return; // already initialized
+
   const appId = process.env.GITHUB_APP_ID;
   const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
   const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
 
-  if (appId && installationId && privateKey) {
-    useGitHubApp = true;
-    try {
-      const token = await getInstallationToken();
-      installationTokenCache = {
-        token,
-        expiresAt: Date.now() / 1000 + 3300, // 55 minutes from now
-      };
-    } catch {
-      // If initial token fetch fails, fall back to PAT
-      useGitHubApp = false;
-    }
+  if (!appId || !installationId || !privateKey) {
+    return; // not configured — will fall back to PAT
+  }
+
+  useGitHubApp = true;
+  try {
+    const cached = await getInstallationTokenWithExpiry();
+    installationTokenCache = cached;
+  } catch {
+    // If token fetch fails, mark as failed so we don't retry endlessly
+    useGitHubApp = false;
   }
 }
 
@@ -141,11 +159,8 @@ async function refreshIfNeeded(): Promise<void> {
 
   // Refresh token 60 seconds before expiry
   if (installationTokenCache.expiresAt <= Date.now() / 1000 + 60) {
-    const token = await getInstallationToken();
-    installationTokenCache = {
-      token,
-      expiresAt: Date.now() / 1000 + 3300, // 55 minutes from now
-    };
+    const cached = await getInstallationTokenWithExpiry();
+    installationTokenCache = cached;
   }
 }
 
@@ -156,7 +171,10 @@ async function refreshIfNeeded(): Promise<void> {
  * Returns the token string to use for API requests.
  */
 export async function getGitHubToken(): Promise<string> {
-  // Ensure token cache is fresh (for callers that don't go through fetchPaginated)
+  // Ensure GitHub App is initialized (lazy init on first call)
+  await ensureInit();
+
+  // Ensure token cache is fresh
   await refreshIfNeeded();
 
   if (useGitHubApp && installationTokenCache) {
@@ -171,31 +189,7 @@ export async function getGitHubToken(): Promise<string> {
 }
 
 /**
- * Get headers for GitHub API requests.
- * Synchronous version — uses cached token or GITHUB_TOKEN directly.
- */
-function getHeaders(): HeadersInit {
-  if (useGitHubApp && installationTokenCache) {
-    return {
-      Authorization: `Bearer ${installationTokenCache.token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    };
-  }
-
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) {
-    throw new Error("GITHUB_TOKEN environment variable is not set");
-  }
-  return {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-}
-
-/**
- * Get headers for GitHub API requests — async version that ensures token freshness.
+ * Get headers for GitHub API requests — ensures token freshness via async refresh.
  */
 async function getHeadersAsync(): Promise<HeadersInit> {
   await refreshIfNeeded();
@@ -216,10 +210,13 @@ async function getHeadersAsync(): Promise<HeadersInit> {
   };
 }
 
-// Initialize GitHub App auth at module load time (best-effort)
-initGitHubAppAuth().catch(() => {
-  // Silently fail — will fall back to PAT on next request
-});
+/**
+ * Reset internal GitHub App auth state. Exposed for testing only.
+ */
+export function __resetGitHubAppState(): void {
+  installationTokenCache = null;
+  useGitHubApp = false;
+}
 
 /**
  * Parse the Link header from a GitHub API response to extract pagination URLs.
