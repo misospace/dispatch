@@ -293,6 +293,10 @@ export interface GithubPR {
   updated_at: string;
   merged_at: string | null;
   draft: boolean;
+  /** GitHub review decision: APPROVED, CHANGES_REQUESTED, COMMENTED, or null */
+  reviewDecision?: string | null;
+  /** GitHub merge state status: clean, dirty, behind, blocked, unknown, or null */
+  mergeStateStatus?: string | null;
 }
 
 export async function fetchPullRequests(repoFullName: string, perPage = 100): Promise<GithubPR[]> {
