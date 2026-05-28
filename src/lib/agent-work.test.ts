@@ -317,3 +317,94 @@ function createMockTransaction() {
     $transaction: (fn: (tx: any) => Promise<any>) => fn({ agentWork, agentWorkHistory }),
   };
 }
+
+describe("findAndReleaseStaleAgentWorkForIssue", () => {
+  let mockPrisma: any;
+
+  beforeEach(() => {
+    mockPrisma = {
+      lease: { findMany: vi.fn() },
+      agentWork: { 
+        findMany: vi.fn().mockImplementation(({ where }: any) => {
+          let result: any[] = [];
+          // Return data based on what's been mocked — simulate notIn filtering
+          const mockData = (mockPrisma.agentWork as any)._mockData;
+          if (mockData) {
+            result = [...mockData];
+            if (where?.agentName?.notIn) {
+              result = result.filter((w: any) => !where.agentName.notIn.includes(w.agentName));
+            }
+          }
+          return Promise.resolve(result);
+        }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      $transaction: vi.fn((arg: any) => {
+        if (typeof arg === "function") {
+          return Promise.resolve(arg(mockPrisma));
+        }
+        return Promise.all(arg.map((op: any) => op));
+      }),
+    };
+  });
+
+  it("returns 0 when no stale work exists", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    expect(result).toBe(0);
+  });
+
+  it("releases work whose agent has no active lease", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "other-agent" }]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "stale-1", state: "IN_PROGRESS", agentName: "crashed-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    expect(result).toBe(1);
+    expect(mockPrisma.agentWork.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ state: "STALE" }) })
+    );
+  });
+
+  it("does not release work whose agent has an active lease", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "active-agent" }]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "active-1", state: "IN_PROGRESS", agentName: "active-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    expect(result).toBe(0);
+  });
+
+  it("releases work whose agent has no active lease", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "other-agent" }]);
+    mockPrisma.agentWork.findMany.mockResolvedValue([
+      { id: "stale-1", state: "IN_PROGRESS", agentName: "crashed-agent" },
+    ]);
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    expect(result).toBe(1);
+    expect(mockPrisma.agentWork.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ state: "STALE" }) })
+    );
+  });
+
+  it("does not release work whose agent has an active lease", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "active-agent" }]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "active-1", state: "IN_PROGRESS", agentName: "active-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    expect(result).toBe(0);
+  });
+});

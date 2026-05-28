@@ -4,6 +4,7 @@ import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { authorizeRequest } from "@/lib/auth";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
+import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 
@@ -67,6 +68,12 @@ export async function POST(request: Request) {
     const expiredCount = await releaseExpiredLeases(issueId as string);
     if (expiredCount > 0) {
       console.warn(`Released ${expiredCount} expired lease(s) for issue #${issueNumber}`);
+    }
+
+    // Clean up stale AgentWork records (no matching active Lease)
+    const staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string);
+    if (staleWorkCount > 0) {
+      console.warn(`Released ${staleWorkCount} stale AgentWork record(s) for issue #${issueNumber}`);
     }
 
     // Analyze assignment conflicts using the shared conflict resolution module

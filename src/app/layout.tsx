@@ -53,6 +53,7 @@ export default function RootLayout({
                   width={28}
                   height={28}
                   className="shrink-0"
+                  aria-label="Dispatch"
                 />
                 <span className="font-bold text-lg">Dispatch</span>
               </Link>
