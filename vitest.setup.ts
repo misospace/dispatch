@@ -1,6 +1,10 @@
 // Import @testing-library/jest-dom/vitest for custom matchers
 import "@testing-library/jest-dom/vitest";
 
+// Provide a dummy DATABASE_URL so prisma.ts module loads without throwing.
+// Tests that need real DB access mock/override as needed.
+process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/dispatch_test";
+
 // Patch React.act for React 19 + @testing-library/react v16 compat.
 // React 19 removed React.act, but older react-dom/test-utils still calls it.
 const React = require("react");
