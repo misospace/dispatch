@@ -2,16 +2,220 @@ import { GitHubIssue } from "@/types";
 
 const GITHUB_API = "https://api.github.com";
 
-function getHeaders(): HeadersInit {
+// Token cache for GitHub App installation tokens
+interface CachedToken {
+  token: string;
+  expiresAt: number;
+}
+
+let installationTokenCache: CachedToken | null = null;
+let useGitHubApp = false;
+
+/**
+ * Base64url-encode an ArrayBuffer (no padding).
+ */
+function base64urlEncodeArrayBuffer(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return Buffer.from(binary, "binary").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Base64url-encode a string (no padding).
+ */
+function base64urlEncode(data: string): string {
+  return Buffer.from(data).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Convert a PEM private key string to an ArrayBuffer suitable for crypto.subtle.importKey.
+ */
+function pemToArrayBuffer(pem: string): ArrayBuffer {
+  const lines = pem.split("\n").filter((line) => !line.startsWith("-----"));
+  const base64 = lines.join("");
+  const bytes = Buffer.from(base64, "base64");
+  // Create a clean copy to avoid shared buffer issues
+  const copy = Buffer.alloc(bytes.length);
+  copy.set(bytes);
+  return copy.buffer as ArrayBuffer;
+}
+
+/**
+ * Generate a JWT signed with the GitHub App private key using RS256 (RSA-SHA256).
+ */
+async function generateAppJwt(privateKey: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64urlEncode(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const payload = base64urlEncode(JSON.stringify({
+    iat: now,
+    exp: now + 600, // 10 minutes
+    iss: process.env.GITHUB_APP_ID,
+  }));
+  const signingInput = `${header}.${payload}`;
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToArrayBuffer(privateKey),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signatureBuffer = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    new TextEncoder().encode(signingInput)
+  );
+  const signature = base64urlEncodeArrayBuffer(signatureBuffer);
+
+  return `${signingInput}.${signature}`;
+}
+
+/**
+ * Fetch an installation access token from GitHub App auth.
+ */
+async function getInstallationToken(): Promise<string> {
+  const result = await getInstallationTokenWithExpiry();
+  return result.token;
+}
+
+/**
+ * Fetch an installation access token with its expiry timestamp.
+ */
+async function getInstallationTokenWithExpiry(): Promise<CachedToken> {
+  const appId = process.env.GITHUB_APP_ID;
+  const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
+  let privateKey = process.env.GITHUB_APP_PRIVATE_KEY || "";
+
+  if (!appId || !installationId || !privateKey) {
+    throw new Error("GitHub App authentication is misconfigured — missing required env vars");
+  }
+
+  // Support escaped newlines from Kubernetes/ExternalSecrets-style env injection
+  privateKey = privateKey.replace(/\\n/g, "\n");
+
+  const jwt = generateAppJwt(privateKey);
+
+  const response = await fetch(
+    `${GITHUB_API}/app/installations/${installationId}/access_tokens`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to get GitHub App installation token: ${response.status} ${text}`);
+  }
+
+  const data = (await response.json()) as { token: string; expires_at: number };
+
+  // Cache with a safety buffer before the actual GitHub expiry.
+  // GitHub defaults to 1 hour but allows 10min–1h; use whichever is smaller.
+  const githubExpiresAt = data.expires_at;
+  const safeTtl = Math.min(3300, githubExpiresAt - Math.floor(Date.now() / 1000) - 60);
+
+  return { token: data.token, expiresAt: Date.now() / 1000 + safeTtl };
+}
+
+/**
+ * Initialize GitHub App token cache if all required env vars are present.
+ * Called lazily on first use of getGitHubToken().
+ */
+async function ensureInit(): Promise<void> {
+  if (useGitHubApp) return; // already initialized
+
+  const appId = process.env.GITHUB_APP_ID;
+  const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
+  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+
+  if (!appId || !installationId || !privateKey) {
+    return; // not configured — will fall back to PAT
+  }
+
+  useGitHubApp = true;
+  try {
+    const cached = await getInstallationTokenWithExpiry();
+    installationTokenCache = cached;
+  } catch {
+    // If token fetch fails, mark as failed so we don't retry endlessly
+    useGitHubApp = false;
+  }
+}
+
+/**
+ * Refresh the GitHub App installation token if needed.
+ */
+async function refreshIfNeeded(): Promise<void> {
+  if (!useGitHubApp || !installationTokenCache) return;
+
+  // Refresh token 60 seconds before expiry
+  if (installationTokenCache.expiresAt <= Date.now() / 1000 + 60) {
+    const cached = await getInstallationTokenWithExpiry();
+    installationTokenCache = cached;
+  }
+}
+
+/**
+ * Get a valid GitHub token, choosing between GitHub App installation auth
+ * and the legacy PAT-based auth.
+ *
+ * Returns the token string to use for API requests.
+ */
+export async function getGitHubToken(): Promise<string> {
+  // Ensure GitHub App is initialized (lazy init on first call)
+  await ensureInit();
+
+  // Ensure token cache is fresh
+  await refreshIfNeeded();
+
+  if (useGitHubApp && installationTokenCache) {
+    return installationTokenCache.token;
+  }
+
   const token = process.env.GITHUB_TOKEN;
   if (!token) {
     throw new Error("GITHUB_TOKEN environment variable is not set");
   }
+  return token;
+}
+
+/**
+ * Get headers for GitHub API requests — ensures token freshness via async refresh.
+ */
+async function getHeadersAsync(): Promise<HeadersInit> {
+  await refreshIfNeeded();
+
+  if (useGitHubApp && installationTokenCache) {
+    return {
+      Authorization: `Bearer ${installationTokenCache.token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+  }
+
+  const token = await getGitHubToken();
   return {
     Authorization: `Bearer ${token}`,
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
+}
+
+/**
+ * Reset internal GitHub App auth state. Exposed for testing only.
+ */
+export function __resetGitHubAppState(): void {
+  installationTokenCache = null;
+  useGitHubApp = false;
 }
 
 /**
@@ -38,7 +242,7 @@ export async function fetchPaginated<T>(url: string, maxItems = Infinity): Promi
   let currentUrl: string | null = url;
 
   while (currentUrl && all.length < maxItems) {
-    const response = await fetch(currentUrl, { headers: getHeaders() });
+    const response = await fetch(currentUrl, { headers: await getHeadersAsync() });
 
     if (!response.ok) {
       const text = await response.text();
@@ -70,7 +274,7 @@ export async function fetchIssues(repoFullName: string, options?: { includeClose
 export async function fetchIssue(repoFullName: string, issueNumber: number): Promise<GitHubIssue> {
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
-  const response = await fetch(url, { headers: getHeaders() });
+  const response = await fetch(url, { headers: await getHeadersAsync() });
 
   if (!response.ok) {
     const text = await response.text();
@@ -96,7 +300,7 @@ export async function updateIssueLabels(
 
   const response = await fetch(url, {
     method: "PUT",
-    headers: getHeaders(),
+    headers: await getHeadersAsync(),
     body: JSON.stringify({ labels }),
   });
 
@@ -116,7 +320,7 @@ export async function addIssueLabel(
 
   const response = await fetch(url, {
     method: "POST",
-    headers: getHeaders(),
+    headers: await getHeadersAsync(),
     body: JSON.stringify({ labels: [label] }),
   });
 
@@ -136,7 +340,7 @@ export async function removeIssueLabel(
 
   const response = await fetch(url, {
     method: "DELETE",
-    headers: getHeaders(),
+    headers: await getHeadersAsync(),
   });
 
   if (!response.ok && response.status !== 404) {
@@ -154,7 +358,7 @@ export async function closeIssue(
 
   const response = await fetch(url, {
     method: "PATCH",
-    headers: getHeaders(),
+    headers: await getHeadersAsync(),
     body: JSON.stringify({ state: "closed" }),
   });
 
@@ -167,7 +371,7 @@ export async function closeIssue(
 export async function validateGitHubToken(): Promise<boolean> {
   try {
     const response = await fetch(`${GITHUB_API}/user`, {
-      headers: getHeaders(),
+      headers: await getHeadersAsync(),
     });
     return response.ok;
   } catch {
@@ -185,7 +389,7 @@ export interface GithubRepo {
 
 export async function fetchRepo(repoFullName: string): Promise<GithubRepo> {
   const response = await fetch(`${GITHUB_API}/repos/${repoFullName}`, {
-    headers: getHeaders(),
+    headers: await getHeadersAsync(),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -206,7 +410,7 @@ export interface GithubWorkflow {
 
 export async function fetchWorkflows(repoFullName: string): Promise<GithubWorkflow[]> {
   const response = await fetch(`${GITHUB_API}/repos/${repoFullName}/actions/workflows`, {
-    headers: getHeaders(),
+    headers: await getHeadersAsync(),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -254,7 +458,7 @@ export interface GithubJob {
 export async function fetchRunJobs(repoFullName: string, runId: number): Promise<GithubJob[]> {
   const response = await fetch(
     `${GITHUB_API}/repos/${repoFullName}/actions/runs/${runId}/jobs`,
-    { headers: getHeaders() }
+    { headers: await getHeadersAsync() }
   );
   if (!response.ok) {
     const text = await response.text();
@@ -325,7 +529,7 @@ export async function fetchPackages(repoFullName: string): Promise<GithubPackage
 export async function rerunWorkflow(repoFullName: string, runId: number): Promise<void> {
   const response = await fetch(
     `${GITHUB_API}/repos/${repoFullName}/actions/runs/${runId}/rerun`,
-    { method: "POST", headers: getHeaders() }
+    { method: "POST", headers: await getHeadersAsync() }
   );
   if (!response.ok) {
     const text = await response.text();
@@ -342,7 +546,7 @@ export async function triggerWorkflowDispatch(
     `${GITHUB_API}/repos/${repoFullName}/actions/workflows/${workflowId}/dispatches`,
     {
       method: "POST",
-      headers: getHeaders(),
+      headers: await getHeadersAsync(),
       body: JSON.stringify({ ref }),
     }
   );
@@ -361,7 +565,7 @@ export interface GithubCommit {
 export async function fetchLatestCommit(repoFullName: string, branch: string): Promise<GithubCommit | null> {
   const response = await fetch(
     `${GITHUB_API}/repos/${repoFullName}/commits/${branch}?per_page=1`,
-    { headers: getHeaders() }
+    { headers: await getHeadersAsync() }
   );
   if (!response.ok) {
     if (response.status === 404) return null;
