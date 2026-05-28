@@ -99,7 +99,7 @@ describe("POST /api/agent-work/start", () => {
     const res = await makeStartRequest({});
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.error).toBe("Missing required field: agentName");
+    expect(body.error).toBe("Missing required field: agentName (string)");
   });
 
   it("returns 401 when token is invalid", async () => {
@@ -138,5 +138,44 @@ describe("POST /api/agent-work/start", () => {
         data: expect.objectContaining({ state: "RELEASED" }),
       })
     );
+  });
+
+  it("returns 400 when body is null", async () => {
+    const res = await handleStart(
+      new Request("http://localhost/api/agent-work/start", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify(null),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected an object");
+  });
+
+  it("returns 400 when body is an array", async () => {
+    const res = await handleStart(
+      new Request("http://localhost/api/agent-work/start", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-token",
+        },
+        body: JSON.stringify([{ agentName: "test-agent" }]),
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("expected an object");
+  });
+
+  it("returns 400 when agentName is empty string", async () => {
+    const res = await makeStartRequest({ agentName: "" });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing required field: agentName (string)");
   });
 });

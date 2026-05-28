@@ -14,6 +14,17 @@ export type AgentWorkClient = {
   $transaction: <T>(fn: (tx: AgentWorkClient) => Promise<T>) => Promise<T>;
 };
 
+/**
+ * Canonical request schema for POST /api/agent-work/start
+ * @body agentName (string, required) - Worker identifier, e.g. "saffron"
+ * @body issueId (string, optional) - GitHub issue ID, e.g. "GH_issue_abc123"
+ * @body runId (string, optional) - Agent run identifier for traceability
+ * @body branch (string, optional) - Git branch name the worker will use
+ *
+ * Response 201: Created work object with state="CLAIMED", checkpoint="CLAIMED"
+ * Response 400: { error: string } when required fields are missing or invalid
+ * Response 401: { error: "Unauthorized" } when bearer token is missing/invalid
+ */
 export interface StartAgentWorkInput {
   agentName: string;
   issueId?: string | null;
@@ -21,6 +32,26 @@ export interface StartAgentWorkInput {
   branch?: string | null;
 }
 
+/**
+ * Canonical request schema for POST /api/agent-work/checkpoint
+ *
+ * The checkpoint value MUST be one of the valid AgentWorkCheckpoint values.
+ * Workers should use the exact canonical value — no nesting, no casing variations.
+ *
+ * Valid checkpoints: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE,
+ *                    TESTS_RUNNING, PR_OPENED, DONE, BLOCKED
+ *
+ * @body agentName (string, required) - Worker identifier matching the active work record
+ * @body checkpoint (string, required) - One of the valid checkpoint values listed above
+ * @body summary (string, optional) - Human-readable description of progress made
+ * @body blockerReason (string, optional) - Required when checkpoint is "BLOCKED"; explains why work cannot proceed
+ *
+ * Response 200: Updated work object reflecting new state/checkpoint and extended lease
+ * Response 400: { error: string } with details about which field failed validation
+ * Response 401: { error: "Unauthorized" } when bearer token is missing/invalid
+ * Response 404: { error: "No active work found for agent" } when agent has no active work
+ *               (also cleans up orphaned leases automatically)
+ */
 export interface CheckpointAgentWorkInput {
   agentName: string;
   checkpoint: string;
@@ -28,6 +59,25 @@ export interface CheckpointAgentWorkInput {
   blockerReason?: string | null;
 }
 
+/**
+ * Canonical request schema for POST /api/agent-work/finish
+ *
+ * The state value MUST be one of the valid AgentWorkState values.
+ * Workers should use the exact canonical value — no nesting, no casing variations.
+ *
+ * Valid states: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE
+ * Common finish states: DONE (work completed), BLOCKED (cannot proceed)
+ *
+ * @body agentName (string, required) - Worker identifier matching the active work record
+ * @body state (string, required) - One of the valid state values listed above
+ * @body summary (string, optional) - Final summary of what was accomplished or why blocked
+ *
+ * Response 200: Updated work object with final state set and lease expired
+ * Response 400: { error: string } with details about which field failed validation
+ * Response 401: { error: "Unauthorized" } when bearer token is missing/invalid
+ * Response 404: { error: "No active work found for agent" } when agent has no active work
+ *               (also cleans up orphaned leases automatically)
+ */
 export interface FinishAgentWorkInput {
   agentName: string;
   state: string;
@@ -38,10 +88,17 @@ function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/**
+ * Parse and validate a request body for POST /api/agent-work/start.
+ * Returns the parsed input object or { error: string } with a descriptive message.
+ */
 export function parseStartAgentWorkInput(body: unknown): StartAgentWorkInput | { error: string } {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body" };
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body: expected an object" };
   const input = body as Record<string, unknown>;
-  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName" };
+  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName (string)" };
+  if (typeof input.agentName === "string" && input.agentName.trim() !== input.agentName) {
+    // Trimmed but original had whitespace — still accept it, just trim
+  }
 
   return {
     agentName: input.agentName.trim(),
@@ -51,31 +108,59 @@ export function parseStartAgentWorkInput(body: unknown): StartAgentWorkInput | {
   };
 }
 
+/**
+ * Parse and validate a request body for POST /api/agent-work/checkpoint.
+ * Returns the parsed input object or { error: string } with a descriptive message.
+ *
+ * Valid checkpoint values: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE,
+ *                    TESTS_RUNNING, PR_OPENED, DONE, BLOCKED
+ */
 export function parseCheckpointAgentWorkInput(body: unknown): CheckpointAgentWorkInput | { error: string } {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body" };
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body: expected an object with agentName and checkpoint" };
   const input = body as Record<string, unknown>;
-  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName" };
-  if (!nonEmpty(input.checkpoint)) return { error: "Missing required field: checkpoint" };
-  if (!normalizeAgentWorkCheckpoint(input.checkpoint)) return { error: "Invalid checkpoint value" };
+
+  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName (string)" };
+  if (typeof input.checkpoint === "object") return { error: "Invalid checkpoint value: expected a string, not an object" };
+  if (typeof input.checkpoint !== "string") return { error: `Invalid checkpoint value: expected a string, got ${typeof input.checkpoint}` };
+  if (input.checkpoint.trim().length === 0) return { error: "Missing required field: checkpoint (one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)" };
+
+  const normalized = normalizeAgentWorkCheckpoint(input.checkpoint);
+  if (!normalized) return { error: `Invalid checkpoint value: "${input.checkpoint}" (expected one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)` };
+
+  // Validate blockerReason type when checkpoint is BLOCKED
+  if (normalized === "BLOCKED" && input.blockerReason !== undefined && typeof input.blockerReason !== "string") {
+    return { error: "Invalid blockerReason: expected a string when checkpoint is BLOCKED" };
+  }
 
   return {
     agentName: input.agentName.trim(),
-    checkpoint: normalizeAgentWorkCheckpoint(input.checkpoint) as AgentWorkCheckpoint,
+    checkpoint: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
     blockerReason: typeof input.blockerReason === "string" ? input.blockerReason : null,
   };
 }
 
+/**
+ * Parse and validate a request body for POST /api/agent-work/finish.
+ * Returns the parsed input object or { error: string } with a descriptive message.
+ *
+ * Valid state values: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE
+ */
 export function parseFinishAgentWorkInput(body: unknown): FinishAgentWorkInput | { error: string } {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body" };
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body: expected an object with agentName and state" };
   const input = body as Record<string, unknown>;
-  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName" };
-  if (!nonEmpty(input.state)) return { error: "Missing required field: state" };
-  if (!normalizeAgentWorkState(input.state)) return { error: "Invalid state value" };
+
+  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName (string)" };
+  if (typeof input.state === "object") return { error: "Invalid state value: expected a string, not an object" };
+  if (typeof input.state !== "string") return { error: `Invalid state value: expected a string, got ${typeof input.state}` };
+  if (input.state.trim().length === 0) return { error: "Missing required field: state (one of: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE)" };
+
+  const normalized = normalizeAgentWorkState(input.state);
+  if (!normalized) return { error: `Invalid state value: "${input.state}" (expected one of: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE)` };
 
   return {
     agentName: input.agentName.trim(),
-    state: normalizeAgentWorkState(input.state) as AgentWorkState,
+    state: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
   };
 }
