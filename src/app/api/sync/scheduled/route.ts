@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchIssues, fetchRepo, fetchWorkflows, fetchRecentRunsAllWorkflows, fetchReleases, fetchPullRequests, fetchLatestCommit, fetchPackages, fetchRunJobs } from "@/lib/github";
+import { fetchIssues, fetchIssue, fetchRepo, fetchWorkflows, fetchRecentRunsAllWorkflows, fetchReleases, fetchPullRequests, fetchLatestCommit, fetchPackages, fetchRunJobs } from "@/lib/github";
 import { getSyncRepos, getTrackedRepos } from "@/lib/config";
-import { syncIssuesForRepos, SyncResponse } from "@/lib/issue-sync";
+import { syncIssuesForRepos, reconcileClosedIssues, SyncResponse, ClosedIssueReconcileResponse } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
 
 // ---------------------------------------------------------------------------
@@ -97,6 +97,7 @@ export async function POST(request: Request) {
 
   try {
     let issueSync: SyncResponse | null = null;
+    let closedIssueReconcile: ClosedIssueReconcileResponse | null = null;
     let automationResult: { synced: number; failed: number } | null = null;
 
     // Issue sync (default enabled)
@@ -124,6 +125,45 @@ export async function POST(request: Request) {
           await prisma.issue.create({ data: { ...data, repositoryId } });
         },
       });
+
+      // Reconcile closed issues with stale active statuses
+      try {
+        const reposForReconcile = await getSyncRepos();
+        closedIssueReconcile = await reconcileClosedIssues(reposForReconcile, fetchIssue, {
+          async findActiveCachedIssues(repositoryId) {
+            return prisma.issue.findMany({
+              where: {
+                repositoryId,
+                state: { in: ["open", "closed"] as const },
+                labels: {
+                  hasSome: ["status/ready", "status/in-progress", "status/in-review"],
+                },
+              },
+              select: { id: true, number: true, labels: true, state: true },
+            });
+          },
+          async updateIssue(id, data) {
+            await prisma.issue.update({
+              where: { id },
+              data: {
+                labels: data.labels,
+                state: data.state,
+                closedAt: data.closedAt,
+              },
+            });
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        console.error("Closed issue reconciliation failed:", error);
+        closedIssueReconcile = {
+          success: false,
+          reposProcessed: 0,
+          issuesChecked: 0,
+          issuesReconciled: 0,
+          results: [{ repo: "", issueNumber: 0, reconciled: false, action: "no_change", error: message }],
+        };
+      }
     }
 
     // Automation sync (optional, opt-in)
@@ -268,6 +308,13 @@ export async function POST(request: Request) {
         syncedCount: issueSync?.syncedCount ?? 0,
         notes: JSON.stringify({
           issueResults: issueSync?.results,
+          closedIssueReconcile: closedIssueReconcile
+            ? {
+                issuesReconciled: closedIssueReconcile.issuesReconciled,
+                issuesChecked: closedIssueReconcile.issuesChecked,
+                results: closedIssueReconcile.results,
+              }
+            : null,
           automationResult,
         }),
       },
@@ -288,6 +335,14 @@ export async function POST(request: Request) {
         syncedCount: issueSync.syncedCount,
         results: issueSync.results,
       };
+
+      if (closedIssueReconcile) {
+        response.closedIssueReconcile = {
+          issuesReconciled: closedIssueReconcile.issuesReconciled,
+          issuesChecked: closedIssueReconcile.issuesChecked,
+          results: closedIssueReconcile.results,
+        };
+      }
     }
 
     if (syncAutomation && automationResult) {

@@ -80,7 +80,7 @@ Agent Runs → Dispatch → Agent Activity Page
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string (canonical) |
-| `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token |
+| `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token (fallback when GitHub App auth is not configured) |
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 | `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Dispatch UI or `/api/automation/repos` after initial setup. |
 | `DISPATCH_AUTH_MODE` | No | Authentication mode: `"basic"` (HTTP Basic Auth), `"oidc"` (OIDC/SSO), `"disabled"` (no auth), or unset (legacy mode) |
@@ -93,6 +93,23 @@ Agent Runs → Dispatch → Agent Activity Page
 | `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | Conditional | Secret for NextAuth.js JWT signing — required when `DISPATCH_AUTH_MODE=oidc`. Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `NEXTAUTH_URL` | Conditional | Public Dispatch base URL used by NextAuth to derive callback URLs. Set this in OIDC deployments. |
+
+### GitHub App Authentication (Optional)
+
+Dispatch supports optional GitHub App authentication to provide a separate identity in GitHub issue timelines. When configured, mutations (label changes, state changes, etc.) appear under the GitHub App bot identity instead of the shared PAT account.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GITHUB_APP_ID` | Conditional | Your GitHub App's numeric ID |
+| `GITHUB_APP_INSTALLATION_ID` | Conditional | The installation ID for the GitHub App on your org/repo |
+| `GITHUB_APP_PRIVATE_KEY` | Conditional | PEM-formatted private key (supports real newlines and escaped `\n` form) |
+
+**Behavior:**
+
+- When **all three** GitHub App env vars are present, Dispatch uses GitHub App installation auth with token caching (refreshed ~5 minutes before expiry).
+- When GitHub App env vars are **absent**, Dispatch falls back to the existing `GITHUB_TOKEN` PAT behavior.
+- **Partial** configuration is silently ignored — Dispatch falls back to PAT without error.
+- Secrets, tokens, and private keys are never logged.
 
 **Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` (for instance URL).
 

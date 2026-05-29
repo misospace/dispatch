@@ -31,7 +31,7 @@ function patchParser(parser) {
 }
 
 const config = [
-  { ignores: [".next/**", "out/**", "build/**", "next-env.d.ts"] },
+  { ignores: [".next/**", "out/**", "build/**", "next-env.d.ts", "vitest/dist/**"] },
   ...fixupConfigRules(nextVitals).map((config) => ({
     ...config,
     rules: {

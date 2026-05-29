@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { getToken } from "next-auth/jwt";
+import { safeEqual } from "@/lib/dispatch-env";
 
 type AuthMode = "basic" | "oidc" | "disabled" | undefined;
 
@@ -23,14 +24,6 @@ function shouldUseSecureAuthCookie(request: NextRequest): boolean {
   return request.nextUrl.protocol === "https:";
 }
 
-function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
-}
 
 function isBearerAuthorized(authHeader: string | null): boolean {
   const token = process.env.DISPATCH_AGENT_TOKEN;

@@ -7,6 +7,14 @@ const { mocks } = vi.hoisted(() => ({
     leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
     leaseCreate: vi.fn(), leaseUpdate: vi.fn(), leaseDelete: vi.fn(), leaseFindFirst: vi.fn(),
+    agentWorkFindMany: vi.fn().mockResolvedValue([]),
+    agentWorkUpdate: vi.fn().mockResolvedValue({}),
+    transaction: vi.fn((arg: any) => {
+      if (typeof arg === "function") {
+        return Promise.resolve(arg({ agentWork: { update: mocks.agentWorkUpdate }, agentWorkHistory: { create: vi.fn().mockResolvedValue({}) } }));
+      }
+      return Promise.all(arg.map((op: any) => op));
+    }),
   },
 }));
 
@@ -27,6 +35,11 @@ vi.mock("@/lib/prisma", () => ({
       delete: mocks.leaseDelete,
       findFirst: mocks.leaseFindFirst,
     },
+    agentWork: {
+      findMany: mocks.agentWorkFindMany,
+      update: mocks.agentWorkUpdate,
+    },
+    $transaction: mocks.transaction,
   },
 }));
 

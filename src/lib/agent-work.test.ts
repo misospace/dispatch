@@ -23,13 +23,13 @@ describe("parseStartAgentWorkInput", () => {
 
   it("returns error when agentName is missing", () => {
     const result = parseStartAgentWorkInput({});
-    expect(result).toEqual({ error: "Missing required field: agentName" });
+    expect(result).toEqual({ error: "Missing required field: agentName (string)" });
   });
 
   it("returns error for invalid body", () => {
-    expect(parseStartAgentWorkInput(null)).toEqual({ error: "Invalid JSON body" });
-    expect(parseStartAgentWorkInput([])).toEqual({ error: "Invalid JSON body" });
-    expect(parseStartAgentWorkInput("string")).toEqual({ error: "Invalid JSON body" });
+    expect(parseStartAgentWorkInput(null)).toEqual({ error: "Invalid JSON body: expected an object" });
+    expect(parseStartAgentWorkInput([])).toEqual({ error: "Invalid JSON body: expected an object" });
+    expect(parseStartAgentWorkInput("string")).toEqual({ error: "Invalid JSON body: expected an object" });
   });
 });
 
@@ -46,12 +46,77 @@ describe("parseCheckpointAgentWorkInput", () => {
 
   it("returns error for invalid checkpoint", () => {
     const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "INVALID" });
-    expect(result).toEqual({ error: "Invalid checkpoint value" });
+    expect(result).toEqual({ error: 'Invalid checkpoint value: "INVALID" (expected one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)' });
   });
 
   it("returns error when required fields are missing", () => {
-    expect(parseCheckpointAgentWorkInput({})).toEqual({ error: "Missing required field: agentName" });
-    expect(parseCheckpointAgentWorkInput({ agentName: "test" })).toEqual({ error: "Missing required field: checkpoint" });
+    expect(parseCheckpointAgentWorkInput({})).toEqual({ error: "Missing required field: agentName (string)" });
+    expect(parseCheckpointAgentWorkInput({ agentName: "test" })).toEqual({ error: "Invalid checkpoint value: expected a string, got undefined" });
+  });
+
+  it("returns error for null body", () => {
+    const result = parseCheckpointAgentWorkInput(null);
+    expect(result).toEqual({ error: "Invalid JSON body: expected an object with agentName and checkpoint" });
+  });
+
+  it("returns error for array body", () => {
+    const result = parseCheckpointAgentWorkInput([{ agentName: "test", checkpoint: "DONE" }]);
+    expect(result).toEqual({ error: "Invalid JSON body: expected an object with agentName and checkpoint" });
+  });
+
+  it("returns error for string body", () => {
+    const result = parseCheckpointAgentWorkInput("not a valid body");
+    expect(result).toEqual({ error: "Invalid JSON body: expected an object with agentName and checkpoint" });
+  });
+
+  it("returns error when checkpoint is a nested object", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: { nested: "value" } });
+    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, not an object" });
+  });
+
+  it("returns error when checkpoint is an array", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: ["CHANGES_MADE"] });
+    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, not an object" });
+  });
+
+  it("returns error when checkpoint is a number", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: 42 });
+    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, got number" });
+  });
+
+  it("normalizes hyphenated checkpoint values", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "branch-created" });
+    expect(result).toEqual({
+      agentName: "test-agent",
+      checkpoint: "BRANCH_CREATED",
+      summary: null,
+      blockerReason: null,
+    });
+  });
+
+  it("accepts BLOCKED checkpoint with string blockerReason", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "BLOCKED", blockerReason: "waiting on API" });
+    expect(result).toEqual({
+      agentName: "test-agent",
+      checkpoint: "BLOCKED",
+      summary: null,
+      blockerReason: "waiting on API",
+    });
+  });
+
+  it("returns error when checkpoint is BLOCKED but blockerReason is a number", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "BLOCKED", blockerReason: 123 });
+    expect(result).toEqual({ error: "Invalid blockerReason: expected a string when checkpoint is BLOCKED" });
+  });
+
+  it("returns error when checkpoint is empty string", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "" });
+    expect(result).toEqual({ error: "Missing required field: checkpoint (one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)" });
+  });
+
+  it("returns error when agentName is empty string", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "", checkpoint: "DONE" });
+    expect(result).toEqual({ error: "Missing required field: agentName (string)" });
   });
 });
 
@@ -85,7 +150,56 @@ describe("parseFinishAgentWorkInput", () => {
 
   it("returns error for invalid state", () => {
     const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: "INVALID" });
-    expect(result).toEqual({ error: "Invalid state value" });
+    expect(result).toEqual({ error: 'Invalid state value: "INVALID" (expected one of: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE)' });
+  });
+
+  it("returns error for null body", () => {
+    const result = parseFinishAgentWorkInput(null);
+    expect(result).toEqual({ error: "Invalid JSON body: expected an object with agentName and state" });
+  });
+
+  it("returns error for array body", () => {
+    const result = parseFinishAgentWorkInput([{ agentName: "test", state: "DONE" }]);
+    expect(result).toEqual({ error: "Invalid JSON body: expected an object with agentName and state" });
+  });
+
+  it("returns error for string body", () => {
+    const result = parseFinishAgentWorkInput("not a valid body");
+    expect(result).toEqual({ error: "Invalid JSON body: expected an object with agentName and state" });
+  });
+
+  it("returns error when state is a nested object", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: { nested: "DONE" } });
+    expect(result).toEqual({ error: "Invalid state value: expected a string, not an object" });
+  });
+
+  it("returns error when state is an array", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: ["DONE"] });
+    expect(result).toEqual({ error: "Invalid state value: expected a string, not an object" });
+  });
+
+  it("returns error when state is a number", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: 42 });
+    expect(result).toEqual({ error: "Invalid state value: expected a string, got number" });
+  });
+
+  it("normalizes hyphenated state values", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: "in-progress" });
+    expect(result).toEqual({
+      agentName: "test-agent",
+      state: "IN_PROGRESS",
+      summary: null,
+    });
+  });
+
+  it("returns error when state is empty string", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: "" });
+    expect(result).toEqual({ error: "Missing required field: state (one of: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE)" });
+  });
+
+  it("returns error when agentName is empty string", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "", state: "DONE" });
+    expect(result).toEqual({ error: "Missing required field: agentName (string)" });
   });
 });
 
@@ -205,16 +319,40 @@ function createMockTransaction() {
 }
 
 describe("findAndReleaseStaleAgentWorkForIssue", () => {
-  const mockPrisma = {
-    lease: { findMany: vi.fn() },
-    agentWork: { findMany: vi.fn(), update: vi.fn().mockResolvedValue({}) },
-    $transaction: vi.fn((fn) => fn({ agentWork: mockPrisma.agentWork })),
-  };
+  let mockPrisma: any;
+
+  beforeEach(() => {
+    mockPrisma = {
+      lease: { findMany: vi.fn() },
+      agentWork: { 
+        findMany: vi.fn().mockImplementation(({ where }: any) => {
+          let result: any[] = [];
+          // Return data based on what's been mocked — simulate notIn filtering
+          const mockData = (mockPrisma.agentWork as any)._mockData;
+          if (mockData) {
+            result = [...mockData];
+            if (where?.agentName?.notIn) {
+              result = result.filter((w: any) => !where.agentName.notIn.includes(w.agentName));
+            }
+          }
+          return Promise.resolve(result);
+        }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      $transaction: vi.fn((arg: any) => {
+        if (typeof arg === "function") {
+          return Promise.resolve(arg(mockPrisma));
+        }
+        return Promise.all(arg.map((op: any) => op));
+      }),
+    };
+  });
 
   it("returns 0 when no stale work exists", async () => {
     const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
     mockPrisma.lease.findMany.mockResolvedValue([]);
-    mockPrisma.agentWork.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [];
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
     expect(result).toBe(0);
@@ -223,9 +361,9 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
   it("releases work whose agent has no active lease", async () => {
     const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
     mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "other-agent" }]);
-    mockPrisma.agentWork.findMany.mockResolvedValue([
+    (mockPrisma.agentWork as any)._mockData = [
       { id: "stale-1", state: "IN_PROGRESS", agentName: "crashed-agent" },
-    ]);
+    ];
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
     expect(result).toBe(1);
@@ -237,9 +375,9 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
   it("does not release work whose agent has an active lease", async () => {
     const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
     mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "active-agent" }]);
-    mockPrisma.agentWork.findMany.mockResolvedValue([
+    (mockPrisma.agentWork as any)._mockData = [
       { id: "active-1", state: "IN_PROGRESS", agentName: "active-agent" },
-    ]);
+    ];
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
     expect(result).toBe(0);
