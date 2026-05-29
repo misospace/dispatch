@@ -71,7 +71,7 @@ export async function POST(request: Request) {
     }
 
     // Clean up stale AgentWork records (no matching active Lease)
-    const staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string);
+    const staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string, repoFullName as string);
     if (staleWorkCount > 0) {
       console.warn(`Released ${staleWorkCount} stale AgentWork record(s) for issue #${issueNumber}`);
     }

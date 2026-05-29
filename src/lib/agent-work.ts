@@ -127,9 +127,14 @@ export function parseCheckpointAgentWorkInput(body: unknown): CheckpointAgentWor
   const normalized = normalizeAgentWorkCheckpoint(input.checkpoint);
   if (!normalized) return { error: `Invalid checkpoint value: "${input.checkpoint}" (expected one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)` };
 
-  // Validate blockerReason type when checkpoint is BLOCKED
-  if (normalized === "BLOCKED" && input.blockerReason !== undefined && typeof input.blockerReason !== "string") {
-    return { error: "Invalid blockerReason: expected a string when checkpoint is BLOCKED" };
+  // blockerReason is required (and must be a non-empty string) when BLOCKED.
+  if (normalized === "BLOCKED") {
+    if (input.blockerReason !== undefined && typeof input.blockerReason !== "string") {
+      return { error: "Invalid blockerReason: expected a string when checkpoint is BLOCKED" };
+    }
+    if (!nonEmpty(input.blockerReason)) {
+      return { error: "Missing required field: blockerReason (string) is required when checkpoint is BLOCKED" };
+    }
   }
 
   return {
@@ -360,6 +365,7 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
 export async function findAndReleaseStaleAgentWorkForIssue(
   prisma: any,
   issueId: string,
+  repoFullName: string,
 ): Promise<number> {
   // Active lease agent names for this issue (non-expired)
   const activeLeases = await prisma.lease.findMany({
@@ -382,18 +388,23 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   if (staleWorks.length === 0) return 0;
 
   const staleIds = staleWorks.map((w: any) => w.id);
-  await prisma.agentWork.deleteMany({
-    where: { id: { in: staleIds } },
-  });
 
-  await prisma.auditLog.create({
-    data: {
-      actor: "system",
-      action: "stale_agentwork_cleanup",
-      issueId: issueId,
-      success: true,
-      notes: `Deleted ${staleWorks.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${staleIds.join(", ")}])`,
-    },
+  // Delete + audit atomically so a deletion is never left without its audit row.
+  await prisma.$transaction(async (tx: any) => {
+    await tx.agentWork.deleteMany({
+      where: { id: { in: staleIds } },
+    });
+
+    await tx.auditLog.create({
+      data: {
+        actor: "system",
+        action: "stale_agentwork_cleanup",
+        repoFullName,
+        issueId: issueId,
+        success: true,
+        notes: `Deleted ${staleWorks.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${staleIds.join(", ")}])`,
+      },
+    });
   });
 
   return staleWorks.length;

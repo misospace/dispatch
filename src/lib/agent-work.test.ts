@@ -109,6 +109,16 @@ describe("parseCheckpointAgentWorkInput", () => {
     expect(result).toEqual({ error: "Invalid blockerReason: expected a string when checkpoint is BLOCKED" });
   });
 
+  it("returns error when checkpoint is BLOCKED but blockerReason is missing", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "BLOCKED" });
+    expect(result).toEqual({ error: "Missing required field: blockerReason (string) is required when checkpoint is BLOCKED" });
+  });
+
+  it("returns error when checkpoint is BLOCKED but blockerReason is empty", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "BLOCKED", blockerReason: "   " });
+    expect(result).toEqual({ error: "Missing required field: blockerReason (string) is required when checkpoint is BLOCKED" });
+  });
+
   it("returns error when checkpoint is empty string", () => {
     const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "" });
     expect(result).toEqual({ error: "Missing required field: checkpoint (one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)" });
@@ -356,7 +366,7 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     mockPrisma.lease.findMany.mockResolvedValue([]);
     (mockPrisma.agentWork as any)._mockData = [];
 
-    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
     expect(result).toBe(0);
   });
 
@@ -367,7 +377,7 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
       { id: "stale-1", state: "IN_PROGRESS", agentName: "crashed-agent" },
     ];
 
-    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
     expect(result).toBe(1);
     expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
       where: { id: { in: ["stale-1"] } },
@@ -375,7 +385,9 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     expect(mockPrisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         action: "stale_agentwork_cleanup",
+        repoFullName: "org/repo",
         issueId: "issue-1",
+        success: true,
         notes: expect.stringContaining("Deleted 1 stale AgentWork record"),
       }),
     });
@@ -388,7 +400,7 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
       { id: "active-1", state: "IN_PROGRESS", agentName: "active-agent" },
     ];
 
-    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
     expect(result).toBe(0);
   });
 });

@@ -4,9 +4,11 @@
  * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN, DISPATCH_AGENT_NAME,
  *                     DATABASE_URL, DISPATCH_DATABASE_URL, DISPATCH_AUTH_MODE,
  *                     DISPATCH_AUTH_USERNAME, DISPATCH_AUTH_PASSWORD
+ *
+ * NOTE: This module is imported by src/middleware.ts, which runs in the Edge
+ * runtime. It must therefore stay free of Node-only APIs (node:crypto, Buffer,
+ * fs, etc.) at both module scope and in any code path the middleware reaches.
  */
-
-import { timingSafeEqual } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // URL resolution
@@ -117,12 +119,17 @@ export function isAuthorizedAgentToken(token: string | null | undefined): boolea
 
 /**
  * Timing-safe string comparison to prevent timing attacks.
+ *
+ * Pure-JS implementation (no node:crypto / Buffer) so it is safe to call from
+ * the Edge runtime via src/middleware.ts.
  */
 export function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  const aBuf = Buffer.from(a);
-  const bBuf = Buffer.from(b);
-  return timingSafeEqual(aBuf, bBuf);
+  let result = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
 }
 
 // ---------------------------------------------------------------------------

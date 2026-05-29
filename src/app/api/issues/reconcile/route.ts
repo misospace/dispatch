@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequests, fetchIssues } from "@/lib/github";
+import { fetchPullRequests, fetchIssues, fetchPullRequestHealthSignals } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
   prBranchMatchesIssue,
-  checkPrHealth,
   reconcileIssue,
   classifyLaneByHeuristics,
   executeActions,
@@ -104,6 +103,15 @@ export async function POST(request: Request) {
               openPrToIssue.set(issueNum, pr);
             }
           }
+        }
+
+        // The PR list endpoint omits reviewDecision and mergeStateStatus, so
+        // enrich each issue-linked open PR with a per-PR health fetch. Without
+        // this, checkPrHealth always sees null signals and reports "healthy".
+        for (const pr of openPrToIssue.values()) {
+          const signals = await fetchPullRequestHealthSignals(repo.fullName, pr.number);
+          pr.reviewDecision = signals.reviewDecision;
+          pr.mergeStateStatus = signals.mergeStateStatus;
         }
 
         // Fetch all issues for this repo
