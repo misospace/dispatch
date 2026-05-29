@@ -46,18 +46,15 @@ export default function RootLayout({
           <header className="border-b bg-card">
             <div className="mx-auto w-full max-w-screen-2xl px-4 sm:px-6 lg:px-8 flex items-center gap-6 py-4">
               <Link href="/" className="flex items-center gap-3 shrink-0">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/images/logo.png"
+                  alt="Dispatch"
                   width={28}
                   height={28}
-                  viewBox="0 0 28 28"
-                  fill="none"
                   className="shrink-0"
                   aria-label="Dispatch"
-                >
-                  <rect width="28" height="28" rx="6" fill="hsl(var(--primary))" />
-                  <path d="M8 14L12 18L20 10" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
+                />
                 <span className="font-bold text-lg">Dispatch</span>
               </Link>
 
