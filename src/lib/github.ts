@@ -506,9 +506,22 @@ export interface GithubPR {
 
 export async function fetchPullRequests(repoFullName: string, perPage = 100): Promise<GithubPR[]> {
   // Fetch open PRs across all pages — these are the ones that affect current board state.
-  // Closed/merged PRs are history and bounded separately by the sync pipeline.
+  // Use fetchClosedPullRequests for merged/closed history.
   const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=open&per_page=${perPage}`;
   return fetchPaginated<GithubPR>(url, 200);
+}
+
+/**
+ * Fetch recently-updated closed PRs (merged and closed-unmerged), most recent first.
+ *
+ * The open-only fetchPullRequests never returns merged PRs (their merged_at is
+ * always null), so reconciliation uses this to detect merged PRs that should
+ * close their fixing issue. Bounded to the most recently updated PRs so old
+ * repos don't pull unbounded history.
+ */
+export async function fetchClosedPullRequests(repoFullName: string, maxItems = 100): Promise<GithubPR[]> {
+  const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=closed&sort=updated&direction=desc&per_page=100`;
+  return fetchPaginated<GithubPR>(url, maxItems);
 }
 
 export interface PrHealthSignals {

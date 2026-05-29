@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequests, fetchIssues, fetchPullRequestHealthSignals } from "@/lib/github";
+import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchPullRequestHealthSignals } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
@@ -60,9 +60,16 @@ export async function POST(request: Request) {
 
     for (const repo of repos) {
       try {
-        // Fetch all PRs (open and merged) for this repo
-        const allPrs = await fetchPullRequests(repo.fullName, 100);
-        
+        // Fetch open PRs (current board/health state) and recently-closed PRs
+        // (to detect merged PRs that should close their fixing issue). The
+        // open-only list never carries merged_at, so merged PRs come from the
+        // closed fetch.
+        const [openPrsList, closedPrsList] = await Promise.all([
+          fetchPullRequests(repo.fullName, 100),
+          fetchClosedPullRequests(repo.fullName, 100),
+        ]);
+        const allPrs = [...openPrsList, ...closedPrsList];
+
         const openPrsMap = new Map<number, typeof allPrs[number]>();
         const mergedPrsMap = new Map<number, typeof allPrs[number]>();
 
