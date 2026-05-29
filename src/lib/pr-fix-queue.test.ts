@@ -112,11 +112,11 @@ describe("PR review-fix queue", () => {
 
   it("filters by lane and excludes needs-human blocked items unless requested", async () => {
     await enqueuePrFixItem(client, { repo: "org/one", pr: 1, lane: "normal", reason: "r", feedback: "f", evidenceKey: "1" });
-    await enqueuePrFixItem(client, { repo: "org/two", pr: 2, lane: "gpt", reason: "r", feedback: "f", evidenceKey: "2" });
+    await enqueuePrFixItem(client, { repo: "org/two", pr: 2, lane: "escalated", reason: "r", feedback: "f", evidenceKey: "2" });
     await enqueuePrFixItem(client, { repo: "org/three", pr: 3, lane: "needs-human", reason: "r", feedback: "f", evidenceKey: "3" });
 
     expect((await listQueuedPrFixItems(client, { lane: "normal" })).map((i) => i.pr)).toEqual([1]);
-    expect((await listQueuedPrFixItems(client, { lane: "gpt" })).map((i) => i.pr)).toEqual([2]);
+    expect((await listQueuedPrFixItems(client, { lane: "escalated" })).map((i) => i.pr)).toEqual([2]);
     expect(await listQueuedPrFixItems(client, { lane: "needs-human" })).toEqual([]);
     expect((await listQueuedPrFixItems(client, { lane: "needs-human", includeBlocked: true })).map((i) => i.pr)).toEqual([3]);
   });
