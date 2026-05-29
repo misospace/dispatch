@@ -348,52 +348,42 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
 }
 
 /**
- * Find and release AgentWork records for the given issue that have no
+ * Find and delete AgentWork records for the given issue that have no
  * matching active Lease. This covers the crash/oom-kill scenario where an
  * agent leaves a CLAIMED/IN_PROGRESS AgentWork behind with no live lease.
  *
- * Returns the count of released records.
+ * History entries are automatically cascaded via onDelete: Cascade.
+ *
+ * Returns the count of deleted records.
  */
 export async function findAndReleaseStaleAgentWorkForIssue(
   prisma: any,
   issueId: string,
 ): Promise<number> {
-  // Active lease IDs for this issue (non-expired)
+  // Active lease agent names for this issue (non-expired)
   const activeLeases = await prisma.lease.findMany({
     where: { issueId, expiredAt: { gt: new Date() } },
     select: { agentName: true },
   });
 
-  const activeAgentNames = new Set(activeLeases.map((l: any) => l.agentName));
+  const activeAgentNames = Array.from(new Set(activeLeases.map((l: any) => l.agentName)));
 
   // Find active AgentWork records for this issue whose agent has no active lease
   const staleWorks = await prisma.agentWork.findMany({
     where: {
       issueId,
       state: { in: ["CLAIMED", "IN_PROGRESS"] },
-      agentName: { notIn: Array.from(activeAgentNames) },
+      agentName: { notIn: activeAgentNames },
     },
+    select: { id: true },
   });
 
   if (staleWorks.length === 0) return 0;
 
-  const now = new Date();
-  await prisma.$transaction(
-    staleWorks.map((w: any) =>
-      prisma.agentWork.update({
-        where: { id: w.id },
-        data: { state: "STALE", leaseExpiresAt: now },
-      })
-    )
-  );
-
-  await prisma.$transaction(
-    staleWorks.map((w: any) =>
-      prisma.agentWorkHistory.create({
-        data: { workId: w.id, action: "released_by_claim_cleanup" },
-      })
-    )
-  );
+  const staleIds = staleWorks.map((w: any) => w.id);
+  await prisma.agentWork.deleteMany({
+    where: { id: { in: staleIds } },
+  });
 
   return staleWorks.length;
 }
