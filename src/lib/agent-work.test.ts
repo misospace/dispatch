@@ -338,6 +338,7 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
           return Promise.resolve(result);
         }),
         update: vi.fn().mockResolvedValue({}),
+        deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
       },
       agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
       $transaction: vi.fn((arg: any) => {
@@ -367,9 +368,9 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1");
     expect(result).toBe(1);
-    expect(mockPrisma.agentWork.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ state: "STALE" }) })
-    );
+    expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ["stale-1"] } },
+    });
   });
 
   it("does not release work whose agent has an active lease", async () => {
