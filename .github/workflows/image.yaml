@@ -72,7 +72,7 @@ jobs:
           docker build -t "$IMAGE" .
           echo "Validating Prisma CLI in image: $IMAGE"
           docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" --version
-          docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" validate --no-engine
+          docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" validate
 
       - name: Run Trivy vulnerability scanner
         if: github.event_name != 'pull_request'
