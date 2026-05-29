@@ -486,6 +486,7 @@ model Lease {
   createdAt  DateTime @default(now())
 
   @@unique([agentName, issueId])
+  @@index([agentName, expiredAt])
   @@index([expiredAt])
   @@index([issueId])
 }
