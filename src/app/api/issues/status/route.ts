@@ -55,25 +55,27 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
       }
 
-      // Find existing status label to remove
-      const existingStatus = issue.labels.find((l) => l.startsWith("status/"));
-      const labelsToSet = existingStatus && existingStatus !== targetLabel
-        ? issue.labels.filter((l) => !l.startsWith("status/"))
-        : [...issue.labels];
+      // Find ALL existing status labels (not just the first one).
+      const existingStatusLabels = issue.labels.filter((l) => l.startsWith("status/"));
+      const nonStatusLabels = issue.labels.filter((l) => !l.startsWith("status/"));
 
-      if (existingStatus !== targetLabel) {
-        labelsToSet.push(targetLabel);
-      }
+      // Build final label set: all non-status labels + target (always, even if already present).
+      const labelsToSet = [...nonStatusLabels, targetLabel];
 
       // Update GitHub labels
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
       const effectiveNumber = issue.number;
 
-      if (existingStatus && existingStatus !== targetLabel) {
-        await removeIssueLabel(effectiveRepo, effectiveNumber, existingStatus);
+      // Remove ALL existing status labels before adding the new one.
+      // Skip removing the target label itself (already on GitHub or will be added).
+      for (const oldLabel of existingStatusLabels) {
+        if (oldLabel !== targetLabel) {
+          await removeIssueLabel(effectiveRepo, effectiveNumber, oldLabel);
+        }
       }
 
-      if (existingStatus !== targetLabel) {
+      // Add the target label if it wasn't already present among the existing status labels.
+      if (!existingStatusLabels.includes(targetLabel)) {
         await addIssueLabel(effectiveRepo, effectiveNumber, targetLabel);
       }
 
@@ -119,6 +121,6 @@ export async function POST(request: Request) {
     }
   } catch (error) {
     console.error("Set issue status failed:", error);
-    return NextResponse.json({ error: "Failed to set issue status" }, { status: 500 });
+    return NextResponse.json({ error: "Failed to set issue" }, { status: 500 });
   }
 }
