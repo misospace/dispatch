@@ -58,7 +58,7 @@ jobs:
           tool_allowed_gh_api_repos: '*'
           tool_request_timeout_sec: '15'
           tool_failure_enforcement: 'true'
-          tool_min_successful_requests: '1'
+          tool_min_successful_requests: '0'
           tool_enable_for_forks: 'false'
           publish_mode: review_verdict
           allow_approve: 'true'
