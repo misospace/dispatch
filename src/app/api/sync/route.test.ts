@@ -8,6 +8,7 @@ vi.mock("@/lib/dispatch-env", () => ({
   isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
   getAcceptedAgentTokens: vi.fn(() => [mockToken]),
   resetCaches: vi.fn(),
+  safeEqual: vi.fn((a: string, b: string) => a === b),
 }));
 
 const { mocks } = vi.hoisted(() => ({
