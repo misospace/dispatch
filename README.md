@@ -576,4 +576,3 @@ docker run -p 3000:3000 \
   # -e NEXTAUTH_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")" \
   ghcr.io/misospace/dispatch:local
 ```
-# minor formatting
