@@ -166,6 +166,221 @@ describe("checkPrHealth", () => {
     expect(health.url).toContain("pull/42");
     expect(health.headRefName).toBe("fix/issue-42-feature");
   });
+
+  it("returns needs_work when reviewDecision is CHANGES_REQUESTED", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      reviewDecision: "CHANGES_REQUESTED",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("needs_work");
+    expect(health.reason).toBe("Review changes requested");
+  });
+
+  it("returns healthy when reviewDecision is APPROVED", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      reviewDecision: "APPROVED",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("healthy");
+  });
+
+  it("returns healthy when reviewDecision is COMMENTED", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      reviewDecision: "COMMENTED",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("healthy");
+  });
+
+  it("returns needs_work when mergeStateStatus is dirty", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      mergeStateStatus: "dirty",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("needs_work");
+    expect(health.reason).toBe("Merge state is dirty");
+  });
+
+  it("returns needs_work when mergeStateStatus is behind", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      mergeStateStatus: "behind",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("needs_work");
+  });
+
+  it("returns needs_work when mergeStateStatus is blocked", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      mergeStateStatus: "blocked",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("needs_work");
+  });
+
+  it("returns needs_work when mergeStateStatus is unknown", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      mergeStateStatus: "unknown",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("needs_work");
+  });
+
+  it("returns healthy when mergeStateStatus is clean", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      mergeStateStatus: "clean",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("healthy");
+  });
+
+  it("prioritizes CHANGES_REQUESTED over dirty merge state", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      reviewDecision: "CHANGES_REQUESTED",
+      mergeStateStatus: "dirty",
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("needs_work");
+    expect(health.reason).toBe("Review changes requested");
+  });
+
+  it("handles null reviewDecision and mergeStateStatus gracefully", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      reviewDecision: null,
+      mergeStateStatus: null,
+    };
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("healthy");
+    expect(health.reviewDecision).toBe(null);
+    expect(health.mergeStateStatus).toBe(null);
+  });
+
+  it("handles missing reviewDecision and mergeStateStatus fields gracefully", () => {
+    const pr = {
+      number: 42,
+      url: "https://github.com/test/repo/pull/42",
+      title: "Add feature",
+      state: "open",
+      user: { login: "test-user" },
+      head: { ref: "fix/issue-42-feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+      merged_at: null,
+      draft: false,
+    } as any;
+    const health = checkPrHealth(pr);
+    expect(health.status).toBe("healthy");
+  });
 });
 
 describe("reconcileIssue", () => {

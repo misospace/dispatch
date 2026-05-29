@@ -116,8 +116,8 @@ export interface PrHealthCheck {
  * Check the health of an open PR. Returns whether it needs another worker pass.
  */
 export function checkPrHealth(pr: GithubPR): PrHealthCheck {
-  const reviewDecision = pr.user?.login ?? null; // Simplified - real impl would use review API
-  const mergeStateStatus = "clean"; // Simplified
+  const reviewDecision = pr.reviewDecision ?? null;
+  const mergeStateStatus = pr.mergeStateStatus ?? null;
 
   // Check for review changes requested
   if (reviewDecision === "CHANGES_REQUESTED") {
