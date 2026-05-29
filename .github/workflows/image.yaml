@@ -71,6 +71,8 @@ jobs:
           IMAGE="dispatch:prisma-cli-runtime"
           docker build -t "$IMAGE" .
           echo "Validating Prisma CLI in image: $IMAGE"
+          # Pass DATABASE_URL at runtime so prisma validate can load prisma.config.ts.
+          # The builder stage ENV is only for npm run build (Next.js static generation).
           docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" --version
           docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" validate
 
