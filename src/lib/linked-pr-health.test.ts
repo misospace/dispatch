@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeLinkedPrHealth, computeLinkedPrHealthBatch, enrichQueueItemsWithPrHealth } from "./linked-pr-health";
+import { computeLinkedPrHealth, computeLinkedPrHealthBatch, enrichQueueItemsWithPrHealth, PrHealthInput } from "./linked-pr-health";
 
 describe("computeLinkedPrHealth", () => {
   it("returns null for draft PRs", () => {
@@ -319,7 +319,7 @@ describe("computeLinkedPrHealthBatch", () => {
 
 describe("enrichQueueItemsWithPrHealth", () => {
   it("attaches health data to items with matching PRs", () => {
-    const prMap = new Map<number, typeof import("./linked-pr-health").PrHealthInput>();
+    const prMap = new Map<number, PrHealthInput>();
     prMap.set(100, {
       url: "https://github.com/org/repo/pull/100",
       number: 100,
@@ -369,7 +369,7 @@ describe("enrichQueueItemsWithPrHealth", () => {
   });
 
   it("preserves all original item fields while adding linkedPrHealth", () => {
-    const prMap = new Map<number, typeof import("./linked-pr-health").PrHealthInput>();
+    const prMap = new Map<number, PrHealthInput>();
     prMap.set(10, {
       url: "https://github.com/org/repo/pull/10",
       number: 10,
