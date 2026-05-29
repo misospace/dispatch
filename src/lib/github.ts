@@ -97,7 +97,7 @@ async function getInstallationTokenWithExpiry(): Promise<CachedToken> {
   // Support escaped newlines from Kubernetes/ExternalSecrets-style env injection
   privateKey = privateKey.replace(/\\n/g, "\n");
 
-  const jwt = generateAppJwt(privateKey);
+  const jwt = await generateAppJwt(privateKey);
 
   const response = await fetch(
     `${GITHUB_API}/app/installations/${installationId}/access_tokens`,
@@ -116,11 +116,12 @@ async function getInstallationTokenWithExpiry(): Promise<CachedToken> {
     throw new Error(`Failed to get GitHub App installation token: ${response.status} ${text}`);
   }
 
-  const data = (await response.json()) as { token: string; expires_at: number };
+  const data = (await response.json()) as { token: string; expires_at: string };
 
   // Cache with a safety buffer before the actual GitHub expiry.
+  // GitHub returns expires_at as an ISO-8601 string (e.g. "2026-05-29T18:00:00Z").
   // GitHub defaults to 1 hour but allows 10min–1h; use whichever is smaller.
-  const githubExpiresAt = data.expires_at;
+  const githubExpiresAt = Math.floor(Date.parse(data.expires_at) / 1000);
   const safeTtl = Math.min(3300, githubExpiresAt - Math.floor(Date.now() / 1000) - 60);
 
   return { token: data.token, expiresAt: Date.now() / 1000 + safeTtl };
@@ -508,6 +509,79 @@ export async function fetchPullRequests(repoFullName: string, perPage = 100): Pr
   // Closed/merged PRs are history and bounded separately by the sync pipeline.
   const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=open&per_page=${perPage}`;
   return fetchPaginated<GithubPR>(url, 200);
+}
+
+export interface PrHealthSignals {
+  reviewDecision: string | null;
+  mergeStateStatus: string | null;
+}
+
+/**
+ * Derive an aggregate review decision from a PR's review list.
+ *
+ * Mirrors GitHub's own aggregation: the latest non-comment review per reviewer
+ * wins; any outstanding CHANGES_REQUESTED takes precedence over APPROVED.
+ * Returns null when there are no actionable reviews.
+ */
+function deriveReviewDecision(
+  reviews: Array<{ user?: { login?: string } | null; state?: string; submitted_at?: string }>,
+): string | null {
+  const latestByUser = new Map<string, { state: string; submittedAt: number }>();
+  for (const review of reviews) {
+    const login = review.user?.login;
+    const state = review.state?.toUpperCase();
+    if (!login || !state) continue;
+    // COMMENTED / DISMISSED / PENDING don't carry an approval signal.
+    if (state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
+    const submittedAt = review.submitted_at ? Date.parse(review.submitted_at) : 0;
+    const prev = latestByUser.get(login);
+    if (!prev || submittedAt >= prev.submittedAt) {
+      latestByUser.set(login, { state, submittedAt });
+    }
+  }
+
+  const states = Array.from(latestByUser.values()).map((r) => r.state);
+  if (states.includes("CHANGES_REQUESTED")) return "CHANGES_REQUESTED";
+  if (states.includes("APPROVED")) return "APPROVED";
+  return null;
+}
+
+/**
+ * Fetch the health signals (review decision + merge state) for a single PR.
+ *
+ * The list endpoint used by fetchPullRequests does not return `mergeable_state`
+ * or any review decision, so these require a per-PR detail GET plus the reviews
+ * endpoint. Failures are tolerated and surface as null signals.
+ */
+export async function fetchPullRequestHealthSignals(
+  repoFullName: string,
+  prNumber: number,
+): Promise<PrHealthSignals> {
+  const headers = await getHeadersAsync();
+
+  let mergeStateStatus: string | null = null;
+  let reviewDecision: string | null = null;
+
+  try {
+    const detailResp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (detailResp.ok) {
+      const detail = (await detailResp.json()) as { mergeable_state?: string | null };
+      mergeStateStatus = detail.mergeable_state ?? null;
+    }
+  } catch {
+    // Leave mergeStateStatus null on transient failure.
+  }
+
+  try {
+    const reviews = await fetchPaginated<{ user?: { login?: string } | null; state?: string; submitted_at?: string }>(
+      `${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/reviews?per_page=100`,
+    );
+    reviewDecision = deriveReviewDecision(reviews);
+  } catch {
+    // Leave reviewDecision null on transient failure.
+  }
+
+  return { reviewDecision, mergeStateStatus };
 }
 
 export interface GithubPackageInfo {

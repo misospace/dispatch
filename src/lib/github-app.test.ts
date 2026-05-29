@@ -103,13 +103,18 @@ describe("GitHub App authentication", () => {
     const now = Math.floor(Date.now() / 1000);
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ token: "app-token-abc", expires_at: now + 3600 }),
+      json: () => Promise.resolve({ token: "app-token-abc", expires_at: new Date((now + 3600) * 1000).toISOString() }),
       headers: new Headers(),
     } as Response);
 
     const { getGitHubToken } = await import("./github");
     const token = await getGitHubToken();
     expect(token).toBe("app-token-abc");
+
+    // The App JWT must be awaited before being sent — a missing await would
+    // produce "Bearer [object Promise]" and GitHub would reject with 401.
+    const authHeader = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(authHeader.Authorization).toMatch(/^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
   });
 
   it("caches token and reuses on second call without refetching", async () => {
@@ -121,7 +126,7 @@ describe("GitHub App authentication", () => {
     const now = Math.floor(Date.now() / 1000);
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ token: "cached-token", expires_at: now + 3600 }),
+      json: () => Promise.resolve({ token: "cached-token", expires_at: new Date((now + 3600) * 1000).toISOString() }),
       headers: new Headers(),
     } as Response);
 
@@ -142,7 +147,7 @@ describe("GitHub App authentication", () => {
     const now = Math.floor(Date.now() / 1000);
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ token: "short-lived", expires_at: now + 600 }), // 10 min
+      json: () => Promise.resolve({ token: "short-lived", expires_at: new Date((now + 600) * 1000).toISOString() }), // 10 min
       headers: new Headers(),
     } as Response);
 
@@ -160,7 +165,7 @@ describe("GitHub App authentication", () => {
     const now = Math.floor(Date.now() / 1000);
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: () => Promise.resolve({ token: "escaped-key-token", expires_at: now + 3600 }),
+      json: () => Promise.resolve({ token: "escaped-key-token", expires_at: new Date((now + 3600) * 1000).toISOString() }),
       headers: new Headers(),
     } as Response);
 

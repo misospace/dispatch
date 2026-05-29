@@ -31,8 +31,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       },
     });
 
-    const issueLane = lane === "gpt" ? "escalated" : (lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined);
-    const prFixLane = lane === "gpt" ? "ESCALATED" : lane;
+    const issueLane = lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined;
+    const prFixLane = lane;
 
     // Find issues that have active leases from OTHER agents — exclude them
     // so other agents don't overlap on leased work.
