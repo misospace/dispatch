@@ -54,6 +54,15 @@ export interface Issue {
   blockedReason?: string | null;
   needsInfoReason?: string | null;
   nextGroomingAction?: string | null;
+
+  // Linked PR health (persisted by reconcile / refresh endpoint)
+  linkedPrNumber?: number | null;
+  linkedPrUrl?: string | null;
+  linkedPrNeedsFollowup?: boolean;
+  linkedPrFollowupReasons?: string[];
+  linkedPrReviewDecision?: string | null;
+  linkedPrMergeState?: string | null;
+  linkedPrHealthCheckedAt?: Date | null;
 }
 
 export interface StoredIssueLane {

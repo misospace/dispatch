@@ -12,6 +12,20 @@ const IN_PROGRESS_STATUS: string = "status/in-progress";
 const BACKLOG_STATUS: string = "status/backlog";
 const READY_STATUS: string = "status/ready";
 
+/**
+ * Compact linked-PR-health summary carried on queue items, sourced from the
+ * persisted Issue columns (populated by reconcile / the refresh endpoint).
+ */
+export interface QueueLinkedPrHealth {
+  number: number | null;
+  url: string | null;
+  needsFollowup: boolean;
+  followupReasons: string[];
+  reviewDecision: string | null;
+  mergeState: string | null;
+  checkedAt: string | null;
+}
+
 export interface RankedIssue {
   type?: "issue";
   number: number;
@@ -27,6 +41,7 @@ export interface RankedIssue {
   issueId?: string;
   repoFullName?: string;
   claimable?: boolean;
+  linkedPrHealth?: QueueLinkedPrHealth | null;
 }
 
 /**
@@ -141,6 +156,7 @@ export function buildAgentQueue(
     decomposed?: boolean;
     issueId?: string;
     repoFullName?: string;
+    linkedPrHealth?: QueueLinkedPrHealth | null;
   }>,
   agentName: string,
   options?: {
@@ -218,6 +234,7 @@ export function buildAgentQueue(
       issueId: item.issueId,
       repoFullName: item.repoFullName,
       claimable: status !== BACKLOG_STATUS,
+      linkedPrHealth: item.linkedPrHealth ?? null,
     };
   });
 }
