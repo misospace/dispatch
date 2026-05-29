@@ -14,8 +14,7 @@
  * route handlers authorize API access for browsers and agents.
  */
 
-import { getAcceptedAgentTokens, isAuthorizedBearerToken as _isAuthed, resetCaches as _resetEnvCaches } from "./dispatch-env";
-import { timingSafeEqual } from "node:crypto";
+import { getAcceptedAgentTokens, isAuthorizedBearerToken as _isAuthed, resetCaches as _resetEnvCaches, safeEqual } from "./dispatch-env";
 
 // ---------------------------------------------------------------------------
 // Auth mode resolution
@@ -115,17 +114,6 @@ export function parseAuthorizationHeader(
 // ---------------------------------------------------------------------------
 // Basic Auth authorization
 // ---------------------------------------------------------------------------
-
-/**
- * Compare two strings using a constant-time algorithm to prevent timing attacks.
- * Returns true if the strings are equal, false otherwise.
- */
-function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  const aBuf = Buffer.from(a);
-  const bBuf = Buffer.from(b);
-  return timingSafeEqual(aBuf, bBuf);
-}
 
 // ---------------------------------------------------------------------------
 // Bearer token authorization (delegates to dispatch-env)
