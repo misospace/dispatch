@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchPullRequestHealthSignals } from "@/lib/github";
+import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchLinkedPrHealthInput } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
@@ -9,6 +9,7 @@ import {
   classifyLaneByHeuristics,
   executeActions,
 } from "@/lib/issue-reconciliation";
+import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest } from "@/lib/auth";
 
 /**
@@ -112,13 +113,16 @@ export async function POST(request: Request) {
           }
         }
 
-        // The PR list endpoint omits reviewDecision and mergeStateStatus, so
-        // enrich each issue-linked open PR with a per-PR health fetch. Without
-        // this, checkPrHealth always sees null signals and reports "healthy".
-        for (const pr of openPrToIssue.values()) {
-          const signals = await fetchPullRequestHealthSignals(repo.fullName, pr.number);
-          pr.reviewDecision = signals.reviewDecision;
-          pr.mergeStateStatus = signals.mergeStateStatus;
+        // The PR list endpoint omits reviewDecision/mergeStateStatus/checks, so
+        // fetch a full health input per issue-linked open PR. This both feeds
+        // checkPrHealth (which needs review + merge signals) and produces the
+        // linked-PR-health snapshot we persist on the issue below.
+        const linkedPrHealthByIssue = new Map<number, LinkedPrHealth | null>();
+        for (const [issueNum, pr] of openPrToIssue) {
+          const input = await fetchLinkedPrHealthInput(repo.fullName, pr);
+          pr.reviewDecision = input.reviewDecision;
+          pr.mergeStateStatus = input.mergeStateStatus;
+          linkedPrHealthByIssue.set(issueNum, computeLinkedPrHealth(input));
         }
 
         // Fetch all issues for this repo
@@ -194,6 +198,24 @@ export async function POST(request: Request) {
               data: { currentLane: classification.lane },
             });
             totalLaneClassified++;
+          }
+
+          // Persist linked PR health. Write when the issue has a linked open PR;
+          // otherwise clear any stale snapshot left from a PR that has since
+          // closed or merged. Skip the write when there's nothing to clear.
+          if (existingIssue) {
+            const hasLinkedPr = openPrToIssue.has(issue.number);
+            if (hasLinkedPr) {
+              await prisma.issue.update({
+                where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
+                data: toPersistedLinkedPrHealth(linkedPrHealthByIssue.get(issue.number) ?? null),
+              });
+            } else if (existingIssue.linkedPrNumber !== null) {
+              await prisma.issue.update({
+                where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
+                data: toPersistedLinkedPrHealth(null),
+              });
+            }
           }
 
           totalIssuesReconciled++;

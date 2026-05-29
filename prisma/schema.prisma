@@ -57,9 +57,19 @@ model Issue {
   needsInfoReason  String?  @db.Text
   nextGroomingAction String? @db.Text
 
+  // Linked PR health (persisted by reconcile, refreshable on demand)
+  linkedPrNumber          Int?
+  linkedPrUrl             String?
+  linkedPrNeedsFollowup   Boolean   @default(false)
+  linkedPrFollowupReasons String[]  @default([])
+  linkedPrReviewDecision  String?
+  linkedPrMergeState      String?
+  linkedPrHealthCheckedAt DateTime?
+
   @@unique([repositoryId, number])
   @@index([state])
   @@index([labels])
+  @@index([linkedPrNeedsFollowup])
 }
 
 enum PrFixLane {

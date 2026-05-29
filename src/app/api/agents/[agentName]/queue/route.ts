@@ -28,6 +28,13 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
         currentLane: true,
         decomposed: true,
         repository: { select: { fullName: true } },
+        linkedPrNumber: true,
+        linkedPrUrl: true,
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: true,
+        linkedPrReviewDecision: true,
+        linkedPrMergeState: true,
+        linkedPrHealthCheckedAt: true,
       },
     });
 
@@ -51,6 +58,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
         lane: issue.currentLane ?? undefined,
         issueId: issue.id,
         repoFullName: issue.repository.fullName,
+        linkedPrHealth: {
+          number: issue.linkedPrNumber,
+          url: issue.linkedPrUrl,
+          needsFollowup: issue.linkedPrNeedsFollowup,
+          followupReasons: issue.linkedPrFollowupReasons,
+          reviewDecision: issue.linkedPrReviewDecision,
+          mergeState: issue.linkedPrMergeState,
+          checkedAt: issue.linkedPrHealthCheckedAt?.toISOString() ?? null,
+        },
       })),
       agentName,
       {

@@ -14,6 +14,20 @@ interface IssueCardProps {
   onIssueUpdate?: (updatedIssue: Issue) => void;
 }
 
+/** Turn a linked-PR-health follow-up reason code into human-readable text. */
+function formatFollowupReason(reason: string): string {
+  switch (reason) {
+    case "changes_requested":
+      return "changes requested";
+    case "failing_checks":
+      return "failing checks";
+    case "merge_conflict":
+      return "merge conflict";
+    default:
+      return reason.startsWith("merge_state_") ? reason.replace("merge_state_", "merge state: ") : reason;
+  }
+}
+
 export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) {
   const {
     attributes,
@@ -529,6 +543,19 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
             <span className="px-1.5 py-0.5 text-xs rounded bg-red-100 text-red-700">
               {priorityLabel.replace("priority/", "p")}
             </span>
+          )}
+          {issue.linkedPrNeedsFollowup && (
+            <a
+              href={issue.linkedPrUrl ?? issue.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded bg-amber-100 text-amber-700 hover:bg-amber-200"
+              title={(issue.linkedPrFollowupReasons ?? []).map(formatFollowupReason).join(", ")}
+            >
+              <GitPullRequest className="h-3 w-3" />
+              PR needs work
+            </a>
           )}
         </div>
         {(issue.notReadyReason || issue.blockedReason || issue.needsInfoReason || issue.groomingSummary) && (

@@ -1,4 +1,5 @@
 import { GitHubIssue } from "@/types";
+import type { CheckFailure, PrHealthInput } from "./linked-pr-health";
 
 const GITHUB_API = "https://api.github.com";
 
@@ -595,6 +596,56 @@ export async function fetchPullRequestHealthSignals(
   }
 
   return { reviewDecision, mergeStateStatus };
+}
+
+/**
+ * Fetch failing CI check runs for a PR's head ref.
+ *
+ * Uses the check-runs endpoint for the head branch. Only completed runs with a
+ * failure-type conclusion are returned. Transient failures yield an empty list
+ * rather than throwing, so health computation degrades gracefully.
+ */
+export async function fetchPullRequestCheckFailures(repoFullName: string, ref: string): Promise<CheckFailure[]> {
+  const FAILURE_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required"]);
+  try {
+    const response = await fetch(
+      `${GITHUB_API}/repos/${repoFullName}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`,
+      { headers: await getHeadersAsync() },
+    );
+    if (!response.ok) return [];
+    const data = (await response.json()) as { check_runs?: Array<{ name?: string; conclusion?: string | null }> };
+    return (data.check_runs ?? [])
+      .filter((run) => run.conclusion && FAILURE_CONCLUSIONS.has(run.conclusion.toLowerCase()))
+      .map((run) => ({ name: run.name ?? "unknown", conclusion: run.conclusion as string }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Assemble a full PrHealthInput for a PR by combining review decision + merge
+ * state (fetchPullRequestHealthSignals) with failing check runs. This is the
+ * single source the linked-PR-health feature uses to compute a snapshot, from
+ * both the reconcile job and the on-demand refresh endpoint.
+ */
+export async function fetchLinkedPrHealthInput(repoFullName: string, pr: GithubPR): Promise<PrHealthInput> {
+  const [signals, checkFailures] = await Promise.all([
+    fetchPullRequestHealthSignals(repoFullName, pr.number),
+    fetchPullRequestCheckFailures(repoFullName, pr.head?.ref ?? ""),
+  ]);
+
+  const state: PrHealthInput["state"] = pr.merged_at ? "merged" : pr.state === "closed" ? "closed" : "open";
+
+  return {
+    url: pr.url,
+    number: pr.number,
+    state,
+    draft: pr.draft,
+    mergedAt: pr.merged_at,
+    mergeStateStatus: signals.mergeStateStatus,
+    reviewDecision: signals.reviewDecision,
+    checkFailures,
+  };
 }
 
 export interface GithubPackageInfo {
