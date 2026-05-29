@@ -341,6 +341,7 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
         deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
       },
       agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      auditLog: { create: vi.fn().mockResolvedValue({ id: "log-1" }) },
       $transaction: vi.fn((arg: any) => {
         if (typeof arg === "function") {
           return Promise.resolve(arg(mockPrisma));
@@ -370,6 +371,13 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     expect(result).toBe(1);
     expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
       where: { id: { in: ["stale-1"] } },
+    });
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "stale_agentwork_cleanup",
+        issueId: "issue-1",
+        notes: expect.stringContaining("Deleted 1 stale AgentWork record"),
+      }),
     });
   });
 

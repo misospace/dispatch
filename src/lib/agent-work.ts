@@ -353,6 +353,7 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * agent leaves a CLAIMED/IN_PROGRESS AgentWork behind with no live lease.
  *
  * History entries are automatically cascaded via onDelete: Cascade.
+ * An AuditLog entry is created for traceability.
  *
  * Returns the count of deleted records.
  */
@@ -375,7 +376,7 @@ export async function findAndReleaseStaleAgentWorkForIssue(
       state: { in: ["CLAIMED", "IN_PROGRESS"] },
       agentName: { notIn: activeAgentNames },
     },
-    select: { id: true },
+    select: { id: true, agentName: true },
   });
 
   if (staleWorks.length === 0) return 0;
@@ -383,6 +384,16 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   const staleIds = staleWorks.map((w: any) => w.id);
   await prisma.agentWork.deleteMany({
     where: { id: { in: staleIds } },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      actor: "system",
+      action: "stale_agentwork_cleanup",
+      issueId: issueId,
+      success: true,
+      notes: `Deleted ${staleWorks.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${staleIds.join(", ")}])`,
+    },
   });
 
   return staleWorks.length;
