@@ -16,7 +16,7 @@ export async function GET(request: Request) {
 
     if (lane) {
       const normalized = lane.trim().toUpperCase().replace(/-/g, "_");
-      if (normalized !== "GPT" && !isValidPrFixLane(normalized)) {
+      if (!isValidPrFixLane(normalized)) {
         return NextResponse.json({ error: `Invalid lane. Valid lanes: ${VALID_PR_FIX_LANES.join(", ")}` }, { status: 400 });
       }
     }

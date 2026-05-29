@@ -224,7 +224,6 @@ export function isValidPrFixStatus(status: string): status is PrFixStatus {
 export function normalizePrFixLane(lane?: string | null): PrFixLane {
   if (!lane) return "NORMAL";
   const normalized = lane.trim().toUpperCase().replace(/-/g, "_");
-  if (normalized === "GPT") return "ESCALATED";
   if (normalized === "NEEDS_HUMAN" || normalized === "NEEDS-HUMAN") return "NEEDS_HUMAN";
   return isValidPrFixLane(normalized) ? normalized : "NEEDS_HUMAN";
 }
