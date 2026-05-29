@@ -12,6 +12,7 @@ RUN npm ci --omit=dev
 
 FROM base AS builder
 WORKDIR /app
+ARG DATABASE_URL=postgresql://localhost:5432/dispatch
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
