@@ -32,6 +32,7 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/config", () => ({
   getSyncRepos: vi.fn().mockResolvedValue([{ id: "repo-1", fullName: "org/repo" }]),
+  parseExcludedLabels: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock("@/lib/issue-sync", () => ({

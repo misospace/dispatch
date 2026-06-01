@@ -36,6 +36,19 @@ export function buildLabelWhere(labels: Array<string | null | undefined>) {
   return { hasEvery: selectedLabels };
 }
 
+export function isIssueExcludedByLabels(issueLabels: string[], excludedLabels: string[]): boolean {
+  if (excludedLabels.length === 0) return false;
+  for (const label of issueLabels) {
+    if (excludedLabels.includes(label)) return true;
+  }
+  return false;
+}
+
+export function buildExcludedLabelWhere(excludedLabels: string[]) {
+  if (excludedLabels.length === 0) return undefined;
+  return { hasNone: excludedLabels };
+}
+
 export function toProjectLabel(project: string | null | undefined) {
   return project ? `project/${project}` : undefined;
 }

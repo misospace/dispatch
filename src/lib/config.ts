@@ -74,6 +74,24 @@ export async function getTrackedRepos(): Promise<string[]> {
   return envRepos;
 }
 
+export function parseExcludedLabels(input: string | undefined): string[] {
+  if (!input) return [];
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  const parts = input.split(/[,\n]/);
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+
+  return result;
+}
+
 export async function getSyncRepos(): Promise<{ id: string; fullName: string }[]> {
   const trackedRepos = await getTrackedRepos();
   const results: { id: string; fullName: string }[] = [];

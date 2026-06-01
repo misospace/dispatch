@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel } from "@/lib/issue-filters";
+import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere } from "@/lib/issue-filters";
+import { parseExcludedLabels } from "@/lib/config";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -29,6 +30,12 @@ export async function GET(request: Request) {
 
     const labels = buildLabelWhere([agent, owner, toProjectLabel(project), priority]);
     if (labels) where.labels = labels;
+
+    const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
+    const excludedLabelFilter = buildExcludedLabelWhere(excludedLabels);
+    if (excludedLabelFilter) {
+      where.labels = { ...(where.labels as object), ...excludedLabelFilter };
+    }
 
     const issues = await prisma.issue.findMany({
       where,

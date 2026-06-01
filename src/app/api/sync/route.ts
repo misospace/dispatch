@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
-import { getSyncRepos } from "@/lib/config";
+import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, mergeLabels } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
 
@@ -34,6 +34,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
     const result = await syncIssuesForRepos(repos, fetchIssues, {
       findIssue(repositoryId, number) {
         return prisma.issue.findUnique({
@@ -59,7 +60,7 @@ export async function POST(request: NextRequest) {
       async createIssue(repositoryId, data) {
         await prisma.issue.create({ data: { ...data, repositoryId } });
       },
-    });
+    }, excludedLabels);
 
     return NextResponse.json(result);
   } catch (error) {

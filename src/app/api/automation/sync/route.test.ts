@@ -12,6 +12,7 @@ vi.mock("@/lib/dispatch-env", () => ({
 
 vi.mock("@/lib/config", () => ({
   getTrackedRepos: vi.fn().mockResolvedValue([]),
+  parseExcludedLabels: vi.fn().mockReturnValue([]),
 }));
 
 import { POST } from "./route";

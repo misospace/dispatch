@@ -12,6 +12,7 @@ const { mocks } = vi.hoisted(() => ({
 
 vi.mock("@/lib/config", () => ({
   parseAgentList: mocks.parseAgentList,
+  parseExcludedLabels: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock("@/lib/prisma", () => ({
