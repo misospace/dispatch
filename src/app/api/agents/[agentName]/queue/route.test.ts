@@ -105,7 +105,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
         number: 51,
         title: "Test issue",
         url: "https://github.com/org/repo/issues/51",
-        labels: [],
+        labels: ["priority/p1"],
         currentLane: "escalated",
         decomposed: false,
         repository: { fullName: "org/repo" },
@@ -147,7 +147,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
         number: 5,
         title: "Issue work",
         url: "https://github.com/org/repo/issues/5",
-        labels: [],
+        labels: ["enhancement"],
         currentLane: "normal",
         decomposed: false,
         repository: { fullName: "org/repo" },
@@ -164,7 +164,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(body[1].type).toBe("issue");
   });
 
-  it("excludes claimed issues by default", async () => {
+  it("includes same-agent claimed issues by default and excludes unlabelled orphans", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {
         id: "issue-claimed",
@@ -194,7 +194,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.map((item: { number: number }) => item.number)).toEqual([53]);
+    // Same-agent claimed work is now included (fix #291), unlabelled orphans are excluded
+    expect(body.map((item: { number: number }) => item.number)).toEqual([52]);
   });
 
   it("includes claimed issues when includeClaimed=true", async () => {
@@ -239,7 +240,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
         number: 55,
         title: "Open issue",
         url: "https://github.com/org/repo/issues/55",
-        labels: [],
+        labels: ["bug"],
         currentLane: "normal",
         decomposed: false,
         repository: { fullName: "org/repo" },
