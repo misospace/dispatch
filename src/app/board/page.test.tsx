@@ -20,6 +20,7 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/config", () => ({
   getTrackedRepos: mocks.getTrackedRepos,
+  parseExcludedLabels: vi.fn().mockReturnValue([]),
 }));
 
 // Components render to React elements but are not deep-rendered here.

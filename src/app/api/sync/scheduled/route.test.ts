@@ -109,6 +109,7 @@ function createConfigMock() {
       { id: "repo-1", fullName: "org/repo" },
     ]),
     getTrackedRepos: vi.fn().mockResolvedValue(["org/repo"]),
+    parseExcludedLabels: vi.fn().mockReturnValue([]),
   };
 }
 

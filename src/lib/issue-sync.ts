@@ -1,4 +1,5 @@
 import { GitHubIssue } from "@/types";
+import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 
 export interface SyncRepo {
   id: string;
@@ -129,6 +130,7 @@ export async function syncIssuesForRepos(
   repos: SyncRepo[],
   fetchIssues: (repoFullName: string) => Promise<GitHubIssue[]>,
   store: IssueStore,
+  excludedLabels: string[] = [],
 ): Promise<SyncResponse> {
   const results: SyncResult[] = [];
   let syncedCount = 0;
@@ -139,6 +141,10 @@ export async function syncIssuesForRepos(
       let repoSyncedCount = 0;
 
       for (const ghIssue of githubIssues) {
+        if (isIssueExcludedByLabels(ghIssue.labels.map((l) => l.name), excludedLabels)) {
+          continue;
+        }
+
         const issueData = githubIssueToSyncedIssueData(ghIssue);
         const existingIssue = await store.findIssue(repo.id, ghIssue.number);
 

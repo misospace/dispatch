@@ -6,6 +6,7 @@ import {
   getAgentFromLabels,
   getPriorityFromLabels,
 } from "@/types";
+import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 
 const DONE_STATUS: string = "status/done";
 const IN_PROGRESS_STATUS: string = "status/in-progress";
@@ -148,6 +149,7 @@ function isActionable(issueLabels: string[]): boolean {
  * Excludes Renovate issues by default; pass includeRenovate=true to include them.
  * By default, only claimable work is returned (excludes status/backlog).
  * Pass claimableOnly=false to include all actionable issues including backlog.
+ * Excludes issues with labels matching DISPATCH_EXCLUDED_LABELS by default.
  */
 export function buildAgentQueue(
   issues: Array<{
@@ -168,6 +170,7 @@ export function buildAgentQueue(
     includeClaimed?: boolean;
     includeRenovate?: boolean;
     claimableOnly?: boolean;
+    excludedLabels?: string[];
   },
 ): RankedIssue[] {
   // Normalize lane to lowercase for consistent comparison
@@ -217,6 +220,12 @@ export function buildAgentQueue(
   // Exclude decomposed audit parents if requested
   if (options?.excludeDecomposed) {
     actionable = actionable.filter((issue) => !issue.decomposed);
+  }
+
+  // Exclude issues with labels matching the excluded labels config
+  const excludedLabels = options?.excludedLabels;
+  if (excludedLabels && excludedLabels.length > 0) {
+    actionable = actionable.filter((issue) => !isIssueExcludedByLabels(issue.labels, excludedLabels));
   }
 
   // Lane filter: exclude BACKLOG lane items from normal agent queue

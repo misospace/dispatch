@@ -3,6 +3,7 @@ import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { buildAgentQueue } from "@/lib/agent-queue";
 import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
 import { findLeasedIssueIds } from "@/lib/lease";
+import { parseExcludedLabels } from "@/lib/config";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
@@ -74,6 +75,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
         excludeDecomposed: excludeDecomposed === "true",
         includeClaimed,
         includeRenovate,
+        excludedLabels: parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS),
       },
     );
 
