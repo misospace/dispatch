@@ -9,6 +9,7 @@ import {
 
 const DONE_STATUS: string = "status/done";
 const IN_PROGRESS_STATUS: string = "status/in-progress";
+const IN_REVIEW_STATUS: string = "status/in-review";
 const BACKLOG_STATUS: string = "status/backlog";
 const READY_STATUS: string = "status/ready";
 
@@ -54,6 +55,7 @@ export function isRenovateIssue(issue: { title: string; labels: string[] }): boo
 
   // Title-based heuristics
   if (title.includes("dependency dashboard")) return true;
+  if (title.includes("renovate dashboard")) return true;
   if (/^update (?:dependency|image|deps?)/.test(title)) return true;
 
   // Label-based heuristics
@@ -100,17 +102,23 @@ function rankIssue(issueLabels: string[], agentName: string): { score: number; r
     parts.push(`${AGENT_PREFIX}${agentName}`);
   }
 
-  // Status component: in-progress before ready before backlog before no-status
-  let statusScore = 2;
+  // Status component: in-progress before in-review before ready before backlog before no-status
+  let statusScore = 3;
   if (status === IN_PROGRESS_STATUS) {
     statusScore = 0;
     parts.push("in-progress");
-  } else if (status === READY_STATUS) {
+  } else if (status === IN_REVIEW_STATUS) {
     statusScore = 1;
-    parts.push("ready");
-  } else if (status === BACKLOG_STATUS || status === null) {
+    parts.push("in-review");
+  } else if (status === READY_STATUS) {
     statusScore = 2;
-    parts.push(status ?? "no-status");
+    parts.push("ready");
+  } else if (status === BACKLOG_STATUS) {
+    statusScore = 3;
+    parts.push("backlog");
+  } else if (status === null) {
+    statusScore = 4;
+    parts.push("no-status");
   }
 
   const score = priorityScore * 100 + agentScore * 10 + statusScore;
@@ -121,7 +129,6 @@ function rankIssue(issueLabels: string[], agentName: string): { score: number; r
  * Determine if an issue is actionable for the agent queue.
  * - Must be open (not closed)
  * - Must not have status/done
- * - Must either have no status label, status/backlog, or status/in-progress
  */
 function isActionable(issueLabels: string[]): boolean {
   const status = getStatusFromLabels(issueLabels);
@@ -129,12 +136,8 @@ function isActionable(issueLabels: string[]): boolean {
   // Exclude done
   if (status === DONE_STATUS) return false;
 
-  // Include: no status, backlog, ready, in-progress
-  if (status === null || status === BACKLOG_STATUS || status === READY_STATUS || status === IN_PROGRESS_STATUS) {
-    return true;
-  }
-
-  return false;
+  // Include all non-done statuses including no-status
+  return true;
 }
 
 /**
@@ -181,8 +184,29 @@ export function buildAgentQueue(
     actionable = actionable.filter((issue) => getStatusFromLabels(issue.labels) !== BACKLOG_STATUS);
   }
 
+  // Default claimed filter: keep work assigned to the requesting agent, exclude other agents' claims
   if (!options?.includeClaimed) {
-    actionable = actionable.filter((issue) => !issue.labels.some((label) => label.startsWith(AGENT_PREFIX)));
+    actionable = actionable.filter((issue) => {
+      const agentLabel = getAgentFromLabels(issue.labels);
+      return !agentLabel || agentLabel === `${AGENT_PREFIX}${agentName}`;
+    });
+
+    // Exclude unclaimed no-status issues by default (no-label orphan items)
+    // This prevents "Renovate Dashboard" and other completely unlabelled issues from polluting the worker queue
+    // When claimableOnly=false (triage/grooming views), include them for review
+    if (claimableOnly) {
+      actionable = actionable.filter((issue) => {
+        const status = getStatusFromLabels(issue.labels);
+        const agentLabel = getAgentFromLabels(issue.labels);
+        // Has a status label → keep it
+        if (status !== null) return true;
+        // Has an agent label → keep it (agent-assigned, no-status work)
+        if (agentLabel) return true;
+        // Completely unlabelled (no labels at all) → exclude
+        if (issue.labels.length === 0) return false;
+        return true; // has some labels but no status — keep it
+      });
+    }
   }
 
   // Exclude Renovate issues by default (unless explicitly included)
