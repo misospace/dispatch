@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import Link from "next/link";
 import { getClientVersionLabel } from "@/lib/version-client";
 import { ThemeToggle } from "./theme-toggle";
+import { AuthControls } from "./auth-controls";
 
 const navLinks = [
   { href: "/", label: "Overview" },
@@ -73,7 +74,10 @@ export function MobileNav() {
           ))}
           <div className="pt-2 flex items-center justify-between border-t mt-1">
             <span className="text-xs text-muted-foreground/60">{getClientVersionLabel()}</span>
-            <ThemeToggle />
+            <div className="flex items-center gap-2">
+              <AuthControls />
+              <ThemeToggle />
+            </div>
           </div>
         </nav>
       )}

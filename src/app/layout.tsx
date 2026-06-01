@@ -4,6 +4,7 @@ import Link from "next/link";
 import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { MobileNav } from "@/components/mobile-nav";
+import { AuthControls } from "@/components/auth-controls";
 import { getVersionLabel } from "@/lib/version";
 
 const inter = Inter({ subsets: ["latin"] });
@@ -81,7 +82,8 @@ export default function RootLayout({
               <MobileNav />
 
               <span className="text-xs text-muted-foreground/60 shrink-0">{getVersionLabel()}</span>
-              <div className="ml-auto shrink-0">
+              <div className="ml-auto shrink-0 flex items-center gap-2">
+                <AuthControls />
                 <ThemeToggle />
               </div>
             </div>

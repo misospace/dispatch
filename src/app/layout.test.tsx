@@ -27,6 +27,12 @@ vi.mock("@/components/theme-toggle", () => ({
   },
 }));
 
+vi.mock("@/components/auth-controls", () => ({
+  AuthControls: function AuthControls() {
+    return null;
+  },
+}));
+
 vi.mock("next/link", () => ({
   default: function NavLink({ href, children }: { href: string; children: React.ReactNode }) {
     return React.createElement("a", { href, "data-nav": "true" }, children);

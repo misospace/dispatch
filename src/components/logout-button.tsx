@@ -1,33 +1,41 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { signOut } from "next-auth/react";
+import {
+  clearBasicAuthCredentials,
+  hasBasicAuthCredentials,
+} from "@/lib/client-auth";
 
 /**
- * Client-side logout button for OIDC authentication mode.
+ * Client-side logout button for both OIDC and Basic Auth modes.
  *
- * In OIDC mode, clears the session via the API and redirects to login.
- * In Basic Auth mode, this is a no-op since browsers manage credentials.
+ * - OIDC mode: calls NextAuth signOut to clear session cookie
+ * - Basic Auth mode: clears stored credentials from sessionStorage
  */
-export function LogoutButton({
-  onLogout,
-  className,
-}: {
-  onLogout?: () => void;
-  className?: string;
-}) {
+export function LogoutButton({ className }: { className?: string }) {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
+  const [hasCredentials, setHasCredentials] = useState(false);
+
+  useEffect(() => {
+    setHasCredentials(hasBasicAuthCredentials());
+  }, []);
 
   const handleLogout = async () => {
     setLoading(true);
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      if (hasCredentials) {
+        clearBasicAuthCredentials();
+      } else {
+        await signOut({ redirect: false });
+      }
       router.push("/login");
       router.refresh();
-      onLogout?.();
     } catch {
-      // If logout API fails, clear session and redirect anyway
+      // If logout fails, clear credentials anyway and redirect
+      clearBasicAuthCredentials();
       router.push("/login");
       router.refresh();
     } finally {
