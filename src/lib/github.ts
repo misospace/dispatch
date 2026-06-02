@@ -491,6 +491,8 @@ export interface GithubPR {
   number: number;
   url: string;
   title: string;
+  /** PR body text (available when fetched from closed PRs endpoint) */
+  body?: string | null;
   state: string;
   user: { login: string };
   head: { ref: string };

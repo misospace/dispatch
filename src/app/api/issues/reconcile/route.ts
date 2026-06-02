@@ -86,16 +86,29 @@ export async function POST(request: Request) {
         totalMergedPrsFound += mergedPrsMap.size;
         totalOpenPrsChecked += openPrsMap.size;
 
-        // Extract issue numbers from merged PR bodies (if available via branch names)
+        // Extract issue numbers from merged PRs: scan body keywords first, then
+        // fall back to branch name patterns so we catch "Fixes #NNN", "Closes #NNN",
+        // "Resolves #NNN" references that workers write in PR bodies.
         const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
         for (const [, pr] of mergedPrsMap) {
-          // Use branch name as proxy for issue reference
-          const branch = pr.head?.ref ?? "";
-          const match = branch.match(/issue[-_/]?(\d+)/i);
-          if (match) {
-            const issueNum = parseInt(match[1], 10);
-            if (!isNaN(issueNum)) {
-              mergedFixingIssues.set(issueNum, pr);
+          // 1. Check PR body for keyword references (Fixes #, Closes #, Resolves #)
+          const bodyNumbers = extractFixingIssueNumbers(pr.body ?? pr.title ?? null);
+          for (const num of bodyNumbers) {
+            if (!mergedFixingIssues.has(num)) {
+              mergedFixingIssues.set(num, pr);
+            }
+          }
+          // 2. Fallback: check branch name pattern
+          if (!mergedFixingIssues.has(pr.number)) {
+            const branch = pr.head?.ref ?? "";
+            const match = branch.match(/issue[-_/]?(\d+)/i);
+            if (match) {
+              const issueNum = parseInt(match[1], 10);
+              if (!isNaN(issueNum)) {
+                if (!mergedFixingIssues.has(issueNum)) {
+                  mergedFixingIssues.set(issueNum, pr);
+                }
+              }
             }
           }
         }
