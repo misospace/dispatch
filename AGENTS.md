@@ -225,3 +225,66 @@ For the detailed worker execution contract (PR fix queue precedence, duplicate P
 ### Worker cron prompt migration
 
 Worker cron prompts have been migrated from GitHub Project board readers to Dispatch queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](./docs/worker-cron-prompt-migration.md).
+
+### Release cut process
+
+Dispatch follows semver. Releases are cut from `main` after each notable fix or feature merge.
+
+1. **Branch from up-to-date main**
+   ```bash
+   git checkout main
+   git pull --ff-only
+   git checkout -b chore/release-v<version>
+   ```
+
+2. **Bump version (no git tag yet)**
+   ```bash
+   npm version <version> --no-git-tag-version
+   ```
+   This updates `package.json` and `package-lock.json`.
+
+3. **Validate**
+   ```bash
+   npm run lint
+   npm run typecheck
+   npm run test
+   npm run build
+   ```
+
+4. **Commit and open PR**
+   ```bash
+   git add package.json package-lock.json
+   git commit -m "chore: release v<version>"
+   git push -u origin chore/release-v<version>
+   gh pr create \
+     --repo misospace/dispatch \
+     --base main \
+     --head chore/release-v<version> \
+     --title "chore: release v<version>" \
+     --body "Bump Dispatch package metadata to v<version>.
+
+   Validation:
+   - npm run lint
+   - npm run typecheck
+   - npm run test
+   - npm run build"
+   ```
+
+5. **Merge PR**
+   ```bash
+   gh pr merge --repo misospace/dispatch --squash --delete-branch
+   ```
+
+6. **Tag and publish release**
+   ```bash
+   git checkout main
+   git pull --ff-only
+   git tag -a v<version> -m "v<version>"
+   git push origin v<version>
+   gh release create v<version> \
+     --repo misospace/dispatch \
+     --title "v<version>" \
+     --generate-notes
+   ```
+
+   The tag push triggers the `Build Dispatch Image` workflow on GitHub Actions, which publishes to `ghcr.io/misospace/dispatch:v<version>`.
