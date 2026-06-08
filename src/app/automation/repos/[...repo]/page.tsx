@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, use } from "react";
+import { authedFetch } from "@/lib/client-auth";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -107,7 +108,7 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
   useEffect(() => {
     if (!repoFullName) return;
     const decoded = decodeURIComponent(repoFullName);
-    fetch(`/api/automation/repos/${decoded}`)
+    authedFetch(`/api/automation/repos/${decoded}`)
       .then((res) => {
         if (!res.ok) throw new Error("Repo not found");
         return res.json();
@@ -160,7 +161,7 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
           <Button
             variant="outline"
             onClick={() => {
-              fetch(`/api/automation/sync`, {
+              authedFetch(`/api/automation/sync`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ repo: repo.fullName }),
@@ -294,7 +295,7 @@ export default function RepoDetailPage({ params }: { params: Promise<{ repo: str
                                     variant="ghost"
                                     size="sm"
                                     onClick={() => {
-                                      fetch(`/api/automation/runs/${run.runId}?repo=${repo.fullName}&action=rerun`, { method: "POST" })
+                                      authedFetch(`/api/automation/runs/${run.runId}?repo=${repo.fullName}&action=rerun`, { method: "POST" })
                                         .then(() => window.location.reload());
                                     }}
                                   >

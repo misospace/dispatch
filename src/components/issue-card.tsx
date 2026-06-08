@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction } from "@/types";
 import { GitPullRequest, MessageSquare, ExternalLink, MoreVertical, User, Users, X, Scissors, AlertTriangle, Info, Ban } from "lucide-react";
 import { useState, useCallback } from "react";
+import { authedFetch } from "@/lib/client-auth";
 
 interface IssueCardProps {
   issue: Issue;
@@ -67,7 +68,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     if (agents.length > 0 || fetchingAgents) return;
     setFetchingAgents(true);
     try {
-      const res = await fetch("/api/issues/actions/agents");
+      const res = await authedFetch("/api/issues/actions/agents");
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.agents)) setAgents(data.agents);
@@ -93,7 +94,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
 
     // Trigger a sync to pick up label changes from GitHub
     try {
-      await fetch("/api/sync", { method: "POST" });
+      await authedFetch("/api/sync", { method: "POST" });
     } catch {
       // Sync failure is non-blocking
     }
@@ -116,7 +117,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     setError(null);
     try {
       const value = type === "agent" ? `${AGENT_PREFIX}${name}` : `${OWNER_PREFIX}${name}`;
-      const res = await fetch("/api/issues/actions", {
+      const res = await authedFetch("/api/issues/actions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -145,7 +146,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     setLoadingAction(`unassign-${type}`);
     setError(null);
     try {
-      const res = await fetch("/api/issues/unassign", {
+      const res = await authedFetch("/api/issues/unassign", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -191,7 +192,7 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
     setLoadingAction(`groom-${action}`);
     setError(null);
     try {
-      const res = await fetch("/api/issues/groom", {
+      const res = await authedFetch("/api/issues/groom", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
