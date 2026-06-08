@@ -4,59 +4,7 @@ import { fetchIssues, fetchIssue, fetchRepo, fetchWorkflows, fetchRecentRunsAllW
 import { getSyncRepos, getTrackedRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, reconcileClosedIssues, SyncResponse, ClosedIssueReconcileResponse } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
-
-// ---------------------------------------------------------------------------
-// Lock acquisition — DB-backed single-row guard to prevent overlapping runs.
-// Uses upsert on a single "global" row; the first writer wins.
-// ---------------------------------------------------------------------------
-
-async function acquireLock(): Promise<{ locked: true; runId: string } | { locked: false }> {
-  const existing = await prisma.syncLock.findUnique({ where: { id: "global" } });
-
-  if (existing && existing.syncRunId) {
-    const maxAgeMs = 30 * 60 * 1000;
-    const age = Date.now() - existing.acquiredAt.getTime();
-    if (age < maxAgeMs) {
-      return { locked: false };
-    }
-    // Stale lock — clear it and proceed
-    await prisma.syncLock.delete({ where: { id: "global" } });
-  }
-
-  try {
-    const runId = await prisma.$transaction(async (tx) => {
-      // Double-check inside the transaction for race safety
-      const stillExisting = await tx.syncLock.findUnique({ where: { id: "global" } });
-      if (stillExisting && stillExisting.syncRunId) {
-        throw new Error("already_locked");
-      }
-
-      const run = await tx.issueSyncRun.create({
-        data: { status: "running", syncType: "scheduled", startedAt: new Date() },
-      });
-
-      await tx.syncLock.create({
-        data: { id: "global", syncRunId: run.id, acquiredAt: new Date() },
-      });
-
-      return run.id;
-    });
-
-    return { locked: true, runId };
-  } catch (err) {
-    if (err instanceof Error && err.message === "already_locked") {
-      return { locked: false };
-    }
-    // Re-throw unexpected errors
-    throw err;
-  }
-}
-
-async function releaseLock(runId: string): Promise<void> {
-  await prisma.syncLock.deleteMany({
-    where: { id: "global", syncRunId: runId },
-  });
-}
+import { acquireLock, releaseLock } from "@/lib/sync-lock";
 
 // ---------------------------------------------------------------------------
 // Route handlers
@@ -83,11 +31,11 @@ export async function POST(request: Request) {
   const syncIssues = options.issues !== false; // default true
   const syncAutomation = options.automation === true; // default false
 
-  // Acquire DB lock to prevent overlapping runs
-  const lockResult = await acquireLock();
+  // Acquire shared DB lock to prevent overlapping runs across all sync types
+  const lockResult = await acquireLock("scheduled");
   if (!lockResult.locked) {
     return NextResponse.json(
-      { error: "A scheduled sync is already running. Try again later.", locked: true },
+      { error: "A sync is already running. Try again later.", locked: true },
       { status: 409 },
     );
   }
