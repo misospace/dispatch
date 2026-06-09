@@ -15,7 +15,9 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn(),
     update: vi.fn().mockResolvedValue(undefined),
-    create: vi.fn().mockResolvedValue({ id: "issue-1" }),
+    create: vi.fn().mockImplementation(({ data }) => {
+      return Promise.resolve({ id: "issue-1", ...data });
+    }),
     auth: vi.fn(),
     syncLockFindUnique: vi.fn().mockResolvedValue(null),
     syncLockDelete: vi.fn().mockResolvedValue(undefined),
@@ -32,22 +34,39 @@ vi.mock("@/lib/auth-next", () => ({
   auth: mocks.auth,
 }));
 
+// Build a mock transaction client that mirrors the prisma structure
+const mockTxClient = {
+  syncLock: {
+    findUnique: vi.fn().mockResolvedValue(null),
+    create: vi.fn().mockResolvedValue({ id: "lock-1" }),
+  },
+  issueSyncRun: {
+    create: vi.fn().mockResolvedValue({ id: "run-1", status: "running", syncType: "manual" }),
+  },
+};
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
+    syncLock: {
+      findUnique: mocks.syncLockFindUnique,
+      create: vi.fn().mockResolvedValue({ id: "lock-1" }),
+      delete: mocks.syncLockDelete,
+      deleteMany: mocks.syncLockDeleteMany,
+    },
+    issueSyncRun: {
+      create: vi.fn().mockResolvedValue({ id: "run-1", status: "running", syncType: "manual" }),
+      updateMany: mocks.issueSyncRunUpdateMany,
+    },
+    automationSyncRun: {
+      create: vi.fn().mockResolvedValue({ id: "auto-run-1" }),
+      update: vi.fn().mockResolvedValue(undefined),
+    },
+    $transaction: mocks.transactionFn,
     issue: {
       findUnique: mocks.findUnique,
       update: mocks.update,
       create: mocks.create,
     },
-    syncLock: {
-      findUnique: mocks.syncLockFindUnique,
-      delete: mocks.syncLockDelete,
-      deleteMany: mocks.syncLockDeleteMany,
-    },
-    issueSyncRun: {
-      updateMany: mocks.issueSyncRunUpdateMany,
-    },
-    $transaction: mocks.transactionFn,
   },
 }));
 
