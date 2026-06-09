@@ -48,34 +48,25 @@ const mockTxClient = {
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     syncLock: {
-      findUnique: vi.fn().mockResolvedValue(null),
+      findUnique: mocks.syncLockFindUnique,
       create: vi.fn().mockResolvedValue({ id: "lock-1" }),
-      delete: vi.fn().mockResolvedValue(undefined),
-      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+      delete: mocks.syncLockDelete,
+      deleteMany: mocks.syncLockDeleteMany,
     },
     issueSyncRun: {
       create: vi.fn().mockResolvedValue({ id: "run-1", status: "running", syncType: "manual" }),
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      updateMany: mocks.issueSyncRunUpdateMany,
     },
     automationSyncRun: {
       create: vi.fn().mockResolvedValue({ id: "auto-run-1" }),
       update: vi.fn().mockResolvedValue(undefined),
     },
-    $transaction: vi.fn().mockImplementation(async (fn) => fn(mockTxClient)),
+    $transaction: mocks.transactionFn,
     issue: {
       findUnique: mocks.findUnique,
       update: mocks.update,
       create: mocks.create,
     },
-    syncLock: {
-      findUnique: mocks.syncLockFindUnique,
-      delete: mocks.syncLockDelete,
-      deleteMany: mocks.syncLockDeleteMany,
-    },
-    issueSyncRun: {
-      updateMany: mocks.issueSyncRunUpdateMany,
-    },
-    $transaction: mocks.transactionFn,
   },
 }));
 
