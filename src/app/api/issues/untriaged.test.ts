@@ -18,6 +18,8 @@ const mockFindMany = vi.mocked(prisma.issue.findMany);
 // Mock STATUS_LABELS and isRenovateIssue
 vi.mock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
 }));
 
 vi.mock("@/lib/agent-queue", () => ({
@@ -51,7 +53,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 3, labels: ["priority/p2"] }), // untriaged
       makeIssue({ number: 4, labels: ["status/backlog"] }), // has status — excluded
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -66,7 +68,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, labels: ["bug"], state: "open" }),
       makeIssue({ number: 2, labels: ["bug"], state: "closed" }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -82,7 +84,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 3, labels: ["status/in-review"] }),
       makeIssue({ number: 4, labels: [] }), // truly unlabelled — should be included
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -93,7 +95,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("respects limit parameter (default 50)", async () => {
     const issues = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -103,7 +105,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("respects custom limit parameter", async () => {
     const issues = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?limit=10"));
     const body = await response.json();
@@ -113,7 +115,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("caps limit at 200", async () => {
     const issues = Array.from({ length: 500 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?limit=999"));
     const body = await response.json();
@@ -126,7 +128,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, labels: ["bug"], repository: { fullName: "test/repo" } }),
       makeIssue({ number: 2, labels: ["bug"], repository: { fullName: "other/repo" } }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?repo=test/repo"));
     const body = await response.json();
@@ -140,7 +142,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["bug"] }),
       makeIssue({ number: 2, title: "Fix critical bug", labels: ["bug"] }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -154,7 +156,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["bug"] }),
       makeIssue({ number: 2, title: "Fix critical bug", labels: ["bug"] }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?excludeRenovate=false"));
     const body = await response.json();
@@ -167,7 +169,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, labels: ["status/ready"] }),
       makeIssue({ number: 2, labels: ["status/backlog"] }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -177,7 +179,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("returns correct issue shape with all fields", async () => {
     const expectedIssue = makeIssue({ number: 42, title: "Untriaged bug", labels: ["bug"] });
-    mockFindMany.mockResolvedValue([expectedIssue]);
+    mockFindMany.mockResolvedValue([expectedIssue] as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -200,7 +202,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 2, labels: ["bug"], updatedAt: baseDate }),
       makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
