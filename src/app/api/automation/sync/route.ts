@@ -12,6 +12,7 @@ import {
 } from "@/lib/github";
 import { getTrackedRepos } from "@/lib/config";
 import { authorizeRequest } from "@/lib/auth";
+import { acquireLock, releaseLock } from "@/lib/sync-lock";
 
 async function syncRepo(repoFullName: string) {
   const parts = repoFullName.split("/");
@@ -334,24 +335,39 @@ export async function POST(request: Request) {
   const body = await request.json().catch(() => ({}));
   const repoFullName = body.repo || body.fullName;
 
-  if (repoFullName) {
-    const result = await syncRepo(repoFullName);
-    if (result.success) {
-      return NextResponse.json({ success: true, syncRunId: result.syncRunId });
-    } else {
-      return NextResponse.json({ error: result.error }, { status: 500 });
+  // Acquire shared DB lock to prevent overlapping runs across all sync types
+  const lockResult = await acquireLock("automation");
+  if (!lockResult.locked) {
+    return NextResponse.json(
+      { error: "A sync is already running. Try again later.", locked: true },
+      { status: 409 },
+    );
+  }
+
+  const { runId } = lockResult;
+
+  try {
+    if (repoFullName) {
+      const result = await syncRepo(repoFullName);
+      if (result.success) {
+        return NextResponse.json({ success: true, syncRunId: result.syncRunId });
+      } else {
+        return NextResponse.json({ error: result.error }, { status: 500 });
+      }
     }
-  }
 
-  const repos = await getTrackedRepos();
-  const results = [];
-  for (const repo of repos) {
-    results.push({ repo, result: await syncRepo(repo) });
-  }
+    const repos = await getTrackedRepos();
+    const results = [];
+    for (const repo of repos) {
+      results.push({ repo, result: await syncRepo(repo) });
+    }
 
-  return NextResponse.json({
-    synced: results.filter((r) => r.result.success).length,
-    failed: results.filter((r) => !r.result.success).length,
-    results,
-  });
+    return NextResponse.json({
+      synced: results.filter((r) => r.result.success).length,
+      failed: results.filter((r) => !r.result.success).length,
+      results,
+    });
+  } finally {
+    await releaseLock(runId).catch(() => {});
+  }
 }

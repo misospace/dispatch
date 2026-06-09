@@ -392,7 +392,7 @@ model IssueSyncRun {
   syncedCount      Int      @default(0)
   errorMessage     String?
   notes            String?  @db.Text
-  syncType         String   @default("scheduled") // "scheduled" | "manual" | "pre-claim"
+  syncType         String   @default("scheduled") // "scheduled" | "manual" | "automation"
   startedAt        DateTime @default(now())
   completedAt      DateTime?
 

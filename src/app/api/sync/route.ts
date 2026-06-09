@@ -4,6 +4,7 @@ import { fetchIssues } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, mergeLabels } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
+import { acquireLock, releaseLock } from "@/lib/sync-lock";
 
 export async function POST(request: NextRequest) {
   if (!(await authorizeRequest(request)).authorized) {
@@ -34,35 +35,61 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
-    const result = await syncIssuesForRepos(repos, fetchIssues, {
-      findIssue(repositoryId, number) {
-        return prisma.issue.findUnique({
-          where: { repositoryId_number: { repositoryId, number } },
-        });
-      },
-      async updateIssue(id, data) {
-        // Preserve agent/* labels from Prisma in case GitHub hasn't propagated the claim yet.
-        // This prevents a race condition where the claim endpoint adds an agent label to both
-        // Prisma and GitHub, but a concurrent sync overwrites Prisma with stale GitHub data.
-        const existing = await prisma.issue.findUnique({
-          where: { id },
-          select: { labels: true },
-        });
+    // Acquire shared DB lock to prevent overlapping runs across all sync types
+    const lockResult = await acquireLock("manual");
+    if (!lockResult.locked) {
+      return NextResponse.json(
+        { error: "A sync is already running. Try again later.", locked: true },
+        { status: 409 },
+      );
+    }
 
-        if (existing && existing.labels.length > 0) {
-          // Merge: use GitHub labels as base, add any agent/* labels from Prisma that aren't on GitHub
-          data.labels = mergeLabels(data.labels, existing.labels);
-        }
+    const { runId } = lockResult;
 
-        await prisma.issue.update({ where: { id }, data });
-      },
-      async createIssue(repositoryId, data) {
-        await prisma.issue.create({ data: { ...data, repositoryId } });
-      },
-    }, excludedLabels);
+    try {
+      const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
+      const result = await syncIssuesForRepos(repos, fetchIssues, {
+        findIssue(repositoryId, number) {
+          return prisma.issue.findUnique({
+            where: { repositoryId_number: { repositoryId, number } },
+          });
+        },
+        async updateIssue(id, data) {
+          // Preserve agent/* labels from Prisma in case GitHub hasn't propagated the claim yet.
+          // This prevents a race condition where the claim endpoint adds an agent label to both
+          // Prisma and GitHub, but a concurrent sync overwrites Prisma with stale GitHub data.
+          const existing = await prisma.issue.findUnique({
+            where: { id },
+            select: { labels: true },
+          });
 
-    return NextResponse.json(result);
+          if (existing && existing.labels.length > 0) {
+            // Merge: use GitHub labels as base, add any agent/* labels from Prisma that aren't on GitHub
+            data.labels = mergeLabels(data.labels, existing.labels);
+          }
+
+          await prisma.issue.update({ where: { id }, data });
+        },
+        async createIssue(repositoryId, data) {
+          await prisma.issue.create({ data: { ...data, repositoryId } });
+        },
+      }, excludedLabels);
+
+      // Update the sync run record
+      await prisma.issueSyncRun.updateMany({
+        where: { id: runId, status: "running" },
+        data: {
+          status: "completed",
+          completedAt: new Date(),
+          reposFetched: result.repos ?? 0,
+          syncedCount: result.syncedCount ?? 0,
+        },
+      });
+
+      return NextResponse.json(result);
+    } finally {
+      await releaseLock(runId).catch(() => {});
+    }
   } catch (error) {
     console.error("Sync failed:", error);
     return NextResponse.json({ error: "Sync failed" }, { status: 500 });

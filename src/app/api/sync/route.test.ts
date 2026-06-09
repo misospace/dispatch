@@ -17,6 +17,14 @@ const { mocks } = vi.hoisted(() => ({
     update: vi.fn().mockResolvedValue(undefined),
     create: vi.fn().mockResolvedValue({ id: "issue-1" }),
     auth: vi.fn(),
+    syncLockFindUnique: vi.fn().mockResolvedValue(null),
+    syncLockDelete: vi.fn().mockResolvedValue(undefined),
+    syncLockDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    issueSyncRunUpdateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    transactionFn: vi.fn(async (fn: any) => {
+      const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      return runId;
+    }),
   },
 }));
 
@@ -31,6 +39,15 @@ vi.mock("@/lib/prisma", () => ({
       update: mocks.update,
       create: mocks.create,
     },
+    syncLock: {
+      findUnique: mocks.syncLockFindUnique,
+      delete: mocks.syncLockDelete,
+      deleteMany: mocks.syncLockDeleteMany,
+    },
+    issueSyncRun: {
+      updateMany: mocks.issueSyncRunUpdateMany,
+    },
+    $transaction: mocks.transactionFn,
   },
 }));
 
