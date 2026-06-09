@@ -1,27 +1,54 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
-// Use vi.hoisted to ensure mocks are set up before any module imports.
-const { mocks } = vi.hoisted(() => ({
-  mocks: {
-    findMany: vi.fn(),
-    isRenovateIssue: vi.fn(),
-  },
-}));
+const STATUS_LABELS_MOCK = [
+  "status/backlog",
+  "status/ready",
+  "status/in-progress",
+  "status/in-review",
+  "status/done",
+] as const;
 
+// Use dynamic import with doMock for @/types to ensure it's resolved correctly.
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
-      findMany: mocks.findMany,
+      findMany: vi.fn(),
     },
   },
 }));
 
 vi.mock("@/lib/agent-queue", () => ({
-  isRenovateIssue: mocks.isRenovateIssue,
+  isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
+    const title = issue.title.toLowerCase();
+    return title.includes("dependency dashboard") || title.includes("renovate dashboard");
+  }),
 }));
 
-// Import routes after all mocks are registered.
+// Mock @/types to provide STATUS_LABELS that the route uses.
+vi.mock("@/types", () => ({
+  STATUS_LABELS: STATUS_LABELS_MOCK,
+  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
+  PROJECT_PREFIX: "project/",
+  BOARD_COLUMNS: [
+    { id: "status/backlog" },
+    { id: "status/ready" },
+    { id: "status/in-progress" },
+    { id: "status/in-review" },
+    { id: "status/done" },
+  ],
+  VALID_LANES: ["normal", "escalated", "backlog"],
+  VALID_CONFIDENCE: ["high", "medium", "low"],
+  isAgentLabel: (label: string) => label.startsWith("agent/"),
+  isOwnerLabel: (label: string) => label.startsWith("owner/"),
+  getStatusFromLabels: (_labels: string[]) => null,
+  getAgentFromLabels: (_labels: string[]) => null,
+  getOwnerFromLabels: (_labels: string[]) => null,
+  getPriorityFromLabels: (_labels: string[]) => null,
+}));
+
 import { GET } from "./route";
 import { prisma } from "@/lib/prisma";
 
@@ -55,10 +82,6 @@ const makeIssue = (overrides: Partial<MockIssue> = {}) => ({
 describe("GET /api/issues/untriaged", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.isRenovateIssue.mockImplementation((issue: { title: string; labels: string[] }) => {
-      const title = issue.title.toLowerCase();
-      return title.includes("dependency dashboard") || title.includes("renovate dashboard");
-    });
   });
 
   it("returns only issues with no status/* label", async () => {
