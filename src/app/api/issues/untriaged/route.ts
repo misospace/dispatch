@@ -75,8 +75,13 @@ export async function GET(request: Request) {
       return true;
     });
 
-    // Optionally exclude Renovate/dashboard noise
+    // Filter by repo if specified
     let result = untriaged;
+    if (repoFilter) {
+      result = result.filter((issue) => issue.repository.fullName === repoFilter);
+    }
+
+    // Optionally exclude Renovate/dashboard noise
     if (excludeRenovate) {
       result = result.filter((issue) => !isRenovateIssue(issue));
     }

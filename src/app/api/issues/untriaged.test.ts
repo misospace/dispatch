@@ -41,7 +41,7 @@ vi.doMock("@/types", () => ({
 }));
 
 // Dynamic imports after doMock setup.
-const { GET } = await import("./route");
+const { GET } = await import("./untriaged/route");
 const { prisma } = await import("@/lib/prisma");
 
 const mockFindMany = vi.mocked(prisma.issue.findMany);
