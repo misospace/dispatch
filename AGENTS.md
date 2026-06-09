@@ -74,9 +74,8 @@ Each classification stores: `lane`, `confidence` (`high`/`medium`/`low`), `reaso
 - If confidence is low and the issue is not actionable, choose BACKLOG.
 
 **API endpoints:**
-- `GET /api/issues/[id]/classify` — get current lane classification for an issue
-- `POST /api/issues/[id]/classify` — reclassify an issue (optional `forceLane` param)
-- `POST /api/issue-lanes/classify-bulk` — bulk classify unclassified/stale issues (rate-limited, max 200 per call)
+- `GET /api/issues/[issueId]/lane` — get the current lane classification for an issue
+- `POST /api/issues/[issueId]/lane` — classify or reclassify an issue (body: `{ force?: boolean, model?: string, classification?: Record<string, unknown> }`). Omit body to return current lane; provide `classification` to set it directly; use `force` to bypass lazy evaluation.
 
 **Agent queue integration:**
 - Agent queue endpoint (`GET /api/agents/[agentName]/queue`) accepts a `lane` query param to filter by lane.
@@ -142,7 +141,6 @@ src/
     api/           # API routes
       automation/  # Automation sync, runs, workflows, events
       agent-runs/  # Agent run ingestion
-      issue-lanes/  # Lane classification (bulk)
       issues/       # Issue listing, movement, and lane classification
       repos/       # Repository config
       sync/        # Issue sync
