@@ -1,27 +1,31 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { GET } from "./route";
 
-// Mock prisma — return the array as-is (route handles filtering/sorting).
+// Use vi.hoisted to ensure mocks are set up before any module imports.
+const { mocks } = vi.hoisted(() => ({
+  mocks: {
+    findMany: vi.fn(),
+    isRenovateIssue: vi.fn(),
+  },
+}));
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
-      findMany: vi.fn(),
+      findMany: mocks.findMany,
     },
   },
 }));
 
+vi.mock("@/lib/agent-queue", () => ({
+  isRenovateIssue: mocks.isRenovateIssue,
+}));
+
+// Import routes after all mocks are registered.
+import { GET } from "./route";
 import { prisma } from "@/lib/prisma";
 
 const mockFindMany = vi.mocked(prisma.issue.findMany);
-
-// Mock only @/lib/agent-queue — keep the real @/types so STATUS_LABELS works.
-vi.mock("@/lib/agent-queue", () => ({
-  isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
-    const title = issue.title.toLowerCase();
-    return title.includes("dependency dashboard") || title.includes("renovate dashboard");
-  }),
-}));
 
 // Minimal mock issue — only fields accessed by the route are needed.
 type MockIssue = {
@@ -51,6 +55,10 @@ const makeIssue = (overrides: Partial<MockIssue> = {}) => ({
 describe("GET /api/issues/untriaged", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.isRenovateIssue.mockImplementation((issue: { title: string; labels: string[] }) => {
+      const title = issue.title.toLowerCase();
+      return title.includes("dependency dashboard") || title.includes("renovate dashboard");
+    });
   });
 
   it("returns only issues with no status/* label", async () => {
@@ -71,7 +79,6 @@ describe("GET /api/issues/untriaged", () => {
   });
 
   it("excludes closed issues", async () => {
-    // Prisma's where.state="open" filters this — only return open issues.
     const issues = [makeIssue({ number: 1, labels: ["bug"], state: "open" })];
     mockFindMany.mockResolvedValue(issues as never);
 
