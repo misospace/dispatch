@@ -2,11 +2,11 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { GET } from "./route";
 
-// Mock prisma — respect the `where.state` filter so tests behave like real Prisma.
+// Mock prisma — return the array as-is (route handles filtering/sorting).
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
-      findMany: vi.fn((_where: unknown, _select: unknown) => Promise.resolve([])),
+      findMany: vi.fn(),
     },
   },
 }));
@@ -15,13 +15,30 @@ import { prisma } from "@/lib/prisma";
 
 const mockFindMany = vi.mocked(prisma.issue.findMany);
 
-// Partial mock of @/types — only what the route and its dependencies need.
+// Full mock of @/types — includes everything the route and its transitive
+// dependencies (agent-queue → issue-filters) need so nothing falls through
+// to the real module.
 vi.mock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
   AGENT_PREFIX: "agent/",
   OWNER_PREFIX: "owner/",
+  PROJECT_PREFIX: "project/",
+  BOARD_COLUMNS: [
+    { id: "status/backlog" },
+    { id: "status/ready" },
+    { id: "status/in-progress" },
+    { id: "status/in-review" },
+    { id: "status/done" },
+  ],
+  VALID_LANES: ["normal", "escalated", "backlog"],
+  VALID_CONFIDENCE: ["high", "medium", "low"],
   isAgentLabel: (label: string) => label.startsWith("agent/"),
   isOwnerLabel: (label: string) => label.startsWith("owner/"),
+  getStatusFromLabels: (_labels: string[]) => null,
+  getAgentFromLabels: (_labels: string[]) => null,
+  getOwnerFromLabels: (_labels: string[]) => null,
+  getPriorityFromLabels: (_labels: string[]) => null,
 }));
 
 vi.mock("@/lib/agent-queue", () => ({
@@ -79,10 +96,8 @@ describe("GET /api/issues/untriaged", () => {
   });
 
   it("excludes closed issues", async () => {
-    // Only return open issues — Prisma's where.state="open" filters this.
-    const issues = [
-      makeIssue({ number: 1, labels: ["bug"], state: "open" }),
-    ];
+    // Prisma's where.state="open" filters this — only return open issues.
+    const issues = [makeIssue({ number: 1, labels: ["bug"], state: "open" })];
     mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
