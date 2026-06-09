@@ -15,9 +15,13 @@ import { prisma } from "@/lib/prisma";
 
 const mockFindMany = vi.mocked(prisma.issue.findMany);
 
-// Mock STATUS_LABELS and isRenovateIssue
+// Partial mock of @/types — only what the route and its dependencies need.
 vi.mock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
+  isAgentLabel: (label: string) => label.startsWith("agent/"),
+  isOwnerLabel: (label: string) => label.startsWith("owner/"),
 }));
 
 vi.mock("@/lib/agent-queue", () => ({
