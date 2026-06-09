@@ -45,7 +45,10 @@ export async function GET(request: Request) {
     };
 
     if (repoFilter) {
-      where.repository = { ...where.repository, fullName: repoFilter };
+      where = {
+        ...where,
+        repository: { enabled: true, fullName: repoFilter },
+      };
     }
 
     const issues: UntriagedIssue[] = await prisma.issue.findMany({
@@ -67,7 +70,7 @@ export async function GET(request: Request) {
     // Filter to only issues with no status/* label (untriaged)
     const untriaged = issues.filter((issue) => {
       for (const label of issue.labels) {
-        if (STATUS_LABELS.includes(label)) return false;
+        if ((STATUS_LABELS as string[]).includes(label)) return false;
       }
       return true;
     });

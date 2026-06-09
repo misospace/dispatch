@@ -27,7 +27,7 @@ vi.mock("@/lib/agent-queue", () => ({
   }),
 }));
 
-const makeIssue = (overrides: Partial<{ id: string; number: number; title: string; url: string; labels: string[]; state: string; createdAt: Date; updatedAt: Date; repository: { fullName: string } }> = {}) => ({
+const makeIssue = (overrides: Partial<{ id: string; number: number; title: string; url: string; labels: string[]; state: string; createdAt: Date; updatedAt: Date; repository: { fullName: string }; body: string | null; assignees: string[]; commentsCount: number }> = {}) => ({
   id: overrides.id ?? "issue_1",
   number: overrides.number ?? 1,
   title: overrides.title ?? "Test issue",
@@ -36,8 +36,11 @@ const makeIssue = (overrides: Partial<{ id: string; number: number; title: strin
   state: overrides.state ?? "open",
   createdAt: overrides.createdAt ?? new Date("2026-01-01"),
   updatedAt: overrides.updatedAt ?? new Date("2026-01-01"),
+  body: overrides.body ?? null,
+  assignees: overrides.assignees ?? [],
+  commentsCount: overrides.commentsCount ?? 0,
   repository: { fullName: overrides.repository?.fullName ?? "test/repo" },
-});
+} as const);
 
 describe("GET /api/issues/untriaged", () => {
   beforeEach(() => {
