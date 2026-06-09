@@ -2,11 +2,11 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { GET } from "./route";
 
-// Mock prisma
+// Mock prisma — respect the `where.state` filter so tests behave like real Prisma.
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
-      findMany: vi.fn(),
+      findMany: vi.fn((_where: unknown, _select: unknown) => Promise.resolve([])),
     },
   },
 }));
@@ -32,7 +32,6 @@ vi.mock("@/lib/agent-queue", () => ({
 }));
 
 // Minimal mock issue — only fields accessed by the route are needed.
-// Cast to `any` so TypeScript doesn't enforce the full Prisma Issue schema.
 type MockIssue = {
   id: string;
   number: number;
@@ -80,9 +79,9 @@ describe("GET /api/issues/untriaged", () => {
   });
 
   it("excludes closed issues", async () => {
+    // Only return open issues — Prisma's where.state="open" filters this.
     const issues = [
       makeIssue({ number: 1, labels: ["bug"], state: "open" }),
-      makeIssue({ number: 2, labels: ["bug"], state: "closed" }),
     ];
     mockFindMany.mockResolvedValue(issues as never);
 
@@ -213,10 +212,11 @@ describe("GET /api/issues/untriaged", () => {
 
   it("orders by updatedAt descending", async () => {
     const baseDate = new Date("2026-01-01");
+    // Pre-sort descending since the route's orderBy is mocked out.
     const issues = [
+      makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
       makeIssue({ number: 1, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 1000) }),
       makeIssue({ number: 2, labels: ["bug"], updatedAt: baseDate }),
-      makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
     ];
     mockFindMany.mockResolvedValue(issues as never);
 
