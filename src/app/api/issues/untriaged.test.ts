@@ -1,8 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { GET } from "./route";
 
-// Mock prisma
+// Mock prisma FIRST
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
@@ -11,23 +10,37 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
-import { prisma } from "@/lib/prisma";
-
-const mockFindMany = vi.mocked(prisma.issue.findMany);
-
-// Mock STATUS_LABELS and isRenovateIssue
+// Mock @/types with ALL needed exports
 vi.mock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
   AGENT_PREFIX: "agent/",
   OWNER_PREFIX: "owner/",
+  getStatusFromLabels: vi.fn(),
+  getAgentFromLabels: vi.fn(),
+  getPriorityFromLabels: vi.fn(),
+  isAgentLabel: vi.fn(),
+  isOwnerLabel: vi.fn(),
 }));
 
+// Mock agent-queue
 vi.mock("@/lib/agent-queue", () => ({
-  isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
+  isRenovateIssue: vi.fn((issue: { title: string }) => {
     const title = issue.title.toLowerCase();
     return title.includes("dependency dashboard") || title.includes("renovate dashboard");
   }),
 }));
+
+// Mock issue-filters
+vi.mock("@/lib/issue-filters", () => ({
+  isIssueExcludedByLabels: vi.fn(() => false),
+}));
+
+import { prisma } from "@/lib/prisma";
+const mockFindMany = vi.mocked(prisma.issue.findMany);
+
+// Import route AFTER all mocks are set up
+import { GET } from "./route";
 
 const makeIssue = (overrides: Partial<{ id: string; number: number; title: string; url: string; labels: string[]; state: string; createdAt: Date; updatedAt: Date; repository: { fullName: string } }> = {}) => ({
   id: overrides.id ?? "issue_1",
