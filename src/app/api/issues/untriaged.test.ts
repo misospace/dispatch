@@ -15,32 +15,7 @@ import { prisma } from "@/lib/prisma";
 
 const mockFindMany = vi.mocked(prisma.issue.findMany);
 
-// Full mock of @/types — includes everything the route and its transitive
-// dependencies (agent-queue → issue-filters) need so nothing falls through
-// to the real module.
-vi.mock("@/types", () => ({
-  STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
-  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
-  AGENT_PREFIX: "agent/",
-  OWNER_PREFIX: "owner/",
-  PROJECT_PREFIX: "project/",
-  BOARD_COLUMNS: [
-    { id: "status/backlog" },
-    { id: "status/ready" },
-    { id: "status/in-progress" },
-    { id: "status/in-review" },
-    { id: "status/done" },
-  ],
-  VALID_LANES: ["normal", "escalated", "backlog"],
-  VALID_CONFIDENCE: ["high", "medium", "low"],
-  isAgentLabel: (label: string) => label.startsWith("agent/"),
-  isOwnerLabel: (label: string) => label.startsWith("owner/"),
-  getStatusFromLabels: (_labels: string[]) => null,
-  getAgentFromLabels: (_labels: string[]) => null,
-  getOwnerFromLabels: (_labels: string[]) => null,
-  getPriorityFromLabels: (_labels: string[]) => null,
-}));
-
+// Mock only @/lib/agent-queue — keep the real @/types so STATUS_LABELS works.
 vi.mock("@/lib/agent-queue", () => ({
   isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
     const title = issue.title.toLowerCase();
