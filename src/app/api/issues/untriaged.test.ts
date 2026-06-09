@@ -2,25 +2,34 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
 // Mock prisma FIRST — simulate Prisma's where/orderBy behavior
-let mockFindManyData: unknown[] = [];
+interface MockIssue {
+  id?: string;
+  number?: number;
+  title?: string;
+  url?: string;
+  labels?: string[];
+  state?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+  repository?: { fullName: string };
+}
+let mockFindManyData: MockIssue[] = [];
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       findMany: vi.fn((args?: { where?: Record<string, unknown>; orderBy?: Record<string, string> }) => {
-        let results = [...mockFindManyData];
-
         // Simulate Prisma state filter (where.state === "open")
-        results = results.filter((i: { state: string }) => i.state === "open");
+        let results = mockFindManyData.filter((i) => i.state === "open");
 
         // Simulate Prisma repo filter (where.repository.fullName)
         if (args?.where?.repository && typeof args.where.repository === "object" && "fullName" in args.where.repository) {
           const repoName = (args.where.repository as Record<string, string>).fullName;
-          results = results.filter((i: { repository: { fullName: string } }) => i.repository.fullName === repoName);
+          results = results.filter((i) => i.repository?.fullName === repoName);
         }
 
         // Simulate Prisma orderBy (updatedAt: "desc")
         if (args?.orderBy?.updatedAt === "desc") {
-          results.sort((a: unknown, b: unknown) => (b as { updatedAt: Date }).updatedAt.getTime() - (a as { updatedAt: Date }).updatedAt.getTime());
+          results.sort((a, b) => (b.updatedAt ?? new Date(0)).getTime() - (a.updatedAt ?? new Date(0)).getTime());
         }
 
         return Promise.resolve(results);
