@@ -1,11 +1,30 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
-// Mock prisma FIRST
+// Mock prisma FIRST — simulate Prisma's where/orderBy behavior
+let mockFindManyData: unknown[] = [];
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
-      findMany: vi.fn(),
+      findMany: vi.fn((args?: { where?: Record<string, unknown>; orderBy?: Record<string, string> }) => {
+        let results = [...mockFindManyData];
+
+        // Simulate Prisma state filter (where.state === "open")
+        results = results.filter((i: { state: string }) => i.state === "open");
+
+        // Simulate Prisma repo filter (where.repository.fullName)
+        if (args?.where?.repository && typeof args.where.repository === "object" && "fullName" in args.where.repository) {
+          const repoName = (args.where.repository as Record<string, string>).fullName;
+          results = results.filter((i: { repository: { fullName: string } }) => i.repository.fullName === repoName);
+        }
+
+        // Simulate Prisma orderBy (updatedAt: "desc")
+        if (args?.orderBy?.updatedAt === "desc") {
+          results.sort((a: unknown, b: unknown) => (b as { updatedAt: Date }).updatedAt.getTime() - (a as { updatedAt: Date }).updatedAt.getTime());
+        }
+
+        return Promise.resolve(results);
+      }),
     },
   },
 }));
@@ -40,7 +59,7 @@ import { prisma } from "@/lib/prisma";
 const mockFindMany = vi.mocked(prisma.issue.findMany);
 
 // Import route AFTER all mocks are set up
-import { GET } from "./route";
+import { GET } from "./untriaged/route";
 
 const makeIssue = (overrides: Partial<{ id: string; number: number; title: string; url: string; labels: string[]; state: string; createdAt: Date; updatedAt: Date; repository: { fullName: string } }> = {}) => ({
   id: overrides.id ?? "issue_1",
@@ -54,19 +73,20 @@ const makeIssue = (overrides: Partial<{ id: string; number: number; title: strin
   repository: { fullName: overrides.repository?.fullName ?? "test/repo" },
 });
 
-describe("GET /api/issues/untriaged", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+beforeEach(() => {
+    mockFindManyData = [];
   });
 
+  describe("GET /api/issues/untriaged", () => {
+  // Reset mock data before each test
+
   it("returns only issues with no status/* label", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, labels: ["bug", "priority/p1"] }), // untriaged
       makeIssue({ number: 2, labels: ["status/ready", "priority/p1"] }), // has status — excluded
       makeIssue({ number: 3, labels: ["priority/p2"] }), // untriaged
       makeIssue({ number: 4, labels: ["status/backlog"] }), // has status — excluded
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -76,12 +96,12 @@ describe("GET /api/issues/untriaged", () => {
     expect(body.map((i: { number: number }) => i.number)).toEqual([1, 3]);
   });
 
+
   it("excludes closed issues", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, labels: ["bug"], state: "open" }),
       makeIssue({ number: 2, labels: ["bug"], state: "closed" }),
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -90,14 +110,14 @@ describe("GET /api/issues/untriaged", () => {
     expect(body[0].number).toBe(1);
   });
 
+
   it("excludes issues with any status label", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, labels: ["status/done"] }),
       makeIssue({ number: 2, labels: ["status/in-progress"] }),
       makeIssue({ number: 3, labels: ["status/in-review"] }),
       makeIssue({ number: 4, labels: [] }), // truly unlabelled — should be included
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -106,9 +126,9 @@ describe("GET /api/issues/untriaged", () => {
     expect(body[0].number).toBe(4);
   });
 
+
   it("respects limit parameter (default 50)", async () => {
-    const issues = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues as never);
+    mockFindManyData = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -116,9 +136,9 @@ describe("GET /api/issues/untriaged", () => {
     expect(body).toHaveLength(50); // default limit
   });
 
+
   it("respects custom limit parameter", async () => {
-    const issues = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues as never);
+    mockFindManyData = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?limit=10"));
     const body = await response.json();
@@ -126,9 +146,9 @@ describe("GET /api/issues/untriaged", () => {
     expect(body).toHaveLength(10);
   });
 
+
   it("caps limit at 200", async () => {
-    const issues = Array.from({ length: 500 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues as never);
+    mockFindManyData = Array.from({ length: 500 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?limit=999"));
     const body = await response.json();
@@ -136,12 +156,12 @@ describe("GET /api/issues/untriaged", () => {
     expect(body).toHaveLength(200); // hard cap
   });
 
+
   it("filters by repo when specified", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, labels: ["bug"], repository: { fullName: "test/repo" } }),
       makeIssue({ number: 2, labels: ["bug"], repository: { fullName: "other/repo" } }),
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?repo=test/repo"));
     const body = await response.json();
@@ -150,12 +170,12 @@ describe("GET /api/issues/untriaged", () => {
     expect(body[0].number).toBe(1);
   });
 
+
   it("excludes Renovate issues by default", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["bug"] }),
       makeIssue({ number: 2, title: "Fix critical bug", labels: ["bug"] }),
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -164,12 +184,12 @@ describe("GET /api/issues/untriaged", () => {
     expect(body[0].number).toBe(2);
   });
 
+
   it("includes Renovate issues when excludeRenovate=false", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["bug"] }),
       makeIssue({ number: 2, title: "Fix critical bug", labels: ["bug"] }),
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?excludeRenovate=false"));
     const body = await response.json();
@@ -177,12 +197,12 @@ describe("GET /api/issues/untriaged", () => {
     expect(body).toHaveLength(2);
   });
 
+
   it("returns empty array when no untriaged issues exist", async () => {
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, labels: ["status/ready"] }),
       makeIssue({ number: 2, labels: ["status/backlog"] }),
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -190,9 +210,9 @@ describe("GET /api/issues/untriaged", () => {
     expect(body).toEqual([]);
   });
 
+
   it("returns correct issue shape with all fields", async () => {
-    const expectedIssue = makeIssue({ number: 42, title: "Untriaged bug", labels: ["bug"] });
-    mockFindMany.mockResolvedValue([expectedIssue] as never);
+    mockFindManyData = [makeIssue({ number: 42, title: "Untriaged bug", labels: ["bug"] })];
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -208,14 +228,14 @@ describe("GET /api/issues/untriaged", () => {
     expect(issue).toHaveProperty("repository", { fullName: "test/repo" });
   });
 
+
   it("orders by updatedAt descending", async () => {
     const baseDate = new Date("2026-01-01");
-    const issues = [
+    mockFindManyData = [
       makeIssue({ number: 1, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 1000) }),
       makeIssue({ number: 2, labels: ["bug"], updatedAt: baseDate }),
       makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
     ];
-    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
