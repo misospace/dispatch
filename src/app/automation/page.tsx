@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { authedFetch } from "@/lib/client-auth";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -141,7 +142,7 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
             variant="ghost"
             size="sm"
             onClick={() => {
-              fetch(`/api/automation/sync`, {
+              authedFetch(`/api/automation/sync`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ repo: repo.fullName }),
@@ -182,10 +183,10 @@ export default function AutomationOverview() {
   const [addLoading, setAddLoading] = useState(false);
 
   useEffect(() => {
-    fetch("/api/automation/sync")
+    authedFetch("/api/automation/sync")
       .then((res) => res.json())
       .catch(() => ({}));
-    fetch("/api/automation/repos")
+    authedFetch("/api/automation/repos")
       .then((res) => res.json())
       .then((data) => setRepos(data))
       .catch(() => setRepos([]))
@@ -195,8 +196,8 @@ export default function AutomationOverview() {
   async function syncAll() {
     setSyncing(true);
     try {
-      await fetch("/api/automation/sync", { method: "POST" });
-      const res = await fetch("/api/automation/repos");
+      await authedFetch("/api/automation/sync", { method: "POST" });
+      const res = await authedFetch("/api/automation/repos");
       const data = await res.json();
       setRepos(data);
     } finally {
@@ -209,7 +210,7 @@ export default function AutomationOverview() {
     setAddLoading(true);
     setAddError("");
     try {
-      const res = await fetch("/api/automation/repos", {
+      const res = await authedFetch("/api/automation/repos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fullName: newRepo.trim() }),
@@ -221,7 +222,7 @@ export default function AutomationOverview() {
       }
       setNewRepo("");
       setShowAddForm(false);
-      const res2 = await fetch("/api/automation/repos");
+      const res2 = await authedFetch("/api/automation/repos");
       const data2 = await res2.json();
       setRepos(data2);
     } catch {
@@ -236,7 +237,7 @@ export default function AutomationOverview() {
       return;
     }
     try {
-      const res = await fetch(`/api/automation/repos/${encodeURIComponent(fullName)}`, {
+      const res = await authedFetch(`/api/automation/repos/${encodeURIComponent(fullName)}`, {
         method: "DELETE",
       });
       if (!res.ok) return;

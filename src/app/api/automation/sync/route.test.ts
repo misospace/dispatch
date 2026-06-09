@@ -15,6 +15,94 @@ vi.mock("@/lib/config", () => ({
   parseExcludedLabels: vi.fn().mockReturnValue([]),
 }));
 
+const { mocks, mockTxClient } = vi.hoisted(() => ({
+  mockTxClient: {
+    syncLock: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: "lock-1" }),
+    },
+    issueSyncRun: {
+      create: vi.fn().mockResolvedValue({ id: "run-1", status: "running", syncType: "automation" }),
+    },
+  },
+  mocks: {
+    syncLockFindUnique: vi.fn().mockResolvedValue(null),
+    syncLockCreate: vi.fn().mockResolvedValue({ id: "lock-1" }),
+    syncLockDelete: vi.fn().mockResolvedValue(undefined),
+    syncLockDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    transactionFn: vi.fn(async (fn: any) => {
+      const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      return runId;
+    }),
+    upsert: vi.fn().mockResolvedValue({ id: "ar-1", fullName: "org/repo" }),
+    findMany: vi.fn().mockResolvedValue([]),
+    create: vi.fn().mockResolvedValue(undefined),
+  },
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    syncLock: {
+      findUnique: mocks.syncLockFindUnique,
+      create: mocks.syncLockCreate,
+      delete: mocks.syncLockDelete,
+      deleteMany: mocks.syncLockDeleteMany,
+    },
+    issueSyncRun: {
+      create: vi.fn().mockResolvedValue({ id: "run-1", status: "running", syncType: "automation" }),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    automationSyncRun: {
+      create: vi.fn().mockResolvedValue({ id: "auto-run-1" }),
+      update: vi.fn().mockResolvedValue(undefined),
+    },
+    automationRepo: {
+      upsert: mocks.upsert,
+      update: vi.fn().mockResolvedValue({ id: "repo-1" }),
+    },
+    githubWorkflow: {
+      upsert: mocks.upsert,
+      findMany: mocks.findMany,
+      create: mocks.create,
+    },
+    githubWorkflowRun: {
+      upsert: mocks.upsert,
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+    githubWorkflowJob: {
+      upsert: mocks.upsert,
+    },
+    githubRelease: {
+      upsert: mocks.upsert,
+    },
+    githubPackage: {
+      upsert: mocks.upsert,
+    },
+    githubPullRequest: {
+      upsert: mocks.upsert,
+    },
+    automationEvent: {
+      create: mocks.create,
+    },
+    $transaction: mocks.transactionFn,
+  },
+  asPrFixQueueClient: (client: unknown): unknown => client,
+}));
+
+vi.mock("@/lib/github", () => ({
+  fetchRepo: vi.fn().mockResolvedValue({
+    name: "test",
+    owner: { login: "test" },
+    default_branch: "main",
+  }),
+  fetchWorkflows: vi.fn().mockResolvedValue([]),
+  fetchRecentRunsAllWorkflows: vi.fn().mockResolvedValue([]),
+  fetchReleases: vi.fn().mockResolvedValue([]),
+  fetchPullRequests: vi.fn().mockResolvedValue([]),
+  fetchLatestCommit: vi.fn().mockResolvedValue({ sha: "abc123" }),
+  fetchPackages: vi.fn().mockResolvedValue([]),
+}));
+
 import { POST } from "./route";
 
 describe("POST /api/automation/sync — auth", () => {

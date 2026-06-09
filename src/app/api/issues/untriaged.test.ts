@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
-// Mock prisma FIRST
-vi.mock("@/lib/prisma", () => ({
+// Use dynamic doMock to avoid hoisting issues entirely.
+vi.doMock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       findMany: vi.fn(),
@@ -10,39 +10,56 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
-// Mock @/types with ALL needed exports
-vi.mock("@/types", () => ({
-  STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
-  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
-  AGENT_PREFIX: "agent/",
-  OWNER_PREFIX: "owner/",
-  getStatusFromLabels: vi.fn(),
-  getAgentFromLabels: vi.fn(),
-  getPriorityFromLabels: vi.fn(),
-  isAgentLabel: vi.fn(),
-  isOwnerLabel: vi.fn(),
-}));
-
-// Mock agent-queue
-vi.mock("@/lib/agent-queue", () => ({
-  isRenovateIssue: vi.fn((issue: { title: string }) => {
+vi.doMock("@/lib/agent-queue", () => ({
+  isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
     const title = issue.title.toLowerCase();
     return title.includes("dependency dashboard") || title.includes("renovate dashboard");
   }),
 }));
 
-// Mock issue-filters
-vi.mock("@/lib/issue-filters", () => ({
-  isIssueExcludedByLabels: vi.fn(() => false),
+vi.doMock("@/types", () => ({
+  STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
+  PROJECT_PREFIX: "project/",
+  BOARD_COLUMNS: [
+    { id: "status/backlog" },
+    { id: "status/ready" },
+    { id: "status/in-progress" },
+    { id: "status/in-review" },
+    { id: "status/done" },
+  ],
+  VALID_LANES: ["normal", "escalated", "backlog"],
+  VALID_CONFIDENCE: ["high", "medium", "low"],
+  isAgentLabel: (label: string) => label.startsWith("agent/"),
+  isOwnerLabel: (label: string) => label.startsWith("owner/"),
+  getStatusFromLabels: (_labels: string[]) => null,
+  getAgentFromLabels: (_labels: string[]) => null,
+  getOwnerFromLabels: (_labels: string[]) => null,
+  getPriorityFromLabels: (_labels: string[]) => null,
 }));
 
-import { prisma } from "@/lib/prisma";
+// Dynamic imports after doMock setup.
+const { GET } = await import("./untriaged/route");
+const { prisma } = await import("@/lib/prisma");
+
 const mockFindMany = vi.mocked(prisma.issue.findMany);
 
-// Import route AFTER all mocks are set up
-import { GET } from "./route";
+// Minimal mock issue — only fields accessed by the route are needed.
+type MockIssue = {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  labels: string[];
+  state: string;
+  createdAt: Date;
+  updatedAt: Date;
+  repository: { fullName: string };
+};
 
-const makeIssue = (overrides: Partial<{ id: string; number: number; title: string; url: string; labels: string[]; state: string; createdAt: Date; updatedAt: Date; repository: { fullName: string } }> = {}) => ({
+const makeIssue = (overrides: Partial<MockIssue> = {}) => ({
   id: overrides.id ?? "issue_1",
   number: overrides.number ?? 1,
   title: overrides.title ?? "Test issue",
@@ -52,7 +69,7 @@ const makeIssue = (overrides: Partial<{ id: string; number: number; title: strin
   createdAt: overrides.createdAt ?? new Date("2026-01-01"),
   updatedAt: overrides.updatedAt ?? new Date("2026-01-01"),
   repository: { fullName: overrides.repository?.fullName ?? "test/repo" },
-});
+}) satisfies MockIssue;
 
 describe("GET /api/issues/untriaged", () => {
   beforeEach(() => {
@@ -210,10 +227,11 @@ describe("GET /api/issues/untriaged", () => {
 
   it("orders by updatedAt descending", async () => {
     const baseDate = new Date("2026-01-01");
+    // Pre-sort descending since the route's orderBy is mocked out.
     const issues = [
+      makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
       makeIssue({ number: 1, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 1000) }),
       makeIssue({ number: 2, labels: ["bug"], updatedAt: baseDate }),
-      makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
     ];
     mockFindMany.mockResolvedValue(issues as never);
 

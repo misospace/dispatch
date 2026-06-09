@@ -45,11 +45,10 @@ export async function GET(request: Request) {
     };
 
     if (repoFilter) {
-      where.repository = Object.assign(
-        {},
-        where.repository as Record<string, unknown>,
-        { fullName: repoFilter },
-      );
+      where = {
+        ...where,
+        repository: { enabled: true, fullName: repoFilter },
+      };
     }
 
     const issues: UntriagedIssue[] = await prisma.issue.findMany({
@@ -71,13 +70,18 @@ export async function GET(request: Request) {
     // Filter to only issues with no status/* label (untriaged)
     const untriaged = issues.filter((issue) => {
       for (const label of issue.labels) {
-        if ((STATUS_LABELS as unknown as string[]).includes(label)) return false;
+        if ((STATUS_LABELS as string[]).includes(label)) return false;
       }
       return true;
     });
 
-    // Optionally exclude Renovate/dashboard noise
+    // Filter by repo if specified
     let result = untriaged;
+    if (repoFilter) {
+      result = result.filter((issue) => issue.repository.fullName === repoFilter);
+    }
+
+    // Optionally exclude Renovate/dashboard noise
     if (excludeRenovate) {
       result = result.filter((issue) => !isRenovateIssue(issue));
     }
