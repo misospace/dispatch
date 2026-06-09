@@ -12,6 +12,7 @@ describe("API route smoke checks", () => {
     "src/app/api/issues/move/route.ts",
     "src/app/api/issues/claim/route.ts",
     "src/app/api/issues/unclaim/route.ts",
+    "src/app/api/issues/untriaged/route.ts",
     "src/app/api/automation/repos/[...repo]/route.ts",
     "src/app/api/health/route.ts",
     "src/app/api/agents/[agentName]/queue/route.ts",
