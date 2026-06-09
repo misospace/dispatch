@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
-// Mock prisma — return the array as-is (route handles filtering/sorting).
-vi.mock("@/lib/prisma", () => ({
+// Use dynamic doMock to avoid hoisting issues entirely.
+vi.doMock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       findMany: vi.fn(),
@@ -10,15 +10,14 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
-vi.mock("@/lib/agent-queue", () => ({
+vi.doMock("@/lib/agent-queue", () => ({
   isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
     const title = issue.title.toLowerCase();
     return title.includes("dependency dashboard") || title.includes("renovate dashboard");
   }),
 }));
 
-// Mock @/types — ALL values must be inline literals since vi.mock() is hoisted.
-vi.mock("@/types", () => ({
+vi.doMock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
   PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
   AGENT_PREFIX: "agent/",
@@ -41,8 +40,9 @@ vi.mock("@/types", () => ({
   getPriorityFromLabels: (_labels: string[]) => null,
 }));
 
-import { GET } from "./route";
-import { prisma } from "@/lib/prisma";
+// Dynamic imports after doMock setup.
+const { GET } = await import("./route");
+const { prisma } = await import("@/lib/prisma");
 
 const mockFindMany = vi.mocked(prisma.issue.findMany);
 
