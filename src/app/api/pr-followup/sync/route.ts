@@ -1,5 +1,6 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
+import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { processPrFollowupEvents, isAllowedBotAuthor } from "@/lib/pr-followup-ingestion";
 
@@ -85,7 +86,12 @@ async function fetchWithGithub(url: string, token: string): Promise<any> {
   return res.json();
 }
 
-export async function POST() {
+export async function POST(request: NextRequest) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     const token = process.env.GITHUB_TOKEN;
     if (!token) {
