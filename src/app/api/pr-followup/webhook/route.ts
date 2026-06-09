@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 
@@ -25,10 +26,21 @@ function extractLinkedIssueFromPr(pr: Record<string, unknown>): number | null {
  * - pull_request (merge_state_status changes, etc.)
  *
  * Signature verification: validates X-Hub-Signature-256 using HMAC-SHA256
- * with the WEBHOOK_SECRET environment variable. Set this to your GitHub
- * webhook secret in deployment configuration. If not set, verification is
- * skipped (e.g. when behind an API gateway that handles auth).
+ * with the WEBHOOK_SECRET environment variable.
+ *
+ * Default behavior is fail-closed: if WEBHOOK_SECRET is not configured,
+ * requests are rejected unless WEBHOOK_GATEWAY_MODE is explicitly set to "true",
+ * which indicates the endpoint is behind a gateway that performs its own
+ * authentication and signature verification.
  */
+
+/** Is webhook signature verification enabled (fail-closed default)? */
+function isSignatureVerificationEnabled(): boolean {
+  const secret = process.env.WEBHOOK_SECRET;
+  if (secret) return true;
+  // Gateway mode: caller explicitly opts out of local signature verification
+  return process.env.WEBHOOK_GATEWAY_MODE === "true";
+}
 
 function verifyWebhookSignature(secret: string, payload: Buffer, signature: string): boolean {
   if (!signature.startsWith("sha256=")) return false;
@@ -179,18 +191,27 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing x-github-event header" }, { status: 400 });
     }
 
+    // Authenticate the request (Bearer token, Basic Auth, or OIDC session)
+    const auth = await authorizeRequest(request);
+    if (!auth.authorized) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     // Read raw body once for signature verification and parsing
     const rawBody = await request.arrayBuffer();
     const payload = Buffer.from(rawBody);
 
-    // Validate webhook signature if WEBHOOK_SECRET is configured
-    const webhookSecret = process.env.WEBHOOK_SECRET;
-    if (webhookSecret) {
+    // Webhook signature verification: fail-closed by default.
+    // If WEBHOOK_SECRET is set, always verify. If not set, only skip when
+    // WEBHOOK_GATEWAY_MODE=true (explicit opt-out for gateway deployments).
+    const sigVerificationEnabled = isSignatureVerificationEnabled();
+    if (sigVerificationEnabled) {
+      const webhookSecret = process.env.WEBHOOK_SECRET;
       const signature = request.headers.get("x-hub-signature-256");
       if (!signature) {
         return NextResponse.json({ error: "Missing x-hub-signature-256 header" }, { status: 401 });
       }
-      if (!verifyWebhookSignature(webhookSecret, payload, signature)) {
+      if (!verifyWebhookSignature(webhookSecret!, payload, signature)) {
         return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
       }
     }
