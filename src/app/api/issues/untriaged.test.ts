@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
+// Define mock constants BEFORE any vi.mock() calls to avoid TDZ issues.
 const STATUS_LABELS_MOCK = [
   "status/backlog",
   "status/ready",
@@ -9,7 +10,7 @@ const STATUS_LABELS_MOCK = [
   "status/done",
 ] as const;
 
-// Use dynamic import with doMock for @/types to ensure it's resolved correctly.
+// Mock prisma — return the array as-is (route handles filtering/sorting).
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
@@ -25,7 +26,7 @@ vi.mock("@/lib/agent-queue", () => ({
   }),
 }));
 
-// Mock @/types to provide STATUS_LABELS that the route uses.
+// Mock @/types — include all exports needed by the route and its transitive deps.
 vi.mock("@/types", () => ({
   STATUS_LABELS: STATUS_LABELS_MOCK,
   PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
