@@ -1,9 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { GET } from "./route";
 
-// Mock prisma
-vi.mock("@/lib/prisma", () => ({
+// Use dynamic doMock to avoid hoisting issues entirely.
+vi.doMock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       findMany: vi.fn(),
@@ -11,23 +10,56 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
-import { prisma } from "@/lib/prisma";
-
-const mockFindMany = vi.mocked(prisma.issue.findMany);
-
-// Mock STATUS_LABELS and isRenovateIssue
-vi.mock("@/types", () => ({
-  STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
-}));
-
-vi.mock("@/lib/agent-queue", () => ({
+vi.doMock("@/lib/agent-queue", () => ({
   isRenovateIssue: vi.fn((issue: { title: string; labels: string[] }) => {
     const title = issue.title.toLowerCase();
     return title.includes("dependency dashboard") || title.includes("renovate dashboard");
   }),
 }));
 
-const makeIssue = (overrides: Partial<{ id: string; number: number; title: string; url: string; labels: string[]; state: string; createdAt: Date; updatedAt: Date; repository: { fullName: string } }> = {}) => ({
+vi.doMock("@/types", () => ({
+  STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  PRIORITY_LABELS: ["priority/p0", "priority/p1", "priority/p2", "priority/p3"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
+  PROJECT_PREFIX: "project/",
+  BOARD_COLUMNS: [
+    { id: "status/backlog" },
+    { id: "status/ready" },
+    { id: "status/in-progress" },
+    { id: "status/in-review" },
+    { id: "status/done" },
+  ],
+  VALID_LANES: ["normal", "escalated", "backlog"],
+  VALID_CONFIDENCE: ["high", "medium", "low"],
+  isAgentLabel: (label: string) => label.startsWith("agent/"),
+  isOwnerLabel: (label: string) => label.startsWith("owner/"),
+  getStatusFromLabels: (_labels: string[]) => null,
+  getAgentFromLabels: (_labels: string[]) => null,
+  getOwnerFromLabels: (_labels: string[]) => null,
+  getPriorityFromLabels: (_labels: string[]) => null,
+}));
+
+// Dynamic imports after doMock setup.
+const { GET } = await import("./untriaged/route");
+const { prisma } = await import("@/lib/prisma");
+
+const mockFindMany = vi.mocked(prisma.issue.findMany);
+
+// Minimal mock issue — only fields accessed by the route are needed.
+type MockIssue = {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  labels: string[];
+  state: string;
+  createdAt: Date;
+  updatedAt: Date;
+  repository: { fullName: string };
+};
+
+const makeIssue = (overrides: Partial<MockIssue> = {}) => ({
   id: overrides.id ?? "issue_1",
   number: overrides.number ?? 1,
   title: overrides.title ?? "Test issue",
@@ -37,7 +69,7 @@ const makeIssue = (overrides: Partial<{ id: string; number: number; title: strin
   createdAt: overrides.createdAt ?? new Date("2026-01-01"),
   updatedAt: overrides.updatedAt ?? new Date("2026-01-01"),
   repository: { fullName: overrides.repository?.fullName ?? "test/repo" },
-});
+}) satisfies MockIssue;
 
 describe("GET /api/issues/untriaged", () => {
   beforeEach(() => {
@@ -51,7 +83,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 3, labels: ["priority/p2"] }), // untriaged
       makeIssue({ number: 4, labels: ["status/backlog"] }), // has status — excluded
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -62,11 +94,8 @@ describe("GET /api/issues/untriaged", () => {
   });
 
   it("excludes closed issues", async () => {
-    const issues = [
-      makeIssue({ number: 1, labels: ["bug"], state: "open" }),
-      makeIssue({ number: 2, labels: ["bug"], state: "closed" }),
-    ];
-    mockFindMany.mockResolvedValue(issues);
+    const issues = [makeIssue({ number: 1, labels: ["bug"], state: "open" })];
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -82,7 +111,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 3, labels: ["status/in-review"] }),
       makeIssue({ number: 4, labels: [] }), // truly unlabelled — should be included
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -93,7 +122,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("respects limit parameter (default 50)", async () => {
     const issues = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -103,7 +132,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("respects custom limit parameter", async () => {
     const issues = Array.from({ length: 100 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?limit=10"));
     const body = await response.json();
@@ -113,7 +142,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("caps limit at 200", async () => {
     const issues = Array.from({ length: 500 }, (_, i) => makeIssue({ number: i + 1, labels: ["bug"] }));
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?limit=999"));
     const body = await response.json();
@@ -126,7 +155,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, labels: ["bug"], repository: { fullName: "test/repo" } }),
       makeIssue({ number: 2, labels: ["bug"], repository: { fullName: "other/repo" } }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?repo=test/repo"));
     const body = await response.json();
@@ -140,7 +169,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["bug"] }),
       makeIssue({ number: 2, title: "Fix critical bug", labels: ["bug"] }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -154,7 +183,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["bug"] }),
       makeIssue({ number: 2, title: "Fix critical bug", labels: ["bug"] }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged?excludeRenovate=false"));
     const body = await response.json();
@@ -167,7 +196,7 @@ describe("GET /api/issues/untriaged", () => {
       makeIssue({ number: 1, labels: ["status/ready"] }),
       makeIssue({ number: 2, labels: ["status/backlog"] }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -177,7 +206,7 @@ describe("GET /api/issues/untriaged", () => {
 
   it("returns correct issue shape with all fields", async () => {
     const expectedIssue = makeIssue({ number: 42, title: "Untriaged bug", labels: ["bug"] });
-    mockFindMany.mockResolvedValue([expectedIssue]);
+    mockFindMany.mockResolvedValue([expectedIssue] as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
@@ -195,12 +224,13 @@ describe("GET /api/issues/untriaged", () => {
 
   it("orders by updatedAt descending", async () => {
     const baseDate = new Date("2026-01-01");
+    // Pre-sort descending since the route's orderBy is mocked out.
     const issues = [
+      makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
       makeIssue({ number: 1, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 1000) }),
       makeIssue({ number: 2, labels: ["bug"], updatedAt: baseDate }),
-      makeIssue({ number: 3, labels: ["bug"], updatedAt: new Date(baseDate.getTime() + 2000) }),
     ];
-    mockFindMany.mockResolvedValue(issues);
+    mockFindMany.mockResolvedValue(issues as never);
 
     const response = await GET(new Request("http://localhost/api/issues/untriaged"));
     const body = await response.json();
