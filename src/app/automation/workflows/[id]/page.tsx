@@ -1,5 +1,6 @@
 "use client";
 
+import { authedFetch } from "@/lib/client-auth";
 import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -83,7 +84,7 @@ export default function WorkflowDetailPage({ params }: { params: Promise<{ id: s
 
   useEffect(() => {
     if (!workflowId) return;
-    fetch(`/api/automation/workflows/${workflowId}`)
+    authedFetch(`/api/automation/workflows/${workflowId}`)
       .then((res) => {
         if (!res.ok) throw new Error("Workflow not found");
         return res.json();
@@ -134,7 +135,7 @@ export default function WorkflowDetailPage({ params }: { params: Promise<{ id: s
           variant="outline"
           onClick={() => {
             if (workflow.runs[0]) {
-              fetch(`/api/automation/runs/${workflow.runs[0].runId}?repo=${workflow.repo.fullName}&action=dispatch`, { method: "POST" })
+              authedFetch(`/api/automation/runs/${workflow.runs[0].runId}?repo=${workflow.repo.fullName}&action=dispatch`, { method: "POST" })
                 .then(() => window.location.reload());
             }
           }}
@@ -230,7 +231,7 @@ export default function WorkflowDetailPage({ params }: { params: Promise<{ id: s
                             variant="ghost"
                             size="sm"
                             onClick={() => {
-                              fetch(`/api/automation/runs/${run.runId}?repo=${workflow.repo.fullName}&action=rerun`, { method: "POST" })
+                              authedFetch(`/api/automation/runs/${run.runId}?repo=${workflow.repo.fullName}&action=rerun`, { method: "POST" })
                                 .then(() => window.location.reload());
                             }}
                           >
