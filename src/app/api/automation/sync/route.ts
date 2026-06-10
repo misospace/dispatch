@@ -219,7 +219,7 @@ async function syncRepo(repoFullName: string) {
             pullRequestUrl: prUrl,
           },
         });
-      }).filter(Boolean);
+      }).filter((item): item is any => item !== null);
 
       if (resolvedUpserts.length > 0) {
         await prisma.$transaction(resolvedUpserts, { timeout: 60_000 });
