@@ -1,5 +1,6 @@
 "use client";
 
+import { authedFetch } from "@/lib/client-auth";
 import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -47,7 +48,7 @@ export default function ActivityFeedPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/automation/events?limit=100")
+    authedFetch("/api/automation/events?limit=100")
       .then((res) => res.json())
       .then((data) => setEvents(data))
       .catch(() => setEvents([]))

@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
+import { getAppVersion } from "@/lib/version";
 import { prisma } from "@/lib/prisma";
 
 export async function GET() {
-  const version = process.env.npm_package_version || "0.1.1";
+  const version = getAppVersion();
 
   try {
     await prisma.$queryRaw`SELECT 1`;

@@ -30,9 +30,11 @@ Run all checks against the target instance (local dev, staging, or production) b
 {
   "ok": true,
   "database": "ok",
-  "version": "0.1.13"
+  "version": "<current-app-version>"
 }
 ```
+
+**Note:** The `version` field is dynamically resolved by `getAppVersion()` — it reflects the current app version from `package.json` (or `NEXT_PUBLIC_DISPATCH_VERSION` at build time).
 
 **Status code:** `200 OK`
 
