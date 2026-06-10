@@ -74,36 +74,33 @@ async function syncRepo(repoFullName: string) {
       },
     });
 
-    for (const wf of workflows) {
-      await prisma.githubWorkflow.upsert({
-        where: { workflowId: wf.id },
-        create: {
-          repoId: repo.id,
-          workflowId: wf.id,
-          name: wf.name,
-          path: wf.path,
-          state: wf.state,
-          createdAt: new Date(wf.created_at),
-          updatedAt: new Date(wf.updated_at),
-          lastRunAt: wf.last_run ? new Date(wf.last_run.created_at) : null,
-        },
-        update: {
-          name: wf.name,
-          path: wf.path,
-          state: wf.state,
-          updatedAt: new Date(wf.updated_at),
-          lastRunAt: wf.last_run ? new Date(wf.last_run.created_at) : null,
-        },
-      });
-    }
-
-    const workflowMap = new Map<string, string>();
-    const dbWorkflows = await prisma.githubWorkflow.findMany({
-      where: { repoId: repo.id },
-      select: { id: true, name: true },
-    });
-    for (const wf of dbWorkflows) {
-      workflowMap.set(wf.name, wf.id);
+    // Batch workflow upserts in a single transaction
+    if (workflows.length > 0) {
+      await prisma.$transaction(
+        workflows.map((wf) =>
+          prisma.githubWorkflow.upsert({
+            where: { workflowId: wf.id },
+            create: {
+              repoId: repo.id,
+              workflowId: wf.id,
+              name: wf.name,
+              path: wf.path,
+              state: wf.state,
+              createdAt: new Date(wf.created_at),
+              updatedAt: new Date(wf.updated_at),
+              lastRunAt: wf.last_run ? new Date(wf.last_run.created_at) : null,
+            },
+            update: {
+              name: wf.name,
+              path: wf.path,
+              state: wf.state,
+              updatedAt: new Date(wf.updated_at),
+              lastRunAt: wf.last_run ? new Date(wf.last_run.created_at) : null,
+            },
+          })
+        ),
+        { timeout: 30_000 }
+      );
     }
 
     await prisma.automationSyncRun.update({
@@ -111,84 +108,160 @@ async function syncRepo(repoFullName: string) {
       data: { workflowsFetched: workflows.length },
     });
 
-    for (const run of runs) {
-      const prUrl = run.pull_requests?.[0]?.url || null;
-
-      let durationSecs: number | null = null;
-      if (run.status === "completed" && run.run_started_at) {
-        const start = new Date(run.run_started_at).getTime();
-        const end = new Date(run.updated_at).getTime();
-        durationSecs = Math.round((end - start) / 1000);
-      }
-
-      let wfId = workflowMap.get(run.name);
-      if (!wfId) {
-        const placeholderWf = await prisma.githubWorkflow.create({
-          data: {
-            repoId: repo.id,
-            workflowId: BigInt(run.id),
+    // Batch run upserts in a single transaction
+    if (runs.length > 0) {
+      const runUpserts = runs.map((run) => {
+        const prUrl = run.pull_requests?.[0]?.url || null;
+        let durationSecs: number | null = null;
+        if (run.status === "completed" && run.run_started_at) {
+          const start = new Date(run.run_started_at).getTime();
+          const end = new Date(run.updated_at).getTime();
+          durationSecs = Math.round((end - start) / 1000);
+        }
+        return prisma.githubWorkflowRun.upsert({
+          where: { runId: run.id },
+          create: {
+            workflowId: "placeholder", // filled below
+            runId: run.id,
             name: run.name,
-            path: "unknown",
-            state: "unknown",
-            createdAt: new Date(),
-            updatedAt: new Date(),
+            status: run.status,
+            conclusion: run.conclusion,
+            branch: run.head_branch,
+            headSha: run.head_sha,
+            actor: run.actor.login,
+            runStartedAt: new Date(run.run_started_at),
+            updatedAt: new Date(run.updated_at),
+            durationSecs,
+            pullRequestUrl: prUrl,
+          },
+          update: {
+            status: run.status,
+            conclusion: run.conclusion,
+            branch: run.head_branch,
+            actor: run.actor.login,
+            updatedAt: new Date(run.updated_at),
+            durationSecs,
+            pullRequestUrl: prUrl,
           },
         });
-        wfId = placeholderWf.id;
-        workflowMap.set(run.name, wfId);
+      });
+
+      // First, resolve workflow IDs for runs that reference unknown workflows
+      const dbWorkflows = await prisma.githubWorkflow.findMany({
+        where: { repoId: repo.id },
+        select: { id: true, name: true },
+      });
+      const workflowMap = new Map<string, string>();
+      for (const wf of dbWorkflows) {
+        workflowMap.set(wf.name, wf.id);
       }
 
-      await prisma.githubWorkflowRun.upsert({
-        where: { runId: run.id },
-        create: {
-          workflowId: wfId,
-          runId: run.id,
-          name: run.name,
-          status: run.status,
-          conclusion: run.conclusion,
-          branch: run.head_branch,
-          headSha: run.head_sha,
-          actor: run.actor.login,
-          runStartedAt: new Date(run.run_started_at),
-          updatedAt: new Date(run.updated_at),
-          durationSecs,
-          pullRequestUrl: prUrl,
-        },
-        update: {
-          status: run.status,
-          conclusion: run.conclusion,
-          branch: run.head_branch,
-          actor: run.actor.login,
-          updatedAt: new Date(run.updated_at),
-          durationSecs,
-          pullRequestUrl: prUrl,
-        },
-      }).catch(() => {});
+      // Create placeholder workflows for runs with unknown workflow names
+      const unknownRuns = runs.filter((run) => !workflowMap.has(run.name));
+      if (unknownRuns.length > 0) {
+        const placeholders = await prisma.$transaction(
+          unknownRuns.map((run) =>
+            prisma.githubWorkflow.create({
+              data: {
+                repoId: repo.id,
+                workflowId: BigInt(run.id),
+                name: run.name,
+                path: "unknown",
+                state: "unknown",
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            })
+          )
+        );
+        for (const ph of placeholders) {
+          workflowMap.set(ph.name, ph.id);
+        }
+      }
 
-      const savedRun = await prisma.githubWorkflowRun.findUnique({
-        where: { runId: run.id },
-      });
-      if (savedRun && run.status === "completed") {
-        const jobs = await fetchRunJobs(repoFullName, run.id).catch(() => []);
-        for (const job of jobs) {
-          await prisma.githubWorkflowJob.upsert({
-            where: { runId_jobId: { runId: savedRun.id, jobId: job.id } },
-            create: {
-              runId: savedRun.id,
-              jobId: job.id,
-              name: job.name,
-              status: job.status,
-              conclusion: job.conclusion,
-              startedAt: job.started_at ? new Date(job.started_at) : null,
-              completedAt: job.completed_at ? new Date(job.completed_at) : null,
-            },
-            update: {
-              status: job.status,
-              conclusion: job.conclusion,
-              startedAt: job.started_at ? new Date(job.started_at) : null,
-              completedAt: job.completed_at ? new Date(job.completed_at) : null,
-            },
+      // Now batch all run upserts with correct workflow IDs
+      const resolvedUpserts = runs.map((run) => {
+        let wfId = workflowMap.get(run.name);
+        if (!wfId) {
+          // Shouldn't happen after placeholder creation, but guard anyway
+          return null;
+        }
+        const prUrl = run.pull_requests?.[0]?.url || null;
+        let durationSecs: number | null = null;
+        if (run.status === "completed" && run.run_started_at) {
+          const start = new Date(run.run_started_at).getTime();
+          const end = new Date(run.updated_at).getTime();
+          durationSecs = Math.round((end - start) / 1000);
+        }
+        return prisma.githubWorkflowRun.upsert({
+          where: { runId: run.id },
+          create: {
+            workflowId: wfId,
+            runId: run.id,
+            name: run.name,
+            status: run.status,
+            conclusion: run.conclusion,
+            branch: run.head_branch,
+            headSha: run.head_sha,
+            actor: run.actor.login,
+            runStartedAt: new Date(run.run_started_at),
+            updatedAt: new Date(run.updated_at),
+            durationSecs,
+            pullRequestUrl: prUrl,
+          },
+          update: {
+            status: run.status,
+            conclusion: run.conclusion,
+            branch: run.head_branch,
+            actor: run.actor.login,
+            updatedAt: new Date(run.updated_at),
+            durationSecs,
+            pullRequestUrl: prUrl,
+          },
+        });
+      }).filter(Boolean);
+
+      if (resolvedUpserts.length > 0) {
+        await prisma.$transaction(resolvedUpserts, { timeout: 60_000 });
+      }
+
+      // Batch job upserts for completed runs — only fetch jobs for completed runs once
+      const completedRuns = runs.filter((run) => run.status === "completed");
+      if (completedRuns.length > 0) {
+        for (const run of completedRuns) {
+          const jobs = await fetchRunJobs(repoFullName, run.id).catch(() => []);
+          if (jobs.length === 0) continue;
+
+          // Get the run record we just upserted (no redundant findUnique needed)
+          const savedRun = await prisma.githubWorkflowRun.findUnique({
+            where: { runId: run.id },
           });
+          if (!savedRun) continue;
+
+          // Batch job upserts in a single transaction
+          await prisma.$transaction(
+            jobs.map((job) =>
+              prisma.githubWorkflowJob.upsert({
+                where: { runId_jobId: { runId: savedRun.id, jobId: job.id } },
+                create: {
+                  runId: savedRun.id,
+                  jobId: job.id,
+                  name: job.name,
+                  status: job.status,
+                  conclusion: job.conclusion,
+                  startedAt: job.started_at ? new Date(job.started_at) : null,
+                  completedAt: job.completed_at ? new Date(job.completed_at) : null,
+                },
+                update: {
+                  status: job.status,
+                  conclusion: job.conclusion,
+                  startedAt: job.started_at ? new Date(job.started_at) : null,
+                  completedAt: job.completed_at ? new Date(job.completed_at) : null,
+                },
+              })
+            ),
+            { timeout: 30_000 }
+          );
         }
       }
     }
@@ -198,83 +271,101 @@ async function syncRepo(repoFullName: string) {
       data: { runsFetched: runs.length },
     });
 
-    for (const rel of releases) {
-      await prisma.githubRelease.upsert({
-        where: { repoId_releaseId: { repoId: repo.id, releaseId: rel.id } },
-        create: {
-          repoId: repo.id,
-          releaseId: rel.id,
-          tagName: rel.tag_name,
-          name: rel.name,
-          draft: rel.draft,
-          prerelease: rel.prerelease,
-          targetCommit: rel.target_commitish,
-          url: rel.html_url,
-          publishedAt: new Date(rel.published_at),
-        },
-        update: {
-          tagName: rel.tag_name,
-          name: rel.name,
-          draft: rel.draft,
-          prerelease: rel.prerelease,
-          targetCommit: rel.target_commitish,
-          url: rel.html_url,
-          publishedAt: new Date(rel.published_at),
-        },
-      });
+    // Batch release upserts in a single transaction
+    if (releases.length > 0) {
+      await prisma.$transaction(
+        releases.map((rel) =>
+          prisma.githubRelease.upsert({
+            where: { repoId_releaseId: { repoId: repo.id, releaseId: rel.id } },
+            create: {
+              repoId: repo.id,
+              releaseId: rel.id,
+              tagName: rel.tag_name,
+              name: rel.name,
+              draft: rel.draft,
+              prerelease: rel.prerelease,
+              targetCommit: rel.target_commitish,
+              url: rel.html_url,
+              publishedAt: new Date(rel.published_at),
+            },
+            update: {
+              tagName: rel.tag_name,
+              name: rel.name,
+              draft: rel.draft,
+              prerelease: rel.prerelease,
+              targetCommit: rel.target_commitish,
+              url: rel.html_url,
+              publishedAt: new Date(rel.published_at),
+            },
+          })
+        ),
+        { timeout: 30_000 }
+      );
     }
 
+    // Batch PR upserts in a single transaction
     const prsToUpsert = prs.slice(0, 50);
-    for (const pr of prsToUpsert) {
-      await prisma.githubPullRequest.upsert({
-        where: { repoId_number: { repoId: repo.id, number: pr.number } },
-        create: {
-          repoId: repo.id,
-          number: pr.number,
-          url: pr.url,
-          title: pr.title,
-          state: pr.state,
-          author: pr.user.login,
-          branch: pr.head.ref,
-          baseBranch: pr.base.ref,
-          createdAt: new Date(pr.created_at),
-          updatedAt: new Date(pr.updated_at),
-          mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
-          isDraft: pr.draft,
-        },
-        update: {
-          title: pr.title,
-          state: pr.state,
-          author: pr.user.login,
-          branch: pr.head.ref,
-          baseBranch: pr.base.ref,
-          updatedAt: new Date(pr.updated_at),
-          mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
-          isDraft: pr.draft,
-        },
-      });
+    if (prsToUpsert.length > 0) {
+      await prisma.$transaction(
+        prsToUpsert.map((pr) =>
+          prisma.githubPullRequest.upsert({
+            where: { repoId_number: { repoId: repo.id, number: pr.number } },
+            create: {
+              repoId: repo.id,
+              number: pr.number,
+              url: pr.url,
+              title: pr.title,
+              state: pr.state,
+              author: pr.user.login,
+              branch: pr.head.ref,
+              baseBranch: pr.base.ref,
+              createdAt: new Date(pr.created_at),
+              updatedAt: new Date(pr.updated_at),
+              mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
+              isDraft: pr.draft,
+            },
+            update: {
+              title: pr.title,
+              state: pr.state,
+              author: pr.user.login,
+              branch: pr.head.ref,
+              baseBranch: pr.base.ref,
+              updatedAt: new Date(pr.updated_at),
+              mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
+              isDraft: pr.draft,
+            },
+          })
+        ),
+        { timeout: 30_000 }
+      );
     }
 
-    for (const pkg of packages) {
-      const latestTag = pkg.metadata?.container?.tags?.[0] || null;
-      await prisma.githubPackage.upsert({
-        where: { repoId_name: { repoId: repo.id, name: pkg.name } },
-        create: {
-          repoId: repo.id,
-          packageType: pkg.package_type,
-          name: pkg.name,
-          visibility: pkg.visibility,
-          url: pkg.html_url,
-          latestTag,
-          updatedAt: new Date(pkg.updated_at),
-        },
-        update: {
-          latestTag,
-          visibility: pkg.visibility,
-          url: pkg.html_url,
-          updatedAt: new Date(pkg.updated_at),
-        },
-      });
+    // Batch package upserts in a single transaction
+    if (packages.length > 0) {
+      await prisma.$transaction(
+        packages.map((pkg) => {
+          const latestTag = pkg.metadata?.container?.tags?.[0] || null;
+          return prisma.githubPackage.upsert({
+            where: { repoId_name: { repoId: repo.id, name: pkg.name } },
+            create: {
+              repoId: repo.id,
+              packageType: pkg.package_type,
+              name: pkg.name,
+              visibility: pkg.visibility,
+              url: pkg.html_url,
+              latestTag,
+              updatedAt: new Date(pkg.updated_at),
+            },
+            update: {
+              latestTag,
+              visibility: pkg.visibility,
+              url: pkg.html_url,
+              updatedAt: new Date(pkg.updated_at),
+            },
+          });
+        }),
+        { timeout: 30_000 }
+      );
     }
 
     await prisma.automationEvent.create({
