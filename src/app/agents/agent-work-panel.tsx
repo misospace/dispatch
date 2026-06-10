@@ -1,5 +1,6 @@
 "use client";
 
+import { authedFetch } from "@/lib/client-auth";
 import { useState, useEffect, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -75,7 +76,7 @@ export default function AgentWorkPanel() {
 
   const fetchData = useCallback(async () => {
     try {
-      const res = await fetch(`/api/agent-work?include_stale=true`);
+      const res = await authedFetch(`/api/agent-work?include_stale=true`);
       if (res.ok) {
         const json: AgentWorkResponse = await res.json();
         setData(json);
@@ -94,7 +95,7 @@ export default function AgentWorkPanel() {
 
   const handleRelease = async (workId: string | null, leaseId?: string) => {
     try {
-      const res = await fetch("/api/agent-work", {
+      const res = await authedFetch("/api/agent-work", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "release", workId, leaseId, reason: "Released by operator" }),
@@ -112,7 +113,7 @@ export default function AgentWorkPanel() {
     if (!newAgent?.trim()) return;
     setReassigning(workId);
     try {
-      const res = await fetch("/api/agent-work", {
+      const res = await authedFetch("/api/agent-work", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "reassign", workId, newAgentName: newAgent.trim(), reason: "Reassigned by operator" }),
