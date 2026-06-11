@@ -17,6 +17,13 @@ if [ -z "$DATABASE_URL" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Authentication mode warning — disabled mode is local-dev only
+# ---------------------------------------------------------------------------
+if [ "$DISPATCH_AUTH_MODE" = "disabled" ]; then
+    echo "⚠️  [Dispatch] DISPATCH_AUTH_MODE=disabled — NO AUTHENTICATION ENFORCED. This instance must be bound to localhost only and must NOT be exposed to the internet."
+fi
+
+# ---------------------------------------------------------------------------
 # Database migrations
 # ---------------------------------------------------------------------------
 

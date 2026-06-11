@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAppVersion } from "@/lib/version";
 import { prisma } from "@/lib/prisma";
+import { getAuthMode } from "@/lib/auth";
 
 export async function GET() {
   const version = getAppVersion();
@@ -11,6 +12,7 @@ export async function GET() {
       ok: true,
       database: "ok",
       version,
+      authMode: getAuthMode() || "legacy",
     });
   } catch (error) {
     return NextResponse.json({
