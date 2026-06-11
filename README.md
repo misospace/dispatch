@@ -83,7 +83,7 @@ Agent Runs → Dispatch → Agent Activity Page
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token (fallback when GitHub App auth is not configured) |
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 | `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Dispatch UI or `/api/automation/repos` after initial setup. |
-| `DISPATCH_AUTH_MODE` | No | Authentication mode: `"basic"` (HTTP Basic Auth), `"oidc"` (OIDC/SSO), `"disabled"` (no auth), or unset (legacy mode) |
+| `DISPATCH_AUTH_MODE` | No | Authentication mode: `"basic"` (HTTP Basic Auth), `"oidc"` (OIDC/SSO), `"disabled"` (no auth, **local development only** — see [Operational Notes](#operational-notes)), or unset (legacy mode) |
 | `DISPATCH_AUTH_USERNAME` | Conditional | Username for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
 | `DISPATCH_AUTH_PASSWORD` | Conditional | Password for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
 | `DISPATCH_OIDC_ISSUER` | Conditional | OIDC provider issuer URL (e.g., `https://auth.example.com`). Discovery URLs ending in `/.well-known/openid-configuration` are also accepted for compatibility. Required when `DISPATCH_AUTH_MODE=oidc` |
@@ -137,7 +137,7 @@ Dispatch supports three authentication models:
    - **Basic Auth** (`DISPATCH_AUTH_MODE=basic`): HTTP Basic Auth — the browser prompts for username/password. Mutating API calls from the browser automatically include these credentials via `authedFetch()`.
    - **OIDC** (`DISPATCH_AUTH_MODE=oidc`): OIDC provider authentication (SSO). Operators sign in via a login page that redirects to the OIDC provider. Session cookies are managed by NextAuth.
 
-3. **Disabled** (`DISPATCH_AUTH_MODE=disabled`): No auth enforcement — full open access. Use for local development only.
+3. **Disabled** (`DISPATCH_AUTH_MODE=disabled`): No auth enforcement — full open access. **Local development only — never use in production or any internet-facing deployment.** See [Operational Notes](#operational-notes).
 
 ### Auth Modes
 
@@ -146,7 +146,7 @@ Dispatch supports three authentication models:
 | *(not set)* | Legacy mode — no middleware enforcement. Agent routes use Bearer token auth via `DISPATCH_AGENT_TOKEN`. Browser UI has no separate auth model. |
 | `basic` | HTTP Basic Auth required for operator UI routes. API routes also accept `DISPATCH_AGENT_TOKEN` bearer auth for agents and workers. |
 | `oidc` | OIDC session-based authentication for operator UI routes. Route handlers accept either a valid NextAuth session cookie or `DISPATCH_AGENT_TOKEN` bearer auth. |
-| `disabled` | No auth enforcement — full open access. Use for local development only. |
+| `disabled` | **No auth enforcement — full open access.** All routes are publicly accessible without authentication. **Local development only.** See [Operational Notes](#operational-notes). |
 
 ### How it works
 
@@ -154,6 +154,32 @@ Dispatch supports three authentication models:
 - **Route handlers** use a shared `authorizeRequest(request)` helper from `src/lib/auth.ts` that supports Basic Auth, Bearer token auth, and OIDC session cookies depending on the configured auth mode.
 - **OIDC flow**: Operators visit `/login`, click "Sign in with SSO", are redirected to the OIDC provider, and return via `/api/auth/callback/oidc`. NextAuth issues a signed JWT session cookie.
 - **Client components** (`kanban-board.tsx`, `sync-issues-button.tsx`) use `authedFetch()` which automatically attaches stored Basic Auth credentials to outgoing requests. In OIDC mode, cookies are sent automatically by the browser.
+
+
+### Operational Notes
+
+#### DISPATCH_AUTH_MODE=disabled — Security Warnings and Deployment Checks
+
+Setting `DISPATCH_AUTH_MODE=disabled` disables all authentication enforcement for both operator UI routes and API routes. **This means every endpoint is publicly accessible without any credentials.**
+
+**⚠️ CRITICAL: This mode MUST only be used for local development.** The following deployment checks are enforced when `DISPATCH_AUTH_MODE=disabled` is detected:
+
+1. **Startup Warning**: A warning is logged to stdout on every application start, reminding operators that disabled auth mode is active.
+2. **Health Endpoint Exposure**: The `/api/health` endpoint reports the current auth mode in its response (`{ ok: true, database: "ok", version: "...", authMode: "disabled" }`), allowing operators and monitoring tools to verify the configuration at a glance.
+3. **Local-Only Guidance**: When deploying with disabled auth mode, ensure Dispatch is bound to `127.0.0.1` (localhost) only and is NOT exposed to any network interface that could be reached from outside the local machine. Do not set up reverse proxies, load balancers, or ingress rules that forward external traffic to a dispatch instance running with `DISPATCH_AUTH_MODE=disabled`.
+
+**If you need Dispatch without authentication:**
+- Use `DISPATCH_AUTH_MODE=basic` with strong credentials for internal deployments behind a trusted network.
+- Use `DISPATCH_AUTH_MODE=oidc` with a proper OIDC provider for production deployments.
+- Never expose a disabled-auth instance to the internet or untrusted networks.
+
+**Security implications of disabled mode:**
+- All mutating API endpoints (create/update/delete issues, claim work, sync repos, etc.) accept requests from any source.
+- The operator UI is fully accessible — anyone can view and modify all kanban boards, trigger syncs, and manage tracked repositories.
+- Agent tokens (`DISPATCH_AGENT_TOKEN`) are also ignored — there is no distinction between authenticated and unauthenticated requests.
+- Webhook endpoints in `src/app/api/pr-followup/` that conditionally skip signature verification become completely unprotected.
+
+---
 
 ### Agent Token vs Operator Auth
 
