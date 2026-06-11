@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
-import { processPrFollowupEvents, isAllowedBotAuthor } from "@/lib/pr-followup-ingestion";
+import { processPrFollowupEvents, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 
 /**
  * PR Follow-up Sync Endpoint (Pull-based)
@@ -32,6 +32,7 @@ interface GithubPR {
   merged_at: string | null;
   draft: boolean;
   mergeable_state?: string;
+  mergeable?: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
 }
 
 /**
@@ -226,6 +227,32 @@ export async function POST(request: NextRequest) {
             id: String(pr.id ?? Date.now()),
             linkedIssue,
           });
+        }
+
+        // Detect merge conflicts (CONFLICTING mergeable status)
+        if (pr.mergeable && pr.mergeable.toUpperCase() === "CONFLICTING") {
+          const conflictKey = await ingestMergeConflict(asPrFixQueueClient(prisma), {
+            repoFullName,
+            prNumber: pr.number,
+            branch: pr.head.ref ?? null,
+            url: pr.url,
+            title: pr.title,
+            author: pr.user.login,
+            mergeable: pr.mergeable,
+            linkedIssue,
+          });
+          if (conflictKey) {
+            totalEnqueued++;
+          }
+        } else {
+          // Clear resolved conflict items if PR is no longer conflicting
+          if (pr.mergeable) {
+            await clearResolvedConflictItems(asPrFixQueueClient(prisma), {
+              repoFullName,
+              prNumber: pr.number,
+              mergeable: pr.mergeable,
+            });
+          }
         }
       }
     }

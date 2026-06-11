@@ -1,4 +1,4 @@
-import { normalizePrFixLane, normalizePrFixStatus, PrFixLane, PrFixStatus } from "@/types";
+import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
 
 export type PrFixQueueClient = {
   prFixQueueItem: {
@@ -17,6 +17,7 @@ export interface EnqueuePrFixInput {
   repo: string;
   pr: number;
   lane?: string | null;
+  type?: string | null;
   reason: string;
   feedback: string;
   evidenceKey: string;
@@ -52,6 +53,7 @@ export function parseEnqueuePrFixInput(body: unknown): EnqueuePrFixInput | { err
     repo: input.repo.trim(),
     pr: Number(input.pr),
     lane: typeof input.lane === "string" ? input.lane : undefined,
+    type: typeof input.type === "string" ? input.type : undefined,
     reason: input.reason.trim(),
     feedback: input.feedback.trim(),
     evidenceKey: input.evidenceKey.trim(),
@@ -105,6 +107,7 @@ function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number
 
 export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueuePrFixInput) {
   const lane = normalizePrFixLane(input.lane);
+  const type = normalizePrFixType(input.type);
   const status: PrFixStatus = lane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
 
   return client.$transaction(async (tx) => {
@@ -114,6 +117,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         where: { id: existing.id },
         data: {
           lane,
+          type,
           status,
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
@@ -132,6 +136,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         repo: input.repo,
         pr: input.pr,
         lane,
+        type,
         status,
         reason: input.reason,
         feedback: [input.feedback],
@@ -146,13 +151,28 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
   });
 }
 
-export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean } = {}) {
+export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
   const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
   const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED"] } : "QUEUED";
-  return client.prFixQueueItem.findMany({
+  
+  const items = await client.prFixQueueItem.findMany({
     where: { status, ...(lane ? { lane } : {}) },
-    orderBy: [{ queuedAt: "asc" }, { repo: "asc" }, { pr: "asc" }],
   });
+  
+  // Sort by type priority first, then by queuedAt
+  if (options.prioritizeByType !== false) {
+    items.sort((a, b) => {
+      const aPriority = PR_FIX_TYPE_PRIORITY[normalizePrFixType(a.type)] ?? 3;
+      const bPriority = PR_FIX_TYPE_PRIORITY[normalizePrFixType(b.type)] ?? 3;
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      // Within same type, oldest first
+      return new Date(a.queuedAt).getTime() - new Date(b.queuedAt).getTime();
+    });
+  } else {
+    items.sort((a, b) => new Date(a.queuedAt).getTime() - new Date(b.queuedAt).getTime());
+  }
+  
+  return items;
 }
 
 export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixInput) {
@@ -168,8 +188,10 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
 }
 
 export function toAgentQueuePrFixItem(item: any) {
+  const fixType = normalizePrFixType(item.type);
   return {
     type: "pr-review-fix",
+    fixType,
     id: item.id,
     repo: item.repo,
     pr: item.pr,
@@ -186,6 +208,6 @@ export function toAgentQueuePrFixItem(item: any) {
     author: item.author,
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
-    rankingReason: "queued PR review-fix item",
+    rankingReason: `queued PR review-fix item (${fixType})`,
   };
 }

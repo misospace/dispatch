@@ -221,6 +221,36 @@ export type PrFixStatus = "QUEUED" | "FIXED" | "BLOCKED" | "STALE" | "IGNORED";
 
 export const VALID_PR_FIX_LANES: PrFixLane[] = ["NORMAL", "ESCALATED", "NEEDS_HUMAN"];
 export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED", "STALE", "IGNORED"];
+// ─── PR Fix Type Constants ───────────────────────────────────────────────────
+
+export type PrFixType = "MERGE_CONFLICT" | "CI_FAILURE" | "REVIEW_FEEDBACK" | "OTHER";
+
+export const VALID_PR_FIX_TYPES: PrFixType[] = ["MERGE_CONFLICT", "CI_FAILURE", "REVIEW_FEEDBACK", "OTHER"];
+
+export function isValidPrFixType(type: string): type is PrFixType {
+  return VALID_PR_FIX_TYPES.includes(type as PrFixType);
+}
+
+export function normalizePrFixType(type?: string | null): PrFixType {
+  if (!type) return "OTHER";
+  const normalized = type.trim().toUpperCase().replace(/-/g, "_");
+  if (normalized === "MERGE_CONFLICT" || normalized === "MERGECONFLICT") return "MERGE_CONFLICT";
+  if (normalized === "CI_FAILURE" || normalized === "CIFAILURE") return "CI_FAILURE";
+  if (normalized === "REVIEW_FEEDBACK" || normalized === "REVIEWFEEDBACK") return "REVIEW_FEEDBACK";
+  return isValidPrFixType(normalized) ? normalized : "OTHER";
+}
+
+/**
+ * Priority ordering for PR fix queue items.
+ * Lower number = higher priority.
+ */
+export const PR_FIX_TYPE_PRIORITY: Record<PrFixType, number> = {
+  MERGE_CONFLICT: 0,
+  CI_FAILURE: 1,
+  REVIEW_FEEDBACK: 2,
+  OTHER: 3,
+};
+
 
 export function isValidPrFixLane(lane: string): lane is PrFixLane {
   return VALID_PR_FIX_LANES.includes(lane as PrFixLane);
