@@ -13,6 +13,7 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const lane = searchParams.get("lane");
     const includeBlocked = searchParams.get("include_blocked") === "true";
+    const prioritizeByType = searchParams.get("prioritize_by_type") !== "false"; // default true
 
     if (lane) {
       const normalized = lane.trim().toUpperCase().replace(/-/g, "_");
@@ -21,7 +22,7 @@ export async function GET(request: Request) {
       }
     }
 
-    const items = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane, includeBlocked });
+    const items = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane, includeBlocked, prioritizeByType });
     return NextResponse.json(items);
   } catch (error) {
     console.error("Failed to list PR fix queue:", error);

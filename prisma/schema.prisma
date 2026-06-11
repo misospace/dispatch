@@ -86,6 +86,14 @@ enum PrFixStatus {
   IGNORED
 }
 
+enum PrFixType {
+  MERGE_CONFLICT
+  CI_FAILURE
+  REVIEW_FEEDBACK
+  OTHER
+}
+
+
 model PrFixQueueItem {
   id           String         @id @default(cuid())
   repo         String
@@ -93,6 +101,7 @@ model PrFixQueueItem {
   issue        Int?
   branch       String?
   lane         PrFixLane      @default(NORMAL)
+  type         PrFixType      @default(OTHER)
   reason       String         @db.Text
   feedback     String[]       @default([])
   evidenceKeys String[]       @default([])
@@ -109,6 +118,9 @@ model PrFixQueueItem {
   @@index([status])
   @@index([lane])
   @@index([status, lane])
+
+  @@index([type])
+  @@index([status, type])
 }
 
 model PrFixHistory {

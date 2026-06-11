@@ -157,7 +157,7 @@ export function classifyFeedback(content: string): FeedbackClassification {
  * Format: {eventType}:{source}:{identifier}
  */
 export function computeEvidenceKey(
-  eventType: "comment" | "review" | "check_run" | "merge_state",
+  eventType: "comment" | "review" | "check_run" | "merge_state" | "merge_conflict",
   sourceId: string, // comment ID, review ID, check run ID
   repoFullName: string,
   prNumber: number,
@@ -202,6 +202,7 @@ export async function ingestCommentEvent(
     repo: opts.repoFullName,
     pr: opts.prNumber,
     lane,
+    type: "REVIEW_FEEDBACK",
     reason: `PR comment: ${classification === "needs_human" ? "ambiguous feedback" : "actionable feedback"}`,
     feedback: opts.commentBody,
     evidenceKey,
@@ -251,6 +252,7 @@ export async function ingestReviewEvent(
     repo: opts.repoFullName,
     pr: opts.prNumber,
     lane,
+    type: "REVIEW_FEEDBACK",
     reason: `PR review: CHANGES_REQUESTED`,
     feedback: opts.reviewBody,
     evidenceKey,
@@ -302,6 +304,7 @@ export async function ingestCheckRunEvent(
     repo: opts.repoFullName,
     pr: opts.prNumber,
     lane,
+    type: "CI_FAILURE",
     reason: `Failing check: ${opts.checkName} (${opts.conclusion})`,
     feedback: opts.checkDetails ?? `Check "${opts.checkName}" concluded ${opts.conclusion}`,
     evidenceKey,
@@ -343,10 +346,16 @@ export async function ingestMergeStateEvent(
 
   const evidenceKey = computeEvidenceKey("merge_state", opts.mergeStateStatus, opts.repoFullName, opts.prNumber);
 
+  // Determine type based on merge state status
+  const mergeType = ["dirty", "conflicting"].includes(opts.mergeStateStatus.toLowerCase()) 
+    ? "MERGE_CONFLICT" 
+    : "OTHER";
+  
   await enqueuePrFixItem(client, {
     repo: opts.repoFullName,
     pr: opts.prNumber,
     lane: "NORMAL",
+    type: mergeType,
     reason: `Merge state change: ${opts.mergeStateStatus}`,
     feedback: `PR merge state is now ${opts.mergeStateStatus}`,
     evidenceKey,
@@ -358,6 +367,100 @@ export async function ingestMergeStateEvent(
   });
 
   return evidenceKey;
+}
+
+
+// ─── Merge Conflict Detection ───────────────────────────────────────────────
+
+/**
+ * Detect and enqueue merge conflict items for PRs with mergeable=CONFLICTING.
+ * This is the primary function for surfacing merge conflicts as PR review-fix items.
+ * 
+ * Returns the evidence key if a new item was enqueued, null if skipped (not conflicting,
+ * not eligible, or already queued).
+ */
+export async function ingestMergeConflict(
+  client: PrFixQueueClient,
+  opts: {
+    repoFullName: string;
+    prNumber: number;
+    branch: string | null;
+    url: string;
+    title: string;
+    author: string | null;
+    mergeable: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
+    linkedIssue?: number | null;
+  },
+): Promise<string | null> {
+  // Only CONFLICTING PRs trigger merge conflict items
+  if (opts.mergeable.toUpperCase() !== "CONFLICTING") return null;
+
+  // Check author eligibility
+  if (!isAllowedBotAuthor(opts.author)) return null;
+
+  // Check repo owner eligibility
+  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
+
+  const evidenceKey = computeEvidenceKey("merge_conflict", "conflicting", opts.repoFullName, opts.prNumber);
+
+  await enqueuePrFixItem(client, {
+    repo: opts.repoFullName,
+    pr: opts.prNumber,
+    lane: "NORMAL",
+    type: "MERGE_CONFLICT",
+    reason: `Merge conflict detected: PR is CONFLICTING`,
+    feedback: `PR has merge conflicts and needs rebase. Use \`git rebase\` to resolve, not patch.`,
+    evidenceKey,
+    issue: opts.linkedIssue,
+    branch: opts.branch,
+    url: opts.url,
+    title: opts.title,
+    author: opts.author,
+  });
+
+  return evidenceKey;
+}
+
+/**
+ * Clear merge conflict items for PRs that are no longer conflicting.
+ * This handles idempotent cleanup — items are marked FIXED when the PR
+ * becomes mergeable or is closed.
+ */
+export async function clearResolvedConflictItems(
+  client: PrFixQueueClient,
+  opts: {
+    repoFullName: string;
+    prNumber: number;
+    mergeable: string; // "MERGEABLE", "CONFLICTING", "UNKNOWN"
+  },
+): Promise<boolean> {
+  // Only clear when PR is no longer conflicting
+  if (opts.mergeable.toUpperCase() === "CONFLICTING") return false;
+
+  const existing = await client.prFixQueueItem.findUnique({
+    where: { repo_pr: { repo: opts.repoFullName, pr: opts.prNumber } },
+  });
+
+  if (!existing) return false;
+
+  // Only clear if it's a merge conflict item and still queued
+  if (existing.type !== "MERGE_CONFLICT" || existing.status !== "QUEUED") return false;
+
+  await client.prFixQueueItem.update({
+    where: { id: existing.id },
+    data: { status: "FIXED" },
+  });
+
+  await client.prFixHistory.create({
+    data: {
+      itemId: existing.id,
+      action: "mark",
+      status: "FIXED",
+      note: `PR is now ${opts.mergeable} — conflict resolved`,
+    },
+  });
+
+  return true;
 }
 
 // ─── Bulk Sync ──────────────────────────────────────────────────────────────
