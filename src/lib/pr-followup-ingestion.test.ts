@@ -120,6 +120,15 @@ describe("isAllowedBotAuthor", () => {
     expect(isAllowedBotAuthor(undefined)).toBe(false);
   });
 
+  it("defaults to itsmiso-ai + github-actions[bot] when env var is unset", () => {
+    delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+    expect(isAllowedBotAuthor("itsmiso-ai")).toBe(true);
+    expect(isAllowedBotAuthor("github-actions[bot]")).toBe(true);
+    // Other bots still rejected by default
+    expect(isAllowedBotAuthor("app/smurf-bot")).toBe(false);
+    expect(isAllowedBotAuthor("random-bot")).toBe(false);
+  });
+
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
   });

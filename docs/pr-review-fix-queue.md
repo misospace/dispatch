@@ -33,7 +33,7 @@ Configuration:
 
 | Env Var | Description | Default |
 |---------|-------------|---------|
-| `PR_FOLLOWUP_BOT_IDENTITIES` | Comma-separated GitHub logins whose PRs are eligible | `github-actions[bot]` |
+| `PR_FOLLOWUP_BOT_IDENTITIES` | Comma-separated GitHub logins whose PRs are eligible | `github-actions[bot]`, `itsmiso-ai` |
 | `PR_FOLLOWUP_BRANCH_OWNERS` | Comma-separated repo owners allowed for queueing | All (opt-in safety) |
 
 ### Real-time webhooks

@@ -32,9 +32,16 @@ export interface PrFollowupConfig {
 /** Classification result from feedback analysis */
 export type FeedbackClassification = "actionable" | "needs_human";
 
-// ─── Default config (no hardcoded agent names or repo names) ────────────────
+// ─── Default config ─────────────────────────────────────────────────────────
+// The default bot allowlist is intentionally narrow. Operators should set
+// `PR_FOLLOWUP_BOT_IDENTITIES` (comma-separated GitHub logins) to match the
+// bots that author their agent PRs. Without that env var, the merge-conflict
+// surfacing and other PR-followup ingestion paths will silently no-op.
+//
+// `itsmiso-ai` is included by default because that is the Miso author identity
+// for the current `misospace/*` agent fleet. The env var still wins when set.
 
-const DEFAULT_BOT_IDENTITIES: BotIdentity[] = ["github-actions[bot]"];
+const DEFAULT_BOT_IDENTITIES: BotIdentity[] = ["github-actions[bot]", "itsmiso-ai"];
 
 function getConfig(): PrFollowupConfig {
   const rawIdentities = process.env.PR_FOLLOWUP_BOT_IDENTITIES;
