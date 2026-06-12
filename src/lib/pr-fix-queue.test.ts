@@ -9,15 +9,7 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
     items,
     history,
     $transaction: async (fn: any) => fn(client),
-    _findMany: async ({ where }: any) => {
-      let result = items.slice();
-      if (where?.repo) result = result.filter((i) => i.repo === where.repo);
-      if (where?.pr?.in) result = result.filter((i) => where.pr.in.includes(i.pr));
-      if (where?.status) result = result.filter((i) => i.status === where.status);
-      return result;
-    },
     prFixQueueItem: {
-      findMany: async (args: any) => client._findMany(args),
       findUnique: async ({ where }: any) => items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null,
       create: async ({ data }: any) => {
         const item = {
@@ -36,6 +28,8 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
       },
       findMany: async ({ where, orderBy }: any) => {
         let result = items.slice();
+        if (where?.repo) result = result.filter((i) => i.repo === where.repo);
+        if (where?.pr?.in) result = result.filter((i) => where.pr.in.includes(i.pr));
         if (where?.status) {
           result = Array.isArray(where.status.in)
             ? result.filter((i) => where.status.in.includes(i.status))
