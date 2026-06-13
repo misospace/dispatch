@@ -170,8 +170,10 @@ describe("reconcileStalePrFixItems", () => {
     expect(result.markedStale).toBe(2);
     expect(result.errored).toBe(0);
 
-    const items = await listQueuedPrFixItems(client, { lane: null, includeBlocked: true });
-    const byId = new Map(items.map((i) => [i.pr, i]));
+    // listQueuedPrFixItems filters by status (only QUEUED/[QUEUED,BLOCKED]),
+    // so it would not return STALE rows after the reconcile. Inspect the
+    // test client's items array directly to verify the state transition.
+    const byId = new Map(client.items.map((i) => [i.pr, i]));
     expect(byId.get(566)?.status).toBe("STALE");
     expect(byId.get(567)?.status).toBe("QUEUED"); // not in merged/closed set
     expect(byId.get(568)?.status).toBe("STALE");
