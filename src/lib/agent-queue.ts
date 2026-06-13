@@ -146,6 +146,9 @@ function isActionable(issueLabels: string[]): boolean {
  * Optionally filters by execution lane (normal | escalated | backlog).
  * Optionally excludes decomposed audit parents.
  * Excludes claimed issues by default; pass includeClaimed to include agent/* labels.
+ * Note: includeClaimed and claimableOnly are independent options — not a rename.
+ *   includeClaimed: whether to show issues claimed by other agents
+ *   claimableOnly: whether to filter to only status/ready and status/in-progress
  * Excludes Renovate issues by default; pass includeRenovate=true to include them.
  * By default, only claimable work is returned (excludes status/backlog).
  * Pass claimableOnly=false to include all actionable issues including backlog.
@@ -200,14 +203,13 @@ export function buildAgentQueue(
     if (claimableOnly) {
       actionable = actionable.filter((issue) => {
         const status = getStatusFromLabels(issue.labels);
-        const agentLabel = getAgentFromLabels(issue.labels);
-        // Has a status label → keep it
-        if (status !== null) return true;
-        // Has an agent label → keep it (agent-assigned, no-status work)
-        if (agentLabel) return true;
-        // Completely unlabelled (no labels at all) → exclude
-        if (issue.labels.length === 0) return false;
-        return true; // has some labels but no status — keep it
+        // No status label → exclude from worker queue (not claimable)
+        // Worker queues should only return status/ready or status/in-progress work
+        if (status === null) return false;
+        // status/in-review is not worker-actionable by default — PR exists, needs review not implementation
+        if (status === IN_REVIEW_STATUS) return false;
+        // status/backlog already filtered above; remaining statuses (ready, in-progress) are actionable
+        return true;
       });
     }
   }
