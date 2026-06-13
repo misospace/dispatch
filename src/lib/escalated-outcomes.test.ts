@@ -62,7 +62,7 @@ describe("Escalated outcome validation", () => {
 
 describe("buildAgentQueue with decomposed audit parents", () => {
   it("includes decomposed issues when excludeDecomposed is false (default)", () => {
-    const issues = [makeIssue({ number: 1, labels: ["priority/p1"], decomposed: true })];
+    const issues = [makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], decomposed: true })];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
     expect(result[0].decomposed).toBe(true);
@@ -70,8 +70,8 @@ describe("buildAgentQueue with decomposed audit parents", () => {
 
   it("excludes decomposed issues when excludeDecomposed is true", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1"], decomposed: true }),
-      makeIssue({ number: 2, labels: ["priority/p1"], decomposed: false }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], decomposed: true }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     expect(result).toHaveLength(1);
@@ -80,10 +80,10 @@ describe("buildAgentQueue with decomposed audit parents", () => {
 
   it("excludes only decomposed issues, keeps non-decomposed ones", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1"], lane: "ESCALATED", decomposed: true }),
-      makeIssue({ number: 2, labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
-      makeIssue({ number: 3, labels: ["priority/p0"], lane: "ESCALATED", decomposed: true }),
-      makeIssue({ number: 4, labels: ["priority/p0"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: true }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 3, labels: ["priority/p0", "status/ready"], lane: "ESCALATED", decomposed: true }),
+      makeIssue({ number: 4, labels: ["priority/p0", "status/ready"], lane: "ESCALATED", decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "ESCALATED", excludeDecomposed: true });
     expect(result).toHaveLength(2);
@@ -92,8 +92,8 @@ describe("buildAgentQueue with decomposed audit parents", () => {
 
   it("returns decomposed flag in result for each issue", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1"], decomposed: true }),
-      makeIssue({ number: 2, labels: ["priority/p1"], decomposed: false }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], decomposed: true }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result[0].decomposed).toBe(true);
@@ -101,7 +101,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
   });
 
   it("defaults decomposed to false when not provided", () => {
-    const issues = [makeIssue({ number: 1, labels: ["priority/p1"] })];
+    const issues = [makeIssue({ number: 1, labels: ["priority/p1", "status/ready"] })];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result[0].decomposed).toBe(false);
   });
@@ -109,9 +109,9 @@ describe("buildAgentQueue with decomposed audit parents", () => {
   it("works with Escalated lane + excludeDecomposed for audit parent workflow", () => {
     // Simulates: broad audit parent (decomposed) vs concrete follow-up issues (not decomposed)
     const issues = [
-      makeIssue({ number: 10, title: "Security audit decomposition", labels: ["priority/p1"], lane: "ESCALATED", decomposed: true }),
-      makeIssue({ number: 11, title: "Review auth module", labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
-      makeIssue({ number: 12, title: "Update CI config", labels: ["priority/p2"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 10, title: "Security audit decomposition", labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: true }),
+      makeIssue({ number: 11, title: "Review auth module", labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 12, title: "Update CI config", labels: ["priority/p2", "status/ready"], lane: "ESCALATED", decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "ESCALATED", excludeDecomposed: true });
     expect(result).toHaveLength(2);
@@ -120,7 +120,7 @@ describe("buildAgentQueue with decomposed audit parents", () => {
   });
 
   it("does not hardcode agent names in decomposed filtering", () => {
-    const issues = [makeIssue({ number: 1, labels: ["priority/p1"], lane: "ESCALATED", decomposed: true })];
+    const issues = [makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: true })];
     const resultWorker = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     const resultBeta = buildAgentQueue(issues, "beta", { excludeDecomposed: true });
 
@@ -133,13 +133,13 @@ describe("buildAgentQueue with decomposed audit parents", () => {
       makeIssue({
         number: 1,
         url: "https://github.com/misospace/dispatch/issues/1",
-        labels: ["priority/p1"],
+        labels: ["priority/p1", "status/ready"],
         decomposed: true,
       }),
       makeIssue({
         number: 2,
         url: "https://github.com/misospace/miso-chat/issues/42",
-        labels: ["priority/p1"],
+        labels: ["priority/p1", "status/ready"],
         decomposed: false,
       }),
     ];
@@ -154,10 +154,10 @@ describe("buildAgentQueue with decomposed audit parents", () => {
 describe("Combined lane and decomposed filtering", () => {
   it("applies both lane filter and decomposed exclusion together", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1"], lane: "ESCALATED", decomposed: true }),
-      makeIssue({ number: 2, labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
-      makeIssue({ number: 3, labels: ["priority/p1"], lane: "NORMAL", decomposed: true }),
-      makeIssue({ number: 4, labels: ["priority/p0"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: true }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 3, labels: ["priority/p1", "status/ready"], lane: "NORMAL", decomposed: true }),
+      makeIssue({ number: 4, labels: ["priority/p0", "status/ready"], lane: "ESCALATED", decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "ESCALATED", excludeDecomposed: true });
     expect(result).toHaveLength(2);
@@ -166,8 +166,8 @@ describe("Combined lane and decomposed filtering", () => {
 
   it("excludes BACKLOG lane items even when excludeDecomposed is false", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1"], lane: "BACKLOG", decomposed: true }),
-      makeIssue({ number: 2, labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "BACKLOG", decomposed: true }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -176,8 +176,8 @@ describe("Combined lane and decomposed filtering", () => {
 
   it("excludes BACKLOG lane items even when excludeDecomposed is true", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1"], lane: "BACKLOG", decomposed: false }),
-      makeIssue({ number: 2, labels: ["priority/p1"], lane: "ESCALATED", decomposed: false }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "BACKLOG", decomposed: false }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "ESCALATED", decomposed: false }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { excludeDecomposed: true });
     expect(result).toHaveLength(1);

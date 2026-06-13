@@ -92,11 +92,10 @@ describe("buildAgentQueue", () => {
     expect(result).toHaveLength(0);
   });
 
-  it("includes issues with no status label", () => {
+  it("excludes no-status issues from default worker queue", () => {
     const issues = [makeIssue({ labels: ["priority/p2"] })];
     const result = buildAgentQueue(issues, "worker-agent");
-    expect(result).toHaveLength(1);
-    expect(result[0].status).toBeNull();
+    expect(result).toHaveLength(0);
   });
 
   it("excludes unlabelled no-status issues from normal worker queue by default", () => {
@@ -105,9 +104,9 @@ describe("buildAgentQueue", () => {
     expect(result).toHaveLength(0);
   });
 
-  it("includes no-status issues when includeClaimed=true", () => {
+  it("includes no-status issues when claimableOnly=false", () => {
     const issues = [makeIssue({ labels: ["priority/p2"] })];
-    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
+    const result = buildAgentQueue(issues, "worker-agent", { claimableOnly: false });
     expect(result).toHaveLength(1);
     expect(result[0].status).toBeNull();
   });
@@ -148,10 +147,10 @@ describe("buildAgentQueue", () => {
 
   it("sorts by priority: p0 before p1 before p2 before p3", () => {
     const issues = [
-      makeIssue({ number: 4, labels: ["priority/p3"] }),
-      makeIssue({ number: 1, labels: ["priority/p0"] }),
-      makeIssue({ number: 3, labels: ["priority/p2"] }),
-      makeIssue({ number: 2, labels: ["priority/p1"] }),
+      makeIssue({ number: 4, labels: ["priority/p3", "status/ready"] }),
+      makeIssue({ number: 1, labels: ["priority/p0", "status/ready"] }),
+      makeIssue({ number: 3, labels: ["priority/p2", "status/ready"] }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result.map((i) => i.number)).toEqual([1, 2, 3, 4]);
@@ -175,8 +174,8 @@ describe("buildAgentQueue", () => {
 
   it("works across multiple repos (no hardcoded repo names)", () => {
     const issues = [
-      makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", labels: ["priority/p1"] }),
-      makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", labels: ["priority/p1"] }),
+      makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", labels: ["priority/p1", "status/ready"] }),
+      makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", labels: ["priority/p1", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(2);
@@ -201,8 +200,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues from agent queue by default", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1"] }),
-      makeIssue({ number: 2, title: "Fix login bug", labels: ["priority/p1"] }),
+      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1", "status/ready"] }),
+      makeIssue({ number: 2, title: "Fix login bug", labels: ["priority/p1", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -211,8 +210,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues with 'Update dependency' title by default", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Update dependency lodash to v4.18.0", labels: [] }),
-      makeIssue({ number: 2, title: "Add dark mode", labels: ["enhancement"] }),
+      makeIssue({ number: 1, title: "Update dependency lodash to v4.18.0", labels: ["status/ready"] }),
+      makeIssue({ number: 2, title: "Add dark mode", labels: ["enhancement", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -221,8 +220,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues with 'renovate' label by default", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Bump lodash", labels: ["renovate"] }),
-      makeIssue({ number: 2, title: "Fix crash on startup", labels: ["bug"] }),
+      makeIssue({ number: 1, title: "Bump lodash", labels: ["renovate", "status/ready"] }),
+      makeIssue({ number: 2, title: "Fix crash on startup", labels: ["bug", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -231,8 +230,8 @@ describe("buildAgentQueue", () => {
 
   it("includes Renovate issues when includeRenovate=true", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1"] }),
-      makeIssue({ number: 2, title: "Fix login bug", labels: ["priority/p1"] }),
+      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1", "status/ready"] }),
+      makeIssue({ number: 2, title: "Fix login bug", labels: ["priority/p1", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { includeRenovate: true });
     expect(result).toHaveLength(2);
@@ -240,8 +239,8 @@ describe("buildAgentQueue", () => {
 
   it("does not exclude non-Renovate issues", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Update README", labels: ["documentation"] }),
-      makeIssue({ number: 2, title: "Fix null pointer", labels: ["bug", "priority/p0"] }),
+      makeIssue({ number: 1, title: "Update README", labels: ["documentation", "status/ready"] }),
+      makeIssue({ number: 2, title: "Fix null pointer", labels: ["bug", "priority/p0", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(2);
@@ -249,8 +248,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues with 'Update image' title by default", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Update image node to v20", labels: [] }),
-      makeIssue({ number: 2, title: "Implement search", labels: ["enhancement"] }),
+      makeIssue({ number: 1, title: "Update image node to v20", labels: ["status/ready"] }),
+      makeIssue({ number: 2, title: "Implement search", labels: ["enhancement", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -259,8 +258,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues with 'dependencies' label by default", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Bump all deps", labels: ["dependencies"] }),
-      makeIssue({ number: 2, title: "Fix API timeout", labels: ["bug"] }),
+      makeIssue({ number: 1, title: "Bump all deps", labels: ["dependencies", "status/ready"] }),
+      makeIssue({ number: 2, title: "Fix API timeout", labels: ["bug", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -269,8 +268,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues with 'automated' label by default", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Bump eslint", labels: ["automated"] }),
-      makeIssue({ number: 2, title: "Add unit tests", labels: ["testing"] }),
+      makeIssue({ number: 1, title: "Bump eslint", labels: ["automated", "status/ready"] }),
+      makeIssue({ number: 2, title: "Add unit tests", labels: ["testing", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -279,9 +278,9 @@ describe("buildAgentQueue", () => {
 
   it("respects lane filter when excluding Renovate issues", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1"], lane: "normal" }),
-      makeIssue({ number: 2, title: "Fix crash", labels: ["priority/p0"], lane: "normal" }),
-      makeIssue({ number: 3, title: "Escalated issue", labels: ["priority/p0"], lane: "escalated" }),
+      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 2, title: "Fix crash", labels: ["priority/p0", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 3, title: "Escalated issue", labels: ["priority/p0", "status/ready"], lane: "escalated" }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "normal" });
     expect(result).toHaveLength(1);
@@ -309,8 +308,8 @@ describe("buildAgentQueue", () => {
 
   it("excludes Renovate issues across multiple repos", () => {
     const issues = [
-      makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", title: "Dependency Dashboard", labels: ["priority/p1"] }),
-      makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", title: "Fix bug", labels: ["bug"] }),
+      makeIssue({ number: 1, url: "https://github.com/misospace/dispatch/issues/1", title: "Dependency Dashboard", labels: ["priority/p1", "status/ready"] }),
+      makeIssue({ number: 2, url: "https://github.com/misospace/miso-chat/issues/42", title: "Fix bug", labels: ["bug", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -461,15 +460,15 @@ describe("buildAgentQueue with claimable-only behavior", () => {
     expect(result[0].claimable).toBe(false);
   });
 
-  it("excludes status/backlog but includes no-status with labels when no lane filter is applied", () => {
+  it("excludes status/backlog and no-status issues from default queue", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["priority/p1"] }),
       makeIssue({ number: 2, labels: ["priority/p1", "status/backlog"] }),
       makeIssue({ number: 3, labels: ["priority/p1", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
-    expect(result).toHaveLength(2);
-    expect(result.map((i) => i.number)).toEqual([3, 1]); // ready > no-status with labels
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(3); // only ready included
   });
 
   it("works with includeRenovate and claimableOnly together", () => {
@@ -482,6 +481,7 @@ describe("buildAgentQueue with claimable-only behavior", () => {
     expect(result).toHaveLength(3);
     expect(result.find((i) => i.number === 3)?.claimable).toBe(true);
     expect(result.find((i) => i.number === 2)?.claimable).toBe(false);
+    // no-status issue included with claimableOnly=false but marked non-claimable
     expect(result.find((i) => i.number === 1)?.claimable).toBe(true);
   });
 
@@ -516,12 +516,10 @@ describe("buildAgentQueue agent assignment fixes (issue #291)", () => {
     expect(result[0].agentMatch).toBe(true);
   });
 
-  it("includes same-agent + status/in-review by default", () => {
+  it("excludes same-agent + status/in-review from default worker queue", () => {
     const issues = [makeIssue({ labels: ["agent/worker-agent", "status/in-review", "priority/p0"] })];
     const result = buildAgentQueue(issues, "worker-agent");
-    expect(result).toHaveLength(1);
-    expect(result[0].number).toBe(1);
-    expect(result[0].agentMatch).toBe(true);
+    expect(result).toHaveLength(0);
   });
 
   it("includes same-agent + status/ready by default", () => {
@@ -549,13 +547,13 @@ describe("buildAgentQueue agent assignment fixes (issue #291)", () => {
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
-    expect(result[0].number).toBe(2);
+    expect(result[0].number).toBe(2); // only ready included
   });
 
   it("excludes Renovate Dashboard title by default", () => {
     const issues = [
       makeIssue({ number: 1, title: "Renovate Dashboard 🤖", labels: [] }),
-      makeIssue({ number: 2, title: "Fix critical bug", labels: ["priority/p0"] }),
+      makeIssue({ number: 2, title: "Fix critical bug", labels: ["priority/p0", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -564,21 +562,21 @@ describe("buildAgentQueue agent assignment fixes (issue #291)", () => {
 
   it("includes Renovate Dashboard when includeRenovate=true", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Renovate Dashboard 🤖", labels: ["priority/p1"] }),
-      makeIssue({ number: 2, title: "Fix critical bug", labels: ["priority/p0"] }),
+      makeIssue({ number: 1, title: "Renovate Dashboard 🤖", labels: ["priority/p1", "status/ready"] }),
+      makeIssue({ number: 2, title: "Fix critical bug", labels: ["priority/p0", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { includeRenovate: true });
     expect(result).toHaveLength(2);
   });
 
-  it("ranks in-progress before in-review before ready for same agent", () => {
+  it("ranks in-progress before ready; excludes in-review from default queue", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["agent/worker-agent", "status/ready"] }),
       makeIssue({ number: 2, labels: ["agent/worker-agent", "status/in-review"] }),
       makeIssue({ number: 3, labels: ["agent/worker-agent", "status/in-progress"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
-    expect(result.map((i) => i.number)).toEqual([3, 2, 1]);
+    expect(result.map((i) => i.number)).toEqual([3, 1]); // in-review excluded
   });
 
   it("prioritizes same-agent over other-agent at same status", () => {
@@ -591,25 +589,24 @@ describe("buildAgentQueue agent assignment fixes (issue #291)", () => {
     expect(result[1].number).toBe(1); // other-agent's work is included but ranked lower
   });
 
-  it("includes same-agent in-review issues across multiple priorities", () => {
+  it("excludes same-agent in-review issues from default queue", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["agent/worker-agent", "status/in-review", "priority/p0"] }),
       makeIssue({ number: 2, labels: ["agent/worker-agent", "status/ready", "priority/p1"] }),
       makeIssue({ number: 3, labels: ["agent/other-agent", "status/in-progress", "priority/p0"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
-    expect(result.map((i) => i.number)).toEqual([1, 2]);
+    expect(result.map((i) => i.number)).toEqual([2]); // in-review excluded, other-agent excluded
   });
 
-  it("includes same-agent no-status issues (assigned work is visible)", () => {
+  it("excludes same-agent no-status issues from default worker queue", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["agent/worker-agent"] }),
       makeIssue({ number: 2, labels: ["agent/worker-agent", "status/ready"] }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
-    expect(result).toHaveLength(2);
-    expect(result[0].number).toBe(2); // ready first
-    expect(result[1].number).toBe(1); // no-status second
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(2); // only ready included, no-status excluded
   });
 
   it("includes no-status same-agent issue when claimableOnly=false", () => {
@@ -621,5 +618,105 @@ describe("buildAgentQueue agent assignment fixes (issue #291)", () => {
     expect(result).toHaveLength(2);
     expect(result[0].number).toBe(2); // ready first
     expect(result[1].number).toBe(1); // no-status second
+  });
+});
+
+describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", () => {
+  it("excludes status/in-review from default worker queue", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["status/in-review", "priority/p0"] }),
+      makeIssue({ number: 2, labels: ["status/ready", "priority/p1"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(2); // only ready included
+  });
+
+  it("excludes no-status issues with labels from default worker queue", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p0", "bug"] }),
+      makeIssue({ number: 2, labels: ["status/ready", "priority/p1"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(2); // only ready included
+  });
+
+  it("excludes no-status same-agent issues from default worker queue", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["agent/worker-agent", "priority/p0"] }),
+      makeIssue({ number: 2, labels: ["status/ready", "priority/p1"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(2); // only ready included, no-status excluded even with agent label
+  });
+
+  it("includes status/in-review when claimableOnly=false", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["status/in-review", "priority/p0"] }),
+      makeIssue({ number: 2, labels: ["status/ready", "priority/p1"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent", { claimableOnly: false });
+    expect(result).toHaveLength(2);
+    expect(result[0].number).toBe(1); // in-review included with claimableOnly=false
+  });
+
+  it("includes no-status issues when claimableOnly=false", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p0"] }),
+      makeIssue({ number: 2, labels: ["status/ready", "priority/p1"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent", { claimableOnly: false });
+    expect(result).toHaveLength(2);
+  });
+
+  it("includes status/ready issues in default worker queue", () => {
+    const issues = [makeIssue({ labels: ["status/ready", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].status).toBe("status/ready");
+  });
+
+  it("includes status/in-progress issues in default worker queue", () => {
+    const issues = [makeIssue({ labels: ["status/in-progress", "priority/p0"] })];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].status).toBe("status/in-progress");
+  });
+
+  it("excludes all non-actionable statuses from default queue: no-status, backlog, in-review, done", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p0"] }), // no-status
+      makeIssue({ number: 2, labels: ["status/backlog", "priority/p0"] }),
+      makeIssue({ number: 3, labels: ["status/in-review", "priority/p0"] }),
+      makeIssue({ number: 4, labels: ["status/done", "priority/p0"] }),
+      makeIssue({ number: 5, labels: ["status/ready", "priority/p1"] }),
+      makeIssue({ number: 6, labels: ["status/in-progress", "priority/p2"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(2);
+    expect(result.map((i) => i.number)).toEqual([5, 6]); // only ready and in-progress
+  });
+
+  it("returns only status/ready when no other actionable issues exist", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p0"] }), // no-status
+      makeIssue({ number: 2, labels: ["status/in-review", "priority/p0"] }),
+      makeIssue({ number: 3, labels: ["status/ready", "priority/p2"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].number).toBe(3);
+  });
+
+  it("returns empty queue when only non-actionable issues exist", () => {
+    const issues = [
+      makeIssue({ number: 1, labels: ["priority/p0"] }), // no-status
+      makeIssue({ number: 2, labels: ["status/in-review", "priority/p0"] }),
+      makeIssue({ number: 3, labels: ["status/backlog", "priority/p0"] }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(0);
   });
 });
