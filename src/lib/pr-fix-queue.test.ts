@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, PrFixQueueClient } from "./pr-fix-queue";
+import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, PrFixQueueClient } from "./pr-fix-queue";
 
 function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
   const items: any[] = [];
@@ -28,6 +28,8 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
       },
       findMany: async ({ where, orderBy }: any) => {
         let result = items.slice();
+        if (where?.repo) result = result.filter((i) => i.repo === where.repo);
+        if (where?.pr?.in) result = result.filter((i) => where.pr.in.includes(i.pr));
         if (where?.status) {
           result = Array.isArray(where.status.in)
             ? result.filter((i) => where.status.in.includes(i.status))
@@ -128,5 +130,80 @@ describe("PR review-fix queue", () => {
     expect(fixed?.status).toBe("FIXED");
     expect(await listQueuedPrFixItems(client, { lane: "normal" })).toEqual([]);
     expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED", note: "pushed fix + validation" });
+  });
+});
+
+describe("reconcileStalePrFixItems", () => {
+  it("marks queued items stale when the upstream PR is merged/closed", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 566,
+      reason: "AI review failed",
+      feedback: "feedback",
+      evidenceKey: "k1",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 567,
+      reason: "test 567",
+      feedback: "f",
+      evidenceKey: "k2",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 568,
+      reason: "test 568",
+      feedback: "f",
+      evidenceKey: "k3",
+    });
+
+    const mergedOrClosed = new Map<string, Set<number>>([
+      ["misospace/miso-chat", new Set([566, 568])],
+    ]);
+    const states = new Map<string, Map<number, "merged" | "closed">>([
+      ["misospace/miso-chat", new Map([[566, "merged"], [568, "closed"]])],
+    ]);
+
+    const result = await reconcileStalePrFixItems(client, mergedOrClosed, states);
+    expect(result.checked).toBe(2);
+    expect(result.markedStale).toBe(2);
+    expect(result.errored).toBe(0);
+
+    // listQueuedPrFixItems filters by status (only QUEUED/[QUEUED,BLOCKED]),
+    // so it would not return STALE rows after the reconcile. Inspect the
+    // test client's items array directly to verify the state transition.
+    const byId = new Map(client.items.map((i) => [i.pr, i]));
+    expect(byId.get(566)?.status).toBe("STALE");
+    expect(byId.get(567)?.status).toBe("QUEUED"); // not in merged/closed set
+    expect(byId.get(568)?.status).toBe("STALE");
+  });
+
+  it("does not touch items already in non-QUEUED status", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 570,
+      reason: "x",
+      feedback: "f",
+      evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "misospace/miso-chat", pr: 570, status: "FIXED" });
+    const mergedOrClosed = new Map<string, Set<number>>([
+      ["misospace/miso-chat", new Set([570])],
+    ]);
+    const states = new Map<string, Map<number, "merged" | "closed">>([
+      ["misospace/miso-chat", new Map([[570, "merged"]])],
+    ]);
+    const result = await reconcileStalePrFixItems(client, mergedOrClosed, states);
+    expect(result.checked).toBe(0);
+    expect(result.markedStale).toBe(0);
+  });
+
+  it("returns zero counts for repos with no merged/closed PRs", async () => {
+    const client = makeClient();
+    const result = await reconcileStalePrFixItems(client, new Map(), new Map());
+    expect(result.checked).toBe(0);
+    expect(result.markedStale).toBe(0);
   });
 });
