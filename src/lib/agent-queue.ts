@@ -142,6 +142,19 @@ function isActionable(issueLabels: string[]): boolean {
 }
 
 /**
+ * Check if an issue's status is claimable for the default worker queue.
+ * Only status/ready and status/in-progress are worker-actionable.
+ * Excludes: no-status, status/in-review, status/backlog (filtered earlier).
+ */
+function isClaimableStatus(labels: string[]): boolean {
+  const status = getStatusFromLabels(labels);
+  if (status === null) return false;
+  if (status === IN_REVIEW_STATUS) return false;
+  // status/backlog already filtered above; remaining statuses (ready, in-progress) are actionable
+  return true;
+}
+
+/**
  * Build the agent queue: filter, rank, and return issues for a given agent.
  * Optionally filters by execution lane (normal | escalated | backlog).
  * Optionally excludes decomposed audit parents.
@@ -197,20 +210,11 @@ export function buildAgentQueue(
       return !agentLabel || agentLabel === `${AGENT_PREFIX}${agentName}`;
     });
 
-    // Exclude unclaimed no-status issues by default (no-label orphan items)
-    // This prevents "Renovate Dashboard" and other completely unlabelled issues from polluting the worker queue
-    // When claimableOnly=false (triage/grooming views), include them for review
+    // Exclude unclaimed no-status and in-review issues from default worker queue.
+    // Worker queues should only return status/ready or status/in-progress work.
+    // When claimableOnly=false (triage/grooming views), include them for review.
     if (claimableOnly) {
-      actionable = actionable.filter((issue) => {
-        const status = getStatusFromLabels(issue.labels);
-        // No status label → exclude from worker queue (not claimable)
-        // Worker queues should only return status/ready or status/in-progress work
-        if (status === null) return false;
-        // status/in-review is not worker-actionable by default — PR exists, needs review not implementation
-        if (status === IN_REVIEW_STATUS) return false;
-        // status/backlog already filtered above; remaining statuses (ready, in-progress) are actionable
-        return true;
-      });
+      actionable = actionable.filter((issue) => isClaimableStatus(issue.labels));
     }
   }
 
