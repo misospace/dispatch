@@ -142,10 +142,26 @@ function isActionable(issueLabels: string[]): boolean {
 }
 
 /**
+ * Check if an issue's status is claimable for the default worker queue.
+ * Only status/ready and status/in-progress are worker-actionable.
+ * Excludes: no-status, status/in-review, status/backlog (filtered earlier).
+ */
+function isClaimableStatus(labels: string[]): boolean {
+  const status = getStatusFromLabels(labels);
+  if (status === null) return false;
+  if (status === IN_REVIEW_STATUS) return false;
+  // status/backlog already filtered above; remaining statuses (ready, in-progress) are actionable
+  return true;
+}
+
+/**
  * Build the agent queue: filter, rank, and return issues for a given agent.
  * Optionally filters by execution lane (normal | escalated | backlog).
  * Optionally excludes decomposed audit parents.
  * Excludes claimed issues by default; pass includeClaimed to include agent/* labels.
+ * Note: includeClaimed and claimableOnly are independent options — not a rename.
+ *   includeClaimed: whether to show issues claimed by other agents
+ *   claimableOnly: whether to filter to only status/ready and status/in-progress
  * Excludes Renovate issues by default; pass includeRenovate=true to include them.
  * By default, only claimable work is returned (excludes status/backlog).
  * Pass claimableOnly=false to include all actionable issues including backlog.
@@ -194,21 +210,11 @@ export function buildAgentQueue(
       return !agentLabel || agentLabel === `${AGENT_PREFIX}${agentName}`;
     });
 
-    // Exclude unclaimed no-status issues by default (no-label orphan items)
-    // This prevents "Renovate Dashboard" and other completely unlabelled issues from polluting the worker queue
-    // When claimableOnly=false (triage/grooming views), include them for review
+    // Exclude unclaimed no-status and in-review issues from default worker queue.
+    // Worker queues should only return status/ready or status/in-progress work.
+    // When claimableOnly=false (triage/grooming views), include them for review.
     if (claimableOnly) {
-      actionable = actionable.filter((issue) => {
-        const status = getStatusFromLabels(issue.labels);
-        const agentLabel = getAgentFromLabels(issue.labels);
-        // Has a status label → keep it
-        if (status !== null) return true;
-        // Has an agent label → keep it (agent-assigned, no-status work)
-        if (agentLabel) return true;
-        // Completely unlabelled (no labels at all) → exclude
-        if (issue.labels.length === 0) return false;
-        return true; // has some labels but no status — keep it
-      });
+      actionable = actionable.filter((issue) => isClaimableStatus(issue.labels));
     }
   }
 
