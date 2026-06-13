@@ -187,6 +187,63 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
   });
 }
 
+/**
+ * Mark queued pr-fix items as stale when the upstream PR is merged or closed.
+ *
+ * This is a deterministic cleanup that catches the failure mode where
+ * pr-followup/sync enqueues items without checking the upstream PR's state,
+ * leaving merged/closed PRs in the worker queue. The data source is whatever
+ * caller passes in — the issues/reconcile route already builds a
+ * `mergedOrClosedPrsByRepo` map per tracked repo, so we just consume it.
+ *
+ * Returns counts for logging/audit. No model judgment.
+ */
+export async function reconcileStalePrFixItems(
+  client: PrFixQueueClient,
+  mergedOrClosedPrsByRepo: Map<string, Set<number>>,
+  prStateByRepo: Map<string, Map<number, "merged" | "closed">>,
+): Promise<{ checked: number; markedStale: number; errored: number }> {
+  let checked = 0;
+  let markedStale = 0;
+  let errored = 0;
+
+  for (const [repo, prNumbers] of mergedOrClosedPrsByRepo) {
+    if (prNumbers.size === 0) continue;
+    const queued = await client.prFixQueueItem.findMany({
+      where: {
+        repo,
+        pr: { in: Array.from(prNumbers) },
+        status: "QUEUED",
+      },
+    });
+    checked += queued.length;
+    for (const item of queued) {
+      try {
+        const state = prStateByRepo.get(repo)?.get(item.pr) ?? "merged";
+        await client.$transaction(async (tx) => {
+          await tx.prFixQueueItem.update({
+            where: { id: item.id },
+            data: { status: "STALE" },
+          });
+          await tx.prFixHistory.create({
+            data: {
+              itemId: item.id,
+              action: "mark",
+              status: "STALE",
+              note: `Upstream PR state=${state} at reconcile time`,
+            },
+          });
+        });
+        markedStale++;
+      } catch (err) {
+        errored++;
+      }
+    }
+  }
+
+  return { checked, markedStale, errored };
+}
+
 export function toAgentQueuePrFixItem(item: any) {
   const fixType = normalizePrFixType(item.type);
   return {

@@ -11,6 +11,7 @@ import {
 } from "@/lib/issue-reconciliation";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest } from "@/lib/auth";
+import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
 
 /**
  * Reconcile issue state against PR state for all tracked repos.
@@ -52,6 +53,8 @@ export async function POST(request: Request) {
     }
 
     let totalIssuesReconciled = 0;
+    let totalPrFixStaleChecked = 0;
+    let totalPrFixStaleMarked = 0;
     let totalMergedPrsFound = 0;
     let totalOpenPrsChecked = 0;
     let totalIssuesClosed = 0;
@@ -233,6 +236,31 @@ export async function POST(request: Request) {
 
           totalIssuesReconciled++;
         }
+
+        // Reconcile pr-fix-queue items: mark stale when the upstream PR is
+        // merged or closed. Uses the mergedPrsMap already built above. No
+        // model judgment, deterministic.
+        const mergedOrClosedPrsByRepo = new Map<string, Set<number>>();
+        const prStateByRepo = new Map<string, Map<number, "merged" | "closed">>();
+        for (const pr of mergedPrsMap.values()) {
+          if (!mergedOrClosedPrsByRepo.has(repo.fullName)) mergedOrClosedPrsByRepo.set(repo.fullName, new Set());
+          if (!prStateByRepo.has(repo.fullName)) prStateByRepo.set(repo.fullName, new Map());
+          mergedOrClosedPrsByRepo.get(repo.fullName)!.add(pr.number);
+          prStateByRepo.get(repo.fullName)!.set(pr.number, "merged");
+        }
+        for (const pr of closedPrsList) {
+          if (pr.merged_at) continue; // already counted
+          if (!mergedOrClosedPrsByRepo.has(repo.fullName)) mergedOrClosedPrsByRepo.set(repo.fullName, new Set());
+          if (!prStateByRepo.has(repo.fullName)) prStateByRepo.set(repo.fullName, new Map());
+          mergedOrClosedPrsByRepo.get(repo.fullName)!.add(pr.number);
+          prStateByRepo.get(repo.fullName)!.set(pr.number, "closed");
+        }
+        const staleResult = await reconcileStalePrFixItems(prisma, mergedOrClosedPrsByRepo, prStateByRepo);
+        totalPrFixStaleChecked += staleResult.checked;
+        totalPrFixStaleMarked += staleResult.markedStale;
+        if (staleResult.errored > 0) {
+          errors.push(`${repo.fullName}: pr-fix-queue reconcile errored on ${staleResult.errored} item(s)`);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         console.error(`Reconciliation failed for ${repo.fullName}:`, error);
@@ -249,6 +277,8 @@ export async function POST(request: Request) {
       issuesClosed: totalIssuesClosed,
       labelsChanged: totalLabelsChanged,
       lanesClassified: totalLaneClassified,
+      prFixQueueStaleChecked: totalPrFixStaleChecked,
+      prFixQueueStaleMarked: totalPrFixStaleMarked,
       errors,
     });
   } catch (error) {
