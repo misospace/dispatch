@@ -275,6 +275,48 @@ describe("ingestReviewEvent", () => {
     expect(client.items).toHaveLength(0);
   });
 
+  it("skips reviews for merged PRs (prMergedAt set)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const result = await ingestReviewEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      reviewBody: "Change X to Y",
+      reviewId: "r4",
+      reviewState: "CHANGES_REQUESTED",
+      prMergedAt: "2026-06-01T00:00:00Z",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+  });
+
+  it("skips reviews for closed PRs (prState=closed)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const result = await ingestReviewEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      reviewBody: "Change X to Y",
+      reviewId: "r5",
+      reviewState: "CHANGES_REQUESTED",
+      prState: "closed",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+  });
+
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
   });
@@ -377,6 +419,44 @@ describe("ingestMergeStateEvent", () => {
       title: "Fix test issue",
       author: "itsmiso-ai",
       mergeStateStatus: "clean",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+  });
+
+  it("skips merge state events for merged PRs (prMergedAt set)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const result = await ingestMergeStateEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      mergeStateStatus: "behind",
+      prMergedAt: "2026-06-01T00:00:00Z",
+    });
+
+    expect(result).toBeNull();
+    expect(client.items).toHaveLength(0);
+  });
+
+  it("skips merge state events for closed PRs (prState=closed)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const result = await ingestMergeStateEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      mergeStateStatus: "behind",
+      prState: "closed",
     });
 
     expect(result).toBeNull();
