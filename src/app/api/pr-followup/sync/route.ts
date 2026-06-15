@@ -175,6 +175,8 @@ export async function POST(request: NextRequest) {
                 id: String(review.id),
                 state: review.state,
                 linkedIssue,
+                prState: pr.state,
+                prMergedAt: pr.merged_at,
               });
             } else {
               totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
@@ -226,6 +228,8 @@ export async function POST(request: NextRequest) {
             mergeStateStatus: pr.mergeable_state,
             id: String(pr.id ?? Date.now()),
             linkedIssue,
+            prState: pr.state,
+            prMergedAt: pr.merged_at,
           });
         }
 
