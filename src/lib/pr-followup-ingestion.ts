@@ -231,12 +231,19 @@ export async function ingestReviewEvent(
     reviewBody: string;
     reviewId: string;
     reviewState: string; // "APPROVED", "CHANGES_REQUESTED", "COMMENTED"
+    prState?: string | null;
+    prMergedAt?: string | null;
     linkedIssue?: number | null;
   },
 ): Promise<string | null> {
   // Only CHANGES_REQUESTED triggers PR-fix work (not APPROVED or COMMENTED)
   if (opts.reviewState !== "CHANGES_REQUESTED") return null;
 
+
+  // Filter merged/closed PRs — do not enqueue work for terminal PRs
+  if (opts.prMergedAt || opts.prState === "closed") {
+    return null;
+  }
   // Check author eligibility
   if (!isAllowedBotAuthor(opts.author)) return null;
 
@@ -331,6 +338,8 @@ export async function ingestMergeStateEvent(
     title: string;
     author: string | null;
     mergeStateStatus: string; // "BEHIND", "DIRTY", "UNSTABLE", "HAS_HOOKS", etc.
+    prState?: string | null;
+    prMergedAt?: string | null;
     linkedIssue?: number | null;
   },
 ): Promise<string | null> {
@@ -338,6 +347,11 @@ export async function ingestMergeStateEvent(
   const problematicStates = ["behind", "dirty", "unstable", "has_hooks"];
   if (!problematicStates.includes(opts.mergeStateStatus.toLowerCase())) return null;
 
+
+  // Filter merged/closed PRs — do not enqueue work for terminal PRs
+  if (opts.prMergedAt || opts.prState === "closed") {
+    return null;
+  }
   // Check author eligibility
   if (!isAllowedBotAuthor(opts.author)) return null;
 
@@ -483,6 +497,8 @@ export interface PrFollowupEvent {
   conclusion?: string;
   checkName?: string;
   mergeStateStatus?: string;
+  prState?: string | null;
+  prMergedAt?: string | null;
   linkedIssue?: number | null;
 }
 
@@ -537,6 +553,8 @@ export async function processPrFollowupEvents(
               reviewId: event.id,
               reviewState: event.state,
               linkedIssue: event.linkedIssue,
+              prState: event.prState,
+              prMergedAt: event.prMergedAt,
             });
             if (key) enqueued++; else skipped++;
           } else {
@@ -576,6 +594,8 @@ export async function processPrFollowupEvents(
               author: event.author,
               mergeStateStatus: event.mergeStateStatus,
               linkedIssue: event.linkedIssue,
+              prState: event.prState,
+              prMergedAt: event.prMergedAt,
             });
             if (key) enqueued++; else skipped++;
           } else {
