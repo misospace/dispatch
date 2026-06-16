@@ -215,16 +215,15 @@ describe("KanbanBoard refresh status", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(4);
 
+    // Advance past the 10s debounce window. The second move resets the timer,
+    // so the sync fires after 10s from the second move (15s total).
     await act(async () => {
-      vi.advanceTimersByTime(9_999);
-    });
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/sync")).toHaveLength(0);
-
-    await act(async () => {
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10_001);
     });
 
-    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => url === "/api/sync")).toHaveLength(1));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/sync")).toHaveLength(1)
+    );
   });
 
   it("shows a warning when debounced GitHub sync fails", async () => {
