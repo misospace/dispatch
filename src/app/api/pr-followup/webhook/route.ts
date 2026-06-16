@@ -72,6 +72,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         id: String(prReview.review?.id),
         state: prReview.review?.state,
         linkedIssue: extractLinkedIssueFromPr(pr),
+        prState: pr.state,
+        prMergedAt: pr.merged_at,
       });
       break;
     }
@@ -173,6 +175,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         mergeStateStatus: pr.mergeable_state,
         id: String(pr.id ?? Date.now()),
         linkedIssue: extractLinkedIssueFromPr(pr),
+        prState: pr.state,
+        prMergedAt: pr.merged_at,
       });
       break;
     }

@@ -48,6 +48,12 @@ export function classifyLaneByHeuristics(
     }
   }
 
+  // Explicit escalation labels take precedence over text heuristics
+  const escalatedLabelSignals = ["needs-escalation", "needs-gpt"];
+  if (escalatedLabelSignals.some((s) => labelSet.has(s))) {
+    return { lane: "escalated", confidence: "high", reason: "Escalation label detected" };
+  }
+
   // Check escalated signals
   const escalationMatches = escalatedSignals.filter((s) => text.includes(s));
   if (escalationMatches.length > 0 && !labelSet.has("status/backlog")) {
@@ -56,6 +62,54 @@ export function classifyLaneByHeuristics(
 
   // Default to normal for concrete, actionable issues
   return { lane: "normal", confidence: "medium", reason: "Default classification: concrete implementation work" };
+}
+
+/**
+ * Determine whether a stale backlog lane should be reclassified.
+ *
+ * An issue with currentLane=backlog that currently carries an active status
+ * label (ready / in-progress / in-review) is stuck and must be reclassified.
+ * Returns the new lane to use, or null when no reclassification is needed.
+ *
+ * Delegates to classifyLaneByHeuristics so escalation signals from title/body
+ * are respected. Falls back to "normal" if the classifier still returns
+ * "backlog" (e.g. stale text mentions) — an active-status issue must never
+ * stay in the backlog lane.
+ */
+export function shouldReclassifyStaleBacklog(
+  existingLane: string | null,
+  title: string,
+  body: string | null,
+  currentLabels: string[],
+): "normal" | "escalated" | null {
+  if (existingLane !== "backlog") {
+    return null;
+  }
+
+  const labelSet = new Set(currentLabels.map((l) => l.toLowerCase()));
+
+  // Don't reclassify when the issue still has status/backlog
+  if (labelSet.has("status/backlog")) {
+    return null;
+  }
+
+  // Only reclassify for active statuses
+  const activeStatuses = ["status/ready", "status/in-progress", "status/in-review"];
+  const hasActiveStatus = activeStatuses.some((s) => labelSet.has(s));
+  if (!hasActiveStatus) {
+    return null;
+  }
+
+  // Reuse the same heuristic classifier as first-time classification.
+  const classification = classifyLaneByHeuristics(title, body, currentLabels);
+
+  // If classifier still says backlog (stale text mentions), fall back to normal.
+  // An issue with an active status label must never remain in the backlog lane.
+  if (classification.lane === "backlog") {
+    return "normal";
+  }
+
+  return classification.lane;
 }
 
 // ─── Merged PR Detection ─────────────────────────────────────────────────────
