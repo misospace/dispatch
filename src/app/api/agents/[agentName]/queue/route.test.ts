@@ -1,6 +1,16 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { resetLaneConfig, setLaneConfig } from "@/lib/lane-config";
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
+}));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
@@ -22,9 +32,18 @@ vi.mock("@/lib/lease", () => ({
 }));
 
 import { GET } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
+
+function request(url: string, agentName = "example-agent", includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  return new Request(`http://localhost${url}`, { headers });
+}
 
 describe("GET /api/agents/[agentName]/queue", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
     mocks.issueFindMany.mockResolvedValue([]);
@@ -34,6 +53,89 @@ describe("GET /api/agents/[agentName]/queue", () => {
   afterEach(() => {
     resetLaneConfig();
   });
+
+  // ── Auth tests ─────────────────────────────────────────────────────
+
+  it("returns 401 when no auth header is present", async () => {
+    const res = await GET(
+      request("/api/agents/example-agent/queue?lane=normal", "example-agent", false),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 401 for bad bearer token", async () => {
+    const headers: Record<string, string> = { Authorization: "Bearer wrong-token" };
+    const req = new Request("http://localhost/api/agents/example-agent/queue?lane=normal", { headers });
+
+    const res = await GET(req, {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("valid bearer token preserves existing queue behavior", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-auth",
+        number: 1,
+        title: "Auth test issue",
+        url: "https://github.com/org/repo/issues/1",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/queue?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(1);
+  });
+
+  it("unauthorized request does not call findLeasedIssueIds", async () => {
+    const req = new Request("http://localhost/api/agents/example-agent/queue?lane=normal", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+
+    await GET(req, { params: Promise.resolve({ agentName: "example-agent" }) });
+
+    expect(mocks.findLeasedIssueIds).not.toHaveBeenCalled();
+  });
+
+  it("unauthorized request does not call PR-fix lookup", async () => {
+    const req = new Request("http://localhost/api/agents/example-agent/queue?lane=normal", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+
+    await GET(req, { params: Promise.resolve({ agentName: "example-agent" }) });
+
+    expect(mocks.prFixFindMany).not.toHaveBeenCalled();
+  });
+
+  it("unauthorized request does not call issue lookup", async () => {
+    const req = new Request("http://localhost/api/agents/example-agent/queue?lane=normal", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+
+    await GET(req, { params: Promise.resolve({ agentName: "example-agent" }) });
+
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+  });
+
+  // ── PR review-fix prioritization ───────────────────────────────────
 
   it("prioritizes queued PR review-fix items before new issue work", async () => {
     mocks.prFixFindMany.mockResolvedValue([
@@ -68,7 +170,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -93,7 +195,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -117,7 +219,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=escalated"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=escalated"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -159,7 +261,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -168,6 +270,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(body[0].type).toBe("pr-review-fix");
     expect(body[1].type).toBe("issue");
   });
+
+  // ── Agent assignment tests ─────────────────────────────────────────
 
   it("includes same-agent claimed issues by default and excludes unlabelled orphans", async () => {
     mocks.issueFindMany.mockResolvedValue([
@@ -193,13 +297,12 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    // Same-agent claimed work is now included (fix #291), unlabelled orphans are excluded
     expect(body.map((item: { number: number }) => item.number)).toEqual([52]);
   });
 
@@ -217,7 +320,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -251,10 +354,9 @@ describe("GET /api/agents/[agentName]/queue", () => {
         repository: { fullName: "org/repo" },
       },
     ]);
-    // issue-leased is leased by another agent
     mocks.findLeasedIssueIds.mockResolvedValue(["issue-leased"]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -276,10 +378,9 @@ describe("GET /api/agents/[agentName]/queue", () => {
         repository: { fullName: "org/repo" },
       },
     ]);
-    // example-agent holds the lease, so findLeasedIssueIds returns empty for them
     mocks.findLeasedIssueIds.mockResolvedValue([]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -291,7 +392,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
   it("calls findLeasedIssueIds with the requesting agent name", async () => {
     mocks.issueFindMany.mockResolvedValue([]);
 
-    await GET(new Request("http://localhost/api/agents/saffron/queue?lane=normal"), {
+    await GET(request("/api/agents/saffron/queue?lane=normal", "saffron"), {
       params: Promise.resolve({ agentName: "saffron" }),
     });
 
@@ -324,7 +425,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -357,7 +458,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeRenovate=true"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal&includeRenovate=true"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -392,7 +493,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -425,7 +526,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -448,7 +549,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -462,7 +563,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
   it("returns 400 for unknown lane", async () => {
     mocks.issueFindMany.mockResolvedValue([]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=unknown-lane"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=unknown-lane"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -486,7 +587,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -510,7 +611,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=escalated"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=escalated"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -534,7 +635,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue"), {
+    const res = await GET(request("/api/agents/example-agent/queue"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -565,7 +666,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=fast"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=fast"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -585,7 +686,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
 
     mocks.issueFindMany.mockResolvedValue([]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -608,7 +709,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=escalated"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=escalated"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -631,7 +732,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -654,7 +755,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeRenovate=true"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal&includeRenovate=true"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 
@@ -688,7 +789,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&exclude_decomposed=true"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal&exclude_decomposed=true"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 

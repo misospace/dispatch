@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { buildAgentQueue } from "@/lib/agent-queue";
 import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
@@ -8,6 +9,11 @@ import { isValidLane, getLaneIds } from "@/lib/lane-config";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
+
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const lane = searchParams.get("lane");
   const excludeDecomposed = searchParams.get("exclude_decomposed");
