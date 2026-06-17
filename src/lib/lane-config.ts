@@ -143,6 +143,14 @@ export function getLaneIds(): string[] {
   return getConfiguredLanes().map((lane) => lane.id);
 }
 
+/**
+ * Check whether a lane id is the non-claimable (backlog) lane.
+ */
+export function isBacklogLane(id: string): boolean {
+  const backlog = getBacklogLane();
+  return backlog !== undefined && backlog.id === id;
+}
+
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 /**

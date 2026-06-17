@@ -7,6 +7,7 @@ import {
   getPriorityFromLabels,
 } from "@/types";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { isBacklogLane } from "@/lib/lane-config";
 
 const DONE_STATUS: string = "status/done";
 const IN_PROGRESS_STATUS: string = "status/in-progress";
@@ -156,7 +157,7 @@ function isClaimableStatus(labels: string[]): boolean {
 
 /**
  * Build the agent queue: filter, rank, and return issues for a given agent.
- * Optionally filters by execution lane (normal | escalated | backlog).
+ * Optionally filters by execution lane. By default excludes backlog lane items.
  * Optionally excludes decomposed audit parents.
  * Excludes claimed issues by default; pass includeClaimed to include agent/* labels.
  * Note: includeClaimed and claimableOnly are independent options — not a rename.
@@ -181,7 +182,7 @@ export function buildAgentQueue(
   }>,
   agentName: string,
   options?: {
-    lane?: "normal" | "escalated" | "backlog" | "NORMAL" | "ESCALATED" | "BACKLOG";
+    lane?: string;
     excludeDecomposed?: boolean;
     includeClaimed?: boolean;
     includeRenovate?: boolean;
@@ -190,7 +191,7 @@ export function buildAgentQueue(
   },
 ): RankedIssue[] {
   // Normalize lane to lowercase for consistent comparison
-  const normalizedLane = options?.lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined;
+  const normalizedLane = options?.lane?.toLowerCase();
 
   // Default claimableOnly to true per the worker contract (backlog is triage-only)
   const claimableOnly = options?.claimableOnly ?? true;
@@ -234,10 +235,13 @@ export function buildAgentQueue(
     actionable = actionable.filter((issue) => !isIssueExcludedByLabels(issue.labels, excludedLabels));
   }
 
-  // Lane filter: exclude BACKLOG lane items from normal agent queue
+  // Lane filter: exclude backlog lane items from normal agent queue
+  // When claimableOnly=false, include all lanes (including backlog/non-claimable)
   const filtered = normalizedLane
     ? actionable.filter((issue) => issue.lane?.toLowerCase() === normalizedLane)
-    : actionable.filter((issue) => issue.lane?.toLowerCase() !== "backlog");
+    : claimableOnly
+      ? actionable.filter((issue) => !isBacklogLane(issue.lane?.toLowerCase() ?? ""))
+      : actionable;
 
   // Rank and filter out excluded items
   const ranked = filtered

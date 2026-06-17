@@ -79,6 +79,7 @@ export class DispatchClientError extends Error {
 }
 
 import { getDispatchUrl, getDispatchAgentToken, getDispatchAgentName } from "./dispatch-env";
+import { getClaimableLanes } from "./lane-config";
 
 export function getDispatchConfig(): { baseUrl: string; token: string } {
   const baseUrl = getDispatchUrl();
@@ -293,7 +294,7 @@ export async function claimWork(
 
 Issue: ${resolved.title}
 URL: ${resolved.url}
-Lane: ${resolved.lane || "normal"}
+Lane: ${resolved.lane || getClaimableLanes()[0]?.id || "normal"}
 Status: ${status}
 Labels: ${resolved.labels.join(", ") || "none"}
 Agent: ${resolvedAgent}

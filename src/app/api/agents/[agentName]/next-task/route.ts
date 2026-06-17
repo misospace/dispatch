@@ -11,6 +11,7 @@ import {
   createFollowupPrTask,
   createGroomTask,
 } from "@/lib/agent-task";
+import { isValidLane, isBacklogLane } from "@/lib/lane-config";
 
 export async function GET(
   request: Request,
@@ -54,7 +55,7 @@ export async function GET(
           const hasPriority = issue.labels.some((l) => l.startsWith("priority/"));
           const hasAgent = issue.labels.some((l) => l.startsWith("agent/"));
           const hasLane = !!issue.currentLane;
-          const isBacklog = issue.currentLane === "backlog";
+          const isBacklog = issue.currentLane ? isBacklogLane(issue.currentLane) : false;
           const isUnlabeled = issue.labels.length === 0;
 
           // Eligible if missing any key metadata
@@ -118,7 +119,7 @@ export async function GET(
       },
     });
 
-    const issueLane = lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined;
+    const issueLane = lane?.toLowerCase();
     const prFixLane = lane;
 
     const leasedIssueIds = await findLeasedIssueIds(agentName);

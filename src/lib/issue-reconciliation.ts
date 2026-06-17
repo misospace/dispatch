@@ -1,5 +1,6 @@
 import { GitHubIssue } from "@/types";
 import { GithubPR, closeIssue as githubCloseIssue, addIssueLabel as githubAddIssueLabel, removeIssueLabel as githubRemoveIssueLabel } from "@/lib/github";
+import { isBacklogLane } from "@/lib/lane-config";
 
 // ─── Lane Classification Helpers ──────────────────────────────────────────────
 
@@ -82,7 +83,7 @@ export function shouldReclassifyStaleBacklog(
   body: string | null,
   currentLabels: string[],
 ): "normal" | "escalated" | null {
-  if (existingLane !== "backlog") {
+  if (!existingLane || !isBacklogLane(existingLane)) {
     return null;
   }
 
@@ -105,11 +106,13 @@ export function shouldReclassifyStaleBacklog(
 
   // If classifier still says backlog (stale text mentions), fall back to normal.
   // An issue with an active status label must never remain in the backlog lane.
-  if (classification.lane === "backlog") {
+  if (isBacklogLane(classification.lane)) {
     return "normal";
   }
 
-  return classification.lane;
+  // classifyLaneByHeuristics returns one of "normal", "escalated", or backlog lane id.
+  // Since we've ruled out backlog above, this is safe to cast.
+  return classification.lane as "normal" | "escalated";
 }
 
 // ─── Merged PR Detection ─────────────────────────────────────────────────────

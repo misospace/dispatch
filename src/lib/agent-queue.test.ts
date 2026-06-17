@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach } from "vitest";
 import { buildAgentQueue, isRenovateIssue } from "./agent-queue";
+import { setLaneConfig, resetLaneConfig } from "./lane-config";
 
 const makeIssue = (overrides: Partial<{ number: number; title: string; url: string; labels: string[]; lane?: string }> = {}) => ({
   number: overrides.number ?? 1,
@@ -718,5 +719,43 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(0);
+  });
+
+  describe("custom lanes", () => {
+    afterEach(() => {
+      resetLaneConfig();
+    });
+
+    it("accepts custom configured lanes and filters by them", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "fast", title: "Fast Lane", claimable: true },
+          { id: "slow", title: "Slow Lane", claimable: true },
+          { id: "parked", title: "Parked", claimable: false },
+        ],
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "fast" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "slow" }),
+        // Note: parked issue uses status/ready (not status/backlog) to test lane filtering
+        // separately from status-based filtering
+        makeIssue({ number: 3, labels: ["priority/p1", "status/ready"], lane: "parked" }),
+      ];
+
+      // Filter by custom lane
+      const fastOnly = buildAgentQueue(issues, "worker-agent", { lane: "fast" });
+      expect(fastOnly).toHaveLength(1);
+      expect(fastOnly[0].number).toBe(1);
+
+      // Default (no lane filter) excludes parked (non-claimable) lane
+      const allClaimable = buildAgentQueue(issues, "worker-agent");
+      expect(allClaimable).toHaveLength(2);
+      expect(allClaimable.map((i) => i.number)).toEqual([1, 2]);
+
+      // Include parked with claimableOnly=false
+      const allIncludingParked = buildAgentQueue(issues, "worker-agent", { claimableOnly: false });
+      expect(allIncludingParked).toHaveLength(3);
+    });
   });
 });

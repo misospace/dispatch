@@ -1,11 +1,12 @@
-import { VALID_LANES, VALID_CONFIDENCE } from "@/types";
+import { VALID_CONFIDENCE } from "@/types";
+import { isValidLane as isValidLaneConfig } from "@/lib/lane-config";
 
 /**
  * A lane classification result for an issue.
  */
 export interface LaneClassification {
-  /** The assigned execution lane */
-  lane: "normal" | "escalated" | "backlog";
+  /** The assigned execution lane id (e.g. "normal", "escalated", "backlog", or custom) */
+  lane: string;
   /** Confidence in the classification */
   confidence: "high" | "medium" | "low";
   /** Human-readable reason for the classification */
@@ -15,10 +16,11 @@ export interface LaneClassification {
 }
 
 /**
- * Validate a lane value against known lanes.
+ * Validate a lane value against configured lanes.
+ * Delegates to lane-config which respects custom lane configuration.
  */
-export function isValidLane(lane: unknown): lane is "normal" | "escalated" | "backlog" {
-  return typeof lane === "string" && VALID_LANES.includes(lane as "normal" | "escalated" | "backlog");
+export function isValidLane(lane: unknown): lane is string {
+  return typeof lane === "string" && isValidLaneConfig(lane);
 }
 
 /**

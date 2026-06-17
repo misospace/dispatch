@@ -128,9 +128,12 @@ export const AGENT_PREFIX = "agent/";
 export const OWNER_PREFIX = "owner/";
 
 // Lane classification types and constants
+// NOTE: These represent the default configuration. For runtime validation,
+// use isValidLane() from "@/lib/lane-config" which respects custom lane config.
 export type IssueLaneValue = "normal" | "escalated" | "backlog";
 export type ConfidenceValue = "high" | "medium" | "low";
 
+/** @deprecated Use getLaneIds() from "@/lib/lane-config" for runtime validation */
 export const VALID_LANES: IssueLaneValue[] = ["normal", "escalated", "backlog"];
 export const VALID_CONFIDENCE: ConfidenceValue[] = ["high", "medium", "low"];
 
