@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  classifyLaneFromSignals,
+  getDefaultClaimableLane,
+  getEscalationLane,
   getBacklogLane,
   getClaimableLanes,
   getConfiguredLanes,
@@ -197,5 +200,153 @@ describe("lane-config reset", () => {
     resetLaneConfig();
     expect(getConfiguredLanes()).toHaveLength(3);
     expect(getLaneIds()).toEqual(["normal", "escalated", "backlog"]);
+  });
+});
+
+describe("lane-config classification helpers", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  describe("getDefaultClaimableLane", () => {
+    it("returns the lane with role=default by default config", () => {
+      expect(getDefaultClaimableLane()?.id).toBe("normal");
+    });
+
+    it("returns the first claimable lane when no role is set", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "fast", title: "Fast", claimable: true },
+          { id: "slow", title: "Slow", claimable: true },
+          { id: "parked", title: "Parked", claimable: false },
+        ],
+      });
+      expect(getDefaultClaimableLane()?.id).toBe("fast");
+    });
+
+    it("prefers explicit role=default over first claimable", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "fast", title: "Fast", claimable: true },
+          { id: "default-lane", title: "Default", claimable: true, role: "default" },
+          { id: "parked", title: "Parked", claimable: false },
+        ],
+      });
+      expect(getDefaultClaimableLane()?.id).toBe("default-lane");
+    });
+  });
+
+  describe("getEscalationLane", () => {
+    it("returns the lane with role=escalation by default config", () => {
+      expect(getEscalationLane()?.id).toBe("escalated");
+    });
+
+    it("falls back to default claimable when no escalation role exists", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "default", title: "Default", claimable: true },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+      expect(getEscalationLane()?.id).toBe("default");
+    });
+
+    it("returns explicit escalation lane when configured", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "normal", title: "Normal", claimable: true, role: "default" },
+          { id: "senior-review", title: "Senior Review", claimable: true, role: "escalation" },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+      expect(getEscalationLane()?.id).toBe("senior-review");
+    });
+  });
+
+  describe("classifyLaneFromSignals", () => {
+    it("maps backlog signals to the non-claimable lane", () => {
+      expect(
+        classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
+      ).toBe("backlog");
+    });
+
+    it("maps escalation signals to the escalation lane", () => {
+      expect(
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
+      ).toBe("escalated");
+    });
+
+    it("maps default signals to the default claimable lane", () => {
+      expect(
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
+      ).toBe("normal");
+    });
+
+    it("with single claimable lane: all actionable goes to that lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "work", title: "Work", claimable: true },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+      expect(
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
+      ).toBe("work");
+      // High-complexity falls back to same lane since no escalation role
+      expect(
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
+      ).toBe("work");
+      expect(
+        classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
+      ).toBe("backlog");
+    });
+
+    it("with single claimable lane and escalation role: maps correctly", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "work", title: "Work", claimable: true, role: "default" },
+          { id: "expert", title: "Expert", claimable: true, role: "escalation" },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+      expect(
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
+      ).toBe("work");
+      expect(
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
+      ).toBe("expert");
+      expect(
+        classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
+      ).toBe("backlog");
+    });
+
+    it("with no backlog lane: backlog signals fall back to default claimable", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "work", title: "Work", claimable: true },
+        ],
+      });
+      expect(
+        classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
+      ).toBe("work");
+    });
+
+    it("never returns unknown lane ids", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "alpha", title: "Alpha", claimable: true },
+          { id: "beta", title: "Beta", claimable: true, role: "escalation" },
+          { id: "gamma", title: "Gamma", claimable: false },
+        ],
+      });
+      const results = [
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
+        classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
+        classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
+      ];
+      for (const lane of results) {
+        expect(["alpha", "beta", "gamma"]).toContain(lane);
+      }
+    });
   });
 });

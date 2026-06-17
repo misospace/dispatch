@@ -1,5 +1,5 @@
 import { VALID_CONFIDENCE } from "@/types";
-import { isValidLane as isValidLaneConfig } from "@/lib/lane-config";
+import { classifyLaneFromSignals, getConfiguredLanes, getDefaultClaimableLane, getEscalationLane, getBacklogLane, isValidLane as isValidLaneConfig } from "@/lib/lane-config";
 
 /**
  * A lane classification result for an issue.
@@ -96,6 +96,7 @@ export function validateLaneRecord(data: unknown): {
 /**
  * Build a prompt for the model to classify an issue's execution lane.
  * This prompt is generic — no hardcoded agent names, repo names, or owner names.
+ * Uses configured lanes so the model returns valid lane ids.
  */
 export function buildLaneClassificationPrompt(
   title: string,
@@ -105,22 +106,46 @@ export function buildLaneClassificationPrompt(
 ): string {
   const truncatedBody = body ? (body.length > 8000 ? body.slice(0, 8000) + "\n...[truncated]" : body) : "(no body)";
 
+  const lanes = getConfiguredLanes();
+  const laneIds = lanes.map((l) => `"${l.id}"`).join("|");
+
+  // Build lane definitions from config
+  const defaultLane = getDefaultClaimableLane();
+  const escalationLane = getEscalationLane();
+  const backlogLane = getBacklogLane();
+
+  const laneDefinitions: string[] = [];
+  if (defaultLane) {
+    laneDefinitions.push(
+      `- ${defaultLane.id}: concrete, scoped, testable implementation work suitable for a normal worker.`,
+    );
+  }
+  // Only add escalation definition if it differs from default
+  if (escalationLane && escalationLane.id !== defaultLane?.id) {
+    laneDefinitions.push(
+      `- ${escalationLane.id}: requires higher-judgment model support, such as architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, or audit parent decomposition.`,
+    );
+  }
+  if (backlogLane) {
+    laneDefinitions.push(
+      `- ${backlogLane.id}: not actionable yet, placeholder, missing enough detail, or a parent/umbrella item with no direct work remaining.`,
+    );
+  }
+
   return `You are a task routing assistant. Classify this GitHub issue into an execution lane.
 
 Return ONLY compact JSON with this exact schema:
-{"lane":"normal"|"escalated"|"backlog","confidence":"high"|"medium"|"low","reason":"short reason"}
+{"lane":${laneIds},"confidence":"high"|"medium"|"low","reason":"short reason"}
 
 Lane definitions:
-- normal: concrete, scoped, testable implementation work suitable for a normal worker.
-- escalated: requires higher-judgment model support, such as architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, or audit parent decomposition.
-- backlog: not actionable yet, placeholder, missing enough detail, or a parent/umbrella item with no direct work remaining.
+${laneDefinitions.join("\n")}
 
 Routing rules:
-- Do not route to escalated only because labels include needs-escalation, escalated, priority/p1, or because the issue came from an audit.
-- Do route broad audit parent/umbrella issues to escalated for decomposition/design unless already decomposed.
-- Documentation, tests, CI, lint, release/version drift, bounded frontend/backend fixes, and concrete follow-up issues usually go to normal.
-- If the issue already contains a reasonable implementation approach and acceptance criteria, prefer normal.
-- If confidence is low and the issue is not actionable, choose backlog.
+- Do not route to ${escalationLane?.id ?? "escalated"} only because labels include needs-escalation, escalated, priority/p1, or because the issue came from an audit.
+- Do route broad audit parent/umbrella issues to ${escalationLane?.id ?? "escalated"} for decomposition/design unless already decomposed.
+- Documentation, tests, CI, lint, release/version drift, bounded frontend/backend fixes, and concrete follow-up issues usually go to ${defaultLane?.id ?? "normal"}.
+- If the issue already contains a reasonable implementation approach and acceptance criteria, prefer ${defaultLane?.id ?? "normal"}.
+- If confidence is low and the issue is not actionable, choose ${backlogLane?.id ?? "backlog"}.
 
 Issue:
 title: ${title}
@@ -134,6 +159,7 @@ ${truncatedBody}`;
 /**
  * Build a fallback classification when model classification fails.
  * Uses simple heuristics based on labels and title/body content.
+ * Returns configured lane ids — never hardcoded strings.
  */
 export function classifyByHeuristics(
   title: string,
@@ -145,7 +171,11 @@ export function classifyByHeuristics(
 
   // Check for backlog indicators
   if (labelSet.has("status/backlog") || labelSet.has("type/research")) {
-    return { lane: "backlog", confidence: "high", reason: "Issue marked as backlog or research type" };
+    return {
+      lane: classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
+      confidence: "high",
+      reason: "Issue marked as backlog or research type",
+    };
   }
 
   // Check for escalated indicators (but not just priority/escalated labels)
@@ -164,11 +194,19 @@ export function classifyByHeuristics(
   ];
   const hasEscalationKeyword = escalationKeywords.some((kw) => text.includes(kw));
   if (hasEscalationKeyword && !labelSet.has("status/backlog")) {
-    return { lane: "escalated", confidence: "medium", reason: "Issue contains architecture/design/audit decomposition keywords" };
+    return {
+      lane: classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
+      confidence: "medium",
+      reason: "Issue contains architecture/design/audit decomposition keywords",
+    };
   }
 
   // Default to normal for concrete, actionable issues
-  return { lane: "normal", confidence: "medium", reason: "Default classification: concrete implementation work" };
+  return {
+    lane: classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
+    confidence: "medium",
+    reason: "Default classification: concrete implementation work",
+  };
 }
 
 /**

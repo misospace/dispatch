@@ -1,68 +1,104 @@
 import { GitHubIssue } from "@/types";
 import { GithubPR, closeIssue as githubCloseIssue, addIssueLabel as githubAddIssueLabel, removeIssueLabel as githubRemoveIssueLabel } from "@/lib/github";
-import { isBacklogLane } from "@/lib/lane-config";
+import { classifyLaneFromSignals, getDefaultClaimableLane, isBacklogLane, LaneSignals } from "@/lib/lane-config";
 
 // ─── Lane Classification Helpers ──────────────────────────────────────────────
 
 /**
+ * Shared escalation keyword list used by both classifyLaneByHeuristics and
+ * shouldReclassifyStaleBacklog.
+ */
+const ESCALATION_KEYWORDS = [
+  "architecture",
+  "audit",
+  "design doc",
+  "rfc",
+  "alternatives considered",
+  "migration strategy",
+  "cross-service",
+  "distributed system",
+  "audit parent",
+  "parent issue",
+  "umbrella",
+  "decomposition",
+];
+
+/**
+ * Shared backlog signal list.
+ */
+const BACKLOG_SIGNALS = [
+  "status/backlog",
+  "type/research",
+  "tbd",
+  "to be determined",
+  "placeholder",
+  "more details needed",
+  "needs more info",
+];
+
+/**
+ * Shared escalation label signals.
+ */
+const ESCALATION_LABELS = ["needs-escalation", "needs-gpt"];
+
+/**
+ * Evaluate heuristic signals for an issue. Returns structured signals that can
+ * be mapped to a configured lane via classifyLaneFromSignals.
+ */
+export function evaluateLaneSignals(
+  title: string,
+  body: string | null,
+  labels: string[],
+): LaneSignals & { reason: string } {
+  const text = `${title} ${body ?? ""}`.toLowerCase();
+  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
+
+  // Check backlog first (highest priority exclusion)
+  for (const signal of BACKLOG_SIGNALS) {
+    if (text.includes(signal) || labelSet.has(signal)) {
+      return { isBacklog: true, isEscalation: false, reason: `Backlog signal detected: ${signal}` };
+    }
+  }
+
+  // Explicit escalation labels take precedence over text heuristics
+  if (ESCALATION_LABELS.some((s) => labelSet.has(s))) {
+    return { isBacklog: false, isEscalation: true, reason: "Escalation label detected" };
+  }
+
+  // Check escalated signals
+  const escalationMatches = ESCALATION_KEYWORDS.filter((s) => text.includes(s));
+  if (escalationMatches.length > 0 && !labelSet.has("status/backlog")) {
+    return { isBacklog: false, isEscalation: true, reason: `Escalation keywords: ${escalationMatches.join(", ")}` };
+  }
+
+  // Default: concrete, actionable issues
+  return { isBacklog: false, isEscalation: false, reason: "Default classification: concrete implementation work" };
+}
+
+/**
  * Heuristic lane classification when model calls are unavailable.
  * Uses label patterns and issue content to infer the correct execution lane.
+ * Returns a configured lane id — never an unknown string.
  */
 export function classifyLaneByHeuristics(
   title: string,
   body: string | null,
   labels: string[],
-): { lane: "normal" | "escalated" | "backlog"; confidence: "high" | "medium" | "low"; reason: string } {
-  const text = `${title} ${body ?? ""}`.toLowerCase();
-  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
+): { lane: string; confidence: "high" | "medium" | "low"; reason: string } {
+  const signals = evaluateLaneSignals(title, body, labels);
 
-  // Escalated indicators: architecture, design, audit decomposition, cross-service
-  const escalatedSignals = [
-    "architecture",
-    "audit",
-    "design doc",
-    "rfc",
-    "alternatives considered",
-    "migration strategy",
-    "cross-service",
-    "distributed system",
-    "audit parent",
-    "parent issue",
-    "umbrella",
-    "decomposition",
-  ];
-
-  const backlogSignals = [
-    "status/backlog",
-    "type/research",
-    "tbd",
-    "to be determined",
-    "placeholder",
-    "more details needed",
-    "needs more info",
-  ];
-
-  // Check backlog first (highest priority exclusion)
-  for (const signal of backlogSignals) {
-    if (text.includes(signal) || labelSet.has(signal)) {
-      return { lane: "backlog", confidence: "high", reason: `Backlog signal detected: ${signal}` };
-    }
+  let confidence: "high" | "medium" | "low" = "medium";
+  if (signals.isBacklog) {
+    confidence = "high";
+  } else if (signals.isEscalation && ESCALATION_LABELS.some((l) => labels.map((x) => x.toLowerCase()).includes(l))) {
+    confidence = "high";
   }
 
-  // Explicit escalation labels take precedence over text heuristics
-  const escalatedLabelSignals = ["needs-escalation", "needs-gpt"];
-  if (escalatedLabelSignals.some((s) => labelSet.has(s))) {
-    return { lane: "escalated", confidence: "high", reason: "Escalation label detected" };
-  }
-
-  // Check escalated signals
-  const escalationMatches = escalatedSignals.filter((s) => text.includes(s));
-  if (escalationMatches.length > 0 && !labelSet.has("status/backlog")) {
-    return { lane: "escalated", confidence: "medium", reason: `Escalation keywords: ${escalationMatches.join(", ")}` };
-  }
-
-  // Default to normal for concrete, actionable issues
-  return { lane: "normal", confidence: "medium", reason: "Default classification: concrete implementation work" };
+  return {
+    lane: classifyLaneFromSignals({ isBacklog: signals.isBacklog, isEscalation: signals.isEscalation }),
+    confidence,
+    reason: signals.reason,
+  };
 }
 
 /**
@@ -73,16 +109,16 @@ export function classifyLaneByHeuristics(
  * Returns the new lane to use, or null when no reclassification is needed.
  *
  * Delegates to classifyLaneByHeuristics so escalation signals from title/body
- * are respected. Falls back to "normal" if the classifier still returns
- * "backlog" (e.g. stale text mentions) — an active-status issue must never
- * stay in the backlog lane.
+ * are respected. Falls back to the default claimable lane if the classifier
+ * still returns a backlog lane (e.g. stale text mentions) — an active-status
+ * issue must never stay in the backlog lane.
  */
 export function shouldReclassifyStaleBacklog(
   existingLane: string | null,
   title: string,
   body: string | null,
   currentLabels: string[],
-): "normal" | "escalated" | null {
+): string | null {
   if (!existingLane || !isBacklogLane(existingLane)) {
     return null;
   }
@@ -104,15 +140,14 @@ export function shouldReclassifyStaleBacklog(
   // Reuse the same heuristic classifier as first-time classification.
   const classification = classifyLaneByHeuristics(title, body, currentLabels);
 
-  // If classifier still says backlog (stale text mentions), fall back to normal.
-  // An issue with an active status label must never remain in the backlog lane.
+  // If classifier still says backlog (stale text mentions), fall back to default
+  // claimable lane. An issue with an active status label must never remain in
+  // the backlog lane.
   if (isBacklogLane(classification.lane)) {
-    return "normal";
+    return getDefaultClaimableLane()?.id ?? "normal";
   }
 
-  // classifyLaneByHeuristics returns one of "normal", "escalated", or backlog lane id.
-  // Since we've ruled out backlog above, this is safe to cast.
-  return classification.lane as "normal" | "escalated";
+  return classification.lane;
 }
 
 // ─── Merged PR Detection ─────────────────────────────────────────────────────
