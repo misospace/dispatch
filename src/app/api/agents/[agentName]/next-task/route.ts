@@ -11,7 +11,7 @@ import {
   createFollowupPrTask,
   createGroomTask,
 } from "@/lib/agent-task";
-import { isBacklogLane } from "@/lib/lane-config";
+import { isBacklogLane, isValidLane, getLaneIds } from "@/lib/lane-config";
 
 export async function GET(
   request: Request,
@@ -121,6 +121,16 @@ export async function GET(
 
     const issueLane = lane?.toLowerCase();
     const prFixLane = lane;
+
+    // Validate lane against configured lanes (allow omitting lane for backward compatibility)
+    if (issueLane && !isValidLane(issueLane)) {
+      return NextResponse.json(
+        {
+          error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}`,
+        },
+        { status: 400 },
+      );
+    }
 
     const leasedIssueIds = await findLeasedIssueIds(agentName);
 

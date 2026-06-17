@@ -4,6 +4,7 @@ import { buildAgentQueue } from "@/lib/agent-queue";
 import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
 import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
+import { isValidLane, getLaneIds } from "@/lib/lane-config";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
@@ -41,6 +42,16 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
 
     const issueLane = lane?.toLowerCase();
     const prFixLane = lane;
+
+    // Validate lane against configured lanes (allow omitting lane for backward compatibility)
+    if (issueLane && !isValidLane(issueLane)) {
+      return NextResponse.json(
+        {
+          error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}`,
+        },
+        { status: 400 },
+      );
+    }
 
     // Find issues that have active leases from OTHER agents — exclude them
     // so other agents don't overlap on leased work.

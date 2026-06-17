@@ -623,6 +623,123 @@ describe("buildAgentQueue agent assignment fixes (issue #291)", () => {
 });
 
 describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", () => {
+  describe("configurable lanes", () => {
+    afterEach(() => {
+      resetLaneConfig();
+    });
+
+    it("single claimable lane config works", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "default", title: "Default", claimable: true },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "default" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "backlog" }),
+      ];
+
+      // Default queue includes only claimable lane (default), excludes backlog lane
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(1);
+      expect(result[0].number).toBe(1);
+
+      // Explicit lane filter works
+      const defaultOnly = buildAgentQueue(issues, "worker-agent", { lane: "default" });
+      expect(defaultOnly).toHaveLength(1);
+      expect(defaultOnly[0].number).toBe(1);
+    });
+
+    it("three claimable lanes config works", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "fast", title: "Fast Lane", claimable: true },
+          { id: "slow", title: "Slow Lane", claimable: true },
+          { id: "critical", title: "Critical", claimable: true },
+          { id: "parked", title: "Parked", claimable: false },
+        ],
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p0", "status/ready"], lane: "fast" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "slow" }),
+        makeIssue({ number: 3, labels: ["priority/p0", "status/ready"], lane: "critical" }),
+        makeIssue({ number: 4, labels: ["priority/p1", "status/ready"], lane: "parked" }),
+      ];
+
+      // Default queue includes all claimable lanes, excludes parked
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(3);
+      expect(result.map((i) => i.number)).toEqual([1, 3, 2]); // p0 fast, p0 critical, p1 slow
+
+      // Each lane filter works independently
+      const fastOnly = buildAgentQueue(issues, "worker-agent", { lane: "fast" });
+      expect(fastOnly).toHaveLength(1);
+      expect(fastOnly[0].number).toBe(1);
+
+      const criticalOnly = buildAgentQueue(issues, "worker-agent", { lane: "critical" });
+      expect(criticalOnly).toHaveLength(1);
+      expect(criticalOnly[0].number).toBe(3);
+    });
+
+    it("non-claimable lane is excluded from default worker queue", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "work", title: "Work", claimable: true },
+          { id: "triage", title: "Triage", claimable: false },
+        ],
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "work" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "triage" }),
+      ];
+
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(1);
+      expect(result[0].number).toBe(1);
+
+      // Non-claimable lane can be included with claimableOnly=false
+      const all = buildAgentQueue(issues, "worker-agent", { claimableOnly: false });
+      expect(all).toHaveLength(2);
+    });
+
+    it("non-claimable lane items not accidentally worker-claimable", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "work", title: "Work", claimable: true },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p0", "status/ready"], lane: "backlog" }),
+      ];
+
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(0);
+    });
+
+    it("custom claimable lane can be queried successfully", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "alpha", title: "Alpha", claimable: true },
+          { id: "backlog", title: "Backlog", claimable: false },
+        ],
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "alpha" }),
+      ];
+
+      const result = buildAgentQueue(issues, "worker-agent", { lane: "alpha" });
+      expect(result).toHaveLength(1);
+      expect(result[0].number).toBe(1);
+    });
+  });
+
   it("excludes status/in-review from default worker queue", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["status/in-review", "priority/p0"] }),

@@ -1,4 +1,5 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { resetLaneConfig, setLaneConfig } from "@/lib/lane-config";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -28,6 +29,10 @@ describe("GET /api/agents/[agentName]/queue", () => {
     mocks.prFixFindMany.mockResolvedValue([]);
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    resetLaneConfig();
   });
 
   it("prioritizes queued PR review-fix items before new issue work", async () => {
@@ -450,5 +455,246 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.map((item: { number: number }) => item.number)).toEqual([20]);
+  });
+
+  // ── Lane validation tests ─────────────────────────────────────────
+
+  it("returns 400 for unknown lane", async () => {
+    mocks.issueFindMany.mockResolvedValue([]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=unknown-lane"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("Invalid lane");
+    expect(body.error).toContain("unknown-lane");
+  });
+
+  it("returns 200 for default normal lane", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-normal",
+        number: 1,
+        title: "Normal issue",
+        url: "https://github.com/org/repo/issues/1",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(1);
+  });
+
+  it("returns 200 for default escalated lane", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-escalated",
+        number: 2,
+        title: "Escalated issue",
+        url: "https://github.com/org/repo/issues/2",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "escalated",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=escalated"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(2);
+  });
+
+  it("returns 200 when lane param is omitted (backward-compatible)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-no-lane",
+        number: 3,
+        title: "No lane filter",
+        url: "https://github.com/org/repo/issues/3",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+  });
+
+  it("returns 200 for custom configured lane", async () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "slow", title: "Slow Lane", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-fast",
+        number: 10,
+        title: "Fast issue",
+        url: "https://github.com/org/repo/issues/10",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "fast",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=fast"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(10);
+  });
+
+  it("returns 400 for default lane when custom config is active", async () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+
+    mocks.issueFindMany.mockResolvedValue([]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("Invalid lane");
+  });
+
+  it("includes issue lane value in response", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-lane-val",
+        number: 5,
+        title: "Has lane",
+        url: "https://github.com/org/repo/issues/5",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "escalated",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=escalated"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].lane).toBe("escalated");
+  });
+
+  it("preserves includeClaimed behavior with lane filter", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-claimed-lane",
+        number: 6,
+        title: "Claimed in lane",
+        url: "https://github.com/org/repo/issues/6",
+        labels: ["agent/example-agent", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeClaimed=true"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0]).toMatchObject({ number: 6, agentMatch: true });
+  });
+
+  it("preserves includeRenovate behavior with lane filter", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-renovate-lane",
+        number: 7,
+        title: "Dependency Dashboard",
+        url: "https://github.com/org/repo/issues/7",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&includeRenovate=true"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(7);
+  });
+
+  it("preserves exclude_decomposed behavior with lane filter", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-decomposed",
+        number: 8,
+        title: "Decomposed issue",
+        url: "https://github.com/org/repo/issues/8",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: true,
+        repository: { fullName: "org/repo" },
+      },
+      {
+        id: "issue-not-decomposed",
+        number: 9,
+        title: "Not decomposed",
+        url: "https://github.com/org/repo/issues/9",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(new Request("http://localhost/api/agents/example-agent/queue?lane=normal&exclude_decomposed=true"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].number).toBe(9);
   });
 });
