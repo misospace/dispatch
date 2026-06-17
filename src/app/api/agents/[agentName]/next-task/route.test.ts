@@ -394,4 +394,311 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       }),
     );
   });
+
+  // Linked PR follow-up tests
+
+  it("returns followup-pr when issue has linked PR needing follow-up", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 42,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: ["tests failing", "lint errors"],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.shouldRun).toBe(true);
+  });
+
+  it("linked PR follow-up beats normal implement work", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-followup",
+        number: 42,
+        title: "Issue with PR needing follow-up",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p1", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: ["needs changes"],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+      {
+        id: "issue-normal",
+        number: 99,
+        title: "Normal issue",
+        url: "https://github.com/org/repo/issues/99",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: null,
+        linkedPrUrl: null,
+        linkedPrNeedsFollowup: false,
+        linkedPrFollowupReasons: [],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: null,
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(15);
+  });
+
+  it("PR-fix queue item still beats linked PR follow-up", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-1",
+        repo: "org/repo",
+        pr: 12,
+        issue: null,
+        branch: "fix/something",
+        url: "https://github.com/org/repo/pull/12",
+        title: "Fix something",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "review changes requested",
+        feedback: ["update tests"],
+        evidenceKeys: ["review:1"],
+        author: "bot",
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-followup",
+        number: 42,
+        title: "Issue with PR needing follow-up",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: ["needs changes"],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(12);
+  });
+
+  it("linked PR follow-up includes issue context", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 42,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: ["needs changes"],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.issue.repoFullName).toBe("org/repo");
+    expect(body.issue.number).toBe(42);
+    expect(body.issue.title).toBe("Fix login bug");
+    expect(body.issue.url).toBe("https://github.com/org/repo/issues/42");
+  });
+
+  it("linked PR follow-up includes pull request context", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 42,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: ["needs changes"],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.repoFullName).toBe("org/repo");
+    expect(body.pullRequest.number).toBe(15);
+    expect(body.pullRequest.url).toBe("https://github.com/org/repo/pull/15");
+  });
+
+  it("linked PR follow-up uses followup reasons", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 42,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: ["tests failing", "lint errors", "missing docs"],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.reasons).toContain("tests failing");
+    expect(body.reasons).toContain("lint errors");
+    expect(body.reasons).toContain("missing docs");
+  });
+
+  it("missing followup reasons uses fallback reason", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 42,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: 15,
+        linkedPrUrl: "https://github.com/org/repo/pull/15",
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: [],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.reasons).toEqual(["Linked PR needs follow-up"]);
+  });
+
+  it("normal issue still returns implement when no follow-up exists", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 42,
+        title: "Fix login bug",
+        url: "https://github.com/org/repo/issues/42",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "normal",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+        linkedPrNumber: null,
+        linkedPrUrl: null,
+        linkedPrNeedsFollowup: false,
+        linkedPrFollowupReasons: [],
+        linkedPrReviewDecision: null,
+        linkedPrMergeState: null,
+        linkedPrHealthCheckedAt: null,
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(42);
+  });
+
+  it("idle still works when queue is empty", async () => {
+    mocks.issueFindMany.mockResolvedValue([]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("idle");
+    expect(body.shouldRun).toBe(false);
+  });
 });
