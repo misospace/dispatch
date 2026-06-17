@@ -294,4 +294,58 @@ describe("POST /api/agents/[agentName]/tasks/report", () => {
       expect(res.status).toBe(200);
     }
   });
+
+  it("returns 400 when repoFullName is not a string", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      repoFullName: 123,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 when pullRequestUrl is not a string", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      pullRequestUrl: 123,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 when summary is not a string", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      summary: true,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 when error is not a string", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "failed",
+      error: 500,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 when issueNumber is a decimal", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      issueNumber: 42.5,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 when pullRequestNumber is a decimal", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      pullRequestNumber: 10.7,
+    });
+    expect(res.status).toBe(400);
+  });
 });

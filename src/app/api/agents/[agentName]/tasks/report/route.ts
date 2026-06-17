@@ -60,18 +60,28 @@ export async function POST(
     );
   }
 
-  if (raw.issueNumber !== undefined && typeof raw.issueNumber !== "number") {
+  if (raw.issueNumber !== undefined && (typeof raw.issueNumber !== "number" || !Number.isInteger(raw.issueNumber))) {
     return NextResponse.json(
-      { error: "issueNumber must be a number" },
+      { error: "issueNumber must be an integer" },
       { status: 400 },
     );
   }
 
-  if (raw.pullRequestNumber !== undefined && typeof raw.pullRequestNumber !== "number") {
+  if (raw.pullRequestNumber !== undefined && (typeof raw.pullRequestNumber !== "number" || !Number.isInteger(raw.pullRequestNumber))) {
     return NextResponse.json(
-      { error: "pullRequestNumber must be a number" },
+      { error: "pullRequestNumber must be an integer" },
       { status: 400 },
     );
+  }
+
+  const stringFields: readonly string[] = ["repoFullName", "pullRequestUrl", "summary", "error"];
+  for (const field of stringFields) {
+    if (raw[field] !== undefined && typeof raw[field] !== "string") {
+      return NextResponse.json(
+        { error: `${field} must be a string` },
+        { status: 400 },
+      );
+    }
   }
 
   const report: TaskReportBody = {
