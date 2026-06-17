@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach } from "vitest";
 import {
   isValidLane,
   isValidConfidence,
@@ -8,6 +8,7 @@ import {
   buildLaneClassificationPrompt,
   serializeLaneData,
 } from "./issue-lane";
+import { setLaneConfig, resetLaneConfig } from "./lane-config";
 
 describe("isValidLane", () => {
   it("returns true for valid lanes", () => {
@@ -22,6 +23,21 @@ describe("isValidLane", () => {
     expect(isValidLane(123)).toBe(false);
     expect(isValidLane(null)).toBe(false);
     expect(isValidLane(undefined)).toBe(false);
+  });
+
+  it("accepts custom configured lanes", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "slow", title: "Slow Lane", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    expect(isValidLane("fast")).toBe(true);
+    expect(isValidLane("slow")).toBe(true);
+    expect(isValidLane("parked")).toBe(true);
+    expect(isValidLane("normal")).toBe(false);
+    resetLaneConfig();
   });
 });
 
@@ -72,6 +88,18 @@ describe("parseLaneClassification", () => {
   it("trims and truncates reason", () => {
     const result = parseLaneClassification({ lane: "normal", confidence: "high", reason: "  too long " + "x".repeat(495) });
     expect(result!.reason.length).toBeLessThanOrEqual(500);
+  });
+
+  it("parses custom configured lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    const result = parseLaneClassification({ lane: "fast", confidence: "high", reason: "Custom lane work" });
+    expect(result).toEqual({ lane: "fast", confidence: "high", reason: "Custom lane work" });
+    resetLaneConfig();
   });
 });
 

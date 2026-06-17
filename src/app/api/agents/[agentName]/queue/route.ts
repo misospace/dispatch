@@ -39,7 +39,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       },
     });
 
-    const issueLane = lane?.toLowerCase() as "normal" | "escalated" | "backlog" | undefined;
+    const issueLane = lane?.toLowerCase();
     const prFixLane = lane;
 
     // Find issues that have active leases from OTHER agents — exclude them

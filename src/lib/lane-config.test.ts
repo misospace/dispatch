@@ -5,6 +5,7 @@ import {
   getConfiguredLanes,
   getLaneById,
   getLaneIds,
+  isBacklogLane,
   isClaimableLane,
   isValidLane,
   resetLaneConfig,
@@ -42,6 +43,13 @@ describe("lane-config defaults", () => {
     expect(isValidLane("escalated")).toBe(true);
     expect(isValidLane("backlog")).toBe(true);
     expect(isValidLane("unknown")).toBe(false);
+  });
+
+  it("isBacklogLane identifies the backlog lane", () => {
+    expect(isBacklogLane("backlog")).toBe(true);
+    expect(isBacklogLane("normal")).toBe(false);
+    expect(isBacklogLane("escalated")).toBe(false);
+    expect(isBacklogLane("unknown")).toBe(false);
   });
 
   it("getLaneById returns the lane or undefined", () => {
@@ -134,6 +142,25 @@ describe("lane-config custom config", () => {
         ],
       }),
     ).toThrow("Lane config must contain at least one claimable lane");
+  });
+
+  it("custom lanes are accepted by isValidLane and isClaimableLane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "slow", title: "Slow Lane", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+
+    expect(isValidLane("fast")).toBe(true);
+    expect(isValidLane("slow")).toBe(true);
+    expect(isValidLane("parked")).toBe(true);
+    expect(isValidLane("normal")).toBe(false);
+    expect(isClaimableLane("fast")).toBe(true);
+    expect(isClaimableLane("parked")).toBe(false);
+    expect(isBacklogLane("parked")).toBe(true);
+    expect(isBacklogLane("fast")).toBe(false);
   });
 
   it("supports optional fields (description, color, defaultAgent)", () => {
