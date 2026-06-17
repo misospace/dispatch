@@ -77,7 +77,7 @@ export async function GET(
       const best = candidates[0].issue;
       const task = createGroomTask({
         agentName,
-        lane: best.currentLane ?? undefined,
+        lane: best.currentLane ?? "backlog",
         issue: {
           repoFullName: best.repository.fullName,
           number: best.number,

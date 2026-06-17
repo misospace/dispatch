@@ -1121,5 +1121,27 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(body.type).toBe("groom");
       expect(body.lane).toBe("backlog");
     });
+
+    it("defaults lane to backlog when currentLane is null", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.lane).toBe("backlog");
+    });
   });
 });
