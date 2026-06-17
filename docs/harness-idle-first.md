@@ -100,7 +100,7 @@ def heartbeat():
     result = run_model(task)
 
     # Step 4: report result later via task report endpoint
-    post("https://dispatch.example.com/api/agents/saffron/task-report", result)
+    post("https://dispatch.example.com/api/agents/saffron/tasks/report", result)
 ```
 
 ## Key Properties
