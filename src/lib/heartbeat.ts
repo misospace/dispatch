@@ -42,6 +42,7 @@ export async function runSyncBestEffort(
   const errors: string[] = [];
   const touchedIssueUrls: string[] = [];
   let syncedCount = 0;
+  let reposProcessed = 0;
 
   try {
     const repos = await getSyncRepos();
@@ -77,6 +78,7 @@ export async function runSyncBestEffort(
     }, excludedLabels);
 
     syncedCount = result.syncedCount;
+    reposProcessed = result.repos;
 
     for (const r of result.results) {
       if (r.error) {
@@ -96,7 +98,7 @@ export async function runSyncBestEffort(
     errors.push(`Sync failed: ${message}`);
   }
 
-  return { synced: syncedCount, reposProcessed: 0, warnings, errors, touchedIssueUrls };
+  return { synced: syncedCount, reposProcessed, warnings, errors, touchedIssueUrls };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +168,13 @@ export async function runReconcileBestEffort(): Promise<ReconcileStepResult> {
     if (!result.success) {
       errors.push("Reconciliation completed with one or more failures");
     }
+    return {
+      issuesReconciled: result.issuesReconciled,
+      issuesChecked: result.issuesChecked,
+      reposProcessed: result.reposProcessed,
+      warnings,
+      errors,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown reconcile error";
     errors.push(`Reconciliation failed: ${message}`);
