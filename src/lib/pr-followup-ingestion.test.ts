@@ -167,6 +167,7 @@ describe("ingestCommentEvent", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
     expect(client.items[0].reason).toContain("actionable feedback");
   });
 
@@ -187,6 +188,7 @@ describe("ingestCommentEvent", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
     expect(client.items[0].status).toBe("BLOCKED");
   });
 
@@ -233,6 +235,7 @@ describe("ingestReviewEvent", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
   });
 
   it("skips APPROVED reviews", async () => {
@@ -342,6 +345,7 @@ describe("ingestCheckRunEvent", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("CI_FAILURE");
   });
 
   it("enqueues cancelled/timed_out checks", async () => {
@@ -361,6 +365,7 @@ describe("ingestCheckRunEvent", () => {
     });
 
     expect(client.items).toHaveLength(1);
+    expect(client.items[0].type).toBe("CI_FAILURE");
   });
 
   it("skips passing checks", async () => {
@@ -405,6 +410,7 @@ describe("ingestMergeStateEvent", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("OTHER");
   });
 
   it("skips clean merge state", async () => {
@@ -462,6 +468,25 @@ describe("ingestMergeStateEvent", () => {
     expect(result).toBeNull();
     expect(client.items).toHaveLength(0);
   });
+
+  it("populates MERGE_CONFLICT type for DIRTY merge state", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    await ingestMergeStateEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/pull/42",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      mergeStateStatus: "dirty",
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].type).toBe("MERGE_CONFLICT");
+  });
+
 
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;

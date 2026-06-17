@@ -7,6 +7,7 @@ import {
   prBranchMatchesIssue,
   reconcileIssue,
   classifyLaneByHeuristics,
+  shouldReclassifyStaleBacklog,
   executeActions,
 } from "@/lib/issue-reconciliation";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
@@ -198,12 +199,13 @@ export async function POST(request: Request) {
             }
           }
 
-          // Classify lane using heuristics if not already set
+          // Classify lane using heuristics — first-time set, or stale-backlog reclassification.
           const existingIssue = await prisma.issue.findUnique({
             where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
           });
 
           if (existingIssue && !existingIssue.currentLane) {
+            // First-time classification: lane was never set.
             const classification = classifyLaneByHeuristics(
               issue.title,
               issue.body,
@@ -214,6 +216,22 @@ export async function POST(request: Request) {
               data: { currentLane: classification.lane },
             });
             totalLaneClassified++;
+          } else if (existingIssue && existingIssue.currentLane === "backlog") {
+            // Stale-backlog reclassification: the issue has an active status label
+            // but is stuck in the backlog lane. Reclassify to normal or escalated.
+            const reclassify = shouldReclassifyStaleBacklog(
+              existingIssue.currentLane,
+              issue.title,
+              issue.body,
+              currentLabels,
+            );
+            if (reclassify) {
+              await prisma.issue.update({
+                where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
+                data: { currentLane: reclassify },
+              });
+              totalLaneClassified++;
+            }
           }
 
           // Persist linked PR health. Write when the issue has a linked open PR;

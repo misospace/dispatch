@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere } from "@/lib/issue-filters";
+import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
 
 export async function GET(request: Request) {
@@ -11,6 +11,7 @@ export async function GET(request: Request) {
   const project = searchParams.get("project");
   const priority = searchParams.get("priority");
   const decomposed = searchParams.get("decomposed");
+  const untriaged = searchParams.get("untriaged");
   const includeClosed = searchParams.get("includeClosed");
 
   try {
@@ -36,6 +37,10 @@ export async function GET(request: Request) {
     if (excludedLabelFilter) {
       where.labels = { ...(where.labels as object), ...excludedLabelFilter };
     }
+
+    // Filter for untriaged issues (no status/* label) — grooming intake
+    const noStatusFilter = buildNoStatusWhere(untriaged === "true");
+    if (noStatusFilter) where.labels = { ...(where.labels as object), ...noStatusFilter };
 
     const issues = await prisma.issue.findMany({
       where,

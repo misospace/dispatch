@@ -8,6 +8,7 @@ import {
   prReferencesIssue,
   executeAction,
   executeActions,
+  shouldReclassifyStaleBacklog,
 } from "./issue-reconciliation";
 
 const githubModule = await import("./github");
@@ -62,6 +63,78 @@ describe("classifyLaneByHeuristics", () => {
   it("handles empty inputs", () => {
     const result = classifyLaneByHeuristics("", "", []);
     expect(result.lane).toBe("normal");
+  });
+
+  it("classifies needs-escalation label as escalated", () => {
+    const result = classifyLaneByHeuristics("Fix login bug", null, ["status/ready", "needs-escalation"]);
+    expect(result.lane).toBe("escalated");
+  });
+
+  it("classifies needs-gpt label as escalated", () => {
+    const result = classifyLaneByHeuristics("Add new feature", null, ["enhancement", "needs-gpt"]);
+    expect(result.lane).toBe("escalated");
+  });
+
+  it("does NOT treat priority/p1 as escalation signal", () => {
+    const result = classifyLaneByHeuristics("Fix urgent bug", null, ["status/ready", "priority/p1"]);
+    expect(result.lane).toBe("normal");
+  });
+});
+
+describe("shouldReclassifyStaleBacklog", () => {
+  it("returns null when existing lane is not backlog", () => {
+    expect(shouldReclassifyStaleBacklog("normal", "Fix bug", null, ["status/ready"])).toBeNull();
+    expect(shouldReclassifyStaleBacklog("escalated", "Fix bug", null, ["status/ready"])).toBeNull();
+    expect(shouldReclassifyStaleBacklog(null, "Fix bug", null, ["status/ready"])).toBeNull();
+  });
+
+  it("returns null when issue still has status/backlog label", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Research API", null, ["status/backlog", "enhancement"])).toBeNull();
+  });
+
+  it("reclass backlog→normal when current label is status/ready", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready", "enhancement"])).toBe("normal");
+  });
+
+  it("reclass backlog→normal when current label is status/in-progress", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix login bug", null, ["status/in-progress", "bug"])).toBe("normal");
+  });
+
+  it("reclass backlog→normal when current label is status/in-review", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Add settings page", null, ["status/in-review", "enhancement"])).toBe("normal");
+  });
+
+  it("reclass backlog→escalated when title has escalation signals", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Database migration strategy for user tables", null, ["status/ready", "enhancement"])).toBe("escalated");
+    expect(shouldReclassifyStaleBacklog("backlog", "RFC: new auth architecture", null, ["status/ready"])).toBe("escalated");
+  });
+
+  it("reclass backlog→escalated when body has escalation signals", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Tech debt audit", "Weekly audit parent for Q1 decomposition.", ["status/ready"])).toBe("escalated");
+  });
+
+  it("reclass backlog→escalated when needs-escalation label present", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix login bug", null, ["status/ready", "needs-escalation"])).toBe("escalated");
+    expect(shouldReclassifyStaleBacklog("backlog", "Add new feature", null, ["status/ready", "needs-gpt"])).toBe("escalated");
+  });
+
+  it("does NOT treat priority/p1 as escalation signal", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix urgent bug", null, ["status/ready", "priority/p1"])).toBe("normal");
+  });
+
+  it("falls back to normal when classifier returns backlog for active-status issue", () => {
+    // Issue has status/ready but body contains backlog signals like "placeholder"
+    expect(shouldReclassifyStaleBacklog("backlog", "New feature TBD", "This is a placeholder. More details needed.", ["status/ready"])).toBe("normal");
+  });
+
+  it("returns null when no active status label present", () => {
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix bug", null, ["enhancement", "bug"])).toBeNull();
+  });
+
+  it("preserves existing normal/escalated lanes by returning null", () => {
+    // These verify the route won't overwrite non-backlog lanes
+    expect(shouldReclassifyStaleBacklog("normal", "Fix bug", null, ["status/ready"])).toBeNull();
+    expect(shouldReclassifyStaleBacklog("escalated", "Fix bug", null, ["status/ready"])).toBeNull();
   });
 });
 
