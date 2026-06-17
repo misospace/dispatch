@@ -1,10 +1,15 @@
 import { NextResponse } from "next/server";
+import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
 import { isValidLane, getLaneIds } from "@/lib/lane-config";
 
 export async function GET(request: Request) {
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const repo = searchParams.get("repo");
   const agent = searchParams.get("agent");

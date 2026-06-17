@@ -1,5 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
+}));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
@@ -16,20 +26,97 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 import { GET } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
 
 const TEST_AGENT = "test-agent";
 
+function makeRequest(urlString: string, includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  return GET(new Request(urlString, { headers }), {
+    params: Promise.resolve({ agentName: TEST_AGENT }),
+  });
+}
+
+describe("GET /api/agents/[agentName]/work-summary — auth", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.prFixFindMany.mockResolvedValue([]);
+  });
+
+  it("returns 401 when no auth header is present", async () => {
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+      false,
+    );
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 401 for bad bearer token", async () => {
+    const headers: Record<string, string> = { Authorization: "Bearer wrong-token" };
+    const res = await GET(
+      new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`, { headers }),
+      { params: Promise.resolve({ agentName: TEST_AGENT }) },
+    );
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("authorized request preserves existing summary response", async () => {
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.prFixFindMany.mockResolvedValue([]);
+
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.agentName).toBe(TEST_AGENT);
+    expect(body.issues).toHaveProperty("normal");
+    expect(body.prFixes).toHaveProperty("normal");
+  });
+
+  it("unauthorized request does not call prisma.issue.findMany", async () => {
+    await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+      false,
+    );
+
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+  });
+
+  it("unauthorized request does not call listQueuedPrFixItems", async () => {
+    await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+      false,
+    );
+
+    expect(mocks.prFixFindMany).not.toHaveBeenCalled();
+  });
+});
+
 describe("GET /api/agents/[agentName]/work-summary", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
     vi.clearAllMocks();
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.prFixFindMany.mockResolvedValue([]);
   });
 
   it("returns agent name and empty lane counts when no issues or PR fixes exist", async () => {
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -58,9 +145,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -75,9 +162,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["type/bug"], currentLane: "normal" },
     ]);
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -94,9 +181,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { lane: "NORMAL", status: "BLOCKED" },
     ]);
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -110,9 +197,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { lane: null, status: "QUEUED" },
     ]);
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -124,9 +211,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["status/ready"], currentLane: null },
     ]);
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -138,9 +225,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       { labels: ["status/done"], currentLane: "normal" },
     ]);
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -150,9 +237,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
   it("returns 500 on database error", async () => {
     mocks.issueFindMany.mockRejectedValue(new Error("connection refused"));
 
-    const res = await GET(new Request(`http://localhost/api/agents/${TEST_AGENT}/work-summary`), {
-      params: Promise.resolve({ agentName: TEST_AGENT }),
-    });
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
 
     expect(res.status).toBe(500);
     const body = await res.json();

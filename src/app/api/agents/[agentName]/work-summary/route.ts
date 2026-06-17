@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
 import { getConfiguredLanes, getDefaultClaimableLane } from "@/lib/lane-config";
@@ -23,6 +24,10 @@ function classifyIssueStatus(labels: string[]): "queued" | "inProgress" {
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
+
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   try {
     const issues = await prisma.issue.findMany({
