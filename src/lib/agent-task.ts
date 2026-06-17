@@ -1,18 +1,18 @@
-interface IssueRef {
+export interface IssueRef {
   repoFullName: string;
   number: number;
   title: string;
   url: string;
 }
 
-interface OptionalIssueRef {
+export interface OptionalIssueRef {
   repoFullName: string;
   number: number;
   title?: string;
   url?: string;
 }
 
-interface PullRequestRef {
+export interface PullRequestRef {
   repoFullName: string;
   number: number;
   url?: string;
@@ -122,7 +122,7 @@ export function createImplementTask(input: ImplementTaskInput): ImplementTask {
     issue: input.issue,
     instructions: input.instructions ?? IMPLEMENT_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? IMPLEMENT_STOP_AFTER,
-    forbiddenActions: input.forbiddenActions ?? IMPLEMENT_FORBIDDEN,
+    forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...IMPLEMENT_FORBIDDEN],
   };
 }
 
@@ -148,7 +148,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
     reasons: input.reasons,
     instructions: input.instructions ?? FOLLOWUP_PR_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? FOLLOWUP_PR_STOP_AFTER,
-    forbiddenActions: input.forbiddenActions ?? FOLLOWUP_PR_FORBIDDEN,
+    forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...FOLLOWUP_PR_FORBIDDEN],
   };
 }
 
@@ -168,6 +168,6 @@ export function createGroomTask(input: GroomTaskInput): GroomTask {
     issue: input.issue,
     instructions: input.instructions ?? GROOM_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? GROOM_STOP_AFTER,
-    forbiddenActions: input.forbiddenActions ?? GROOM_FORBIDDEN,
+    forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...GROOM_FORBIDDEN],
   };
 }

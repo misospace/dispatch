@@ -307,3 +307,48 @@ describe("AgentTask discriminated union", () => {
     expect(task.agentName).toBe("a");
   });
 });
+
+describe("forbiddenActions mutation isolation", () => {
+  it("mutating one implement task's forbiddenActions does not affect another", () => {
+    const issue = { repoFullName: "r", number: 1, title: "t", url: "u" };
+    const taskA = createImplementTask({ agentName: "a", issue });
+    const taskB = createImplementTask({ agentName: "b", issue });
+
+    taskA.forbiddenActions.push("Injected action");
+
+    expect(taskA.forbiddenActions).toContain("Injected action");
+    expect(taskB.forbiddenActions).not.toContain("Injected action");
+  });
+
+  it("mutating one followup-pr task's forbiddenActions does not affect another", () => {
+    const pr = { repoFullName: "r", number: 1 };
+    const taskA = createFollowupPrTask({ agentName: "a", pullRequest: pr, reasons: ["r"] });
+    const taskB = createFollowupPrTask({ agentName: "b", pullRequest: pr, reasons: ["r"] });
+
+    taskA.forbiddenActions.push("Injected action");
+
+    expect(taskA.forbiddenActions).toContain("Injected action");
+    expect(taskB.forbiddenActions).not.toContain("Injected action");
+  });
+
+  it("mutating one groom task's forbiddenActions does not affect another", () => {
+    const taskA = createGroomTask({ agentName: "a" });
+    const taskB = createGroomTask({ agentName: "b" });
+
+    taskA.forbiddenActions.push("Injected action");
+
+    expect(taskA.forbiddenActions).toContain("Injected action");
+    expect(taskB.forbiddenActions).not.toContain("Injected action");
+  });
+
+  it("mutating caller's input array does not affect created task", () => {
+    const custom = ["Custom forbidden"];
+    const issue = { repoFullName: "r", number: 1, title: "t", url: "u" };
+    const task = createImplementTask({ agentName: "a", issue, forbiddenActions: custom });
+
+    custom.push("Added after creation");
+
+    expect(task.forbiddenActions).not.toContain("Added after creation");
+    expect(task.forbiddenActions).toEqual(["Custom forbidden"]);
+  });
+});
