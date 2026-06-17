@@ -166,6 +166,71 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(Array.isArray(body.reasons)).toBe(true);
   });
 
+  it("includes linked issue context when PR-fix has an issue number", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-1",
+        repo: "org/repo",
+        pr: 12,
+        issue: 67,
+        branch: "fix/issue-67",
+        url: "https://github.com/org/repo/pull/12",
+        title: "Fix issue 67",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "review changes requested",
+        feedback: ["please update tests"],
+        evidenceKeys: ["review:1"],
+        author: "itsmiso-ai",
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.issue.repoFullName).toBe("org/repo");
+    expect(body.issue.number).toBe(67);
+  });
+
+  it("includes both reason and feedback in reasons", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-1",
+        repo: "org/repo",
+        pr: 12,
+        issue: null,
+        branch: "fix/something",
+        url: "https://github.com/org/repo/pull/12",
+        title: "Fix something",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "CI failure on main",
+        feedback: ["update tests", "fix lint"],
+        evidenceKeys: ["ci:1"],
+        author: "bot",
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.reasons).toContain("CI failure on main");
+    expect(body.reasons).toContain("update tests");
+    expect(body.reasons).toContain("fix lint");
+  });
+
   it("preserves lane filtering", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {

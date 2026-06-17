@@ -90,8 +90,9 @@ export async function GET(
 
     if (prFixQueueItems.length > 0) {
       const first = prFixQueueItems[0];
-      const reasons =
-        first.feedback.length > 0 ? first.feedback : [first.reason];
+      const reasons = [
+        ...new Set([first.reason, ...first.feedback].filter(Boolean)),
+      ];
       const task = createFollowupPrTask({
         agentName,
         lane: first.lane ?? undefined,
@@ -100,6 +101,9 @@ export async function GET(
           number: first.pr,
           url: first.url ?? undefined,
         },
+        issue: first.issue
+          ? { repoFullName: first.repo, number: first.issue }
+          : undefined,
         reasons,
       });
       return NextResponse.json(task);
