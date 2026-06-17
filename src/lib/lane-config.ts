@@ -19,6 +19,8 @@ export interface LaneConfig {
   title: string;
   /** Whether workers may claim issues in this lane */
   claimable: boolean;
+  /** Optional role hint for heuristic classification ("default" or "escalation") */
+  role?: "default" | "escalation";
   /** Optional human-readable description */
   description?: string;
   /** Optional hex color for UI rendering */
@@ -49,6 +51,7 @@ const DEFAULT_LANE_CONFIG: LaneConfigSet = {
       id: "normal",
       title: "Normal",
       claimable: true,
+      role: "default",
       description: "Standard execution lane for concrete, scoped implementation work.",
       color: "#3b82f6",
     },
@@ -56,6 +59,7 @@ const DEFAULT_LANE_CONFIG: LaneConfigSet = {
       id: "escalated",
       title: "Escalated",
       claimable: true,
+      role: "escalation",
       description: "Requires higher-judgment model support (architecture, design, cross-service).",
       color: "#f97316",
     },
@@ -149,6 +153,69 @@ export function getLaneIds(): string[] {
 export function isBacklogLane(id: string): boolean {
   const backlog = getBacklogLane();
   return backlog !== undefined && backlog.id === id;
+}
+
+// ─── Classification Helpers ──────────────────────────────────────────────────
+
+/**
+ * Return the default claimable lane.
+ * Prefers a lane with role "default", falls back to the first claimable lane.
+ */
+export function getDefaultClaimableLane(): LaneConfig | undefined {
+  const lanes = getConfiguredLanes();
+  const explicitDefault = lanes.find((l) => l.claimable && l.role === "default");
+  if (explicitDefault) return explicitDefault;
+  return lanes.find((l) => l.claimable);
+}
+
+/**
+ * Return the escalation lane, if configured.
+ * Prefers a lane with role "escalation". Falls back to the default claimable
+ * lane when no escalation lane exists — ensuring we never return an unknown id.
+ */
+export function getEscalationLane(): LaneConfig | undefined {
+  const lanes = getConfiguredLanes();
+  const explicitEscalation = lanes.find((l) => l.claimable && l.role === "escalation");
+  if (explicitEscalation) return explicitEscalation;
+  // Fall back to default claimable so we always have a valid lane id.
+  return getDefaultClaimableLane();
+}
+
+/**
+ * Signals used by heuristic classification to decide which lane an issue belongs to.
+ */
+export interface LaneSignals {
+  /** Issue has backlog/not-ready indicators (status/backlog, placeholder, etc.) */
+  isBacklog: boolean;
+  /** Issue has escalation/high-complexity indicators (architecture, RFC, etc.) */
+  isEscalation: boolean;
+}
+
+/**
+ * Map heuristic signals to a configured lane id.
+ * Never returns an unknown lane id — always falls back to the default claimable lane.
+ */
+export function classifyLaneFromSignals(signals: LaneSignals): string {
+  if (signals.isBacklog) {
+    const backlog = getBacklogLane();
+    if (backlog) return backlog.id;
+    // No non-claimable lane configured — fall back to default claimable.
+    const defaultLane = getDefaultClaimableLane();
+    if (defaultLane) return defaultLane.id;
+  }
+
+  if (signals.isEscalation) {
+    const escalation = getEscalationLane();
+    if (escalation) return escalation.id;
+  }
+
+  // Default: actionable issue -> default claimable lane.
+  const defaultLane = getDefaultClaimableLane();
+  if (defaultLane) return defaultLane.id;
+
+  // Should never happen (config validation requires at least one claimable lane),
+  // but provide a safe fallback.
+  return "normal";
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────

@@ -234,3 +234,121 @@ describe("serializeLaneData", () => {
     expect((data.reason as string).length).toBeLessThanOrEqual(500);
   });
 });
+
+describe("classifyByHeuristics config-aware", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  it("default config stays backward-compatible: concrete -> normal", () => {
+    const result = classifyByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
+    expect(result.lane).toBe("normal");
+  });
+
+  it("default config stays backward-compatible: architecture -> escalated", () => {
+    const result = classifyByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
+    expect(result.lane).toBe("escalated");
+  });
+
+  it("default config stays backward-compatible: backlog label -> backlog", () => {
+    const result = classifyByHeuristics("Fix bug", null, ["status/backlog"]);
+    expect(result.lane).toBe("backlog");
+  });
+
+  it("single claimable lane: actionable goes to that lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "work", title: "Work", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const result = classifyByHeuristics("Fix login bug", "Login fails.", ["bug"]);
+    expect(result.lane).toBe("work");
+  });
+
+  it("single claimable lane: high-complexity goes to same lane (no escalation)", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "work", title: "Work", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const result = classifyByHeuristics("Architecture review", "Design doc for auth.", ["type/feature"]);
+    expect(result.lane).toBe("work");
+  });
+
+  it("custom escalation lane: high-complexity goes to escalation lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "expert", title: "Expert", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const result = classifyByHeuristics("Architecture review", "Design doc for auth.", ["type/feature"]);
+    expect(result.lane).toBe("expert");
+  });
+
+  it("backlog goes to configured non-claimable lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "work", title: "Work", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    const result = classifyByHeuristics("Research options", null, ["type/research"]);
+    expect(result.lane).toBe("parked");
+  });
+
+  it("no hardcoded lane allowlist: custom lanes work", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "slow", title: "Slow Lane", claimable: true, role: "escalation" },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    expect(classifyByHeuristics("Fix typo", null, ["bug"]).lane).toBe("fast");
+    expect(classifyByHeuristics("RFC: new flow", "Design doc.", ["type/feature"]).lane).toBe("slow");
+    expect(classifyByHeuristics("Research", null, ["status/backlog"]).lane).toBe("parked");
+  });
+});
+
+describe("buildLaneClassificationPrompt config-aware", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  it("default config includes normal, escalated, backlog in prompt", () => {
+    const prompt = buildLaneClassificationPrompt("Test", "body", [], "open");
+    expect(prompt).toContain('"normal"|"escalated"|"backlog"');
+    expect(prompt).toContain("normal:");
+    expect(prompt).toContain("escalated:");
+    expect(prompt).toContain("backlog:");
+  });
+
+  it("custom config uses configured lane ids in prompt", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "slow", title: "Slow Lane", claimable: true, role: "escalation" },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    const prompt = buildLaneClassificationPrompt("Test", "body", [], "open");
+    expect(prompt).toContain('"fast"|"slow"|"parked"');
+    expect(prompt).not.toContain('"normal"');
+    expect(prompt).not.toContain('"escalated"');
+  });
+
+  it("single claimable lane config has only that lane and backlog in prompt", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "work", title: "Work", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const prompt = buildLaneClassificationPrompt("Test", "body", [], "open");
+    expect(prompt).toContain('"work"|"backlog"');
+  });
+});

@@ -1,6 +1,7 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   classifyLaneByHeuristics,
+  evaluateLaneSignals,
   extractFixingIssueNumbers,
   prBranchMatchesIssue,
   checkPrHealth,
@@ -10,6 +11,7 @@ import {
   executeActions,
   shouldReclassifyStaleBacklog,
 } from "./issue-reconciliation";
+import { setLaneConfig, resetLaneConfig } from "./lane-config";
 
 const githubModule = await import("./github");
 
@@ -792,5 +794,244 @@ describe("executeActions", () => {
 
     expect(result.success).toBe(false);
     expect(addLabelMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("classifyLaneByHeuristics config-aware", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  it("default config stays backward-compatible: concrete issue -> normal", () => {
+    const result = classifyLaneByHeuristics(
+      "Add dark mode toggle to settings page",
+      "Implement a toggle in the settings page.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("normal");
+  });
+
+  it("default config stays backward-compatible: architecture issue -> escalated", () => {
+    const result = classifyLaneByHeuristics(
+      "Database migration strategy for user tables",
+      "We need to plan the migration strategy.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("escalated");
+  });
+
+  it("default config stays backward-compatible: placeholder -> backlog", () => {
+    const result = classifyLaneByHeuristics(
+      "New feature TBD",
+      "This is a placeholder. More details needed.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("backlog");
+  });
+
+  it("single claimable lane: actionable issue goes to that lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "default", title: "Default", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const result = classifyLaneByHeuristics(
+      "Add dark mode toggle",
+      "Implement a toggle.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("default");
+  });
+
+  it("single claimable lane: high-complexity goes to same lane (no escalation lane)", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "default", title: "Default", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const result = classifyLaneByHeuristics(
+      "Database migration strategy",
+      "Plan the migration strategy.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("default");
+  });
+
+  it("single claimable lane: high-complexity goes to explicit escalation lane when configured", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "default", title: "Default", claimable: true, role: "default" },
+        { id: "expert", title: "Expert", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    const result = classifyLaneByHeuristics(
+      "Database migration strategy",
+      "Plan the migration strategy.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("expert");
+  });
+
+  it("backlog signals go to configured non-claimable lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "default", title: "Default", claimable: true },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    const result = classifyLaneByHeuristics(
+      "New feature TBD",
+      "This is a placeholder.",
+      ["enhancement"],
+    );
+    expect(result.lane).toBe("parked");
+  });
+
+  it("custom multi-lane config: high-complexity to configured escalation lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "alpha", title: "Alpha", claimable: true, role: "default" },
+        { id: "beta", title: "Beta", claimable: true, role: "escalation" },
+        { id: "gamma", title: "Gamma", claimable: false },
+      ],
+    });
+    const result = classifyLaneByHeuristics(
+      "Architecture review for auth service",
+      "Design doc for new authentication redesign.",
+      ["type/feature"],
+    );
+    expect(result.lane).toBe("beta");
+  });
+
+  it("no hardcoded lane allowlist rejects configured custom lanes", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "fast", title: "Fast Lane", claimable: true },
+        { id: "slow", title: "Slow Lane", claimable: true, role: "escalation" },
+        { id: "parked", title: "Parked", claimable: false },
+      ],
+    });
+    const normalResult = classifyLaneByHeuristics("Fix typo", null, ["bug"]);
+    expect(normalResult.lane).toBe("fast");
+    const escalatedResult = classifyLaneByHeuristics(
+      "RFC: new auth flow",
+      "Design document for authentication redesign",
+      ["type/feature"],
+    );
+    expect(escalatedResult.lane).toBe("slow");
+    const backlogResult = classifyLaneByHeuristics(
+      "Research API rate limiting",
+      null,
+      ["enhancement", "status/backlog"],
+    );
+    expect(backlogResult.lane).toBe("parked");
+  });
+
+  it("never returns unknown lane ids", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "custom1", title: "Custom 1", claimable: true },
+        { id: "custom2", title: "Custom 2", claimable: false },
+      ],
+    });
+    const lanes = new Set<string>();
+    // Test all signal combinations
+    lanes.add(
+      classifyLaneByHeuristics("Fix typo", null, ["bug"]).lane,
+    );
+    lanes.add(
+      classifyLaneByHeuristics("Architecture review", "Design doc.", ["type/feature"]).lane,
+    );
+    lanes.add(
+      classifyLaneByHeuristics("TBD", "placeholder", ["enhancement"]).lane,
+    );
+    for (const lane of lanes) {
+      expect(["custom1", "custom2"]).toContain(lane);
+    }
+  });
+});
+
+describe("shouldReclassifyStaleBacklog config-aware", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  it("default config: reclass backlog->normal for concrete issue", () => {
+    expect(
+      shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready", "enhancement"]),
+    ).toBe("normal");
+  });
+
+  it("default config: reclass backlog->escalated for architecture issue", () => {
+    expect(
+      shouldReclassifyStaleBacklog("backlog", "Database migration strategy for user tables", null, ["status/ready", "enhancement"]),
+    ).toBe("escalated");
+  });
+
+  it("single claimable lane: reclass to that lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "default", title: "Default", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    expect(
+      shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready"]),
+    ).toBe("default");
+  });
+
+  it("single claimable lane: high-complexity reclass to same lane (no escalation)", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "default", title: "Default", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    expect(
+      shouldReclassifyStaleBacklog("backlog", "Database migration strategy", null, ["status/ready"]),
+    ).toBe("default");
+  });
+
+  it("custom escalation lane: high-complexity reclass to escalation lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "expert", title: "Expert", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    expect(
+      shouldReclassifyStaleBacklog("backlog", "Database migration strategy", null, ["status/ready"]),
+    ).toBe("expert");
+  });
+
+  it("falls back to default claimable when classifier returns backlog for active-status issue", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "work", title: "Work", claimable: true },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+    });
+    expect(
+      shouldReclassifyStaleBacklog("backlog", "New feature TBD", "This is a placeholder.", ["status/ready"]),
+    ).toBe("work");
+  });
+
+  it("rejection of unknown lane ids: never writes hardcoded lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "alpha", title: "Alpha", claimable: true },
+        { id: "beta", title: "Beta", claimable: true, role: "escalation" },
+        { id: "gamma", title: "Gamma", claimable: false },
+      ],
+    });
+    // gamma is the backlog lane; reclassify from gamma
+    const result1 = shouldReclassifyStaleBacklog("gamma", "Fix typo", null, ["status/ready"]);
+    expect(["alpha", "beta"]).toContain(result1);
+    const result2 = shouldReclassifyStaleBacklog("gamma", "Architecture review", "Design doc.", ["status/ready"]);
+    expect(["alpha", "beta"]).toContain(result2);
   });
 });
