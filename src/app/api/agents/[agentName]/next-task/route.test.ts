@@ -1,5 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
+}));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
@@ -21,9 +31,18 @@ vi.mock("@/lib/lease", () => ({
 }));
 
 import { GET } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
+
+function request(url: string, agentName = "example-agent", includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  return new Request(`http://localhost${url}`, { headers });
+}
 
 describe("GET /api/agents/[agentName]/next-task", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
     mocks.issueFindMany.mockResolvedValue([]);
@@ -32,7 +51,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("returns idle when the queue is empty", async () => {
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task"),
+      request("/api/agents/example-agent/next-task"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -45,7 +64,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("returns idle when queue is empty (not an array)", async () => {
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task"),
+      request("/api/agents/example-agent/next-task"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -68,7 +87,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -108,7 +127,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -151,7 +170,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -188,7 +207,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -220,7 +239,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -256,7 +275,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -280,7 +299,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -303,9 +322,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request(
-        "http://localhost/api/agents/example-agent/next-task?lane=normal&includeClaimed=true",
-      ),
+      request("/api/agents/example-agent/next-task?lane=normal&includeClaimed=true"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -329,7 +346,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -360,7 +377,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -384,7 +401,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -419,7 +436,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -468,7 +485,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -518,7 +535,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -549,7 +566,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -583,7 +600,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -616,7 +633,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -649,7 +666,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -680,7 +697,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=normal"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -693,7 +710,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.issueFindMany.mockResolvedValue([]);
 
     const res = await GET(
-      new Request("http://localhost/api/agents/example-agent/next-task"),
+      request("/api/agents/example-agent/next-task"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -710,7 +727,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.prFixFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -724,7 +741,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.prFixFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -737,7 +754,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -751,7 +768,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -767,7 +784,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.prFixFindMany.mockResolvedValue([]);
 
       await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -780,7 +797,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -807,7 +824,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=normal"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -829,7 +846,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -852,7 +869,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -874,7 +891,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -896,7 +913,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -918,7 +935,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -940,7 +957,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -953,7 +970,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -970,7 +987,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -994,7 +1011,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1017,7 +1034,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1041,7 +1058,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1063,7 +1080,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1093,7 +1110,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1123,7 +1140,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1153,7 +1170,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1175,7 +1192,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1200,7 +1217,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1222,7 +1239,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1246,7 +1263,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1268,7 +1285,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       const res = await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1289,7 +1306,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1313,7 +1330,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
@@ -1334,11 +1351,105 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       ]);
 
       await GET(
-        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        request("/api/agents/groomer/next-task?mode=groom"),
         { params: Promise.resolve({ agentName: "groomer" }) },
       );
 
       // Groom mode does not query leases at all
+      expect(mocks.findLeasedIssueIds).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── Auth tests ──────────────────────────────────────────────────
+
+  describe("auth", () => {
+    it("returns 401 when no authorization header is provided", async () => {
+      const res = await GET(
+        request("/api/agents/example-agent/next-task", "example-agent", false),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it("returns 401 when bearer token is wrong", async () => {
+      const res = await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task", {
+          headers: { Authorization: "Bearer wrong-token" },
+        }),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it("allows normal worker next-task with valid bearer token", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          id: "issue-1",
+          number: 42,
+          title: "Fix login bug",
+          url: "https://github.com/org/repo/issues/42",
+          labels: ["priority/p0", "status/ready"],
+          currentLane: "normal",
+          decomposed: false,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.type).toBe("implement");
+      expect(body.issue.number).toBe(42);
+    });
+
+    it("allows mode=groom with valid bearer token", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        request("/api/agents/groomer/next-task?mode=groom", "groomer"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(10);
+    });
+
+    it("unauthorized normal request does not call pr-fix, issues, or leases", async () => {
+      const res = await GET(
+        request("/api/agents/example-agent/next-task", "example-agent", false),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(res.status).toBe(401);
+      expect(mocks.issueFindMany).not.toHaveBeenCalled();
+      expect(mocks.prFixFindMany).not.toHaveBeenCalled();
+      expect(mocks.findLeasedIssueIds).not.toHaveBeenCalled();
+    });
+
+    it("unauthorized groom request does not call issues, pr-fix, or leases", async () => {
+      const res = await GET(
+        request("/api/agents/groomer/next-task?mode=groom", "groomer", false),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      expect(res.status).toBe(401);
+      expect(mocks.issueFindMany).not.toHaveBeenCalled();
+      expect(mocks.prFixFindMany).not.toHaveBeenCalled();
       expect(mocks.findLeasedIssueIds).not.toHaveBeenCalled();
     });
   });
