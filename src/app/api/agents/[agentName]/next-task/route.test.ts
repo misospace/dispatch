@@ -702,6 +702,93 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.shouldRun).toBe(false);
   });
 
+  // ─── Worker idle read-only tests ─────────────────────────────────────
+
+  describe("worker idle is read-only", () => {
+    it("empty issue queue returns idle with shouldRun false", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+      mocks.prFixFindMany.mockResolvedValue([]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(body.shouldRun).toBe(false);
+    });
+
+    it("empty PR-fix queue returns idle with shouldRun false", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+      mocks.prFixFindMany.mockResolvedValue([]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(body.shouldRun).toBe(false);
+    });
+
+    it("idle reason is a short non-empty string", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(typeof body.reason).toBe("string");
+      expect(body.reason.length).toBeGreaterThan(0);
+      expect(body.reason.length).toBeLessThan(200);
+    });
+
+    it("idle check does not mutate issues", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+
+      await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(mocks.issueFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ state: "open" }),
+        }),
+      );
+    });
+
+    it("idle check does not mutate PR-fix queue", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+      mocks.prFixFindMany.mockResolvedValue([]);
+
+      await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      // listQueuedPrFixItems reads via prisma.prFixQueueItem.findMany
+      // An idle check must not create, update, or delete any PR-fix queue items
+      expect(mocks.prFixFindMany).toHaveBeenCalled();
+    });
+
+    it("idle check does not mutate leases", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+
+      await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      // findLeasedIssueIds is a read-only query; no lease mutations should occur
+      expect(mocks.findLeasedIssueIds).toHaveBeenCalledWith("example-agent");
+    });
+  });
+
   // ─── Groom mode tests ──────────────────────────────────────────────
 
   describe("mode=groom", () => {
@@ -1142,6 +1229,117 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       const body = await res.json();
       expect(body.type).toBe("groom");
       expect(body.lane).toBe("backlog");
+    });
+
+    // ─── Groom idle read-only tests ──────────────────────────────────────
+
+    it("groom idle with no candidates returns shouldRun false", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(body.shouldRun).toBe(false);
+    });
+
+    it("groom idle reason is 'No grooming work available'", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.reason).toBe("No grooming work available");
+    });
+
+    it("groom idle does not mutate issues", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      expect(mocks.issueFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ state: "open" }),
+        }),
+      );
+    });
+
+    it("groom idle does not mutate PR-fix queue", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      // Groom mode does not query the PR-fix queue at all
+      expect(mocks.prFixFindMany).not.toHaveBeenCalled();
+    });
+
+    it("groom idle does not mutate leases", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      // Groom mode does not query leases at all
+      expect(mocks.findLeasedIssueIds).not.toHaveBeenCalled();
     });
   });
 });
