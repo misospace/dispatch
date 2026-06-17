@@ -110,6 +110,34 @@ export async function GET(
     }
 
     if (queue.length > 0) {
+      // Scan for linked PR follow-up before returning implement task
+      const followupItem = queue.find(
+        (item) => item.linkedPrHealth?.needsFollowup && item.linkedPrHealth?.number,
+      );
+
+      if (followupItem && followupItem.linkedPrHealth?.number) {
+        const health = followupItem.linkedPrHealth;
+        const task = createFollowupPrTask({
+          agentName,
+          lane: followupItem.lane ?? undefined,
+          issue: {
+            repoFullName: followupItem.repoFullName ?? "",
+            number: followupItem.number,
+            title: followupItem.title,
+            url: followupItem.url,
+          },
+          pullRequest: {
+            repoFullName: followupItem.repoFullName ?? "",
+            number: health.number!,
+            url: health.url ?? undefined,
+          },
+          reasons: health.followupReasons.length > 0
+            ? health.followupReasons
+            : ["Linked PR needs follow-up"],
+        });
+        return NextResponse.json(task);
+      }
+
       const first = queue[0];
       const task = createImplementTask({
         agentName,
