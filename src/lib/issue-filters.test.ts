@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { buildLabelWhere, discoverLabelFilterOptions, toProjectLabel, buildVisibleIssueWhere, getDoneRetentionDays, DEFAULT_DONE_RETENTION_DAYS } from "./issue-filters";
+import { buildLabelWhere, discoverLabelFilterOptions, toProjectLabel, buildVisibleIssueWhere, getDoneRetentionDays, DEFAULT_DONE_RETENTION_DAYS, buildNoStatusWhere } from "./issue-filters";
 
 describe("issue filter helpers", () => {
   it("discovers sorted agent and owner options from labels only", () => {
@@ -39,6 +39,22 @@ describe("issue filter helpers", () => {
   it("normalizes project filter values to project labels", () => {
     expect(toProjectLabel("api")).toBe("project/api");
     expect(toProjectLabel("")).toBeUndefined();
+  });
+});
+
+describe("buildNoStatusWhere", () => {
+  it("returns undefined when includeUntriaged is false", () => {
+    expect(buildNoStatusWhere(false)).toBeUndefined();
+  });
+
+  it("returns hasNone filter with STATUS_LABELS when includeUntriaged is true", () => {
+    const result = buildNoStatusWhere(true);
+    expect(result).toBeDefined();
+    expect(result!.hasNone).toContain("status/backlog");
+    expect(result!.hasNone).toContain("status/ready");
+    expect(result!.hasNone).toContain("status/in-progress");
+    expect(result!.hasNone).toContain("status/in-review");
+    expect(result!.hasNone).toContain("status/done");
   });
 });
 

@@ -1,4 +1,4 @@
-import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX } from "@/types";
+import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
 
 export interface VisibleIssueWhereOptions {
   includeClosed?: boolean;
@@ -47,6 +47,15 @@ export function isIssueExcludedByLabels(issueLabels: string[], excludedLabels: s
 export function buildExcludedLabelWhere(excludedLabels: string[]) {
   if (excludedLabels.length === 0) return undefined;
   return { hasNone: excludedLabels };
+}
+
+/**
+ * Build a Prisma where clause that matches issues with no status/* label.
+ * Used for grooming intake — surfaces untriaged open issues.
+ */
+export function buildNoStatusWhere(includeUntriaged: boolean): { hasNone: string[] } | undefined {
+  if (!includeUntriaged) return undefined;
+  return { hasNone: STATUS_LABELS };
 }
 
 export function toProjectLabel(project: string | null | undefined) {

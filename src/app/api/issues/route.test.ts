@@ -99,6 +99,38 @@ describe("GET /api/issues — visible issue filtering", () => {
     expect(call.where.decomposed).toBe(true);
   });
 
+  it("filters for untriaged issues (no status label) when untriaged=true", async () => {
+    await makeRequest("http://localhost/api/issues?untriaged=true");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.labels).toBeDefined();
+    expect(call.where.labels.hasNone).toBeDefined();
+    expect(call.where.labels.hasNone).toContain("status/backlog");
+    expect(call.where.labels.hasNone).toContain("status/ready");
+    expect(call.where.labels.hasNone).toContain("status/in-progress");
+    expect(call.where.labels.hasNone).toContain("status/in-review");
+    expect(call.where.labels.hasNone).toContain("status/done");
+  });
+
+  it("does not add hasNone filter when untriaged is not true", async () => {
+    await makeRequest("http://localhost/api/issues?untriaged=false");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    // labels may have other filters but should not have hasNone from noStatus
+    if (call.where.labels) {
+      expect(call.where.labels.hasNone).toBeUndefined();
+    }
+  });
+
+  it("combines untriaged filter with agent filter", async () => {
+    await makeRequest("http://localhost/api/issues?untriaged=true&agent=agent/alpha");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.labels.has).toBe("agent/alpha");
+    expect(call.where.labels.hasNone).toBeDefined();
+    expect(call.where.labels.hasNone).toContain("status/ready");
+  });
+
   it("orders by updatedAt descending", async () => {
     await makeRequest("http://localhost/api/issues");
 
