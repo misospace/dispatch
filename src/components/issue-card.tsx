@@ -37,6 +37,11 @@ function formatFollowupReason(reason: string): string {
   }
 }
 
+/** Normalize a hex color string to always include a leading `#`. */
+function normalizeHexColor(color: string): string {
+  return color.startsWith("#") ? color : `#${color}`;
+}
+
 export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCardProps) {
   const {
     attributes,
@@ -556,13 +561,14 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
           {issue.currentLane && lanes && (() => {
             const laneConfig = lanes.find((l) => l.id === issue.currentLane);
             if (!laneConfig) return null;
-            const color = laneConfig.color ?? "#6b7280";
+            const rawColor = laneConfig.color ?? "#6b7280";
+            const hex = normalizeHexColor(rawColor).slice(1);
             return (
               <span
                 className="px-1.5 py-0.5 text-xs rounded"
                 style={{
-                  backgroundColor: `${color}20`,
-                  color: `#${color}`,
+                  backgroundColor: `#${hex}20`,
+                  color: `#${hex}`,
                   opacity: laneConfig.claimable ? 1 : 0.6,
                 }}
                 title={`Lane: ${laneConfig.title}${laneConfig.claimable ? "" : " (non-claimable)"}`}

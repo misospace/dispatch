@@ -177,4 +177,26 @@ describe("GET /api/issues — visible issue filtering", () => {
     expect(res.status).toBe(500);
     expect(body.error).toBe("Failed to fetch issues");
   });
+
+  it("returns 400 for invalid lane filter", async () => {
+    const res = await makeRequest("http://localhost/api/issues?lane=unknown-lane");
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body.error).toContain('Invalid lane: "unknown-lane"');
+  });
+
+  it("filters by valid configured lane", async () => {
+    await makeRequest("http://localhost/api/issues?lane=normal");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane).toBe("normal");
+  });
+
+  it("filters by backlog lane", async () => {
+    await makeRequest("http://localhost/api/issues?lane=backlog");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane).toBe("backlog");
+  });
 });

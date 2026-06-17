@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
-import { isValidLane } from "@/lib/lane-config";
+import { isValidLane, getLaneIds } from "@/lib/lane-config";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -45,7 +45,13 @@ export async function GET(request: Request) {
     if (noStatusFilter) where.labels = { ...(where.labels as object), ...noStatusFilter };
 
     // Filter by execution lane
-    if (lane && isValidLane(lane)) {
+    if (lane) {
+      if (!isValidLane(lane)) {
+        return NextResponse.json(
+          { error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}` },
+          { status: 400 },
+        );
+      }
       where.currentLane = lane.toLowerCase();
     }
 
