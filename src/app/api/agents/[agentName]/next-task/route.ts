@@ -8,6 +8,7 @@ import {
   createIdleTask,
   createImplementTask,
   createFollowupPrTask,
+  createGroomTask,
 } from "@/lib/agent-task";
 
 export async function GET(
@@ -20,8 +21,73 @@ export async function GET(
   const excludeDecomposed = searchParams.get("exclude_decomposed");
   const includeClaimed = searchParams.get("includeClaimed") === "true";
   const includeRenovate = searchParams.get("includeRenovate") === "true";
+  const mode = searchParams.get("mode");
 
   try {
+    // Groom mode: return exactly one issue to triage/enrich
+    if (mode === "groom") {
+      const issues = await prisma.issue.findMany({
+        where: {
+          state: "open",
+          repository: { enabled: true },
+        },
+        select: {
+          number: true,
+          title: true,
+          url: true,
+          labels: true,
+          currentLane: true,
+          repository: { select: { fullName: true } },
+        },
+        orderBy: { number: "asc" },
+      });
+
+      const candidates = issues
+        .map((issue) => {
+          const hasStatus = issue.labels.some((l) => l.startsWith("status/"));
+          const hasPriority = issue.labels.some((l) => l.startsWith("priority/"));
+          const hasAgent = issue.labels.some((l) => l.startsWith("agent/"));
+          const hasLane = !!issue.currentLane;
+          const isBacklog = issue.currentLane === "backlog";
+          const isUnlabeled = issue.labels.length === 0;
+
+          // Eligible if missing any key metadata
+          const eligible =
+            isUnlabeled || !hasStatus || !hasPriority || !hasAgent || !hasLane || isBacklog;
+
+          // Score: fewer missing fields = lower priority (higher number)
+          // Priority order: unlabeled > missing status > missing priority > backlog lane
+          let score = 0;
+          if (isUnlabeled) score += 1000;
+          if (!hasStatus) score += 500;
+          if (!hasPriority) score += 250;
+          if (isBacklog) score += 100;
+          if (!hasAgent) score += 50;
+          if (!hasLane && !isBacklog) score += 25;
+
+          return { issue, eligible, score };
+        })
+        .filter((c) => c.eligible)
+        .sort((a, b) => b.score - a.score || a.issue.number - b.issue.number);
+
+      if (candidates.length === 0) {
+        return NextResponse.json(createIdleTask("No grooming work available"));
+      }
+
+      const best = candidates[0].issue;
+      const task = createGroomTask({
+        agentName,
+        lane: best.currentLane ?? undefined,
+        issue: {
+          repoFullName: best.repository.fullName,
+          number: best.number,
+          title: best.title,
+          url: best.url,
+        },
+      });
+      return NextResponse.json(task);
+    }
+
     const issues = await prisma.issue.findMany({
       where: {
         state: "open",

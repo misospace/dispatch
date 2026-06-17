@@ -701,4 +701,425 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.type).toBe("idle");
     expect(body.shouldRun).toBe(false);
   });
+
+  // ─── Groom mode tests ──────────────────────────────────────────────
+
+  describe("mode=groom", () => {
+    it("default next-task behavior is unchanged when mode is absent", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          id: "issue-1",
+          number: 42,
+          title: "Fix login bug",
+          url: "https://github.com/org/repo/issues/42",
+          labels: ["priority/p0", "status/ready"],
+          currentLane: "normal",
+          decomposed: false,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("implement");
+      expect(body.issue.number).toBe(42);
+    });
+
+    it("mode=groom returns one groom task", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.shouldRun).toBe(true);
+      expect(body.agentName).toBe("groomer");
+    });
+
+    it("unlabeled issue is eligible", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(10);
+    });
+
+    it("issue missing status is eligible", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 20,
+          title: "Missing status",
+          url: "https://github.com/org/repo/issues/20",
+          labels: ["priority/p1"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(20);
+    });
+
+    it("issue missing priority is eligible", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 30,
+          title: "Missing priority",
+          url: "https://github.com/org/repo/issues/30",
+          labels: ["status/ready"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(30);
+    });
+
+    it("backlog lane issue is eligible", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 40,
+          title: "Backlog issue",
+          url: "https://github.com/org/repo/issues/40",
+          labels: ["status/backlog", "priority/p2"],
+          currentLane: "backlog",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(40);
+    });
+
+    it("fully labeled issue with lane is not eligible", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(body.reason).toBe("No grooming work available");
+    });
+
+    it("closed issues are excluded", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      expect(mocks.issueFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ state: "open" }),
+        }),
+      );
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+    });
+
+    it("disabled repo issues are excluded", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+
+      await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      expect(mocks.issueFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ repository: { enabled: true } }),
+        }),
+      );
+    });
+
+    it("no candidates returns idle", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 50,
+          title: "Fully labeled",
+          url: "https://github.com/org/repo/issues/50",
+          labels: ["status/ready", "priority/p0", "agent/alice"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(body.shouldRun).toBe(false);
+      expect(body.reason).toBe("No grooming work available");
+    });
+
+    it("groom mode does not claim or mutate anything", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      expect(mocks.issueFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ state: "open" }),
+        }),
+      );
+    });
+
+    it("groom mode returns one object, not an array", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(Array.isArray(body)).toBe(false);
+      expect(body.type).toBe("groom");
+    });
+
+    it("groom mode does not require harness-specific fields", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect("harness" in body).toBe(false);
+      expect("workflowRepo" in body).toBe(false);
+    });
+
+    it("prefers unlabeled issues over partially labeled", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 20,
+          title: "Missing status",
+          url: "https://github.com/org/repo/issues/20",
+          labels: ["priority/p1"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(10);
+    });
+
+    it("prefers missing status over missing priority", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 30,
+          title: "Missing priority",
+          url: "https://github.com/org/repo/issues/30",
+          labels: ["status/ready"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+        {
+          number: 20,
+          title: "Missing status",
+          url: "https://github.com/org/repo/issues/20",
+          labels: ["priority/p1"],
+          currentLane: "normal",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(20);
+    });
+
+    it("prefers lowest issue number as tie breaker", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 30,
+          title: "Also unlabeled",
+          url: "https://github.com/org/repo/issues/30",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.number).toBe(10);
+    });
+
+    it("includes issue context in groom task", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 10,
+          title: "Unlabeled issue",
+          url: "https://github.com/org/repo/issues/10",
+          labels: [],
+          currentLane: null,
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.issue.repoFullName).toBe("org/repo");
+      expect(body.issue.number).toBe(10);
+      expect(body.issue.title).toBe("Unlabeled issue");
+      expect(body.issue.url).toBe("https://github.com/org/repo/issues/10");
+    });
+
+    it("includes lane in groom task when available", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          number: 40,
+          title: "Backlog issue",
+          url: "https://github.com/org/repo/issues/40",
+          labels: ["status/backlog", "priority/p2"],
+          currentLane: "backlog",
+          repository: { fullName: "org/repo" },
+        },
+      ]);
+
+      const res = await GET(
+        new Request("http://localhost/api/agents/groomer/next-task?mode=groom"),
+        { params: Promise.resolve({ agentName: "groomer" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("groom");
+      expect(body.lane).toBe("backlog");
+    });
+  });
 });
