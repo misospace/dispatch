@@ -11,7 +11,7 @@ import {
   createFollowupPrTask,
   createGroomTask,
 } from "@/lib/agent-task";
-import { isValidLane, isBacklogLane } from "@/lib/lane-config";
+import { isBacklogLane } from "@/lib/lane-config";
 
 export async function GET(
   request: Request,
