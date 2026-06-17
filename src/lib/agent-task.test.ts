@@ -257,6 +257,16 @@ describe("createGroomTask", () => {
     expect(task.issue).toBeUndefined();
   });
 
+  it("preserves lane when provided", () => {
+    const task = createGroomTask({ ...baseInput, lane: "backlog" });
+    expect(task.lane).toBe("backlog");
+  });
+
+  it("omits lane when not provided", () => {
+    const task = createGroomTask(baseInput);
+    expect(task.lane).toBeUndefined();
+  });
+
   it("preserves custom instructions", () => {
     const task = createGroomTask({ ...baseInput, instructions: "Custom grooming" });
     expect(task.instructions).toBe("Custom grooming");

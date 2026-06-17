@@ -52,6 +52,7 @@ export interface GroomTask {
   type: "groom";
   shouldRun: true;
   agentName: string;
+  lane?: string;
   issue?: IssueRef;
   instructions: string;
   stopAfter: string;
@@ -154,6 +155,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
 
 export interface GroomTaskInput {
   agentName: string;
+  lane?: string;
   issue?: IssueRef;
   instructions?: string;
   stopAfter?: string;
@@ -165,6 +167,7 @@ export function createGroomTask(input: GroomTaskInput): GroomTask {
     type: "groom",
     shouldRun: true,
     agentName: input.agentName,
+    lane: input.lane,
     issue: input.issue,
     instructions: input.instructions ?? GROOM_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? GROOM_STOP_AFTER,
