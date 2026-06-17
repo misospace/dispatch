@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { authorizeRequest } from "@/lib/auth";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr", "groom"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -25,11 +27,61 @@ export interface TaskReportBody {
   error?: string;
 }
 
+function deriveStatus(outcome: ValidOutcome): string {
+  if (outcome === "failed") return "failed";
+  if (outcome === "blocked") return "blocked";
+  return "completed";
+}
+
+async function resolveIssueId(
+  repoFullName: string | undefined,
+  issueNumber: number | undefined,
+): Promise<string | null> {
+  if (!repoFullName || issueNumber === undefined) return null;
+
+  const repo = await prisma.repository.findUnique({
+    where: { fullName: repoFullName },
+    select: { id: true },
+  });
+
+  if (!repo) return null;
+
+  const issue = await prisma.issue.findUnique({
+    where: { repositoryId_number: { repositoryId: repo.id, number: issueNumber } },
+    select: { id: true },
+  });
+
+  return issue?.id ?? null;
+}
+
+function buildTouchedUrls(
+  report: TaskReportBody,
+): string[] {
+  const urls: string[] = [];
+
+  if (report.repoFullName && report.issueNumber !== undefined) {
+    urls.push(`https://github.com/${report.repoFullName}/issues/${report.issueNumber}`);
+  }
+
+  if (report.pullRequestUrl) {
+    urls.push(report.pullRequestUrl);
+  } else if (report.repoFullName && report.pullRequestNumber !== undefined) {
+    urls.push(`https://github.com/${report.repoFullName}/pull/${report.pullRequestNumber}`);
+  }
+
+  return urls;
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ agentName: string }> },
 ) {
   const { agentName } = await params;
+
+  // Authenticate
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   let body: unknown;
   try {
@@ -95,9 +147,32 @@ export async function POST(
     error: raw.error as string | undefined,
   };
 
+  // Resolve issueId from repoFullName + issueNumber
+  const issueId = await resolveIssueId(report.repoFullName, report.issueNumber);
+
+  // Build touched URLs
+  const touchedIssueUrls = buildTouchedUrls(report);
+
+  // Persist AgentRun
+  const now = new Date();
+  const run = await prisma.agentRun.create({
+    data: {
+      agentName,
+      runType: report.taskType,
+      status: deriveStatus(report.outcome),
+      startedAt: now,
+      finishedAt: now,
+      summary: report.summary,
+      errorMessage: report.error,
+      touchedIssueUrls,
+      issueId,
+    },
+  });
+
   return NextResponse.json({
     ok: true,
     agentName,
     report,
+    agentRunId: run.id,
   });
 }
