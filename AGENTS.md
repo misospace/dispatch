@@ -180,41 +180,38 @@ This section is the source of truth for how any agent (Saffron, or any other har
 
 Every agent heartbeat follows this loop:
 
-1. **Best-effort `POST /api/sync`** to refresh Dispatch's issue cache. Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
-2. **`GET /api/agents/{agentName}/next-task?lane=normal`** (bearer-auth required). Returns exactly one `AgentTask`. If idle (`shouldRun: false`), stop immediately — do not start the model.
-3. **Execute exactly one task.** The task type determines what to do (see Task Types below).
-4. **`POST /api/agents/{agentName}/tasks/report`** (bearer-auth required). Report the outcome, then stop.
+1. **`GET /api/agents/{agentName}/next-task?lane=normal`** (bearer-auth required). Returns exactly one `AgentTask`. If idle (`shouldRun: false`), stop immediately — do not start the model.
+2. **Execute exactly one task.** The task type determines what to do (see Task Types below).
+3. **`POST /api/agents/{agentName}/tasks/report`** (bearer-auth required). Report the outcome, then stop.
 
 ```python
 def heartbeat(agent_name, dispatch_url):
-    # Step 1: best-effort sync
-    try:
-        post(f"{dispatch_url}/api/sync")
-    except Exception as e:
-        log_warning(f"sync failed: {e}")
+    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
 
-    # Step 2: fetch next task (auth required)
+    # Step 1: fetch next task (auth required)
     task = get(
         f"{dispatch_url}/api/agents/{agent_name}/next-task?lane=normal",
-        headers={"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"},
+        headers=auth,
     )
 
-    # Step 3: idle check — stop before model work
+    # Step 2: idle check — stop before model work
     if not task["shouldRun"]:
         return
 
-    # Step 4: execute exactly one task
+    # Step 3: execute exactly one task
     result = execute(task)
 
-    # Step 5: report outcome (auth required)
+    # Step 4: report outcome (auth required)
     post(
         f"{dispatch_url}/api/agents/{agent_name}/tasks/report",
-        headers={"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"},
+        headers=auth,
         json={"taskType": task["type"], "outcome": result["outcome"], **result["metadata"]},
     )
 
     # Stop
 ```
+
+**Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
 
 ### Auth Requirements
 
@@ -274,18 +271,21 @@ Workers must respect these constraints:
 
 ### Failure Modes
 
-* **Dispatch failures must not fail the heartbeat.** Sync, next-task, and report are all best-effort. Log a warning, continue.
+* **`next-task` failure:** If the endpoint returns an error, log a warning and stop — do not start the model.
+* **`tasks/report` failure:** If reporting fails after execution, log a warning and stop. The work was completed; the report is best-effort visibility.
+* **Optional sync failure:** Log as a freshness warning. Never block task execution.
 * **Tokens are secrets.** `DISPATCH_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
 
 ### Auditability
 
-Every state-changing move on Dispatch must produce an AuditLog row. Operators trace agent activity through `/api/audit`.
+* Label, lane, and issue state changes that go through Dispatch mutation APIs produce AuditLog entries. Operators trace these through `/api/audit`.
+* Task execution reports create AgentRun rows via `tasks/report`.
 
 ### Legacy APIs
 
 The following endpoints remain available for internal use and backward compatibility but are **not** the primary agent workflow:
 
-* `POST /api/sync` — best-effort cache refresh (still used at heartbeat start)
+* `POST /api/sync` — optional best-effort cache refresh
 * `POST /api/agent-runs` — legacy run ingestion (superseded by `tasks/report`)
 * `GET /api/issues` — raw issue listing (superseded by `next-task`)
 * `GET /api/agents/{name}/queue` — legacy queue endpoint (superseded by `next-task`)

@@ -48,12 +48,6 @@ The report endpoint accepts these outcomes:
 def worker_heartbeat(agent_name, dispatch_url):
     auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
 
-    # Best-effort sync — do not fail on error
-    try:
-        post(f"{dispatch_url}/api/sync")
-    except Exception as e:
-        log_warning(f"sync failed: {e}")
-
     # Fetch next task (auth required)
     task = get(
         f"{dispatch_url}/api/agents/{agent_name}/next-task?lane=normal",
@@ -80,17 +74,13 @@ def worker_heartbeat(agent_name, dispatch_url):
     # Stop
 ```
 
+**Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
+
 ## Generic Groomer Loop
 
 ```python
 def groomer_heartbeat(agent_name, dispatch_url):
     auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
-
-    # Best-effort sync — do not fail on error
-    try:
-        post(f"{dispatch_url}/api/sync")
-    except Exception as e:
-        log_warning(f"sync failed: {e}")
 
     # Fetch grooming task (auth required)
     task = get(
@@ -179,7 +169,7 @@ echo "$TASK" | codex --one-shot
 1. **One task per run:** The harness fetches one task, executes it, reports, and stops. It does not loop inside a single heartbeat.
 2. **Idle before model startup:** The `next-task` endpoint is read-only and cheap. Call it before starting the model to avoid wasted compute.
 3. **No lease mutation:** Calling `next-task` does not claim or lock any issue. The agent claims the issue as part of executing the task.
-4. **Best-effort sync:** Dispatch failures must not fail the heartbeat. Log a warning and continue.
+4. **Optional preflight sync:** `POST /api/sync` is optional and out-of-band. Sync failures should be logged as freshness warnings and must not block task execution.
 
 ## Source Code
 
