@@ -256,10 +256,8 @@ To enable OIDC authentication:
    - Record every board mutation with actor, action, before/after labels, success/failure
 
 9. **Deployment**
-   - Dockerfile for app
-   - Kubernetes manifests (bjw-s/app-template style)
-   - ExternalSecret placeholders for all secrets
-   - Internal-only ingress
+    - Dockerfile for containerized deployment (Debian bookworm-slim)
+    - Production database migrations run automatically on container startup
 
 ### Intentionally Not Included in Phase 1
 
@@ -337,9 +335,9 @@ npm run db:push
 
 ## Deployment
 
-The app uses the bjw-s/app-template Helm chart. See `home-ops/kubernetes/apps/base/llm/dispatch/` for manifests.
+Dispatch ships with a Dockerfile for containerized deployment. Orchestration manifests (Kubernetes, Docker Compose, etc.) are not included — deploy using whatever platform fits your infrastructure. Example Kubernetes manifests using the bjw-s/app-template Helm chart are available in optional example repos.
 
-Required secrets (via ExternalSecret):
+Required secrets:
 - `DATABASE_URL` - PostgreSQL connection string (canonical)
 - `GITHUB_TOKEN` - GitHub authentication
 - `DISPATCH_AGENT_TOKEN` - Agent API bearer token

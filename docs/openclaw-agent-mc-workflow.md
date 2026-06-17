@@ -105,17 +105,7 @@ All Dispatch interactions are best-effort from the heartbeat's perspective:
 
 ## Pre-Cutover Validation
 
-Before the OpenClaw agent stops grooming GitHub Projects and fully adopts Dispatch, run the [smoke checklist](./smoke-checklist.md):
-
-```bash
-# Against local dev instance
-node scripts/smoke-checklist.mjs http://localhost:3000
-
-# Against staging/prod
-node/scripts/smoke-checklist.mjs https://mc.example.com
-```
-
-All 11 checks in the smoke checklist must pass (or be explicitly skipped with justification) before proceeding with cutover.
+Before the OpenClaw agent stops grooming GitHub Projects and fully adopts Dispatch, run the [smoke checklist](./smoke-checklist.md). The checklist documents 14 verification steps covering health, sync, repos, issues, board UI, projects UI, agent runs, queue, claim/unclaim lifecycle, audit trail, log errors, and failure resilience. All checks must pass (or be explicitly skipped with documented reason) before trusting Dispatch for assignment decisions.
 
 ## API Reference Summary
 
