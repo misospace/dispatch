@@ -5,12 +5,20 @@ import { CSS } from "@dnd-kit/utilities";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction } from "@/types";
+
+interface LaneOption {
+  id: string;
+  title: string;
+  claimable: boolean;
+  color?: string;
+}
 import { GitPullRequest, MessageSquare, ExternalLink, MoreVertical, User, Users, X, Scissors, AlertTriangle, Info, Ban } from "lucide-react";
 import { useState, useCallback } from "react";
 import { authedFetch } from "@/lib/client-auth";
 
 interface IssueCardProps {
   issue: Issue;
+  lanes?: LaneOption[];
   isDragging?: boolean;
   onIssueUpdate?: (updatedIssue: Issue) => void;
 }
@@ -29,7 +37,7 @@ function formatFollowupReason(reason: string): string {
   }
 }
 
-export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) {
+export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCardProps) {
   const {
     attributes,
     listeners,
@@ -545,6 +553,24 @@ export function IssueCard({ issue, isDragging, onIssueUpdate }: IssueCardProps) 
               {priorityLabel.replace("priority/", "p")}
             </span>
           )}
+          {issue.currentLane && lanes && (() => {
+            const laneConfig = lanes.find((l) => l.id === issue.currentLane);
+            if (!laneConfig) return null;
+            const color = laneConfig.color ?? "#6b7280";
+            return (
+              <span
+                className="px-1.5 py-0.5 text-xs rounded"
+                style={{
+                  backgroundColor: `${color}20`,
+                  color: `#${color}`,
+                  opacity: laneConfig.claimable ? 1 : 0.6,
+                }}
+                title={`Lane: ${laneConfig.title}${laneConfig.claimable ? "" : " (non-claimable)"}`}
+              >
+                {laneConfig.title}
+              </span>
+            );
+          })()}
           {issue.linkedPrNeedsFollowup && (
             <a
               href={issue.linkedPrUrl ?? issue.url}

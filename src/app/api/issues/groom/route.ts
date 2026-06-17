@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { authorizeRequest } from "@/lib/auth";
+import { getEscalationLane } from "@/lib/lane-config";
 
 /**
  * Resolve the actor name for grooming attribution.
@@ -148,8 +149,8 @@ export async function POST(request: Request) {
         }
 
         case "escalate": {
-          // Set lane to escalated
-          groomingData.currentLane = "escalated";
+          const escalationLane = getEscalationLane();
+          groomingData.currentLane = escalationLane?.id ?? "escalated";
           groomingData.nextGroomingAction = "Implement or decompose into actionable sub-tasks";
           break;
         }

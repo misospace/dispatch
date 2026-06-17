@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
-import { VALID_LANES } from "@/types";
+import { getConfiguredLanes, getDefaultClaimableLane } from "@/lib/lane-config";
 
 type WorkSummaryLaneCounts = { queued: number; inProgress: number };
 type PrFixLaneCounts = { total: number; blocked: number };
@@ -36,13 +36,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       },
     });
 
+    const configuredLanes = getConfiguredLanes();
     const laneCounts: Record<string, WorkSummaryLaneCounts> = {};
-    for (const lane of VALID_LANES) {
-      laneCounts[lane] = { queued: 0, inProgress: 0 };
+    for (const lane of configuredLanes) {
+      laneCounts[lane.id] = { queued: 0, inProgress: 0 };
     }
 
     for (const issue of issues) {
-      const lane = (issue.currentLane ?? "normal").toLowerCase();
+      const defaultLane = getDefaultClaimableLane()?.id ?? "normal";
+      const lane = (issue.currentLane ?? defaultLane).toLowerCase();
       if (!laneCounts[lane]) continue;
 
       const status = classifyIssueStatus(issue.labels);

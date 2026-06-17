@@ -22,6 +22,13 @@ import { KanbanColumn } from "./kanban-column";
 import { IssueCard } from "./issue-card";
 import { Button } from "@/components/ui/button";
 import { BOARD_COLUMNS, Issue, StatusLabel } from "@/types";
+
+interface LaneOption {
+  id: string;
+  title: string;
+  claimable: boolean;
+  color?: string;
+}
 import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
 import { authedFetch } from "@/lib/client-auth";
 
@@ -33,6 +40,7 @@ const MOVE_SYNC_DEBOUNCE_MS = 10_000;
 
 interface KanbanBoardProps {
   initialIssues: Issue[];
+  lanes?: LaneOption[];
 }
 
 export interface KanbanBoardRef {
@@ -40,7 +48,7 @@ export interface KanbanBoardRef {
 }
 
 export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function KanbanBoard(
-  { initialIssues },
+  { initialIssues, lanes },
   ref
 ) {
   const [issues, setIssues] = useState<Issue[]>(initialIssues);
@@ -319,6 +327,7 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
                         <IssueCard
                           key={issue.id}
                           issue={issue}
+                          lanes={lanes}
                           onIssueUpdate={() => doRefresh()}
                         />
                       ))}

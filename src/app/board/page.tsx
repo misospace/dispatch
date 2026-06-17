@@ -5,10 +5,11 @@ import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getTrackedRepos } from "@/lib/config";
 import { buildLabelWhere, buildVisibleIssueWhere, discoverLabelFilterOptions, getDoneRetentionDays } from "@/lib/issue-filters";
+import { getConfiguredLanes, isValidLane } from "@/lib/lane-config";
 
 export const dynamic = "force-dynamic";
 
-async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string, includeClosed?: boolean) {
+async function getIssues(repo?: string, agent?: string, owner?: string, priority?: string, lane?: string, includeClosed?: boolean) {
   const where: Record<string, unknown> = { repository: { enabled: true } };
 
   buildVisibleIssueWhere(where, { includeClosed });
@@ -17,6 +18,10 @@ async function getIssues(repo?: string, agent?: string, owner?: string, priority
 
   const labels = buildLabelWhere([agent, owner, priority]);
   if (labels) where.labels = labels;
+
+  if (lane && isValidLane(lane)) {
+    where.currentLane = lane.toLowerCase();
+  }
 
   return prisma.issue.findMany({
     where,
@@ -59,18 +64,19 @@ async function getIssueSyncStatus() {
 }
 
 interface PageProps {
-  searchParams: Promise<{ repo?: string; agent?: string; owner?: string; priority?: string; includeClosed?: string }>;
+  searchParams: Promise<{ repo?: string; agent?: string; owner?: string; priority?: string; lane?: string; includeClosed?: string }>;
 }
 
 export default async function BoardPage({ searchParams }: PageProps) {
   const params = await searchParams;
   const includeClosed = params.includeClosed === "true";
   const [issues, repos, filterOptions, syncStatus] = await Promise.all([
-    getIssues(params.repo, params.agent, params.owner, params.priority, includeClosed),
+    getIssues(params.repo, params.agent, params.owner, params.priority, params.lane, includeClosed),
     getRepos(),
     getFilterOptions(),
     getIssueSyncStatus(),
   ]);
+  const lanes = getConfiguredLanes();
 
   return (
     <div className="space-y-6">
@@ -92,11 +98,13 @@ export default async function BoardPage({ searchParams }: PageProps) {
         repos={repos}
         agents={filterOptions.agents}
         owners={filterOptions.owners}
+        lanes={lanes}
         activeFilters={{
           repo: params.repo || "",
           agent: params.agent || "",
           owner: params.owner || "",
           priority: params.priority || "",
+          lane: params.lane || "",
         }}
       />
 
@@ -121,7 +129,7 @@ export default async function BoardPage({ searchParams }: PageProps) {
           </CardContent>
         </Card>
       ) : (
-        <KanbanBoardClient initialIssues={issues} />
+        <KanbanBoardClient initialIssues={issues} lanes={lanes} />
       )}
     </div>
   );

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
+import { isValidLane } from "@/lib/lane-config";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -10,6 +11,7 @@ export async function GET(request: Request) {
   const owner = searchParams.get("owner");
   const project = searchParams.get("project");
   const priority = searchParams.get("priority");
+  const lane = searchParams.get("lane");
   const decomposed = searchParams.get("decomposed");
   const untriaged = searchParams.get("untriaged");
   const includeClosed = searchParams.get("includeClosed");
@@ -41,6 +43,11 @@ export async function GET(request: Request) {
     // Filter for untriaged issues (no status/* label) — grooming intake
     const noStatusFilter = buildNoStatusWhere(untriaged === "true");
     if (noStatusFilter) where.labels = { ...(where.labels as object), ...noStatusFilter };
+
+    // Filter by execution lane
+    if (lane && isValidLane(lane)) {
+      where.currentLane = lane.toLowerCase();
+    }
 
     const issues = await prisma.issue.findMany({
       where,
