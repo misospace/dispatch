@@ -1,5 +1,9 @@
 # Generic Agent Workflow — Dispatch Assignment Layer
 
+> **⚠️ SUPERSEDED** — This document describes the legacy claim/unclaim workflow.
+> The canonical agent workflow now uses `GET /api/agents/{name}/next-task` and `POST /api/agents/{name}/tasks/report`.
+> See [AGENTS.md](../AGENTS.md) (Agent Workflow Contract) and [docs/generic-harness-loop.md](./generic-harness-loop.md) for current guidance.
+>
 > **Issue:** [misospace/dispatch#59](https://github.com/misospace/dispatch/issues/59)
 > **Date:** 2026-05-16
 
