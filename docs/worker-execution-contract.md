@@ -218,8 +218,12 @@ Renovate exclusion applies to issue queue items only, not PR review-fix queue it
 ## Linking
 
 This contract is referenced from:
-- [AGENTS.md](../AGENTS.md) — OpenClaw Agent Workflow Contract section
-- [OpenClaw Agent — Dispatch Phase 1 Workflow Contract](./openclaw-agent-mc-workflow.md) — historical pre-cutover reference (marked as archived)
+- [AGENTS.md](../AGENTS.md) — Agent Workflow Contract section
+- [Generic Harness Loop](./generic-harness-loop.md) — harness-agnostic integration examples
+
+## Relationship to next-task
+
+Workers using the canonical `next-task` endpoint automatically receive PR-fix items before issue work. The `next-task` endpoint handles PR-fix queue precedence, linked PR follow-up detection, and idle checks internally. This contract documents the detailed execution rules that apply regardless of how a worker discovers its task.
 
 ---
 

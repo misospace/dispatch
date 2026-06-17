@@ -172,55 +172,133 @@ src/
 
 Returns 503 if database is unreachable.
 
-## OpenClaw Agent Workflow Contract
+## Agent Workflow Contract
 
-This section is the source of truth for how an OpenClaw agent should interact with Dispatch. Agents should follow this contract instead of grooming a GitHub Project board.
+This section is the source of truth for how any agent (Saffron, or any other harness) interacts with Dispatch. It supersedes all prior workflow guidance.
 
-### Heartbeat lifecycle
+### Canonical One-Task Worker Loop
 
-At the **start** of each heartbeat:
+Every agent heartbeat follows this loop:
 
-1. **Best-effort `POST /api/sync`** to refresh Dispatch's issue cache. Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
+1. **`GET /api/agents/{agentName}/next-task?lane=normal`** (bearer-auth required). Returns exactly one `AgentTask`. If idle (`shouldRun: false`), stop immediately — do not start the model.
+2. **Execute exactly one task.** The task type determines what to do (see Task Types below).
+3. **`POST /api/agents/{agentName}/tasks/report`** (bearer-auth required). Report the outcome, then stop.
 
-At the **end** of each heartbeat:
+```python
+def heartbeat(agent_name, dispatch_url):
+    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
 
-2. **`POST /api/agent-runs`** (bearer-auth with `DISPATCH_AGENT_TOKEN`) with run metadata: `agentName`, `runType`, `status`, `startedAt`, `finishedAt`, `summary`, `touchedIssueUrls`.
+    # Step 1: fetch next task (auth required)
+    task = get(
+        f"{dispatch_url}/api/agents/{agent_name}/next-task?lane=normal",
+        headers=auth,
+    )
 
-### Reading work
+    # Step 2: idle check — stop before model work
+    if not task["shouldRun"]:
+        return
 
-3. **Read issues from `GET /api/issues`.** Do not query the Postgres cache directly — the API is the contract.
-4. **Prefer issues assigned via `agent/<agent-id>` label** if present. If no `agent/*` label exists, pick from **Ready** by default. Agents pick `status/ready` issues — `status/backlog` and unlabeled issues need triage and are excluded from the default queue.
-5. **Filter by execution lane** using the `lane` query param on `GET /api/agents/[agentName]/queue` (values: `NORMAL`, `ESCALATED`, `BACKLOG`). By default, BACKLOG issues are excluded from the normal agent queue.
-6. **Agents pick from Ready by default.** `status/backlog` or unlabeled issues are not queueable unless triage marks them Ready — they need grooming before being actionable.
-7. **Respect execution lane classification** when present: NORMAL issues are the primary queue for agents; ESCALATED issues may require higher-judgment support; BACKLOG issues are not actionable until decomposed.
+    # Step 3: execute exactly one task
+    result = execute(task)
 
-### PR review-fix queue
+    # Step 4: report outcome (auth required)
+    post(
+        f"{dispatch_url}/api/agents/{agent_name}/tasks/report",
+        headers=auth,
+        json={"taskType": task["type"], "outcome": result["outcome"], **result["metadata"]},
+    )
 
-8. **PR-fix items take precedence over issue work.** Before consuming from the assignment queue, query `GET /api/agents/[agentName]/queue?lane=normal` — `type: "pr-review-fix"` items appear first in the response array.
-9. **For each PR-fix item:** verify the PR is open and authored by the expected bot account, checkout the queued branch, apply minimal changes based on `feedback[]`, validate locally, push to the same branch, then mark via `POST /api/pr-fix-queue/mark` with status `fixed`, `blocked`, `stale`, or `ignored`.
-10. **Never open a new PR for a queued PR fix.** Workers only push to the existing branch.
-11. **PR-fix queue is the sole source of truth.** Do not use workspace-local scripts (e.g., `pr_fix_queue.py`) or state files (e.g., `.state/pr_fix_queue.json`) for PR-fix orchestration — all queue operations go through Dispatch APIs.
+    # Stop
+```
 
-### Source of truth
+**Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
 
-8. **GitHub Issues and PRs remain the source of truth.** Dispatch's Postgres is a cache; do not write back to it as if it were authoritative.
-9. **Do not rely on GitHub Projects.** The Projects board is deprecated for this workflow — group by repository instead.
-10. **Do not auto-close issues without explicit evidence of completion.** Dispatch's audit log is not a license to close — a green pipeline, merged PR, or human approval is.
+### Auth Requirements
 
-### Failure modes
+Both `next-task` and `tasks/report` require bearer token authentication via `DISPATCH_AGENT_TOKEN`. Use the existing Dispatch bearer token model — no new environment variables or auth schemes.
 
-11. **Dispatch failures must not fail the heartbeat.** Sync, agent-run POST, and issue read are all best-effort from the heartbeat's perspective. Log a warning, continue.
-12. **Tokens are secrets.** `DISPATCH_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
+```bash
+# Fetch next task
+curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  "$DISPATCH_URL/api/agents/saffron/next-task?lane=normal"
+
+# Report outcome
+curl -s -X POST -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"taskType":"implement","outcome":"pr_opened","repoFullName":"org/repo","issueNumber":42,"pullRequestUrl":"https://github.com/org/repo/pull/50"}' \
+  "$DISPATCH_URL/api/agents/saffron/tasks/report"
+```
+
+### Task Types
+
+The `next-task` endpoint returns one of four task types:
+
+| Type | `shouldRun` | Description |
+|------|-------------|-------------|
+| `idle` | `false` | No work available. Stop immediately — do not start the model. |
+| `implement` | `true` | Work exactly one GitHub issue. Open or update one PR, then stop. |
+| `followup-pr` | `true` | Update exactly one existing PR with requested changes, then stop. |
+| `groom` | `true` | Triage and enrich exactly one issue (labels, lane, status), then stop. (Use `?mode=groom`) |
+
+### Report Outcomes
+
+The `tasks/report` endpoint accepts these outcomes:
+
+| Outcome | Meaning |
+|---------|---------|
+| `pr_opened` | A new PR was opened for the issue |
+| `pr_updated` | An existing PR was updated with changes |
+| `issue_updated` | The issue was updated (labels, body, etc.) |
+| `issue_closed` | The issue was closed |
+| `blocked` | Work cannot proceed without external input |
+| `failed` | The task failed unexpectedly |
+| `no_changes_needed` | No action was required |
+
+### Worker Boundaries
+
+Workers must respect these constraints:
+
+* **Do not merge PRs.** Workers never merge pull requests.
+* **Do not groom unless taskType is `groom`.** Implementation workers do not triage issues.
+* **Do not claim another issue after finishing one task.** Report outcome and stop. The next heartbeat fetches the next task.
+* **Report outcome and stop.** Every heartbeat executes at most one task.
+
+### Source of Truth
+
+* **GitHub Issues and PRs remain the source of truth.** Dispatch's Postgres is a cache; do not write back to it as if it were authoritative.
+* **Do not rely on GitHub Projects.** The Projects board is deprecated for this workflow — group by repository instead.
+* **Do not auto-close issues without explicit evidence of completion.** A green pipeline, merged PR, or human approval is required.
+
+### Failure Modes
+
+* **`next-task` failure:** If the endpoint returns an error, log a warning and stop — do not start the model.
+* **`tasks/report` failure:** If reporting fails after execution, log a warning and stop. The work was completed; the report is best-effort visibility.
+* **Optional sync failure:** Log as a freshness warning. Never block task execution.
+* **Tokens are secrets.** `DISPATCH_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
 
 ### Auditability
 
-13. **Every state-changing move on Dispatch must produce an AuditLog row.** Operators trace agent activity through `/api/audit`. Drag-and-drop moves on the Kanban board already write audit entries via `POST /api/issues/move`; agents using the same endpoint inherit this behavior.
+* Label, lane, and issue state changes that go through Dispatch mutation APIs produce AuditLog entries. Operators trace these through `/api/audit`.
+* Task execution reports create AgentRun rows via `tasks/report`.
 
-### Worker execution contract
+### Legacy APIs
+
+The following endpoints remain available for internal use and backward compatibility but are **not** the primary agent workflow:
+
+* `POST /api/sync` — optional best-effort cache refresh
+* `POST /api/agent-runs` — legacy run ingestion (superseded by `tasks/report`)
+* `GET /api/issues` — raw issue listing (superseded by `next-task`)
+* `GET /api/agents/{name}/queue` — legacy queue endpoint (superseded by `next-task`)
+
+### Detailed Worker Contract
 
 For the detailed worker execution contract (PR fix queue precedence, duplicate PR avoidance, hard completion gates, branch naming conventions, failure response format), see [docs/worker-execution-contract.md](./docs/worker-execution-contract.md). This supersedes ad-hoc behavior and applies to all agent workers.
 
-### Worker cron prompt migration
+### Generic Harness Loop
+
+For harness-agnostic integration examples (curl, OpenClaw, Codex, Claude Code), see [docs/generic-harness-loop.md](./docs/generic-harness-loop.md).
+
+### Worker Cron Prompt Migration
 
 Worker cron prompts have been migrated from GitHub Project board readers to Dispatch queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](./docs/worker-cron-prompt-migration.md).
 

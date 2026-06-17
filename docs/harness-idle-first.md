@@ -1,5 +1,8 @@
 # Idle-First Harness Checks
 
+> **⚠️ SUPERSEDED** — This content has been consolidated into [docs/generic-harness-loop.md](./generic-harness-loop.md).
+> See the Generic Worker Loop and Generic Groomer Loop sections for the current integration pattern.
+>
 > **Issue:** [misospace/dispatch#399](https://github.com/misospace/dispatch/issues/399)
 > **Date:** 2026-06-16
 

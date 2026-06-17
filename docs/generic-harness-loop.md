@@ -46,14 +46,13 @@ The report endpoint accepts these outcomes:
 
 ```python
 def worker_heartbeat(agent_name, dispatch_url):
-    # Best-effort sync — do not fail on error
-    try:
-        post(f"{dispatch_url}/api/sync")
-    except Exception as e:
-        log_warning(f"sync failed: {e}")
+    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
 
-    # Fetch next task
-    task = get(f"{dispatch_url}/api/agents/{agent_name}/next-task?lane=normal")
+    # Fetch next task (auth required)
+    task = get(
+        f"{dispatch_url}/api/agents/{agent_name}/next-task?lane=normal",
+        headers=auth,
+    )
 
     # Exit immediately on idle
     if not task["shouldRun"]:
@@ -65,28 +64,29 @@ def worker_heartbeat(agent_name, dispatch_url):
     elif task["type"] == "followup-pr":
         result = update_pr(task["pullRequest"], task["reasons"])
 
-    # Report outcome
-    post(f"{dispatch_url}/api/agents/{agent_name}/tasks/report", {
-        "taskType": task["type"],
-        "outcome": result["outcome"],
-        **result["metadata"],
-    })
+    # Report outcome (auth required)
+    post(
+        f"{dispatch_url}/api/agents/{agent_name}/tasks/report",
+        headers=auth,
+        json={"taskType": task["type"], "outcome": result["outcome"], **result["metadata"]},
+    )
 
     # Stop
 ```
+
+**Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
 
 ## Generic Groomer Loop
 
 ```python
 def groomer_heartbeat(agent_name, dispatch_url):
-    # Best-effort sync — do not fail on error
-    try:
-        post(f"{dispatch_url}/api/sync")
-    except Exception as e:
-        log_warning(f"sync failed: {e}")
+    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
 
-    # Fetch grooming task
-    task = get(f"{dispatch_url}/api/agents/{agent_name}/next-task?mode=groom")
+    # Fetch grooming task (auth required)
+    task = get(
+        f"{dispatch_url}/api/agents/{agent_name}/next-task?mode=groom",
+        headers=auth,
+    )
 
     # Exit immediately on idle
     if not task["shouldRun"]:
@@ -96,12 +96,12 @@ def groomer_heartbeat(agent_name, dispatch_url):
     if task["type"] == "groom":
         result = groom_issue(task["issue"])
 
-    # Report outcome
-    post(f"{dispatch_url}/api/agents/{agent_name}/tasks/report", {
-        "taskType": task["type"],
-        "outcome": result["outcome"],
-        **result["metadata"],
-    })
+    # Report outcome (auth required)
+    post(
+        f"{dispatch_url}/api/agents/{agent_name}/tasks/report",
+        headers=auth,
+        json={"taskType": task["type"], "outcome": result["outcome"], **result["metadata"]},
+    )
 
     # Stop
 ```
@@ -116,15 +116,17 @@ Each example uses the same Dispatch contract. None implies OpenClaw is required.
 DISPATCH="https://dispatch.example.com"
 AGENT="saffron"
 
-# Idle check
-TASK=$(curl -s "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
+# Idle check (auth required)
+TASK=$(curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
 echo "$TASK" | python3 -c "import sys,json; t=json.load(sys.stdin); sys.exit(0 if t['shouldRun'] else 1)" || exit 0
 
 # Execute task (replace with your model invocation)
 # ...
 
-# Report result
+# Report result (auth required)
 curl -s -X POST "$DISPATCH/api/agents/$AGENT/tasks/report" \
+  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"taskType":"implement","outcome":"pr_opened"}'
 ```
@@ -136,7 +138,8 @@ Configure the scheduler to run a one-shot job per heartbeat:
 ```yaml
 schedule: "*/15 * * * *"
 command: |
-  TASK=$(curl -s "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
+  TASK=$(curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+    "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
   SHOULD_RUN=$(echo "$TASK" | jq -r '.shouldRun')
   [ "$SHOULD_RUN" = "false" ] && exit 0
   # Start model, execute task, report result
@@ -146,16 +149,17 @@ command: |
 
 Manually invoke the endpoint, read the task, and execute:
 
-1. Fetch `GET /api/agents/{name}/next-task?lane=normal`
+1. Fetch `GET /api/agents/{name}/next-task?lane=normal` (bearer auth required)
 2. If idle, stop
 3. Execute the task with your preferred tooling
-4. Report via `POST /api/agents/{name}/tasks/report`
+4. Report via `POST /api/agents/{name}/tasks/report` (bearer auth required)
 
 ### Codex or Claude Code One-Shot
 
 ```bash
-# One-shot: fetch task, feed to model, report
-TASK=$(curl -s "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
+# One-shot: fetch task, feed to model, report (auth required)
+TASK=$(curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
 echo "$TASK" | codex --one-shot
 # Report outcome after execution
 ```
@@ -165,7 +169,7 @@ echo "$TASK" | codex --one-shot
 1. **One task per run:** The harness fetches one task, executes it, reports, and stops. It does not loop inside a single heartbeat.
 2. **Idle before model startup:** The `next-task` endpoint is read-only and cheap. Call it before starting the model to avoid wasted compute.
 3. **No lease mutation:** Calling `next-task` does not claim or lock any issue. The agent claims the issue as part of executing the task.
-4. **Best-effort sync:** Dispatch failures must not fail the heartbeat. Log a warning and continue.
+4. **Optional preflight sync:** `POST /api/sync` is optional and out-of-band. Sync failures should be logged as freshness warnings and must not block task execution.
 
 ## Source Code
 
