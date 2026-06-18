@@ -42,6 +42,10 @@ GitHub Labels ↔ Kanban Board ↔ Audit Log
 Agent Runs → Dispatch → Agent Activity Page
 ```
 
+### Execution Lanes
+
+Issues are classified into execution lanes that control agent queue behavior and claimability. The default setup provides three lanes: `normal` (standard work), `escalated` (higher-judgment tasks), and `backlog` (non-actionable). Lanes are fully configurable via the `DISPATCH_LANE_CONFIG` environment variable, supporting custom lane IDs, migration aliases, and role-based classification routing. See [Configurable Execution Lanes](docs/configurable-lanes.md) for details.
+
 ## Required Labels
 
 ### Status Labels

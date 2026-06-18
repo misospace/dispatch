@@ -1,17 +1,14 @@
 import { NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/auth";
-import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { buildAgentQueue } from "@/lib/agent-queue";
-import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
-import { findLeasedIssueIds } from "@/lib/lease";
-import { parseExcludedLabels } from "@/lib/config";
+import { prisma } from "@/lib/prisma";
 import {
   createIdleTask,
   createImplementTask,
   createFollowupPrTask,
   createGroomTask,
 } from "@/lib/agent-task";
-import { isBacklogLane, isValidLane, getLaneIds, getBacklogLane, resolveRequestLane } from "@/lib/lane-config";
+import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
+import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 
 export async function GET(
   request: Request,
@@ -95,84 +92,25 @@ export async function GET(
       return NextResponse.json(task);
     }
 
-    const issues = await prisma.issue.findMany({
-      where: {
-        state: "open",
-        repository: { enabled: true },
-      },
-      select: {
-        id: true,
-        number: true,
-        title: true,
-        url: true,
-        labels: true,
-        currentLane: true,
-        decomposed: true,
-        repository: { select: { fullName: true } },
-        linkedPrNumber: true,
-        linkedPrUrl: true,
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: true,
-        linkedPrReviewDecision: true,
-        linkedPrMergeState: true,
-        linkedPrHealthCheckedAt: true,
-      },
+    const { laneValid, rankedQueue, prFixItems, availableLanes } = await fetchAgentQueueData({
+      agentName,
+      lane,
+      excludeDecomposed: excludeDecomposed === "true",
+      includeClaimed,
+      includeRenovate,
     });
 
-    const issueLane = resolveRequestLane(lane?.toLowerCase());
-    const prFixLane = lane;
-
-    // Validate lane against configured lanes (allow omitting lane for backward compatibility)
-    if (issueLane === null && lane) {
+    if (!laneValid) {
       return NextResponse.json(
         {
-          error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}`,
+          error: `Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`,
         },
         { status: 400 },
       );
     }
 
-    const leasedIssueIds = await findLeasedIssueIds(agentName);
-
-    const prFixItems = await listQueuedPrFixItems(
-      asPrFixQueueClient(prisma),
-      { lane: prFixLane },
-    );
-
-    const filteredIssues = issues.filter(
-      (issue) => !leasedIssueIds.includes(issue.id),
-    );
-
-    const queue = buildAgentQueue(
-      filteredIssues.map((issue) => ({
-        ...issue,
-        lane: issue.currentLane ?? undefined,
-        issueId: issue.id,
-        repoFullName: issue.repository.fullName,
-        linkedPrHealth: {
-          number: issue.linkedPrNumber,
-          url: issue.linkedPrUrl,
-          needsFollowup: issue.linkedPrNeedsFollowup,
-          followupReasons: issue.linkedPrFollowupReasons,
-          reviewDecision: issue.linkedPrReviewDecision,
-          mergeState: issue.linkedPrMergeState,
-          checkedAt: issue.linkedPrHealthCheckedAt?.toISOString() ?? null,
-        },
-      })),
-      agentName,
-      {
-        lane: issueLane ?? undefined,
-        excludeDecomposed: excludeDecomposed === "true",
-        includeClaimed,
-        includeRenovate,
-        excludedLabels: parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS),
-      },
-    );
-
-    const prFixQueueItems = prFixItems.map(toAgentQueuePrFixItem);
-
-    if (prFixQueueItems.length > 0) {
-      const first = prFixQueueItems[0];
+    if (prFixItems.length > 0) {
+      const first = prFixItems[0];
       const reasons = [
         ...new Set([first.reason, ...first.feedback].filter(Boolean)),
       ];
@@ -192,9 +130,9 @@ export async function GET(
       return NextResponse.json(task);
     }
 
-    if (queue.length > 0) {
+    if (rankedQueue.length > 0) {
       // Scan for linked PR follow-up before returning implement task
-      const followupItem = queue.find(
+      const followupItem = rankedQueue.find(
         (item) => item.linkedPrHealth?.needsFollowup && item.linkedPrHealth?.number,
       );
 
@@ -221,7 +159,7 @@ export async function GET(
         return NextResponse.json(task);
       }
 
-      const first = queue[0];
+      const first = rankedQueue[0];
       const task = createImplementTask({
         agentName,
         lane: first.lane ?? undefined,

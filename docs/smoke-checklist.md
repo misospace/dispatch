@@ -6,7 +6,7 @@
 
 This checklist documents the runtime smoke checks an operator or agent should run against a Dispatch instance to confirm the assignment layer is fully operational. Each check maps to a specific API endpoint, UI page, or log signal.
 
-Run all checks against the target instance (local dev, staging, or production) before cutover or after any deployment. Mark each as **PASS**, **FAIL**, or **SKIP** (with justification). All 14 checks must pass — or be explicitly skipped with documented reason — before trusting Dispatch for assignment decisions.
+Run all checks against the target instance (local dev, staging, or production) before cutover or after any deployment. Mark each as **PASS**, **FAIL**, or **SKIP** (with justification). All 17 checks must pass — or be explicitly skipped with documented reason — before trusting Dispatch for assignment decisions.
 
 ---
 
@@ -16,6 +16,7 @@ Run all checks against the target instance (local dev, staging, or production) b
 - At least one repository is tracked (`GET /api/automation/repos` returns items, or `GITHUB_REPOSITORIES` env var was set).
 - At least one issue has been synced (`POST /api/sync` was run successfully at least once).
 - A test agent identity is available (e.g. `"smoke-test"`).
+- `DISPATCH_AGENT_TOKEN` environment variable is set for bearer-authenticated endpoints (`next-task`, `tasks/report`).
 
 ---
 
@@ -231,6 +232,91 @@ where `N > 0`.
 
 ---
 
+### 15. Authenticated next-task returns a task (happy path)
+
+**Endpoint:** `GET <base-url>/api/agents/<agent-name>/next-task?lane=normal`
+
+**Headers:**
+```
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
+```
+
+**Expected response:**
+```json
+{
+  "shouldRun": true,
+  "type": "implement",
+  "issue": {
+    "number": 123,
+    "title": "Example issue title",
+    "url": "https://github.com/owner/repo/issues/123",
+    "labels": ["status/ready", "agent/smoke-test"],
+    "repository": "owner/repo"
+  }
+}
+```
+
+**Prerequisites:** At least one issue with `status/ready` label exists in a tracked repo. The agent must have been synced via `POST /api/sync` at least once.
+
+**Failure signal:** HTTP 401 (missing/invalid bearer token), HTTP 404 (agent not found), or `shouldRun: false` when work is expected.
+
+---
+
+### 16. Next-task returns idle when no work is available
+
+**Endpoint:** `GET <base-url>/api/agents/<agent-name>/next-task?lane=normal`
+
+**Headers:**
+```
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
+```
+
+**Expected response:**
+```json
+{
+  "shouldRun": false,
+  "type": "idle"
+}
+```
+
+**Prerequisites:** All issues in tracked repos are either closed, already claimed (`status/in-progress`), or in `status/done`. No PR-fix queue items are pending.
+
+**How to test:** After confirming check #15 passes with work available, resolve or close the remaining ready issues, then re-run this endpoint. The response should switch from `shouldRun: true` to `shouldRun: false` with `type: "idle"`.
+
+**Failure signal:** `shouldRun: true` when no work is available, or HTTP error. An idle response must not include an `issue` field.
+
+---
+
+### 17. Next-task with mode=groom returns groom task
+
+**Endpoint:** `GET <base-url>/api/agents/<agent-name>/next-task?mode=groom`
+
+**Headers:**
+```
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
+```
+
+**Expected response:**
+```json
+{
+  "shouldRun": true,
+  "type": "groom",
+  "issue": {
+    "number": 456,
+    "title": "Example issue title",
+    "url": "https://github.com/owner/repo/issues/456",
+    "labels": ["status/backlog"],
+    "repository": "owner/repo"
+  }
+}
+```
+
+**Prerequisites:** At least one issue exists that needs triage (e.g., missing `status/*` label, or in `status/backlog`). The agent must have been synced via `POST /api/sync` at least once.
+
+**Failure signal:** HTTP 401 (missing/invalid bearer token), or `shouldRun: false` when groomable issues exist. The `type` field must be `"groom"` when `mode=groom` is used.
+
+---
+
 ## Runbook: Interpreting Results
 
 | Result | Action |
@@ -247,9 +333,12 @@ where `N > 0`.
 - **Issues empty after sync:** GitHub token may lack permissions for the target repos. Verify `GITHUB_TOKEN` scopes.
 - **Audit log missing entries:** Check Prisma schema for `AuditLog` model and confirm migrations are deployed (`prisma migrate deploy`).
 - **BigInt errors in logs:** Prisma version mismatch or schema using `BigInt` without proper type handling. Check `prisma/schema.prisma` for `@db.BigInt` fields.
+- **next-task returns 401:** `DISPATCH_AGENT_TOKEN` is not set, expired, or does not match the server's configured token. Verify the env var on both client and server.
+- **next-task returns idle unexpectedly:** No issues with `status/ready` exist, or sync has not been run. Run `POST /api/sync` and verify at least one ready issue exists.
 
 ---
 
 ## History
 
 - **2026-05-16** — Created as assignment-layer runtime smoke checklist (Issue #60). Documents all 14 checks covering health, sync, repos, issues, board UI, projects UI, agent runs, queue, claim/unclaim lifecycle, audit trail, log errors, and failure resilience.
+- **2026-06-17** — Added checks 15–17 for `next-task` endpoint: authenticated happy path, idle path when no work available, and groom mode (Issue #422). Updated prerequisite section to include `DISPATCH_AGENT_TOKEN`.
