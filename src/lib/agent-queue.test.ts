@@ -875,4 +875,115 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
       expect(allIncludingParked).toHaveLength(3);
     });
   });
+
+  describe("lane aliases", () => {
+    afterEach(() => {
+      resetLaneConfig();
+    });
+
+    it("queue includes aliased issues under the resolved configured lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: {
+          normal: "local",
+          escalated: "frontier",
+          backlog: "parking-lot",
+        },
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+        makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "local" }),
+        makeIssue({ number: 3, labels: ["priority/p1", "status/ready"], lane: "parking-lot" }),
+      ];
+
+      // Filter by resolved lane "local" should include both "normal" (aliased) and "local" issues
+      const result = buildAgentQueue(issues, "worker-agent", { lane: "local" });
+      expect(result).toHaveLength(2);
+      expect(result.map((i) => i.number)).toEqual([2, 1]); // p0 local, then p1 normal(alias)
+    });
+
+    it("board/list includes unknown-lane issues when no lane filter is used", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local" },
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "unknown-lane" }),
+      ];
+
+      // Default queue (no lane filter) should include unknown-lane issues
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(2);
+    });
+
+    it("aliased backlog lane is excluded from default claimable queue", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { backlog: "parking-lot" },
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/backlog"], lane: "backlog" }),
+      ];
+
+      // Issue with lane "backlog" should resolve to "parking-lot" (non-claimable) and be excluded
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(1);
+      expect(result[0].number).toBe(1);
+    });
+
+    it("unknown-lane issues are not excluded from default queue", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local" },
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
+        makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "some-old-lane" }),
+      ];
+
+      // Unknown lane should not be excluded (preserve visibility)
+      const result = buildAgentQueue(issues, "worker-agent");
+      expect(result).toHaveLength(2);
+    });
+
+    it("configured lane query includes raw stored lane IDs that alias to the configured lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local", escalated: "local" },
+      });
+
+      const issues = [
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+        makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "escalated" }),
+        makeIssue({ number: 3, labels: ["priority/p2", "status/ready"], lane: "local" }),
+      ];
+
+      // Filter by "local" should include all three (normal, escalated, and local)
+      const result = buildAgentQueue(issues, "worker-agent", { lane: "local" });
+      expect(result).toHaveLength(3);
+      expect(result.map((i) => i.number)).toEqual([2, 1, 3]); // p0 escalated, p1 normal, p2 local
+    });
+  });
 });

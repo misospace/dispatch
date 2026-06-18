@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -244,5 +244,100 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("Failed to fetch work summary");
+  });
+});
+
+describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.prFixFindMany.mockResolvedValue([]);
+  });
+
+  afterEach(async () => {
+    const { resetLaneConfig } = await import("@/lib/lane-config");
+    resetLaneConfig();
+  });
+
+  it("counts aliased lanes under the resolved configured lane", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local", backlog: "parking-lot" },
+    });
+
+    mocks.issueFindMany.mockResolvedValue([
+      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/in-progress"], currentLane: "local" },
+      { labels: ["status/backlog"], currentLane: "backlog" },
+    ]);
+
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // "normal" aliases to "local", so both should count under "local"
+    expect(body.issues.local).toEqual({ queued: 1, inProgress: 1 });
+    // "backlog" aliases to "parking-lot"
+    expect(body.issues["parking-lot"]).toEqual({ queued: 1, inProgress: 0 });
+  });
+
+  it("exposes unknown lanes in unknownLanes bucket", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local" },
+    });
+
+    mocks.issueFindMany.mockResolvedValue([
+      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "unknown-old-lane" },
+      { labels: ["status/in-progress"], currentLane: "another-unknown" },
+    ]);
+
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issues.local.queued).toBe(1); // "normal" aliased to "local"
+    expect(body.unknownLanes).toBeDefined();
+    expect(body.unknownLanes["unknown-old-lane"]).toEqual({ queued: 1, inProgress: 0 });
+    expect(body.unknownLanes["another-unknown"]).toEqual({ queued: 0, inProgress: 1 });
+  });
+
+  it("does not include unknownLanes when all lanes are known", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local", backlog: "parking-lot" },
+    });
+
+    mocks.issueFindMany.mockResolvedValue([
+      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/backlog"], currentLane: "backlog" },
+    ]);
+
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.unknownLanes).toBeUndefined();
   });
 });

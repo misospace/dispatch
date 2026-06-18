@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -259,13 +259,99 @@ describe("GET /api/issues — visible issue filtering", () => {
     await makeRequest("http://localhost/api/issues?lane=normal");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
-    expect(call.where.currentLane).toBe("normal");
+    expect(call.where.currentLane).toEqual({ in: ["normal"] });
   });
 
   it("filters by backlog lane", async () => {
     await makeRequest("http://localhost/api/issues?lane=backlog");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
-    expect(call.where.currentLane).toBe("backlog");
+    expect(call.where.currentLane).toEqual({ in: ["backlog"] });
+  });
+});
+
+describe("GET /api/issues — lane aliases", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    delete process.env.DISPATCH_DONE_RETENTION_DAYS;
+    mocks.findManyIssues.mockResolvedValue([]);
+  });
+
+  afterEach(async () => {
+    // Reset lane config after each test
+    const { resetLaneConfig } = await import("@/lib/lane-config");
+    resetLaneConfig();
+  });
+
+  it("resolves aliased lane filter to configured lane with OR query", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local", backlog: "parking-lot" },
+    });
+
+    await makeRequest("http://localhost/api/issues?lane=normal");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane).toEqual({ in: ["local", "normal"] });
+  });
+
+  it("resolves aliased lane filter when requesting by configured lane name", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local" },
+    });
+
+    await makeRequest("http://localhost/api/issues?lane=local");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane).toEqual({ in: ["local", "normal"] });
+  });
+
+  it("returns 400 for unknown lane filter even with aliases configured", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true },
+      ],
+      laneAliases: { normal: "local" },
+    });
+
+    const res = await makeRequest("http://localhost/api/issues?lane=unknown-lane");
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain('Invalid lane: "unknown-lane"');
+  });
+
+  it("multiple aliases to same lane are all included in query", async () => {
+    const { setLaneConfig } = await import("@/lib/lane-config");
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: {
+        normal: "local",
+        escalated: "local",
+        backlog: "parking-lot",
+      },
+    });
+
+    await makeRequest("http://localhost/api/issues?lane=local");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane.in).toContain("local");
+    expect(call.where.currentLane.in).toContain("normal");
+    expect(call.where.currentLane.in).toContain("escalated");
   });
 });

@@ -560,20 +560,30 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
           )}
           {issue.currentLane && lanes && (() => {
             const laneConfig = lanes.find((l) => l.id === issue.currentLane);
-            if (!laneConfig) return null;
-            const rawColor = laneConfig.color ?? "#6b7280";
-            const hex = normalizeHexColor(rawColor).slice(1);
+            if (laneConfig) {
+              const rawColor = laneConfig.color ?? "#6b7280";
+              const hex = normalizeHexColor(rawColor).slice(1);
+              return (
+                <span
+                  className="px-1.5 py-0.5 text-xs rounded"
+                  style={{
+                    backgroundColor: `#${hex}20`,
+                    color: `#${hex}`,
+                    opacity: laneConfig.claimable ? 1 : 0.6,
+                  }}
+                  title={`Lane: ${laneConfig.title}${laneConfig.claimable ? "" : " (non-claimable)"}`}
+                >
+                  {laneConfig.title}
+                </span>
+              );
+            }
+            // Unknown/unconfigured lane — show a diagnostic badge
             return (
               <span
-                className="px-1.5 py-0.5 text-xs rounded"
-                style={{
-                  backgroundColor: `#${hex}20`,
-                  color: `#${hex}`,
-                  opacity: laneConfig.claimable ? 1 : 0.6,
-                }}
-                title={`Lane: ${laneConfig.title}${laneConfig.claimable ? "" : " (non-claimable)"}`}
+                className="px-1.5 py-0.5 text-xs rounded bg-gray-200 text-gray-600"
+                title={`Unknown lane: ${issue.currentLane} (not configured)`}
               >
-                {laneConfig.title}
+                Unknown: {issue.currentLane}
               </span>
             );
           })()}

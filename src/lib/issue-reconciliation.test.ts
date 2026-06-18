@@ -1035,3 +1035,41 @@ describe("shouldReclassifyStaleBacklog config-aware", () => {
     expect(["alpha", "beta"]).toContain(result2);
   });
 });
+
+describe("shouldReclassifyStaleBacklog — lane aliases", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  it("resolves aliased lane before backlog check", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local", backlog: "parking-lot" },
+    });
+
+    // "normal" is aliased to "local", so it's not the backlog lane -> returns null
+    const result = shouldReclassifyStaleBacklog("normal", "Fix bug", null, ["status/ready"]);
+    expect(result).toBeNull();
+
+    // "backlog" is aliased to "parking-lot", so it IS the backlog lane -> reclassifies
+    const result2 = shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready"]);
+    expect(result2).toBe("local");
+  });
+
+  it("unknown lanes in backlog are not reclassified", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true },
+        { id: "parking-lot", title: "Parking Lot", claimable: false },
+      ],
+      laneAliases: { normal: "local" },
+    });
+
+    // "unknown-old-lane" is not configured and not aliased -> never reclassified
+    const result = shouldReclassifyStaleBacklog("unknown-old-lane", "Fix bug", null, ["status/ready"]);
+    expect(result).toBeNull();
+  });
+});

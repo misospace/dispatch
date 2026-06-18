@@ -107,7 +107,7 @@ describe("IssueCard lane badge", () => {
     expect(screen.queryByText("Normal")).not.toBeInTheDocument();
   });
 
-  it("does not render lane badge when lane id is not in config", () => {
+  it("renders unknown lane badge when lane id is not in config", () => {
     const lanes = [
       { id: "normal", title: "Normal", claimable: true, color: "#3b82f6" },
     ];
@@ -116,6 +116,9 @@ describe("IssueCard lane badge", () => {
     render(React.createElement(IssueCard, { issue, lanes }));
 
     expect(screen.queryByText("Normal")).not.toBeInTheDocument();
+    expect(screen.getByText("Unknown: unknown-lane")).toBeInTheDocument();
+    const badge = screen.getByText("Unknown: unknown-lane").closest("span");
+    expect(badge).toHaveAttribute("title", "Unknown lane: unknown-lane (not configured)");
   });
 
   it("uses default gray color when lane has no color", () => {
