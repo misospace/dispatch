@@ -1,11 +1,6 @@
 import { NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/auth";
-import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { buildAgentQueue } from "@/lib/agent-queue";
-import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
-import { findLeasedIssueIds } from "@/lib/lease";
-import { parseExcludedLabels } from "@/lib/config";
-import { isValidLane, getLaneIds } from "@/lib/lane-config";
+import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
@@ -21,82 +16,24 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   const includeRenovate = searchParams.get("includeRenovate") === "true";
 
   try {
-    // Fetch all open issues from enabled repos, using GitHub Issues as source of truth
-    const issues = await prisma.issue.findMany({
-      where: {
-        state: "open",
-        repository: { enabled: true },
-      },
-      select: {
-        id: true,
-        number: true,
-        title: true,
-        url: true,
-        labels: true,
-        currentLane: true,
-        decomposed: true,
-        repository: { select: { fullName: true } },
-        linkedPrNumber: true,
-        linkedPrUrl: true,
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: true,
-        linkedPrReviewDecision: true,
-        linkedPrMergeState: true,
-        linkedPrHealthCheckedAt: true,
-      },
+    const { laneValid, rankedQueue, prFixItems, availableLanes } = await fetchAgentQueueData({
+      agentName,
+      lane,
+      excludeDecomposed: excludeDecomposed === "true",
+      includeClaimed,
+      includeRenovate,
     });
 
-    const issueLane = lane?.toLowerCase();
-    const prFixLane = lane;
-
-    // Validate lane against configured lanes (allow omitting lane for backward compatibility)
-    if (issueLane && !isValidLane(issueLane)) {
+    if (!laneValid) {
       return NextResponse.json(
         {
-          error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}`,
+          error: `Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`,
         },
         { status: 400 },
       );
     }
 
-    // Find issues that have active leases from OTHER agents — exclude them
-    // so other agents don't overlap on leased work.
-    const leasedIssueIds = await findLeasedIssueIds(agentName);
-
-    const prFixItems = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: prFixLane });
-
-    // Filter out leased issue IDs before building the queue
-    const filteredIssues = issues.filter(
-      (issue) => !leasedIssueIds.includes(issue.id),
-    );
-
-    const queue = buildAgentQueue(
-      filteredIssues.map((issue) => ({
-        ...issue,
-        lane: issue.currentLane ?? undefined,
-        issueId: issue.id,
-        repoFullName: issue.repository.fullName,
-        linkedPrHealth: {
-          number: issue.linkedPrNumber,
-          url: issue.linkedPrUrl,
-          needsFollowup: issue.linkedPrNeedsFollowup,
-          followupReasons: issue.linkedPrFollowupReasons,
-          reviewDecision: issue.linkedPrReviewDecision,
-          mergeState: issue.linkedPrMergeState,
-          checkedAt: issue.linkedPrHealthCheckedAt?.toISOString() ?? null,
-        },
-      })),
-      agentName,
-      {
-        lane: issueLane,
-        excludeDecomposed: excludeDecomposed === "true",
-        includeClaimed,
-        includeRenovate,
-        excludedLabels: parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS),
-      },
-    );
-
-    return NextResponse.json([...prFixItems.map(toAgentQueuePrFixItem), ...queue]);
+    return NextResponse.json([...prFixItems, ...rankedQueue]);
   } catch (error) {
     console.error("Failed to fetch agent queue:", error);
     return NextResponse.json({ error: "Failed to fetch agent queue" }, { status: 500 });
