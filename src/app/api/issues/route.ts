@@ -1,15 +1,22 @@
 import { NextResponse } from "next/server";
+import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
+import { isValidLane, getLaneIds } from "@/lib/lane-config";
 
 export async function GET(request: Request) {
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const repo = searchParams.get("repo");
   const agent = searchParams.get("agent");
   const owner = searchParams.get("owner");
   const project = searchParams.get("project");
   const priority = searchParams.get("priority");
+  const lane = searchParams.get("lane");
   const decomposed = searchParams.get("decomposed");
   const untriaged = searchParams.get("untriaged");
   const includeClosed = searchParams.get("includeClosed");
@@ -41,6 +48,17 @@ export async function GET(request: Request) {
     // Filter for untriaged issues (no status/* label) — grooming intake
     const noStatusFilter = buildNoStatusWhere(untriaged === "true");
     if (noStatusFilter) where.labels = { ...(where.labels as object), ...noStatusFilter };
+
+    // Filter by execution lane
+    if (lane) {
+      if (!isValidLane(lane)) {
+        return NextResponse.json(
+          { error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}` },
+          { status: 400 },
+        );
+      }
+      where.currentLane = lane.toLowerCase();
+    }
 
     const issues = await prisma.issue.findMany({
       where,

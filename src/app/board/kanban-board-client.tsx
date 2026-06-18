@@ -3,10 +3,18 @@
 import { KanbanBoard } from "@/components/kanban-board";
 import { Issue } from "@/types";
 
-interface KanbanBoardClientProps {
-  initialIssues: Issue[];
+interface LaneOption {
+  id: string;
+  title: string;
+  claimable: boolean;
+  color?: string;
 }
 
-export function KanbanBoardClient({ initialIssues }: KanbanBoardClientProps) {
-  return <KanbanBoard initialIssues={initialIssues} />;
+interface KanbanBoardClientProps {
+  initialIssues: Issue[];
+  lanes?: LaneOption[];
+}
+
+export function KanbanBoardClient({ initialIssues, lanes }: KanbanBoardClientProps) {
+  return <KanbanBoard initialIssues={initialIssues} lanes={lanes} />;
 }

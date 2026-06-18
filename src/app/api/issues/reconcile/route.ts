@@ -10,6 +10,7 @@ import {
   shouldReclassifyStaleBacklog,
   executeActions,
 } from "@/lib/issue-reconciliation";
+import { isBacklogLane } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest } from "@/lib/auth";
 import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
@@ -216,7 +217,7 @@ export async function POST(request: Request) {
               data: { currentLane: classification.lane },
             });
             totalLaneClassified++;
-          } else if (existingIssue && existingIssue.currentLane === "backlog") {
+          } else if (existingIssue && existingIssue.currentLane && isBacklogLane(existingIssue.currentLane)) {
             // Stale-backlog reclassification: the issue has an active status label
             // but is stuck in the backlog lane. Reclassify to normal or escalated.
             const reclassify = shouldReclassifyStaleBacklog(

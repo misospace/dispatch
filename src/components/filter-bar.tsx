@@ -4,19 +4,27 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { PRIORITY_LABELS, AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { LABEL_FILTER_HELP } from "@/lib/issue-filters";
 
+interface LaneOption {
+  id: string;
+  title: string;
+  claimable: boolean;
+}
+
 interface FilterBarProps {
   repos: { fullName: string }[];
   agents: string[];
   owners: string[];
+  lanes?: LaneOption[];
   activeFilters: {
     repo: string;
     agent: string;
     owner: string;
     priority: string;
+    lane?: string;
   };
 }
 
-export function FilterBar({ repos, agents, owners, activeFilters }: FilterBarProps) {
+export function FilterBar({ repos, agents, owners, lanes, activeFilters }: FilterBarProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -97,6 +105,22 @@ export function FilterBar({ repos, agents, owners, activeFilters }: FilterBarPro
           </option>
         ))}
       </select>
+
+      {lanes && lanes.length > 0 && (
+        <select
+          aria-label="Filter by execution lane"
+          value={activeFilters.lane || ""}
+          onChange={(e) => updateFilter("lane", e.target.value)}
+          className="h-9 px-3 rounded-md border border-input bg-background text-sm"
+        >
+          <option value="">All Lanes</option>
+          {lanes.map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.title}{!l.claimable ? " (non-claimable)" : ""}
+            </option>
+          ))}
+        </select>
+      )}
     </div>
   );
 }

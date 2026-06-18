@@ -11,7 +11,7 @@ import {
   createFollowupPrTask,
   createGroomTask,
 } from "@/lib/agent-task";
-import { isBacklogLane, isValidLane, getLaneIds } from "@/lib/lane-config";
+import { isBacklogLane, isValidLane, getLaneIds, getBacklogLane } from "@/lib/lane-config";
 
 export async function GET(
   request: Request,
@@ -84,7 +84,7 @@ export async function GET(
       const best = candidates[0].issue;
       const task = createGroomTask({
         agentName,
-        lane: best.currentLane ?? "backlog",
+        lane: best.currentLane ?? getBacklogLane()?.id ?? "backlog",
         issue: {
           repoFullName: best.repository.fullName,
           number: best.number,

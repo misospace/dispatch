@@ -1,5 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
+}));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findManyIssues: vi.fn().mockResolvedValue([]),
@@ -13,13 +23,72 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 import { GET } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
 
-function makeRequest(urlString: string) {
-  return GET(new Request(urlString));
+function makeRequest(urlString: string, includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  return GET(new Request(urlString, { headers }));
 }
+
+describe("GET /api/issues — auth", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    delete process.env.DISPATCH_DONE_RETENTION_DAYS;
+    mocks.findManyIssues.mockResolvedValue([]);
+  });
+
+  it("returns 401 when no auth header is present", async () => {
+    const res = await makeRequest("http://localhost/api/issues", false);
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 401 for bad bearer token", async () => {
+    const headers: Record<string, string> = { Authorization: "Bearer wrong-token" };
+    const res = await GET(new Request("http://localhost/api/issues", { headers }));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("authorized request preserves existing issue listing behavior", async () => {
+    mocks.findManyIssues.mockResolvedValue([
+      { id: "1", title: "Test", state: "open" },
+    ]);
+
+    const res = await makeRequest("http://localhost/api/issues");
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].id).toBe("1");
+  });
+
+  it("unauthorized request does not call prisma.issue.findMany", async () => {
+    await makeRequest("http://localhost/api/issues", false);
+
+    expect(mocks.findManyIssues).not.toHaveBeenCalled();
+  });
+
+  it("authorized invalid lane still returns 400", async () => {
+    const res = await makeRequest("http://localhost/api/issues?lane=unknown-lane");
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain('Invalid lane: "unknown-lane"');
+  });
+});
 
 describe("GET /api/issues — visible issue filtering", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
     vi.clearAllMocks();
     delete process.env.DISPATCH_DONE_RETENTION_DAYS;
     mocks.findManyIssues.mockResolvedValue([]);
@@ -176,5 +245,27 @@ describe("GET /api/issues — visible issue filtering", () => {
 
     expect(res.status).toBe(500);
     expect(body.error).toBe("Failed to fetch issues");
+  });
+
+  it("returns 400 for invalid lane filter", async () => {
+    const res = await makeRequest("http://localhost/api/issues?lane=unknown-lane");
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body.error).toContain('Invalid lane: "unknown-lane"');
+  });
+
+  it("filters by valid configured lane", async () => {
+    await makeRequest("http://localhost/api/issues?lane=normal");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane).toBe("normal");
+  });
+
+  it("filters by backlog lane", async () => {
+    await makeRequest("http://localhost/api/issues?lane=backlog");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.currentLane).toBe("backlog");
   });
 });
