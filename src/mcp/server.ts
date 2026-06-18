@@ -358,7 +358,24 @@ export function createServer(): McpServerType {
 
 // ── Main entry point (stdio) ───────────────────────────────────────────────
 
+/**
+ * Logs a startup warning when DISPATCH_AGENT_NAME is unset.
+ * Mirrors the DISPATCH_AUTH_MODE=disabled warning in docker-entrypoint.sh.
+ * Tools that accept explicit agentName still work; this is a heads-up only.
+ */
+export function warnIfAgentNameUnset(): void {
+  if (!process.env.DISPATCH_AGENT_NAME) {
+    console.warn(
+      "[MCP] DISPATCH_AGENT_NAME is not set. claim_issue and claim_work will " +
+        "require an explicit agentName argument. Do not use generic identities " +
+        "like 'Dispatch MCP'.",
+    );
+  }
+}
+
 async function main() {
+  warnIfAgentNameUnset();
+
   const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
