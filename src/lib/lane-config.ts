@@ -34,6 +34,18 @@ export interface LaneConfig {
  */
 export interface LaneConfigSet {
   lanes: LaneConfig[];
+  /**
+   * Migration aliases: map old lane IDs to currently configured lane IDs.
+   *
+   * Used for read-time compatibility when deploying a custom lane set to an
+   * existing install that has issues stored under the default lane names
+   * (normal, escalated, backlog). Aliases are purely a read-time resolution
+   * mechanism — they do not rewrite issue data.
+   *
+   * Example:
+   *   { normal: "local", escalated: "frontier", backlog: "parking-lot" }
+   */
+  laneAliases?: Record<string, string>;
 }
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
@@ -155,6 +167,91 @@ export function isBacklogLane(id: string): boolean {
   return backlog !== undefined && backlog.id === id;
 }
 
+// ─── Alias / Migration Helpers ────────────────────────────────────────────────
+
+/**
+ * Return the configured lane alias map (empty object if none).
+ */
+export function getLaneAliases(): Record<string, string> {
+  return laneConfigSet.laneAliases ?? {};
+}
+
+/**
+ * Resolve a stored lane ID through the alias map.
+ *
+ * - Returns `null` for null/undefined/empty input.
+ * - Returns the original lane ID if it is a currently configured lane.
+ * - Returns the mapped configured lane ID if an alias exists.
+ * - Returns the original lane ID otherwise (preserves visibility of unknown lanes).
+ *
+ * This function never silently maps unknown lanes to a default — it only
+ * resolves explicitly configured aliases.
+ */
+export function resolveLaneId(laneId: string | null | undefined): string | null {
+  if (!laneId) return null;
+  // Already a configured lane
+  if (isValidLane(laneId)) return laneId;
+  // Check aliases
+  const aliases = getLaneAliases();
+  const resolved = aliases[laneId];
+  if (resolved && isValidLane(resolved)) return resolved;
+  // Unknown lane — return as-is so UI can show "Unknown: <id>"
+  return laneId;
+}
+
+/**
+ * Check whether a lane ID is either configured or has an alias.
+ * Returns true for null/undefined (treated as "no lane set", which is valid).
+ */
+export function isKnownOrAliasedLane(laneId: string | null | undefined): boolean {
+  if (!laneId) return true;
+  if (isValidLane(laneId)) return true;
+  const aliases = getLaneAliases();
+  return laneId in aliases;
+}
+
+/**
+ * Return info about an unconfigured lane ID, if it is unknown.
+ * Returns `null` when the lane is configured or aliased.
+ */
+export function getUnconfiguredLaneInfo(
+  laneId: string | null | undefined,
+): { rawId: string; isAliased: boolean; resolvedId?: string } | null {
+  if (!laneId) return null;
+  if (isValidLane(laneId)) return null;
+  const aliases = getLaneAliases();
+  const resolved = aliases[laneId];
+  if (resolved && isValidLane(resolved)) {
+    return { rawId: laneId, isAliased: true, resolvedId: resolved };
+  }
+  return { rawId: laneId, isAliased: false };
+}
+
+/**
+ * Check whether a stored lane ID matches the given configured lane,
+ * either directly or through an alias.
+ */
+export function laneMatchesConfigured(storedLane: string | null | undefined, configuredLaneId: string): boolean {
+  if (!storedLane) return false;
+  if (storedLane === configuredLaneId) return true;
+  const aliases = getLaneAliases();
+  return aliases[storedLane] === configuredLaneId;
+}
+
+/**
+ * Resolve a request-time lane filter value.
+ * Returns the configured lane ID if the input is valid or aliased,
+ * or `null` if the input is unknown (caller should return 400).
+ */
+export function resolveRequestLane(lane: string | null | undefined): string | null {
+  if (!lane) return null;
+  if (isValidLane(lane)) return lane;
+  const aliases = getLaneAliases();
+  const resolved = aliases[lane];
+  if (resolved && isValidLane(resolved)) return resolved;
+  return null;
+}
+
 // ─── Classification Helpers ──────────────────────────────────────────────────
 
 /**
@@ -252,5 +349,14 @@ function validateLaneConfigSet(config: LaneConfigSet): void {
   const hasClaimable = config.lanes.some((l) => l.claimable);
   if (!hasClaimable) {
     throw new Error("Lane config must contain at least one claimable lane");
+  }
+
+  // Validate aliases point to configured lanes
+  if (config.laneAliases) {
+    for (const [from, to] of Object.entries(config.laneAliases)) {
+      if (!ids.has(to)) {
+        throw new Error(`Lane alias "${from}" -> "${to}" references an unconfigured lane`);
+      }
+    }
   }
 }

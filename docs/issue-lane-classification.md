@@ -47,6 +47,95 @@ Lane classification is stored as operational metadata in the `IssueLane` table. 
 
 ---
 
+## Custom Lane Configuration
+
+Dispatch supports custom lane configurations that override the default `normal`, `escalated`, `backlog` lanes. This allows teams to use lane names that match their workflow terminology while maintaining compatibility with existing issue data.
+
+### Configuring Custom Lanes
+
+Custom lanes are configured via the `DISPATCH_LANE_CONFIG` environment variable, which accepts a JSON object:
+
+```json
+{
+  "lanes": [
+    {
+      "id": "local",
+      "title": "Local",
+      "claimable": true,
+      "role": "default",
+      "color": "#4CAF50",
+      "description": "Standard execution lane for concrete work."
+    },
+    {
+      "id": "expert",
+      "title": "Expert",
+      "claimable": true,
+      "role": "escalation",
+      "color": "#FF9800",
+      "description": "Higher-judgment tasks requiring expert review."
+    },
+    {
+      "id": "parking-lot",
+      "title": "Parking Lot",
+      "claimable": false,
+      "color": "#9E9E9E",
+      "description": "Non-actionable items awaiting triage."
+    }
+  ]
+}
+```
+
+### Lane Roles
+
+Each lane configuration requires one of the following roles:
+
+| Role | Required | Description |
+|------|----------|-------------|
+| `default` | Yes (exactly one) | The standard claimable lane for normal work. Equivalent to the default `normal` lane. |
+| `escalation` | No | The lane for higher-judgment tasks. Equivalent to the default `escalated` lane. |
+| *(none)* | Non-claimable lanes only | Non-claimable lanes (like backlog) do not need a role. |
+
+### Migration Aliases
+
+When deploying a custom lane configuration to an existing instance, issues may have `currentLane` values from the previous configuration. Migration aliases provide read-time compatibility by mapping old lane IDs to new configured lane IDs:
+
+```json
+{
+  "lanes": [
+    { "id": "local", "title": "Local", "claimable": true, "role": "default" },
+    { "id": "parking-lot", "title": "Parking Lot", "claimable": false }
+  ],
+  "laneAliases": {
+    "normal": "local",
+    "escalated": "local",
+    "backlog": "parking-lot"
+  }
+}
+```
+
+With this configuration:
+- Issues with `currentLane: "normal"` are treated as if they're in `"local"`
+- Issues with `currentLane: "escalated"` are treated as if they're in `"local"`
+- Issues with `currentLane: "backlog"` are treated as if they're in `"parking-lot"`
+
+### Unknown Lane Behavior
+
+Issues with lane IDs that don't match any configured lane or alias are considered **unknown lanes**. These issues:
+
+1. **Are NOT hidden** — they remain visible in issue listings and board views
+2. Show an "Unknown: `<lane-id>`" badge on issue cards
+3. Are tracked separately in the work summary API under `unknownLanes`
+4. Are **never reclassified** by reconciliation (preserves data integrity)
+
+### Important Notes
+
+- **No data migration required**: Aliases work at read time. Existing issues retain their original `currentLane` values.
+- **No automatic data rewriting**: Dispatch does not update issue `currentLane` values based on aliases.
+- **Alias validation**: Aliases must point to currently configured lane IDs. An alias pointing to an unconfigured lane is rejected.
+- **Default config**: If no custom configuration is set, Dispatch uses the default lanes (`normal`, `escalated`, `backlog`).
+
+---
+
 ## Data Model
 
 The `IssueLane` model stores classification metadata:
@@ -156,10 +245,12 @@ When no model classification is provided, the system uses label-based heuristics
 
 | Field | Valid Values | Constraints |
 |-------|-------------|-------------|
-| `lane` | `normal`, `escalated`, `backlog` | Must be one of the three defined lanes |
+| `lane` | Configured lane IDs (default: `normal`, `escalated`, `backlog`) | Must be a currently configured lane ID |
 | `confidence` | `high`, `medium`, `low` | Must be one of the three confidence levels |
 | `reason` | Any string | Required, non-empty, truncated to 500 characters |
 | `model` | Any string or null | Optional |
+
+When custom lanes are configured, the `lane` field accepts any configured lane ID. Migration aliases allow old lane IDs to be mapped to new configured lane IDs at read time.
 
 ---
 

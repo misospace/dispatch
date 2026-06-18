@@ -1,6 +1,6 @@
 import { GitHubIssue } from "@/types";
 import { GithubPR, closeIssue as githubCloseIssue, addIssueLabel as githubAddIssueLabel, removeIssueLabel as githubRemoveIssueLabel } from "@/lib/github";
-import { classifyLaneFromSignals, getDefaultClaimableLane, isBacklogLane, LaneSignals } from "@/lib/lane-config";
+import { classifyLaneFromSignals, getDefaultClaimableLane, isBacklogLane, resolveLaneId, LaneSignals } from "@/lib/lane-config";
 
 // ─── Lane Classification Helpers ──────────────────────────────────────────────
 
@@ -119,7 +119,8 @@ export function shouldReclassifyStaleBacklog(
   body: string | null,
   currentLabels: string[],
 ): string | null {
-  if (!existingLane || !isBacklogLane(existingLane)) {
+  const resolved = resolveLaneId(existingLane);
+  if (!resolved || !isBacklogLane(resolved)) {
     return null;
   }
 

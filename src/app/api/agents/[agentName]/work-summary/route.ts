@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
-import { getConfiguredLanes, getDefaultClaimableLane } from "@/lib/lane-config";
+import { getConfiguredLanes, getDefaultClaimableLane, resolveLaneId } from "@/lib/lane-config";
 
 type WorkSummaryLaneCounts = { queued: number; inProgress: number };
 type PrFixLaneCounts = { total: number; blocked: number };
@@ -10,6 +10,8 @@ type PrFixLaneCounts = { total: number; blocked: number };
 interface WorkSummaryResponse {
   agentName: string;
   issues: Record<string, WorkSummaryLaneCounts>;
+  /** Issues in lanes that are not currently configured (stale/unknown lane IDs). */
+  unknownLanes?: Record<string, WorkSummaryLaneCounts>;
   prFixes: Record<string, PrFixLaneCounts>;
 }
 
@@ -47,16 +49,34 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       laneCounts[lane.id] = { queued: 0, inProgress: 0 };
     }
 
+    // Track unknown/unconfigured lanes separately so they're not silently dropped
+    const unknownLaneCounts: Record<string, WorkSummaryLaneCounts> = {};
+
     for (const issue of issues) {
       const defaultLane = getDefaultClaimableLane()?.id ?? "normal";
-      const lane = (issue.currentLane ?? defaultLane).toLowerCase();
-      if (!laneCounts[lane]) continue;
+      const rawLane = (issue.currentLane ?? defaultLane).toLowerCase();
+      const resolved = resolveLaneId(rawLane);
+      if (!resolved) continue;
+
+      // If the resolved lane isn't a configured lane, it's unknown
+      if (!laneCounts[resolved]) {
+        if (!unknownLaneCounts[resolved]) {
+          unknownLaneCounts[resolved] = { queued: 0, inProgress: 0 };
+        }
+        const status = classifyIssueStatus(issue.labels);
+        if (status === "queued") {
+          unknownLaneCounts[resolved].queued++;
+        } else if (status === "inProgress") {
+          unknownLaneCounts[resolved].inProgress++;
+        }
+        continue;
+      }
 
       const status = classifyIssueStatus(issue.labels);
       if (status === "queued") {
-        laneCounts[lane].queued++;
+        laneCounts[resolved].queued++;
       } else if (status === "inProgress") {
-        laneCounts[lane].inProgress++;
+        laneCounts[resolved].inProgress++;
       }
     }
 
@@ -82,6 +102,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     const response: WorkSummaryResponse = {
       agentName,
       issues: laneCounts,
+      ...(Object.keys(unknownLaneCounts).length > 0 ? { unknownLanes: unknownLaneCounts } : {}),
       prFixes: prFixCounts,
     };
 

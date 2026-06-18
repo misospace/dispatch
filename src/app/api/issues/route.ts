@@ -3,7 +3,7 @@ import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
-import { isValidLane, getLaneIds } from "@/lib/lane-config";
+import { isValidLane, getLaneIds, resolveRequestLane, getLaneAliases } from "@/lib/lane-config";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
@@ -51,13 +51,23 @@ export async function GET(request: Request) {
 
     // Filter by execution lane
     if (lane) {
-      if (!isValidLane(lane)) {
+      const resolved = resolveRequestLane(lane.toLowerCase());
+      if (!resolved) {
         return NextResponse.json(
           { error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}` },
           { status: 400 },
         );
       }
-      where.currentLane = lane.toLowerCase();
+      // Match both the configured lane and any aliases that resolve to it
+      const aliases = getLaneAliases();
+      const matchingLanes = new Set<string>();
+      matchingLanes.add(resolved);
+      for (const [from, to] of Object.entries(aliases)) {
+        if (to === resolved) {
+          matchingLanes.add(from.toLowerCase());
+        }
+      }
+      where.currentLane = { in: Array.from(matchingLanes) };
     }
 
     const issues = await prisma.issue.findMany({

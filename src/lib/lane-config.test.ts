@@ -8,10 +8,16 @@ import {
   getConfiguredLanes,
   getLaneById,
   getLaneIds,
+  getLaneAliases,
   isBacklogLane,
   isClaimableLane,
   isValidLane,
   resetLaneConfig,
+  resolveLaneId,
+  isKnownOrAliasedLane,
+  getUnconfiguredLaneInfo,
+  laneMatchesConfigured,
+  resolveRequestLane,
   setLaneConfig,
 } from "./lane-config";
 
@@ -347,6 +353,337 @@ describe("lane-config classification helpers", () => {
       for (const lane of results) {
         expect(["alpha", "beta", "gamma"]).toContain(lane);
       }
+    });
+  });
+});
+
+describe("lane-config aliases", () => {
+  afterEach(() => {
+    resetLaneConfig();
+  });
+
+  describe("getLaneAliases", () => {
+    it("returns empty object when no aliases are configured", () => {
+      expect(getLaneAliases()).toEqual({});
+    });
+
+    it("returns the alias map when configured", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: {
+          normal: "local",
+          escalated: "frontier",
+          backlog: "parking-lot",
+        },
+      });
+      expect(getLaneAliases()).toEqual({
+        normal: "local",
+        escalated: "frontier",
+        backlog: "parking-lot",
+      });
+    });
+  });
+
+  describe("resolveLaneId", () => {
+    it("returns null for null/undefined/empty input", () => {
+      expect(resolveLaneId(null)).toBeNull();
+      expect(resolveLaneId(undefined)).toBeNull();
+      expect(resolveLaneId("")).toBeNull();
+    });
+
+    it("returns the original lane ID if it is configured (default config)", () => {
+      expect(resolveLaneId("normal")).toBe("normal");
+      expect(resolveLaneId("escalated")).toBe("escalated");
+      expect(resolveLaneId("backlog")).toBe("backlog");
+    });
+
+    it("returns the mapped configured lane ID if an alias exists", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: {
+          normal: "local",
+          escalated: "frontier",
+          backlog: "parking-lot",
+        },
+      });
+      expect(resolveLaneId("normal")).toBe("local");
+      expect(resolveLaneId("escalated")).toBe("frontier");
+      expect(resolveLaneId("backlog")).toBe("parking-lot");
+    });
+
+    it("returns the original lane ID for unknown lanes (preserves visibility)", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local" },
+      });
+      expect(resolveLaneId("unknown-old-lane")).toBe("unknown-old-lane");
+    });
+
+    it("does not silently map unknown lanes to default", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+      });
+      expect(resolveLaneId("someRandomLane")).toBe("someRandomLane");
+    });
+
+    it("returns configured lane when input matches a configured lane (not aliased)", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local" },
+      });
+      expect(resolveLaneId("local")).toBe("local");
+      expect(resolveLaneId("parking-lot")).toBe("parking-lot");
+    });
+  });
+
+  describe("isKnownOrAliasedLane", () => {
+    it("returns true for null/undefined (no lane set is valid)", () => {
+      expect(isKnownOrAliasedLane(null)).toBe(true);
+      expect(isKnownOrAliasedLane(undefined)).toBe(true);
+    });
+
+    it("returns true for configured lanes", () => {
+      expect(isKnownOrAliasedLane("normal")).toBe(true);
+      expect(isKnownOrAliasedLane("escalated")).toBe(true);
+      expect(isKnownOrAliasedLane("backlog")).toBe(true);
+    });
+
+    it("returns false for unknown lanes without alias", () => {
+      expect(isKnownOrAliasedLane("unknown-lane")).toBe(false);
+    });
+
+    it("returns true for aliased lanes", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local", escalated: "local" },
+      });
+      expect(isKnownOrAliasedLane("normal")).toBe(true);
+      expect(isKnownOrAliasedLane("escalated")).toBe(true);
+      expect(isKnownOrAliasedLane("unknown-lane")).toBe(false);
+    });
+  });
+
+  describe("getUnconfiguredLaneInfo", () => {
+    it("returns null for configured lanes", () => {
+      expect(getUnconfiguredLaneInfo("normal")).toBeNull();
+      expect(getUnconfiguredLaneInfo("backlog")).toBeNull();
+    });
+
+    it("returns null for null input", () => {
+      expect(getUnconfiguredLaneInfo(null)).toBeNull();
+    });
+
+    it("returns aliased info when lane has an alias", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local", backlog: "parking-lot" },
+      });
+      expect(getUnconfiguredLaneInfo("normal")).toEqual({
+        rawId: "normal",
+        isAliased: true,
+        resolvedId: "local",
+      });
+      expect(getUnconfiguredLaneInfo("backlog")).toEqual({
+        rawId: "backlog",
+        isAliased: true,
+        resolvedId: "parking-lot",
+      });
+    });
+
+    it("returns unaliased info for unknown lanes", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+        ],
+        laneAliases: { normal: "local" },
+      });
+      expect(getUnconfiguredLaneInfo("unknown-lane")).toEqual({
+        rawId: "unknown-lane",
+        isAliased: false,
+      });
+    });
+  });
+
+  describe("laneMatchesConfigured", () => {
+    it("returns true when stored lane equals configured lane", () => {
+      expect(laneMatchesConfigured("normal", "normal")).toBe(true);
+    });
+
+    it("returns false when stored lane differs from configured lane (no alias)", () => {
+      expect(laneMatchesConfigured("escalated", "normal")).toBe(false);
+    });
+
+    it("returns true when stored lane aliases to configured lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local", backlog: "parking-lot" },
+      });
+      expect(laneMatchesConfigured("normal", "local")).toBe(true);
+      expect(laneMatchesConfigured("backlog", "parking-lot")).toBe(true);
+      expect(laneMatchesConfigured("unknown", "local")).toBe(false);
+    });
+
+    it("returns false for null stored lane", () => {
+      expect(laneMatchesConfigured(null, "normal")).toBe(false);
+    });
+  });
+
+  describe("resolveRequestLane", () => {
+    it("returns null for null/undefined input", () => {
+      expect(resolveRequestLane(null)).toBeNull();
+      expect(resolveRequestLane(undefined)).toBeNull();
+    });
+
+    it("returns the configured lane ID for valid lanes", () => {
+      expect(resolveRequestLane("normal")).toBe("normal");
+      expect(resolveRequestLane("escalated")).toBe("escalated");
+    });
+
+    it("resolves aliased lane names to configured lane ID", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local", backlog: "parking-lot" },
+      });
+      expect(resolveRequestLane("normal")).toBe("local");
+      expect(resolveRequestLane("backlog")).toBe("parking-lot");
+    });
+
+    it("returns null for unknown lanes (caller should return 400)", () => {
+      expect(resolveRequestLane("unknown-lane")).toBeNull();
+    });
+  });
+
+  describe("setLaneConfig validation with aliases", () => {
+    it("rejects aliases that point to unconfigured lanes", () => {
+      expect(() =>
+        setLaneConfig({
+          lanes: [
+            { id: "local", title: "Local", claimable: true },
+          ],
+          laneAliases: { normal: "nonexistent" },
+        }),
+      ).toThrow('Lane alias "normal" -> "nonexistent" references an unconfigured lane');
+    });
+
+    it("accepts aliases that point to configured lanes", () => {
+      expect(() =>
+        setLaneConfig({
+          lanes: [
+            { id: "local", title: "Local", claimable: true },
+            { id: "parking-lot", title: "Parking Lot", claimable: false },
+          ],
+          laneAliases: { normal: "local", backlog: "parking-lot" },
+        }),
+      ).not.toThrow();
+    });
+
+    it("allows empty alias map", () => {
+      expect(() =>
+        setLaneConfig({
+          lanes: [
+            { id: "local", title: "Local", claimable: true },
+          ],
+          laneAliases: {},
+        }),
+      ).not.toThrow();
+    });
+  });
+
+  describe("migration scenarios", () => {
+    it("default config still treats normal/escalated/backlog as valid", () => {
+      expect(isValidLane("normal")).toBe(true);
+      expect(isValidLane("escalated")).toBe(true);
+      expect(isValidLane("backlog")).toBe(true);
+      expect(resolveLaneId("normal")).toBe("normal");
+      expect(resolveLaneId("escalated")).toBe("escalated");
+      expect(resolveLaneId("backlog")).toBe("backlog");
+    });
+
+    it("custom config with laneAliases maps old normal to new default lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { normal: "local" },
+      });
+      expect(isValidLane("normal")).toBe(false);
+      expect(resolveLaneId("normal")).toBe("local");
+      expect(laneMatchesConfigured("normal", "local")).toBe(true);
+    });
+
+    it("custom config with laneAliases maps old escalated to configured escalation lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true, role: "default" },
+          { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { escalated: "frontier" },
+      });
+      expect(resolveLaneId("escalated")).toBe("frontier");
+      expect(laneMatchesConfigured("escalated", "frontier")).toBe(true);
+    });
+
+    it("custom config with laneAliases maps old backlog to configured non-claimable lane", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "local", title: "Local", claimable: true },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: { backlog: "parking-lot" },
+      });
+      expect(resolveLaneId("backlog")).toBe("parking-lot");
+      expect(isBacklogLane(resolveLaneId("backlog")!)).toBe(true);
+    });
+
+    it("single claimable lane plus backlog works with aliases from old default lanes", () => {
+      setLaneConfig({
+        lanes: [
+          { id: "work", title: "Work", claimable: true, role: "default" },
+          { id: "parking-lot", title: "Parking Lot", claimable: false },
+        ],
+        laneAliases: {
+          normal: "work",
+          escalated: "work",
+          backlog: "parking-lot",
+        },
+      });
+      expect(resolveLaneId("normal")).toBe("work");
+      expect(resolveLaneId("escalated")).toBe("work");
+      expect(resolveLaneId("backlog")).toBe("parking-lot");
+      expect(laneMatchesConfigured("normal", "work")).toBe(true);
+      expect(laneMatchesConfigured("escalated", "work")).toBe(true);
+      expect(laneMatchesConfigured("backlog", "parking-lot")).toBe(true);
     });
   });
 });

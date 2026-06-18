@@ -7,7 +7,7 @@ import {
   getPriorityFromLabels,
 } from "@/types";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
-import { isBacklogLane } from "@/lib/lane-config";
+import { isBacklogLane, resolveLaneId, laneMatchesConfigured } from "@/lib/lane-config";
 
 const DONE_STATUS: string = "status/done";
 const IN_PROGRESS_STATUS: string = "status/in-progress";
@@ -238,9 +238,18 @@ export function buildAgentQueue(
   // Lane filter: exclude backlog lane items from normal agent queue
   // When claimableOnly=false, include all lanes (including backlog/non-claimable)
   const filtered = normalizedLane
-    ? actionable.filter((issue) => issue.lane?.toLowerCase() === normalizedLane)
+    ? actionable.filter((issue) => {
+        // Include issues whose raw lane matches the filter or aliases to it
+        return laneMatchesConfigured(issue.lane?.toLowerCase(), normalizedLane);
+      })
     : claimableOnly
-      ? actionable.filter((issue) => !isBacklogLane(issue.lane?.toLowerCase() ?? ""))
+      ? actionable.filter((issue) => {
+          const resolved = resolveLaneId(issue.lane?.toLowerCase() ?? null);
+          if (!resolved) return true; // no lane set — include
+          // Don't exclude unknown lanes (preserve visibility)
+          if (!isBacklogLane(resolved)) return true;
+          return false;
+        })
       : actionable;
 
   // Rank and filter out excluded items
