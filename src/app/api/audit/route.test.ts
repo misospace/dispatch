@@ -1,0 +1,107 @@
+import { describe, expect, it, vi, beforeEach } from "vitest";
+
+const mockToken = "test-agent-token";
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+vi.mock("@/lib/dispatch-env", () => ({
+  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
+  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
+  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
+  resetCaches: vi.fn(),
+}));
+
+const { mocks } = vi.hoisted(() => ({
+  mocks: {
+    auditLogFindMany: vi.fn().mockResolvedValue([]),
+  },
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    auditLog: { findMany: mocks.auditLogFindMany },
+  },
+}));
+
+import { GET } from "./route";
+
+function request(urlString: string) {
+  return new Request(urlString, { headers: {} });
+}
+
+describe("GET /api/audit", () => {
+  // NOTE: This route is intentionally unauthenticated. It returns all AuditLog
+  // rows to any caller. In production deployments behind a firewall or auth
+  // gateway this is acceptable; in open deployments consider adding auth.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.auditLogFindMany.mockResolvedValue([]);
+  });
+
+  it("returns audit logs without authentication", async () => {
+    mocks.auditLogFindMany.mockResolvedValue([
+      { id: "log-1", actor: "agent", action: "move_issue", createdAt: new Date() },
+    ]);
+
+    const res = await GET(request("http://localhost/api/audit"));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+    expect(body[0]).toMatchObject({ id: "log-1" });
+  });
+
+  it("returns empty array when no logs exist", async () => {
+    mocks.auditLogFindMany.mockResolvedValue([]);
+
+    const res = await GET(request("http://localhost/api/audit"));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual([]);
+  });
+
+  it("defaults to limit 50", async () => {
+    await GET(request("http://localhost/api/audit"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.take).toBe(50);
+  });
+
+  it("respects custom limit parameter", async () => {
+    await GET(request("http://localhost/api/audit?limit=10"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.take).toBe(10);
+  });
+
+  it("filters by repo when repo param is provided", async () => {
+    await GET(request("http://localhost/api/audit?repo=org/repo"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.where).toMatchObject({ repoFullName: "org/repo" });
+  });
+
+  it("orders by createdAt descending", async () => {
+    await GET(request("http://localhost/api/audit"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.orderBy).toEqual({ createdAt: "desc" });
+  });
+
+  it("includes issue and repository relations", async () => {
+    await GET(request("http://localhost/api/audit"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.include).toEqual({ issue: { include: { repository: true } } });
+  });
+
+  it("returns 500 on database error", async () => {
+    mocks.auditLogFindMany.mockRejectedValue(new Error("db connection lost"));
+
+    const res = await GET(request("http://localhost/api/audit"));
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error).toBe("Failed to fetch audit logs");
+  });
+});
