@@ -49,6 +49,8 @@ Lane classification is stored as operational metadata in the `IssueLane` table. 
 
 ## Custom Lane Configuration
 
+For comprehensive documentation on configuring custom lanes, migration aliases, lane roles, and environment variable setup, see [Configurable Execution Lanes](./configurable-lanes.md).
+
 Dispatch supports custom lane configurations that override the default `normal`, `escalated`, `backlog` lanes. This allows teams to use lane names that match their workflow terminology while maintaining compatibility with existing issue data.
 
 ### Configuring Custom Lanes

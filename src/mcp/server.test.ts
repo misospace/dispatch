@@ -7,6 +7,7 @@ import {
   refreshIssueHandler,
   syncRepoHandler,
   createServer,
+  warnIfAgentNameUnset,
 } from "./server";
 
 const mockToken = "test-agent-token";
@@ -743,5 +744,35 @@ describe("createServer", () => {
     expect(server).toBeDefined();
     // McpServer has a `server` property that is the underlying Server
     expect((server as unknown as { server: unknown }).server).toBeDefined();
+  });
+});
+
+describe("startup DISPATCH_AGENT_NAME warning", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("emits warning when DISPATCH_AGENT_NAME is unset", () => {
+    delete process.env.DISPATCH_AGENT_NAME;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    warnIfAgentNameUnset();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("DISPATCH_AGENT_NAME is not set"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("agentName argument"),
+    );
+  });
+
+  it("does NOT emit warning when DISPATCH_AGENT_NAME is set", () => {
+    process.env.DISPATCH_AGENT_NAME = "test-agent";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    warnIfAgentNameUnset();
+
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("DISPATCH_AGENT_NAME is not set"),
+    );
+    delete process.env.DISPATCH_AGENT_NAME;
   });
 });
