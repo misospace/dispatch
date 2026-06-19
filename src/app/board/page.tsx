@@ -4,7 +4,13 @@ import { FilterBar } from "@/components/filter-bar";
 import { SyncIssuesButton } from "@/components/sync-issues-button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getTrackedRepos } from "@/lib/config";
-import { buildLabelWhere, buildVisibleIssueWhere, discoverLabelFilterOptions, getDoneRetentionDays } from "@/lib/issue-filters";
+import {
+  applyRenovateIssueExclusion,
+  buildLabelWhere,
+  buildVisibleIssueWhere,
+  discoverLabelFilterOptions,
+  getDoneRetentionDays,
+} from "@/lib/issue-filters";
 import { getConfiguredLanes, isValidLane } from "@/lib/lane-config";
 
 export const dynamic = "force-dynamic";
@@ -13,6 +19,7 @@ async function getIssues(repo?: string, agent?: string, owner?: string, priority
   const where: Record<string, unknown> = { repository: { enabled: true } };
 
   buildVisibleIssueWhere(where, { includeClosed });
+  applyRenovateIssueExclusion(where);
 
   if (repo) where.repository = { ...(where.repository as object), fullName: repo };
 
@@ -38,19 +45,28 @@ async function getRepos() {
 }
 
 async function getFilterOptions() {
+  const where: Record<string, unknown> = { repository: { enabled: true } };
+  applyRenovateIssueExclusion(where);
+
   const issues = await prisma.issue.findMany({
-    where: { repository: { enabled: true } },
+    where,
     select: { labels: true },
   });
 
   return discoverLabelFilterOptions(issues);
 }
 
+function buildVisibleIssueStatsWhere() {
+  const where: Record<string, unknown> = { repository: { enabled: true } };
+  applyRenovateIssueExclusion(where);
+  return where;
+}
+
 async function getIssueSyncStatus() {
   const [trackedRepos, issueStats] = await Promise.all([
     getTrackedRepos(),
     prisma.issue.aggregate({
-      where: { repository: { enabled: true } },
+      where: buildVisibleIssueStatsWhere(),
       _count: { _all: true },
       _max: { lastSyncedAt: true },
     }),

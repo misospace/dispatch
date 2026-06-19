@@ -199,19 +199,14 @@ BACKLOG issues are excluded from the normal agent queue by default.
 
 ### Renovate Issue Exclusion
 
-Renovate-created issues (dependency dashboards, update PRs, etc.) are **visible in Dispatch** but **excluded from agent queues by default**. This prevents agents from consuming cycles on dependency bookkeeping instead of normal issue work.
+Renovate-created issues (dependency dashboards, update PRs, etc.) are **filtered out of Dispatch issue surfaces**. This keeps the Board, Projects, lane summaries, grooming intake, and agent queues focused on normal issue work instead of dependency bookkeeping.
 
 Detection heuristics (author detection is not available since the Issue model does not store author):
 - Title contains `Dependency Dashboard`
 - Title starts with `Update dependency`, `Update image`, or similar Renovate patterns
 - Labels: `renovate`, `dependencies`, `automated`
 
-To explicitly include Renovate issues in queue results, pass `includeRenovate=true`:
-```bash
-GET /api/agents/<name>/queue?lane=normal&includeRenovate=true
-```
-
-Renovate exclusion applies to issue queue items only, not PR review-fix queue items. Issues excluded as Renovate remain visible on the Board and Projects pages.
+Renovate exclusion applies to issue queue items only, not PR review-fix queue items.
 
 ---
 
@@ -230,6 +225,7 @@ Workers using the canonical `next-task` endpoint automatically receive PR-fix it
 ## History
 
 - **2026-05-16** — Created to document generic worker execution contract and PR completion gates (Issue #65). Consolidates existing normal-worker behavior into a reusable, agent-agnostic specification.
-- **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are visible in Dispatch but excluded from agent queues by default; `includeRenovate=true` opt-in available (Issue #129).
+- **2026-06-19** — Updated Renovate issue exclusion: Renovate issues are filtered from Dispatch issue surfaces, including Board, Projects, lane summaries, grooming intake, and agent queues.
+- **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are excluded from agent queues by default (Issue #129).
 - **2026-05-19** — Added five-column workflow with Ready status (Issue #140): Backlog → Ready → In Progress → In Review → Done. Agents pick from Ready by default; Backlog excluded unless explicitly requested.
 - **2026-05-20** — Marked `lane=gpt` as deprecated compatibility alias in canonical docs; linked openclaw-agent-mc-workflow.md as historical (Issue #117).

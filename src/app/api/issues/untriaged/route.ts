@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS } from "@/types";
 import { isRenovateIssue } from "@/lib/agent-queue";
+import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 /**
  * GET /api/issues/untriaged
@@ -43,6 +44,9 @@ export async function GET(request: Request) {
       state: "open",
       repository: { enabled: true },
     };
+    if (excludeRenovate) {
+      applyRenovateIssueExclusion(where);
+    }
 
     if (repoFilter) {
       where = {

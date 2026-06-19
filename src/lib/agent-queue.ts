@@ -6,8 +6,10 @@ import {
   getAgentFromLabels,
   getPriorityFromLabels,
 } from "@/types";
-import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { isIssueExcludedByLabels, isRenovateIssue } from "@/lib/issue-filters";
 import { isBacklogLane, resolveLaneId, laneMatchesConfigured } from "@/lib/lane-config";
+
+export { isRenovateIssue } from "@/lib/issue-filters";
 
 const DONE_STATUS: string = "status/done";
 const IN_PROGRESS_STATUS: string = "status/in-progress";
@@ -45,28 +47,6 @@ export interface RankedIssue {
   repoFullName?: string;
   claimable?: boolean;
   linkedPrHealth?: QueueLinkedPrHealth | null;
-}
-
-/**
- * Detect Renovate issues by title/label heuristics.
- * Author detection is not available since the Issue model does not store author.
- */
-export function isRenovateIssue(issue: { title: string; labels: string[] }): boolean {
-  const title = issue.title.toLowerCase();
-  const labels = issue.labels.map((l) => l.toLowerCase());
-
-  // Title-based heuristics
-  if (title.includes("dependency dashboard")) return true;
-  if (title.includes("renovate dashboard")) return true;
-  if (/^update (?:dependency|image|deps?)/.test(title)) return true;
-
-  // Label-based heuristics
-  const renovateLabels = ["renovate", "dependencies", "automated"];
-  for (const label of labels) {
-    if (renovateLabels.includes(label)) return true;
-  }
-
-  return false;
 }
 
 /**

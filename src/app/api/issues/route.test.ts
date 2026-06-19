@@ -172,23 +172,31 @@ describe("GET /api/issues — visible issue filtering", () => {
     await makeRequest("http://localhost/api/issues?untriaged=true");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
-    expect(call.where.labels).toBeDefined();
-    expect(call.where.labels.hasNone).toBeDefined();
-    expect(call.where.labels.hasNone).toContain("status/backlog");
-    expect(call.where.labels.hasNone).toContain("status/ready");
-    expect(call.where.labels.hasNone).toContain("status/in-progress");
-    expect(call.where.labels.hasNone).toContain("status/in-review");
-    expect(call.where.labels.hasNone).toContain("status/done");
+    expect(call.where.AND).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          NOT: { labels: { hasSome: expect.arrayContaining([
+            "status/backlog",
+            "status/ready",
+            "status/in-progress",
+            "status/in-review",
+            "status/done",
+          ]) } },
+        }),
+      ]),
+    );
   });
 
-  it("does not add hasNone filter when untriaged is not true", async () => {
+  it("does not add no-status filter when untriaged is not true", async () => {
     await makeRequest("http://localhost/api/issues?untriaged=false");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
-    // labels may have other filters but should not have hasNone from noStatus
-    if (call.where.labels) {
-      expect(call.where.labels.hasNone).toBeUndefined();
-    }
+    const andClauses = call.where.AND ?? [];
+    expect(andClauses).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ NOT: { labels: { hasSome: expect.arrayContaining(["status/ready"]) } } }),
+      ]),
+    );
   });
 
   it("combines untriaged filter with agent filter", async () => {
@@ -196,8 +204,13 @@ describe("GET /api/issues — visible issue filtering", () => {
 
     const call = mocks.findManyIssues.mock.calls[0][0];
     expect(call.where.labels.has).toBe("agent/alpha");
-    expect(call.where.labels.hasNone).toBeDefined();
-    expect(call.where.labels.hasNone).toContain("status/ready");
+    expect(call.where.AND).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          NOT: { labels: { hasSome: expect.arrayContaining(["status/ready"]) } },
+        }),
+      ]),
+    );
   });
 
   it("orders by updatedAt descending", async () => {
@@ -267,6 +280,23 @@ describe("GET /api/issues — visible issue filtering", () => {
 
     const call = mocks.findManyIssues.mock.calls[0][0];
     expect(call.where.currentLane).toEqual({ in: ["backlog"] });
+  });
+
+  it("excludes Renovate issues from API results", async () => {
+    await makeRequest("http://localhost/api/issues");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.AND).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          NOT: expect.objectContaining({
+            OR: expect.arrayContaining([
+              { labels: { hasSome: ["renovate", "dependencies", "automated"] } },
+            ]),
+          }),
+        }),
+      ]),
+    );
   });
 });
 

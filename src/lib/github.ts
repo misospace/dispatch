@@ -237,9 +237,15 @@ function getNextLink(response: Response): string | null {
  *
  * @param url       - Initial API URL (must include per_page query param).
  * @param maxItems  - Hard cap on total items returned. Defaults to Infinity (exhaust all pages).
+ * @param extractPageItems - Optional extractor for GitHub endpoints that wrap arrays
+ *                           in an object, such as Actions runs.
  * @returns All collected items across pages.
  */
-export async function fetchPaginated<T>(url: string, maxItems = Infinity): Promise<T[]> {
+export async function fetchPaginated<T>(
+  url: string,
+  maxItems = Infinity,
+  extractPageItems?: (data: unknown) => T[],
+): Promise<T[]> {
   const all: T[] = [];
   let currentUrl: string | null = url;
 
@@ -251,7 +257,11 @@ export async function fetchPaginated<T>(url: string, maxItems = Infinity): Promi
       throw new Error(`GitHub API error: ${response.status} ${text}`);
     }
 
-    const page = (await response.json()) as T[];
+    const data = await response.json();
+    const page = extractPageItems ? extractPageItems(data) : data;
+    if (!Array.isArray(page)) {
+      throw new Error(`GitHub API error: expected array response from ${currentUrl}`);
+    }
     const remaining = maxItems - all.length;
     all.push(...page.slice(0, remaining));
 
@@ -439,13 +449,21 @@ export interface GithubWorkflowRun {
 export async function fetchWorkflowRuns(repoFullName: string, workflowId: number, perPage = 20): Promise<GithubWorkflowRun[]> {
   // Bounded to 50 runs — enough to see recent history without excessive API usage.
   const url = `${GITHUB_API}/repos/${repoFullName}/actions/workflows/${workflowId}/runs?per_page=${perPage}`;
-  return fetchPaginated<GithubWorkflowRun>(url, 50);
+  return fetchPaginated<GithubWorkflowRun>(
+    url,
+    50,
+    (data) => (data as { workflow_runs?: GithubWorkflowRun[] }).workflow_runs ?? [],
+  );
 }
 
 export async function fetchRecentRunsAllWorkflows(repoFullName: string, perPage = 30): Promise<GithubWorkflowRun[]> {
   // Bounded to 100 runs across all workflows — recent history cap.
   const url = `${GITHUB_API}/repos/${repoFullName}/actions/runs?per_page=${perPage}`;
-  return fetchPaginated<GithubWorkflowRun>(url, 100);
+  return fetchPaginated<GithubWorkflowRun>(
+    url,
+    100,
+    (data) => (data as { workflow_runs?: GithubWorkflowRun[] }).workflow_runs ?? [],
+  );
 }
 
 export interface GithubJob {

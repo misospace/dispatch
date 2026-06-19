@@ -24,6 +24,10 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
+  isAgentLabel: (label: string) => label.startsWith("agent/"),
+  isOwnerLabel: (label: string) => label.startsWith("owner/"),
 }));
 
 vi.mock("@/lib/agent-queue", () => ({

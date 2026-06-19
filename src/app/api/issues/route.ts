@@ -1,7 +1,15 @@
 import { NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { buildLabelWhere, buildVisibleIssueWhere, toProjectLabel, buildExcludedLabelWhere, buildNoStatusWhere } from "@/lib/issue-filters";
+import {
+  appendIssueWhere,
+  applyRenovateIssueExclusion,
+  buildExcludedLabelWhere,
+  buildLabelWhere,
+  buildNoStatusWhere,
+  buildVisibleIssueWhere,
+  toProjectLabel,
+} from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
 import { isValidLane, getLaneIds, resolveRequestLane, getLaneAliases } from "@/lib/lane-config";
 
@@ -25,6 +33,7 @@ export async function GET(request: Request) {
     const where: Record<string, unknown> = { repository: { enabled: true } };
 
     buildVisibleIssueWhere(where, { includeClosed: includeClosed === "true" });
+    applyRenovateIssueExclusion(where);
 
     if (repo) {
       where.repository = { ...(where.repository as object), fullName: repo };
@@ -41,13 +50,11 @@ export async function GET(request: Request) {
 
     const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
     const excludedLabelFilter = buildExcludedLabelWhere(excludedLabels);
-    if (excludedLabelFilter) {
-      where.labels = { ...(where.labels as object), ...excludedLabelFilter };
-    }
+    appendIssueWhere(where, excludedLabelFilter);
 
     // Filter for untriaged issues (no status/* label) — grooming intake
     const noStatusFilter = buildNoStatusWhere(untriaged === "true");
-    if (noStatusFilter) where.labels = { ...(where.labels as object), ...noStatusFilter };
+    appendIssueWhere(where, noStatusFilter);
 
     // Filter by execution lane
     if (lane) {

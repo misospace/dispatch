@@ -1,5 +1,17 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { buildLabelWhere, discoverLabelFilterOptions, toProjectLabel, buildVisibleIssueWhere, getDoneRetentionDays, DEFAULT_DONE_RETENTION_DAYS, buildNoStatusWhere } from "./issue-filters";
+import {
+  appendIssueWhere,
+  applyRenovateIssueExclusion,
+  buildExcludedLabelWhere,
+  buildLabelWhere,
+  buildNoStatusWhere,
+  buildVisibleIssueWhere,
+  DEFAULT_DONE_RETENTION_DAYS,
+  discoverLabelFilterOptions,
+  getDoneRetentionDays,
+  isRenovateIssue,
+  toProjectLabel,
+} from "./issue-filters";
 
 describe("issue filter helpers", () => {
   it("discovers sorted agent and owner options from labels only", () => {
@@ -47,14 +59,56 @@ describe("buildNoStatusWhere", () => {
     expect(buildNoStatusWhere(false)).toBeUndefined();
   });
 
-  it("returns hasNone filter with STATUS_LABELS when includeUntriaged is true", () => {
+  it("returns a NOT hasSome filter with STATUS_LABELS when includeUntriaged is true", () => {
     const result = buildNoStatusWhere(true);
     expect(result).toBeDefined();
-    expect(result!.hasNone).toContain("status/backlog");
-    expect(result!.hasNone).toContain("status/ready");
-    expect(result!.hasNone).toContain("status/in-progress");
-    expect(result!.hasNone).toContain("status/in-review");
-    expect(result!.hasNone).toContain("status/done");
+    const labels = result!.NOT.labels.hasSome;
+    expect(labels).toContain("status/backlog");
+    expect(labels).toContain("status/ready");
+    expect(labels).toContain("status/in-progress");
+    expect(labels).toContain("status/in-review");
+    expect(labels).toContain("status/done");
+  });
+});
+
+describe("issue exclusion filters", () => {
+  it("builds excluded label filters with Prisma-supported scalar-list syntax", () => {
+    expect(buildExcludedLabelWhere(["renovate"])).toEqual({
+      NOT: { labels: { hasSome: ["renovate"] } },
+    });
+  });
+
+  it("appends issue where clauses with AND", () => {
+    const where: Record<string, unknown> = { repository: { enabled: true } };
+    appendIssueWhere(where, { NOT: { labels: { hasSome: ["renovate"] } } });
+    appendIssueWhere(where, { NOT: { labels: { hasSome: ["status/ready"] } } });
+
+    expect(where.AND).toEqual([
+      { NOT: { labels: { hasSome: ["renovate"] } } },
+      { NOT: { labels: { hasSome: ["status/ready"] } } },
+    ]);
+  });
+
+  it("adds Renovate exclusion as an AND clause", () => {
+    const where: Record<string, unknown> = { repository: { enabled: true } };
+    applyRenovateIssueExclusion(where);
+
+    expect(where.AND).toEqual([
+      expect.objectContaining({
+        NOT: expect.objectContaining({
+          OR: expect.arrayContaining([
+            { labels: { hasSome: ["renovate", "dependencies", "automated"] } },
+          ]),
+        }),
+      }),
+    ]);
+  });
+
+  it("detects Renovate issues by shared heuristics", () => {
+    expect(isRenovateIssue({ title: "Dependency Dashboard", labels: [] })).toBe(true);
+    expect(isRenovateIssue({ title: "Update image node to v20", labels: [] })).toBe(true);
+    expect(isRenovateIssue({ title: "Bump lodash", labels: ["renovate"] })).toBe(true);
+    expect(isRenovateIssue({ title: "Fix login bug", labels: ["bug"] })).toBe(false);
   });
 });
 

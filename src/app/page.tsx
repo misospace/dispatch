@@ -2,13 +2,17 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
 import { STATUS_LABELS } from "@/types";
+import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
 
 async function getStats() {
+  const issueWhere: Record<string, unknown> = { state: "open", repository: { enabled: true } };
+  applyRenovateIssueExclusion(issueWhere);
+
   const [issues, recentRuns, recentLogs] = await Promise.all([
     prisma.issue.findMany({
-      where: { state: "open", repository: { enabled: true } },
+      where: issueWhere,
       include: { repository: true },
     }),
     prisma.agentRun.findMany({

@@ -8,7 +8,7 @@ vi.mock("./github", async (importOriginal) => {
   return { ...actual };
 });
 
-function makeResponse(data: unknown[], hasNext = false): Response {
+function makeResponse(data: unknown, hasNext = false): Response {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (hasNext) {
     headers.Link = '<https://api.github.com/resource?page=2>; rel="next"';
@@ -90,6 +90,25 @@ describe("fetchPaginated", () => {
     const result = await fetchPaginated<{ id: number }>("https://example.com/api");
 
     expect(result).toEqual([]);
+  });
+
+  it("extracts items from wrapped GitHub responses", async () => {
+    fetchMock.mockResolvedValueOnce(makeResponse({ total_count: 2, workflow_runs: [{ id: 1 }, { id: 2 }] }));
+
+    const result = await fetchPaginated<{ id: number }>(
+      "https://example.com/api",
+      Infinity,
+      (data) => (data as { workflow_runs?: { id: number }[] }).workflow_runs ?? [],
+    );
+
+    expect(result).toEqual([{ id: 1 }, { id: 2 }]);
+  });
+
+  it("throws a useful error when an unwrapped response is not an array", async () => {
+    fetchMock.mockResolvedValueOnce(makeResponse({ message: "not an array" }));
+
+    await expect(fetchPaginated<{ id: number }>("https://example.com/api"))
+      .rejects.toThrow("expected array response");
   });
 
   it("handles maxItems of 0", async () => {

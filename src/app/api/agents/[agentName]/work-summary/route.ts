@@ -3,6 +3,7 @@ import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
 import { getConfiguredLanes, getDefaultClaimableLane, resolveLaneId } from "@/lib/lane-config";
+import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 type WorkSummaryLaneCounts = { queued: number; inProgress: number };
 type PrFixLaneCounts = { total: number; blocked: number };
@@ -32,11 +33,14 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   }
 
   try {
+    const issueWhere: Record<string, unknown> = {
+      state: "open",
+      repository: { enabled: true },
+    };
+    applyRenovateIssueExclusion(issueWhere);
+
     const issues = await prisma.issue.findMany({
-      where: {
-        state: "open",
-        repository: { enabled: true },
-      },
+      where: issueWhere,
       select: {
         labels: true,
         currentLane: true,

@@ -4,6 +4,7 @@ import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue"
 import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
 import { resolveRequestLane, getLaneIds } from "@/lib/lane-config";
+import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -53,13 +54,15 @@ export async function fetchAgentQueueData(
   params: AgentQueueFetchParams,
 ): Promise<AgentQueueFetchResult> {
   const { agentName, lane, excludeDecomposed, includeClaimed, includeRenovate } = params;
+  const issueWhere: Record<string, unknown> = {
+    state: "open",
+    repository: { enabled: true },
+  };
+  applyRenovateIssueExclusion(issueWhere);
 
   // Fetch all open issues from enabled repos (GitHub Issues as source of truth)
   const issues = await prisma.issue.findMany({
-    where: {
-      state: "open",
-      repository: { enabled: true },
-    },
+    where: issueWhere,
     select: {
       id: true,
       number: true,
