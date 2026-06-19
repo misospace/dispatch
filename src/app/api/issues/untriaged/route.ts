@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS } from "@/types";
 import { isRenovateIssue } from "@/lib/agent-queue";
 import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
+import { authorizeRequest } from "@/lib/auth";
 
 /**
  * GET /api/issues/untriaged
@@ -30,6 +31,10 @@ interface UntriagedIssue {
 }
 
 export async function GET(request: Request) {
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     const { searchParams } = new URL(request.url);
     const limit = Math.min(
