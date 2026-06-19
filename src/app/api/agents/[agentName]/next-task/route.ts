@@ -8,6 +8,7 @@ import {
   createGroomTask,
 } from "@/lib/agent-task";
 import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
+import { isRenovateIssue } from "@/lib/agent-queue";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 
 export async function GET(
@@ -36,6 +37,7 @@ export async function GET(
           repository: { enabled: true },
         },
         select: {
+          id: true,
           number: true,
           title: true,
           url: true,
@@ -47,6 +49,7 @@ export async function GET(
       });
 
       const candidates = issues
+        .filter((issue) => !isRenovateIssue(issue))
         .map((issue) => {
           const hasStatus = issue.labels.some((l) => l.startsWith("status/"));
           const hasPriority = issue.labels.some((l) => l.startsWith("priority/"));
@@ -83,6 +86,7 @@ export async function GET(
         agentName,
         lane: best.currentLane ?? getBacklogLane()?.id ?? "backlog",
         issue: {
+          id: best.id,
           repoFullName: best.repository.fullName,
           number: best.number,
           title: best.title,

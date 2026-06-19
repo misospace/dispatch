@@ -64,9 +64,9 @@ export async function POST(request: Request) {
       agentName,
     } = body as Record<string, unknown>;
 
-    if (!issueId || !repoFullName || typeof issueNumber !== "number" || typeof action !== "string") {
+    if (!repoFullName || typeof issueNumber !== "number" || typeof action !== "string") {
       return NextResponse.json(
-        { error: "Missing required fields: issueId, repoFullName, issueNumber, action" },
+        { error: "Missing required fields: repoFullName, issueNumber, action" },
         { status: 400 },
       );
     }
@@ -99,17 +99,37 @@ export async function POST(request: Request) {
     }
 
     try {
-      const issue = await prisma.issue.findUnique({
-        where: { id: issueId as string },
-        include: { repository: true },
-      });
+      // Look up the issue: try by DB id first, fall back to repoFullName + issueNumber
+      let issue = null;
+
+      if (issueId && typeof issueId === "string") {
+        issue = await prisma.issue.findUnique({
+          where: { id: issueId },
+          include: { repository: true },
+        });
+      }
 
       if (!issue) {
-        return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+        // Fallback: look up by repoFullName + issueNumber
+        issue = await prisma.issue.findFirst({
+          where: {
+            number: issueNumber,
+            repository: { fullName: repoFullName as string },
+          },
+          include: { repository: true },
+        });
+      }
+
+      if (!issue) {
+        return NextResponse.json(
+          { error: "Issue not found in local cache" },
+          { status: 404 },
+        );
       }
 
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
       const effectiveNumber = issue.number;
+      const effectiveIssueId = issue.id;
       const beforeLabels = [...issue.labels];
       let afterLabels = [...issue.labels];
       const groomedAt = new Date();
@@ -197,12 +217,12 @@ export async function POST(request: Request) {
       // Update GitHub labels if status changed; always refresh lastSyncedAt
       if (action === "promote_to_ready") {
         await prisma.issue.update({
-          where: { id: issueId as string },
+          where: { id: effectiveIssueId },
           data: { ...groomingData, labels: afterLabels, lastSyncedAt: new Date() },
         });
       } else {
         await prisma.issue.update({
-          where: { id: issueId as string },
+          where: { id: effectiveIssueId },
           data: { ...groomingData, lastSyncedAt: new Date() },
         });
       }
@@ -222,7 +242,7 @@ export async function POST(request: Request) {
           action: actionLabels[action],
           repoFullName: effectiveRepo,
           issueNumber: effectiveNumber,
-          issueId: issueId as string,
+          issueId: effectiveIssueId,
           beforeLabels,
           afterLabels: action === "promote_to_ready" ? afterLabels : beforeLabels,
           success: true,
@@ -245,7 +265,7 @@ export async function POST(request: Request) {
           action: `issue_groomed_${action}`,
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
-          issueId: issueId as string,
+          issueId: (issueId as string) ?? null,
           beforeLabels: [],
           afterLabels: [],
           success: false,
