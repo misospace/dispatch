@@ -351,7 +351,27 @@ Dispatch follows semver. Releases are cut from `main` after each notable fix or 
    gh pr merge --repo misospace/dispatch --squash --delete-branch
    ```
 
-6. **Tag and publish release**
+6. **Write release notes**
+   Hand-write release notes by listing the user-facing changes since the previous tag. Do not use `--generate-notes` — auto-generated notes mix dependency bumps and CI chores into the changelog and bury the actual fixes/features operators care about.
+
+   A good template:
+
+   ```markdown
+   ## What's changed
+
+   ### Fixes
+   - <one-line summary of each user-visible bug fix, with PR #>
+
+   ### Features
+   - <one-line summary of each new capability, with PR #>
+
+   ### Maintenance
+   - <dependency bumps, CI/internal changes, with PR #>
+   ```
+
+   Pull the candidate list from `git log v<previous>..HEAD --oneline`, then trim to what operators/users will notice.
+
+7. **Tag and publish release**
    ```bash
    git checkout main
    git pull --ff-only
@@ -360,7 +380,7 @@ Dispatch follows semver. Releases are cut from `main` after each notable fix or 
    gh release create v<version> \
      --repo misospace/dispatch \
      --title "v<version>" \
-     --generate-notes
+     --notes-file release-notes-v<version>.md
    ```
 
    The tag push triggers the `Build Dispatch Image` workflow on GitHub Actions, which publishes to `ghcr.io/misospace/dispatch:v<version>`.
