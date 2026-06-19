@@ -10,7 +10,11 @@ import {
 import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
 import { isRenovateIssue } from "@/lib/agent-queue";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
+import {
+  applyRenovateIssueExclusion,
+  applyUmbrellaIssueExclusion,
+  buildGroomingStateExclusionWhere,
+} from "@/lib/issue-filters";
 
 export async function GET(
   request: Request,
@@ -37,6 +41,20 @@ export async function GET(
         repository: { enabled: true },
       };
       applyRenovateIssueExclusion(issueWhere);
+      applyUmbrellaIssueExclusion(issueWhere);
+
+      // Exclude issues already groomed recently or currently blocked/not-ready
+      const groomingStateWhere = buildGroomingStateExclusionWhere(24);
+      if (groomingStateWhere.AND) {
+        const existing = issueWhere.AND;
+        if (Array.isArray(existing)) {
+          existing.push(...groomingStateWhere.AND);
+        } else if (existing) {
+          issueWhere.AND = [existing, ...groomingStateWhere.AND];
+        } else {
+          issueWhere.AND = groomingStateWhere.AND;
+        }
+      }
 
       const issues = await prisma.issue.findMany({
         where: issueWhere,
@@ -47,6 +65,9 @@ export async function GET(
           url: true,
           labels: true,
           currentLane: true,
+          groomedAt: true,
+          notReadyReason: true,
+          blockedReason: true,
           repository: { select: { fullName: true } },
         },
         orderBy: { number: "asc" },
