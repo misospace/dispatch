@@ -10,6 +10,7 @@ import {
 import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
 import { isRenovateIssue } from "@/lib/agent-queue";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
+import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 export async function GET(
   request: Request,
@@ -31,11 +32,14 @@ export async function GET(
   try {
     // Groom mode: return exactly one issue to triage/enrich
     if (mode === "groom") {
+      const issueWhere: Record<string, unknown> = {
+        state: "open",
+        repository: { enabled: true },
+      };
+      applyRenovateIssueExclusion(issueWhere);
+
       const issues = await prisma.issue.findMany({
-        where: {
-          state: "open",
-          repository: { enabled: true },
-        },
+        where: issueWhere,
         select: {
           id: true,
           number: true,

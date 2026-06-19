@@ -4,6 +4,7 @@ import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/u
 import { Badge } from "@/components/ui/badge";
 import { AGENT_PREFIX } from "@/types";
 import AgentWorkPanel from "@/app/agents/agent-work-panel";
+import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
 
@@ -25,14 +26,12 @@ interface AgentStats {
 }
 
 async function getAgentStats() {
-  const issues = await prisma.issue.findMany({
-    where: { state: "open", repository: { enabled: true } },
-  });
-
   const agentMap: Record<string, AgentStats> = {};
+  const where: Record<string, unknown> = { repository: { enabled: true } };
+  applyRenovateIssueExclusion(where);
 
   const agentIssues = await prisma.issue.findMany({
-    where: { repository: { enabled: true } },
+    where,
     select: { labels: true },
   });
 

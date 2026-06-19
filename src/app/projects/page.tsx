@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { BOARD_COLUMNS, STATUS_LABELS } from "@/types";
-import { buildVisibleIssueWhere } from "@/lib/issue-filters";
+import { applyRenovateIssueExclusion, buildVisibleIssueWhere } from "@/lib/issue-filters";
 import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
@@ -16,6 +16,7 @@ async function getProjects() {
   // to match Board page retention semantics.
   const where: Record<string, unknown> = { repository: { enabled: true } };
   buildVisibleIssueWhere(where);
+  applyRenovateIssueExclusion(where);
 
   const issues = await prisma.issue.findMany({
     where,

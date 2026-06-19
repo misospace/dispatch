@@ -24,6 +24,10 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/types", () => ({
   STATUS_LABELS: ["status/backlog", "status/ready", "status/in-progress", "status/in-review", "status/done"],
+  AGENT_PREFIX: "agent/",
+  OWNER_PREFIX: "owner/",
+  isAgentLabel: (label: string) => label.startsWith("agent/"),
+  isOwnerLabel: (label: string) => label.startsWith("owner/"),
 }));
 
 vi.mock("@/lib/agent-queue", () => ({
@@ -31,21 +35,32 @@ vi.mock("@/lib/agent-queue", () => ({
 }));
 
 import { GET } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
 
-function request(urlString: string) {
-  return new Request(urlString, { headers: {} });
+function request(urlString: string, includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  return new Request(urlString, { headers });
 }
 
 describe("GET /api/issues/untriaged", () => {
-  // NOTE: This route is intentionally unauthenticated. It returns open issues
-  // with no status/* label to any caller. This is an intake view for grooming.
-  // In production deployments behind a firewall or auth gateway this is acceptable.
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
     vi.clearAllMocks();
     mocks.issueFindMany.mockResolvedValue([]);
   });
 
-  it("returns untriaged issues without authentication", async () => {
+  it("returns 401 without authentication", async () => {
+    const res = await GET(request("http://localhost/api/issues/untriaged", false));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+  });
+
+  it("returns untriaged issues with authentication", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {
         id: "i1",

@@ -1,5 +1,7 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
 
+export const RENOVATE_LABELS = ["renovate", "dependencies", "automated"] as const;
+
 export interface VisibleIssueWhereOptions {
   includeClosed?: boolean;
   doneRetentionDays?: number;
@@ -46,20 +48,67 @@ export function isIssueExcludedByLabels(issueLabels: string[], excludedLabels: s
 
 export function buildExcludedLabelWhere(excludedLabels: string[]) {
   if (excludedLabels.length === 0) return undefined;
-  return { hasNone: excludedLabels };
+  return { NOT: { labels: { hasSome: excludedLabels } } };
 }
 
 /**
  * Build a Prisma where clause that matches issues with no status/* label.
  * Used for grooming intake — surfaces untriaged open issues.
  */
-export function buildNoStatusWhere(includeUntriaged: boolean): { hasNone: string[] } | undefined {
+export function buildNoStatusWhere(includeUntriaged: boolean) {
   if (!includeUntriaged) return undefined;
-  return { hasNone: STATUS_LABELS };
+  return { NOT: { labels: { hasSome: STATUS_LABELS } } };
 }
 
 export function toProjectLabel(project: string | null | undefined) {
   return project ? `project/${project}` : undefined;
+}
+
+export function appendIssueWhere(where: Record<string, unknown>, clause: Record<string, unknown> | undefined): void {
+  if (!clause) return;
+
+  const existing = where.AND;
+  if (Array.isArray(existing)) {
+    existing.push(clause);
+  } else if (existing) {
+    where.AND = [existing, clause];
+  } else {
+    where.AND = [clause];
+  }
+}
+
+/**
+ * Detect Renovate issues by title/label heuristics.
+ * Author detection is not available since the Issue model does not store author.
+ */
+export function isRenovateIssue(issue: { title: string; labels: string[] }): boolean {
+  const title = issue.title.toLowerCase();
+  const labels = issue.labels.map((l) => l.toLowerCase());
+
+  if (title.includes("dependency dashboard")) return true;
+  if (title.includes("renovate dashboard")) return true;
+  if (/^update (?:dependency|image|deps?)/.test(title)) return true;
+
+  return labels.some((label) => (RENOVATE_LABELS as readonly string[]).includes(label));
+}
+
+export function buildRenovateIssueExclusionWhere() {
+  return {
+    NOT: {
+      OR: [
+        { labels: { hasSome: [...RENOVATE_LABELS] } },
+        { title: { contains: "dependency dashboard", mode: "insensitive" } },
+        { title: { contains: "renovate dashboard", mode: "insensitive" } },
+        { title: { startsWith: "update dependency", mode: "insensitive" } },
+        { title: { startsWith: "update image", mode: "insensitive" } },
+        { title: { startsWith: "update dep", mode: "insensitive" } },
+      ],
+    },
+  };
+}
+
+export function applyRenovateIssueExclusion(where: Record<string, unknown>): void {
+  appendIssueWhere(where, buildRenovateIssueExclusionWhere());
 }
 
 export const DEFAULT_DONE_RETENTION_DAYS = 7;

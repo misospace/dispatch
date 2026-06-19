@@ -180,6 +180,7 @@ export default function AutomationOverview() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [newRepo, setNewRepo] = useState("");
   const [addError, setAddError] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [addLoading, setAddLoading] = useState(false);
 
   useEffect(() => {
@@ -187,9 +188,21 @@ export default function AutomationOverview() {
       .then((res) => res.json())
       .catch(() => ({}));
     authedFetch("/api/automation/repos")
-      .then((res) => res.json())
-      .then((data) => setRepos(data))
-      .catch(() => setRepos([]))
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error(data?.error || "Failed to load repositories");
+        }
+        if (!Array.isArray(data)) {
+          throw new Error("Repository API returned an unexpected response");
+        }
+        setRepos(data);
+        setLoadError("");
+      })
+      .catch((error) => {
+        setRepos([]);
+        setLoadError(error instanceof Error ? error.message : "Failed to load repositories");
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -199,7 +212,16 @@ export default function AutomationOverview() {
       await authedFetch("/api/automation/sync", { method: "POST" });
       const res = await authedFetch("/api/automation/repos");
       const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to load repositories");
+      }
+      if (!Array.isArray(data)) {
+        throw new Error("Repository API returned an unexpected response");
+      }
       setRepos(data);
+      setLoadError("");
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Failed to sync repositories");
     } finally {
       setSyncing(false);
     }
@@ -224,7 +246,10 @@ export default function AutomationOverview() {
       setShowAddForm(false);
       const res2 = await authedFetch("/api/automation/repos");
       const data2 = await res2.json();
-      setRepos(data2);
+      if (res2.ok && Array.isArray(data2)) {
+        setRepos(data2);
+        setLoadError("");
+      }
     } catch {
       setAddError("Failed to add repo");
     } finally {
@@ -268,6 +293,12 @@ export default function AutomationOverview() {
           </Button>
         </div>
       </div>
+
+      {loadError && (
+        <Card className="border-destructive">
+          <CardContent className="py-4 text-sm text-destructive">{loadError}</CardContent>
+        </Card>
+      )}
 
       {showAddForm && (
         <Card>
