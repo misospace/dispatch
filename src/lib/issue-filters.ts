@@ -111,6 +111,45 @@ export function applyRenovateIssueExclusion(where: Record<string, unknown>): voi
   appendIssueWhere(where, buildRenovateIssueExclusionWhere());
 }
 
+/**
+ * Build a Prisma where clause that excludes umbrella issues (issues with the
+ * "umbrella" label or titles starting with "Weekly tech debt audit:").
+ */
+export function buildUmbrellaIssueExclusionWhere() {
+  return {
+    NOT: {
+      OR: [
+        { labels: { has: "umbrella" } },
+        { title: { startsWith: "Weekly tech debt audit:", mode: "insensitive" } },
+      ],
+    },
+  };
+}
+
+export function applyUmbrellaIssueExclusion(where: Record<string, unknown>): void {
+  appendIssueWhere(where, buildUmbrellaIssueExclusionWhere());
+}
+
+/**
+ * Build a Prisma where clause that excludes issues already groomed within the
+ * given cooldown (default 24h) or currently blocked/not-ready.
+ */
+export function buildGroomingStateExclusionWhere(cooldownHours: number = 24) {
+  const cutoff = new Date();
+  cutoff.setHours(cutoff.getHours() - cooldownHours);
+
+  return {
+    AND: [
+      // Not recently groomed (or never groomed)
+      { OR: [{ groomedAt: null }, { groomedAt: { lt: cutoff } }] },
+      // Not currently blocked
+      { blockedReason: null },
+      // Not currently marked not-ready
+      { notReadyReason: null },
+    ],
+  };
+}
+
 export const DEFAULT_DONE_RETENTION_DAYS = 7;
 
 export function getDoneRetentionDays(): number {
