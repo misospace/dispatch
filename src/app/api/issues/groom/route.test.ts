@@ -4,6 +4,7 @@ import { resetAuthCaches } from "@/lib/auth";
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findIssue: vi.fn().mockResolvedValue(null),
+    findFirstIssue: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
@@ -16,6 +17,7 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       findUnique: mocks.findIssue,
+      findFirst: mocks.findFirstIssue,
       update: mocks.updateIssue,
     },
     auditLog: {
@@ -67,6 +69,7 @@ function mockIssue(extra?: Record<string, unknown>) {
 describe("POST /api/issues/groom — auth", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
   });
@@ -88,6 +91,7 @@ describe("POST /api/issues/groom — auth", () => {
 describe("POST /api/issues/groom — validation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
   });
@@ -149,6 +153,7 @@ describe("POST /api/issues/groom — validation", () => {
 describe("POST /api/issues/groom — actor resolution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
     mockIssue();
@@ -228,6 +233,7 @@ describe("POST /api/issues/groom — actor resolution", () => {
 describe("POST /api/issues/groom — promote_to_ready", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
     mockIssue({ labels: ["status/backlog", "priority/p2"] });
@@ -338,6 +344,7 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
 describe("POST /api/issues/groom — escalate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
     mockIssue({ labels: ["status/in-progress"] });
@@ -392,6 +399,7 @@ describe("POST /api/issues/groom — escalate", () => {
 describe("POST /api/issues/groom — mark_not_ready", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
     mockIssue({ labels: ["status/backlog"] });
@@ -466,6 +474,7 @@ describe("POST /api/issues/groom — mark_not_ready", () => {
 describe("POST /api/issues/groom — mark_needs_info", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
     mockIssue({ labels: ["status/backlog"] });
@@ -526,6 +535,7 @@ describe("POST /api/issues/groom — mark_needs_info", () => {
 describe("POST /api/issues/groom — mark_blocked", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
     mockIssue({ labels: ["status/backlog"] });
@@ -586,6 +596,7 @@ describe("POST /api/issues/groom — mark_blocked", () => {
 describe("POST /api/issues/groom — error handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
   });
@@ -617,6 +628,7 @@ describe("POST /api/issues/groom — error handling", () => {
 describe("POST /api/issues/groom — auth modes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.findFirstIssue.mockResolvedValue(null);
     resetAuthCaches();
     mocks.findIssue.mockResolvedValue({
       id: "issue-1",

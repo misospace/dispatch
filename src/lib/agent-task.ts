@@ -1,4 +1,5 @@
 export interface IssueRef {
+  id?: string;
   repoFullName: string;
   number: number;
   title: string;
