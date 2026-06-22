@@ -80,14 +80,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -110,7 +110,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "First issue",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
@@ -120,14 +120,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Second issue",
         url: "https://github.com/org/repo/issues/43",
         labels: ["priority/p1", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -163,14 +163,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Regular issue",
         url: "https://github.com/org/repo/issues/99",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -207,7 +207,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -239,7 +239,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -258,7 +258,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Normal issue",
         url: "https://github.com/org/repo/issues/10",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
@@ -268,14 +268,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Escalated issue",
         url: "https://github.com/org/repo/issues/20",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "escalated",
+        currentLane: "frontier",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -292,14 +292,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Claimed by other agent",
         url: "https://github.com/org/repo/issues/30",
         labels: ["agent/other-agent", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -315,14 +315,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Claimed by other agent",
         url: "https://github.com/org/repo/issues/30",
         labels: ["agent/other-agent", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal&includeClaimed=true"),
+      request("/api/agents/example-agent/next-task?lane=local&includeClaimed=true"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -339,14 +339,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Test issue",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -377,7 +377,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -394,14 +394,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Test issue",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
       },
     ]);
 
     await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -422,7 +422,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -436,7 +436,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -454,7 +454,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Issue with PR needing follow-up",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p1", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -471,7 +471,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Normal issue",
         url: "https://github.com/org/repo/issues/99",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: null,
@@ -485,7 +485,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -521,7 +521,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Issue with PR needing follow-up",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -535,7 +535,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -552,7 +552,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -566,7 +566,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -586,7 +586,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -600,7 +600,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -619,7 +619,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -633,7 +633,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -652,7 +652,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: 15,
@@ -666,7 +666,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -683,7 +683,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         title: "Fix login bug",
         url: "https://github.com/org/repo/issues/42",
         labels: ["priority/p0", "status/ready"],
-        currentLane: "normal",
+        currentLane: "local",
         decomposed: false,
         repository: { fullName: "org/repo" },
         linkedPrNumber: null,
@@ -697,7 +697,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     ]);
 
     const res = await GET(
-      request("/api/agents/example-agent/next-task?lane=normal"),
+      request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
@@ -727,7 +727,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.prFixFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -741,7 +741,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.prFixFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -754,7 +754,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       const res = await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -768,7 +768,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -784,7 +784,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.prFixFindMany.mockResolvedValue([]);
 
       await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -797,7 +797,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       mocks.issueFindMany.mockResolvedValue([]);
 
       await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -817,14 +817,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fix login bug",
           url: "https://github.com/org/repo/issues/42",
           labels: ["priority/p0", "status/ready"],
-          currentLane: "normal",
+          currentLane: "local",
           decomposed: false,
           repository: { fullName: "org/repo" },
         },
       ]);
 
       const res = await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
@@ -885,7 +885,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Missing status",
           url: "https://github.com/org/repo/issues/20",
           labels: ["priority/p1"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -907,7 +907,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Missing priority",
           url: "https://github.com/org/repo/issues/30",
           labels: ["status/ready"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -951,7 +951,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1005,7 +1005,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1096,7 +1096,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Missing status",
           url: "https://github.com/org/repo/issues/20",
           labels: ["priority/p1"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
         {
@@ -1126,7 +1126,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Missing priority",
           url: "https://github.com/org/repo/issues/30",
           labels: ["status/ready"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
         {
@@ -1134,7 +1134,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Missing status",
           url: "https://github.com/org/repo/issues/20",
           labels: ["priority/p1"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1257,7 +1257,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1279,7 +1279,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1300,7 +1300,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1324,7 +1324,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1345,7 +1345,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fully labeled",
           url: "https://github.com/org/repo/issues/50",
           labels: ["status/ready", "priority/p0", "agent/alice"],
-          currentLane: "normal",
+          currentLane: "local",
           repository: { fullName: "org/repo" },
         },
       ]);
@@ -1389,14 +1389,14 @@ describe("GET /api/agents/[agentName]/next-task", () => {
           title: "Fix login bug",
           url: "https://github.com/org/repo/issues/42",
           labels: ["priority/p0", "status/ready"],
-          currentLane: "normal",
+          currentLane: "local",
           decomposed: false,
           repository: { fullName: "org/repo" },
         },
       ]);
 
       const res = await GET(
-        request("/api/agents/example-agent/next-task?lane=normal"),
+        request("/api/agents/example-agent/next-task?lane=local"),
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 

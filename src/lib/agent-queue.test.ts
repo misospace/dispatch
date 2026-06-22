@@ -279,11 +279,11 @@ describe("buildAgentQueue", () => {
 
   it("respects lane filter when excluding Renovate issues", () => {
     const issues = [
-      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1", "status/ready"], lane: "normal" }),
-      makeIssue({ number: 2, title: "Fix crash", labels: ["priority/p0", "status/ready"], lane: "normal" }),
-      makeIssue({ number: 3, title: "Escalated issue", labels: ["priority/p0", "status/ready"], lane: "escalated" }),
+      makeIssue({ number: 1, title: "Dependency Dashboard", labels: ["priority/p1", "status/ready"], lane: "local" }),
+      makeIssue({ number: 2, title: "Fix crash", labels: ["priority/p0", "status/ready"], lane: "local" }),
+      makeIssue({ number: 3, title: "Escalated issue", labels: ["priority/p0", "status/ready"], lane: "frontier" }),
     ];
-    const result = buildAgentQueue(issues, "worker-agent", { lane: "normal" });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "local" });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
@@ -358,7 +358,7 @@ describe("buildAgentQueue with status/ready", () => {
 
   it("excludes ready issues only when explicitly filtered by lane=backlog", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
       makeIssue({ number: 2, labels: ["priority/p1", "status/backlog"], lane: "backlog" }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "backlog", claimableOnly: false });
@@ -433,8 +433,8 @@ describe("buildAgentQueue with claimable-only behavior", () => {
 
   it("excludes backlog from default queue even with lane filter (no lane specified)", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
-      makeIssue({ number: 2, labels: ["priority/p1", "status/backlog"], lane: "normal" }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/backlog"], lane: "local" }),
     ];
     const result = buildAgentQueue(issues, "worker-agent");
     expect(result).toHaveLength(1);
@@ -444,7 +444,7 @@ describe("buildAgentQueue with claimable-only behavior", () => {
   it("backlog lane returns nothing when claimableOnly=true (no claimable backlog items exist)", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["priority/p1", "status/backlog"], lane: "backlog" }),
-      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "local" }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "backlog" });
     expect(result).toHaveLength(0);
@@ -453,7 +453,7 @@ describe("buildAgentQueue with claimable-only behavior", () => {
   it("backlog lane returns items when claimableOnly=false", () => {
     const issues = [
       makeIssue({ number: 1, labels: ["priority/p1", "status/backlog"], lane: "backlog" }),
-      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "local" }),
     ];
     const result = buildAgentQueue(issues, "worker-agent", { lane: "backlog", claimableOnly: false });
     expect(result).toHaveLength(1);
@@ -486,22 +486,22 @@ describe("buildAgentQueue with claimable-only behavior", () => {
     expect(result.find((i) => i.number === 1)?.claimable).toBe(true);
   });
 
-  it("excludes status/backlog from default queue with lane=normal", () => {
+  it("excludes status/backlog from default queue with lane=local", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p1", "status/backlog"], lane: "normal" }),
-      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+      makeIssue({ number: 1, labels: ["priority/p1", "status/backlog"], lane: "local" }),
+      makeIssue({ number: 2, labels: ["priority/p1", "status/ready"], lane: "local" }),
     ];
-    const result = buildAgentQueue(issues, "worker-agent", { lane: "normal" });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "local" });
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(2);
   });
 
-  it("respects claimableOnly=false with lane=escalated", () => {
+  it("respects claimableOnly=false with lane=frontier", () => {
     const issues = [
-      makeIssue({ number: 1, labels: ["priority/p0", "status/backlog"], lane: "escalated" }),
-      makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "escalated" }),
+      makeIssue({ number: 1, labels: ["priority/p0", "status/backlog"], lane: "frontier" }),
+      makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "frontier" }),
     ];
-    const result = buildAgentQueue(issues, "worker-agent", { lane: "escalated", claimableOnly: false });
+    const result = buildAgentQueue(issues, "worker-agent", { lane: "frontier", claimableOnly: false });
     expect(result).toHaveLength(2);
     expect(result.find((i) => i.number === 1)?.claimable).toBe(false);
     expect(result.find((i) => i.number === 2)?.claimable).toBe(true);
@@ -896,7 +896,7 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
       });
 
       const issues = [
-        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
         makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "local" }),
         makeIssue({ number: 3, labels: ["priority/p1", "status/ready"], lane: "parking-lot" }),
       ];
@@ -971,19 +971,19 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
           { id: "local", title: "Local", claimable: true },
           { id: "parking-lot", title: "Parking Lot", claimable: false },
         ],
-        laneAliases: { normal: "local", escalated: "local" },
+        laneAliases: { normal: "local", escalated: "local", frontier: "local" },
       });
 
       const issues = [
-        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "normal" }),
-        makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "escalated" }),
+        makeIssue({ number: 1, labels: ["priority/p1", "status/ready"], lane: "local" }),
+        makeIssue({ number: 2, labels: ["priority/p0", "status/ready"], lane: "frontier" }),
         makeIssue({ number: 3, labels: ["priority/p2", "status/ready"], lane: "local" }),
       ];
 
-      // Filter by "local" should include all three (normal, escalated, and local)
+      // Filter by "local" should include all three (frontier aliases to local)
       const result = buildAgentQueue(issues, "worker-agent", { lane: "local" });
       expect(result).toHaveLength(3);
-      expect(result.map((i) => i.number)).toEqual([2, 1, 3]); // p0 escalated, p1 normal, p2 local
+      expect(result.map((i) => i.number)).toEqual([2, 1, 3]); // p0 frontier, p1 local, p2 local
     });
   });
 });

@@ -55,8 +55,8 @@ describe("createImplementTask", () => {
   });
 
   it("includes lane when provided", () => {
-    const task = createImplementTask({ agentName: "alpha", issue: baseIssue, lane: "escalated" });
-    expect(task.lane).toBe("escalated");
+    const task = createImplementTask({ agentName: "alpha", issue: baseIssue, lane: "frontier" });
+    expect(task.lane).toBe("frontier");
   });
 
   it("omits lane when not provided", () => {
@@ -116,7 +116,7 @@ describe("createImplementTask", () => {
 describe("createFollowupPrTask", () => {
   const baseInput = {
     agentName: "beta",
-    lane: "normal",
+    lane: "local",
     pullRequest: {
       repoFullName: "misospace/dispatch",
       number: 456,

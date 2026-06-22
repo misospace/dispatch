@@ -22,7 +22,7 @@ describe("classifyLaneByHeuristics", () => {
       "We need to plan the migration strategy for moving user data to a new schema.",
       ["enhancement"],
     );
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
@@ -32,7 +32,7 @@ describe("classifyLaneByHeuristics", () => {
       null,
       ["audit", "needs-gpt"],
     );
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
   });
 
   it("classifies placeholder/tbd issues as backlog", () => {
@@ -50,7 +50,7 @@ describe("classifyLaneByHeuristics", () => {
       "Implement a toggle in the settings page that switches between light and dark themes.",
       ["enhancement"],
     );
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 
   it("classifies issues with status/backlog label as backlog", () => {
@@ -64,22 +64,22 @@ describe("classifyLaneByHeuristics", () => {
 
   it("handles empty inputs", () => {
     const result = classifyLaneByHeuristics("", "", []);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 
   it("classifies needs-escalation label as escalated", () => {
     const result = classifyLaneByHeuristics("Fix login bug", null, ["status/ready", "needs-escalation"]);
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
   });
 
   it("classifies needs-gpt label as escalated", () => {
     const result = classifyLaneByHeuristics("Add new feature", null, ["enhancement", "needs-gpt"]);
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
   });
 
   it("does NOT treat priority/p1 as escalation signal", () => {
     const result = classifyLaneByHeuristics("Fix urgent bug", null, ["status/ready", "priority/p1"]);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 });
 
@@ -95,38 +95,38 @@ describe("shouldReclassifyStaleBacklog", () => {
   });
 
   it("reclass backlog→normal when current label is status/ready", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready", "enhancement"])).toBe("normal");
+    expect(shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready", "enhancement"])).toBe("local");
   });
 
   it("reclass backlog→normal when current label is status/in-progress", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Fix login bug", null, ["status/in-progress", "bug"])).toBe("normal");
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix login bug", null, ["status/in-progress", "bug"])).toBe("local");
   });
 
   it("reclass backlog→normal when current label is status/in-review", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Add settings page", null, ["status/in-review", "enhancement"])).toBe("normal");
+    expect(shouldReclassifyStaleBacklog("backlog", "Add settings page", null, ["status/in-review", "enhancement"])).toBe("local");
   });
 
   it("reclass backlog→escalated when title has escalation signals", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Database migration strategy for user tables", null, ["status/ready", "enhancement"])).toBe("escalated");
-    expect(shouldReclassifyStaleBacklog("backlog", "RFC: new auth architecture", null, ["status/ready"])).toBe("escalated");
+    expect(shouldReclassifyStaleBacklog("backlog", "Database migration strategy for user tables", null, ["status/ready", "enhancement"])).toBe("frontier");
+    expect(shouldReclassifyStaleBacklog("backlog", "RFC: new auth architecture", null, ["status/ready"])).toBe("frontier");
   });
 
   it("reclass backlog→escalated when body has escalation signals", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Tech debt audit", "Weekly audit parent for Q1 decomposition.", ["status/ready"])).toBe("escalated");
+    expect(shouldReclassifyStaleBacklog("backlog", "Tech debt audit", "Weekly audit parent for Q1 decomposition.", ["status/ready"])).toBe("frontier");
   });
 
   it("reclass backlog→escalated when needs-escalation label present", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Fix login bug", null, ["status/ready", "needs-escalation"])).toBe("escalated");
-    expect(shouldReclassifyStaleBacklog("backlog", "Add new feature", null, ["status/ready", "needs-gpt"])).toBe("escalated");
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix login bug", null, ["status/ready", "needs-escalation"])).toBe("frontier");
+    expect(shouldReclassifyStaleBacklog("backlog", "Add new feature", null, ["status/ready", "needs-gpt"])).toBe("frontier");
   });
 
   it("does NOT treat priority/p1 as escalation signal", () => {
-    expect(shouldReclassifyStaleBacklog("backlog", "Fix urgent bug", null, ["status/ready", "priority/p1"])).toBe("normal");
+    expect(shouldReclassifyStaleBacklog("backlog", "Fix urgent bug", null, ["status/ready", "priority/p1"])).toBe("local");
   });
 
   it("falls back to normal when classifier returns backlog for active-status issue", () => {
     // Issue has status/ready but body contains backlog signals like "placeholder"
-    expect(shouldReclassifyStaleBacklog("backlog", "New feature TBD", "This is a placeholder. More details needed.", ["status/ready"])).toBe("normal");
+    expect(shouldReclassifyStaleBacklog("backlog", "New feature TBD", "This is a placeholder. More details needed.", ["status/ready"])).toBe("local");
   });
 
   it("returns null when no active status label present", () => {
@@ -808,7 +808,7 @@ describe("classifyLaneByHeuristics config-aware", () => {
       "Implement a toggle in the settings page.",
       ["enhancement"],
     );
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 
   it("default config stays backward-compatible: architecture issue -> escalated", () => {
@@ -817,7 +817,7 @@ describe("classifyLaneByHeuristics config-aware", () => {
       "We need to plan the migration strategy.",
       ["enhancement"],
     );
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
   });
 
   it("default config stays backward-compatible: placeholder -> backlog", () => {
@@ -962,13 +962,13 @@ describe("shouldReclassifyStaleBacklog config-aware", () => {
   it("default config: reclass backlog->normal for concrete issue", () => {
     expect(
       shouldReclassifyStaleBacklog("backlog", "Add dark mode toggle", null, ["status/ready", "enhancement"]),
-    ).toBe("normal");
+    ).toBe("local");
   });
 
   it("default config: reclass backlog->escalated for architecture issue", () => {
     expect(
       shouldReclassifyStaleBacklog("backlog", "Database migration strategy for user tables", null, ["status/ready", "enhancement"]),
-    ).toBe("escalated");
+    ).toBe("frontier");
   });
 
   it("single claimable lane: reclass to that lane", () => {

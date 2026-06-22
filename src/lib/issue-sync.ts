@@ -177,10 +177,11 @@ export async function syncIssuesForRepos(
 }
 
 /**
- * Status labels that indicate an issue is actively being worked on.
- * Closed issues with these labels in Dispatch need reconciliation.
+ * Status labels that make an issue eligible for closed-issue reconciliation.
+ * When a GitHub issue with one of these labels is found to be closed,
+ * the old status label is replaced with status/done.
  */
-const ACTIVE_STATUS_LABELS = ["status/ready", "status/in-progress", "status/in-review"] as const;
+const RECONCILABLE_STATUS_LABELS = ["status/backlog", "status/ready", "status/in-progress", "status/in-review"] as const;
 
 export async function reconcileClosedIssues(
   repos: SyncRepo[],
@@ -199,16 +200,16 @@ export async function reconcileClosedIssues(
       let repoReconciled = 0;
 
       for (const cached of cachedIssues) {
-        const hasActiveStatus = ACTIVE_STATUS_LABELS.some((s) => cached.labels.includes(s));
-        if (!hasActiveStatus) continue;
+        const hasReconcilableStatus = RECONCILABLE_STATUS_LABELS.some((s) => cached.labels.includes(s));
+        if (!hasReconcilableStatus) continue;
 
         try {
           const ghIssue = await fetchIssueFn(repo.fullName, cached.number);
 
           if (ghIssue.state === "closed") {
-            // Determine the new label: close any active status, add status/done
+            // Determine the new label: remove any reconcilable status, add status/done
             const newLabels = cached.labels
-              .filter((l) => !ACTIVE_STATUS_LABELS.includes(l as typeof ACTIVE_STATUS_LABELS[number]))
+              .filter((l) => !RECONCILABLE_STATUS_LABELS.includes(l as typeof RECONCILABLE_STATUS_LABELS[number]))
               .concat(["status/done"]);
 
             await store.updateIssue(cached.id, {
