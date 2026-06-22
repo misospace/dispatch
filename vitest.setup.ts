@@ -84,3 +84,18 @@ setLaneConfig({
   ],
   laneAliases: { normal: "local", escalated: "frontier" },
 });
+
+// Re-apply lane config before each test — some tests call resetLaneConfig()
+// which wipes the global setup. This ensures every test starts with the
+// 3-tier config unless it explicitly calls resetLaneConfig() itself.
+beforeEach(() => {
+  setLaneConfig({
+    lanes: [
+      { id: "local", title: "Local", claimable: true, role: "default", description: "Local model lane", color: "#3b82f6" },
+      { id: "cloud", title: "Cloud", claimable: true, description: "Cloud model lane", color: "#8b5cf6" },
+      { id: "frontier", title: "Frontier", claimable: true, role: "escalation", description: "Frontier model lane", color: "#f97316" },
+      { id: "backlog", title: "Backlog", claimable: false, description: "Backlog", color: "#6b7280" },
+    ],
+    laneAliases: { normal: "local", escalated: "frontier" },
+  });
+});
