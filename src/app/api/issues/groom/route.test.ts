@@ -364,7 +364,7 @@ describe("POST /api/issues/groom — escalate", () => {
     const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "escalate" });
     expect(res.status).toBe(200);
     const call = mocks.updateIssue.mock.calls[0][0];
-    expect(call.data.currentLane).toBe("escalated");
+    expect(call.data.currentLane).toBe("frontier");
   });
 
   it("sets nextGroomingAction hint", async () => {

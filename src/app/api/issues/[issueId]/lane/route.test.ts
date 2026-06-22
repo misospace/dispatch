@@ -111,7 +111,7 @@ describe("POST /api/issues/[issueId]/lane — validation", () => {
 
   it("returns 400 when classification has invalid confidence", async () => {
     mocks.findUnique.mockResolvedValue(makeIssue());
-    const res = await POST(makeRequest("POST", { classification: { lane: "normal", confidence: "extreme", reason: "test" } }), makeContext());
+    const res = await POST(makeRequest("POST", { classification: { lane: "local", confidence: "extreme", reason: "test" } }), makeContext());
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toContain("invalid confidence");
@@ -119,7 +119,7 @@ describe("POST /api/issues/[issueId]/lane — validation", () => {
 
   it("returns 400 when classification has empty reason", async () => {
     mocks.findUnique.mockResolvedValue(makeIssue());
-    const res = await POST(makeRequest("POST", { classification: { lane: "normal", confidence: "high", reason: "" } }), makeContext());
+    const res = await POST(makeRequest("POST", { classification: { lane: "local", confidence: "high", reason: "" } }), makeContext());
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toContain("reason is required");
@@ -137,20 +137,20 @@ describe("POST /api/issues/[issueId]/lane — business logic", () => {
 
   it("classifies using provided classification when model is given", async () => {
     const res = await POST(
-      makeRequest("POST", { classification: { lane: "normal", confidence: "high", reason: "Concrete bug fix" } }),
+      makeRequest("POST", { classification: { lane: "local", confidence: "high", reason: "Concrete bug fix" } }),
       makeContext(),
     );
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
-    expect(body.lane).toBe("normal");
+    expect(body.lane).toBe("local");
     expect(body.confidence).toBe("high");
     expect(mocks.createLane).toHaveBeenCalledWith({
-      data: expect.objectContaining({ lane: "normal", confidence: "high", reason: "Concrete bug fix" }),
+      data: expect.objectContaining({ lane: "local", confidence: "high", reason: "Concrete bug fix" }),
     });
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
-      data: { currentLane: "normal" },
+      data: { currentLane: "local" },
     });
   });
 
@@ -171,7 +171,7 @@ describe("POST /api/issues/[issueId]/lane — business logic", () => {
     mocks.findFirstLane.mockResolvedValue({
       id: "lane-1",
       issueId: "issue-1",
-      lane: "escalated",
+      lane: "frontier",
       confidence: "medium",
       reason: "Architecture decision needed",
       model: "model-v1",
@@ -180,7 +180,7 @@ describe("POST /api/issues/[issueId]/lane — business logic", () => {
     const res = await POST(makeRequest("POST", {}), makeContext());
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.lane).toBe("escalated");
+    expect(body.lane).toBe("frontier");
     expect(body.confidence).toBe("medium");
     expect(body.reason).toBe("Architecture decision needed");
     expect(mocks.createLane).not.toHaveBeenCalled();
@@ -213,7 +213,7 @@ describe("POST /api/issues/[issueId]/lane — business logic", () => {
   it("truncates reason to 500 chars", async () => {
     const longReason = "a".repeat(600);
     const res = await POST(
-      makeRequest("POST", { classification: { lane: "normal", confidence: "high", reason: longReason } }),
+      makeRequest("POST", { classification: { lane: "local", confidence: "high", reason: longReason } }),
       makeContext(),
     );
     expect(res.status).toBe(200);
@@ -225,11 +225,11 @@ describe("POST /api/issues/[issueId]/lane — business logic", () => {
 
 describe("GET /api/issues/[issueId]/lane", () => {
   it("returns current lane classification with full history", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", currentLane: "normal", lastSyncedAt: new Date() });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", currentLane: "local", lastSyncedAt: new Date() });
     mocks.findFirstLane.mockResolvedValue({
       id: "lane-1",
       issueId: "issue-1",
-      lane: "normal",
+      lane: "local",
       confidence: "high",
       reason: "Concrete implementation work",
       model: "heuristic",
@@ -238,7 +238,7 @@ describe("GET /api/issues/[issueId]/lane", () => {
     const res = await GET(makeRequest("GET"), makeContext());
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.lane).toBe("normal");
+    expect(body.lane).toBe("local");
     expect(body.confidence).toBe("high");
     expect(body.reason).toBe("Concrete implementation work");
   });
