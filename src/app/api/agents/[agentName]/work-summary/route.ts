@@ -57,7 +57,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     const unknownLaneCounts: Record<string, WorkSummaryLaneCounts> = {};
 
     for (const issue of issues) {
-      const defaultLane = getDefaultClaimableLane()?.id ?? "normal";
+      const defaultLane = getDefaultClaimableLane()?.id ?? "default";
       const rawLane = (issue.currentLane ?? defaultLane).toLowerCase();
       const resolved = resolveLaneId(rawLane);
       if (!resolved) continue;
@@ -86,7 +86,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
 
     const prFixItems = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { includeBlocked: true });
 
-    const prFixLaneKeys: Record<string, string> = { NORMAL: "normal", ESCALATED: "escalated", NEEDS_HUMAN: "needsHuman" };
+    const prFixLaneKeys: Record<string, string> = { NORMAL: "local", ESCALATED: "frontier", NEEDS_HUMAN: "needsHuman" };
     const prFixCounts: Record<string, PrFixLaneCounts> = {};
     for (const key of Object.values(prFixLaneKeys)) {
       prFixCounts[key] = { total: 0, blocked: 0 };
@@ -94,7 +94,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
 
     for (const item of prFixItems) {
       const rawLane = (item.lane ?? "NORMAL") as string;
-      const laneKey = prFixLaneKeys[rawLane] ?? "normal";
+      const laneKey = prFixLaneKeys[rawLane] ?? "default";
       if (!prFixCounts[laneKey]) continue;
 
       prFixCounts[laneKey].total++;
