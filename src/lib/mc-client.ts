@@ -294,7 +294,7 @@ export async function claimWork(
 
 Issue: ${resolved.title}
 URL: ${resolved.url}
-Lane: ${resolved.lane || getClaimableLanes()[0]?.id || "normal"}
+Lane: ${resolved.lane || getClaimableLanes()[0]?.id || "local"}
 Status: ${status}
 Labels: ${resolved.labels.join(", ") || "none"}
 Agent: ${resolvedAgent}

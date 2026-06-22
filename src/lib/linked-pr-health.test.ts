@@ -392,7 +392,7 @@ describe("enrichQueueItemsWithPrHealth", () => {
         status: "status/ready",
         agentMatch: true,
         rankingReason: "priority/p1, agent/saffron, ready",
-        lane: "normal",
+        lane: "local",
         decomposed: false,
         issueId: "test-id",
         repoFullName: "org/repo",
@@ -405,7 +405,7 @@ describe("enrichQueueItemsWithPrHealth", () => {
     expect(enriched[0].title).toBe("Test issue");
     expect(enriched[0].labels).toEqual(["enhancement", "priority/p1"]);
     expect(enriched[0].agentMatch).toBe(true);
-    expect(enriched[0].lane).toBe("normal");
+    expect(enriched[0].lane).toBe("local");
     expect(enriched[0].linkedPrHealth).not.toBeNull();
   });
 });
