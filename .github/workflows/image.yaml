@@ -59,7 +59,11 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
         with:
           context: .
+          # BuildKit can't load and push from the same build, so PRs load into
+          # the local daemon (for the validation step below) and main/tags push
+          # to GHCR. The validation step picks the right one.
           push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -68,9 +72,16 @@ jobs:
             DATABASE_URL=postgresql://localhost:5432/dispatch
 
       - name: Validate Prisma CLI runtime
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          IMAGE="dispatch:prisma-cli-runtime"
-          docker build -t "$IMAGE" .
+          set -euo pipefail
+          # Reuse the image built above. On PRs it was loaded into the local
+          # daemon; on main/tags it was pushed to GHCR, so pull it first.
+          IMAGE="$(printf '%s\n' "$TAGS" | head -n1)"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            docker pull "$IMAGE"
+          fi
           echo "Validating Prisma CLI in image: $IMAGE"
           # Pass DATABASE_URL at runtime so prisma validate can load prisma.config.ts.
           # The builder stage ENV is only for npm run build (Next.js static generation).
