@@ -71,7 +71,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(body.context.issueNumber).toBe(42);
     expect(body.context.branch).toBe("feat/my-feature");
     expect(body.context.leaseId).toBe("l-1");
-    expect(body.context.lane).toBe("default");
+    expect(body.context.lane).toBe("local");
     expect(body.context.status).toBe("status/in-progress");
     expect(body.context.labels).toEqual(["agent/test-agent", "priority/p1"]);
   });
@@ -266,7 +266,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.hasActiveWork).toBe(true);
-    expect(body.context.lane).toBe("default");
+    expect(body.context.lane).toBe("local");
     expect(body.context.status).toBe("status/done");
     expect(body.context.labels).toEqual(["type/bug", "priority/p1"]);
   });
