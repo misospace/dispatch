@@ -269,10 +269,10 @@ describe("GET /api/issues — visible issue filtering", () => {
   });
 
   it("filters by valid configured lane", async () => {
-    await makeRequest("http://localhost/api/issues?lane=normal");
+    await makeRequest("http://localhost/api/issues?lane=local");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
-    expect(call.where.currentLane).toEqual({ in: ["normal"] });
+    expect(call.where.currentLane).toEqual({ in: ["local", "normal"] });
   });
 
   it("filters by backlog lane", async () => {
@@ -325,7 +325,7 @@ describe("GET /api/issues — lane aliases", () => {
       laneAliases: { normal: "local", backlog: "parking-lot" },
     });
 
-    await makeRequest("http://localhost/api/issues?lane=normal");
+    await makeRequest("http://localhost/api/issues?lane=local");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
     expect(call.where.currentLane).toEqual({ in: ["local", "normal"] });

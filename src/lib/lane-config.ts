@@ -13,7 +13,7 @@
  * A single lane definition.
  */
 export interface LaneConfig {
-  /** Unique identifier (e.g. "normal", "escalated", "backlog") */
+  /** Unique identifier (e.g. "local", "cloud", "frontier", "backlog") */
   id: string;
   /** Display title */
   title: string;
@@ -51,29 +51,21 @@ export interface LaneConfigSet {
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
 /**
- * Default lane configuration — equivalent to current behavior.
+ * Default lane configuration — minimal, lane-agnostic.
  *
- * - `normal`: claimable, standard worker lane
- * - `escalated`: claimable, requires higher-judgment model support
- * - `backlog`: non-claimable, needs grooming before work can start
+ * Ships with a single `default` claimable lane + `backlog` for non-actionable
+ * items. Real lane topologies (local/cloud/frontier, etc.) are injected at
+ * deploy time via `DISPATCH_LANE_CONFIG_JSON` env var (see instrumentation.ts).
  */
 const DEFAULT_LANE_CONFIG: LaneConfigSet = {
   lanes: [
     {
-      id: "normal",
-      title: "Normal",
+      id: "default",
+      title: "Default",
       claimable: true,
       role: "default",
-      description: "Standard execution lane for concrete, scoped implementation work.",
+      description: "Default execution lane. Override via DISPATCH_LANE_CONFIG_JSON for multi-lane setups.",
       color: "#3b82f6",
-    },
-    {
-      id: "escalated",
-      title: "Escalated",
-      claimable: true,
-      role: "escalation",
-      description: "Requires higher-judgment model support (architecture, design, cross-service).",
-      color: "#f97316",
     },
     {
       id: "backlog",
