@@ -51,28 +51,39 @@ export interface LaneConfigSet {
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
 /**
- * Default lane configuration — equivalent to current behavior.
+ * Default lane configuration — 3-tier execution model (local / cloud / frontier).
  *
- * - `normal`: claimable, standard worker lane
- * - `escalated`: claimable, requires higher-judgment model support
+ * - `local`: claimable, runs on local models (nvidia) — routine, scoped work
+ * - `cloud`: claimable, runs on cloud models (dsv4p) — medium complexity, multi-file
+ * - `frontier`: claimable, runs on frontier models (glm-5.2) — architecture, hard bugs
  * - `backlog`: non-claimable, needs grooming before work can start
+ *
+ * Lane aliases preserve backward compatibility with issues stored under
+ * the previous `normal` / `escalated` lane names.
  */
 const DEFAULT_LANE_CONFIG: LaneConfigSet = {
   lanes: [
     {
-      id: "normal",
-      title: "Normal",
+      id: "local",
+      title: "Local",
       claimable: true,
       role: "default",
-      description: "Standard execution lane for concrete, scoped implementation work.",
+      description: "Local model lane (nvidia) — routine, scoped implementation work.",
       color: "#3b82f6",
     },
     {
-      id: "escalated",
-      title: "Escalated",
+      id: "cloud",
+      title: "Cloud",
+      claimable: true,
+      description: "Cloud model lane (dsv4p) — medium complexity, multi-file changes, debugging with inference.",
+      color: "#8b5cf6",
+    },
+    {
+      id: "frontier",
+      title: "Frontier",
       claimable: true,
       role: "escalation",
-      description: "Requires higher-judgment model support (architecture, design, cross-service).",
+      description: "Frontier model lane (glm-5.2) — architecture, security-sensitive, hard bugs.",
       color: "#f97316",
     },
     {
@@ -83,6 +94,10 @@ const DEFAULT_LANE_CONFIG: LaneConfigSet = {
       color: "#6b7280",
     },
   ],
+  laneAliases: {
+    normal: "local",
+    escalated: "frontier",
+  },
 };
 
 // ─── Config State ─────────────────────────────────────────────────────────────
