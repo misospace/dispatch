@@ -13,7 +13,7 @@
  * A single lane definition.
  */
 export interface LaneConfig {
-  /** Unique identifier (e.g. "normal", "escalated", "backlog") */
+  /** Unique identifier (e.g. "local", "cloud", "frontier", "backlog") */
   id: string;
   /** Display title */
   title: string;

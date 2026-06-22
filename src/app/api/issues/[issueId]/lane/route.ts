@@ -159,7 +159,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ is
 
     if (!currentLane) {
       return NextResponse.json({
-        lane: issue.currentLane ?? "normal",
+        lane: issue.currentLane ?? "local",
         confidence: null,
         reason: "",
         model: null,

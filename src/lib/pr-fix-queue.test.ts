@@ -68,7 +68,7 @@ describe("PR review-fix queue", () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo",
       pr: 10,
-      lane: "normal",
+      lane: "local",
       reason: "review requested",
       feedback: "first comment",
       evidenceKey: "review:1",
@@ -79,7 +79,7 @@ describe("PR review-fix queue", () => {
     const updated = await enqueuePrFixItem(client, {
       repo: "org/repo",
       pr: 10,
-      lane: "normal",
+      lane: "local",
       reason: "checks failed",
       feedback: "failing test",
       evidenceKey: "check:2",
@@ -89,7 +89,7 @@ describe("PR review-fix queue", () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo",
       pr: 10,
-      lane: "normal",
+      lane: "local",
       reason: "duplicate evidence",
       feedback: "failing test",
       evidenceKey: "check:2",
@@ -102,33 +102,33 @@ describe("PR review-fix queue", () => {
   });
 
   it("orders queued items before issue work by queuedAt, repo, then PR", async () => {
-    await enqueuePrFixItem(client, { repo: "z/repo", pr: 2, lane: "normal", reason: "r", feedback: "f", evidenceKey: "z" });
-    await enqueuePrFixItem(client, { repo: "a/repo", pr: 1, lane: "normal", reason: "r", feedback: "f", evidenceKey: "a" });
+    await enqueuePrFixItem(client, { repo: "z/repo", pr: 2, lane: "local", reason: "r", feedback: "f", evidenceKey: "z" });
+    await enqueuePrFixItem(client, { repo: "a/repo", pr: 1, lane: "local", reason: "r", feedback: "f", evidenceKey: "a" });
     client.items[0].queuedAt = new Date("2026-01-02T00:00:00Z");
     client.items[1].queuedAt = new Date("2026-01-01T00:00:00Z");
 
-    const queued = await listQueuedPrFixItems(client, { lane: "normal" });
+    const queued = await listQueuedPrFixItems(client, { lane: "local" });
     expect(queued.map((i) => `${i.repo}#${i.pr}`)).toEqual(["a/repo#1", "z/repo#2"]);
     expect(toAgentQueuePrFixItem(queued[0]).type).toBe("pr-review-fix");
   });
 
   it("filters by lane and excludes needs-human blocked items unless requested", async () => {
-    await enqueuePrFixItem(client, { repo: "org/one", pr: 1, lane: "normal", reason: "r", feedback: "f", evidenceKey: "1" });
-    await enqueuePrFixItem(client, { repo: "org/two", pr: 2, lane: "escalated", reason: "r", feedback: "f", evidenceKey: "2" });
+    await enqueuePrFixItem(client, { repo: "org/one", pr: 1, lane: "local", reason: "r", feedback: "f", evidenceKey: "1" });
+    await enqueuePrFixItem(client, { repo: "org/two", pr: 2, lane: "frontier", reason: "r", feedback: "f", evidenceKey: "2" });
     await enqueuePrFixItem(client, { repo: "org/three", pr: 3, lane: "needs-human", reason: "r", feedback: "f", evidenceKey: "3" });
 
-    expect((await listQueuedPrFixItems(client, { lane: "normal" })).map((i) => i.pr)).toEqual([1]);
-    expect((await listQueuedPrFixItems(client, { lane: "escalated" })).map((i) => i.pr)).toEqual([2]);
+    expect((await listQueuedPrFixItems(client, { lane: "local" })).map((i) => i.pr)).toEqual([1]);
+    expect((await listQueuedPrFixItems(client, { lane: "frontier" })).map((i) => i.pr)).toEqual([2]);
     expect(await listQueuedPrFixItems(client, { lane: "needs-human" })).toEqual([]);
     expect((await listQueuedPrFixItems(client, { lane: "needs-human", includeBlocked: true })).map((i) => i.pr)).toEqual([3]);
   });
 
   it("supports status transitions with history", async () => {
-    await enqueuePrFixItem(client, { repo: "org/repo", pr: 5, lane: "normal", reason: "r", feedback: "f", evidenceKey: "e" });
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 5, lane: "local", reason: "r", feedback: "f", evidenceKey: "e" });
     const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed", note: "pushed fix + validation" });
 
     expect(fixed?.status).toBe("FIXED");
-    expect(await listQueuedPrFixItems(client, { lane: "normal" })).toEqual([]);
+    expect(await listQueuedPrFixItems(client, { lane: "local" })).toEqual([]);
     expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED", note: "pushed fix + validation" });
   });
 });

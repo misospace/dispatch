@@ -135,13 +135,13 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
   it("counts issues by lane and status", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
-      { labels: ["status/ready"], currentLane: "normal" },
-      { labels: [], currentLane: "normal" },
-      { labels: ["status/in-progress"], currentLane: "normal" },
-      { labels: ["status/in-review"], currentLane: "normal" },
-      { labels: ["status/ready"], currentLane: "escalated" },
-      { labels: ["status/in-progress"], currentLane: "escalated" },
+      { labels: ["status/ready"], currentLane: "local" },
+      { labels: ["status/ready"], currentLane: "local" },
+      { labels: [], currentLane: "local" },
+      { labels: ["status/in-progress"], currentLane: "local" },
+      { labels: ["status/in-review"], currentLane: "local" },
+      { labels: ["status/ready"], currentLane: "frontier" },
+      { labels: ["status/in-progress"], currentLane: "frontier" },
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
 
@@ -158,8 +158,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
   it("treats no status label as queued", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["priority/p1"], currentLane: "normal" },
-      { labels: ["type/bug"], currentLane: "normal" },
+      { labels: ["priority/p1"], currentLane: "local" },
+      { labels: ["type/bug"], currentLane: "local" },
     ]);
 
     const res = await makeRequest(
@@ -222,7 +222,7 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
   it("counts issues with status/done as queued since they are still open in the DB", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/done"], currentLane: "normal" },
+      { labels: ["status/done"], currentLane: "local" },
     ]);
 
     const res = await makeRequest(
@@ -272,7 +272,7 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     });
 
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "local" },
       { labels: ["status/in-progress"], currentLane: "local" },
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
@@ -300,7 +300,7 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     });
 
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "local" },
       { labels: ["status/ready"], currentLane: "unknown-old-lane" },
       { labels: ["status/in-progress"], currentLane: "another-unknown" },
     ]);
@@ -328,7 +328,7 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     });
 
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "local" },
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
 

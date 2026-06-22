@@ -55,7 +55,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/in-progress",
         labels: ["agent/test-agent", "priority/p1"],
-        currentLane: "normal",
+        currentLane: "local",
       },
     });
     mocks.issueFindUnique.mockResolvedValue({ id: "issue-abc" });
@@ -71,7 +71,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(body.context.issueNumber).toBe(42);
     expect(body.context.branch).toBe("feat/my-feature");
     expect(body.context.leaseId).toBe("l-1");
-    expect(body.context.lane).toBe("normal");
+    expect(body.context.lane).toBe("local");
     expect(body.context.status).toBe("status/in-progress");
     expect(body.context.labels).toEqual(["agent/test-agent", "priority/p1"]);
   });
@@ -100,7 +100,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/in-progress",
         labels: [],
-        currentLane: "normal",
+        currentLane: "local",
       },
     });
 
@@ -125,7 +125,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/in-progress",
         labels: [],
-        currentLane: "normal",
+        currentLane: "local",
       },
     });
 
@@ -150,7 +150,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/in-progress",
         labels: [],
-        currentLane: "normal",
+        currentLane: "local",
       },
     });
 
@@ -177,7 +177,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/in-progress",
         labels: ["agent/escalated-agent", "priority/p1"],
-        currentLane: "escalated",
+        currentLane: "frontier",
       },
     });
 
@@ -185,7 +185,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.hasActiveWork).toBe(true);
-    expect(body.context.lane).toBe("escalated");
+    expect(body.context.lane).toBe("frontier");
     expect(body.context.status).toBe("status/in-progress");
     expect(body.context.labels).toEqual(["agent/escalated-agent", "priority/p1"]);
   });
@@ -240,7 +240,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.hasActiveWork).toBe(true);
-    expect(body.context.lane).toBe("normal");
+    expect(body.context.lane).toBe("local");
   });
 
   it("returns lane/status metadata for closed issue (stale lease still resolvable)", async () => {
@@ -258,7 +258,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/done",
         labels: ["type/bug", "priority/p1"],
-        currentLane: "normal",
+        currentLane: "local",
       },
     });
 
@@ -266,7 +266,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.hasActiveWork).toBe(true);
-    expect(body.context.lane).toBe("normal");
+    expect(body.context.lane).toBe("local");
     expect(body.context.status).toBe("status/done");
     expect(body.context.labels).toEqual(["type/bug", "priority/p1"]);
   });
@@ -286,7 +286,7 @@ describe("GET /api/agents/:agentName/active-work", () => {
         repository: { fullName: "org/repo" },
         state: "status/in-progress",
         labels: [],
-        currentLane: "normal",
+        currentLane: "local",
       },
     });
 

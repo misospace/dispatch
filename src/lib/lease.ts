@@ -211,7 +211,7 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
       prUrl: lease.prUrl ?? undefined,
     }),
     leaseId: lease.id,
-    lane: lease.issue.currentLane ?? "normal",
+    lane: lease.issue.currentLane ?? "local",
     status: lease.issue.state,
     labels: lease.issue.labels,
   };

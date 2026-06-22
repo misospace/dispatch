@@ -31,7 +31,7 @@ const mockIssue = {
   updatedAt: new Date("2025-01-02"),
   closedAt: null,
   lastSyncedAt: new Date("2025-01-02"),
-  currentLane: "normal",
+  currentLane: "local",
   repository: { fullName: "org/repo" },
 };
 
@@ -197,7 +197,7 @@ describe("resolveIssue", () => {
     expect(result.url).toBe("https://github.com/org/repo/issues/42");
     expect(result.labels).toEqual(["priority/p1", "status/backlog"]);
     expect(result.status).toBe("status/backlog");
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 
   it("returns null status when no status label exists", async () => {
@@ -411,7 +411,7 @@ describe("claimWork", () => {
     expect(result.title).toBe("Fix the thing");
     expect(result.url).toBe("https://github.com/org/repo/issues/42");
     expect(result.labels).toEqual(["priority/p1", "status/backlog"]);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
     expect(result.status).toBe("in-progress");
     expect(result.taskContract).toContain("[Task Contract]");
     expect(result.taskContract).toContain("#42");
@@ -458,7 +458,7 @@ describe("claimWork", () => {
 
   it("includes lane in task contract", async () => {
     const { claimWork } = await import("./mc-client");
-    const escalatedIssue = { ...mockIssue, currentLane: "escalated" };
+    const escalatedIssue = { ...mockIssue, currentLane: "frontier" };
     // claimWork calls resolveIssue 3 times + POST claim + POST status = 5 fetch calls
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy

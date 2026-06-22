@@ -73,7 +73,7 @@ describe("lane-config defaults", () => {
   it("returns a deep copy (mutations do not leak)", () => {
     const lanes = getConfiguredLanes();
     lanes[0].id = "mutated";
-    expect(getConfiguredLanes()[0].id).toBe("normal");
+    expect(getConfiguredLanes()[0].id).toBe("local");
   });
 });
 
@@ -216,7 +216,7 @@ describe("lane-config classification helpers", () => {
 
   describe("getDefaultClaimableLane", () => {
     it("returns the lane with role=default by default config", () => {
-      expect(getDefaultClaimableLane()?.id).toBe("normal");
+      expect(getDefaultClaimableLane()?.id).toBe("local");
     });
 
     it("returns the first claimable lane when no role is set", () => {
@@ -244,7 +244,7 @@ describe("lane-config classification helpers", () => {
 
   describe("getEscalationLane", () => {
     it("returns the lane with role=escalation by default config", () => {
-      expect(getEscalationLane()?.id).toBe("escalated");
+      expect(getEscalationLane()?.id).toBe("frontier");
     });
 
     it("falls back to default claimable when no escalation role exists", () => {
@@ -279,13 +279,13 @@ describe("lane-config classification helpers", () => {
     it("maps escalation signals to the escalation lane", () => {
       expect(
         classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
-      ).toBe("escalated");
+      ).toBe("frontier");
     });
 
     it("maps default signals to the default claimable lane", () => {
       expect(
         classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
-      ).toBe("normal");
+      ).toBe("local");
     });
 
     it("with single claimable lane: all actionable goes to that lane", () => {
@@ -396,8 +396,8 @@ describe("lane-config aliases", () => {
     });
 
     it("returns the original lane ID if it is configured (default config)", () => {
-      expect(resolveLaneId("normal")).toBe("normal");
-      expect(resolveLaneId("escalated")).toBe("escalated");
+      expect(resolveLaneId("normal")).toBe("local");
+      expect(resolveLaneId("escalated")).toBe("frontier");
       expect(resolveLaneId("backlog")).toBe("backlog");
     });
 
@@ -561,8 +561,8 @@ describe("lane-config aliases", () => {
     });
 
     it("returns the configured lane ID for valid lanes", () => {
-      expect(resolveRequestLane("normal")).toBe("normal");
-      expect(resolveRequestLane("escalated")).toBe("escalated");
+      expect(resolveRequestLane("normal")).toBe("local");
+      expect(resolveRequestLane("escalated")).toBe("frontier");
     });
 
     it("resolves aliased lane names to configured lane ID", () => {
@@ -623,8 +623,8 @@ describe("lane-config aliases", () => {
       expect(isValidLane("normal")).toBe(true);
       expect(isValidLane("escalated")).toBe(true);
       expect(isValidLane("backlog")).toBe(true);
-      expect(resolveLaneId("normal")).toBe("normal");
-      expect(resolveLaneId("escalated")).toBe("escalated");
+      expect(resolveLaneId("normal")).toBe("local");
+      expect(resolveLaneId("escalated")).toBe("frontier");
       expect(resolveLaneId("backlog")).toBe("backlog");
     });
 

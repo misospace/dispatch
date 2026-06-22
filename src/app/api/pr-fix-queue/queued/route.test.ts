@@ -73,10 +73,10 @@ describe("GET /api/pr-fix-queue/queued", () => {
   });
 
   it("passes lane filter to listQueuedPrFixItems", async () => {
-    await GET(request("http://localhost/api/pr-fix-queue/queued?lane=normal"));
+    await GET(request("http://localhost/api/pr-fix-queue/queued?lane=local"));
 
     const call = mocks.listQueuedPrFixItems.mock.calls[0][1];
-    expect(call.lane).toBe("normal");
+    expect(call.lane).toBe("local");
   });
 
   it("passes includeBlocked filter", async () => {

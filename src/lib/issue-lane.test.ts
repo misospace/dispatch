@@ -57,13 +57,13 @@ describe("isValidConfidence", () => {
 
 describe("parseLaneClassification", () => {
   it("parses valid classification", () => {
-    const result = parseLaneClassification({ lane: "normal", confidence: "high", reason: "Concrete bug fix" });
-    expect(result).toEqual({ lane: "normal", confidence: "high", reason: "Concrete bug fix" });
+    const result = parseLaneClassification({ lane: "local", confidence: "high", reason: "Concrete bug fix" });
+    expect(result).toEqual({ lane: "local", confidence: "high", reason: "Concrete bug fix" });
   });
 
   it("parses with model field", () => {
-    const result = parseLaneClassification({ lane: "escalated", confidence: "medium", reason: "Architecture decision", model: "test-model" });
-    expect(result).toEqual({ lane: "escalated", confidence: "medium", reason: "Architecture decision", model: "test-model" });
+    const result = parseLaneClassification({ lane: "frontier", confidence: "medium", reason: "Architecture decision", model: "test-model" });
+    expect(result).toEqual({ lane: "frontier", confidence: "medium", reason: "Architecture decision", model: "test-model" });
   });
 
   it("returns null for invalid lane", () => {
@@ -71,11 +71,11 @@ describe("parseLaneClassification", () => {
   });
 
   it("returns null for invalid confidence", () => {
-    expect(parseLaneClassification({ lane: "normal", confidence: "extreme", reason: "test" })).toBeNull();
+    expect(parseLaneClassification({ lane: "local", confidence: "extreme", reason: "test" })).toBeNull();
   });
 
   it("returns null for empty reason", () => {
-    expect(parseLaneClassification({ lane: "normal", confidence: "high", reason: "" })).toBeNull();
+    expect(parseLaneClassification({ lane: "local", confidence: "high", reason: "" })).toBeNull();
   });
 
   it("returns null for non-object input", () => {
@@ -86,7 +86,7 @@ describe("parseLaneClassification", () => {
   });
 
   it("trims and truncates reason", () => {
-    const result = parseLaneClassification({ lane: "normal", confidence: "high", reason: "  too long " + "x".repeat(495) });
+    const result = parseLaneClassification({ lane: "local", confidence: "high", reason: "  too long " + "x".repeat(495) });
     expect(result!.reason.length).toBeLessThanOrEqual(500);
   });
 
@@ -105,9 +105,9 @@ describe("parseLaneClassification", () => {
 
 describe("validateLaneRecord", () => {
   it("validates correct record", () => {
-    const result = validateLaneRecord({ lane: "normal", confidence: "high", reason: "test reason" });
+    const result = validateLaneRecord({ lane: "local", confidence: "high", reason: "test reason" });
     expect(result.valid).toBe(true);
-    expect(result.parsed).toEqual({ lane: "normal", confidence: "high", reason: "test reason" });
+    expect(result.parsed).toEqual({ lane: "local", confidence: "high", reason: "test reason" });
   });
 
   it("rejects invalid lane", () => {
@@ -117,13 +117,13 @@ describe("validateLaneRecord", () => {
   });
 
   it("rejects invalid confidence", () => {
-    const result = validateLaneRecord({ lane: "normal", confidence: "very", reason: "test" });
+    const result = validateLaneRecord({ lane: "local", confidence: "very", reason: "test" });
     expect(result.valid).toBe(false);
     expect(result.error).toContain("invalid confidence");
   });
 
   it("rejects empty reason", () => {
-    const result = validateLaneRecord({ lane: "normal", confidence: "high", reason: "" });
+    const result = validateLaneRecord({ lane: "local", confidence: "high", reason: "" });
     expect(result.valid).toBe(false);
     expect(result.error).toContain("reason is required");
   });
@@ -150,36 +150,36 @@ describe("classifyByHeuristics", () => {
 
   it("classifies escalated when architecture keywords present", () => {
     const result = classifyByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
   it("classifies escalated for rfc/design doc keywords", () => {
     const result = classifyByHeuristics("RFC: New auth flow", "Design document for authentication redesign", ["type/feature"]);
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
   it("classifies escalated for umbrella/decomposition keywords", () => {
     const result = classifyByHeuristics("Audit findings", "Umbrella issue: audit parent decomposition needed", ["priority/p1"]);
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
   it("defaults to normal for concrete issues", () => {
     const result = classifyByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
     expect(result.confidence).toBe("medium");
   });
 
   it("does not escalate just for priority/p1 label", () => {
     const result = classifyByHeuristics("Fix typo in README", "Change 'teh' to 'the'", ["priority/p1"]);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 
   it("does not escalate just for needs-escalation label", () => {
     const result = classifyByHeuristics("Update config", "Simple config change", ["needs-escalation"]);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 });
 
@@ -219,8 +219,8 @@ describe("buildLaneClassificationPrompt", () => {
 
 describe("serializeLaneData", () => {
   it("serializes classification correctly", () => {
-    const data = serializeLaneData({ lane: "normal", confidence: "high", reason: "test", model: "v1" });
-    expect(data).toEqual({ lane: "normal", confidence: "high", reason: "test", model: "v1" });
+    const data = serializeLaneData({ lane: "local", confidence: "high", reason: "test", model: "v1" });
+    expect(data).toEqual({ lane: "local", confidence: "high", reason: "test", model: "v1" });
   });
 
   it("handles null model", () => {
@@ -230,7 +230,7 @@ describe("serializeLaneData", () => {
 
   it("truncates long reasons", () => {
     const longReason = "x".repeat(600);
-    const data = serializeLaneData({ lane: "normal", confidence: "high", reason: longReason });
+    const data = serializeLaneData({ lane: "local", confidence: "high", reason: longReason });
     expect((data.reason as string).length).toBeLessThanOrEqual(500);
   });
 });
@@ -242,12 +242,12 @@ describe("classifyByHeuristics config-aware", () => {
 
   it("default config stays backward-compatible: concrete -> normal", () => {
     const result = classifyByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
-    expect(result.lane).toBe("normal");
+    expect(result.lane).toBe("local");
   });
 
   it("default config stays backward-compatible: architecture -> escalated", () => {
     const result = classifyByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
-    expect(result.lane).toBe("escalated");
+    expect(result.lane).toBe("frontier");
   });
 
   it("default config stays backward-compatible: backlog label -> backlog", () => {

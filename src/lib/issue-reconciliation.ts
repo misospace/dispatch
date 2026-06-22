@@ -145,7 +145,7 @@ export function shouldReclassifyStaleBacklog(
   // claimable lane. An issue with an active status label must never remain in
   // the backlog lane.
   if (isBacklogLane(classification.lane)) {
-    return getDefaultClaimableLane()?.id ?? "normal";
+    return getDefaultClaimableLane()?.id ?? "local";
   }
 
   return classification.lane;
