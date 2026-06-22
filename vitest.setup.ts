@@ -69,3 +69,18 @@ import { resetCaches } from "./src/lib/dispatch-env";
 beforeEach(() => {
   resetCaches();
 });
+
+// Configure 3-tier lanes (local/cloud/frontier) for tests.
+// Code default is minimal (default/backlog) — real deployments use
+// DISPATCH_LANE_CONFIG_JSON. Tests need the full 3-tier config for mock data.
+// lane-config.test.ts resets to default in its own setup.
+import { setLaneConfig } from "./src/lib/lane-config";
+setLaneConfig({
+  lanes: [
+    { id: "local", title: "Local", claimable: true, role: "default", description: "Local model lane", color: "#3b82f6" },
+    { id: "cloud", title: "Cloud", claimable: true, description: "Cloud model lane", color: "#8b5cf6" },
+    { id: "frontier", title: "Frontier", claimable: true, role: "escalation", description: "Frontier model lane", color: "#f97316" },
+    { id: "backlog", title: "Backlog", claimable: false, description: "Backlog", color: "#6b7280" },
+  ],
+  laneAliases: { normal: "local", escalated: "frontier" },
+});

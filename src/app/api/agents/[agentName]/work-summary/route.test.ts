@@ -81,8 +81,8 @@ describe("GET /api/agents/[agentName]/work-summary — auth", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.agentName).toBe(TEST_AGENT);
-    expect(body.issues).toHaveProperty("normal");
-    expect(body.prFixes).toHaveProperty("normal");
+    expect(body.issues).toHaveProperty("local");
+    expect(body.prFixes).toHaveProperty("local");
   });
 
   it("unauthorized request does not call prisma.issue.findMany", async () => {
