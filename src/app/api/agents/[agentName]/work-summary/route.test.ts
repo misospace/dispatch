@@ -122,13 +122,14 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
     const body = await res.json();
     expect(body.agentName).toBe(TEST_AGENT);
     expect(body.issues).toEqual({
-      normal: { queued: 0, inProgress: 0 },
-      escalated: { queued: 0, inProgress: 0 },
+      local: { queued: 0, inProgress: 0 },
+      cloud: { queued: 0, inProgress: 0 },
+      frontier: { queued: 0, inProgress: 0 },
       backlog: { queued: 0, inProgress: 0 },
     });
     expect(body.prFixes).toEqual({
-      normal: { total: 0, blocked: 0 },
-      escalated: { total: 0, blocked: 0 },
+      local: { total: 0, blocked: 0 },
+      frontier: { total: 0, blocked: 0 },
       needsHuman: { total: 0, blocked: 0 },
     });
   });
@@ -151,8 +152,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal).toEqual({ queued: 3, inProgress: 2 });
-    expect(body.issues.escalated).toEqual({ queued: 1, inProgress: 1 });
+    expect(body.issues.local).toEqual({ queued: 3, inProgress: 2 });
+    expect(body.issues.frontier).toEqual({ queued: 1, inProgress: 1 });
     expect(body.issues.backlog).toEqual({ queued: 1, inProgress: 0 });
   });
 
@@ -168,7 +169,7 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal.queued).toBe(2);
+    expect(body.issues.local.queued).toBe(2);
   });
 
   it("counts PR fix queue items by lane", async () => {
@@ -187,8 +188,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.prFixes.normal).toEqual({ total: 3, blocked: 1 });
-    expect(body.prFixes.escalated).toEqual({ total: 1, blocked: 0 });
+    expect(body.prFixes.local).toEqual({ total: 3, blocked: 1 });
+    expect(body.prFixes.frontier).toEqual({ total: 1, blocked: 0 });
     expect(body.prFixes.needsHuman).toEqual({ total: 2, blocked: 2 });
   });
 
@@ -203,10 +204,10 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.prFixes.normal.total).toBe(1);
+    expect(body.prFixes.local.total).toBe(1);
   });
 
-  it("defaults missing lane to normal for issues", async () => {
+  it("defaults missing lane to local for issues", async () => {
     mocks.issueFindMany.mockResolvedValue([
       { labels: ["status/ready"], currentLane: null },
     ]);
@@ -217,7 +218,7 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal.queued).toBe(1);
+    expect(body.issues.local.queued).toBe(1);
   });
 
   it("counts issues with status/done as queued since they are still open in the DB", async () => {
@@ -231,7 +232,7 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal.queued).toBe(1);
+    expect(body.issues.local.queued).toBe(1);
   });
 
   it("returns 500 on database error", async () => {
