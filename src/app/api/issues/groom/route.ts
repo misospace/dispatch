@@ -170,7 +170,7 @@ export async function POST(request: Request) {
 
         case "escalate": {
           const escalationLane = getEscalationLane();
-          groomingData.currentLane = escalationLane?.id ?? "frontier";
+          groomingData.currentLane = escalationLane?.id ?? "default";
           groomingData.nextGroomingAction = "Implement or decompose into actionable sub-tasks";
           break;
         }

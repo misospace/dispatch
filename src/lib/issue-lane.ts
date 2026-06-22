@@ -141,10 +141,10 @@ Lane definitions:
 ${laneDefinitions.join("\n")}
 
 Routing rules:
-- Do not route to ${escalationLane?.id ?? "frontier"} only because labels include needs-escalation, escalated, priority/p1, or because the issue came from an audit.
-- Do route broad audit parent/umbrella issues to ${escalationLane?.id ?? "frontier"} for decomposition/design unless already decomposed.
-- Documentation, tests, CI, lint, release/version drift, bounded frontend/backend fixes, and concrete follow-up issues usually go to ${defaultLane?.id ?? "local"}.
-- If the issue already contains a reasonable implementation approach and acceptance criteria, prefer ${defaultLane?.id ?? "local"}.
+- Do not route to ${escalationLane?.id ?? "default"} only because labels include needs-escalation, escalated, priority/p1, or because the issue came from an audit.
+- Do route broad audit parent/umbrella issues to ${escalationLane?.id ?? "default"} for decomposition/design unless already decomposed.
+- Documentation, tests, CI, lint, release/version drift, bounded frontend/backend fixes, and concrete follow-up issues usually go to ${defaultLane?.id ?? "default"}.
+- If the issue already contains a reasonable implementation approach and acceptance criteria, prefer ${defaultLane?.id ?? "default"}.
 - If confidence is low and the issue is not actionable, choose ${backlogLane?.id ?? "backlog"}.
 
 Issue:

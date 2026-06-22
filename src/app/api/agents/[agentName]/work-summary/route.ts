@@ -57,7 +57,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     const unknownLaneCounts: Record<string, WorkSummaryLaneCounts> = {};
 
     for (const issue of issues) {
-      const defaultLane = getDefaultClaimableLane()?.id ?? "local";
+      const defaultLane = getDefaultClaimableLane()?.id ?? "default";
       const rawLane = (issue.currentLane ?? defaultLane).toLowerCase();
       const resolved = resolveLaneId(rawLane);
       if (!resolved) continue;
@@ -94,7 +94,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
 
     for (const item of prFixItems) {
       const rawLane = (item.lane ?? "NORMAL") as string;
-      const laneKey = prFixLaneKeys[rawLane] ?? "local";
+      const laneKey = prFixLaneKeys[rawLane] ?? "default";
       if (!prFixCounts[laneKey]) continue;
 
       prFixCounts[laneKey].total++;
