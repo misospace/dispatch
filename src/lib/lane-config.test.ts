@@ -205,7 +205,7 @@ describe("lane-config reset", () => {
     expect(getConfiguredLanes()).toHaveLength(1);
 
     resetLaneConfig();
-    expect(getConfiguredLanes()).toHaveLength(3);
+    expect(getConfiguredLanes()).toHaveLength(2);
     expect(getLaneIds()).toEqual(["default", "backlog"]);
   });
 });

@@ -12,8 +12,8 @@ import { setLaneConfig, resetLaneConfig } from "./lane-config";
 
 describe("isValidLane", () => {
   it("returns true for valid lanes", () => {
-    expect(isValidLane("normal")).toBe(true);
-    expect(isValidLane("escalated")).toBe(true);
+    expect(isValidLane("local")).toBe(true);
+    expect(isValidLane("frontier")).toBe(true);
     expect(isValidLane("backlog")).toBe(true);
   });
 
@@ -319,11 +319,11 @@ describe("buildLaneClassificationPrompt config-aware", () => {
     resetLaneConfig();
   });
 
-  it("default config includes normal, escalated, backlog in prompt", () => {
+  it("global test config includes local, cloud, frontier, backlog in prompt", () => {
     const prompt = buildLaneClassificationPrompt("Test", "body", [], "open");
-    expect(prompt).toContain('"normal"|"escalated"|"backlog"');
-    expect(prompt).toContain("normal:");
-    expect(prompt).toContain("escalated:");
+    expect(prompt).toContain('"local"|"cloud"|"frontier"|"backlog"');
+    expect(prompt).toContain("local:");
+    expect(prompt).toContain("frontier:");
     expect(prompt).toContain("backlog:");
   });
 

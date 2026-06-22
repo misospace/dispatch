@@ -971,7 +971,7 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
           { id: "local", title: "Local", claimable: true },
           { id: "parking-lot", title: "Parking Lot", claimable: false },
         ],
-        laneAliases: { normal: "local", escalated: "local" },
+        laneAliases: { normal: "local", escalated: "local", frontier: "local" },
       });
 
       const issues = [
@@ -980,10 +980,10 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
         makeIssue({ number: 3, labels: ["priority/p2", "status/ready"], lane: "local" }),
       ];
 
-      // Filter by "local" should include all three (normal, escalated, and local)
+      // Filter by "local" should include all three (frontier aliases to local)
       const result = buildAgentQueue(issues, "worker-agent", { lane: "local" });
       expect(result).toHaveLength(3);
-      expect(result.map((i) => i.number)).toEqual([2, 1, 3]); // p0 escalated, p1 normal, p2 local
+      expect(result.map((i) => i.number)).toEqual([2, 1, 3]); // p0 frontier, p1 local, p2 local
     });
   });
 });
