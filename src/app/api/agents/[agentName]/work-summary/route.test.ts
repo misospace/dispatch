@@ -81,8 +81,8 @@ describe("GET /api/agents/[agentName]/work-summary — auth", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.agentName).toBe(TEST_AGENT);
-    expect(body.issues).toHaveProperty("normal");
-    expect(body.prFixes).toHaveProperty("normal");
+    expect(body.issues).toHaveProperty("local");
+    expect(body.prFixes).toHaveProperty("local");
   });
 
   it("unauthorized request does not call prisma.issue.findMany", async () => {
@@ -122,26 +122,27 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
     const body = await res.json();
     expect(body.agentName).toBe(TEST_AGENT);
     expect(body.issues).toEqual({
-      normal: { queued: 0, inProgress: 0 },
-      escalated: { queued: 0, inProgress: 0 },
+      local: { queued: 0, inProgress: 0 },
+      cloud: { queued: 0, inProgress: 0 },
+      frontier: { queued: 0, inProgress: 0 },
       backlog: { queued: 0, inProgress: 0 },
     });
     expect(body.prFixes).toEqual({
-      normal: { total: 0, blocked: 0 },
-      escalated: { total: 0, blocked: 0 },
+      local: { total: 0, blocked: 0 },
+      frontier: { total: 0, blocked: 0 },
       needsHuman: { total: 0, blocked: 0 },
     });
   });
 
   it("counts issues by lane and status", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
-      { labels: ["status/ready"], currentLane: "normal" },
-      { labels: [], currentLane: "normal" },
-      { labels: ["status/in-progress"], currentLane: "normal" },
-      { labels: ["status/in-review"], currentLane: "normal" },
-      { labels: ["status/ready"], currentLane: "escalated" },
-      { labels: ["status/in-progress"], currentLane: "escalated" },
+      { labels: ["status/ready"], currentLane: "local" },
+      { labels: ["status/ready"], currentLane: "local" },
+      { labels: [], currentLane: "local" },
+      { labels: ["status/in-progress"], currentLane: "local" },
+      { labels: ["status/in-review"], currentLane: "local" },
+      { labels: ["status/ready"], currentLane: "frontier" },
+      { labels: ["status/in-progress"], currentLane: "frontier" },
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
 
@@ -151,15 +152,15 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal).toEqual({ queued: 3, inProgress: 2 });
-    expect(body.issues.escalated).toEqual({ queued: 1, inProgress: 1 });
+    expect(body.issues.local).toEqual({ queued: 3, inProgress: 2 });
+    expect(body.issues.frontier).toEqual({ queued: 1, inProgress: 1 });
     expect(body.issues.backlog).toEqual({ queued: 1, inProgress: 0 });
   });
 
   it("treats no status label as queued", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["priority/p1"], currentLane: "normal" },
-      { labels: ["type/bug"], currentLane: "normal" },
+      { labels: ["priority/p1"], currentLane: "local" },
+      { labels: ["type/bug"], currentLane: "local" },
     ]);
 
     const res = await makeRequest(
@@ -168,7 +169,7 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal.queued).toBe(2);
+    expect(body.issues.local.queued).toBe(2);
   });
 
   it("counts PR fix queue items by lane", async () => {
@@ -187,8 +188,8 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.prFixes.normal).toEqual({ total: 3, blocked: 1 });
-    expect(body.prFixes.escalated).toEqual({ total: 1, blocked: 0 });
+    expect(body.prFixes.local).toEqual({ total: 3, blocked: 1 });
+    expect(body.prFixes.frontier).toEqual({ total: 1, blocked: 0 });
     expect(body.prFixes.needsHuman).toEqual({ total: 2, blocked: 2 });
   });
 
@@ -203,10 +204,10 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.prFixes.normal.total).toBe(1);
+    expect(body.prFixes.local.total).toBe(1);
   });
 
-  it("defaults missing lane to normal for issues", async () => {
+  it("defaults missing lane to local for issues", async () => {
     mocks.issueFindMany.mockResolvedValue([
       { labels: ["status/ready"], currentLane: null },
     ]);
@@ -217,12 +218,12 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal.queued).toBe(1);
+    expect(body.issues.local.queued).toBe(1);
   });
 
   it("counts issues with status/done as queued since they are still open in the DB", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/done"], currentLane: "normal" },
+      { labels: ["status/done"], currentLane: "local" },
     ]);
 
     const res = await makeRequest(
@@ -231,7 +232,7 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issues.normal.queued).toBe(1);
+    expect(body.issues.local.queued).toBe(1);
   });
 
   it("returns 500 on database error", async () => {
@@ -272,7 +273,7 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     });
 
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "local" },
       { labels: ["status/in-progress"], currentLane: "local" },
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
@@ -300,7 +301,7 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     });
 
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "local" },
       { labels: ["status/ready"], currentLane: "unknown-old-lane" },
       { labels: ["status/in-progress"], currentLane: "another-unknown" },
     ]);
@@ -328,7 +329,7 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     });
 
     mocks.issueFindMany.mockResolvedValue([
-      { labels: ["status/ready"], currentLane: "normal" },
+      { labels: ["status/ready"], currentLane: "local" },
       { labels: ["status/backlog"], currentLane: "backlog" },
     ]);
 
