@@ -211,8 +211,8 @@ describe("buildLaneClassificationPrompt", () => {
 
   it("includes lane definitions in prompt", () => {
     const prompt = buildLaneClassificationPrompt("Test", "body", [], "open");
-    expect(prompt).toContain("normal:");
-    expect(prompt).toContain("escalated:");
+    expect(prompt).toContain("local:");
+    expect(prompt).toContain("frontier:");
     expect(prompt).toContain("backlog:");
   });
 });

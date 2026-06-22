@@ -170,7 +170,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
       },
     ]);
 
-    const res = await GET(request("/api/agents/example-agent/queue?lane=local"), {
+    const res = await GET(request("/api/agents/example-agent/queue?lane=normal"), {
       params: Promise.resolve({ agentName: "example-agent" }),
     });
 

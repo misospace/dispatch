@@ -272,7 +272,7 @@ describe("GET /api/issues — visible issue filtering", () => {
     await makeRequest("http://localhost/api/issues?lane=local");
 
     const call = mocks.findManyIssues.mock.calls[0][0];
-    expect(call.where.currentLane).toEqual({ in: ["normal"] });
+    expect(call.where.currentLane).toEqual({ in: ["local", "normal"] });
   });
 
   it("filters by backlog lane", async () => {

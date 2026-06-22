@@ -469,7 +469,7 @@ describe("claimWork", () => {
     fetchSpy.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] })); // set status
 
     const result = await claimWork("org/repo", 42, "test-agent");
-    expect(result.taskContract).toContain("escalated");
+    expect(result.taskContract).toContain("frontier");
   });
 
   it("includes resolvedAgentName in result", async () => {
