@@ -115,35 +115,38 @@ export function validateGroomerOutput(data: unknown): {
     parsed.confidence = obj.confidence as GroomerOutput["confidence"];
   }
 
+  // Tolerate null for optional string fields: treat null the same as absent.
+  // Non-null non-string values are still rejected.
+
   if ("summary" in obj && typeof obj.summary === "string") {
     parsed.summary = obj.summary;
-  } else if ("summary" in obj) {
+  } else if ("summary" in obj && obj.summary !== null) {
     errors.push("summary must be a string");
     return { valid: false, errors };
   }
 
-  if ("githubComment" in obj && typeof obj.githubComment !== "string") {
+  if ("githubComment" in obj && obj.githubComment !== null && typeof obj.githubComment !== "string") {
     errors.push("githubComment must be a string");
     return { valid: false, errors };
-  } else if ("githubComment" in obj) {
+  } else if ("githubComment" in obj && obj.githubComment !== null) {
     parsed.githubComment = obj.githubComment as string;
   }
 
-  if ("needsInfoReason" in obj && typeof obj.needsInfoReason !== "string") {
+  if ("needsInfoReason" in obj && obj.needsInfoReason !== null && typeof obj.needsInfoReason !== "string") {
     errors.push("needsInfoReason must be a string");
     return { valid: false, errors };
-  } else if ("needsInfoReason" in obj) {
+  } else if ("needsInfoReason" in obj && obj.needsInfoReason !== null) {
     parsed.needsInfoReason = obj.needsInfoReason as string;
   }
 
-  if ("blockedReason" in obj && typeof obj.blockedReason !== "string") {
+  if ("blockedReason" in obj && obj.blockedReason !== null && typeof obj.blockedReason !== "string") {
     errors.push("blockedReason must be a string");
     return { valid: false, errors };
-  } else if ("blockedReason" in obj) {
+  } else if ("blockedReason" in obj && obj.blockedReason !== null) {
     parsed.blockedReason = obj.blockedReason as string;
   }
 
-  if ("nextGroomingAction" in obj) {
+  if ("nextGroomingAction" in obj && obj.nextGroomingAction !== null) {
     if (typeof obj.nextGroomingAction !== "string") {
       errors.push("nextGroomingAction must be a string");
       return { valid: false, errors };

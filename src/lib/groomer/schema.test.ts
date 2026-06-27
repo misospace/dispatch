@@ -202,4 +202,96 @@ describe("groomer schema validation", () => {
     });
     expect(result.valid).toBe(false);
   });
+
+  // --- Null tolerance for optional fields ---
+
+  it("accepts null summary (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      summary: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.summary).toBeUndefined();
+  });
+
+  it("accepts null githubComment (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      githubComment: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.githubComment).toBeUndefined();
+  });
+
+  it("accepts null needsInfoReason (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      needsInfoReason: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.needsInfoReason).toBeUndefined();
+  });
+
+  it("accepts null blockedReason (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      blockedReason: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.blockedReason).toBeUndefined();
+  });
+
+  it("accepts null nextGroomingAction (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      nextGroomingAction: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.nextGroomingAction).toBeUndefined();
+  });
+
+  it("rejects non-null non-string summary", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      summary: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("summary must be a string");
+  });
+
+  it("rejects non-null non-string githubComment", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      githubComment: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("githubComment must be a string");
+  });
+
+  it("rejects non-null non-string needsInfoReason", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      needsInfoReason: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("needsInfoReason must be a string");
+  });
+
+  it("rejects non-null non-string blockedReason", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      blockedReason: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("blockedReason must be a string");
+  });
+
+  it("rejects non-null non-string nextGroomingAction", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      nextGroomingAction: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("nextGroomingAction must be a string");
+  });
 });
