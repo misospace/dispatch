@@ -98,6 +98,20 @@ Issues are classified into execution lanes that control agent queue behavior and
 | `NEXTAUTH_SECRET` | Conditional | Secret for NextAuth.js JWT signing — required when `DISPATCH_AUTH_MODE=oidc`. Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `NEXTAUTH_URL` | Conditional | Public Dispatch base URL used by NextAuth to derive callback URLs. Set this in OIDC deployments. |
 
+### Hosted LLM Groomer (Optional)
+
+Dispatch can optionally run issue grooming itself by calling an OpenAI-compatible LLM endpoint. The hosted groomer runs one issue per invocation, defaults to dry-run, validates structured model output, and only updates issue labels/comments plus Dispatch grooming metadata, lane history, run records, and audit logs. It does not edit code, open PRs, merge PRs, run shell commands, or close issues. See [Hosted LLM Groomer](docs/hosted-groomer.md) for rollout details.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISPATCH_HOSTED_GROOMER_ENABLED` | No | Enables `POST /api/groomer/run` when set to `true` or `1`. Defaults to disabled. |
+| `DISPATCH_LLM_BASE_URL` | Conditional | OpenAI-compatible base URL, without `/chat/completions`. Required when hosted grooming is enabled. |
+| `DISPATCH_LLM_API_KEY` | Conditional | LLM provider API key. Required when hosted grooming is enabled. |
+| `DISPATCH_GROOMER_MODEL` | No | Model name sent to the chat completions API. Defaults to `gpt-4o-mini`. |
+| `DISPATCH_GROOMER_TIMEOUT_MS` | No | LLM request timeout. Defaults to `60000`. |
+| `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | No | Issue context budget sent to the model. Defaults to `8192`. |
+| `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |
+
 ### GitHub App Authentication (Optional)
 
 Dispatch supports optional GitHub App authentication to provide a separate identity in GitHub issue timelines. When configured, mutations (label changes, state changes, etc.) appear under the GitHub App bot identity instead of the shared PAT account.
@@ -382,6 +396,9 @@ List agent runs. Query params: `limit`
 
 ### POST /api/agent-runs
 Create agent run. Requires `DISPATCH_AGENT_TOKEN` bearer auth.
+
+### POST /api/groomer/run
+Run the optional hosted LLM issue groomer for at most one issue. Requires `DISPATCH_AGENT_TOKEN` bearer auth and `DISPATCH_HOSTED_GROOMER_ENABLED=true`. Defaults to dry-run unless `DISPATCH_GROOMER_DRY_RUN=false` or the request body sets `{ "dryRun": false }`. Optional body fields: `dryRun`, `repoFullName`, `issueNumber`, `force`.
 
 ### GET /api/audit
 List audit logs. Query params: `limit`, `repo`

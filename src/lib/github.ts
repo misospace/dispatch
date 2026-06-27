@@ -322,6 +322,55 @@ export async function updateIssueLabels(
   }
 }
 
+export interface GitHubIssueComment {
+  user?: { login?: string };
+  body?: string | null;
+  created_at?: string;
+}
+
+export async function fetchIssueComments(
+  repoFullName: string,
+  issueNumber: number,
+  maxComments = 5,
+): Promise<GitHubIssueComment[]> {
+  const [owner, repo] = repoFullName.split("/");
+  const perPage = Math.max(1, Math.min(maxComments, 100));
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=${perPage}&sort=created&direction=asc`;
+
+  const response = await fetch(url, { headers: await getHeadersAsync() });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API error for ${repoFullName}#${issueNumber} comments: ${response.status} ${text}`);
+  }
+
+  const data = await response.json();
+  if (!Array.isArray(data)) {
+    throw new Error(`GitHub API error: expected comments array for ${repoFullName}#${issueNumber}`);
+  }
+
+  return data.slice(0, maxComments) as GitHubIssueComment[];
+}
+
+export async function addIssueComment(
+  repoFullName: string,
+  issueNumber: number,
+  body: string,
+): Promise<void> {
+  const [owner, repo] = repoFullName.split("/");
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: await getHeadersAsync(),
+    body: JSON.stringify({ body }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API error adding comment: ${response.status} ${text}`);
+  }
+}
+
 export async function addIssueLabel(
   repoFullName: string,
   issueNumber: number,
