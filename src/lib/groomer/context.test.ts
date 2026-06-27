@@ -1,16 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { buildIssueContext, fetchIssueComments } from "./context";
 
-const mockToken = "test-agent-token";
-process.env.DISPATCH_AGENT_TOKEN = mockToken;
-
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
-
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     fetchGitHubIssueComments: vi.fn(),
@@ -84,6 +74,8 @@ describe("buildIssueContext", () => {
     });
 
     expect(result.length).toBeLessThan(2000);
+    expect(result).toContain("...[truncated]");
+    expect(result).not.toContain(longBody);
   });
 
   it("includes lane info when available", async () => {
@@ -97,6 +89,28 @@ describe("buildIssueContext", () => {
     });
 
     expect(result).toContain("lane: backlog");
+  });
+
+  it("includes repository context and warnings when provided", async () => {
+    const result = await buildIssueContext({
+      number: 42,
+      title: "Fix login bug",
+      body: "Users cannot log in.",
+      labels: ["status/backlog"],
+      currentLane: "backlog",
+      comments: [],
+      repositoryContext: {
+        text: "Repository context:\nFile: src/login.ts\nexport function login() {}",
+        sources: ["src/login.ts"],
+        warnings: ["one search failed"],
+        bytes: 64,
+        queries: ["login"],
+      },
+    });
+    expect(result).toContain("Repository context:");
+    expect(result).toContain("src/login.ts");
+    expect(result).toContain("Context warnings:");
+    expect(result).toContain("one search failed");
   });
 });
 

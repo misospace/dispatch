@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeGroomerRequest } from "@/lib/auth";
 import { runHostedGroomer } from "@/lib/groomer/run";
 import { getHostedGroomerConfig } from "@/lib/groomer/config";
 
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
+  if (!(await authorizeGroomerRequest(request)).authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -46,11 +46,15 @@ export async function POST(request: Request) {
       dryRun: result.dryRun,
       output: result.output,
       plannedLabels: result.plannedLabels,
+      groomingRunId: result.groomingRunId,
+      contextWarnings: result.contextWarnings,
+      mutationPlan: result.mutationPlan,
+      appliedMutations: result.appliedMutations,
     });
   } catch (error) {
     console.error("Hosted groomer run failed:", error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Unknown error" },
+      { error: "Hosted groomer run failed" },
       { status: 500 },
     );
   }

@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchPaginated } from "./github";
+import {
+  addIssueComment,
+  fetchPaginated,
+  fetchRepositoryMetadata,
+  searchRepositoryCode,
+  fetchRepositoryFileText,
+} from "./github";
 
 process.env.GITHUB_TOKEN = "test-token-for-pagination-tests";
 
@@ -116,5 +122,259 @@ describe("fetchPaginated", () => {
 
     expect(result).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchRepositoryMetadata", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns repo metadata on success", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ full_name: "org/repo", default_branch: "main", description: "A repo" }),
+    } as Response);
+
+    const result = await fetchRepositoryMetadata("org/repo");
+
+    expect(result).toEqual({
+      fullName: "org/repo",
+      defaultBranch: "main",
+      description: "A repo",
+    });
+  });
+
+  it("handles null description", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ full_name: "org/repo", default_branch: "develop", description: null }),
+    } as Response);
+
+    const result = await fetchRepositoryMetadata("org/repo");
+
+    expect(result.description).toBeNull();
+    expect(result.defaultBranch).toBe("develop");
+  });
+
+  it("throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      text: () => Promise.resolve("Not Found"),
+    } as Response);
+
+    await expect(fetchRepositoryMetadata("org/repo")).rejects.toThrow("Failed to fetch repo metadata");
+  });
+});
+
+describe("searchRepositoryCode", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns search results with path and url", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        items: [
+          { path: "src/a.ts", html_url: "https://github.com/org/repo/blob/main/src/a.ts" },
+          { path: "src/b.ts", html_url: "https://github.com/org/repo/blob/main/src/b.ts" },
+        ],
+      }),
+    } as Response);
+
+    const result = await searchRepositoryCode("org/repo", "test", 10);
+
+    expect(result).toEqual([
+      { path: "src/a.ts", url: "https://github.com/org/repo/blob/main/src/a.ts" },
+      { path: "src/b.ts", url: "https://github.com/org/repo/blob/main/src/b.ts" },
+    ]);
+  });
+
+  it("encodes the full search query string correctly", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ items: [] }),
+    } as Response);
+
+    await searchRepositoryCode("org/repo", "fix auth", 10);
+
+    const calledUrl = fetchMock.mock.calls[0][0] as string;
+    const url = new URL(calledUrl);
+    expect(url.searchParams.get("q")).toBe("fix auth repo:org/repo");
+  });
+
+  it("respects the limit parameter", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({
+        items: [
+          { path: "a.ts", html_url: "1" },
+          { path: "b.ts", html_url: "2" },
+          { path: "c.ts", html_url: "3" },
+        ],
+      }),
+    } as Response);
+
+    const result = await searchRepositoryCode("org/repo", "test", 2);
+
+    expect(result.length).toBe(2);
+  });
+
+  it("returns empty array when no items", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ items: [] }),
+    } as Response);
+
+    const result = await searchRepositoryCode("org/repo", "test", 10);
+
+    expect(result).toEqual([]);
+  });
+
+  it("throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      text: () => Promise.resolve("Validation failed"),
+    } as Response);
+
+    await expect(searchRepositoryCode("org/repo", "test", 10)).rejects.toThrow("Code search failed");
+  });
+});
+
+describe("fetchRepositoryFileText", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns decoded file content", async () => {
+    const content = "const x = 1;";
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ content: Buffer.from(content).toString("base64"), type: "file" }),
+    } as Response);
+
+    const result = await fetchRepositoryFileText("org/repo", "src/index.ts");
+
+    expect(result).toBe(content);
+  });
+
+  it("encodes each path segment separately", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ content: Buffer.from("ok").toString("base64"), type: "file" }),
+    } as Response);
+
+    await fetchRepositoryFileText("org/repo", "src/my file.ts");
+
+    const calledUrl = (fetchMock.mock.calls[0][0] as string);
+    expect(calledUrl).toContain("my%20file.ts");
+  });
+
+  it("includes ref query param when provided", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ content: Buffer.from("ok").toString("base64"), type: "file" }),
+    } as Response);
+
+    await fetchRepositoryFileText("org/repo", "src/index.ts", "feature-branch");
+
+    const calledUrl = (fetchMock.mock.calls[0][0] as string);
+    expect(calledUrl).toContain("?ref=feature-branch");
+  });
+
+  it("returns empty string for directory response", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ type: "dir" }),
+    } as Response);
+
+    const result = await fetchRepositoryFileText("org/repo", "src");
+
+    expect(result).toBe("");
+  });
+
+  it("returns empty string when content is missing", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ type: "file", content: null }),
+    } as Response);
+
+    const result = await fetchRepositoryFileText("org/repo", "src/index.ts");
+
+    expect(result).toBe("");
+  });
+
+  it("throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      text: () => Promise.resolve("Not Found"),
+    } as Response);
+
+    await expect(fetchRepositoryFileText("org/repo", "missing.ts")).rejects.toThrow("Failed to fetch file missing.ts");
+  });
+});
+
+describe("addIssueComment", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns the comment url from the response", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ html_url: "https://github.com/org/repo/issues/1#issuecomment-999" }),
+    } as Response);
+
+    const result = await addIssueComment("org/repo", 1, "test comment");
+
+    expect(result).toEqual({ url: "https://github.com/org/repo/issues/1#issuecomment-999" });
+  });
+
+  it("returns null url when html_url is missing", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({}),
+    } as Response);
+
+    const result = await addIssueComment("org/repo", 1, "test comment");
+
+    expect(result).toEqual({ url: null });
+  });
+
+  it("returns null url when json parse fails", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.reject(new Error("parse error")),
+    } as Response);
+
+    const result = await addIssueComment("org/repo", 1, "test comment");
+
+    expect(result).toEqual({ url: null });
+  });
+
+  it("throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 403,
+      text: () => Promise.resolve("rate limited"),
+    } as Response);
+
+    await expect(addIssueComment("org/repo", 1, "test")).rejects.toThrow("GitHub API error adding comment");
   });
 });

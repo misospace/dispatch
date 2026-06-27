@@ -28,7 +28,10 @@ const { mocks } = vi.hoisted(() => ({
     releaseLease: vi.fn(),
     addIssueLabel: vi.fn(),
     removeIssueLabel: vi.fn(),
+    buildRepositoryContext: vi.fn(),
     prisma: {
+      automationRepo: { findUnique: vi.fn() },
+      groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
       issue: { update: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
@@ -75,6 +78,10 @@ vi.mock("@/lib/lease", () => ({
   releaseLease: mocks.releaseLease,
 }));
 
+vi.mock("./repository-context", () => ({
+  buildRepositoryContext: mocks.buildRepositoryContext,
+}));
+
 import { runHostedGroomer } from "./run";
 
 const mockCandidate: GroomingCandidate = {
@@ -103,7 +110,16 @@ const mockConfig: HostedGroomerConfig = {
   model: "gpt-4o-mini",
   timeoutMs: 60000,
   maxContextBytes: 8192,
+  repoContextEnabled: false,
+  maxContextFiles: 5,
+  maxSearches: 3,
+  maxFileBytes: 4096,
+  commentCooldownHours: 24,
+  groomerToken: null,
 };
+
+const mockAutomationRepo = { id: "repo-1", fullName: "org/repo", enabled: true };
+const mockGroomingRun = { id: "gr-1", stage: "selected" };
 
 describe("runHostedGroomer", () => {
   beforeEach(() => {
@@ -115,31 +131,55 @@ describe("runHostedGroomer", () => {
     mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
     mocks.callGroomerLLM.mockResolvedValue(mockOutput);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
-    mocks.addIssueComment.mockResolvedValue(undefined);
+    mocks.addIssueComment.mockResolvedValue({ url: null });
     mocks.findActiveLeasesForIssue.mockResolvedValue([]);
     mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
     mocks.releaseLease.mockResolvedValue({ id: "lease-1" });
+    mocks.prisma.automationRepo.findUnique.mockResolvedValue(mockAutomationRepo);
+    mocks.prisma.groomingRun.create.mockResolvedValue(mockGroomingRun);
+    mocks.prisma.groomingRun.update.mockResolvedValue({ ...mockGroomingRun, stage: "planned" });
+    mocks.prisma.groomingRun.findFirst.mockResolvedValue(null);
     mocks.prisma.issue.update.mockResolvedValue({ id: "issue-42" });
     mocks.prisma.issueLane.create.mockResolvedValue({ id: "lane-1" });
     mocks.prisma.agentRun.create.mockResolvedValue({ id: "run-1" });
     mocks.prisma.auditLog.create.mockResolvedValue({ id: "audit-1" });
+    mocks.buildRepositoryContext.mockResolvedValue({
+      text: "",
+      sources: [],
+      warnings: [],
+      bytes: 0,
+      queries: [],
+    });
   });
 
   it("returns null when no grooming candidate available", async () => {
     mocks.selectGroomingCandidate.mockResolvedValue(null);
 
     const result = await runHostedGroomer();
+
     expect(result).toBeNull();
     expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
   });
 
-  it("dry-run returns plan without calling mutation functions", async () => {
+  it("dry-run creates and completes groomingRun and result has groomingRunId", async () => {
     mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
 
     const result = await runHostedGroomer();
 
     expect(result).not.toBeNull();
     expect(result!.dryRun).toBe(true);
+    expect(result!.groomingRunId).toBe("gr-1");
+    expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          issueId: "issue-42",
+          repoId: "repo-1",
+          dryRun: true,
+          status: "running",
+        }),
+      }),
+    );
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalled();
     expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.addIssueComment).not.toHaveBeenCalled();
     expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
@@ -147,6 +187,30 @@ describe("runHostedGroomer", () => {
     expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
     expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
     expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+  });
+
+  it("repository context warnings are persisted and returned", async () => {
+    mocks.buildRepositoryContext.mockResolvedValue({
+      text: "",
+      sources: [],
+      warnings: ["Failed to fetch repo metadata: timeout"],
+      bytes: 0,
+      queries: [],
+    });
+    mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.contextWarnings).toEqual(["Failed to fetch repo metadata: timeout"]);
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "gr-1" },
+        data: expect.objectContaining({
+          stage: "context_built",
+          contextWarnings: ["Failed to fetch repo metadata: timeout"],
+        }),
+      }),
+    );
   });
 
   it("write mode calls label update when labels change", async () => {
@@ -215,6 +279,57 @@ describe("runHostedGroomer", () => {
           issueNumber: 42,
         }),
       }),
+    );
+  });
+
+  it("write mode cooldown skips duplicate comment", async () => {
+    mocks.prisma.groomingRun.findFirst.mockResolvedValue({ id: "gr-previous" });
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, githubComment: "Test comment" },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(result!.appliedMutations?.commentSkippedReason).toBe("cooldown");
+  });
+
+  it("write mode stores comment URL when comment is posted", async () => {
+    mocks.addIssueComment.mockResolvedValue({ url: "https://github.com/org/repo/issues/42#issuecomment-123" });
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, githubComment: "Test comment" },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(mocks.addIssueComment).toHaveBeenCalled();
+    expect(result!.appliedMutations?.commentUrl).toBe("https://github.com/org/repo/issues/42#issuecomment-123");
+  });
+
+  it("failure after groomingRun creation completes run as failed", async () => {
+    mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+
+    await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "gr-1" },
+        data: expect.objectContaining({
+          status: "failed",
+          errorMessage: "LLM timeout",
+          retryable: true,
+        }),
+      }),
+    );
+  });
+
+  it("missing AutomationRepo errors cleanly", async () => {
+    mocks.prisma.automationRepo.findUnique.mockResolvedValue(null);
+
+    await expect(runHostedGroomer()).rejects.toThrow(
+      "Automation repository not found for org/repo",
     );
   });
 

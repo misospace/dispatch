@@ -40,6 +40,7 @@ model Issue {
   laneHistory   IssueLane[]
   agentWork     AgentWork[]
   leases        Lease[]
+  groomingRuns  GroomingRun[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -155,6 +156,7 @@ model AgentRun {
 
   // Escalated lane outcome tracking
   outcome          EscalatedOutcome?
+  groomingRuns     GroomingRun[]
 
   @@index([agentName])
   @@index([runType])
@@ -226,6 +228,7 @@ model AutomationRepo {
   syncRuns         AutomationSyncRun[]
   pullRequests     GithubPullRequest[]
   commits          GithubCommit[]
+  groomingRuns     GroomingRun[]
 
   @@index([owner])
 }
@@ -391,6 +394,69 @@ model AutomationSyncRun {
 
   @@index([repoId])
   @@index([startedAt])
+}
+
+// ---------------------------------------------------------------------------
+// GroomingRun — tracks individual issue grooming executions by the hosted groomer.
+// ---------------------------------------------------------------------------
+
+model GroomingRun {
+  id                String         @id @default(cuid())
+  issueId           String
+  issue             Issue          @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  repoId            String
+  repo              AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  agentRunId        String?
+  agentRun          AgentRun?      @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+
+  repoFullName      String
+  issueNumber       Int
+  issueUrl          String
+  status            String
+  dryRun            Boolean
+  candidateSource   String         @default("selector")
+  stage             String         @default("selected")
+
+  model             String?
+  provider          String?
+  promptVersion     String         @default("hosted-groomer-v1")
+  timeoutMs         Int?
+  maxContextBytes   Int?
+
+  contextSummary    Json?
+  contextWarnings   String[]       @default([])
+  rawOutput         Json?
+  validatedOutput   Json?
+  validationErrors  String[]       @default([])
+
+  labelsBefore      String[]       @default([])
+  labelsAfter       String[]       @default([])
+  labelsToAdd       String[]       @default([])
+  labelsToRemove    String[]       @default([])
+  laneBefore        String?
+  laneAfter         String?
+  mutationPlan      Json?
+  appliedMutations  Json?
+  commentBodyPreview String?       @db.Text
+  commentUrl        String?
+
+  errorMessage      String?        @db.Text
+  retryable         Boolean        @default(false)
+  startedAt         DateTime       @default(now())
+  completedAt       DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@index([repoFullName])
+  @@index([issueId])
+  @@index([repoId])
+  @@index([agentRunId])
+  @@index([status])
+  @@index([dryRun])
+  @@index([createdAt])
+  @@index([issueId, createdAt])
+  @@index([repoId, status, createdAt])
+  @@index([issueId, status])
 }
 
 // ---------------------------------------------------------------------------

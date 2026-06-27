@@ -12,6 +12,12 @@ describe("groomer config", () => {
     delete process.env.DISPATCH_GROOMER_TIMEOUT_MS;
     delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES;
     delete process.env.DISPATCH_GROOMER_DRY_RUN;
+    delete process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED;
+    delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_FILES;
+    delete process.env.DISPATCH_GROOMER_MAX_SEARCHES;
+    delete process.env.DISPATCH_GROOMER_MAX_FILE_BYTES;
+    delete process.env.DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS;
+    delete process.env.DISPATCH_GROOMER_TOKEN;
   });
 
   it("is disabled by default", () => {
@@ -154,5 +160,37 @@ describe("groomer config", () => {
   it("is disabled when baseUrl or apiKey is missing (no throw)", () => {
     const config = getHostedGroomerConfig();
     expect(config.enabled).toBe(false);
+  });
+
+  it("defaults repository context and cooldown settings safely", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    const config = getHostedGroomerConfig();
+    expect(config.repoContextEnabled).toBe(false);
+    expect(config.maxContextFiles).toBe(5);
+    expect(config.maxSearches).toBe(3);
+    expect(config.maxFileBytes).toBe(4096);
+    expect(config.commentCooldownHours).toBe(24);
+    expect(config.groomerToken).toBeNull();
+  });
+
+  it("reads repository context and scheduler token settings", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED = "true";
+    process.env.DISPATCH_GROOMER_MAX_CONTEXT_FILES = "2";
+    process.env.DISPATCH_GROOMER_MAX_SEARCHES = "1";
+    process.env.DISPATCH_GROOMER_MAX_FILE_BYTES = "1024";
+    process.env.DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS = "6";
+    process.env.DISPATCH_GROOMER_TOKEN = "scheduled-token";
+    const config = getHostedGroomerConfig();
+    expect(config.repoContextEnabled).toBe(true);
+    expect(config.maxContextFiles).toBe(2);
+    expect(config.maxSearches).toBe(1);
+    expect(config.maxFileBytes).toBe(1024);
+    expect(config.commentCooldownHours).toBe(6);
+    expect(config.groomerToken).toBe("scheduled-token");
   });
 });
