@@ -55,7 +55,7 @@ export interface LaneConfigSet {
  *
  * Ships with a single `default` claimable lane + `backlog` for non-actionable
  * items. Real lane topologies (local/cloud/frontier, etc.) are injected at
- * deploy time via `DISPATCH_LANE_CONFIG_JSON` env var (see instrumentation.ts).
+ * deploy time via `DISPATCH_LANE_CONFIG_JSON` env var (see module-load init below).
  */
 const DEFAULT_LANE_CONFIG: LaneConfigSet = {
   lanes: [
@@ -352,3 +352,28 @@ function validateLaneConfigSet(config: LaneConfigSet): void {
     }
   }
 }
+
+// ─── Environment Init (Module-Load Side Effect) ──────────────────────────────
+
+/**
+ * Initialize lane config from DISPATCH_LANE_CONFIG_JSON env var.
+ *
+ * This runs as a module-load side effect so the config is available in the same
+ * module instance that route handlers import — avoiding Turbopack standalone
+ * chunk isolation where instrumentation.ts would mutate a separate instance.
+ *
+ * Placed at the bottom of this file so all declarations (DEFAULT_LANE_CONFIG,
+ * laneConfigSet, setLaneConfig, validateLaneConfigSet) are already initialized.
+ */
+(function initFromEnv(): void {
+  const raw = process.env.DISPATCH_LANE_CONFIG_JSON;
+  if (!raw) return;
+
+  try {
+    const parsed = JSON.parse(raw) as LaneConfigSet;
+    setLaneConfig(parsed);
+    console.log(`[lane-config] Loaded ${parsed.lanes.length} lanes from DISPATCH_LANE_CONFIG_JSON`);
+  } catch (err) {
+    console.error("[lane-config] Failed to parse DISPATCH_LANE_CONFIG_JSON:", err);
+  }
+})();
