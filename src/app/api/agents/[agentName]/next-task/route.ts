@@ -8,13 +8,8 @@ import {
   createGroomTask,
 } from "@/lib/agent-task";
 import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
-import { isRenovateIssue } from "@/lib/agent-queue";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import {
-  applyRenovateIssueExclusion,
-  applyUmbrellaIssueExclusion,
-  buildGroomingStateExclusionWhere,
-} from "@/lib/issue-filters";
+import { selectGroomingCandidate } from "@/lib/groomer/selector";
 
 export async function GET(
   request: Request,
@@ -36,86 +31,20 @@ export async function GET(
   try {
     // Groom mode: return exactly one issue to triage/enrich
     if (mode === "groom") {
-      const issueWhere: Record<string, unknown> = {
-        state: "open",
-        repository: { enabled: true },
-      };
-      applyRenovateIssueExclusion(issueWhere);
-      applyUmbrellaIssueExclusion(issueWhere);
-
-      // Exclude issues already groomed recently or currently blocked/not-ready
-      const groomingStateWhere = buildGroomingStateExclusionWhere(24);
-      if (groomingStateWhere.AND) {
-        const existing = issueWhere.AND;
-        if (Array.isArray(existing)) {
-          existing.push(...groomingStateWhere.AND);
-        } else if (existing) {
-          issueWhere.AND = [existing, ...groomingStateWhere.AND];
-        } else {
-          issueWhere.AND = groomingStateWhere.AND;
-        }
-      }
-
-      const issues = await prisma.issue.findMany({
-        where: issueWhere,
-        select: {
-          id: true,
-          number: true,
-          title: true,
-          url: true,
-          labels: true,
-          currentLane: true,
-          groomedAt: true,
-          notReadyReason: true,
-          blockedReason: true,
-          repository: { select: { fullName: true } },
-        },
-        orderBy: { number: "asc" },
-      });
-
-      const candidates = issues
-        .filter((issue) => !isRenovateIssue(issue))
-        .map((issue) => {
-          const hasStatus = issue.labels.some((l) => l.startsWith("status/"));
-          const hasPriority = issue.labels.some((l) => l.startsWith("priority/"));
-          const hasAgent = issue.labels.some((l) => l.startsWith("agent/"));
-          const hasLane = !!issue.currentLane;
-          const isBacklog = issue.currentLane ? isBacklogLane(issue.currentLane) : false;
-          const isUnlabeled = issue.labels.length === 0;
-
-          // Eligible if missing any key metadata
-          const eligible =
-            isUnlabeled || !hasStatus || !hasPriority || !hasAgent || !hasLane || isBacklog;
-
-          // Score: fewer missing fields = lower priority (higher number)
-          // Priority order: unlabeled > missing status > missing priority > backlog lane
-          let score = 0;
-          if (isUnlabeled) score += 1000;
-          if (!hasStatus) score += 500;
-          if (!hasPriority) score += 250;
-          if (isBacklog) score += 100;
-          if (!hasAgent) score += 50;
-          if (!hasLane && !isBacklog) score += 25;
-
-          return { issue, eligible, score };
-        })
-        .filter((c) => c.eligible)
-        .sort((a, b) => b.score - a.score || a.issue.number - b.issue.number);
-
-      if (candidates.length === 0) {
+      const candidate = await selectGroomingCandidate();
+      if (!candidate) {
         return NextResponse.json(createIdleTask("No grooming work available"));
       }
 
-      const best = candidates[0].issue;
       const task = createGroomTask({
         agentName,
-        lane: best.currentLane ?? getBacklogLane()?.id ?? "backlog",
+        lane: candidate.currentLane ?? getBacklogLane()?.id ?? "backlog",
         issue: {
-          id: best.id,
-          repoFullName: best.repository.fullName,
-          number: best.number,
-          title: best.title,
-          url: best.url,
+          id: candidate.id,
+          repoFullName: candidate.repoFullName,
+          number: candidate.number,
+          title: candidate.title,
+          url: candidate.url,
         },
       });
       return NextResponse.json(task);
