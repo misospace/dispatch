@@ -1,5 +1,6 @@
 import type { GroomerOutput } from "./schema";
 import { getConfiguredLanes } from "@/lib/lane-config";
+import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 
 export interface CallLlmOptions {
   baseUrl: string;
@@ -9,8 +10,13 @@ export interface CallLlmOptions {
   timeoutMs: number;
 }
 
+const VALID_TYPE_LABELS = ["type/bug", "type/feature", "type/chore", "type/research", "type/security"];
+
 function buildSystemPrompt(): string {
   const laneIds = getConfiguredLanes().map((lane) => lane.id).join("|");
+  const statusLabels = STATUS_LABELS.join(", ");
+  const priorityLabels = PRIORITY_LABELS.join(", ");
+  const typeLabels = VALID_TYPE_LABELS.join(", ");
   return `You are an issue grooming assistant for a software project. Your job is to analyze GitHub issues and recommend labels, lane classification, and grooming actions.
 
 Return ONLY valid JSON with this exact schema:
@@ -29,6 +35,9 @@ Return ONLY valid JSON with this exact schema:
 
 Rules:
 - Only add/remove labels with prefixes: status/, priority/, type/
+- Valid status labels: ${statusLabels}
+- Valid priority labels: ${priorityLabels}
+- Valid type labels: ${typeLabels}
 - Never remove agent/* labels
 - Lane must be one of the configured lane ids
 - Be concise in summary and reason fields`;
