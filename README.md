@@ -111,6 +111,13 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_GROOMER_TIMEOUT_MS` | No | LLM request timeout. Defaults to `60000`. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | No | Issue context budget sent to the model. Defaults to `8192`. |
 | `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |
+| `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | No | Enables bounded GitHub API repository context. Defaults to `false`. |
+| `DISPATCH_GROOMER_MAX_CONTEXT_FILES` | No | Maximum files included in repository context. Defaults to `5`. |
+| `DISPATCH_GROOMER_MAX_SEARCHES` | No | Maximum GitHub code searches per grooming run. Defaults to `3`. |
+| `DISPATCH_GROOMER_MAX_FILE_BYTES` | No | Maximum bytes per fetched file snippet. Defaults to `4096`. |
+| `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | No | Suppresses repeated hosted-groomer comments on the same issue. Defaults to `24`. |
+| `DISPATCH_GROOMER_TOKEN` | No | Optional bearer token for scheduled/admin groomer invocations. |
+| `DISPATCH_GROOMER_INTERVAL_SECONDS` | No | Suggested external scheduler cadence; Dispatch runs at most one issue per request. |
 
 ### GitHub App Authentication (Optional)
 
@@ -398,7 +405,7 @@ List agent runs. Query params: `limit`
 Create agent run. Requires `DISPATCH_AGENT_TOKEN` bearer auth.
 
 ### POST /api/groomer/run
-Run the optional hosted LLM issue groomer for at most one issue. Requires `DISPATCH_AGENT_TOKEN` bearer auth and `DISPATCH_HOSTED_GROOMER_ENABLED=true`. Defaults to dry-run unless `DISPATCH_GROOMER_DRY_RUN=false` or the request body sets `{ "dryRun": false }`. Optional body fields: `dryRun`, `repoFullName`, `issueNumber`, `force`.
+Run the optional hosted LLM issue groomer for at most one issue. Requires `DISPATCH_AGENT_TOKEN` bearer auth (or `DISPATCH_GROOMER_TOKEN` when configured) and `DISPATCH_HOSTED_GROOMER_ENABLED=true`. Defaults to dry-run unless `DISPATCH_GROOMER_DRY_RUN=false` or the request body sets `{ "dryRun": false }`. Every run is recorded in a dedicated `GroomingRun` history table visible at `/automation/groomer`. Optional body fields: `dryRun`, `repoFullName`, `issueNumber`, `force`.
 
 ### GET /api/audit
 List audit logs. Query params: `limit`, `repo`

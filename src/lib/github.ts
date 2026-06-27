@@ -355,11 +355,11 @@ export async function addIssueComment(
   repoFullName: string,
   issueNumber: number,
   body: string,
-): Promise<void> {
+): Promise<{ url: string | null }> {
   const [owner, repo] = repoFullName.split("/");
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`;
+  const apiPath = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`;
 
-  const response = await fetch(url, {
+  const response = await fetch(apiPath, {
     method: "POST",
     headers: await getHeadersAsync(),
     body: JSON.stringify({ body }),
@@ -368,6 +368,13 @@ export async function addIssueComment(
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`GitHub API error adding comment: ${response.status} ${text}`);
+  }
+
+  try {
+    const data = (await response.json()) as { html_url?: string };
+    return { url: data.html_url ?? null };
+  } catch {
+    return { url: null };
   }
 }
 
@@ -784,4 +791,81 @@ export async function fetchLatestCommit(repoFullName: string, branch: string): P
     throw new Error(`Failed to fetch latest commit for ${repoFullName}/${branch}: ${response.status} ${text}`);
   }
   return response.json();
+}
+
+export interface GitHubRepoMetadata {
+  fullName: string;
+  defaultBranch: string;
+  description: string | null;
+}
+
+export async function fetchRepositoryMetadata(repoFullName: string): Promise<GitHubRepoMetadata> {
+  const response = await fetch(`${GITHUB_API}/repos/${repoFullName}`, {
+    headers: await getHeadersAsync(),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to fetch repo metadata for ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  return {
+    fullName: data.full_name ?? repoFullName,
+    defaultBranch: data.default_branch ?? "main",
+    description: data.description ?? null,
+  };
+}
+
+export interface GitHubCodeSearchResult {
+  path: string;
+  url: string;
+}
+
+export async function searchRepositoryCode(
+  repoFullName: string,
+  query: string,
+  limit: number,
+): Promise<GitHubCodeSearchResult[]> {
+  const perPage = Math.min(Math.max(1, limit), 100);
+  const searchQuery = `${query} repo:${repoFullName}`;
+  const url = `${GITHUB_API}/search/code?q=${encodeURIComponent(searchQuery)}&per_page=${perPage}`;
+  const response = await fetch(url, { headers: await getHeadersAsync() });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Code search failed for ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  const items = (data.items ?? []).slice(0, limit);
+  return items.map((item: { path?: string; html_url?: string }) => ({
+    path: item.path ?? "",
+    url: item.html_url ?? "",
+  }));
+}
+
+/**
+ * Encode each segment of a file path individually for the GitHub Contents API.
+ */
+function encodePathForContentsApi(path: string): string {
+  return path.split("/").map((seg) => encodeURIComponent(seg)).join("/");
+}
+
+export async function fetchRepositoryFileText(
+  repoFullName: string,
+  path: string,
+  ref?: string,
+): Promise<string> {
+  const encodedPath = encodePathForContentsApi(path);
+  const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  const response = await fetch(
+    `${GITHUB_API}/repos/${repoFullName}/contents/${encodedPath}${query}`,
+    { headers: await getHeadersAsync() },
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to fetch file ${path} in ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  if (!data.content || data.type !== "file") {
+    return "";
+  }
+  return Buffer.from(data.content, "base64").toString("utf8");
 }

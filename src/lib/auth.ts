@@ -278,6 +278,24 @@ export function getAuthorizedActor(
   return (typeof fallback === "string" && fallback.trim()) || resolveBearerActor(request);
 }
 
+/**
+ * Authorize a request for the hosted groomer route.
+ * Accepts standard auth (agent token, basic, oidc) OR the dedicated groomer token.
+ */
+export async function authorizeGroomerRequest(request: Request): Promise<AuthorizedRequest> {
+  const standard = await authorizeRequest(request);
+  if (standard.authorized) return standard;
+
+  const token = process.env.DISPATCH_GROOMER_TOKEN?.trim();
+  if (!token) return { authorized: false };
+
+  const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
+  if (parsed?.type === "bearer" && safeEqual(parsed.token, token)) {
+    return { authorized: true, type: "bearer", actor: "hosted-groomer-scheduler" };
+  }
+  return { authorized: false };
+}
+
 // ---------------------------------------------------------------------------
 // Cache reset (for testing)
 // ---------------------------------------------------------------------------

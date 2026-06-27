@@ -1,4 +1,5 @@
 import { fetchIssueComments as fetchGitHubIssueComments } from "@/lib/github";
+import type { RepositoryContextResult } from "./repository-context";
 
 export interface IssueComment {
   author: string;
@@ -14,6 +15,7 @@ export interface IssueContextInput {
   currentLane: string | null;
   comments: IssueComment[];
   maxContextBytes?: number;
+  repositoryContext?: RepositoryContextResult;
 }
 
 export async function fetchIssueComments(
@@ -51,11 +53,18 @@ export async function buildIssueContext(input: IssueContextInput): Promise<strin
     commentSection = `\n\nRecent comments:\n${commentTexts.join("\n")}`;
   }
 
+  const repoContext = input.repositoryContext?.text
+    ? `\n\n${input.repositoryContext.text}`
+    : "";
+  const warningSection = input.repositoryContext?.warnings.length
+    ? `\n\nContext warnings:\n${input.repositoryContext.warnings.map((w) => `- ${w}`).join("\n")}`
+    : "";
+
   return `Issue #${input.number}: ${input.title}
 
 ${laneStr}
 labels: ${labelStr}
 
 body:
-${body}${commentSection}`;
+${body}${commentSection}${repoContext}${warningSection}`;
 }

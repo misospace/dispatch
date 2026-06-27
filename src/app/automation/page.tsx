@@ -284,6 +284,9 @@ export default function AutomationOverview() {
           <p className="text-muted-foreground">CI/CD, builds, releases, and workflow status</p>
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" asChild>
+            <Link href="/automation/groomer">Hosted Groomer</Link>
+          </Button>
           <Button variant="outline" onClick={() => setShowAddForm(!showAddForm)}>
             {showAddForm ? "Cancel" : "Add Repo"}
           </Button>
