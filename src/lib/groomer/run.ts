@@ -175,6 +175,14 @@ export async function runHostedGroomer(
 
     const output = validation.parsed!;
 
+
+    // Record structured alias-resolution warnings for observability
+    if (validation.resolutions && validation.resolutions.length > 0) {
+      for (const r of validation.resolutions) {
+        contextWarnings.push(`enum:${r.field}: resolved '${r.rawValue}' -> '${r.resolvedValue}' via alias`);
+      }
+    }
+
     const newLabels = applyLabelChanges(candidate.labels, output.labelsToAdd, output.labelsToRemove);
 
     // Build mutationPlan
