@@ -294,4 +294,111 @@ describe("groomer schema validation", () => {
     expect(result.valid).toBe(false);
     expect(result.errors?.[0]).toContain("nextGroomingAction must be a string");
   });
+
+  // --- Schema-driven enum validation & alias resolution ---
+
+  it("resolves lane alias: raw 'normal' -> resolved 'local', mutation applied, resolution event recorded", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "normal", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("local");
+    expect(result.resolutions).toHaveLength(1);
+    expect(result.resolutions?.[0]).toEqual({
+      field: "lane.id",
+      rawValue: "normal",
+      resolvedValue: "local",
+      source: "alias",
+    });
+  });
+
+  it("resolves lane alias: raw 'escalated' -> resolved 'frontier'", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "escalated", confidence: "medium", reason: "complex task" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("frontier");
+    expect(result.resolutions).toHaveLength(1);
+    expect(result.resolutions?.[0].rawValue).toBe("escalated");
+    expect(result.resolutions?.[0].resolvedValue).toBe("frontier");
+  });
+
+  it("lane configured directly: no resolution event", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "local", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("local");
+    expect(result.resolutions).toHaveLength(0);
+  });
+
+  it("unknown lane: validation error, no resolution event", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "bogus-lane", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("lane id");
+    expect(result.resolutions).toHaveLength(0);
+  });
+
+  it("multiple enum fields with aliases: both events appear in resolutions", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "normal", confidence: "high", reason: "test" },
+      actionability: "ready",
+      nextGroomingAction: "promote_to_ready",
+    });
+    expect(result.valid).toBe(true);
+    // Only lane.id has an alias hit here (actionability and nextGroomingAction are canonical)
+    expect(result.resolutions).toHaveLength(1);
+    expect(result.resolutions?.[0].field).toBe("lane.id");
+  });
+
+  it("empty aliases map: behavior matches no-aliases (no spurious events)", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "local", confidence: "high", reason: "test" },
+      actionability: "ready",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.resolutions).toHaveLength(0);
+  });
+
+  it("resolutions is an empty array on valid output with no aliases", () => {
+    const result = validateGroomerOutput(validOutput);
+    expect(result.valid).toBe(true);
+    expect(Array.isArray(result.resolutions)).toBe(true);
+    expect(result.resolutions).toHaveLength(0);
+  });
+
+  it("resolutions is an empty array on invalid output (still present)", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: [],
+      labelsToRemove: [],
+      lane: { id: "bogus", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(false);
+    expect(Array.isArray(result.resolutions)).toBe(true);
+  });
+
+  it("resolutions array is present on non-object input", () => {
+    const result = validateGroomerOutput("not an object");
+    expect(result.valid).toBe(false);
+    expect(Array.isArray(result.resolutions)).toBe(false); // early return, no resolutions
+  });
+
+  it("resolutions array is present on null input", () => {
+    const result = validateGroomerOutput(null as any);
+    expect(result.valid).toBe(false);
+  });
 });
