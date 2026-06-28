@@ -120,12 +120,54 @@ describe("groomer config", () => {
     expect(config.timeoutMs).toBe(30000);
   });
 
-  it("defaults timeoutMs to 60000 when not set", () => {
+  it("env override DISPATCH_GROOMER_TIMEOUT_MS wins over scaled default", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "16384";
+    // Without override, 16KB would yield 140000. Override to 45000 should win.
+    process.env.DISPATCH_GROOMER_TIMEOUT_MS = "45000";
     const config = getHostedGroomerConfig();
-    expect(config.timeoutMs).toBe(60000);
+    expect(config.timeoutMs).toBe(45000);
+  });
+
+  it("scales default timeoutMs with maxContextBytes (8192 → 100000)", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    // default maxContextBytes = 8192 → ceil(8)*5000 + 60000 = 100000
+    const config = getHostedGroomerConfig();
+    expect(config.timeoutMs).toBe(100_000);
+  });
+
+  it("scales default timeoutMs with maxContextBytes (2048 → floor 60000)", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "2048";
+    // ceil(2048/1024)*5000 + 60000 = 70000, above floor so no clamp needed
+    const config = getHostedGroomerConfig();
+    expect(config.timeoutMs).toBe(70_000);
+  });
+
+  it("scales default timeoutMs with maxContextBytes (16384 → 140000)", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "16384";
+    // ceil(16)*5000 + 60000 = 140000
+    const config = getHostedGroomerConfig();
+    expect(config.timeoutMs).toBe(140_000);
+  });
+
+  it("clamps default timeoutMs to 300000 ceiling at large maxContextBytes", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "65536";
+    // ceil(64)*5000 + 60000 = 380000 → clamped to 300000
+    const config = getHostedGroomerConfig();
+    expect(config.timeoutMs).toBe(300_000);
   });
 
   it("reads maxContextBytes from env", () => {

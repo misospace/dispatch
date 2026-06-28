@@ -108,7 +108,7 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_LLM_BASE_URL` | Conditional | OpenAI-compatible base URL, without `/chat/completions`. Required when hosted grooming is enabled. |
 | `DISPATCH_LLM_API_KEY` | Conditional | LLM provider API key. Required when hosted grooming is enabled. |
 | `DISPATCH_GROOMER_MODEL` | No | Model name sent to the chat completions API. Defaults to `gpt-4o-mini`. |
-| `DISPATCH_GROOMER_TIMEOUT_MS` | No | LLM request timeout. Defaults to `60000`. |
+| `DISPATCH_GROOMER_TIMEOUT_MS` | No | LLM request timeout. Defaults to a scaled value of `60s + 5s/KB of maxContextBytes`, clamped to 60s–300s. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | No | Issue context budget sent to the model. Defaults to `8192`. |
 | `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |
 | `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | No | Enables bounded GitHub API repository context. Defaults to `false`. |
