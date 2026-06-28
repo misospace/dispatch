@@ -19,7 +19,7 @@ The feature is disabled by default.
 | `DISPATCH_LLM_BASE_URL` | required when enabled | OpenAI-compatible base URL, without `/chat/completions`. |
 | `DISPATCH_LLM_API_KEY` | required when enabled | LLM provider API key. |
 | `DISPATCH_GROOMER_MODEL` | `gpt-4o-mini` | Model sent to the chat completions API. |
-| `DISPATCH_GROOMER_TIMEOUT_MS` | `60000` | LLM request timeout. |
+| `DISPATCH_GROOMER_TIMEOUT_MS` | Scaled | LLM request timeout. Defaults to `60s + 5s/KB of maxContextBytes`, clamped to 60s–300s. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | `8192` | Budget for issue context sent to the model. |
 | `DISPATCH_GROOMER_DRY_RUN` | `true` | Keeps rollout safe by returning a mutation plan without writes. |
 | `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | `false` | Enables bounded GitHub API repository context. When true, the groomer gathers repository metadata, code-search snippets, and file text through GitHub REST APIs only — it never clones repositories or runs shell commands. |
