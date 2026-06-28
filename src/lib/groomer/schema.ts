@@ -1,5 +1,5 @@
 import { STATUS_LABELS, PRIORITY_LABELS, isValidGroomAction, type GroomAction } from "@/types";
-import { isValidLane } from "@/lib/lane-config";
+import { isValidLane, resolveLaneId } from "@/lib/lane-config";
 
 export interface GroomerOutput {
   actionability?: "ready" | "needs_info" | "blocked" | "backlog" | "already_done";
@@ -83,8 +83,16 @@ export function validateGroomerOutput(data: unknown): {
     const confidence = laneObj.confidence;
     const reason = laneObj.reason;
 
-    if (typeof laneId !== "string" || !isValidLane(laneId)) {
+    if (typeof laneId !== "string") {
       errors.push(`invalid lane id: ${String(laneId)}`);
+    } else {
+      const resolvedLane = resolveLaneId(laneId);
+      if (!resolvedLane || !isValidLane(resolvedLane)) {
+        errors.push(`invalid lane id: ${laneId}${resolvedLane && resolvedLane !== laneId ? ` (resolved to ${resolvedLane})` : ""}`);
+      } else {
+        // Mutate the validated object so downstream consumers see the resolved id.
+        laneObj.id = resolvedLane;
+      }
     }
     if (!["high", "medium", "low"].includes(String(confidence))) {
       errors.push(`invalid confidence: ${String(confidence)}`);

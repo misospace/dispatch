@@ -294,4 +294,57 @@ describe("groomer schema validation", () => {
     expect(result.valid).toBe(false);
     expect(result.errors?.[0]).toContain("nextGroomingAction must be a string");
   });
+
+
+  // --- Lane alias resolution tests ---
+
+  it("accepts configured lane id directly (local)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      lane: { id: "local", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("local");
+  });
+
+  it("resolves legacy lane alias 'normal' to 'local'", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      lane: { id: "normal", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("local");
+  });
+
+  it("resolves legacy lane alias 'escalated' to 'frontier'", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      lane: { id: "escalated", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("frontier");
+  });
+
+  it("rejects unknown lane id with no alias (bogus)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      lane: { id: "bogus", confidence: "high", reason: "test" },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("bogus");
+  });
+
+  it("mutates the input lane object with the resolved id", () => {
+    const input = {
+      ...validOutput,
+      lane: { id: "normal" as any, confidence: "high" as const, reason: "test" },
+    };
+    const result = validateGroomerOutput(input);
+    expect(result.valid).toBe(true);
+    // The original input object should have been mutated
+    expect(input.lane.id).toBe("local");
+    // And the parsed output should also carry the resolved id
+    expect(result.parsed?.lane.id).toBe("local");
+  });
+
 });
