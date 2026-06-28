@@ -25,6 +25,9 @@ pnpm-debug.log*
 .vscode/
 .idea/
 
+# local git worktrees
+.worktrees/
+
 # prisma/local db if any
 *.db
 *.sqlite
