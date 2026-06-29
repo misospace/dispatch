@@ -17,6 +17,8 @@ export interface GroomerOutput {
   needsInfoReason?: string;
   blockedReason?: string;
   nextGroomingAction?: GroomAction;
+  proposedTitle?: string;
+  proposedBody?: string;
 }
 
 export interface ValidationResult {
@@ -113,11 +115,13 @@ const baseSchema = z.object({
 
 // ─── Optional String Fields ───────────────────────────────────────────────────
 
-const OPTIONAL_STRING_FIELDS: (keyof Pick<GroomerOutput, "summary" | "githubComment" | "needsInfoReason" | "blockedReason">)[] = [
+const OPTIONAL_STRING_FIELDS: (keyof Pick<GroomerOutput, "summary" | "githubComment" | "needsInfoReason" | "blockedReason" | "proposedTitle" | "proposedBody">)[] = [
   "summary",
   "githubComment",
   "needsInfoReason",
   "blockedReason",
+  "proposedTitle",
+  "proposedBody",
 ];
 
 // ─── Main Validator ───────────────────────────────────────────────────────────
@@ -275,6 +279,28 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
 
   if (resolvedConfidence !== undefined) {
     parsed.confidence = resolvedConfidence as GroomerOutput["confidence"];
+  }
+
+  // proposedTitle — length guardrails (10-200 chars)
+  if ("proposedTitle" in obj) {
+    const rawTitle = obj.proposedTitle;
+    if (rawTitle !== null && typeof rawTitle === "string") {
+      if (rawTitle.length < 10 || rawTitle.length > 200) {
+        errors.push(`proposedTitle must be between 10 and 200 characters, got ${rawTitle.length}`);
+        return { valid: false, errors, resolutions };
+      }
+    }
+  }
+
+  // proposedBody — length guardrails (< 10000 chars)
+  if ("proposedBody" in obj) {
+    const rawBody = obj.proposedBody;
+    if (rawBody !== null && typeof rawBody === "string") {
+      if (rawBody.length > 10_000) {
+        errors.push(`proposedBody must be under 10000 characters, got ${rawBody.length}`);
+        return { valid: false, errors, resolutions };
+      }
+    }
   }
 
   // Optional string fields — null tolerance (null treated as absent)

@@ -23,6 +23,7 @@ const { mocks } = vi.hoisted(() => ({
     getHostedGroomerConfig: vi.fn(),
     updateIssueLabels: vi.fn(),
     addIssueComment: vi.fn(),
+    updateIssueTitleAndBody: vi.fn(),
     findActiveLeasesForIssue: vi.fn(),
     upsertLease: vi.fn(),
     releaseLease: vi.fn(),
@@ -64,6 +65,7 @@ vi.mock("./config", () => ({
 vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
   addIssueComment: mocks.addIssueComment,
+  updateIssueTitleAndBody: mocks.updateIssueTitleAndBody,
   addIssueLabel: mocks.addIssueLabel,
   removeIssueLabel: mocks.removeIssueLabel,
 }));
@@ -131,6 +133,7 @@ describe("runHostedGroomer", () => {
     mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
     mocks.callGroomerLLM.mockResolvedValue(mockOutput);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.updateIssueTitleAndBody.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
     mocks.findActiveLeasesForIssue.mockResolvedValue([]);
     mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
@@ -468,5 +471,188 @@ describe("runHostedGroomer", () => {
         }),
       }),
     );
+  });
+
+  // ─── Title rewriting tests ───
+
+  it("does not rewrite a good title", async () => {
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedTitle: "Fix the login bug" },
+    });
+
+    const result = await runHostedGroomer();
+
+    // "Fix login bug" (13 chars) is a good title — should not be rewritten
+    expect(result!.mutationPlan?.titleRewritten).toBe(false);
+    expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+  });
+
+  it("rewrites a bad short title", async () => {
+    const badCandidate = { ...mockCandidate, title: "P0" };
+    mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: {
+        ...mockOutput,
+        proposedTitle: "Fix SSO/OIDC callback state verification mismatch causing 400 errors",
+      },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.titleRewritten).toBe(true);
+    expect(result!.mutationPlan?.originalTitle).toBe("P0");
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      expect.objectContaining({ title: "Fix SSO/OIDC callback state verification mismatch causing 400 errors" }),
+    );
+    expect(result!.appliedMutations?.titleUpdated).toBe(true);
+  });
+
+  it("rewrites a single-word generic title like TODO", async () => {
+    const badCandidate = { ...mockCandidate, title: "TODO" };
+    mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedTitle: "Implement user authentication flow" },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.titleRewritten).toBe(true);
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalled();
+  });
+
+  it("rewrites an empty title", async () => {
+    const badCandidate = { ...mockCandidate, title: "" };
+    mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedTitle: "Add missing error handling for database connections" },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.titleRewritten).toBe(true);
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalled();
+  });
+
+  // ─── Body enrichment tests ───
+
+  it("does not enrich a substantial body", async () => {
+    const goodCandidate = {
+      ...mockCandidate,
+      body: "This is a detailed issue description that explains the problem clearly with enough context and detail for developers to understand what needs to be done.",
+    };
+    mocks.selectGroomingCandidate.mockResolvedValue(goodCandidate);
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedBody: "Enriched body content." },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.bodyEnriched).toBe(false);
+    expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+  });
+
+  it("enriches a sparse body", async () => {
+    const sparseCandidate = { ...mockCandidate, body: "Broken." };
+    mocks.selectGroomingCandidate.mockResolvedValue(sparseCandidate);
+    const enrichedBody = `## Context
+This issue relates to the login flow.
+
+## What's known
+- Login fails after password reset
+
+## Suggested approach
+Investigate session handling in auth module.`;
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedBody: enrichedBody },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.bodyEnriched).toBe(true);
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      expect.objectContaining({ body: enrichedBody }),
+    );
+    expect(result!.appliedMutations?.bodyUpdated).toBe(true);
+  });
+
+  it("enriches a null body", async () => {
+    const noBodyCandidate = { ...mockCandidate, body: null };
+    mocks.selectGroomingCandidate.mockResolvedValue(noBodyCandidate);
+    const enrichedBody = "## Description\nMore detail needed.\n\n## Labels\npriority/p0";
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedBody: enrichedBody },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.bodyEnriched).toBe(true);
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalled();
+  });
+
+  it("applies both title rewrite and body enrichment together", async () => {
+    const badCandidate = { ...mockCandidate, title: "P0", body: "Fix." };
+    mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
+    const enrichedBody = "## Context\nSSO login is broken.\n\n## What's known\nState verification fails on callback.";
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: {
+        ...mockOutput,
+        proposedTitle: "Fix SSO callback state mismatch",
+        proposedBody: enrichedBody,
+      },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan?.titleRewritten).toBe(true);
+    expect(result!.mutationPlan?.bodyEnriched).toBe(true);
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      expect.objectContaining({
+        title: "Fix SSO callback state mismatch",
+        body: enrichedBody,
+      }),
+    );
+    expect(result!.appliedMutations?.titleUpdated).toBe(true);
+    expect(result!.appliedMutations?.bodyUpdated).toBe(true);
+  });
+
+  it("dry-run includes title/body plan but does not call GitHub API", async () => {
+    const badCandidate = { ...mockCandidate, title: "P0" };
+    mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
+    mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, proposedTitle: "Fix the thing" },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.dryRun).toBe(true);
+    expect(result!.mutationPlan?.titleRewritten).toBe(true);
+    expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+  });
+
+  it("skips title/body update when LLM does not propose changes", async () => {
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: mockOutput, // no proposedTitle or proposedBody
+    });
+
+    await runHostedGroomer();
+
+    expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
   });
 });

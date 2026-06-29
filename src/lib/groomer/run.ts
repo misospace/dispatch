@@ -1,10 +1,10 @@
 import { prisma } from "@/lib/prisma";
-import { addIssueComment, updateIssueLabels } from "@/lib/github";
+import { addIssueComment, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
-import { validateGroomerOutput } from "./schema";
+import { validateGroomerOutput, type GroomerOutput } from "./schema";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
@@ -41,6 +41,7 @@ export interface GroomerDeps {
   getConfig: typeof getHostedGroomerConfig;
   updateLabels: typeof updateIssueLabels;
   addComment: typeof addIssueComment;
+  updateTitleAndBody: typeof updateIssueTitleAndBody;
   findActiveLeases: typeof findActiveLeasesForIssue;
   upsertLease: typeof upsertLease;
   releaseLease: typeof releaseLease;
@@ -57,6 +58,7 @@ const defaultDeps: GroomerDeps = {
   getConfig: getHostedGroomerConfig,
   updateLabels: updateIssueLabels,
   addComment: addIssueComment,
+  updateTitleAndBody: updateIssueTitleAndBody,
   findActiveLeases: findActiveLeasesForIssue,
   upsertLease,
   releaseLease,
@@ -185,6 +187,9 @@ export async function runHostedGroomer(
 
     const newLabels = applyLabelChanges(candidate.labels, output.labelsToAdd, output.labelsToRemove);
 
+    // Compute title/body enrichment decisions
+    const titleBodyMutations = computeTitleBodyMutations(candidate, output);
+
     // Build mutationPlan
     const mutationPlan: Record<string, unknown> = {
       labelsToAdd: output.labelsToAdd,
@@ -192,6 +197,11 @@ export async function runHostedGroomer(
       lane: output.lane,
       summary: output.summary ?? null,
       willComment: Boolean(output.githubComment?.trim()),
+      titleRewritten: titleBodyMutations.shouldRewrite,
+      originalTitle: titleBodyMutations.shouldRewrite ? candidate.title : undefined,
+      proposedTitle: titleBodyMutations.proposedTitle,
+      bodyEnriched: titleBodyMutations.shouldEnrich,
+      proposedBody: titleBodyMutations.proposedBody,
     };
 
     // Persist stage planned
@@ -230,6 +240,20 @@ export async function runHostedGroomer(
 
     await deps.updateLabels(candidate.repoFullName, candidate.number, newLabels);
     appliedMutations.labelsUpdated = true;
+
+    // Apply title and/or body updates if guardrails pass
+    const titleBodyFields: Record<string, unknown> = {};
+    if (titleBodyMutations.shouldRewrite && titleBodyMutations.proposedTitle) {
+      titleBodyFields.title = titleBodyMutations.proposedTitle;
+    }
+    if (titleBodyMutations.shouldEnrich && titleBodyMutations.proposedBody) {
+      titleBodyFields.body = titleBodyMutations.proposedBody;
+    }
+    if (Object.keys(titleBodyFields).length > 0) {
+      await deps.updateTitleAndBody(candidate.repoFullName, candidate.number, titleBodyFields as Parameters<typeof updateIssueTitleAndBody>[2]);
+      appliedMutations.titleUpdated = titleBodyMutations.shouldRewrite;
+      appliedMutations.bodyUpdated = titleBodyMutations.shouldEnrich;
+    }
 
     // Comment with cooldown enforcement
     if (output.githubComment?.trim()) {
@@ -398,6 +422,72 @@ export async function runHostedGroomer(
 
 function getCurrentStage(run: { stage?: string }): string {
   return run.stage ?? "selected";
+}
+
+/**
+ * Check if a title is "bad" and should be rewritten.
+ * Bad titles: length < 10 chars, or matches generic patterns (single word like "P0", "TODO", etc.),
+ * or is clearly just a priority/label token.
+ */
+function shouldRewriteTitle(title: string): boolean {
+  const trimmed = title.trim();
+  if (trimmed.length === 0) return true;
+  if (trimmed.length < 10) return true;
+
+  // Single word that looks like a generic token
+  const words = trimmed.split(/\s+/);
+  if (words.length === 1) {
+    const lower = trimmed.toLowerCase();
+    const GENERIC_TOKENS = ["p0", "p1", "p2", "p3", "p4", "todo", "bug", "fix", "fixme", "wip", "help", "urgent", "critical"];
+    if (GENERIC_TOKENS.includes(lower)) return true;
+
+    // Priority/label-like tokens: starts with a letter/digit, no spaces, looks like a label prefix
+    if (/^[a-z0-9]+$/i.test(trimmed) && trimmed.length <= 6) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Check if a body is "sparse" and should be enriched.
+ * Sparse bodies: missing, empty, or < 100 chars (excluding markdown/HTML comments).
+ */
+function shouldEnrichBody(body: string | null): boolean {
+  if (body === null || body.trim().length === 0) return true;
+
+  // Strip HTML comments
+  let stripped = body.replace(/<!--[sS]*?-->/g, "");
+  // Strip markdown-style block comments (if any)
+  stripped = stripped.replace(/^<!--[\s\S]*?-->/gm, "");
+
+  if (stripped.trim().length < 100) return true;
+  return false;
+}
+
+/**
+ * Compute title/body enrichment decisions and build the mutation plan entries.
+ */
+function computeTitleBodyMutations(
+  candidate: { title: string; body: string | null },
+  output: GroomerOutput,
+): {
+  shouldRewrite: boolean;
+  shouldEnrich: boolean;
+  proposedTitle?: string;
+  proposedBody?: string;
+} {
+  const proposedTitle = typeof output.proposedTitle === "string" ? output.proposedTitle : undefined;
+  const proposedBody = typeof output.proposedBody === "string" ? output.proposedBody : undefined;
+
+  const shouldRewrite = proposedTitle !== undefined && shouldRewriteTitle(candidate.title);
+  const shouldEnrich = proposedBody !== undefined && shouldEnrichBody(candidate.body);
+
+  return {
+    shouldRewrite,
+    shouldEnrich,
+    ...(shouldRewrite ? { proposedTitle } : {}),
+    ...(shouldEnrich ? { proposedBody } : {}),
+  };
 }
 
 function applyLabelChanges(

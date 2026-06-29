@@ -398,6 +398,34 @@ export async function addIssueLabel(
   }
 }
 
+
+export interface UpdateIssueFields {
+  title?: string;
+  body?: string | null;
+}
+
+/**
+ * Update issue title and/or body via GitHub API.
+ */
+export async function updateIssueTitleAndBody(
+  repoFullName: string,
+  issueNumber: number,
+  fields: UpdateIssueFields,
+): Promise<void> {
+  const [owner, repo] = repoFullName.split("/");
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
+
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: await getHeadersAsync(),
+    body: JSON.stringify(fields),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API error updating issue #${issueNumber}: ${response.status} ${text}`);
+  }
+}
 export async function removeIssueLabel(
   repoFullName: string,
   issueNumber: number,
