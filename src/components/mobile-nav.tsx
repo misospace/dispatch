@@ -12,6 +12,7 @@ const navLinks = [
   { href: "/projects", label: "Projects" },
   { href: "/agents", label: "Agents" },
   { href: "/automation", label: "Automation" },
+  { href: "/groomer", label: "Groomer" },
 ];
 
 export function MobileNav() {

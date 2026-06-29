@@ -285,7 +285,7 @@ export default function AutomationOverview() {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" asChild>
-            <Link href="/automation/groomer">Hosted Groomer</Link>
+            <Link href="/groomer">Hosted Groomer</Link>
           </Button>
           <Button variant="outline" onClick={() => setShowAddForm(!showAddForm)}>
             {showAddForm ? "Cancel" : "Add Repo"}
