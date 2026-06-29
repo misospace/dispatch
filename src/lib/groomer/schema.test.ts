@@ -401,4 +401,98 @@ describe("groomer schema validation", () => {
     const result = validateGroomerOutput(null as any);
     expect(result.valid).toBe(false);
   });
+
+  // ─── proposedTitle validation ───
+
+  it("accepts valid proposedTitle (10-200 chars)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedTitle: "Fix SSO/OIDC callback state verification mismatch",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.proposedTitle).toBe("Fix SSO/OIDC callback state verification mismatch");
+  });
+
+  it("rejects proposedTitle that is too short (< 10 chars)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedTitle: "Fix bug",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("proposedTitle must be between 10 and 200 characters");
+  });
+
+  it("rejects proposedTitle that is too long (> 200 chars)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedTitle: "A".repeat(201),
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("proposedTitle must be between 10 and 200 characters");
+  });
+
+  it("accepts null proposedTitle (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedTitle: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.proposedTitle).toBeUndefined();
+  });
+
+  // ─── proposedBody validation ───
+
+  it("accepts valid proposedBody (under 10000 chars)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedBody: "## Context\nThis issue relates to the login flow.",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.proposedBody).toBe("## Context\nThis issue relates to the login flow.");
+  });
+
+  it("rejects proposedBody that is too long (> 10000 chars)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedBody: "A".repeat(10_001),
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("proposedBody must be under 10000 characters");
+  });
+
+  it("accepts null proposedBody (treated as omitted)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedBody: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.proposedBody).toBeUndefined();
+  });
+
+  it("accepts both proposedTitle and proposedBody together", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedTitle: "Fix SSO callback state mismatch in auth module",
+      proposedBody: "## Context\nThe SSO login flow has a bug.",
+    });
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects non-string proposedTitle when provided", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedTitle: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("proposedTitle must be a string");
+  });
+
+  it("rejects non-string proposedBody when provided", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      proposedBody: 123 as any,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors?.[0]).toContain("proposedBody must be a string");
+  });
 });
