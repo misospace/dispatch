@@ -28,6 +28,7 @@ export async function selectGroomingCandidate(
 ): Promise<GroomingCandidate | null> {
   const issueWhere: Record<string, unknown> = {
     state: "open",
+    NOT: { labels: { has: "status/done" } },
     repository: { enabled: true },
   };
 

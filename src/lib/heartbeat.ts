@@ -135,7 +135,7 @@ export async function runReconcileBestEffort(): Promise<ReconcileStepResult> {
       repos,
       async (repoFullName: string, issueNumber: number) => {
         // Fetch the latest issue state from GitHub for reconciliation
-        const issues = await fetchIssues(repoFullName);
+        const issues = await fetchIssues(repoFullName, { includeClosed: true });
         const found = issues.find((i) => i.number === issueNumber);
         if (!found) {
           throw new Error(`Issue #${issueNumber} not found in ${repoFullName}`);
