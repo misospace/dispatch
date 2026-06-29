@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubIssue } from "@/types";
-import { IssueStore, syncIssuesForRepos, mergeLabels } from "./issue-sync";
+import { IssueStore, syncIssuesForRepos, mergeLabels, reconcileClosedIssues } from "./issue-sync";
 
-function githubIssue(number: number): GitHubIssue {
+function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
     number,
     title: `Issue ${number}`,
@@ -15,6 +15,7 @@ function githubIssue(number: number): GitHubIssue {
     created_at: "2026-01-01T00:00:00.000Z",
     updated_at: "2026-01-02T00:00:00.000Z",
     closed_at: null,
+    ...overrides,
   };
 }
 
@@ -133,5 +134,126 @@ describe("syncIssuesForRepos", () => {
     expect(findMock).toHaveBeenCalledTimes(2);
     expect(updateMock).toHaveBeenCalledWith("existing-1", expect.objectContaining({ number: 1 }));
     expect(createMock).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 2 }));
+  });
+});
+
+describe("reconcileClosedIssues", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("marks closed issues with active status labels as done", async () => {
+    const updateCalls: Array<{ id: string; data: any }> = [];
+
+    const result = await reconcileClosedIssues(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async (_, number) =>
+        githubIssue(number, {
+          state: "closed",
+          labels: [{ name: "type/bug", color: "ffffff" }],
+          closed_at: "2026-01-03T00:00:00.000Z",
+        }),
+      {
+        findActiveCachedIssues: vi.fn().mockResolvedValue([
+          { id: "issue-1", number: 42, labels: ["status/ready", "type/bug"], state: "open" },
+        ]),
+        updateIssue: vi.fn().mockImplementation((id, data) => {
+          updateCalls.push({ id, data });
+        }),
+      },
+    );
+
+    expect(result.issuesReconciled).toBe(1);
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0].data.state).toBe("closed");
+    expect(updateCalls[0].data.labels).toContain("status/done");
+    expect(updateCalls[0].data.labels).not.toContain("status/ready");
+  });
+
+  it("fixes stale state for issues with status/done but open state", async () => {
+    const updateCalls: Array<{ id: string; data: any }> = [];
+
+    const result = await reconcileClosedIssues(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async (_, number) =>
+        githubIssue(number, {
+          state: "closed",
+          labels: [{ name: "status/done", color: "ffffff" }, { name: "type/bug", color: "ffffff" }],
+          closed_at: "2026-01-03T00:00:00.000Z",
+        }),
+      {
+        findActiveCachedIssues: vi.fn().mockResolvedValue([
+          // Issue has status/done label but still shows as open (stale cache)
+          { id: "issue-460", number: 460, labels: ["status/done", "type/bug"], state: "open" },
+        ]),
+        updateIssue: vi.fn().mockImplementation((id, data) => {
+          updateCalls.push({ id, data });
+        }),
+      },
+    );
+
+    expect(result.issuesReconciled).toBe(1);
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0].data.state).toBe("closed");
+    // Labels should be preserved (already has status/done)
+    expect(updateCalls[0].data.labels).toContain("status/done");
+    expect(updateCalls[0].data.labels).toContain("type/bug");
+
+    // Verify the action is "state_fixed" not "marked_done"
+    const stateFixedResults = result.results.filter((r) => r.action === "state_fixed");
+    expect(stateFixedResults).toHaveLength(1);
+    expect(stateFixedResults[0].issueNumber).toBe(460);
+  });
+
+  it("skips issues without reconcilable status labels or done label", async () => {
+    const result = await reconcileClosedIssues(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => githubIssue(99, { state: "closed", closed_at: "2026-01-03T00:00:00.000Z" }),
+      {
+        findActiveCachedIssues: vi.fn().mockResolvedValue([
+          // No reconcilable status label and no done label — should be skipped
+          { id: "issue-99", number: 99, labels: ["type/bug"], state: "open" },
+        ]),
+        updateIssue: vi.fn(),
+      },
+    );
+
+    expect(result.issuesReconciled).toBe(0);
+    expect(result.issuesChecked).toBe(0);
+    // No results generated since the issue was filtered out before processing
+    expect(result.results).toHaveLength(0);
+  });
+
+  it("does not reconcile if GitHub still shows the issue as open", async () => {
+    const result = await reconcileClosedIssues(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => githubIssue(42, { state: "open" }),
+      {
+        findActiveCachedIssues: vi.fn().mockResolvedValue([
+          { id: "issue-42", number: 42, labels: ["status/ready"], state: "open" },
+        ]),
+        updateIssue: vi.fn(),
+      },
+    );
+
+    expect(result.issuesReconciled).toBe(0);
+    expect(result.results[0].reconciled).toBe(false);
+    expect(result.results[0].action).toBe("no_change");
+  });
+
+  it("marks in-progress issues as released_lease", async () => {
+    const result = await reconcileClosedIssues(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => githubIssue(42, { state: "closed", closed_at: "2026-01-03T00:00:00.000Z" }),
+      {
+        findActiveCachedIssues: vi.fn().mockResolvedValue([
+          { id: "issue-42", number: 42, labels: ["status/in-progress"], state: "open" },
+        ]),
+        updateIssue: vi.fn(),
+      },
+    );
+
+    expect(result.issuesReconciled).toBe(1);
+    expect(result.results[0].action).toBe("released_lease");
   });
 });

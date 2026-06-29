@@ -144,11 +144,27 @@ export async function runReconcileBestEffort(): Promise<ReconcileStepResult> {
       },
       {
         findActiveCachedIssues(repositoryId: string) {
+          // FIX: Use labels.hasSome instead of currentLane (currentLane stores lane IDs
+          // like "normal"/"frontier", not status labels). Also include issues with
+          // status/done that still have state="open" (stale cache — label was applied
+          // but state field wasn't updated yet).
           return prisma.issue.findMany({
             where: {
               repositoryId,
-              state: "open",
-              currentLane: { in: ["status/ready", "status/in-progress", "status/in-review"] },
+              OR: [
+                // Issues with active status labels (may be stale if GitHub closed them)
+                {
+                  state: { in: ["open", "closed"] as const },
+                  labels: {
+                    hasSome: ["status/ready", "status/in-progress", "status/in-review"],
+                  },
+                },
+                // Issues with status/done that still show as open (stale state field)
+                {
+                  state: "open",
+                  labels: { has: "status/done" },
+                },
+              ],
             },
             select: { id: true, number: true, labels: true, state: true },
           });

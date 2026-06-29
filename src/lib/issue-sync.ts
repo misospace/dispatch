@@ -46,7 +46,7 @@ export interface ReconcileClosedIssueResult {
   repo: string;
   issueNumber: number;
   reconciled: boolean;
-  action: "marked_done" | "released_lease" | "no_change";
+  action: "marked_done" | "released_lease" | "state_fixed" | "no_change";
   error: string | null;
 }
 
@@ -200,37 +200,60 @@ export async function reconcileClosedIssues(
       let repoReconciled = 0;
 
       for (const cached of cachedIssues) {
+        // Check if this issue needs reconciliation:
+        // 1. Has a reconcilable status label (backlog/ready/in-progress/in-review)
+        // 2. Already has status/done but state is still "open" (stale cache)
         const hasReconcilableStatus = RECONCILABLE_STATUS_LABELS.some((s) => cached.labels.includes(s));
-        if (!hasReconcilableStatus) continue;
+        const hasDoneLabelButOpenState = cached.labels.includes("status/done") && cached.state === "open";
+
+        if (!hasReconcilableStatus && !hasDoneLabelButOpenState) continue;
 
         try {
           const ghIssue = await fetchIssueFn(repo.fullName, cached.number);
 
           if (ghIssue.state === "closed") {
-            // Determine the new label: remove any reconcilable status, add status/done
-            const newLabels = cached.labels
-              .filter((l) => !RECONCILABLE_STATUS_LABELS.includes(l as typeof RECONCILABLE_STATUS_LABELS[number]))
-              .concat(["status/done"]);
+            // Case 1: Issue has status/done but stale open state — just fix the state
+            if (hasDoneLabelButOpenState) {
+              await store.updateIssue(cached.id, {
+                labels: cached.labels,
+                state: "closed",
+                closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
+              });
 
-            await store.updateIssue(cached.id, {
-              labels: newLabels,
-              state: "closed",
-              closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
-            });
+              repoReconciled++;
+              results.push({
+                repo: repo.fullName,
+                issueNumber: cached.number,
+                reconciled: true,
+                action: "state_fixed",
+                error: null,
+              });
+            } else {
+              // Case 2: Issue has an active status label — replace with status/done
+              const newLabels = cached.labels
+                .filter((l) => !RECONCILABLE_STATUS_LABELS.includes(l as typeof RECONCILABLE_STATUS_LABELS[number]))
+                .concat(["status/done"]);
 
-            repoReconciled++;
-            results.push({
-              repo: repo.fullName,
-              issueNumber: cached.number,
-              reconciled: true,
-              action: "marked_done",
-              error: null,
-            });
+              await store.updateIssue(cached.id, {
+                labels: newLabels,
+                state: "closed",
+                closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
+              });
 
-            // If the issue had in-progress status, that implies a lease was active.
-            // Mark it as released for observability (actual lease release is handled separately).
-            if (cached.labels.includes("status/in-progress")) {
-              results[results.length - 1].action = "released_lease";
+              repoReconciled++;
+              results.push({
+                repo: repo.fullName,
+                issueNumber: cached.number,
+                reconciled: true,
+                action: "marked_done",
+                error: null,
+              });
+
+              // If the issue had in-progress status, that implies a lease was active.
+              // Mark it as released for observability (actual lease release is handled separately).
+              if (cached.labels.includes("status/in-progress")) {
+                results[results.length - 1].action = "released_lease";
+              }
             }
           } else {
             results.push({

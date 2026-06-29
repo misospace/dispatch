@@ -14,6 +14,11 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     runHostedGroomer: vi.fn(),
     getHostedGroomerConfig: vi.fn(),
+    prisma: {
+      issue: {
+        findFirst: vi.fn(),
+      },
+    },
   },
 }));
 
@@ -23,6 +28,10 @@ vi.mock("@/lib/groomer/run", () => ({
 
 vi.mock("@/lib/groomer/config", () => ({
   getHostedGroomerConfig: mocks.getHostedGroomerConfig,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: mocks.prisma,
 }));
 
 import { POST } from "./route";
@@ -120,6 +129,11 @@ describe("POST /api/groomer/run", () => {
       timeoutMs: 60000,
       maxContextBytes: 8192,
     });
+    // Mock the prisma lookup for the closed-issue guard
+    mocks.prisma.issue.findFirst.mockResolvedValue({
+      state: "open",
+      labels: ["type/bug"],
+    });
 
     await POST(new Request("http://localhost/api/groomer/run", {
       method: "POST",
@@ -197,5 +211,111 @@ describe("POST /api/groomer/run", () => {
     const body = await res.json();
     expect(body.candidateNumber).toBe(42);
     expect(body.groomingRunId).toBe("run-1");
+  });
+
+  // --- Closed issue guards ---
+
+  it("returns 400 when grooming a closed issue", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({
+      enabled: true,
+      dryRun: true,
+      llmBaseUrl: "https://llm.example.com",
+      apiKey: "sk-test",
+      model: "gpt-4o-mini",
+      timeoutMs: 60000,
+      maxContextBytes: 8192,
+    });
+    mocks.prisma.issue.findFirst.mockResolvedValue({
+      state: "closed",
+      labels: ["status/done"],
+    });
+
+    const res = await POST(new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${mockToken}` },
+      body: JSON.stringify({ repoFullName: "org/repo", issueNumber: 460 }),
+    }));
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Cannot groom a closed issue");
+    // Should NOT call the groomer
+    expect(mocks.runHostedGroomer).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when grooming an issue with status/done label", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({
+      enabled: true,
+      dryRun: true,
+      llmBaseUrl: "https://llm.example.com",
+      apiKey: "sk-test",
+      model: "gpt-4o-mini",
+      timeoutMs: 60000,
+      maxContextBytes: 8192,
+    });
+    mocks.prisma.issue.findFirst.mockResolvedValue({
+      state: "open",
+      labels: ["status/done", "type/bug"],
+    });
+
+    const res = await POST(new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${mockToken}` },
+      body: JSON.stringify({ repoFullName: "org/repo", issueNumber: 460 }),
+    }));
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Cannot groom an issue with status/done label");
+    // Should NOT call the groomer
+    expect(mocks.runHostedGroomer).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when grooming a non-existent issue", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({
+      enabled: true,
+      dryRun: true,
+      llmBaseUrl: "https://llm.example.com",
+      apiKey: "sk-test",
+      model: "gpt-4o-mini",
+      timeoutMs: 60000,
+      maxContextBytes: 8192,
+    });
+    mocks.prisma.issue.findFirst.mockResolvedValue(null);
+
+    const res = await POST(new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${mockToken}` },
+      body: JSON.stringify({ repoFullName: "org/repo", issueNumber: 9999 }),
+    }));
+
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe("Issue #9999 not found");
+    // Should NOT call the groomer
+    expect(mocks.runHostedGroomer).not.toHaveBeenCalled();
+  });
+
+  it("skips closed-issue guard when no issueNumber provided (auto-select mode)", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({
+      enabled: true,
+      dryRun: true,
+      llmBaseUrl: "https://llm.example.com",
+      apiKey: "sk-test",
+      model: "gpt-4o-mini",
+      timeoutMs: 60000,
+      maxContextBytes: 8192,
+    });
+
+    const res = await POST(new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${mockToken}` },
+      body: JSON.stringify({ dryRun: true }),
+    }));
+
+    expect(res.status).toBe(200);
+    // The guard should not have been triggered (no issueNumber)
+    expect(mocks.prisma.issue.findFirst).not.toHaveBeenCalled();
+    expect(mocks.runHostedGroomer).toHaveBeenCalled();
   });
 });
