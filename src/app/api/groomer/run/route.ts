@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { authorizeGroomerRequest } from "@/lib/auth";
 import { runHostedGroomer } from "@/lib/groomer/run";
 import { getHostedGroomerConfig } from "@/lib/groomer/config";
+import { prisma } from "@/lib/prisma";
 
 export async function POST(request: Request) {
   if (!(await authorizeGroomerRequest(request)).authorized) {
@@ -24,6 +25,43 @@ export async function POST(request: Request) {
       { error: "Hosted groomer is disabled. Set DISPATCH_HOSTED_GROOMER_ENABLED=true to enable." },
       { status: 503 },
     );
+  }
+
+  // Guard: reject grooming of closed issues when issueNumber is explicitly provided.
+  // This prevents the groomer from processing issues that are already closed on GitHub
+  // but still appear open in Dispatch's cache (stale sync state).
+  if (typeof body.issueNumber === "number" && Number.isInteger(body.issueNumber)) {
+    const issueNumber = body.issueNumber;
+    const repoFullName = typeof body.repoFullName === "string" ? body.repoFullName : undefined;
+
+    let where: Record<string, unknown> = { number: issueNumber };
+    if (repoFullName) {
+      where.repository = { fullName: repoFullName };
+    }
+
+    const issue = await prisma.issue.findFirst({
+      where,
+      select: { state: true, labels: true },
+    });
+
+    if (!issue) {
+      return NextResponse.json(
+        { error: `Issue #${issueNumber} not found` },
+        { status: 404 },
+      );
+    }
+    if (issue.state === "closed") {
+      return NextResponse.json(
+        { error: "Cannot groom a closed issue" },
+        { status: 400 },
+      );
+    }
+    if (issue.labels.includes("status/done")) {
+      return NextResponse.json(
+        { error: "Cannot groom an issue with status/done label" },
+        { status: 400 },
+      );
+    }
   }
 
   try {
