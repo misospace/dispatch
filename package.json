@@ -14,6 +14,7 @@
     "test:watch": "NODE_ENV=development vitest",
     "test:coverage": "NODE_ENV=development vitest run --coverage",
     "typecheck": "NODE_ENV=development tsc --noEmit",
+    "postinstall": "test -f prisma/schema.prisma && prisma generate || true",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",

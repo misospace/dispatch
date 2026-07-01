@@ -15,12 +15,12 @@ Dispatch is a self-hosted Next.js/TypeScript Kanban and work dispatch layer for 
 ## Key Commands
 
 ```bash
-npm install          # Install dependencies
+npm install          # Install dependencies (runs `prisma generate` via postinstall)
 npm run dev          # Start development server
 npm run build        # Production build
 npm run lint         # Lint check
 npm run typecheck    # TypeScript check
-npx prisma generate  # Generate Prisma client
+npm run db:generate  # Regenerate Prisma client (also runs on postinstall; re-run after editing schema.prisma)
 npm run db:push      # Push schema (dev)
 npm run db:deploy    # Deploy migrations (prod)
 ```
