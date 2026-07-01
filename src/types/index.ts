@@ -123,6 +123,11 @@ export const BOARD_COLUMNS: BoardColumn[] = [
 
 export const STATUS_LABELS: StatusLabel[] = BOARD_COLUMNS.map((col) => col.id);
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
+
+/** Type guard: is `label` one of the allowed `status/*` labels? */
+export function isStatusLabel(label: string): label is StatusLabel {
+  return (STATUS_LABELS as readonly string[]).includes(label);
+}
 export const PROJECT_PREFIX = "project/";
 export const AGENT_PREFIX = "agent/";
 export const OWNER_PREFIX = "owner/";
