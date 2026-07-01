@@ -1,5 +1,5 @@
 import type { GroomerOutput } from "./schema";
-import { getConfiguredLanes, getClaimableLanes, getBacklogLane } from "@/lib/lane-config";
+import { getConfiguredLanes, getClaimableLanes, getBacklogLane, getLaneIds } from "@/lib/lane-config";
 import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 
 export interface CallLlmOptions {
@@ -61,6 +61,78 @@ Body enrichment rules:
 - Keep enriched body under 10000 characters`;
 }
 
+const CONFIDENCE_ENUM = ["high", "medium", "low"] as const;
+
+/**
+ * JSON Schema for the groomer's output, used as an OpenAI-style `json_schema`
+ * response_format. On a self-hosted llama.cpp backend (via litellm) this
+ * grammar-constrains decoding to the exact shape — the key to reliable output
+ * from a small model. `lane.id` is a dynamic enum built from the configured
+ * lanes so the model can only emit a real lane, never a hallucinated one.
+ * `validateGroomerOutput` still runs afterward as the safety net (and handles
+ * enum alias canonicalization), so this is belt-and-suspenders.
+ */
+export function buildGroomerResponseSchema(): Record<string, unknown> {
+  const laneIds = getLaneIds();
+  const confidence = { type: "string", enum: [...CONFIDENCE_ENUM] };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["labelsToAdd", "labelsToRemove", "lane"],
+    properties: {
+      actionability: { type: "string", enum: ["ready", "needs_info", "blocked", "backlog", "already_done"] },
+      confidence,
+      labelsToAdd: { type: "array", items: { type: "string" } },
+      labelsToRemove: { type: "array", items: { type: "string" } },
+      lane: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "confidence", "reason"],
+        properties: {
+          id: laneIds.length > 0 ? { type: "string", enum: laneIds } : { type: "string" },
+          confidence,
+          reason: { type: "string" },
+        },
+      },
+      summary: { type: "string" },
+      githubComment: { type: "string" },
+      needsInfoReason: { type: "string" },
+      blockedReason: { type: "string" },
+      nextGroomingAction: {
+        type: "string",
+        enum: ["promote_to_ready", "escalate", "mark_not_ready", "mark_needs_info", "mark_blocked"],
+      },
+      proposedTitle: { type: "string" },
+      proposedBody: { type: "string" },
+    },
+  };
+}
+
+function postChatCompletion(
+  url: string,
+  options: CallLlmOptions,
+  responseFormat: unknown,
+  signal: AbortSignal,
+): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${options.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: options.model,
+      messages: [
+        { role: "system", content: buildSystemPrompt() },
+        { role: "user", content: options.prompt },
+      ],
+      response_format: responseFormat,
+      temperature: 0.1,
+    }),
+    signal,
+  });
+}
+
 export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOutput> {
   const url = `${options.baseUrl}/chat/completions`;
 
@@ -68,23 +140,18 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOu
   const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs);
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${options.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: options.model,
-        messages: [
-          { role: "system", content: buildSystemPrompt() },
-          { role: "user", content: options.prompt },
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-      }),
-      signal: controller.signal,
-    });
+    // Prefer schema-constrained decoding. Fall back to plain JSON mode if the
+    // backend rejects json_schema (400), so grooming never breaks on a serving
+    // stack that doesn't support it; validateGroomerOutput repairs content either way.
+    let response = await postChatCompletion(
+      url,
+      options,
+      { type: "json_schema", json_schema: { name: "groomer_output", schema: buildGroomerResponseSchema() } },
+      controller.signal,
+    );
+    if (response.status === 400) {
+      response = await postChatCompletion(url, options, { type: "json_object" }, controller.signal);
+    }
 
     if (!response.ok) {
       const text = await response.text();

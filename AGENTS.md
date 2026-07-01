@@ -15,12 +15,12 @@ Dispatch is a self-hosted Next.js/TypeScript Kanban and work dispatch layer for 
 ## Key Commands
 
 ```bash
-npm install          # Install dependencies
+npm install          # Install dependencies (runs `prisma generate` via postinstall)
 npm run dev          # Start development server
 npm run build        # Production build
 npm run lint         # Lint check
 npm run typecheck    # TypeScript check
-npx prisma generate  # Generate Prisma client
+npm run db:generate  # Regenerate Prisma client (also runs on postinstall; re-run after editing schema.prisma)
 npm run db:push      # Push schema (dev)
 npm run db:deploy    # Deploy migrations (prod)
 ```
@@ -41,6 +41,8 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
+| `DISPATCH_SCHEDULER_ENABLED` | No | `true` runs periodic jobs (issue sync) in-process instead of via external cronjobs. Off by default. Confine to a single replica. |
+| `DISPATCH_SYNC_INTERVAL_MS` | No | Scheduled-sync interval when the in-app scheduler is enabled (default 900000 = 15m) |
 
 Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` for agent API bearer auth.
 
