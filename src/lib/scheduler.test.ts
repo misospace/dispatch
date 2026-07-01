@@ -38,9 +38,32 @@ describe("schedulerConfigFromEnv", () => {
   });
 
   it("honors DISPATCH_SYNC_INTERVAL_MS and falls back on garbage", () => {
-    expect(schedulerConfigFromEnv({ DISPATCH_SYNC_INTERVAL_MS: "60000" }).jobs[0].intervalMs).toBe(60000);
-    expect(schedulerConfigFromEnv({ DISPATCH_SYNC_INTERVAL_MS: "nope" }).jobs[0].intervalMs).toBe(15 * 60 * 1000);
+    const byName = (env: Record<string, string | undefined>, name: string) =>
+      schedulerConfigFromEnv(env).jobs.find((j) => j.name === name)!;
+    expect(byName({ DISPATCH_SYNC_INTERVAL_MS: "60000" }, "sync").intervalMs).toBe(60000);
+    expect(byName({ DISPATCH_SYNC_INTERVAL_MS: "nope" }, "sync").intervalMs).toBe(15 * 60 * 1000);
     expect(schedulerConfigFromEnv({ PORT: "" }).baseUrl).toBe("http://127.0.0.1:3000");
+  });
+
+  it("configures sync + groomer + pr-followup + prune-closed with defaults", () => {
+    const jobs = schedulerConfigFromEnv({}).jobs;
+    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "prune-closed"]);
+    const byName = (n: string) => jobs.find((j) => j.name === n)!;
+    expect(byName("groomer").path).toBe("/api/groomer/run");
+    expect(byName("groomer").intervalMs).toBe(10 * 60 * 1000);
+    expect(byName("pr-followup").path).toBe("/api/pr-followup/sync");
+    expect(byName("pr-followup").intervalMs).toBe(15 * 60 * 1000);
+    expect(byName("prune-closed").path).toBe("/api/issues/prune-closed");
+    expect(byName("prune-closed").intervalMs).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("disables an individual job when its interval env is 0", () => {
+    const jobs = schedulerConfigFromEnv({ DISPATCH_GROOMER_INTERVAL_MS: "0", DISPATCH_PRUNE_CLOSED_INTERVAL_MS: "0" }).jobs;
+    const names = jobs.map((j) => j.name);
+    expect(names).toContain("sync");
+    expect(names).toContain("pr-followup");
+    expect(names).not.toContain("groomer");
+    expect(names).not.toContain("prune-closed");
   });
 });
 
