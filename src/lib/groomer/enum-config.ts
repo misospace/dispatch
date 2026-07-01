@@ -46,7 +46,7 @@ export interface ResolutionEvent {
   /** The canonical value after alias resolution */
   resolvedValue: string;
   /** How this resolution happened */
-  source: "alias";
+  source: "alias" | "invariant";
 }
 
 /**

@@ -3,6 +3,7 @@ import { STATUS_LABELS, PRIORITY_LABELS, type GroomAction } from "@/types";
 import { resolveEnumConfig, type ResolutionEvent } from "./enum-config";
 import type { EnumConfig } from "./enum-config";
 import { GROOMER_ENUM_CONFIGS } from "./enum-configs";
+import { isClaimableLane, getDefaultClaimableLane } from "@/lib/lane-config";
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
@@ -346,6 +347,28 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
           source: "alias",
         });
       }
+    }
+  }
+
+  // ── Cross-field invariant: a "ready" issue must land in a claimable worker
+  // lane, never the non-claimable backlog lane (dispatch#492). The groomer LLM
+  // sometimes conflates "backlog" (low priority) with the non-claimable backlog
+  // lane, stranding ready issues where no worker queue can see them. Coerce to
+  // the default claimable lane and record it as an invariant resolution.
+  if (parsed.actionability === "ready" && !isClaimableLane(parsed.lane.id)) {
+    const target = getDefaultClaimableLane();
+    if (target) {
+      resolutions.push({
+        field: "lane.id",
+        rawValue: parsed.lane.id,
+        resolvedValue: target.id,
+        source: "invariant",
+      });
+      parsed.lane = {
+        ...parsed.lane,
+        id: target.id,
+        reason: `${parsed.lane.reason} [auto: ready issue reassigned from non-claimable "${parsed.lane.id}" to "${target.id}"]`,
+      };
     }
   }
 
