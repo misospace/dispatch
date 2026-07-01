@@ -1,12 +1,8 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, addIssueLabel } from "@/lib/github";
-import { STATUS_LABELS, StatusLabel } from "@/types";
+import { STATUS_LABELS, StatusLabel, isStatusLabel } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
-
-function isStatusLabel(label: string): label is StatusLabel {
-  return (STATUS_LABELS as readonly string[]).includes(label);
-}
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
