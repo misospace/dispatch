@@ -30,6 +30,8 @@ const { mocks } = vi.hoisted(() => ({
     addIssueLabel: vi.fn(),
     removeIssueLabel: vi.fn(),
     buildRepositoryContext: vi.fn(),
+    acquireGroomerLock: vi.fn(),
+    releaseGroomerLock: vi.fn(),
     prisma: {
       automationRepo: { findUnique: vi.fn() },
       groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
@@ -82,6 +84,11 @@ vi.mock("@/lib/lease", () => ({
 
 vi.mock("./repository-context", () => ({
   buildRepositoryContext: mocks.buildRepositoryContext,
+}));
+
+vi.mock("./groomer-lock", () => ({
+  acquireGroomerLock: mocks.acquireGroomerLock,
+  releaseGroomerLock: mocks.releaseGroomerLock,
 }));
 
 import { runHostedGroomer } from "./run";
@@ -138,6 +145,8 @@ describe("runHostedGroomer", () => {
     mocks.findActiveLeasesForIssue.mockResolvedValue([]);
     mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
     mocks.releaseLease.mockResolvedValue({ id: "lease-1" });
+    mocks.acquireGroomerLock.mockResolvedValue({ locked: true, token: "lock-token" });
+    mocks.releaseGroomerLock.mockResolvedValue(undefined);
     mocks.prisma.automationRepo.findUnique.mockResolvedValue(mockAutomationRepo);
     mocks.prisma.groomingRun.create.mockResolvedValue(mockGroomingRun);
     mocks.prisma.groomingRun.update.mockResolvedValue({ ...mockGroomingRun, stage: "planned" });
@@ -162,6 +171,23 @@ describe("runHostedGroomer", () => {
 
     expect(result).toBeNull();
     expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+  });
+
+  it("bails without selecting when the groomer lock is held", async () => {
+    mocks.acquireGroomerLock.mockResolvedValue({ locked: false });
+
+    const result = await runHostedGroomer();
+
+    expect(result).toBeNull();
+    expect(mocks.selectGroomingCandidate).not.toHaveBeenCalled();
+    expect(mocks.releaseGroomerLock).not.toHaveBeenCalled();
+  });
+
+  it("releases the groomer lock after a run completes", async () => {
+    await runHostedGroomer();
+
+    expect(mocks.acquireGroomerLock).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseGroomerLock).toHaveBeenCalledWith("lock-token");
   });
 
   it("dry-run creates and completes groomingRun and result has groomingRunId", async () => {
