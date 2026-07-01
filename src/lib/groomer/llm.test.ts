@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { callGroomerLLM } from "./llm";
+import { callGroomerLLM, buildGroomerResponseSchema } from "./llm";
+import { getLaneIds } from "@/lib/lane-config";
 
 describe("callGroomerLLM", () => {
   const originalFetch = global.fetch;
@@ -30,7 +31,7 @@ describe("callGroomerLLM", () => {
     capturedBody = JSON.parse((global.fetch as any).mock.calls[0][1].body);
     expect(capturedUrl).toBe("https://llm.example.com/chat/completions");
     expect(capturedBody.model).toBe("gpt-4o-mini");
-    expect(capturedBody.response_format?.type).toBe("json_object");
+    expect(capturedBody.response_format?.type).toBe("json_schema");
   });
 
   it("returns parsed JSON from LLM response", async () => {
@@ -184,5 +185,45 @@ describe("callGroomerLLM", () => {
     });
 
     expect(result.lane.id).toBe("local");
+  });
+});
+
+describe("buildGroomerResponseSchema", () => {
+  it("requires lane/labels, forbids extra props, and constrains lane.id to configured lanes", () => {
+    const schema = buildGroomerResponseSchema() as any;
+    expect(schema.required).toEqual(expect.arrayContaining(["labelsToAdd", "labelsToRemove", "lane"]));
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties.lane.required).toEqual(["id", "confidence", "reason"]);
+    const laneId = schema.properties.lane.properties.id;
+    expect(laneId.enum).toEqual(getLaneIds());
+    expect(laneId.enum.length).toBeGreaterThan(0);
+  });
+});
+
+describe("callGroomerLLM response_format", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  const okContent = () =>
+    `{"labelsToAdd":[],"labelsToRemove":[],"lane":{"id":"${getLaneIds()[0]}","confidence":"high","reason":"r"}}`;
+
+  it("sends json_schema (name + dynamic lane enum) on the first attempt", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [{ message: { content: okContent() } }] }) });
+    await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000 });
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body);
+    expect(body.response_format.type).toBe("json_schema");
+    expect(body.response_format.json_schema.name).toBe("groomer_output");
+    expect(body.response_format.json_schema.schema.properties.lane.properties.id.enum).toEqual(getLaneIds());
+  });
+
+  it("falls back to json_object when the backend rejects json_schema (400)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 400, text: async () => "unsupported response_format" })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: okContent() } }] }) });
+    global.fetch = fetchMock as any;
+    const result = await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).response_format.type).toBe("json_schema");
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).response_format.type).toBe("json_object");
+    expect(result.lane.confidence).toBe("high");
   });
 });
