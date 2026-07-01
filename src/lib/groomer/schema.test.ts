@@ -179,6 +179,41 @@ describe("groomer schema validation", () => {
     expect(result.valid).toBe(true);
   });
 
+  // ── dispatch#492: a "ready" issue must never land in the non-claimable backlog lane.
+  it("coerces a ready issue out of the non-claimable backlog lane (dispatch#492)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      actionability: "ready",
+      lane: { id: "backlog", confidence: "high", reason: "P2 but low priority" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("local"); // default claimable lane
+    const invariant = result.resolutions?.find((r) => r.source === "invariant");
+    expect(invariant).toMatchObject({ field: "lane.id", rawValue: "backlog", resolvedValue: "local" });
+  });
+
+  it("leaves a ready issue already in a claimable lane untouched", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      actionability: "ready",
+      lane: { id: "cloud", confidence: "high", reason: "ci work" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("cloud");
+    expect(result.resolutions?.some((r) => r.source === "invariant")).toBe(false);
+  });
+
+  it("leaves a non-ready issue in the backlog lane", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      actionability: "needs_info",
+      lane: { id: "backlog", confidence: "medium", reason: "missing acceptance criteria" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("backlog");
+    expect(result.resolutions?.some((r) => r.source === "invariant")).toBe(false);
+  });
+
   it("accepts valid frontier lane", () => {
     const result = validateGroomerOutput({
       ...validOutput,

@@ -1,5 +1,5 @@
 import type { GroomerOutput } from "./schema";
-import { getConfiguredLanes } from "@/lib/lane-config";
+import { getConfiguredLanes, getClaimableLanes, getBacklogLane } from "@/lib/lane-config";
 import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 
 export interface CallLlmOptions {
@@ -14,6 +14,8 @@ const VALID_TYPE_LABELS = ["type/bug", "type/feature", "type/chore", "type/resea
 
 function buildSystemPrompt(): string {
   const laneIds = getConfiguredLanes().map((lane) => lane.id).join("|");
+  const claimableIds = getClaimableLanes().map((lane) => lane.id).join("|");
+  const backlogLane = getBacklogLane();
   const statusLabels = STATUS_LABELS.join(", ");
   const priorityLabels = PRIORITY_LABELS.join(", ");
   const typeLabels = VALID_TYPE_LABELS.join(", ");
@@ -42,6 +44,7 @@ Rules:
 - Valid type labels: ${typeLabels}
 - Never remove agent/* labels
 - Lane must be one of the configured lane ids
+- When actionability is "ready", lane.id MUST be a claimable worker lane (${claimableIds})${backlogLane ? `, NEVER "${backlogLane.id}"` : ""}${backlogLane ? `. The "${backlogLane.id}" lane is non-claimable — use it only when actionability is not "ready" (needs_info/blocked/backlog/already_done). Priority (P2/P3/low) does NOT mean backlog: a low-priority but ready issue still goes to a claimable lane.` : ""}
 - Be concise in summary and reason fields
 
 Title rewriting rules:
