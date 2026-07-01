@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
+import { acquireGroomerLock, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
@@ -47,6 +48,8 @@ export interface GroomerDeps {
   releaseLease: typeof releaseLease;
   prisma: typeof prisma;
   buildRepositoryContext: typeof buildRepositoryContext;
+  acquireGroomerLock: typeof acquireGroomerLock;
+  releaseGroomerLock: typeof releaseGroomerLock;
 }
 
 const defaultDeps: GroomerDeps = {
@@ -64,9 +67,27 @@ const defaultDeps: GroomerDeps = {
   releaseLease,
   prisma,
   buildRepositoryContext,
+  acquireGroomerLock,
+  releaseGroomerLock,
 };
 
 export async function runHostedGroomer(
+  options: RunHostedGroomerOptions = {},
+  deps: GroomerDeps = defaultDeps,
+): Promise<GroomerRunResult | null> {
+  // Serialize runs behind a DB lock: without it, two concurrent groomer runs
+  // can select the same candidate before either acquires the per-issue lease
+  // (selection and lease acquisition are not atomic), double-grooming the issue.
+  const lock = await deps.acquireGroomerLock();
+  if (!lock.locked) return null;
+  try {
+    return await executeGroomerRun(options, deps);
+  } finally {
+    await deps.releaseGroomerLock(lock.token);
+  }
+}
+
+async function executeGroomerRun(
   options: RunHostedGroomerOptions = {},
   deps: GroomerDeps = defaultDeps,
 ): Promise<GroomerRunResult | null> {
