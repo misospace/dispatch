@@ -9,4 +9,21 @@
  */
 export async function register() {
   // Lane config init moved to src/lib/lane-config.ts module-load side effect.
+
+  // In-app periodic scheduler (opt-in via DISPATCH_SCHEDULER_ENABLED). Node
+  // runtime only — register() also runs in the edge runtime, which has no
+  // timers/loopback. Dynamic import so the edge bundle never pulls it in. The
+  // scheduler fires loopback HTTP POSTs (no shared module state with routes),
+  // so the Turbopack chunk-graph isolation noted above does not affect it.
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+  const { schedulerConfigFromEnv, startScheduler } = await import("@/lib/scheduler");
+  startScheduler(schedulerConfigFromEnv(process.env), {
+    fetch,
+    setInterval,
+    setTimeout,
+    log: (message, error) =>
+      error !== undefined
+        ? console.error(`[scheduler] ${message}`, error)
+        : console.log(`[scheduler] ${message}`),
+  });
 }
