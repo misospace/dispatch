@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { AgentWorkClient } from "@/lib/agent-work";
@@ -95,11 +95,17 @@ export function __resetPrismaClientForTests(): void {
   globalForPrisma.prisma = undefined;
 }
 
+// The adapter interfaces type the interactive-transaction callback's `tx` as
+// the narrowed client (PrFixQueueClient / AgentWorkClient), whereas Prisma types
+// it as Prisma.TransactionClient. The two are structurally compatible for the
+// model delegates these callbacks actually use; cast the callback once (rather
+// than `as any`) so the transaction's return type T is still checked.
 export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
   return {
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
-    $transaction: (fn) => client.$transaction(fn as any) as any,
+    $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
+      client.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
   };
 }
 
@@ -107,6 +113,7 @@ export function asAgentWorkClient(client: PrismaClient): AgentWorkClient {
   return {
     agentWork: client.agentWork,
     agentWorkHistory: client.agentWorkHistory,
-    $transaction: (fn) => client.$transaction(fn as any) as any,
+    $transaction: <T>(fn: (tx: AgentWorkClient) => Promise<T>): Promise<T> =>
+      client.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
   };
 }
