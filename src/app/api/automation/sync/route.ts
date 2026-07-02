@@ -408,7 +408,10 @@ async function syncRepo(repoFullName: string) {
   }
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   const repos = await prisma.automationRepo.findMany({
     orderBy: { fullName: "asc" },
     include: {

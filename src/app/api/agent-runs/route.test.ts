@@ -56,12 +56,17 @@ describe("GET /api/agent-runs", () => {
     mocks.agentRunFindMany.mockResolvedValue([]);
   });
 
-  it("returns agent runs without authentication", async () => {
+  it("401s an unauthenticated request", async () => {
+    const res = await GET(getRequest("http://localhost/api/agent-runs", false));
+    expect(res.status).toBe(401);
+  });
+
+  it("returns agent runs to an authenticated caller", async () => {
     mocks.agentRunFindMany.mockResolvedValue([
       { id: "run-1", agentName: "saffron", status: "completed" },
     ]);
 
-    const res = await GET(getRequest("http://localhost/api/agent-runs", false));
+    const res = await GET(getRequest("http://localhost/api/agent-runs"));
 
     expect(res.status).toBe(200);
     const body = await res.json();

@@ -25,21 +25,26 @@ vi.mock("@/lib/prisma", () => ({
 import { GET } from "./route";
 
 describe("GET /api/repos", () => {
-  // NOTE: This route is intentionally unauthenticated. It returns all tracked
-  // repositories to any caller. In production deployments behind a firewall or
-  // auth gateway this is acceptable; in open deployments consider adding auth.
+  const authed = () =>
+    new Request("http://localhost/api/repos", { headers: { Authorization: `Bearer ${mockToken}` } });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.repositoryFindMany.mockResolvedValue([]);
   });
 
-  it("returns repos without authentication", async () => {
+  it("401s an unauthenticated request", async () => {
+    const res = await GET(new Request("http://localhost/api/repos"));
+    expect(res.status).toBe(401);
+  });
+
+  it("returns repos to an authenticated caller", async () => {
     mocks.repositoryFindMany.mockResolvedValue([
       { id: "r1", fullName: "org/repo1", enabled: true },
       { id: "r2", fullName: "org/repo2", enabled: true },
     ]);
 
-    const res = await GET();
+    const res = await GET(authed());
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -51,7 +56,7 @@ describe("GET /api/repos", () => {
   it("returns empty array when no repos exist", async () => {
     mocks.repositoryFindMany.mockResolvedValue([]);
 
-    const res = await GET();
+    const res = await GET(authed());
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -59,7 +64,7 @@ describe("GET /api/repos", () => {
   });
 
   it("orders by fullName ascending", async () => {
-    await GET();
+    await GET(authed());
 
     const call = mocks.repositoryFindMany.mock.calls[0][0];
     expect(call.orderBy).toEqual({ fullName: "asc" });
@@ -68,7 +73,7 @@ describe("GET /api/repos", () => {
   it("returns 500 on database error", async () => {
     mocks.repositoryFindMany.mockRejectedValue(new Error("db connection lost"));
 
-    const res = await GET();
+    const res = await GET(authed());
 
     expect(res.status).toBe(500);
     const body = await res.json();
