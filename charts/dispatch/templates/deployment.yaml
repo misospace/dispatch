@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dispatch.fullname" . }}
+  labels:
+    {{- include "dispatch.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "dispatch.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dispatch.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "dispatch.serviceAccountName" . }}
+      containers:
+        - name: dispatch
+          image: "{{ .Values.image.repository }}:{{ include "dispatch.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort | default 3000 }}
+              protocol: TCP
+          env:
+            # Skip migrations in the pod — handled by pre-install/pre-upgrade hook Job
+            - name: SKIP_DB_MIGRATIONS
+              value: "true"
+            # Auth mode
+            - name: DISPATCH_AUTH_MODE
+              value: {{ .Values.config.authMode | quote }}
+            # Excluded labels (comma-separated)
+            - name: DISPATCH_EXCLUDED_LABELS
+              value: {{ .Values.config.excludedLabels | default list | join "," | quote }}
+            # LLM base URL
+            - name: DISPATCH_LLM_BASE_URL
+              value: {{ .Values.config.llmBaseUrl | quote }}
+            # Groomer config
+            - name: DISPATCH_GROOMER_ENABLED
+              value: {{ .Values.config.groomer.enabled | default true | quote }}
+            - name: DISPATCH_GROOMER_MODEL
+              value: {{ .Values.config.groomer.model | default "" | quote }}
+            - name: DISPATCH_GROOMER_DRY_RUN
+              value: {{ .Values.config.groomer.dryRun | default false | quote }}
+            - name: DISPATCH_GROOMER_REPO_CONTEXT
+              value: {{ .Values.config.groomer.repoContext | default true | quote }}
+            # Scheduler config
+            - name: DISPATCH_SCHEDULER_ENABLED
+              value: {{ .Values.config.scheduler.enabled | default true | quote }}
+            - name: DISPATCH_SCHEDULER_SYNC_MS
+              value: {{ .Values.config.scheduler.intervals.syncMs | default 900000 | int64 | toString | quote }}
+            - name: DISPATCH_SCHEDULER_GROOMER_MS
+              value: {{ .Values.config.scheduler.intervals.groomerMs | default 600000 | int64 | toString | quote }}
+            - name: DISPATCH_SCHEDULER_PR_FOLLOWUP_MS
+              value: {{ .Values.config.scheduler.intervals.prFollowupMs | default 900000 | int64 | toString | quote }}
+            - name: DISPATCH_SCHEDULER_PRUNE_CLOSED_MS
+              value: {{ .Values.config.scheduler.intervals.pruneClosedMs | default 86400000 | int64 | toString | quote }}
+            # Lane config (structured -> JSON)
+            - name: DISPATCH_LANE_CONFIG_JSON
+              value: {{ include "dispatch.laneConfigJson" . | quote }}
+            # Database URL from secret
+            {{- if .Values.database.existingSecret }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.key | default "uri" }}
+            {{- end }}
+            # Escape hatch env vars (merged last)
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          envFrom:
+            {{- if .Values.existingSecret }}
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10

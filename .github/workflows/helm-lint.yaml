@@ -1,0 +1,67 @@
+name: Helm Lint
+
+on:
+  pull_request:
+    paths:
+      - charts/dispatch/**
+      - .github/workflows/helm-lint.yaml
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4619 # v4.2.0
+        with:
+          version: v3.14.0
+
+      - name: Lint chart
+        run: helm lint charts/dispatch
+
+      - name: Template chart (default values)
+        run: helm template dispatch charts/dispatch --validate
+
+      - name: Template chart (custom values)
+        run: |
+          cat > /tmp/test-values.yaml <<'EOF'
+          config:
+            authMode: oidc
+            excludedLabels: [renovate, dependabot]
+            llmBaseUrl: https://api.openai.com/v1
+            groomer:
+              enabled: true
+              model: gpt-4o
+              dryRun: false
+              repoContext: true
+            scheduler:
+              enabled: true
+              intervals:
+                syncMs: 600000
+                groomerMs: 300000
+                prFollowupMs: 600000
+                pruneClosedMs: 43200000
+            lanes:
+              - id: triage
+                title: Triage
+                claimable: true
+                role: default
+              - id: in-progress
+                title: In Progress
+                claimable: true
+                role: escalation
+          database:
+            existingSecret: my-db-secret
+            key: connection-string
+          httpRoute:
+            enabled: true
+            hostnames:
+              - dispatch.example.com
+            parentRefs:
+              - name: my-gateway
+          env:
+            NODE_ENV: production
+          EOF
+          helm template dispatch charts/dispatch --values /tmp/test-values.yaml --validate

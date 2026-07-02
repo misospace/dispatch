@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dispatch
+description: First-party Helm chart for misospace/dispatch
+type: application
+version: 0.5.16
+appVersion: 0.5.16

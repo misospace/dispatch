@@ -1,0 +1,97 @@
+# Default values for dispatch.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+image:
+  repository: ghcr.io/misospace/dispatch
+  pullPolicy: IfNotPresent
+  # tag defaults to .Chart.AppVersion when empty
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+# Structured configuration — rendered into env vars / DISPATCH_LANE_CONFIG_JSON
+config:
+  # Authentication mode: basic | oidc | disabled
+  authMode: basic
+
+  # Comma-separated list of labels to exclude from processing (e.g. "renovate")
+  excludedLabels:
+    - renovate
+
+  # LLM base URL for the groomer agent (empty = use default provider)
+  llmBaseUrl: ""
+
+  # Groomer configuration
+  groomer:
+    enabled: true
+    model: ""
+    dryRun: false
+    repoContext: true
+
+  # Scheduler configuration
+  scheduler:
+    enabled: true
+    intervals:
+      syncMs: 900000
+      groomerMs: 600000
+      prFollowupMs: 900000
+      pruneClosedMs: 86400000
+
+  # Lane configuration — rendered into DISPATCH_LANE_CONFIG_JSON
+  lanes:
+    - id: local
+      title: Local
+      claimable: true
+      role: default
+    - id: frontier
+      title: Frontier
+      claimable: true
+      role: escalation
+    - id: backlog
+      title: Backlog
+      claimable: false
+
+  # Lane aliases for backward compatibility (normal -> local, escalated -> frontier)
+  laneAliases:
+    normal: local
+    escalated: frontier
+
+# Existing Secret to mount via envFrom (must contain DISPATCH_AGENT_TOKEN, GITHUB_*, etc.)
+existingSecret: dispatch
+
+# Database configuration
+database:
+  # Existing Secret containing the database URL
+  existingSecret: ""
+  # Key within the secret that holds the connection string
+  key: uri
+
+# Migration hook Job — runs prisma migrate deploy before pod rollout
+migrations:
+  enabled: true
+
+# Optional HTTPRoute (Gateway API) — off by default
+httpRoute:
+  enabled: false
+  hostnames: []
+  parentRefs: []
+
+# Escape hatch: arbitrary extra env vars merged last into the Deployment
+env: {}
+# Example:
+# env:
+#   NODE_ENV: production
+#   LOG_LEVEL: info

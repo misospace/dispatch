@@ -1,0 +1,15 @@
+Thank you for installing {{ .Chart.Name }}!
+
+Your release is named: {{ .Release.Name }}
+
+To get the application URL, run:
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "dispatch.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 3000:{{ .Values.service.targetPort | default 3000 }}
+
+Then visit http://localhost:3000 in your browser.
+
+Notes:
+- Migrations run via a pre-install/pre-upgrade hook Job (when migrations.enabled: true).
+- Pods start with SKIP_DB_MIGRATIONS=true and never run migrations themselves.
+- Ensure the Secret referenced by existingSecret exists before installing.
+  See templates/secret-contract.md for required keys.
