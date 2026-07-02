@@ -1,5 +1,5 @@
 import { VALID_CONFIDENCE } from "@/types";
-import { classifyLaneFromSignals, getConfiguredLanes, getDefaultClaimableLane, getEscalationLane, getBacklogLane, isValidLane as isValidLaneConfig } from "@/lib/lane-config";
+import { classifyLaneFromSignals, isValidLane as isValidLaneConfig } from "@/lib/lane-config";
 
 /**
  * A lane classification result for an issue.
@@ -94,69 +94,6 @@ export function validateLaneRecord(data: unknown): {
 }
 
 /**
- * Build a prompt for the model to classify an issue's execution lane.
- * This prompt is generic — no hardcoded agent names, repo names, or owner names.
- * Uses configured lanes so the model returns valid lane ids.
- */
-export function buildLaneClassificationPrompt(
-  title: string,
-  body: string | null,
-  labels: string[],
-  state: string,
-): string {
-  const truncatedBody = body ? (body.length > 8000 ? body.slice(0, 8000) + "\n...[truncated]" : body) : "(no body)";
-
-  const lanes = getConfiguredLanes();
-  const laneIds = lanes.map((l) => `"${l.id}"`).join("|");
-
-  // Build lane definitions from config
-  const defaultLane = getDefaultClaimableLane();
-  const escalationLane = getEscalationLane();
-  const backlogLane = getBacklogLane();
-
-  const laneDefinitions: string[] = [];
-  if (defaultLane) {
-    laneDefinitions.push(
-      `- ${defaultLane.id}: concrete, scoped, testable implementation work suitable for a normal worker.`,
-    );
-  }
-  // Only add escalation definition if it differs from default
-  if (escalationLane && escalationLane.id !== defaultLane?.id) {
-    laneDefinitions.push(
-      `- ${escalationLane.id}: requires higher-judgment model support, such as architecture/security/API/auth boundary design, database/schema migration strategy, distributed/cross-service design, ambiguous product behavior, broad refactor planning, RFC/design/alternatives decisions, or audit parent decomposition.`,
-    );
-  }
-  if (backlogLane) {
-    laneDefinitions.push(
-      `- ${backlogLane.id}: not actionable yet, placeholder, missing enough detail, or a parent/umbrella item with no direct work remaining.`,
-    );
-  }
-
-  return `You are a task routing assistant. Classify this GitHub issue into an execution lane.
-
-Return ONLY compact JSON with this exact schema:
-{"lane":${laneIds},"confidence":"high"|"medium"|"low","reason":"short reason"}
-
-Lane definitions:
-${laneDefinitions.join("\n")}
-
-Routing rules:
-- Do not route to ${escalationLane?.id ?? "default"} only because labels include needs-escalation, escalated, priority/p1, or because the issue came from an audit.
-- Do route broad audit parent/umbrella issues to ${escalationLane?.id ?? "default"} for decomposition/design unless already decomposed.
-- Documentation, tests, CI, lint, release/version drift, bounded frontend/backend fixes, and concrete follow-up issues usually go to ${defaultLane?.id ?? "default"}.
-- If the issue already contains a reasonable implementation approach and acceptance criteria, prefer ${defaultLane?.id ?? "default"}.
-- If confidence is low and the issue is not actionable, choose ${backlogLane?.id ?? "backlog"}.
-
-Issue:
-title: ${title}
-state: ${state}
-labels: ${labels.join(", ") || "(none)"}
-
-body:
-${truncatedBody}`;
-}
-
-/**
  * Build a fallback classification when model classification fails.
  * Uses simple heuristics based on labels and title/body content.
  * Returns configured lane ids — never hardcoded strings.
@@ -206,17 +143,5 @@ export function classifyByHeuristics(
     lane: classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
     confidence: "medium",
     reason: "Default classification: concrete implementation work",
-  };
-}
-
-/**
- * Generate a safe JSON string from classification data for Prisma storage.
- */
-export function serializeLaneData(classification: LaneClassification): Record<string, unknown> {
-  return {
-    lane: classification.lane,
-    confidence: classification.confidence,
-    reason: classification.reason.slice(0, 500),
-    model: classification.model ?? null,
   };
 }
