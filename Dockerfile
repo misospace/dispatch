@@ -54,4 +54,9 @@ EXPOSE 3000
 
 ENV PORT=3000
 
+# Next standalone binds to $HOSTNAME. Kubernetes sets HOSTNAME to the pod name,
+# which resolves to the pod IP — the server then skips loopback and the in-app
+# scheduler's POSTs to 127.0.0.1 get ECONNREFUSED. Bind all interfaces.
+ENV HOSTNAME=0.0.0.0
+
 ENTRYPOINT ["/docker-entrypoint.sh"]
