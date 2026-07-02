@@ -33,11 +33,20 @@ export interface ValidationResult {
 
 const validTypeLabels = ["type/bug", "type/feature", "type/chore", "type/research", "type/security"];
 
+/**
+ * Every label the groomer may add or remove. Exported so the LLM response
+ * schema (`buildGroomerResponseSchema`) can enum-constrain label output to
+ * exactly this set — a grammar-constrained small model then cannot invent
+ * labels (e.g. "type/refactor") that this validator would reject.
+ */
+export const ALLOWED_GROOMER_LABELS: readonly string[] = [
+  ...STATUS_LABELS,
+  ...PRIORITY_LABELS,
+  ...validTypeLabels,
+];
+
 function isAllowedLabel(label: string): boolean {
-  if (STATUS_LABELS.some((s) => s === label)) return true;
-  if (PRIORITY_LABELS.some((s) => s === label)) return true;
-  if (validTypeLabels.includes(label)) return true;
-  return false;
+  return ALLOWED_GROOMER_LABELS.includes(label);
 }
 
 function validateLabelList(list: unknown[], kind: string): string[] {
