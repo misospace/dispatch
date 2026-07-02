@@ -24,20 +24,24 @@ vi.mock("@/lib/prisma", () => ({
 
 import { GET } from "./route";
 
-function request(urlString: string) {
-  return new Request(urlString, { headers: {} });
+function request(urlString: string, includeAuth = true) {
+  const headers: Record<string, string> = {};
+  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
+  return new Request(urlString, { headers });
 }
 
 describe("GET /api/audit", () => {
-  // NOTE: This route is intentionally unauthenticated. It returns all AuditLog
-  // rows to any caller. In production deployments behind a firewall or auth
-  // gateway this is acceptable; in open deployments consider adding auth.
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.auditLogFindMany.mockResolvedValue([]);
   });
 
-  it("returns audit logs without authentication", async () => {
+  it("401s an unauthenticated request", async () => {
+    const res = await GET(request("http://localhost/api/audit", false));
+    expect(res.status).toBe(401);
+  });
+
+  it("returns audit logs to an authenticated caller", async () => {
     mocks.auditLogFindMany.mockResolvedValue([
       { id: "log-1", actor: "agent", action: "move_issue", createdAt: new Date() },
     ]);
