@@ -67,7 +67,11 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Only main/tag builds write the cache. PR builds read it but never
+          # export — the mode=max export re-uploads every stage's layers
+          # (~1GB of node_modules) whenever package.json changes, which was
+          # ~270s of every release-bump and Renovate PR build.
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
           build-args: |
             DATABASE_URL=postgresql://localhost:5432/dispatch
 
