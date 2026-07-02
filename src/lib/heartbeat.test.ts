@@ -26,6 +26,7 @@ vi.mock("@/lib/config", () => ({
 
 vi.mock("@/lib/github", () => ({
   fetchIssues: vi.fn(),
+  syncStatusLabels: vi.fn(),
 }));
 
 vi.mock("@/lib/prisma", () => ({
@@ -227,6 +228,7 @@ describe("runSyncBestEffort", () => {
       expect.any(Function),
       expect.any(Object),
       customLabels,
+      expect.any(Function),
     );
   });
 
@@ -251,6 +253,7 @@ describe("runSyncBestEffort", () => {
       expect.any(Function),
       expect.any(Object),
       envLabels,
+      expect.any(Function),
     );
   });
 

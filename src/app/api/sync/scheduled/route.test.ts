@@ -82,6 +82,7 @@ function createPrismaMock() {
 function createGithubMock() {
   return {
     fetchIssues: vi.fn().mockResolvedValue([]),
+    syncStatusLabels: vi.fn(),
     fetchIssue: vi.fn().mockResolvedValue({
       number: 1,
       state: "open",

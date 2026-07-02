@@ -445,6 +445,25 @@ export async function removeIssueLabel(
   }
 }
 
+/**
+ * Apply a status-label change: remove `remove` labels, then add `add` labels.
+ * Used to mirror the closed⇒done sync fix onto GitHub. removeIssueLabel already
+ * ignores 404s, so this is safe to call idempotently.
+ */
+export async function syncStatusLabels(
+  repoFullName: string,
+  issueNumber: number,
+  add: string[],
+  remove: string[],
+): Promise<void> {
+  for (const label of remove) {
+    await removeIssueLabel(repoFullName, issueNumber, label);
+  }
+  for (const label of add) {
+    await addIssueLabel(repoFullName, issueNumber, label);
+  }
+}
+
 export async function closeIssue(
   repoFullName: string,
   issueNumber: number

@@ -6,7 +6,7 @@
  */
 
 import { prisma } from "@/lib/prisma";
-import { fetchIssues } from "@/lib/github";
+import { fetchIssues, syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import {
   syncIssuesForRepos,
@@ -75,7 +75,7 @@ export async function runSyncBestEffort(
       async createIssue(repositoryId: string, data: SyncedIssueData) {
         await prisma.issue.create({ data: { ...data, repositoryId } });
       },
-    }, excludedLabels);
+    }, excludedLabels, syncStatusLabels);
 
     syncedCount = result.syncedCount;
     reposProcessed = result.repos;

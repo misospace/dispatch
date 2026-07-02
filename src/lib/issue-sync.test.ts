@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubIssue } from "@/types";
-import { IssueStore, syncIssuesForRepos, mergeLabels, reconcileClosedIssues } from "./issue-sync";
+import { IssueStore, syncIssuesForRepos, mergeLabels, reconcileClosedIssues, closedIssueStatusFix } from "./issue-sync";
 
 function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
@@ -60,6 +60,47 @@ describe("mergeLabels", () => {
     expect(mergeLabels([], [])).toEqual([]);
     expect(mergeLabels(["a"], [])).toEqual(["a"]);
     expect(mergeLabels([], ["agent/x"])).toEqual(["agent/x"]);
+  });
+});
+
+describe("closedIssueStatusFix", () => {
+  it("leaves open issues untouched", () => {
+    expect(closedIssueStatusFix(["status/ready", "type/bug"], "open")).toEqual({
+      labels: ["status/ready", "type/bug"],
+      added: [],
+      removed: [],
+    });
+  });
+
+  it("moves a closed issue from any status to status/done", () => {
+    for (const from of ["status/backlog", "status/ready", "status/in-progress", "status/in-review"]) {
+      const r = closedIssueStatusFix([from, "type/bug"], "closed");
+      expect(r.labels).toEqual(["type/bug", "status/done"]);
+      expect(r.removed).toEqual([from]);
+      expect(r.added).toEqual(["status/done"]);
+    }
+  });
+
+  it("adds status/done to a closed issue that has no status label", () => {
+    const r = closedIssueStatusFix(["type/bug"], "closed");
+    expect(r.labels).toEqual(["type/bug", "status/done"]);
+    expect(r.added).toEqual(["status/done"]);
+    expect(r.removed).toEqual([]);
+  });
+
+  it("is a no-op when a closed issue is already status/done", () => {
+    expect(closedIssueStatusFix(["type/bug", "status/done"], "closed")).toEqual({
+      labels: ["type/bug", "status/done"],
+      added: [],
+      removed: [],
+    });
+  });
+
+  it("dedupes a stale status label alongside done", () => {
+    const r = closedIssueStatusFix(["status/done", "status/ready", "type/bug"], "closed");
+    expect(r.labels).toEqual(["type/bug", "status/done"]);
+    expect(r.removed).toEqual(["status/ready"]);
+    expect(r.added).toEqual([]);
   });
 });
 
@@ -134,6 +175,48 @@ describe("syncIssuesForRepos", () => {
     expect(findMock).toHaveBeenCalledTimes(2);
     expect(updateMock).toHaveBeenCalledWith("existing-1", expect.objectContaining({ number: 1 }));
     expect(createMock).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 2 }));
+  });
+
+  it("stores status/done for a closed issue and mirrors the change to GitHub", async () => {
+    const syncGithubLabels = vi.fn().mockResolvedValue(undefined);
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1, { state: "closed", labels: [{ name: "status/ready", color: "f" }, { name: "type/bug", color: "f" }] })],
+      store,
+      [],
+      syncGithubLabels,
+    );
+
+    // Cache: status/ready replaced with status/done.
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ labels: ["type/bug", "status/done"] }));
+    // GitHub: remove the stale status, add done.
+    expect(syncGithubLabels).toHaveBeenCalledWith("org/repo", 1, ["status/done"], ["status/ready"]);
+  });
+
+  it("does not touch GitHub for open issues", async () => {
+    const syncGithubLabels = vi.fn().mockResolvedValue(undefined);
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1, { state: "open", labels: [{ name: "status/ready", color: "f" }] })],
+      store,
+      [],
+      syncGithubLabels,
+    );
+
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ labels: ["status/ready"] }));
+    expect(syncGithubLabels).not.toHaveBeenCalled();
+  });
+
+  it("still fixes the cache when no GitHub writer is provided", async () => {
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1, { state: "closed", labels: [{ name: "status/backlog", color: "f" }] })],
+      store,
+    );
+
+    expect(store.createIssue).toHaveBeenCalledWith("repo-1", expect.objectContaining({ labels: ["status/done"] }));
   });
 });
 

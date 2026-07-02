@@ -126,11 +126,39 @@ export function mergeLabels(ghLabels: string[], existingAgentLabels: string[]): 
   return [...ghLabels, ...preserved];
 }
 
+/**
+ * Enforce "closed ⇒ status/done" at sync time. A closed GitHub issue should
+ * carry status/done regardless of its prior status (backlog/ready/in-progress/
+ * in-review, or no status label at all). Applied on every sync so the mapping
+ * is deterministic — no flicker, no dependence on a separate reconcile pass.
+ *
+ * Returns the corrected label set plus the status/* labels to remove and add on
+ * GitHub so the remote matches too. All three are empty when the issue is open
+ * or already correctly status/done.
+ */
+export function closedIssueStatusFix(
+  labels: string[],
+  state: string,
+): { labels: string[]; added: string[]; removed: string[] } {
+  if (state !== "closed") return { labels, added: [], removed: [] };
+  const statusLabels = labels.filter((l) => l.startsWith("status/"));
+  if (statusLabels.length === 1 && statusLabels[0] === "status/done") {
+    return { labels, added: [], removed: [] };
+  }
+  const removed = statusLabels.filter((l) => l !== "status/done");
+  const added = statusLabels.includes("status/done") ? [] : ["status/done"];
+  const labelsOut = [...labels.filter((l) => !l.startsWith("status/")), "status/done"];
+  return { labels: labelsOut, added, removed };
+}
+
 export async function syncIssuesForRepos(
   repos: SyncRepo[],
   fetchIssues: (repoFullName: string) => Promise<GitHubIssue[]>,
   store: IssueStore,
   excludedLabels: string[] = [],
+  // Optional: push the closed⇒done status-label change to GitHub too, so the
+  // remote matches the cache. Omit to fix the cache only (still deterministic).
+  syncGithubLabels?: (repoFullName: string, issueNumber: number, add: string[], remove: string[]) => Promise<void>,
 ): Promise<SyncResponse> {
   const results: SyncResult[] = [];
   let syncedCount = 0;
@@ -146,6 +174,11 @@ export async function syncIssuesForRepos(
         }
 
         const issueData = githubIssueToSyncedIssueData(ghIssue);
+
+        // Closed ⇒ status/done (deterministic, every sync).
+        const statusFix = closedIssueStatusFix(issueData.labels, issueData.state);
+        issueData.labels = statusFix.labels;
+
         const existingIssue = await store.findIssue(repo.id, ghIssue.number);
 
         if (existingIssue) {
@@ -154,6 +187,17 @@ export async function syncIssuesForRepos(
           await store.updateIssue(existingIssue.id, issueData);
         } else {
           await store.createIssue(repo.id, issueData);
+        }
+
+        // Mirror the closed⇒done label change to GitHub (best-effort — the cache
+        // is already correct; a relabel failure must not fail the sync). Self-
+        // limiting: once GitHub is status/done, subsequent syncs are no-ops.
+        if (syncGithubLabels && (statusFix.added.length > 0 || statusFix.removed.length > 0)) {
+          try {
+            await syncGithubLabels(repo.fullName, ghIssue.number, statusFix.added, statusFix.removed);
+          } catch (error) {
+            console.error(`closed→done relabel failed for ${repo.fullName}#${ghIssue.number}:`, error);
+          }
         }
 
         repoSyncedCount++;
