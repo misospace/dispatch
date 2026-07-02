@@ -81,4 +81,13 @@ describe("releaseLock", () => {
     await releaseLock("run-1");
     expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "run-1" } });
   });
+
+  it("is a safe no-op when no matching row exists (release-on-any-path)", async () => {
+    // Callers release in a finally{}, so release can run after a failure that
+    // never acquired (or after the row was already cleared). deleteMany matches
+    // nothing → no throw.
+    mocks.syncLock.deleteMany.mockResolvedValue({ count: 0 });
+    await expect(releaseLock("never-acquired")).resolves.toBeUndefined();
+    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "never-acquired" } });
+  });
 });
