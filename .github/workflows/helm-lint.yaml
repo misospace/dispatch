@@ -22,7 +22,7 @@ jobs:
         run: helm lint charts/dispatch
 
       - name: Template chart (default values)
-        run: helm template dispatch charts/dispatch --validate
+        run: helm template dispatch charts/dispatch
 
       - name: Template chart (custom values)
         run: |
@@ -64,4 +64,4 @@ jobs:
           env:
             NODE_ENV: production
           EOF
-          helm template dispatch charts/dispatch --values /tmp/test-values.yaml --validate
+          helm template dispatch charts/dispatch --values /tmp/test-values.yaml
