@@ -386,6 +386,13 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
     expect(body.issues.repos).toBe(1);
   });
 
+  it("fetches closed issues too, so closed=>done enforcement can run (#521 regression)", async () => {
+    const { POST } = await import("./route");
+    const github = await import("@/lib/github");
+    await POST(makeRequest());
+    expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), { includeClosed: true });
+  });
+
   it("does not sync automation by default", async () => {
     const { POST } = await import("./route");
     const res = await POST(makeRequest());
