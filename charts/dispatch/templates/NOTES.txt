@@ -1,0 +1,10 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} installed as {{ .Release.Name }}.
+
+- Migrations ran via the pre-install/pre-upgrade hook Job (migrations.enabled={{ .Values.migrations.enabled }});
+  server pods start with SKIP_DB_MIGRATIONS=true and never migrate.
+- Values use the bjw-s common library API (same shape as app-template):
+  https://bjw-s-labs.github.io/helm-charts/docs/common-library/
+- Required Secret keys are documented in the chart's secret-contract.md.
+
+Port-forward:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }} 3000:3000

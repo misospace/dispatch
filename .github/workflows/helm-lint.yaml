@@ -1,0 +1,62 @@
+name: Helm Lint
+
+on:
+  pull_request:
+    paths:
+      - charts/dispatch/**
+      - .github/workflows/helm-lint.yaml
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.14.0
+
+      - name: Build chart dependencies
+        run: |
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm dependency build charts/dispatch
+
+      - name: Lint chart
+        run: helm lint charts/dispatch
+
+      - name: Template chart (default values)
+        run: helm template dispatch charts/dispatch
+
+      - name: Template chart (custom values)
+        run: |
+          cat > /tmp/test-values.yaml <<'EOF'
+          controllers:
+            main:
+              replicas: 2
+              containers:
+                main:
+                  env:
+                    DISPATCH_AUTH_MODE: oidc
+                    DISPATCH_EXCLUDED_LABELS: renovate
+                    DISPATCH_SCHEDULER_ENABLED: "true"
+          route:
+            main:
+              hostnames: ["dispatch.example.com"]
+              parentRefs:
+                - name: my-gateway
+                  namespace: network
+              rules:
+                - backendRefs:
+                    - identifier: main
+                      port: 3000
+          migrations:
+            env:
+              DATABASE_URL:
+                valueFrom:
+                  secretKeyRef:
+                    name: dispatch-db
+                    key: uri
+          EOF
+          helm template dispatch charts/dispatch --values /tmp/test-values.yaml

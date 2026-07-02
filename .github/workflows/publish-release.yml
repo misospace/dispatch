@@ -118,3 +118,27 @@ jobs:
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.14.0
+
+      - name: Package and push Helm chart to OCI registry
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          CHART_VERSION="${VERSION#v}"
+          # Stamp Chart.yaml with the release version (runner-preinstalled
+          # mikefarah yq — do NOT pip-install the python jq-wrapper yq, its
+          # flags differ and it shadows the good one on PATH).
+          yq -i ".version = \"${CHART_VERSION}\"" charts/dispatch/Chart.yaml
+          yq -i ".appVersion = \"${CHART_VERSION}\"" charts/dispatch/Chart.yaml
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm dependency build charts/dispatch
+          helm package charts/dispatch --destination /tmp/charts
+          # Native OCI push (helm >= 3.8) — no chartmuseum plugin needed.
+          helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin <<< "${GH_TOKEN}"
+          helm push "/tmp/charts/dispatch-${CHART_VERSION}.tgz" oci://ghcr.io/misospace/charts
