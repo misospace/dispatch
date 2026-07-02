@@ -136,6 +136,7 @@ jobs:
           # flags differ and it shadows the good one on PATH).
           yq -i ".version = \"${CHART_VERSION}\"" charts/dispatch/Chart.yaml
           yq -i ".appVersion = \"${CHART_VERSION}\"" charts/dispatch/Chart.yaml
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
           helm dependency build charts/dispatch
           helm package charts/dispatch --destination /tmp/charts
           # Native OCI push (helm >= 3.8) — no chartmuseum plugin needed.
