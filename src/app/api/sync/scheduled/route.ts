@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchIssues, fetchIssue, fetchRepo, fetchWorkflows, fetchRecentRunsAllWorkflows, fetchReleases, fetchPullRequests, fetchLatestCommit, fetchPackages, fetchRunJobs } from "@/lib/github";
+import { fetchIssues, fetchIssue, syncStatusLabels, fetchRepo, fetchWorkflows, fetchRecentRunsAllWorkflows, fetchReleases, fetchPullRequests, fetchLatestCommit, fetchPackages, fetchRunJobs } from "@/lib/github";
 import { getSyncRepos, getTrackedRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, reconcileClosedIssues, SyncResponse, ClosedIssueReconcileResponse } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
@@ -73,7 +73,7 @@ export async function POST(request: Request) {
         async createIssue(repositoryId, data) {
           await prisma.issue.create({ data: { ...data, repositoryId } });
         },
-      }, excludedLabels);
+      }, excludedLabels, syncStatusLabels);
 
       // Reconcile closed issues with stale active statuses
       try {

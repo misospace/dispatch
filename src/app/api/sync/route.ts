@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { fetchIssues } from "@/lib/github";
+import { fetchIssues, syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, mergeLabels } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
@@ -73,7 +73,7 @@ export async function POST(request: NextRequest) {
         async createIssue(repositoryId, data) {
           await prisma.issue.create({ data: { ...data, repositoryId } });
         },
-      }, excludedLabels);
+      }, excludedLabels, syncStatusLabels);
 
       // Update the sync run record
       await prisma.issueSyncRun.updateMany({

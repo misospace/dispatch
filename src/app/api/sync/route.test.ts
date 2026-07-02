@@ -77,6 +77,7 @@ vi.mock("@/lib/config", () => ({
 
 vi.mock("@/lib/github", () => ({
   fetchIssues: vi.fn().mockResolvedValue([]),
+  syncStatusLabels: vi.fn(),
 }));
 
 vi.mock("@/lib/issue-sync", () => ({
