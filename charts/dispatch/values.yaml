@@ -1,97 +1,103 @@
-# Default values for dispatch.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
-
-image:
-  repository: ghcr.io/misospace/dispatch
-  pullPolicy: IfNotPresent
-  # tag defaults to .Chart.AppVersion when empty
-  tag: ""
-
-imagePullSecrets: []
-nameOverride: ""
-fullnameOverride: ""
-
-serviceAccount:
-  create: true
-  annotations: {}
-  name: ""
+# This chart is powered by the bjw-s common library (v5.0.1) and uses its
+# native values API — the same shape as an app-template HelmRelease:
+# https://bjw-s-labs.github.io/helm-charts/docs/common-library/
+#
+# Dispatch-specific extras live under `migrations:` (a pre-install/pre-upgrade
+# hook Job that runs `prisma migrate deploy` so pods never migrate — safe for
+# multiple replicas). Required Secret keys are documented in secret-contract.md.
+controllers:
+  main:
+    replicas: 1
+    containers:
+      main:
+        image:
+          # -- Image repository.
+          repository: ghcr.io/misospace/dispatch
+          # -- Image tag. Empty falls back to the chart appVersion.
+          tag: ""
+          # -- Image digest (sha256:...); takes precedence over tag when set.
+          digest: ""
+          pullPolicy: IfNotPresent
+        env:
+          # Migrations run in the hook Job (see `migrations:` below), never in
+          # the server pod — required for >1 replica.
+          SKIP_DB_MIGRATIONS: "true"
+          # -- dispatch configuration is plain env. Common keys (see the repo
+          # README for the full contract):
+          # DISPATCH_AUTH_MODE: basic          # basic|oidc|disabled
+          # DISPATCH_EXCLUDED_LABELS: renovate
+          # DISPATCH_LLM_BASE_URL: http://litellm:4000/v1
+          # DISPATCH_HOSTED_GROOMER_ENABLED: "true"
+          # DISPATCH_GROOMER_MODEL: vision
+          # DISPATCH_SCHEDULER_ENABLED: "true"
+          # DISPATCH_LANE_CONFIG_JSON: '{"lanes":[...]}'
+          # DATABASE_URL: from a secretKeyRef, e.g.:
+          #   valueFrom:
+          #     secretKeyRef:
+          #       name: dispatch-db
+          #       key: uri
+        envFrom:
+          # -- Secret carrying tokens (DISPATCH_AGENT_TOKEN, GitHub App creds,
+          # LLM API key). See secret-contract.md. The chart never creates it.
+          - secretRef:
+              name: dispatch
+        probes:
+          liveness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /
+                port: 3000
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 3
+          readiness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /
+                port: 3000
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
 
 service:
-  type: ClusterIP
-  port: 80
-  targetPort: 3000
+  main:
+    controller: main
+    ports:
+      http:
+        port: 3000
 
-# Structured configuration — rendered into env vars / DISPATCH_LANE_CONFIG_JSON
-config:
-  # Authentication mode: basic | oidc | disabled
-  authMode: basic
+# -- Gateway API HTTPRoute (optional). Same shape as app-template:
+# route:
+#   main:
+#     hostnames: ["dispatch.example.com"]
+#     parentRefs:
+#       - name: my-gateway
+#         namespace: network
+#     rules:
+#       - backendRefs:
+#           - identifier: main
+#             port: 3000
 
-  # Comma-separated list of labels to exclude from processing (e.g. "renovate")
-  excludedLabels:
-    - renovate
-
-  # LLM base URL for the groomer agent (empty = use default provider)
-  llmBaseUrl: ""
-
-  # Groomer configuration
-  groomer:
-    enabled: true
-    model: ""
-    dryRun: false
-    repoContext: true
-
-  # Scheduler configuration
-  scheduler:
-    enabled: true
-    intervals:
-      syncMs: 900000
-      groomerMs: 600000
-      prFollowupMs: 900000
-      pruneClosedMs: 86400000
-
-  # Lane configuration — rendered into DISPATCH_LANE_CONFIG_JSON
-  lanes:
-    - id: local
-      title: Local
-      claimable: true
-      role: default
-    - id: frontier
-      title: Frontier
-      claimable: true
-      role: escalation
-    - id: backlog
-      title: Backlog
-      claimable: false
-
-  # Lane aliases for backward compatibility (normal -> local, escalated -> frontier)
-  laneAliases:
-    normal: local
-    escalated: frontier
-
-# Existing Secret to mount via envFrom (must contain DISPATCH_AGENT_TOKEN, GITHUB_*, etc.)
-existingSecret: dispatch
-
-# Database configuration
-database:
-  # Existing Secret containing the database URL
-  existingSecret: ""
-  # Key within the secret that holds the connection string
-  key: uri
-
-# Migration hook Job — runs prisma migrate deploy before pod rollout
+# ── dispatch-specific (not part of the common library) ──────────────────────
 migrations:
+  # -- Run `prisma migrate deploy` as a pre-install/pre-upgrade hook Job.
+  # Disable only if migrations are handled elsewhere; the server pod always
+  # starts with SKIP_DB_MIGRATIONS=true regardless.
   enabled: true
-
-# Optional HTTPRoute (Gateway API) — off by default
-httpRoute:
-  enabled: false
-  hostnames: []
-  parentRefs: []
-
-# Escape hatch: arbitrary extra env vars merged last into the Deployment
-env: {}
-# Example:
-# env:
-#   NODE_ENV: production
-#   LOG_LEVEL: info
+  # -- Env for the migration Job (needs DATABASE_URL). Map form, same as
+  # container env above.
+  env: {}
+  # -- envFrom for the migration Job (e.g. the same Secret as the app).
+  envFrom:
+    - secretRef:
+        name: dispatch

@@ -18,6 +18,9 @@ jobs:
         with:
           version: v3.14.0
 
+      - name: Build chart dependencies
+        run: helm dependency build charts/dispatch
+
       - name: Lint chart
         run: helm lint charts/dispatch
 
@@ -27,41 +30,31 @@ jobs:
       - name: Template chart (custom values)
         run: |
           cat > /tmp/test-values.yaml <<'EOF'
-          config:
-            authMode: oidc
-            excludedLabels: [renovate, dependabot]
-            llmBaseUrl: https://api.openai.com/v1
-            groomer:
-              enabled: true
-              model: gpt-4o
-              dryRun: false
-              repoContext: true
-            scheduler:
-              enabled: true
-              intervals:
-                syncMs: 600000
-                groomerMs: 300000
-                prFollowupMs: 600000
-                pruneClosedMs: 43200000
-            lanes:
-              - id: triage
-                title: Triage
-                claimable: true
-                role: default
-              - id: in-progress
-                title: In Progress
-                claimable: true
-                role: escalation
-          database:
-            existingSecret: my-db-secret
-            key: connection-string
-          httpRoute:
-            enabled: true
-            hostnames:
-              - dispatch.example.com
-            parentRefs:
-              - name: my-gateway
-          env:
-            NODE_ENV: production
+          controllers:
+            main:
+              replicas: 2
+              containers:
+                main:
+                  env:
+                    DISPATCH_AUTH_MODE: oidc
+                    DISPATCH_EXCLUDED_LABELS: renovate
+                    DISPATCH_SCHEDULER_ENABLED: "true"
+          route:
+            main:
+              hostnames: ["dispatch.example.com"]
+              parentRefs:
+                - name: my-gateway
+                  namespace: network
+              rules:
+                - backendRefs:
+                    - identifier: main
+                      port: 3000
+          migrations:
+            env:
+              DATABASE_URL:
+                valueFrom:
+                  secretKeyRef:
+                    name: dispatch-db
+                    key: uri
           EOF
           helm template dispatch charts/dispatch --values /tmp/test-values.yaml

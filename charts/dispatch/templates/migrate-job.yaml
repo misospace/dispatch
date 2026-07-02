@@ -1,48 +1,50 @@
 {{- if .Values.migrations.enabled }}
+{{- $img := .Values.controllers.main.containers.main.image }}
+{{- $tag := $img.tag | default .Chart.AppVersion }}
+{{- $ref := printf "%s:%s" $img.repository $tag }}
+{{- if $img.digest }}
+{{- $ref = printf "%s@%s" $ref $img.digest }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "dispatch.fullname" . }}-migrate
+  name: {{ .Release.Name }}-migrate
   labels:
-    {{- include "dispatch.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: migrations
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-5"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
+  backoffLimit: 3
   template:
     metadata:
       labels:
-        {{- include "dispatch.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ .Chart.Name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: migrations
     spec:
       restartPolicy: Never
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      serviceAccountName: {{ include "dispatch.serviceAccountName" . }}
       containers:
         - name: migrate
-          image: "{{ .Values.image.repository }}:{{ include "dispatch.imageTag" . }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["npx", "prisma", "migrate", "deploy"]
-          envFrom:
-            {{- if .Values.existingSecret }}
-            - secretRef:
-                name: {{ .Values.existingSecret }}
-            {{- end }}
-            {{- if .Values.database.existingSecret }}
-            - secretRef:
-                name: {{ .Values.database.existingSecret }}
-            {{- end }}
+          image: {{ $ref }}
+          imagePullPolicy: {{ $img.pullPolicy }}
+          command: ["./node_modules/.bin/prisma", "migrate", "deploy"]
+          {{- with .Values.migrations.env }}
           env:
-            {{- if not .Values.database.existingSecret }}
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.existingSecret }}
-                  key: {{ .Values.database.key | default "uri" }}
+            {{- range $k, $v := . }}
+            - name: {{ $k }}
+              {{- if kindIs "map" $v }}
+              {{- toYaml $v | nindent 14 }}
+              {{- else }}
+              value: {{ $v | quote }}
+              {{- end }}
             {{- end }}
+          {{- end }}
+          {{- with .Values.migrations.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 {{- end }}

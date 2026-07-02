@@ -1,15 +1,10 @@
-Thank you for installing {{ .Chart.Name }}!
+{{ .Chart.Name }} {{ .Chart.AppVersion }} installed as {{ .Release.Name }}.
 
-Your release is named: {{ .Release.Name }}
+- Migrations ran via the pre-install/pre-upgrade hook Job (migrations.enabled={{ .Values.migrations.enabled }});
+  server pods start with SKIP_DB_MIGRATIONS=true and never migrate.
+- Values use the bjw-s common library API (same shape as app-template):
+  https://bjw-s-labs.github.io/helm-charts/docs/common-library/
+- Required Secret keys are documented in the chart's secret-contract.md.
 
-To get the application URL, run:
-  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "dispatch.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
-  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 3000:{{ .Values.service.targetPort | default 3000 }}
-
-Then visit http://localhost:3000 in your browser.
-
-Notes:
-- Migrations run via a pre-install/pre-upgrade hook Job (when migrations.enabled: true).
-- Pods start with SKIP_DB_MIGRATIONS=true and never run migrations themselves.
-- Ensure the Secret referenced by existingSecret exists before installing.
-  See templates/secret-contract.md for required keys.
+Port-forward:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }} 3000:3000
