@@ -6,6 +6,13 @@ import { syncIssuesForRepos, reconcileClosedIssues, SyncResponse, ClosedIssueRec
 import { authorizeRequest } from "@/lib/auth";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 
+// Sync must see closed issues, or closedIssueStatusFix never runs: the
+// closed=>done enforcement (#521) only applies to issues in the fetch set,
+// and the default fetch is state=open. Regressed to open-only when the
+// heartbeat cron (whose reconcile did its own closed fetch) was retired.
+const fetchAllStateIssues = (repoFullName: string) => fetchIssues(repoFullName, { includeClosed: true });
+
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
@@ -52,7 +59,7 @@ export async function POST(request: Request) {
     if (syncIssues) {
       const repos = await getSyncRepos();
       const excludedLabels = parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
-      issueSync = await syncIssuesForRepos(repos, fetchIssues, {
+      issueSync = await syncIssuesForRepos(repos, fetchAllStateIssues, {
         findIssue(repositoryId, number) {
           return prisma.issue.findUnique({
             where: { repositoryId_number: { repositoryId, number } },
