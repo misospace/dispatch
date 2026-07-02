@@ -26,6 +26,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+      packages: write
     steps:
       - name: Generate bot token
         id: app-token
@@ -126,7 +127,10 @@ jobs:
 
       - name: Package and push Helm chart to OCI registry
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # The Actions token (not the app token): GHCR package creation is
+          # scoped to the repo's own token — the app token 403s on the first
+          # push of a new package (ghcr.io/misospace/charts/dispatch).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
