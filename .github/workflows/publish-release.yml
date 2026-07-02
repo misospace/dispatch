@@ -124,24 +124,19 @@ jobs:
         with:
           version: v3.14.0
 
-      - name: Install helm-push plugin
-        run: helm plugin install https://github.com/chartmuseum/helm-push --version v0.10.4
-
       - name: Package and push Helm chart to OCI registry
         env:
-          HELM_PUSH_REGISTRY_CONFIG: /tmp/.docker/config.json
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           CHART_VERSION="${VERSION#v}"
-          # Stamp Chart.yaml with release version
-          pip install --user yq
+          # Stamp Chart.yaml with the release version (runner-preinstalled
+          # mikefarah yq — do NOT pip-install the python jq-wrapper yq, its
+          # flags differ and it shadows the good one on PATH).
           yq -i ".version = \"${CHART_VERSION}\"" charts/dispatch/Chart.yaml
           yq -i ".appVersion = \"${CHART_VERSION}\"" charts/dispatch/Chart.yaml
-          # Package the chart
           helm package charts/dispatch --destination /tmp/charts
-          # Login to GHCR
-          echo "{\"auths\":{\"ghcr.io\":{\"username\":\"${GITHUB_ACTOR}\",\"password\":\"${GH_TOKEN}\"}}}" > /tmp/.docker/config.json
-          # Push to OCI registry
+          # Native OCI push (helm >= 3.8) — no chartmuseum plugin needed.
+          helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin <<< "${GH_TOKEN}"
           helm push "/tmp/charts/dispatch-${CHART_VERSION}.tgz" oci://ghcr.io/misospace/charts
