@@ -1,4 +1,4 @@
-import type { GroomerOutput } from "./schema";
+import { ALLOWED_GROOMER_LABELS, type GroomerOutput } from "./schema";
 import { getConfiguredLanes, getClaimableLanes, getBacklogLane, getLaneIds } from "@/lib/lane-config";
 import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 
@@ -82,8 +82,10 @@ export function buildGroomerResponseSchema(): Record<string, unknown> {
     properties: {
       actionability: { type: "string", enum: ["ready", "needs_info", "blocked", "backlog", "already_done"] },
       confidence,
-      labelsToAdd: { type: "array", items: { type: "string" } },
-      labelsToRemove: { type: "array", items: { type: "string" } },
+      // Enum-constrained to the validator's allowlist so the model cannot
+      // invent labels (a 4B happily emits "type/refactor" otherwise).
+      labelsToAdd: { type: "array", items: { type: "string", enum: [...ALLOWED_GROOMER_LABELS] } },
+      labelsToRemove: { type: "array", items: { type: "string", enum: [...ALLOWED_GROOMER_LABELS] } },
       lane: {
         type: "object",
         additionalProperties: false,
@@ -102,8 +104,10 @@ export function buildGroomerResponseSchema(): Record<string, unknown> {
         type: "string",
         enum: ["promote_to_ready", "escalate", "mark_not_ready", "mark_needs_info", "mark_blocked"],
       },
-      proposedTitle: { type: "string" },
-      proposedBody: { type: "string" },
+      // The validator requires 10-200 chars (or omitted/null). Without the
+      // bounds in the grammar a small model emits "" instead of omitting.
+      proposedTitle: { anyOf: [{ type: "null" }, { type: "string", minLength: 10, maxLength: 200 }] },
+      proposedBody: { anyOf: [{ type: "null" }, { type: "string", maxLength: 9999 }] },
     },
   };
 }

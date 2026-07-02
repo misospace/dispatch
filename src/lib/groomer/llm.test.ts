@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { callGroomerLLM, buildGroomerResponseSchema } from "./llm";
+import { ALLOWED_GROOMER_LABELS } from "./schema";
 import { getLaneIds } from "@/lib/lane-config";
 
 describe("callGroomerLLM", () => {
@@ -197,6 +198,25 @@ describe("buildGroomerResponseSchema", () => {
     const laneId = schema.properties.lane.properties.id;
     expect(laneId.enum).toEqual(getLaneIds());
     expect(laneId.enum.length).toBeGreaterThan(0);
+  });
+
+  it("enum-constrains label arrays to the validator's allowlist", () => {
+    const schema = buildGroomerResponseSchema() as any;
+    expect(schema.properties.labelsToAdd.items.enum).toEqual([...ALLOWED_GROOMER_LABELS]);
+    expect(schema.properties.labelsToRemove.items.enum).toEqual([...ALLOWED_GROOMER_LABELS]);
+    // The exact failure seen in prod: a 4B inventing "type/refactor".
+    expect(schema.properties.labelsToAdd.items.enum).not.toContain("type/refactor");
+  });
+
+  it("bounds proposedTitle to the validator's 10-200 chars (or null)", () => {
+    const schema = buildGroomerResponseSchema() as any;
+    const title = schema.properties.proposedTitle;
+    expect(title.anyOf).toEqual([
+      { type: "null" },
+      { type: "string", minLength: 10, maxLength: 200 },
+    ]);
+    const body = schema.properties.proposedBody;
+    expect(body.anyOf).toEqual([{ type: "null" }, { type: "string", maxLength: 9999 }]);
   });
 });
 
