@@ -6,7 +6,10 @@ import { isValidRepoName } from "@/lib/config";
 import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
 import { authorizeRequest } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(request: Request) {
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   try {
     const repos = await prisma.automationRepo.findMany({
       orderBy: { fullName: "asc" },

@@ -4,6 +4,9 @@ import { isValidEscalatedOutcome, VALID_ESCALATED_OUTCOMES } from "@/types";
 import { authorizeRequest } from "@/lib/auth";
 
 export async function GET(request: Request) {
+  if (!(await authorizeRequest(request)).authorized) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   const { searchParams } = new URL(request.url);
   const limit = parseInt(searchParams.get("limit") || "50");
 
