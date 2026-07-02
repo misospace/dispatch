@@ -47,6 +47,9 @@ export interface SchedulerDeps {
 }
 
 const DEFAULT_SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15m
+const DEFAULT_GROOMER_INTERVAL_MS = 10 * 60 * 1000; // 10m
+const DEFAULT_PR_FOLLOWUP_INTERVAL_MS = 15 * 60 * 1000; // 15m
+const DEFAULT_PRUNE_CLOSED_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 const DEFAULT_STARTUP_DELAY_MS = 5 * 1000;
 
 function intFromEnv(raw: string | undefined, fallback: number): number {
@@ -55,25 +58,54 @@ function intFromEnv(raw: string | undefined, fallback: number): number {
 }
 
 /**
- * Build the scheduler config from the environment. Only the sync job is wired
- * today; groomer/pr-followup/prune-closed are added in follow-up issues (they
- * need their own concurrency guards first).
+ * Per-job interval: unset → fallback; explicit "0" → 0 (job disabled and
+ * filtered out); any other positive value overrides.
+ */
+function jobIntervalFromEnv(raw: string | undefined, fallback: number): number {
+  if (raw !== undefined && raw.trim() === "0") return 0;
+  return intFromEnv(raw, fallback);
+}
+
+/**
+ * Build the scheduler config from the environment. All periodic jobs run via
+ * loopback POSTs to the existing endpoints; each is authed with
+ * DISPATCH_AGENT_TOKEN (the groomer endpoint accepts it too) and can be
+ * disabled individually by setting its interval env to "0".
  */
 export function schedulerConfigFromEnv(env: Record<string, string | undefined>): SchedulerConfig {
   const port = env.PORT && env.PORT.trim() !== "" ? env.PORT.trim() : "3000";
+  const jobs: ScheduledJob[] = [
+    {
+      name: "sync",
+      path: "/api/sync/scheduled",
+      body: { issues: true },
+      intervalMs: jobIntervalFromEnv(env.DISPATCH_SYNC_INTERVAL_MS, DEFAULT_SYNC_INTERVAL_MS),
+    },
+    {
+      name: "groomer",
+      path: "/api/groomer/run",
+      body: {},
+      intervalMs: jobIntervalFromEnv(env.DISPATCH_GROOMER_INTERVAL_MS, DEFAULT_GROOMER_INTERVAL_MS),
+    },
+    {
+      name: "pr-followup",
+      path: "/api/pr-followup/sync",
+      body: {},
+      intervalMs: jobIntervalFromEnv(env.DISPATCH_PR_FOLLOWUP_INTERVAL_MS, DEFAULT_PR_FOLLOWUP_INTERVAL_MS),
+    },
+    {
+      name: "prune-closed",
+      path: "/api/issues/prune-closed",
+      body: {},
+      intervalMs: jobIntervalFromEnv(env.DISPATCH_PRUNE_CLOSED_INTERVAL_MS, DEFAULT_PRUNE_CLOSED_INTERVAL_MS),
+    },
+  ];
   return {
     enabled: env.DISPATCH_SCHEDULER_ENABLED === "true",
     baseUrl: `http://127.0.0.1:${port}`,
     token: env.DISPATCH_AGENT_TOKEN ?? "",
     startupDelayMs: intFromEnv(env.DISPATCH_SCHEDULER_STARTUP_DELAY_MS, DEFAULT_STARTUP_DELAY_MS),
-    jobs: [
-      {
-        name: "sync",
-        path: "/api/sync/scheduled",
-        body: { issues: true },
-        intervalMs: intFromEnv(env.DISPATCH_SYNC_INTERVAL_MS, DEFAULT_SYNC_INTERVAL_MS),
-      },
-    ],
+    jobs: jobs.filter((job) => job.intervalMs > 0),
   };
 }
 

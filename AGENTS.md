@@ -41,8 +41,11 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
 | `NEXTAUTH_SECRET` | No | NextAuth.js secret |
 | `NEXTAUTH_URL` | No | NextAuth.js URL |
-| `DISPATCH_SCHEDULER_ENABLED` | No | `true` runs periodic jobs (issue sync) in-process instead of via external cronjobs. Off by default. Confine to a single replica. |
-| `DISPATCH_SYNC_INTERVAL_MS` | No | Scheduled-sync interval when the in-app scheduler is enabled (default 900000 = 15m) |
+| `DISPATCH_SCHEDULER_ENABLED` | No | `true` runs periodic jobs (sync, groomer, PR-followup, prune-closed) in-process instead of via external cronjobs. Off by default. Confine to a single replica. |
+| `DISPATCH_SYNC_INTERVAL_MS` | No | Scheduled-sync interval when the scheduler is enabled (default 900000 = 15m; `0` disables the job) |
+| `DISPATCH_GROOMER_INTERVAL_MS` | No | Groomer run interval (default 600000 = 10m; `0` disables) |
+| `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | PR-followup sync interval (default 900000 = 15m; `0` disables) |
+| `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Closed-issue prune interval (default 86400000 = 24h; `0` disables) |
 
 Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` for agent API bearer auth.
 
