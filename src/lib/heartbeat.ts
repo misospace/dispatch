@@ -9,12 +9,19 @@ import { prisma } from "@/lib/prisma";
 import { fetchIssues, syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import {
+
   syncIssuesForRepos,
   mergeLabels,
   reconcileClosedIssues,
   type SyncedIssueData,
   type ClosedIssueReconcileResponse,
 } from "@/lib/issue-sync";
+
+// Sync must see closed issues, or closedIssueStatusFix never runs: the
+// closed=>done enforcement (#521) only applies to issues in the fetch set,
+// and the default fetch is state=open. Regressed to open-only when the
+// heartbeat cron (whose reconcile did its own closed fetch) was retired.
+const fetchAllStateIssues = (repoFullName: string) => fetchIssues(repoFullName, { includeClosed: true });
 
 // ---------------------------------------------------------------------------
 // Sync orchestration
@@ -54,7 +61,7 @@ export async function runSyncBestEffort(
 
     const excludedLabels = opts?.excludedLabels ?? parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
 
-    const result = await syncIssuesForRepos(repos, fetchIssues, {
+    const result = await syncIssuesForRepos(repos, fetchAllStateIssues, {
       findIssue(repositoryId: string, number: number) {
         return prisma.issue.findUnique({
           where: { repositoryId_number: { repositoryId, number } },
