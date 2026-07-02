@@ -1,10 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addIssueComment,
+  addIssueLabel,
+  closeIssue,
+  fetchIssue,
+  fetchIssueComments,
+  fetchIssues,
+  fetchLinkedPrHealthInput,
   fetchPaginated,
+  fetchPullRequestCheckFailures,
+  fetchPullRequestHealthSignals,
   fetchRepositoryMetadata,
+  removeIssueLabel,
   searchRepositoryCode,
   fetchRepositoryFileText,
+  syncStatusLabels,
+  updateIssueLabels,
+  updateIssueTitleAndBody,
+  validateGitHubToken,
+  type GithubPR,
 } from "./github";
 
 process.env.GITHUB_TOKEN = "test-token-for-pagination-tests";
@@ -376,5 +390,417 @@ describe("addIssueComment", () => {
     } as Response);
 
     await expect(addIssueComment("org/repo", 1, "test")).rejects.toThrow("GitHub API error adding comment");
+  });
+});
+
+// Shorthand for a JSON-body OK response (fetchPaginated is not involved).
+function ok(data: unknown): Response {
+  return { ok: true, json: () => Promise.resolve(data) } as Response;
+}
+
+function httpError(status: number, text = "boom"): Response {
+  return { ok: false, status, text: () => Promise.resolve(text) } as Response;
+}
+
+describe("fetchIssues", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("filters out pull requests (GitHub returns PRs on the issues endpoint)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      makeResponse([
+        { number: 1, title: "a real issue" },
+        { number: 2, title: "a PR", pull_request: { url: "https://api.github.com/pulls/2" } },
+        { number: 3, title: "another issue" },
+      ]),
+    );
+
+    const result = await fetchIssues("org/repo");
+
+    expect(result.map((i) => i.number)).toEqual([1, 3]);
+  });
+
+  it("requests state=open by default and state=all when includeClosed", async () => {
+    fetchMock.mockResolvedValue(makeResponse([]));
+
+    await fetchIssues("org/repo");
+    expect(fetchMock.mock.calls[0][0]).toContain("state=open");
+
+    await fetchIssues("org/repo", { includeClosed: true });
+    expect(fetchMock.mock.calls[1][0]).toContain("state=all");
+  });
+});
+
+describe("fetchIssue", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns the issue on success", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ number: 42, title: "hello" }));
+
+    const result = await fetchIssue("org/repo", 42);
+
+    expect(result).toMatchObject({ number: 42, title: "hello" });
+  });
+
+  it("throws when the number is a pull request", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ number: 42, pull_request: { url: "x" } }));
+
+    await expect(fetchIssue("org/repo", 42)).rejects.toThrow("#42 is a pull request, not an issue");
+  });
+
+  it("throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(404, "Not Found"));
+
+    await expect(fetchIssue("org/repo", 42)).rejects.toThrow("GitHub API error for org/repo#42: 404");
+  });
+});
+
+describe("fetchIssueComments", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("clamps per_page into [1, 100]", async () => {
+    fetchMock.mockResolvedValue(ok([]));
+
+    await fetchIssueComments("org/repo", 1, 500);
+    expect(fetchMock.mock.calls[0][0]).toContain("per_page=100");
+  });
+
+  it("slices the response down to maxComments", async () => {
+    const comments = Array.from({ length: 10 }, (_, i) => ({ body: `c${i}` }));
+    fetchMock.mockResolvedValueOnce(ok(comments));
+
+    const result = await fetchIssueComments("org/repo", 1, 3);
+
+    expect(result).toHaveLength(3);
+  });
+
+  it("throws when the payload is not an array", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ message: "nope" }));
+
+    await expect(fetchIssueComments("org/repo", 1)).rejects.toThrow("expected comments array");
+  });
+
+  it("throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(500));
+
+    await expect(fetchIssueComments("org/repo", 1)).rejects.toThrow("comments: 500");
+  });
+});
+
+describe("issue mutations", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("updateIssueLabels PUTs the full label set", async () => {
+    fetchMock.mockResolvedValueOnce(ok({}));
+
+    await updateIssueLabels("org/repo", 5, ["status/done", "type/bug"]);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/repos/org/repo/issues/5/labels");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ labels: ["status/done", "type/bug"] });
+  });
+
+  it("addIssueLabel POSTs a single-label array", async () => {
+    fetchMock.mockResolvedValueOnce(ok({}));
+
+    await addIssueLabel("org/repo", 5, "status/done");
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ labels: ["status/done"] });
+  });
+
+  it("updateIssueTitleAndBody PATCHes only the provided fields", async () => {
+    fetchMock.mockResolvedValueOnce(ok({}));
+
+    await updateIssueTitleAndBody("org/repo", 5, { title: "new title" });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ title: "new title" });
+  });
+
+  it("closeIssue PATCHes state=closed", async () => {
+    fetchMock.mockResolvedValueOnce(ok({}));
+
+    await closeIssue("org/repo", 5);
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ state: "closed" });
+  });
+
+  it("removeIssueLabel DELETEs the url-encoded label", async () => {
+    fetchMock.mockResolvedValueOnce(ok({}));
+
+    await removeIssueLabel("org/repo", 5, "status/in progress");
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(init.method).toBe("DELETE");
+    expect(url).toContain("/labels/status%2Fin%20progress");
+  });
+
+  it("removeIssueLabel tolerates a 404 (label already absent)", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(404, "Label does not exist"));
+
+    await expect(removeIssueLabel("org/repo", 5, "gone")).resolves.toBeUndefined();
+  });
+
+  it("removeIssueLabel still throws on non-404 errors", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(500));
+
+    await expect(removeIssueLabel("org/repo", 5, "x")).rejects.toThrow("GitHub API error: 500");
+  });
+});
+
+describe("syncStatusLabels", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("removes then adds, in that order", async () => {
+    fetchMock.mockResolvedValue(ok({}));
+
+    await syncStatusLabels("org/repo", 5, ["status/done"], ["status/backlog", "status/in-progress"]);
+
+    const methods = fetchMock.mock.calls.map((c) => c[1].method);
+    // Two DELETEs (removes) precede the single POST (add).
+    expect(methods).toEqual(["DELETE", "DELETE", "POST"]);
+  });
+
+  it("is a no-op when both lists are empty", async () => {
+    await syncStatusLabels("org/repo", 5, [], []);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("validateGitHubToken", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns true when /user responds ok", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ login: "me" }));
+    expect(await validateGitHubToken()).toBe(true);
+  });
+
+  it("returns false when /user is not ok", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(401, "Bad credentials"));
+    expect(await validateGitHubToken()).toBe(false);
+  });
+
+  it("returns false when the request throws", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+    expect(await validateGitHubToken()).toBe(false);
+  });
+});
+
+describe("fetchPullRequestHealthSignals", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  // Call order: [0] PR detail GET, [1] reviews (via fetchPaginated).
+  function mockDetailThenReviews(detail: Response, reviews: unknown[]) {
+    fetchMock.mockResolvedValueOnce(detail).mockResolvedValueOnce(makeResponse(reviews));
+  }
+
+  it("returns merge state and the derived review decision", async () => {
+    mockDetailThenReviews(ok({ mergeable_state: "clean" }), [
+      { user: { login: "alice" }, state: "APPROVED", submitted_at: "2026-01-01T00:00:00Z" },
+    ]);
+
+    expect(await fetchPullRequestHealthSignals("org/repo", 7)).toEqual({
+      reviewDecision: "APPROVED",
+      mergeStateStatus: "clean",
+    });
+  });
+
+  it("lets an outstanding CHANGES_REQUESTED win over another reviewer's APPROVED", async () => {
+    mockDetailThenReviews(ok({ mergeable_state: "blocked" }), [
+      { user: { login: "alice" }, state: "APPROVED", submitted_at: "2026-01-01T00:00:00Z" },
+      { user: { login: "bob" }, state: "CHANGES_REQUESTED", submitted_at: "2026-01-02T00:00:00Z" },
+    ]);
+
+    expect((await fetchPullRequestHealthSignals("org/repo", 7)).reviewDecision).toBe("CHANGES_REQUESTED");
+  });
+
+  it("uses only each reviewer's latest review", async () => {
+    mockDetailThenReviews(ok({ mergeable_state: "clean" }), [
+      { user: { login: "alice" }, state: "CHANGES_REQUESTED", submitted_at: "2026-01-01T00:00:00Z" },
+      { user: { login: "alice" }, state: "APPROVED", submitted_at: "2026-01-02T00:00:00Z" },
+    ]);
+
+    expect((await fetchPullRequestHealthSignals("org/repo", 7)).reviewDecision).toBe("APPROVED");
+  });
+
+  it("ignores COMMENTED reviews (no approval signal)", async () => {
+    mockDetailThenReviews(ok({ mergeable_state: "clean" }), [
+      { user: { login: "alice" }, state: "COMMENTED", submitted_at: "2026-01-01T00:00:00Z" },
+    ]);
+
+    expect((await fetchPullRequestHealthSignals("org/repo", 7)).reviewDecision).toBeNull();
+  });
+
+  it("degrades to null merge state when the detail GET is not ok", async () => {
+    mockDetailThenReviews(httpError(500), [
+      { user: { login: "alice" }, state: "APPROVED", submitted_at: "2026-01-01T00:00:00Z" },
+    ]);
+
+    expect(await fetchPullRequestHealthSignals("org/repo", 7)).toEqual({
+      reviewDecision: "APPROVED",
+      mergeStateStatus: null,
+    });
+  });
+});
+
+describe("fetchPullRequestCheckFailures", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  it("returns only completed runs with a failure-type conclusion", async () => {
+    fetchMock.mockResolvedValueOnce(
+      ok({
+        check_runs: [
+          { name: "lint", conclusion: "failure" },
+          { name: "unit", conclusion: "success" },
+          { name: "build", conclusion: "timed_out" },
+          { name: "pending", conclusion: null },
+        ],
+      }),
+    );
+
+    const result = await fetchPullRequestCheckFailures("org/repo", "main");
+
+    expect(result).toEqual([
+      { name: "lint", conclusion: "failure" },
+      { name: "build", conclusion: "timed_out" },
+    ]);
+  });
+
+  it("url-encodes the ref", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ check_runs: [] }));
+
+    await fetchPullRequestCheckFailures("org/repo", "feature/x");
+
+    expect(fetchMock.mock.calls[0][0]).toContain("/commits/feature%2Fx/check-runs");
+  });
+
+  it("returns [] on a non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(403));
+    expect(await fetchPullRequestCheckFailures("org/repo", "main")).toEqual([]);
+  });
+
+  it("returns [] when the request throws", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+    expect(await fetchPullRequestCheckFailures("org/repo", "main")).toEqual([]);
+  });
+});
+
+describe("fetchLinkedPrHealthInput", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  // fetchLinkedPrHealthInput fans out signals + check failures via Promise.all,
+  // so the fetch order is not deterministic — route by URL instead of sequence.
+  function routeByUrl(opts: { mergeableState?: string; reviews?: unknown[]; checkRuns?: unknown[] }) {
+    const { mergeableState = "clean", reviews = [], checkRuns = [] } = opts;
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes("/reviews")) return Promise.resolve(makeResponse(reviews));
+      if (url.includes("/check-runs")) return Promise.resolve(ok({ check_runs: checkRuns }));
+      return Promise.resolve(ok({ mergeable_state: mergeableState }));
+    });
+  }
+
+  function pr(overrides: Partial<GithubPR>): GithubPR {
+    return {
+      number: 7,
+      url: "https://github.com/org/repo/pull/7",
+      title: "t",
+      state: "open",
+      user: { login: "alice" },
+      head: { ref: "feature" },
+      base: { ref: "main" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      merged_at: null,
+      draft: false,
+      ...overrides,
+    };
+  }
+
+  it("maps merged_at to state 'merged'", async () => {
+    routeByUrl({});
+    const result = await fetchLinkedPrHealthInput("org/repo", pr({ state: "closed", merged_at: "2026-01-02T00:00:00Z" }));
+    expect(result.state).toBe("merged");
+  });
+
+  it("maps closed-and-unmerged to state 'closed'", async () => {
+    routeByUrl({});
+    const result = await fetchLinkedPrHealthInput("org/repo", pr({ state: "closed", merged_at: null }));
+    expect(result.state).toBe("closed");
+  });
+
+  it("maps an open PR to state 'open'", async () => {
+    routeByUrl({});
+    const result = await fetchLinkedPrHealthInput("org/repo", pr({ state: "open" }));
+    expect(result.state).toBe("open");
+  });
+
+  it("assembles review decision, merge state, and check failures", async () => {
+    routeByUrl({
+      mergeableState: "dirty",
+      reviews: [{ user: { login: "bob" }, state: "CHANGES_REQUESTED", submitted_at: "2026-01-02T00:00:00Z" }],
+      checkRuns: [{ name: "lint", conclusion: "failure" }],
+    });
+
+    const result = await fetchLinkedPrHealthInput("org/repo", pr({}));
+
+    expect(result).toMatchObject({
+      number: 7,
+      state: "open",
+      draft: false,
+      mergeStateStatus: "dirty",
+      reviewDecision: "CHANGES_REQUESTED",
+      checkFailures: [{ name: "lint", conclusion: "failure" }],
+    });
   });
 });
