@@ -61,7 +61,7 @@
     "vitest": "^4.1.8"
   },
   "//": {
-    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory) and @hono/node-server ^2.0.0 (middleware-bypass advisory). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
+    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory) and @hono/node-server ^2.0.0 (middleware-bypass advisory, Prisma transitive dependency — can be removed once Prisma upgrades to include the patched version). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
   },
   "overrides": {
     "postcss": "^8.5.10",
