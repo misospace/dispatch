@@ -58,6 +58,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
 
   const baseUrl = process.env.DISPATCH_LLM_BASE_URL?.trim() || null;
   const apiKey = process.env.DISPATCH_LLM_API_KEY?.trim() || null;
+  const model = process.env.DISPATCH_GROOMER_MODEL?.trim() || "";
 
   if (!baseUrl) {
     throw new Error("DISPATCH_HOSTED_GROOMER_ENABLED requires DISPATCH_LLM_BASE_URL");
@@ -65,13 +66,16 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
   if (!apiKey) {
     throw new Error("DISPATCH_HOSTED_GROOMER_ENABLED requires DISPATCH_LLM_API_KEY");
   }
+  if (!model) {
+    throw new Error("DISPATCH_HOSTED_GROOMER_ENABLED requires DISPATCH_GROOMER_MODEL");
+  }
 
   const config = {
     enabled: true,
     dryRun: parseBool(process.env.DISPATCH_GROOMER_DRY_RUN, true),
     llmBaseUrl: baseUrl,
     apiKey,
-    model: process.env.DISPATCH_GROOMER_MODEL?.trim() || "gpt-4o-mini",
+    model,
     timeoutMs: 0, // computed below after maxContextBytes is resolved
     maxContextBytes: process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES ? parseInt(process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES, 10) : 8192,
     repoContextEnabled: parseBool(process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED, false),

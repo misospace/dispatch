@@ -103,12 +103,11 @@ describe("groomer config", () => {
     expect(config.model).toBe("gpt-4o-mini");
   });
 
-  it("defaults model to gpt-4o-mini when not set", () => {
+  it("throws when enabled but missing model", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
-    const config = getHostedGroomerConfig();
-    expect(config.model).toBe("gpt-4o-mini");
+    expect(() => getHostedGroomerConfig()).toThrow(/model/i);
   });
 
   it("reads timeoutMs from env", () => {
