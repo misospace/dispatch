@@ -276,10 +276,13 @@ async function executeGroomerRun(
       appliedMutations.bodyUpdated = titleBodyMutations.shouldEnrich;
     }
 
-    // Comment with cooldown enforcement
+    // Comment with cooldown enforcement. Posting the rationale comment is
+    // non-essential: the labels/lane/status mutations above are what actually
+    // matter, so a comment failure (e.g. a transient GitHub 504) must not
+    // fail the whole run and turn this candidate into a poison pill.
     if (output.githubComment?.trim()) {
       let commentPosted = false;
-      let commentUrl: string | null = null;
+      let skipCommentPost = false;
 
       // Check cooldown unless force or cooldown disabled
       const shouldCheckCooldown = !options.force && config.commentCooldownHours > 0;
@@ -294,25 +297,31 @@ async function executeGroomerRun(
         });
         if (recentComment) {
           appliedMutations.commentSkippedReason = "cooldown";
-        } else {
-          const result = await deps.addComment(
-            candidate.repoFullName,
-            candidate.number,
-            output.githubComment.trim().slice(0, MAX_GITHUB_COMMENT_CHARS),
-          );
-          commentUrl = result.url ?? null;
+          skipCommentPost = true;
+        }
+      }
+
+      if (!skipCommentPost) {
+        const commentBody = output.githubComment.trim().slice(0, MAX_GITHUB_COMMENT_CHARS);
+        try {
+          let result;
+          try {
+            result = await deps.addComment(candidate.repoFullName, candidate.number, commentBody);
+          } catch {
+            // One best-effort retry before giving up on transient errors (e.g. 504s).
+            result = await deps.addComment(candidate.repoFullName, candidate.number, commentBody);
+          }
+          const commentUrl = result.url ?? null;
           if (commentUrl) appliedMutations.commentUrl = commentUrl;
           commentPosted = true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown error adding comment";
+          console.error(
+            `[groomer] failed to post comment on ${candidate.repoFullName}#${candidate.number}, continuing without it:`,
+            error,
+          );
+          appliedMutations.commentError = message;
         }
-      } else {
-        const result = await deps.addComment(
-          candidate.repoFullName,
-          candidate.number,
-          output.githubComment.trim().slice(0, MAX_GITHUB_COMMENT_CHARS),
-        );
-        commentUrl = result.url ?? null;
-        if (commentUrl) appliedMutations.commentUrl = commentUrl;
-        commentPosted = true;
       }
 
       if (!commentPosted && !("commentSkippedReason" in appliedMutations)) {
