@@ -58,7 +58,12 @@ Body enrichment rules:
 - If the body already has substantial content, omit proposedBody
 - The enriched body should add structure: brief context, what's known, suggested approach based on labels/body/comments
 - Do NOT clobber existing body content — if there's any meaningful body, append rather than replace; if empty/missing, create from scratch
-- Keep enriched body under 10000 characters`;
+- Keep enriched body under 10000 characters
+
+Comment rules:
+- githubComment is posted verbatim to GitHub and any @username token will be auto-linkified into a live mention that notifies that account — NEVER include @username mentions in githubComment
+- Address roles in plain words (e.g. "the reviewer", "the assignee", "maintainers") instead of using @-mentions
+- If quoting code, identifiers, or example usernames, wrap them in backticks so GitHub does not linkify them`;
 }
 
 const CONFIDENCE_ENUM = ["high", "medium", "low"] as const;
