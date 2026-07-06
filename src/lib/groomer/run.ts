@@ -10,6 +10,7 @@ import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
+import { neutralizeMentions } from "./sanitize";
 
 export interface GroomerRunResult {
   candidateNumber: number;
@@ -302,7 +303,7 @@ async function executeGroomerRun(
       }
 
       if (!skipCommentPost) {
-        const commentBody = output.githubComment.trim().slice(0, MAX_GITHUB_COMMENT_CHARS);
+        const commentBody = neutralizeMentions(output.githubComment.trim()).slice(0, MAX_GITHUB_COMMENT_CHARS);
         try {
           let result;
           try {
