@@ -337,6 +337,24 @@ describe("runHostedGroomer", () => {
     expect(result!.appliedMutations?.commentUrl).toBe("https://github.com/org/repo/issues/42#issuecomment-123");
   });
 
+  it("write mode neutralizes @-mentions in posted comment", async () => {
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: {
+        ...mockOutput,
+        githubComment: "@reviewer This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
+      },
+    });
+
+    await runHostedGroomer();
+
+    expect(mocks.addIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      "`@reviewer` This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
+    );
+  });
+
   it("failure after groomingRun creation completes run as failed", async () => {
     mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
 
