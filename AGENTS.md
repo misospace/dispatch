@@ -143,26 +143,54 @@ For control actions (rerun, dispatch):
 ```
 src/
   app/
-    api/           # API routes
-      automation/  # Automation sync, runs, workflows, events
-      agent-runs/  # Agent run ingestion
-      issues/       # Issue listing, movement, and lane classification
-      repos/       # Repository config
-      sync/        # Issue sync
-      audit/       # Audit log
-      health/      # Health check endpoint
-      pr-fix-queue/ # PR review-fix queue (enqueue, queued, mark)
-      pr-followup/  # PR follow-up ingestion (sync, webhook)
-    automation/    # Automation UI pages
-    board/         # Kanban board
-    projects/      # Project view
-    agents/        # Agent activity page
+    api/
+      agents/[agentName]/   # next-task, tasks/report, queue, heartbeat, active-work
+      agent-work/           # start, checkpoint, finish, operator release
+      agent-runs/           # legacy run ingestion
+      audit/                # audit log read
+      automation/           # sync, runs, workflows, events, repos
+      health/               # health check
+      issues/               # listing, move, claim, unclaim, unassign, status, groom, lane, actions, reconcile, refresh, prune-closed, untriaged
+      pr-fix-queue/         # enqueue, queued, mark
+      pr-followup/          # sync, webhook
+      repos/                # repository config
+      sync/                 # issue sync (+ scheduled)
+    automation/             # automation UI
+    board/                  # Kanban board (page.tsx server, kanban-board-client.tsx client)
+    projects/               # project view
+    agents/                 # agent activity page
+  components/
+    kanban-board.tsx        # board DnD context, auto-refresh, move logic
+    issue-card.tsx          # card + ⋮ assignment/groom dropdown
+    kanban-column.tsx       # droppable column
+    filter-bar.tsx          # board filters
   lib/
-    prisma.ts      # Prisma client singleton
-    github.ts      # GitHub API helpers
-    pr-fix-queue.ts       # PR fix queue client and utilities
-    pr-followup-ingestion.ts  # PR follow-up event ingestion
+    prisma.ts               # Prisma client singleton
+    github.ts               # GitHub label/comment API helpers
+    auth.ts                 # authorizeRequest, getAuthorizedActor (bearer/basic/oidc)
+    lease.ts                # Lease TTL, upsert, release, resolveActiveWork
+    agent-work.ts           # AgentWork start/checkpoint/finish, stale recovery
+    assignment-conflicts.ts # label conflict analysis (agent/owner add/remove)
+    kanban.ts               # getIssuesByStatus, getIssueStatus
+    client-auth.ts          # authedFetch (browser → API, session-aware)
+    version.ts              # version label for header
+  types/index.ts            # Issue, StatusLabel, BOARD_COLUMNS, label helpers
 ```
+
+### Subsystem Map
+
+Cross-cutting concerns and where they live. Read these first when working in that area.
+
+| Concern | Files |
+|---|---|
+| Issue status movement (board drag) | `components/kanban-board.tsx` (client move), `app/api/issues/move/route.ts` |
+| Agent claim / unclaim (lease + status) | `app/api/issues/claim/route.ts`, `app/api/issues/unclaim/route.ts`, `lib/lease.ts` |
+| Assign / unassign (label-only, no lease) | `app/api/issues/actions/route.ts`, `app/api/issues/unassign/route.ts`, `lib/assignment-conflicts.ts` |
+| AgentWork lifecycle | `app/api/agent-work/route.ts`, `app/api/agent-work/{start,checkpoint,finish}/route.ts`, `lib/agent-work.ts` |
+| Auth & audit actor identity | `lib/auth.ts` (`authorizeRequest`, `getAuthorizedActor`) |
+| Board UI component tree | `app/board/page.tsx` → `kanban-board-client.tsx` → `components/kanban-board.tsx` → `components/issue-card.tsx` |
+| App shell / header / nav | `app/layout.tsx` |
+| Label & status constants | `types/index.ts` (`BOARD_COLUMNS`, `StatusLabel`, `AGENT_PREFIX`, `OWNER_PREFIX`) |
 
 ## Health Endpoint
 
