@@ -29,6 +29,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     const config = getHostedGroomerConfig();
     expect(config.enabled).toBe(true);
     expect(config.dryRun).toBe(true);
@@ -38,6 +39,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     const config = getHostedGroomerConfig();
     expect(config.enabled).toBe(true);
   });
@@ -64,6 +66,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_DRY_RUN = "false";
     const config = getHostedGroomerConfig();
     expect(config.dryRun).toBe(false);
@@ -73,6 +76,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_DRY_RUN = "true";
     const config = getHostedGroomerConfig();
     expect(config.dryRun).toBe(true);
@@ -82,6 +86,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://custom.llm/api";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     const config = getHostedGroomerConfig();
     expect(config.llmBaseUrl).toBe("https://custom.llm/api");
   });
@@ -90,6 +95,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "sk-custom-key-123";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     const config = getHostedGroomerConfig();
     expect(config.apiKey).toBe("sk-custom-key-123");
   });
@@ -114,6 +120,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_TIMEOUT_MS = "30000";
     const config = getHostedGroomerConfig();
     expect(config.timeoutMs).toBe(30000);
@@ -123,6 +130,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "16384";
     // Without override, 16KB would yield 140000. Override to 45000 should win.
     process.env.DISPATCH_GROOMER_TIMEOUT_MS = "45000";
@@ -134,6 +142,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     // default maxContextBytes = 8192 → ceil(8)*5000 + 60000 = 100000
     const config = getHostedGroomerConfig();
     expect(config.timeoutMs).toBe(100_000);
@@ -143,6 +152,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "2048";
     // ceil(2048/1024)*5000 + 60000 = 70000, above floor so no clamp needed
     const config = getHostedGroomerConfig();
@@ -153,6 +163,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "16384";
     // ceil(16)*5000 + 60000 = 140000
     const config = getHostedGroomerConfig();
@@ -163,6 +174,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "65536";
     // ceil(64)*5000 + 60000 = 380000 → clamped to 300000
     const config = getHostedGroomerConfig();
@@ -173,15 +185,17 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
-    process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "4096";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES = "16384";
     const config = getHostedGroomerConfig();
-    expect(config.maxContextBytes).toBe(4096);
+    expect(config.maxContextBytes).toBe(16384);
   });
 
   it("defaults maxContextBytes to 8192 when not set", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     const config = getHostedGroomerConfig();
     expect(config.maxContextBytes).toBe(8192);
   });
@@ -207,6 +221,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     const config = getHostedGroomerConfig();
     expect(config.repoContextEnabled).toBe(false);
     expect(config.maxContextFiles).toBe(5);
@@ -220,6 +235,7 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
     process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
     process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
     process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED = "true";
     process.env.DISPATCH_GROOMER_MAX_CONTEXT_FILES = "2";
     process.env.DISPATCH_GROOMER_MAX_SEARCHES = "1";
