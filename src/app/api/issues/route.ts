@@ -12,6 +12,7 @@ import {
 } from "@/lib/issue-filters";
 import { parseExcludedLabels } from "@/lib/config";
 import { isValidLane, getLaneIds, resolveRequestLane, getLaneAliases } from "@/lib/lane-config";
+import { STATUS_LABELS } from "@/types";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
@@ -27,6 +28,7 @@ export async function GET(request: Request) {
   const lane = searchParams.get("lane");
   const decomposed = searchParams.get("decomposed");
   const untriaged = searchParams.get("untriaged");
+  const status = searchParams.get("status");
   const includeClosed = searchParams.get("includeClosed");
 
   try {
@@ -75,6 +77,17 @@ export async function GET(request: Request) {
         }
       }
       where.currentLane = { in: Array.from(matchingLanes) };
+    }
+
+    // Filter by status label (e.g. status/in-progress, status/ready)
+    if (status) {
+      if (!(STATUS_LABELS as readonly string[]).includes(`status/${status}`)) {
+        return NextResponse.json(
+          { error: `Invalid status: ${status}` },
+          { status: 400 },
+        );
+      }
+      appendIssueWhere(where, { labels: { has: `status/${status}` } });
     }
 
     const issues = await prisma.issue.findMany({

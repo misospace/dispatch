@@ -161,6 +161,54 @@ describe("GET /api/issues — visible issue filtering", () => {
     expect(call.where.labels).toEqual({ has: "project/api" });
   });
 
+  it("filters by status label (in-progress)", async () => {
+    await makeRequest("http://localhost/api/issues?status=in-progress");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    const andClauses = Array.isArray(call.where.AND) ? call.where.AND : [call.where.AND];
+    const labelsClause = andClauses.find(
+      (clause: Record<string, unknown>) =>
+        clause && typeof clause === "object" && "labels" in clause,
+    );
+    expect(labelsClause).toEqual({ labels: { has: "status/in-progress" } });
+  });
+
+  it("filters by status label (ready)", async () => {
+    await makeRequest("http://localhost/api/issues?status=ready");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    const andClauses = Array.isArray(call.where.AND) ? call.where.AND : [call.where.AND];
+    const labelsClause = andClauses.find(
+      (clause: Record<string, unknown>) =>
+        clause && typeof clause === "object" && "labels" in clause,
+    );
+    expect(labelsClause).toEqual({ labels: { has: "status/ready" } });
+  });
+
+  it("returns 400 for unknown status value", async () => {
+    const res = await makeRequest("http://localhost/api/issues?status=not-a-real-status");
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("Invalid status: not-a-real-status");
+    expect(mocks.findManyIssues).not.toHaveBeenCalled();
+  });
+
+  it("does not add status label filter when status param is absent", async () => {
+    await makeRequest("http://localhost/api/issues");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    const andClauses = call.where.AND ? (Array.isArray(call.where.AND) ? call.where.AND : [call.where.AND]) : [];
+    for (const clause of andClauses) {
+      if (clause && typeof clause === "object" && "labels" in clause) {
+        const labels = (clause as { labels: { has?: string } }).labels;
+        if (typeof labels?.has === "string" && labels.has.startsWith("status/")) {
+          throw new Error(`unexpected status label filter: ${labels.has}`);
+        }
+      }
+    }
+  });
+
   it("filters by decomposed status", async () => {
     await makeRequest("http://localhost/api/issues?decomposed=true");
 
