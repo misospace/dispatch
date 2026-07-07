@@ -3,6 +3,10 @@ import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, updateIssueLabels } from "@/lib/github";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import {
+  releaseLeaseByAgentAndIssue,
+  releaseAgentWorkByAgentAndIssue,
+} from "@/lib/lease";
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
@@ -37,7 +41,6 @@ export async function POST(request: Request) {
     // Fetch the issue from the local database to get current labels
     const issue = await prisma.issue.findUnique({
       where: { id: issueId as string },
-      include: { repository: true },
     });
 
     if (!issue) {
@@ -68,23 +71,22 @@ export async function POST(request: Request) {
       // Compute the new label set: drop the agent label; if status/in-progress,
       // flip to status/ready so the issue leaves the In Progress column.
       let updatedLabels = issue.labels.filter((l) => l !== agentLabel);
-      const hadInProgress = updatedLabels.includes("status/in-progress");
-      if (hadInProgress) {
+      if (updatedLabels.includes("status/in-progress")) {
         updatedLabels = updatedLabels.filter((l) => l !== "status/in-progress");
         if (!updatedLabels.includes("status/ready")) {
           updatedLabels.push("status/ready");
         }
       }
 
-      // Apply label changes to GitHub. updateIssueLabels handles conflicts and
-      // re-applies all non-status labels and adds status/ready in one shot.
+      // Apply label changes to GitHub (conflict-aware: re-applies all
+      // non-status labels and adds status/ready in one shot).
       await updateIssueLabels(
         repoFullName as string,
         issueNumber as number,
         updatedLabels,
       );
-      // Also remove the agent/* label (updateIssueLabels already drops it from
-      // the list, but call removeIssueLabel defensively to mirror agent path).
+      // Defensive: ensure the agent/* label is removed even if GitHub's API
+      // returned something different than what we expected.
       await removeIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
 
       // Update local cache
@@ -93,12 +95,16 @@ export async function POST(request: Request) {
         data: { labels: updatedLabels, lastSyncedAt: new Date() },
       });
 
-      // Release the lease (issue #166)
-      await releaseLeaseByAgent(issueId as string, agentName as string);
+      // Release the lease using the shared helper (uses deleteMany under
+      // the hood — see src/lib/lease.ts).
+      await releaseLeaseByAgentAndIssue(agentName as string, issueId as string);
 
-      // For the operator path, release any AgentWork records for this agent+issue.
+      // For the operator path, also release any AgentWork records for this
+      // agent+issue (mark them RELEASED and write a released_by_operator
+      // history entry). The agent self-unclaim path doesn't need this
+      // because the agent is releasing its own claim.
       if (!isAgentSelfUnclaim) {
-        await releaseAgentWork(issueId as string, agentName as string, actor);
+        await releaseAgentWorkByAgentAndIssue(agentName as string, issueId as string);
       }
 
       // Write audit log
@@ -140,45 +146,5 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("Unclaim issue failed:", error);
     return NextResponse.json({ error: "Failed to unclaim issue" }, { status: 500 });
-  }
-}
-
-/**
- * Release the lease for a specific agent on an issue.
- */
-async function releaseLeaseByAgent(issueId: string, agentName: string): Promise<void> {
-  const lease = await prisma.lease.findUnique({
-    where: { agentName_issueId: { agentName, issueId } },
-  });
-  if (lease) {
-    await prisma.lease.delete({ where: { id: lease.id } });
-  }
-}
-
-/**
- * Mark AgentWork records for this agent+issue as RELEASED with a
- * `released_by_operator` history entry. Used by the operator-unclaim path.
- */
-async function releaseAgentWork(issueId: string, agentName: string, actor: string): Promise<void> {
-  const works = await prisma.agentWork.findMany({
-    where: { issueId, agentName },
-  });
-  const now = new Date();
-  for (const work of works) {
-    const existing = (work as unknown as { history?: unknown[] }).history;
-    const history: unknown[] = Array.isArray(existing) ? [...existing] : [];
-    history.push({
-      kind: "released_by_operator",
-      actor,
-      at: now.toISOString(),
-    });
-    await prisma.agentWork.update({
-      where: { id: work.id },
-      data: {
-        status: "RELEASED",
-        history: history as unknown as object,
-        completedAt: now,
-      } as never,
-    });
   }
 }
