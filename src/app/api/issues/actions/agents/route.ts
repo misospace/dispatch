@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { parseAgentList } from "@/lib/config";
 
@@ -37,9 +38,6 @@ export async function GET(request: Request) {
 
     return NextResponse.json({ agents: allAgents });
   } catch {
-    return NextResponse.json(
-      { error: "Failed to fetch agent list" },
-      { status: 500 }
-    );
+    return errorResponse("Failed to fetch agent list", 500);
   }
 }

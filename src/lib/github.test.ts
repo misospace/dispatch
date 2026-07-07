@@ -433,6 +433,17 @@ describe("fetchIssues", () => {
     await fetchIssues("org/repo", { includeClosed: true });
     expect(fetchMock.mock.calls[1][0]).toContain("state=all");
   });
+
+  it("omits since by default and includes it as ISO-8601 when provided", async () => {
+    fetchMock.mockResolvedValue(makeResponse([]));
+
+    await fetchIssues("org/repo");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("since=");
+
+    const since = new Date("2026-07-01T00:00:00.000Z");
+    await fetchIssues("org/repo", { since });
+    expect(fetchMock.mock.calls[1][0]).toContain(`since=${since.toISOString()}`);
+  });
 });
 
 describe("fetchIssue", () => {

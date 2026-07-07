@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
@@ -6,7 +7,7 @@ import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const auditActor = getAuthorizedActor(auth, request);
 
@@ -15,14 +16,14 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const input = parseMarkPrFixInput(body);
-    if ("error" in input) return NextResponse.json({ error: input.error }, { status: 400 });
+    if ("error" in input) return errorResponse(input.error, 400);
 
     const item = await markPrFixItem(asPrFixQueueClient(prisma), input);
-    if (!item) return NextResponse.json({ error: "PR fix queue item not found" }, { status: 404 });
+    if (!item) return errorResponse("PR fix queue item not found", 404);
 
     await prisma.auditLog.create({
       data: {
@@ -54,6 +55,6 @@ export async function POST(request: Request) {
       },
     });
 
-    return NextResponse.json({ error: "Failed to mark PR fix queue item" }, { status: 500 });
+    return errorResponse("Failed to mark PR fix queue item", 500);
   }
 }

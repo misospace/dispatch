@@ -12,6 +12,7 @@
  */
 
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { runSyncBestEffort, runReconcileBestEffort } from "@/lib/heartbeat";
@@ -35,7 +36,7 @@ export async function POST(
 
   // Authenticate
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   const startedAt = new Date();

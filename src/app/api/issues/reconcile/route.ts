@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { fetchPullRequests, fetchClosedPullRequests, fetchIssues, fetchLinkedPrHealthInput } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import {
   extractFixingIssueNumbers,
-  prBranchMatchesIssue,
   reconcileIssue,
   classifyLaneByHeuristics,
   shouldReclassifyStaleBacklog,
@@ -29,7 +29,7 @@ import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
  */
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -37,7 +37,7 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const repoFilter = typeof body === "object" && body !== null
@@ -51,7 +51,7 @@ export async function POST(request: Request) {
       : syncRepos;
 
     if (repos.length === 0) {
-      return NextResponse.json({ error: "No tracked repos found" }, { status: 404 });
+      return errorResponse("No tracked repos found", 404);
     }
 
     let totalIssuesReconciled = 0;
@@ -133,18 +133,29 @@ export async function POST(request: Request) {
 
         // The PR list endpoint omits reviewDecision/mergeStateStatus/checks, so
         // fetch a full health input per issue-linked open PR. This both feeds
-        // checkPrHealth (which needs review + merge signals) and produces the
-        // linked-PR-health snapshot we persist on the issue below.
-        const linkedPrHealthByIssue = new Map<number, LinkedPrHealth | null>();
-        for (const [issueNum, pr] of openPrToIssue) {
-          const input = await fetchLinkedPrHealthInput(repo.fullName, pr);
-          pr.reviewDecision = input.reviewDecision;
-          pr.mergeStateStatus = input.mergeStateStatus;
-          linkedPrHealthByIssue.set(issueNum, computeLinkedPrHealth(input));
-        }
+        // reconcileIssue's needs_work judgment (via checkPrHealth, which adapts
+        // the canonical computeLinkedPrHealth actionability signal) and produces
+        // the linked-PR-health snapshot we persist on the issue below.
+        // The PRs are independent, so fetch their health inputs in parallel.
+        const linkedPrHealthByIssue = new Map<number, LinkedPrHealth | null>(
+          await Promise.all(
+            Array.from(openPrToIssue, async ([issueNum, pr]): Promise<[number, LinkedPrHealth | null]> => {
+              const input = await fetchLinkedPrHealthInput(repo.fullName, pr);
+              pr.reviewDecision = input.reviewDecision;
+              pr.mergeStateStatus = input.mergeStateStatus;
+              return [issueNum, computeLinkedPrHealth(input)];
+            }),
+          ),
+        );
 
         // Fetch all issues for this repo
         const issues = await fetchIssues(repo.fullName);
+
+        // Batch-load the existing issue rows once instead of a findUnique per issue.
+        const existingIssues = await prisma.issue.findMany({
+          where: { repositoryId: repo.id, number: { in: issues.map((i) => i.number) } },
+        });
+        const existingIssueByNumber = new Map(existingIssues.map((i) => [i.number, i]));
 
         // Reconcile each issue
         for (const issue of issues) {
@@ -161,6 +172,7 @@ export async function POST(request: Request) {
             },
             mergedFixingIssues,
             openPrToIssue,
+            linkedPrHealthByIssue,
           );
 
           // Execute actions against GitHub
@@ -201,9 +213,7 @@ export async function POST(request: Request) {
           }
 
           // Classify lane using heuristics — first-time set, or stale-backlog reclassification.
-          const existingIssue = await prisma.issue.findUnique({
-            where: { repositoryId_number: { repositoryId: repo.id, number: issue.number } },
-          });
+          const existingIssue = existingIssueByNumber.get(issue.number);
 
           if (existingIssue && !existingIssue.currentLane) {
             // First-time classification: lane was never set.
@@ -259,22 +269,22 @@ export async function POST(request: Request) {
         // Reconcile pr-fix-queue items: mark stale when the upstream PR is
         // merged or closed. Uses the mergedPrsMap already built above. No
         // model judgment, deterministic.
-        const mergedOrClosedPrsByRepo = new Map<string, Set<number>>();
-        const prStateByRepo = new Map<string, Map<number, "merged" | "closed">>();
+        const mergedOrClosedPrs = new Set<number>();
+        const prStates = new Map<number, "merged" | "closed">();
         for (const pr of mergedPrsMap.values()) {
-          if (!mergedOrClosedPrsByRepo.has(repo.fullName)) mergedOrClosedPrsByRepo.set(repo.fullName, new Set());
-          if (!prStateByRepo.has(repo.fullName)) prStateByRepo.set(repo.fullName, new Map());
-          mergedOrClosedPrsByRepo.get(repo.fullName)!.add(pr.number);
-          prStateByRepo.get(repo.fullName)!.set(pr.number, "merged");
+          mergedOrClosedPrs.add(pr.number);
+          prStates.set(pr.number, "merged");
         }
         for (const pr of closedPrsList) {
           if (pr.merged_at) continue; // already counted
-          if (!mergedOrClosedPrsByRepo.has(repo.fullName)) mergedOrClosedPrsByRepo.set(repo.fullName, new Set());
-          if (!prStateByRepo.has(repo.fullName)) prStateByRepo.set(repo.fullName, new Map());
-          mergedOrClosedPrsByRepo.get(repo.fullName)!.add(pr.number);
-          prStateByRepo.get(repo.fullName)!.set(pr.number, "closed");
+          mergedOrClosedPrs.add(pr.number);
+          prStates.set(pr.number, "closed");
         }
-        const staleResult = await reconcileStalePrFixItems(prisma, mergedOrClosedPrsByRepo, prStateByRepo);
+        const staleResult = await reconcileStalePrFixItems(
+          prisma,
+          new Map([[repo.fullName, mergedOrClosedPrs]]),
+          new Map([[repo.fullName, prStates]]),
+        );
         totalPrFixStaleChecked += staleResult.checked;
         totalPrFixStaleMarked += staleResult.markedStale;
         if (staleResult.errored > 0) {
@@ -302,7 +312,7 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("Reconciliation failed:", error);
-    return NextResponse.json({ error: "Reconciliation failed" }, { status: 500 });
+    return errorResponse("Reconciliation failed", 500);
   }
 }
 
@@ -311,7 +321,7 @@ export async function POST(request: Request) {
  */
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -338,6 +348,6 @@ export async function GET(request: Request) {
     });
   } catch (error) {
     console.error("Failed to fetch reconciliation status:", error);
-    return NextResponse.json({ error: "Failed to fetch status" }, { status: 500 });
+    return errorResponse("Failed to fetch status", 500);
   }
 }

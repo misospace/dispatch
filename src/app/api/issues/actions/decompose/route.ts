@@ -1,37 +1,8 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
-
-/**
- * Resolve the actor name for decomposition attribution.
- *
- * Resolution order: actor > agentName > "agent" (default).
- * Validates that the resolved value is a non-empty trimmed string <= 100 chars.
- */
-function resolveActor(body: unknown): { actor: string; error?: string } {
-  const raw = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
-  if (!raw) return { actor: "agent" };
-
-  // Prefer `actor`, fall back to `agentName`, then default to "agent"
-  let value: unknown;
-  if ("actor" in raw) value = raw.actor;
-  else if ("agentName" in raw) value = raw.agentName;
-  else return { actor: "agent" };
-
-  if (typeof value !== "string") {
-    return { actor: "", error: "'actor'/'agentName' must be a string" };
-  }
-
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    return { actor: "", error: "'actor'/'agentName' must not be empty after trimming" };
-  }
-  if (trimmed.length > 100) {
-    return { actor: "", error: "'actor'/'agentName' must be at most 100 characters" };
-  }
-
-  return { actor: trimmed };
-}
+import { resolveActor } from "@/lib/resolve-actor";
 
 /**
  * Mark an issue as decomposed (escalated-lane audit parent tracking).
@@ -44,7 +15,7 @@ function resolveActor(body: unknown): { actor: string; error?: string } {
  */
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -52,23 +23,23 @@ export async function POST(request: Request) {
     const { repo, issueNumber, decomposed, followUpUrls, note } = body;
 
     if (!repo || !issueNumber) {
-      return NextResponse.json({ error: "Missing required fields: repo, issueNumber" }, { status: 400 });
+      return errorResponse("Missing required fields: repo, issueNumber", 400);
     }
 
     if (typeof decomposed !== "boolean") {
-      return NextResponse.json({ error: "Field 'decomposed' must be a boolean" }, { status: 400 });
+      return errorResponse("Field 'decomposed' must be a boolean", 400);
     }
 
     // Resolve attribution actor
     const { actor, error: actorError } = resolveActor(body);
     if (actorError) {
-      return NextResponse.json({ error: actorError }, { status: 400 });
+      return errorResponse(actorError, 400);
     }
 
     // Parse repo as owner/repo format
     const parts = repo.split("/");
     if (parts.length !== 2) {
-      return NextResponse.json({ error: "Invalid repo format. Expected 'owner/repo'" }, { status: 400 });
+      return errorResponse("Invalid repo format. Expected 'owner/repo'", 400);
     }
     const [owner, name] = parts;
 
@@ -84,7 +55,7 @@ export async function POST(request: Request) {
     });
 
     if (!issue) {
-      return NextResponse.json({ error: `Issue #${issueNumber} not found in ${repo}` }, { status: 404 });
+      return errorResponse(`Issue #${issueNumber} not found in ${repo}`, 404);
     }
 
     // Update decomposed state
@@ -124,7 +95,6 @@ export async function POST(request: Request) {
       followUpUrls: updated.followUpUrls,
     }, { status: 200 });
   } catch (error) {
-    console.error("Failed to update decomposed state:", error);
-    return NextResponse.json({ error: "Failed to update decomposed state" }, { status: 500 });
+    return handleApiError("update decomposed state", error);
   }
 }

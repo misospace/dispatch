@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
@@ -17,7 +18,7 @@ type ActionPayload = {
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const auditActor = getAuthorizedActor(auth, request);
 
@@ -26,59 +27,50 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const payload = body as ActionPayload;
 
     // Validate required fields
     if (!payload.action || payload.value == null) {
-      return NextResponse.json({ error: "Missing required fields: action, value" }, { status: 400 });
+      return errorResponse("Missing required fields: action, value", 400);
     }
 
     if (payload.action !== "assign_agent" && payload.action !== "assign_owner") {
-      return NextResponse.json(
-        { error: `Invalid action: ${payload.action}. Allowed: assign_agent, assign_owner` },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid action: ${payload.action}. Allowed: assign_agent, assign_owner`, 400);
     }
 
     if (typeof payload.value !== "string" || payload.value.length === 0) {
-      return NextResponse.json({ error: "value must be a non-empty string" }, { status: 400 });
+      return errorResponse("value must be a non-empty string", 400);
     }
 
     const { issueId, repoFullName, issueNumber } = payload;
 
     if (!issueId || !repoFullName || typeof issueNumber !== "number") {
-      return NextResponse.json({ error: "Missing required fields: issueId, repoFullName, issueNumber" }, { status: 400 });
+      return errorResponse("Missing required fields: issueId, repoFullName, issueNumber", 400);
     }
 
     // Validate value format: must match agent/<name> or owner/<name>
     const expectedPrefix = payload.action === "assign_agent" ? AGENT_PREFIX : OWNER_PREFIX;
     if (!payload.value.startsWith(expectedPrefix)) {
-      return NextResponse.json(
-        { error: `value must start with "${expectedPrefix}" (e.g. "${expectedPrefix}worker")` },
-        { status: 400 },
-      );
+      return errorResponse(`value must start with "${expectedPrefix}" (e.g. "${expectedPrefix}worker")`, 400);
     }
 
     try {
       // Fetch current issue to get existing labels and state
       const issue = await prisma.issue.findUnique({ where: { id: issueId } });
       if (!issue) {
-        return NextResponse.json({ error: `Issue not found: ${issueId}` }, { status: 404 });
+        return errorResponse(`Issue not found: ${issueId}`, 404);
       }
 
       // Policy §1: agents may only claim open issues
       if (issue.state !== "open") {
-        return NextResponse.json(
-          { error: `Cannot assign to closed issue (state: ${issue.state})` },
-          { status: 400 },
-        );
+        return errorResponse(`Cannot assign to closed issue (state: ${issue.state})`, 400);
       }
 
       const currentLabels = issue.labels;
@@ -156,10 +148,10 @@ export async function POST(request: Request) {
         // Audit log failure should not mask the real error
       }
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Assign agent/owner action failed:", error);
-    return NextResponse.json({ error: "Failed to process action" }, { status: 500 });
+    return errorResponse("Failed to process action", 500);
   }
 }

@@ -204,9 +204,13 @@ describe("IssueCard unclaim button (issue #564)", () => {
       );
     });
 
-    // Board refresh path: sync + onIssueUpdate are triggered on success.
+    // Board refresh path: repo-scoped sync + onIssueUpdate are triggered on success.
     await waitFor(() => {
-      expect(authedFetchMock).toHaveBeenCalledWith("/api/sync", { method: "POST" });
+      expect(authedFetchMock).toHaveBeenCalledWith("/api/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoFullName: issue.repository.fullName }),
+      });
       expect(onIssueUpdate).toHaveBeenCalled();
     });
   });

@@ -4,7 +4,7 @@ import {
   isValidConfidence,
   parseLaneClassification,
   validateLaneRecord,
-  classifyByHeuristics,
+  classifyLaneByHeuristics,
 } from "./issue-lane";
 import { setLaneConfig, resetLaneConfig } from "./lane-config";
 
@@ -133,71 +133,72 @@ describe("validateLaneRecord", () => {
   });
 });
 
-describe("classifyByHeuristics", () => {
+describe("classifyLaneByHeuristics", () => {
   it("classifies backlog for status/backlog label", () => {
-    const result = classifyByHeuristics("Fix bug", null, ["status/backlog"]);
+    const result = classifyLaneByHeuristics("Fix bug", null, ["status/backlog"]);
     expect(result.lane).toBe("backlog");
     expect(result.confidence).toBe("high");
   });
 
   it("classifies backlog for type/research label", () => {
-    const result = classifyByHeuristics("Research options", null, ["type/research"]);
+    const result = classifyLaneByHeuristics("Research options", null, ["type/research"]);
     expect(result.lane).toBe("backlog");
     expect(result.confidence).toBe("high");
   });
 
   it("classifies escalated when architecture keywords present", () => {
-    const result = classifyByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
+    const result = classifyLaneByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
     expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
   it("classifies escalated for rfc/design doc keywords", () => {
-    const result = classifyByHeuristics("RFC: New auth flow", "Design document for authentication redesign", ["type/feature"]);
+    const result = classifyLaneByHeuristics("RFC: New auth flow", "Design document for authentication redesign", ["type/feature"]);
     expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
   it("classifies escalated for umbrella/decomposition keywords", () => {
-    const result = classifyByHeuristics("Audit findings", "Umbrella issue: audit parent decomposition needed", ["priority/p1"]);
+    const result = classifyLaneByHeuristics("Audit findings", "Umbrella issue: audit parent decomposition needed", ["priority/p1"]);
     expect(result.lane).toBe("frontier");
     expect(result.confidence).toBe("medium");
   });
 
   it("defaults to normal for concrete issues", () => {
-    const result = classifyByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
+    const result = classifyLaneByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
     expect(result.lane).toBe("local");
     expect(result.confidence).toBe("medium");
   });
 
   it("does not escalate just for priority/p1 label", () => {
-    const result = classifyByHeuristics("Fix typo in README", "Change 'teh' to 'the'", ["priority/p1"]);
+    const result = classifyLaneByHeuristics("Fix typo in README", "Change 'teh' to 'the'", ["priority/p1"]);
     expect(result.lane).toBe("local");
   });
 
-  it("does not escalate just for needs-escalation label", () => {
-    const result = classifyByHeuristics("Update config", "Simple config change", ["needs-escalation"]);
-    expect(result.lane).toBe("local");
+  it("escalates for needs-escalation label with high confidence", () => {
+    const result = classifyLaneByHeuristics("Update config", "Simple config change", ["needs-escalation"]);
+    expect(result.lane).toBe("frontier");
+    expect(result.confidence).toBe("high");
   });
 });
 
-describe("classifyByHeuristics config-aware", () => {
+describe("classifyLaneByHeuristics config-aware", () => {
   afterEach(() => {
     resetLaneConfig();
   });
 
   it("default config stays backward-compatible: concrete -> normal", () => {
-    const result = classifyByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
+    const result = classifyLaneByHeuristics("Fix login bug", "Login fails when password is wrong", ["priority/p2"]);
     expect(result.lane).toBe("local");
   });
 
   it("default config stays backward-compatible: architecture -> escalated", () => {
-    const result = classifyByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
+    const result = classifyLaneByHeuristics("Design migration strategy", "Need to plan database migration strategy", ["priority/p1"]);
     expect(result.lane).toBe("frontier");
   });
 
   it("default config stays backward-compatible: backlog label -> backlog", () => {
-    const result = classifyByHeuristics("Fix bug", null, ["status/backlog"]);
+    const result = classifyLaneByHeuristics("Fix bug", null, ["status/backlog"]);
     expect(result.lane).toBe("backlog");
   });
 
@@ -208,7 +209,7 @@ describe("classifyByHeuristics config-aware", () => {
         { id: "backlog", title: "Backlog", claimable: false },
       ],
     });
-    const result = classifyByHeuristics("Fix login bug", "Login fails.", ["bug"]);
+    const result = classifyLaneByHeuristics("Fix login bug", "Login fails.", ["bug"]);
     expect(result.lane).toBe("work");
   });
 
@@ -219,7 +220,7 @@ describe("classifyByHeuristics config-aware", () => {
         { id: "backlog", title: "Backlog", claimable: false },
       ],
     });
-    const result = classifyByHeuristics("Architecture review", "Design doc for auth.", ["type/feature"]);
+    const result = classifyLaneByHeuristics("Architecture review", "Design doc for auth.", ["type/feature"]);
     expect(result.lane).toBe("work");
   });
 
@@ -231,7 +232,7 @@ describe("classifyByHeuristics config-aware", () => {
         { id: "backlog", title: "Backlog", claimable: false },
       ],
     });
-    const result = classifyByHeuristics("Architecture review", "Design doc for auth.", ["type/feature"]);
+    const result = classifyLaneByHeuristics("Architecture review", "Design doc for auth.", ["type/feature"]);
     expect(result.lane).toBe("expert");
   });
 
@@ -242,7 +243,7 @@ describe("classifyByHeuristics config-aware", () => {
         { id: "parked", title: "Parked", claimable: false },
       ],
     });
-    const result = classifyByHeuristics("Research options", null, ["type/research"]);
+    const result = classifyLaneByHeuristics("Research options", null, ["type/research"]);
     expect(result.lane).toBe("parked");
   });
 
@@ -254,8 +255,8 @@ describe("classifyByHeuristics config-aware", () => {
         { id: "parked", title: "Parked", claimable: false },
       ],
     });
-    expect(classifyByHeuristics("Fix typo", null, ["bug"]).lane).toBe("fast");
-    expect(classifyByHeuristics("RFC: new flow", "Design doc.", ["type/feature"]).lane).toBe("slow");
-    expect(classifyByHeuristics("Research", null, ["status/backlog"]).lane).toBe("parked");
+    expect(classifyLaneByHeuristics("Fix typo", null, ["bug"]).lane).toBe("fast");
+    expect(classifyLaneByHeuristics("RFC: new flow", "Design doc.", ["type/feature"]).lane).toBe("slow");
+    expect(classifyLaneByHeuristics("Research", null, ["status/backlog"]).lane).toBe("parked");
   });
 });

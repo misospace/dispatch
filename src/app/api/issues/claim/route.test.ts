@@ -201,6 +201,19 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
   });
 
+  it("removes ALL existing status labels when an issue carries more than one (approved fix)", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review", "status/backlog"] });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-review");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/backlog");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+    const body = await res.json();
+    expect(body.labels).toContain("status/in-progress");
+    expect(body.labels).not.toContain("status/in-review");
+    expect(body.labels).not.toContain("status/backlog");
+  });
+
   it("updates local cache with agent label after claim", async () => {
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);

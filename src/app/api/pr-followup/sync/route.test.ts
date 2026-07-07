@@ -26,7 +26,8 @@ vi.mock("@/lib/prisma", () => ({
   asPrFixQueueClient: mocks.prFixQueueClient,
 }));
 
-vi.mock("@/lib/pr-followup-ingestion", () => ({
+vi.mock("@/lib/pr-followup-ingestion", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/pr-followup-ingestion")>()),
   processPrFollowupEvents: mocks.processPrFollowupEvents,
   isAllowedBotAuthor: mocks.isAllowedBotAuthor,
   ingestMergeConflict: mocks.ingestMergeConflict,
@@ -105,7 +106,7 @@ describe("POST /api/pr-followup/sync", () => {
     mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix"]);
     mocks.isAllowedBotAuthor.mockReturnValue(true);
 
-    const jsonRes = (data: unknown) => ({ ok: true, json: async () => data, text: async () => "" });
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
     let checksUrl = "";
     const fetchMock = vi.fn(async (url: string) => {
       const u = String(url);

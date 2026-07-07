@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { parseLaneClassification, classifyByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
+import { parseLaneClassification, classifyLaneByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
 import { authorizeRequest } from "@/lib/auth";
 
 interface LaneRequestBody {
@@ -14,7 +15,7 @@ interface LaneRequestBody {
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -25,12 +26,12 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     // Reject non-object types (including arrays and null)
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const parsedBody = body as LaneRequestBody;
@@ -43,7 +44,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     });
 
     if (!issue) {
-      return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+      return errorResponse("Issue not found in local cache", 404);
     }
 
     // Determine classification source
@@ -100,7 +101,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     }
 
     // Use heuristic fallback for auto-classification
-    const classification = classifyByHeuristics(issue.title, issue.body, issue.labels);
+    const classification = classifyLaneByHeuristics(issue.title, issue.body, issue.labels);
 
     await prisma.$transaction([
       prisma.issueLane.create({
@@ -125,7 +126,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     });
   } catch (error) {
     console.error("Lane classification failed:", error);
-    return NextResponse.json({ error: "Failed to classify issue lane" }, { status: 500 });
+    return errorResponse("Failed to classify issue lane", 500);
   }
 }
 
@@ -134,7 +135,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
  */
 export async function GET(_request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   if (!(await authorizeRequest(_request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -148,7 +149,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ is
     });
 
     if (!issue) {
-      return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+      return errorResponse("Issue not found in local cache", 404);
     }
 
     // Check for full classification history
@@ -176,6 +177,6 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ is
     });
   } catch (error) {
     console.error("Failed to get lane classification:", error);
-    return NextResponse.json({ error: "Failed to retrieve lane classification" }, { status: 500 });
+    return errorResponse("Failed to retrieve lane classification", 500);
   }
 }

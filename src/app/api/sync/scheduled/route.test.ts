@@ -58,6 +58,7 @@ function createPrismaMock() {
         update: vi.fn().mockResolvedValue(undefined),
         create: vi.fn().mockResolvedValue(undefined),
         findMany: vi.fn().mockResolvedValue([]),
+        aggregate: vi.fn().mockResolvedValue({ _max: { lastSyncedAt: null } }),
       },
       $transaction: vi.fn(async (fn: (tx: any) => Promise<string>) => {
         const tx = {

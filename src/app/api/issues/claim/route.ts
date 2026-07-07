@@ -1,16 +1,18 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { authorizeRequest } from "@/lib/auth";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
+import { transitionIssueStatus } from "@/lib/issue-status";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -18,18 +20,18 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const { issueId, repoFullName, issueNumber, agentName, force } = body as Record<string, unknown>;
 
     // Validate required fields
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
-      return NextResponse.json({ error: "Missing required fields: issueId, repoFullName, issueNumber, agentName" }, { status: 400 });
+      return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
 
     // Fetch the issue from the local database to check its state and current labels
@@ -39,18 +41,18 @@ export async function POST(request: Request) {
     });
 
     if (!issue) {
-      return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+      return errorResponse("Issue not found in local cache", 404);
     }
 
     // Refuse closed issues
     if (issue.state === "closed") {
-      return NextResponse.json({ error: "Cannot claim a closed issue" }, { status: 400 });
+      return errorResponse("Cannot claim a closed issue", 400);
     }
 
     // Refuse done issues
     const currentStatus = issue.labels.find((l) => l.startsWith("status/"));
     if (currentStatus === "status/done") {
-      return NextResponse.json({ error: "Cannot claim a done issue" }, { status: 400 });
+      return errorResponse("Cannot claim a done issue", 400);
     }
 
     // Check for active leases from OTHER agents — refuse unless force=true
@@ -58,10 +60,7 @@ export async function POST(request: Request) {
     const otherAgentLeases = activeLeases.filter((l) => l.agentName !== agentName);
 
     if (otherAgentLeases.length > 0 && force !== true) {
-      return NextResponse.json(
-        { error: `Issue is actively leased to ${otherAgentLeases[0].agentName}. Use force=true to override.` },
-        { status: 409 },
-      );
+      return errorResponse(`Issue is actively leased to ${otherAgentLeases[0].agentName}. Use force=true to override.`, 409);
     }
 
     // Always clean up expired leases (stale recovery)
@@ -90,10 +89,7 @@ export async function POST(request: Request) {
           // Non-fatal: continue with force claim even if label removal fails
         }
       } else {
-        return NextResponse.json(
-          { error: `Issue is already assigned to ${analysis.existingAgents[0].replace("agent/", "")}. Use force=true to override.` },
-          { status: 409 },
-        );
+        return errorResponse(`Issue is already assigned to ${analysis.existingAgents[0].replace("agent/", "")}. Use force=true to override.`, 409);
       }
     }
 
@@ -106,12 +102,10 @@ export async function POST(request: Request) {
       // Add agent label on GitHub
       await addIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
 
-      if (currentStatus && currentStatus !== IN_PROGRESS_STATUS) {
-        await removeIssueLabel(repoFullName as string, issueNumber as number, currentStatus);
-      }
-      if (currentStatus !== IN_PROGRESS_STATUS) {
-        await addIssueLabel(repoFullName as string, issueNumber as number, IN_PROGRESS_STATUS);
-      }
+      // Remove ALL existing status labels (not just the first) before adding
+      // status/in-progress — keeps GitHub and the Prisma cache from
+      // diverging when an issue carries more than one status label.
+      await transitionIssueStatus(repoFullName as string, issueNumber as number, issue.labels, IN_PROGRESS_STATUS);
 
       // Update local cache
       await prisma.issue.update({
@@ -176,10 +170,10 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Claim issue failed:", error);
-    return NextResponse.json({ error: "Failed to claim issue" }, { status: 500 });
+    return errorResponse("Failed to claim issue", 500);
   }
 }

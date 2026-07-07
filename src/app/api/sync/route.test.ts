@@ -85,7 +85,12 @@ vi.mock("@/lib/issue-sync", () => ({
     success: true,
     issues: { repos: 1, created: 0, updated: 0, deleted: 0 },
   }),
-  mergeLabels: vi.fn((a) => a),
+  makePrismaIssueStore: vi.fn(() => ({
+    findIssue: vi.fn(),
+    updateIssue: vi.fn(),
+    createIssue: vi.fn(),
+  })),
+  fetchAllStateIssues: vi.fn(),
 }));
 
 import { POST } from "./route";

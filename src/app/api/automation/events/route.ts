@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 
@@ -23,6 +24,6 @@ export async function GET(request: Request) {
     return NextResponse.json(jsonSafe(events));
   } catch (error) {
     console.error("Failed to fetch automation events:", error);
-    return NextResponse.json({ error: "Failed to fetch events" }, { status: 500 });
+    return errorResponse("Failed to fetch events", 500);
   }
 }

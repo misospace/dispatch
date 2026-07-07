@@ -6,6 +6,7 @@ const { mocks } = vi.hoisted(() => ({
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
+    addIssueLabel: vi.fn().mockResolvedValue(undefined),
     updateIssueLabels: vi.fn().mockResolvedValue(undefined),
     releaseLeaseByAgentAndIssue: vi.fn().mockResolvedValue(undefined),
     releaseAgentWorkByAgentAndIssue: vi.fn().mockResolvedValue(0),
@@ -29,6 +30,7 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/github", () => ({
   removeIssueLabel: mocks.removeIssueLabel,
+  addIssueLabel: mocks.addIssueLabel,
   updateIssueLabels: mocks.updateIssueLabels,
 }));
 
@@ -146,6 +148,7 @@ describe("POST /api/issues/unclaim — agent self-unclaim (regression)", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
     mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
     mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
@@ -187,6 +190,7 @@ describe("POST /api/issues/unclaim — operator path", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
     mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
     mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(1);
@@ -290,6 +294,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
     mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
     mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);

@@ -6,12 +6,28 @@ import {
   prBranchMatchesIssue,
   checkPrHealth,
   reconcileIssue,
-  prReferencesIssue,
   executeAction,
   executeActions,
   shouldReclassifyStaleBacklog,
 } from "./issue-reconciliation";
 import { setLaneConfig, resetLaneConfig } from "./lane-config";
+import { computeLinkedPrHealth, type LinkedPrHealth, type PrHealthInput } from "./linked-pr-health";
+import type { GithubPR } from "./github";
+
+/** Build a LinkedPrHealth fixture from partial PrHealthInput overrides via the canonical computer. */
+function buildHealth(overrides: Partial<PrHealthInput> = {}): LinkedPrHealth | null {
+  return computeLinkedPrHealth({
+    url: "https://github.com/test/repo/pull/42",
+    number: 42,
+    state: "open",
+    draft: false,
+    mergedAt: null,
+    mergeStateStatus: null,
+    reviewDecision: null,
+    checkFailures: [],
+    ...overrides,
+  });
+}
 
 const githubModule = await import("./github");
 
@@ -186,274 +202,132 @@ describe("prBranchMatchesIssue", () => {
 });
 
 describe("checkPrHealth", () => {
+  const basePr = {
+    number: 42,
+    url: "https://github.com/test/repo/pull/42",
+    title: "Add feature",
+    state: "open",
+    user: { login: "test-user" },
+    head: { ref: "fix/issue-42-feature" },
+    base: { ref: "main" },
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    merged_at: null,
+    draft: false,
+  };
+
   it("returns healthy for a clean PR", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-    };
-    const health = checkPrHealth(pr);
+    const health = checkPrHealth(basePr, buildHealth({ mergeStateStatus: "clean" }));
     expect(health.status).toBe("healthy");
   });
 
-  it("returns healthy for a PR with no issues", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-    };
-    const health = checkPrHealth(pr);
+  it("returns healthy when health is null (fetch failed) — conservative fallback", () => {
+    const health = checkPrHealth(basePr, null);
     expect(health.status).toBe("healthy");
   });
 
   it("includes PR health details in result", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-    };
-    const health = checkPrHealth(pr);
+    const health = checkPrHealth(basePr, buildHealth());
     expect(health.prNumber).toBe(42);
     expect(health.url).toContain("pull/42");
     expect(health.headRefName).toBe("fix/issue-42-feature");
   });
 
   it("returns needs_work when reviewDecision is CHANGES_REQUESTED", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      reviewDecision: "CHANGES_REQUESTED",
-    };
-    const health = checkPrHealth(pr);
+    const pr = { ...basePr, reviewDecision: "CHANGES_REQUESTED" };
+    const health = checkPrHealth(pr, buildHealth({ reviewDecision: "CHANGES_REQUESTED" }));
     expect(health.status).toBe("needs_work");
     expect(health.reason).toBe("Review changes requested");
   });
 
   it("returns healthy when reviewDecision is APPROVED", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      reviewDecision: "APPROVED",
-    };
-    const health = checkPrHealth(pr);
+    const pr = { ...basePr, reviewDecision: "APPROVED" };
+    const health = checkPrHealth(pr, buildHealth({ reviewDecision: "APPROVED" }));
     expect(health.status).toBe("healthy");
   });
 
   it("returns healthy when reviewDecision is COMMENTED", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      reviewDecision: "COMMENTED",
-    };
-    const health = checkPrHealth(pr);
+    const pr = { ...basePr, reviewDecision: "COMMENTED" };
+    const health = checkPrHealth(pr, buildHealth({ reviewDecision: "COMMENTED" }));
     expect(health.status).toBe("healthy");
   });
 
-  it("returns needs_work when mergeStateStatus is dirty", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      mergeStateStatus: "dirty",
-    };
-    const health = checkPrHealth(pr);
+  it("returns needs_work when mergeStateStatus is dirty (merge conflict)", () => {
+    const pr = { ...basePr, mergeStateStatus: "dirty" };
+    const health = checkPrHealth(pr, buildHealth({ mergeStateStatus: "dirty" }));
     expect(health.status).toBe("needs_work");
     expect(health.reason).toBe("Merge state is dirty");
   });
 
-  it("returns needs_work when mergeStateStatus is behind", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      mergeStateStatus: "behind",
-    };
-    const health = checkPrHealth(pr);
+  it("returns needs_work when mergeStateStatus is conflicting (merge conflict)", () => {
+    const pr = { ...basePr, mergeStateStatus: "conflicting" };
+    const health = checkPrHealth(pr, buildHealth({ mergeStateStatus: "conflicting" }));
     expect(health.status).toBe("needs_work");
   });
 
-  it("returns needs_work when mergeStateStatus is blocked", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      mergeStateStatus: "blocked",
-    };
-    const health = checkPrHealth(pr);
-    expect(health.status).toBe("needs_work");
-  });
-
-  it("returns needs_work when mergeStateStatus is unknown", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      mergeStateStatus: "unknown",
-    };
-    const health = checkPrHealth(pr);
-    expect(health.status).toBe("needs_work");
-  });
-
-  it("returns healthy when mergeStateStatus is clean", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      mergeStateStatus: "clean",
-    };
-    const health = checkPrHealth(pr);
+  it("returns healthy when mergeStateStatus is behind (not actionable alone)", () => {
+    const pr = { ...basePr, mergeStateStatus: "behind" };
+    const health = checkPrHealth(pr, buildHealth({ mergeStateStatus: "behind" }));
     expect(health.status).toBe("healthy");
   });
 
-  it("prioritizes CHANGES_REQUESTED over dirty merge state", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      reviewDecision: "CHANGES_REQUESTED",
-      mergeStateStatus: "dirty",
-    };
-    const health = checkPrHealth(pr);
+  it("returns healthy when mergeStateStatus is blocked (not actionable alone)", () => {
+    const pr = { ...basePr, mergeStateStatus: "blocked" };
+    const health = checkPrHealth(pr, buildHealth({ mergeStateStatus: "blocked" }));
+    expect(health.status).toBe("healthy");
+  });
+
+  it("returns healthy when mergeStateStatus is unknown (not actionable alone)", () => {
+    const pr = { ...basePr, mergeStateStatus: "unknown" };
+    const health = checkPrHealth(pr, buildHealth({ mergeStateStatus: "unknown" }));
+    expect(health.status).toBe("healthy");
+  });
+
+  it("returns needs_work when behind is paired with a failing check", () => {
+    const pr = { ...basePr, mergeStateStatus: "behind" };
+    const health = checkPrHealth(
+      pr,
+      buildHealth({ mergeStateStatus: "behind", checkFailures: [{ name: "ci/test", conclusion: "failure" }] }),
+    );
     expect(health.status).toBe("needs_work");
-    expect(health.reason).toBe("Review changes requested");
+  });
+
+  it("returns needs_work when there are failing checks", () => {
+    const health = checkPrHealth(
+      basePr,
+      buildHealth({ checkFailures: [{ name: "ci/build", conclusion: "failure" }] }),
+    );
+    expect(health.status).toBe("needs_work");
+    expect(health.reason).toContain("ci/build");
+  });
+
+  it("returns healthy when mergeStateStatus is clean", () => {
+    const pr = { ...basePr, mergeStateStatus: "clean" };
+    const health = checkPrHealth(pr, buildHealth({ mergeStateStatus: "clean" }));
+    expect(health.status).toBe("healthy");
+  });
+
+  it("prioritizes CHANGES_REQUESTED over dirty merge state (still needs_work)", () => {
+    const pr = { ...basePr, reviewDecision: "CHANGES_REQUESTED", mergeStateStatus: "dirty" };
+    const health = checkPrHealth(
+      pr,
+      buildHealth({ reviewDecision: "CHANGES_REQUESTED", mergeStateStatus: "dirty" }),
+    );
+    expect(health.status).toBe("needs_work");
+    expect(health.reason).toContain("Review changes requested");
   });
 
   it("handles null reviewDecision and mergeStateStatus gracefully", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-      reviewDecision: null,
-      mergeStateStatus: null,
-    };
-    const health = checkPrHealth(pr);
+    const pr = { ...basePr, reviewDecision: null, mergeStateStatus: null };
+    const health = checkPrHealth(pr, buildHealth());
     expect(health.status).toBe("healthy");
     expect(health.reviewDecision).toBe(null);
     expect(health.mergeStateStatus).toBe(null);
   });
 
   it("handles missing reviewDecision and mergeStateStatus fields gracefully", () => {
-    const pr = {
-      number: 42,
-      url: "https://github.com/test/repo/pull/42",
-      title: "Add feature",
-      state: "open",
-      user: { login: "test-user" },
-      head: { ref: "fix/issue-42-feature" },
-      base: { ref: "main" },
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-02T00:00:00Z",
-      merged_at: null,
-      draft: false,
-    } as any;
-    const health = checkPrHealth(pr);
+    const pr = { ...basePr } as any;
+    const health = checkPrHealth(pr, null);
     expect(health.status).toBe("healthy");
   });
 });
@@ -524,11 +398,9 @@ describe("reconcileIssue", () => {
 
     expect(result.hasOpenPr).toBe(true);
   });
-});
 
-describe("prReferencesIssue", () => {
-  it("matches PR by branch name", () => {
-    const pr = {
+  function makeOpenPr(overrides: Partial<GithubPR> = {}): GithubPR {
+    return {
       number: 42,
       url: "https://github.com/test/repo/pull/42",
       title: "Fix issue #42",
@@ -540,9 +412,115 @@ describe("prReferencesIssue", () => {
       updated_at: "2026-01-02T00:00:00Z",
       merged_at: null,
       draft: false,
-    };
-    expect(prReferencesIssue(pr, 42)).toBe(true);
-    expect(prReferencesIssue(pr, 43)).toBe(false);
+      ...overrides,
+    } as GithubPR;
+  }
+
+  it("openPrNeedsWork is false when linked PR is merely behind/blocked", () => {
+    const openPrs = new Map([[42, makeOpenPr({ mergeStateStatus: "behind" })]]);
+    const openPrHealth = new Map([[42, computeLinkedPrHealth({
+      url: "https://github.com/test/repo/pull/42",
+      number: 42,
+      state: "open",
+      draft: false,
+      mergedAt: null,
+      mergeStateStatus: "behind",
+      reviewDecision: null,
+      checkFailures: [],
+    })]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+      new Map(),
+      openPrs,
+      openPrHealth,
+    );
+
+    expect(result.openPrNeedsWork).toBe(false);
+    expect(result.actions[0]?.label).toBe("status/in-review");
+  });
+
+  it("openPrNeedsWork is true when linked PR has failing checks", () => {
+    const openPrs = new Map([[42, makeOpenPr()]]);
+    const openPrHealth = new Map([[42, computeLinkedPrHealth({
+      url: "https://github.com/test/repo/pull/42",
+      number: 42,
+      state: "open",
+      draft: false,
+      mergedAt: null,
+      mergeStateStatus: "clean",
+      reviewDecision: null,
+      checkFailures: [{ name: "ci/test", conclusion: "failure" }],
+    })]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+      new Map(),
+      openPrs,
+      openPrHealth,
+    );
+
+    expect(result.openPrNeedsWork).toBe(true);
+    expect(result.actions[0]?.label).toBe("status/in-progress");
+  });
+
+  it("openPrNeedsWork is true when linked PR has CHANGES_REQUESTED review", () => {
+    const openPrs = new Map([[42, makeOpenPr({ reviewDecision: "CHANGES_REQUESTED" })]]);
+    const openPrHealth = new Map([[42, computeLinkedPrHealth({
+      url: "https://github.com/test/repo/pull/42",
+      number: 42,
+      state: "open",
+      draft: false,
+      mergedAt: null,
+      mergeStateStatus: null,
+      reviewDecision: "CHANGES_REQUESTED",
+      checkFailures: [],
+    })]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+      new Map(),
+      openPrs,
+      openPrHealth,
+    );
+
+    expect(result.openPrNeedsWork).toBe(true);
+  });
+
+  it("openPrNeedsWork is true when linked PR is dirty (merge conflict)", () => {
+    const openPrs = new Map([[42, makeOpenPr({ mergeStateStatus: "dirty" })]]);
+    const openPrHealth = new Map([[42, computeLinkedPrHealth({
+      url: "https://github.com/test/repo/pull/42",
+      number: 42,
+      state: "open",
+      draft: false,
+      mergedAt: null,
+      mergeStateStatus: "dirty",
+      reviewDecision: null,
+      checkFailures: [],
+    })]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+      new Map(),
+      openPrs,
+      openPrHealth,
+    );
+
+    expect(result.openPrNeedsWork).toBe(true);
+  });
+
+  it("falls back to not-needs-work when health is missing for the linked PR", () => {
+    const openPrs = new Map([[42, makeOpenPr({ mergeStateStatus: "dirty" })]]);
+    // No entry in openPrHealth for issue 42 — simulates a failed health fetch.
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: [], state: "open" },
+      new Map(),
+      openPrs,
+      new Map(),
+    );
+
+    expect(result.openPrNeedsWork).toBe(false);
   });
 });
 
@@ -666,20 +644,6 @@ describe("executeAction", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("Forbidden");
-    expect(result.afterLabels).toEqual(["bug"]);
-  });
-
-  it("handles update_lane as no-op", async () => {
-    const action = {
-      type: "update_lane" as const,
-      issueNumber: 42,
-      repoFullName: "test/repo",
-      reason: "Lane update",
-    };
-
-    const result = await executeAction(action, ["bug"]);
-
-    expect(result.success).toBe(true);
     expect(result.afterLabels).toEqual(["bug"]);
   });
 });

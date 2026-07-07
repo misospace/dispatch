@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isValidRepoName } from "@/lib/config";
@@ -7,7 +8,7 @@ import { authorizeRequest } from "@/lib/auth";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   try {
     const repos = await prisma.repository.findMany({
@@ -16,7 +17,7 @@ export async function GET(request: Request) {
     return NextResponse.json(repos);
   } catch (error) {
     console.error("Failed to fetch repos:", error);
-    return NextResponse.json({ error: "Failed to fetch repositories" }, { status: 500 });
+    return errorResponse("Failed to fetch repositories", 500);
   }
 }
 
@@ -24,31 +25,28 @@ export async function GET(request: Request) {
 // tracked repository management.
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return errorResponse("Invalid JSON body", 400);
   }
 
   if (typeof body !== "object" || body === null) {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return errorResponse("Invalid JSON body", 400);
   }
 
   const { fullName } = body as Record<string, unknown>;
 
   if (typeof fullName !== "string" || !fullName) {
-    return NextResponse.json({ error: "fullName is required" }, { status: 400 });
+    return errorResponse("fullName is required", 400);
   }
 
   if (!isValidRepoName(fullName)) {
-    return NextResponse.json(
-      { error: "Invalid fullName format. Expected: owner/repo" },
-      { status: 400 },
-    );
+    return errorResponse("Invalid fullName format. Expected: owner/repo", 400);
   }
 
   try {
@@ -60,12 +58,12 @@ export async function POST(request: Request) {
     return response;
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      return NextResponse.json({ error: "Repository is already tracked" }, { status: 409 });
+      return errorResponse("Repository is already tracked", 409);
     }
 
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     await auditTrackedRepoCreateFailure(fullName, errorMessage);
     console.error("Failed to create repo:", error);
-    return NextResponse.json({ error: errorMessage }, { status: 500 });
+    return errorResponse(errorMessage, 500);
   }
 }

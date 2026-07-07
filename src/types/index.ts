@@ -65,16 +65,6 @@ export interface Issue {
   linkedPrHealthCheckedAt?: Date | null;
 }
 
-export interface StoredIssueLane {
-  id: string;
-  issueId: string;
-  lane: string;
-  confidence: string;
-  reason: string | null;
-  model: string | null;
-  judgedAt: Date;
-}
-
 export interface AgentRun {
   id: string;
   agentName: string;
@@ -122,6 +112,13 @@ export const BOARD_COLUMNS: BoardColumn[] = [
 ];
 
 export const STATUS_LABELS: StatusLabel[] = BOARD_COLUMNS.map((col) => col.id);
+
+/**
+ * Statuses that mean an issue is actively in flight (queued or claimed).
+ * Used by sync/reconcile to decide which cached issues may be stale.
+ */
+export const ACTIVE_STATUS_LABELS: StatusLabel[] = ["status/ready", "status/in-progress", "status/in-review"];
+
 export const PRIORITY_LABELS: PriorityLabel[] = ["priority/p0", "priority/p1", "priority/p2", "priority/p3"];
 
 /** Type guard: is `label` one of the allowed `status/*` labels? */
@@ -135,11 +132,8 @@ export const OWNER_PREFIX = "owner/";
 // Lane classification types and constants
 // NOTE: These represent the default configuration. For runtime validation,
 // use isValidLane() from "@/lib/lane-config" which respects custom lane config.
-export type IssueLaneValue = "local" | "cloud" | "frontier" | "backlog";
 export type ConfidenceValue = "high" | "medium" | "low";
 
-/** @deprecated Use getLaneIds() from "@/lib/lane-config" for runtime validation */
-export const VALID_LANES: IssueLaneValue[] = ["local", "cloud", "frontier", "backlog"];
 export const VALID_CONFIDENCE: ConfidenceValue[] = ["high", "medium", "low"];
 
 export function isAgentLabel(label: string): label is AgentLabel {
@@ -154,9 +148,17 @@ export function getStatusFromLabels(labels: string[]): StatusLabel | null {
   return STATUS_LABELS.find((l) => labels.includes(l)) ?? null;
 }
 
-export function getProjectFromLabels(labels: string[]): string | null {
-  const projectLabel = labels.find((l: string) => l.startsWith(PROJECT_PREFIX));
-  return projectLabel?.replace(PROJECT_PREFIX, "") ?? null;
+/**
+ * Effective board status for an issue: closed issues are always Done,
+ * otherwise the explicit status label, defaulting to Backlog.
+ */
+export function getEffectiveStatus(labels: string[], state: string): StatusLabel {
+  const status = getStatusFromLabels(labels);
+
+  if (state === "closed") return "status/done";
+  if (status) return status;
+
+  return "status/backlog";
 }
 
 export function getAgentFromLabels(labels: string[]): AgentLabel | null {
@@ -210,18 +212,6 @@ export function isValidEscalatedOutcome(outcome: string): outcome is EscalatedOu
   return VALID_ESCALATED_OUTCOMES.includes(outcome as EscalatedOutcome);
 }
 
-/**
- * Human-readable label for an escalated-lane outcome.
- */
-export const ESCALATED_OUTCOME_LABELS: Record<EscalatedOutcome, string> = {
-  PR_OPENED: "PR opened",
-  PR_UPDATED: "PR updated",
-  FOLLOW_UP_CREATED: "Follow-up issues created",
-  DESIGN_COMMENT_POSTED: "Design/RFC comment posted",
-  DECOMPOSED_SKIPPED: "Decomposed/skipped",
-  STUCK: "Stuck",
-};
-
 // ─── PR Review-Fix Queue Constants and Helpers ───────────────────────────────
 
 export type PrFixLane = "NORMAL" | "ESCALATED" | "NEEDS_HUMAN";
@@ -271,7 +261,7 @@ export function isValidPrFixStatus(status: string): status is PrFixStatus {
 export function normalizePrFixLane(lane?: string | null): PrFixLane {
   if (!lane) return "NORMAL";
   const normalized = lane.trim().toUpperCase().replace(/-/g, "_");
-  if (normalized === "NEEDS_HUMAN" || normalized === "NEEDS-HUMAN") return "NEEDS_HUMAN";
+  if (normalized === "NEEDS_HUMAN") return "NEEDS_HUMAN";
   return isValidPrFixLane(normalized) ? normalized : "NEEDS_HUMAN";
 }
 
@@ -326,11 +316,11 @@ export function isValidGroomAction(action: string): action is GroomAction {
 }
 
 export function normalizeGroomAction(action: string): GroomAction | null {
-  const normalized = action.trim().toLowerCase().replace(/_/g, "_");
+  const normalized = action.trim().toLowerCase();
   if (normalized === "promote" || normalized === "ready" || normalized === "promote_to_ready") return "promote_to_ready";
   if (normalized === "escalate" || normalized === "escalated") return "escalate";
   if (normalized === "not_ready" || normalized === "notready" || normalized === "keep_backlog") return "mark_not_ready";
-  if (normalized === "needs_info" || normalized === "needsinfo" || normalized === "needs_info") return "mark_needs_info";
+  if (normalized === "needs_info" || normalized === "needsinfo") return "mark_needs_info";
   if (normalized === "blocked" || normalized === "stuck") return "mark_blocked";
   return isValidGroomAction(normalized) ? normalized : null;
 }

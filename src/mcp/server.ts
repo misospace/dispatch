@@ -15,16 +15,20 @@ import {
 
 type ExtraArgs = Record<string, unknown>;
 
-function getArg(args: ExtraArgs, key: string): unknown {
-  return args[key];
+interface ToolResult {
+  [key: string]: unknown;
+  content: { type: "text"; text: string }[];
+  isError?: boolean;
 }
 
-export async function resolveIssueHandler(args: ExtraArgs) {
+/**
+ * Shared tool-handler skeleton: run the client call, wrap the result as
+ * pretty-printed JSON text, and translate DispatchClientError into the
+ * standard error shape. Other errors are rethrown.
+ */
+async function wrapToolCall(fn: () => Promise<unknown>): Promise<ToolResult> {
   try {
-    const result = await resolveIssue(
-      getArg(args, "repoFullName") as string,
-      getArg(args, "issueNumber") as number,
-    );
+    const result = await fn();
     return {
       content: [
         {
@@ -49,182 +53,84 @@ export async function resolveIssueHandler(args: ExtraArgs) {
   }
 }
 
-export async function claimIssueHandler(args: ExtraArgs) {
-  try {
-    const explicitAgentName = getArg(args, "agentName") as string | undefined;
-    const resolvedAgentName = resolveAgentName(explicitAgentName);
+export async function resolveIssueHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    resolveIssue(
+      args.repoFullName as string,
+      args.issueNumber as number,
+    ),
+  );
+}
 
-    if (!resolvedAgentName) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
-            }, null, 2),
-          },
-        ],
-        isError: true,
-      };
-    }
+export async function claimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
+  const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
 
-    const result = await claimIssue(
-      getArg(args, "repoFullName") as string,
-      getArg(args, "issueNumber") as number,
+  if (!resolvedAgentName) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
+          }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return wrapToolCall(() =>
+    claimIssue(
+      args.repoFullName as string,
+      args.issueNumber as number,
       resolvedAgentName,
-      getArg(args, "force") as boolean | undefined,
-    );
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
-  } catch (error) {
-    if (error instanceof DispatchClientError) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-    throw error;
-  }
+      args.force as boolean | undefined,
+    ),
+  );
 }
 
-export async function setIssueStatusHandler(args: ExtraArgs) {
-  try {
-    const result = await setIssueStatus(
-      getArg(args, "repoFullName") as string,
-      getArg(args, "issueNumber") as number,
-      getArg(args, "status") as string,
-      getArg(args, "agentName") as string | undefined,
-    );
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
-  } catch (error) {
-    if (error instanceof DispatchClientError) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-    throw error;
-  }
+export async function setIssueStatusHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    setIssueStatus(
+      args.repoFullName as string,
+      args.issueNumber as number,
+      args.status as string,
+      args.agentName as string | undefined,
+    ),
+  );
 }
 
-export async function claimWorkHandler(args: ExtraArgs) {
-  try {
-    const explicitAgentName = getArg(args, "agentName") as string | undefined;
-    const result = await claimWork(
-      getArg(args, "repoFullName") as string,
-      getArg(args, "issueNumber") as number,
-      explicitAgentName,
+export async function claimWorkHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    claimWork(
+      args.repoFullName as string,
+      args.issueNumber as number,
+      args.agentName as string | undefined,
       {
-        status: (getArg(args, "status") as string) ?? "in-progress",
-        force: getArg(args, "force") as boolean | undefined,
-        refreshBeforeClaim: getArg(args, "refreshBeforeClaim") as boolean | undefined,
+        status: (args.status as string) ?? "in-progress",
+        force: args.force as boolean | undefined,
+        refreshBeforeClaim: args.refreshBeforeClaim as boolean | undefined,
       },
-    );
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
-  } catch (error) {
-    if (error instanceof DispatchClientError) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-    throw error;
-  }
+    ),
+  );
 }
 
-export async function refreshIssueHandler(args: ExtraArgs) {
-  try {
-    const result = await refreshIssue(
-      getArg(args, "repoFullName") as string,
-      getArg(args, "issueNumber") as number,
-    );
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
-  } catch (error) {
-    if (error instanceof DispatchClientError) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-    throw error;
-  }
+export async function refreshIssueHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    refreshIssue(
+      args.repoFullName as string,
+      args.issueNumber as number,
+    ),
+  );
 }
 
-export async function syncRepoHandler(args: ExtraArgs) {
-  try {
-    const result = await syncRepo(
-      getArg(args, "repoFullName") as string,
-    );
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
-  } catch (error) {
-    if (error instanceof DispatchClientError) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-    throw error;
-  }
+export async function syncRepoHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    syncRepo(
+      args.repoFullName as string,
+    ),
+  );
 }
 
 export function createServer(): McpServerType {

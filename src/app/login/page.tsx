@@ -2,15 +2,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-
-const DEFAULT_CALLBACK_URL = "/board";
-
-function safeCallbackUrl(raw: string | null): string {
-  if (!raw || raw.trim() === "") return DEFAULT_CALLBACK_URL;
-  if (raw.startsWith("//") || /^https?:\/\//i.test(raw)) return DEFAULT_CALLBACK_URL;
-  if (raw.startsWith("/")) return raw;
-  return DEFAULT_CALLBACK_URL;
-}
+import { safeCallbackUrl } from "@/lib/callback-url";
 
 export default function LoginPage() {
   return (

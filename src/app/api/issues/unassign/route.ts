@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
@@ -20,7 +21,7 @@ type UnassignPayload = {
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const auditActor = getAuthorizedActor(auth, request);
 
@@ -29,33 +30,27 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const payload = body as UnassignPayload;
 
     if (!payload.action || !payload.issueId || !payload.repoFullName || typeof payload.issueNumber !== "number") {
-      return NextResponse.json(
-        { error: "Missing required fields: action, issueId, repoFullName, issueNumber" },
-        { status: 400 }
-      );
+      return errorResponse("Missing required fields: action, issueId, repoFullName, issueNumber", 400);
     }
 
     if (payload.action !== "unassign_agent" && payload.action !== "unassign_owner") {
-      return NextResponse.json(
-        { error: `Invalid action: ${payload.action}. Allowed: unassign_agent, unassign_owner` },
-        { status: 400 }
-      );
+      return errorResponse(`Invalid action: ${payload.action}. Allowed: unassign_agent, unassign_owner`, 400);
     }
 
     try {
       const issue = await prisma.issue.findUnique({ where: { id: payload.issueId } });
       if (!issue) {
-        return NextResponse.json({ error: `Issue not found: ${payload.issueId}` }, { status: 404 });
+        return errorResponse(`Issue not found: ${payload.issueId}`, 404);
       }
 
       const currentLabels = issue.labels;
@@ -66,7 +61,7 @@ export async function POST(request: Request) {
         : getOwnerLabels(currentLabels);
 
       if (labelsToRemove.length === 0) {
-        return NextResponse.json({ error: `No ${payload.action === "unassign_agent" ? "agent" : "owner"} label found on this issue` }, { status: 400 });
+        return errorResponse(`No ${payload.action === "unassign_agent" ? "agent" : "owner"} label found on this issue`, 400);
       }
 
       const newLabels = buildUnassignedLabels(currentLabels, payload.action);
@@ -119,10 +114,10 @@ export async function POST(request: Request) {
         // Audit log failure should not mask the real error
       }
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Unassign action failed:", error);
-    return NextResponse.json({ error: "Failed to process unassign" }, { status: 500 });
+    return errorResponse("Failed to process unassign", 500);
   }
 }

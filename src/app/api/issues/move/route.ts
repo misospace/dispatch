@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { updateIssueLabels, removeIssueLabel, addIssueLabel } from "@/lib/github";
+import { removeIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, isStatusLabel } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { transitionIssueStatus } from "@/lib/issue-status";
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -15,11 +17,11 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const { issueId, repoFullName, issueNumber, oldLabels, newLabels, actor: bodyActor } = body as Record<string, unknown>;
@@ -27,7 +29,7 @@ export async function POST(request: Request) {
 
     // Validate required fields with explicit type checks
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !oldLabels || !newLabels) {
-      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+      return errorResponse("Missing required fields", 400);
     }
 
     // Validate status labels are from the allowed set
@@ -35,32 +37,31 @@ export async function POST(request: Request) {
     const newStatusLabel = (newLabels as string[]).find((l: string) => l.startsWith("status/"));
 
     if (oldStatusLabel && !isStatusLabel(oldStatusLabel)) {
-      return NextResponse.json(
-        { error: `Invalid status label: ${oldStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid status label: ${oldStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}`, 400);
     }
 
     if (newStatusLabel && !isStatusLabel(newStatusLabel)) {
-      return NextResponse.json(
-        { error: `Invalid status label: ${newStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}` },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid status label: ${newStatusLabel}. Allowed: ${STATUS_LABELS.join(", ")}`, 400);
     }
 
     try {
-      const labelsToRemove = oldStatusLabel && oldStatusLabel !== newStatusLabel ? [oldStatusLabel] : [];
-      const labelsToAdd = newStatusLabel && oldStatusLabel !== newStatusLabel ? [newStatusLabel] : [];
-
-      for (const label of labelsToRemove) {
-        await removeIssueLabel(repoFullName as string, issueNumber as number, label);
-      }
-
-      for (const label of labelsToAdd) {
-        await addIssueLabel(repoFullName as string, issueNumber as number, label);
-      }
-
+      // Use the cached issue's real current labels (not just the single
+      // label the client computed) as the source of truth for the status
+      // swap, so every status/* label on GitHub gets cleaned up even if the
+      // client only knew about one of them. Falls back to the client-sent
+      // oldLabels when the issue isn't in the local cache.
       const issue = await prisma.issue.findUnique({ where: { id: issueId as string } });
+      const effectiveCurrentLabels = issue?.labels ?? (oldLabels as string[]);
+
+      if (newStatusLabel) {
+        await transitionIssueStatus(repoFullName as string, issueNumber as number, effectiveCurrentLabels, newStatusLabel);
+      } else if (oldStatusLabel) {
+        // No target status in the new label set — drop the old one with no
+        // replacement (rare: kanban-board.tsx always targets a status-bearing
+        // column today, but the API contract allows this).
+        await removeIssueLabel(repoFullName as string, issueNumber as number, oldStatusLabel);
+      }
+
       if (issue) {
         await prisma.issue.update({
           where: { id: issueId as string },
@@ -99,10 +100,10 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Move issue failed:", error);
-    return NextResponse.json({ error: "Failed to move issue" }, { status: 400 });
+    return errorResponse("Failed to move issue", 400);
   }
 }

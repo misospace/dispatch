@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { getGroomingRunDetail } from "@/lib/groomer/history";
@@ -9,7 +10,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   const { id } = await params;
@@ -17,11 +18,10 @@ export async function GET(
   try {
     const run = await getGroomingRunDetail(prisma, id);
     if (!run) {
-      return NextResponse.json({ error: "Grooming run not found" }, { status: 404 });
+      return errorResponse("Grooming run not found", 404);
     }
     return NextResponse.json(jsonSafe(run));
   } catch (error) {
-    console.error("Failed to fetch grooming run:", error);
-    return NextResponse.json({ error: "Failed to fetch grooming run" }, { status: 500 });
+    return handleApiError("fetch grooming run", error);
   }
 }

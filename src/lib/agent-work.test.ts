@@ -71,12 +71,12 @@ describe("parseCheckpointAgentWorkInput", () => {
 
   it("returns error when checkpoint is a nested object", () => {
     const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: { nested: "value" } });
-    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, not an object" });
+    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, got object" });
   });
 
   it("returns error when checkpoint is an array", () => {
     const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: ["CHANGES_MADE"] });
-    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, not an object" });
+    expect(result).toEqual({ error: "Invalid checkpoint value: expected a string, got object" });
   });
 
   it("returns error when checkpoint is a number", () => {
@@ -180,12 +180,12 @@ describe("parseFinishAgentWorkInput", () => {
 
   it("returns error when state is a nested object", () => {
     const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: { nested: "DONE" } });
-    expect(result).toEqual({ error: "Invalid state value: expected a string, not an object" });
+    expect(result).toEqual({ error: "Invalid state value: expected a string, got object" });
   });
 
   it("returns error when state is an array", () => {
     const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: ["DONE"] });
-    expect(result).toEqual({ error: "Invalid state value: expected a string, not an object" });
+    expect(result).toEqual({ error: "Invalid state value: expected a string, got object" });
   });
 
   it("returns error when state is a number", () => {
@@ -216,7 +216,7 @@ describe("parseFinishAgentWorkInput", () => {
 describe("startAgentWork", () => {
   it("creates work and releases existing active work on same issue", async () => {
     const tx = createMockTransaction();
-    tx.agentWork.findFirst.mockResolvedValueOnce({ id: "old-work", state: "IN_PROGRESS" });
+    tx.agentWork.findMany.mockResolvedValueOnce([{ id: "old-work", state: "IN_PROGRESS" }]);
 
     await startAgentWork(tx, { agentName: "agent-1", issueId: "issue-1" });
 
@@ -230,9 +230,7 @@ describe("startAgentWork", () => {
 
   it("releases other active work for the agent", async () => {
     const tx = createMockTransaction();
-    tx.agentWork.findFirst
-      .mockResolvedValueOnce({ id: "old-work-other", state: "IN_PROGRESS" })
-      .mockResolvedValueOnce(null);
+    tx.agentWork.findMany.mockResolvedValueOnce([{ id: "old-work-other", state: "IN_PROGRESS" }]);
 
     await startAgentWork(tx, { agentName: "agent-1", issueId: "issue-2" });
 
@@ -314,7 +312,7 @@ function createMockTransaction() {
   const agentWork = {
     findUnique: vi.fn(),
     findFirst: vi.fn(),
-    findMany: vi.fn(),
+    findMany: vi.fn().mockResolvedValue([]),
     create: vi.fn().mockResolvedValue({ id: "work-1", state: "CLAIMED", checkpoint: "CLAIMED" }),
     update: vi.fn().mockResolvedValue({ id: "work-1" }),
   };

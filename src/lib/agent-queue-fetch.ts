@@ -60,27 +60,35 @@ export async function fetchAgentQueueData(
   };
   applyRenovateIssueExclusion(issueWhere);
 
-  // Fetch all open issues from enabled repos (GitHub Issues as source of truth)
-  const issues = await prisma.issue.findMany({
-    where: issueWhere,
-    select: {
-      id: true,
-      number: true,
-      title: true,
-      url: true,
-      labels: true,
-      currentLane: true,
-      decomposed: true,
-      repository: { select: { fullName: true } },
-      linkedPrNumber: true,
-      linkedPrUrl: true,
-      linkedPrNeedsFollowup: true,
-      linkedPrFollowupReasons: true,
-      linkedPrReviewDecision: true,
-      linkedPrMergeState: true,
-      linkedPrHealthCheckedAt: true,
-    },
-  });
+  // The open-issue list, active leases, and queued PR fix items are
+  // independent — fetch them in parallel.
+  const [issues, leasedIssueIds, prFixItemsRaw] = await Promise.all([
+    // Fetch all open issues from enabled repos (GitHub Issues as source of truth)
+    prisma.issue.findMany({
+      where: issueWhere,
+      select: {
+        id: true,
+        number: true,
+        title: true,
+        url: true,
+        labels: true,
+        currentLane: true,
+        decomposed: true,
+        repository: { select: { fullName: true } },
+        linkedPrNumber: true,
+        linkedPrUrl: true,
+        linkedPrNeedsFollowup: true,
+        linkedPrFollowupReasons: true,
+        linkedPrReviewDecision: true,
+        linkedPrMergeState: true,
+        linkedPrHealthCheckedAt: true,
+      },
+    }),
+    // Find issues that have active leases from OTHER agents — exclude them
+    findLeasedIssueIds(agentName),
+    // List queued PR fix items (uses raw lane for pr-fix queue normalization)
+    listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane }),
+  ]);
 
   // Resolve lane through alias map (returns null for unknown lanes)
   const resolvedLane = resolveRequestLane(lane?.toLowerCase());
@@ -89,16 +97,9 @@ export async function fetchAgentQueueData(
   // Validate: if a lane was provided but resolution returned null, it's invalid
   const laneValid = !(lane && resolvedLane === null);
 
-  // Find issues that have active leases from OTHER agents — exclude them
-  const leasedIssueIds = await findLeasedIssueIds(agentName);
-
-  // List queued PR fix items (uses raw lane for pr-fix queue normalization)
-  const prFixItemsRaw = await listQueuedPrFixItems(asPrFixQueueClient(prisma), {
-    lane,
-  });
-
   // Filter out leased issue IDs before building the queue
-  const filteredIssues = issues.filter((issue) => !leasedIssueIds.includes(issue.id));
+  const leasedIssueIdSet = new Set(leasedIssueIds);
+  const filteredIssues = issues.filter((issue) => !leasedIssueIdSet.has(issue.id));
 
   // Build ranked issue queue
   const rankedQueue = buildAgentQueue(

@@ -1,5 +1,5 @@
 import { VALID_CONFIDENCE } from "@/types";
-import { classifyLaneFromSignals, isValidLane as isValidLaneConfig } from "@/lib/lane-config";
+import { classifyLaneFromSignals, isValidLane as isValidLaneConfig, LaneSignals } from "@/lib/lane-config";
 
 /**
  * A lane classification result for an issue.
@@ -93,55 +93,101 @@ export function validateLaneRecord(data: unknown): {
   };
 }
 
+// ─── Heuristic Lane Classification ────────────────────────────────────────────
+
 /**
- * Build a fallback classification when model classification fails.
- * Uses simple heuristics based on labels and title/body content.
- * Returns configured lane ids — never hardcoded strings.
+ * Shared escalation keyword list used by classifyLaneByHeuristics and
+ * stale-backlog reclassification.
  */
-export function classifyByHeuristics(
+const ESCALATION_KEYWORDS = [
+  "architecture",
+  "audit",
+  "design doc",
+  "rfc",
+  "alternatives considered",
+  "migration strategy",
+  "cross-service",
+  "distributed system",
+  "audit parent",
+  "parent issue",
+  "umbrella",
+  "decomposition",
+];
+
+/**
+ * Shared backlog signal list.
+ */
+const BACKLOG_SIGNALS = [
+  "status/backlog",
+  "type/research",
+  "tbd",
+  "to be determined",
+  "placeholder",
+  "more details needed",
+  "needs more info",
+];
+
+/**
+ * Shared escalation label signals.
+ */
+const ESCALATION_LABELS = ["needs-escalation", "needs-gpt"];
+
+/**
+ * Evaluate heuristic signals for an issue. Returns structured signals that can
+ * be mapped to a configured lane via classifyLaneFromSignals.
+ */
+export function evaluateLaneSignals(
+  title: string,
+  body: string | null,
+  labels: string[],
+): LaneSignals & { reason: string } {
+  const text = `${title} ${body ?? ""}`.toLowerCase();
+  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
+
+  // Check backlog first (highest priority exclusion)
+  for (const signal of BACKLOG_SIGNALS) {
+    if (text.includes(signal) || labelSet.has(signal)) {
+      return { isBacklog: true, isEscalation: false, reason: `Backlog signal detected: ${signal}` };
+    }
+  }
+
+  // Explicit escalation labels take precedence over text heuristics
+  if (ESCALATION_LABELS.some((s) => labelSet.has(s))) {
+    return { isBacklog: false, isEscalation: true, reason: "Escalation label detected" };
+  }
+
+  // Check escalated signals
+  const escalationMatches = ESCALATION_KEYWORDS.filter((s) => text.includes(s));
+  if (escalationMatches.length > 0 && !labelSet.has("status/backlog")) {
+    return { isBacklog: false, isEscalation: true, reason: `Escalation keywords: ${escalationMatches.join(", ")}` };
+  }
+
+  // Default: concrete, actionable issues
+  return { isBacklog: false, isEscalation: false, reason: "Default classification: concrete implementation work" };
+}
+
+/**
+ * Heuristic lane classification when model calls are unavailable.
+ * Uses label patterns and issue content to infer the correct execution lane.
+ * Returns a configured lane id — never an unknown string.
+ */
+export function classifyLaneByHeuristics(
   title: string,
   body: string | null,
   labels: string[],
 ): LaneClassification {
-  const text = `${title} ${body ?? ""}`.toLowerCase();
-  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
+  const signals = evaluateLaneSignals(title, body, labels);
 
-  // Check for backlog indicators
-  if (labelSet.has("status/backlog") || labelSet.has("type/research")) {
-    return {
-      lane: classifyLaneFromSignals({ isBacklog: true, isEscalation: false }),
-      confidence: "high",
-      reason: "Issue marked as backlog or research type",
-    };
+  let confidence: "high" | "medium" | "low" = "medium";
+  if (signals.isBacklog) {
+    confidence = "high";
+  } else if (signals.isEscalation && ESCALATION_LABELS.some((l) => labels.map((x) => x.toLowerCase()).includes(l))) {
+    confidence = "high";
   }
 
-  // Check for escalated indicators (but not just priority/escalated labels)
-  const escalationKeywords = [
-    "architecture",
-    "design doc",
-    "rfc",
-    "alternatives",
-    "migration strategy",
-    "cross-service",
-    "distributed system",
-    "audit parent",
-    "parent issue",
-    "umbrella",
-    "decomposition",
-  ];
-  const hasEscalationKeyword = escalationKeywords.some((kw) => text.includes(kw));
-  if (hasEscalationKeyword && !labelSet.has("status/backlog")) {
-    return {
-      lane: classifyLaneFromSignals({ isBacklog: false, isEscalation: true }),
-      confidence: "medium",
-      reason: "Issue contains architecture/design/audit decomposition keywords",
-    };
-  }
-
-  // Default to normal for concrete, actionable issues
   return {
-    lane: classifyLaneFromSignals({ isBacklog: false, isEscalation: false }),
-    confidence: "medium",
-    reason: "Default classification: concrete implementation work",
+    lane: classifyLaneFromSignals({ isBacklog: signals.isBacklog, isEscalation: signals.isEscalation }),
+    confidence,
+    reason: signals.reason,
   };
 }

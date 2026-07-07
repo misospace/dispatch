@@ -1,6 +1,10 @@
 import { prisma } from "@/lib/prisma";
 
-export function parseRepoList(input: string | undefined): string[] {
+/**
+ * Parse a comma/newline-delimited list into trimmed, deduped entries
+ * (order preserved). Shared by the agent, excluded-label, and repo parsers.
+ */
+function parseDelimitedList(input: string | undefined): string[] {
   if (!input) return [];
 
   const seen = new Set<string>();
@@ -11,10 +15,6 @@ export function parseRepoList(input: string | undefined): string[] {
     const trimmed = part.trim();
     if (!trimmed) continue;
     if (seen.has(trimmed)) continue;
-    const parts = trimmed.split("/");
-    if (parts.length !== 2) continue;
-    const [owner, repo] = parts;
-    if (!owner || !repo || owner.includes(" ") || repo.includes(" ")) continue;
     seen.add(trimmed);
     result.push(trimmed);
   }
@@ -22,22 +22,12 @@ export function parseRepoList(input: string | undefined): string[] {
   return result;
 }
 
+export function parseRepoList(input: string | undefined): string[] {
+  return parseDelimitedList(input).filter(isValidRepoName);
+}
+
 export function parseAgentList(input: string | undefined): string[] {
-  if (!input) return [];
-
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  const parts = input.split(/[,\n]/);
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    if (seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    result.push(trimmed);
-  }
-
-  return result;
+  return parseDelimitedList(input);
 }
 
 export function isValidRepoName(fullName: string): boolean {
@@ -75,21 +65,7 @@ export async function getTrackedRepos(): Promise<string[]> {
 }
 
 export function parseExcludedLabels(input: string | undefined): string[] {
-  if (!input) return [];
-
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  const parts = input.split(/[,\n]/);
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    if (seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    result.push(trimmed);
-  }
-
-  return result;
+  return parseDelimitedList(input);
 }
 
 export async function getSyncRepos(): Promise<{ id: string; fullName: string }[]> {

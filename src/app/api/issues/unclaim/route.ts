@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, updateIssueLabels } from "@/lib/github";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
@@ -7,11 +8,12 @@ import {
   releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue,
 } from "@/lib/lease";
+import { transitionIssueStatus } from "@/lib/issue-status";
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -19,18 +21,18 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const { issueId, repoFullName, issueNumber, agentName } = body as Record<string, unknown>;
 
     // Validate required fields
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
-      return NextResponse.json({ error: "Missing required fields: issueId, repoFullName, issueNumber, agentName" }, { status: 400 });
+      return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
 
     const agentLabel = `${AGENT_PREFIX}${agentName}` as const;
@@ -44,38 +46,40 @@ export async function POST(request: Request) {
     });
 
     if (!issue) {
-      return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+      return errorResponse("Issue not found in local cache", 404);
     }
 
     // Refuse closed issues
     if (issue.state === "closed") {
-      return NextResponse.json({ error: "Cannot unclaim a closed issue" }, { status: 400 });
+      return errorResponse("Cannot unclaim a closed issue", 400);
     }
 
     // Refuse done issues
     const currentStatus = issue.labels.find((l) => l.startsWith("status/"));
     if (currentStatus === "status/done") {
-      return NextResponse.json({ error: "Cannot unclaim a done issue" }, { status: 400 });
+      return errorResponse("Cannot unclaim a done issue", 400);
     }
 
     // Check if the agent is actually assigned
     const currentAgent = getAgentFromLabels(issue.labels);
     if (!currentAgent || currentAgent !== agentLabel) {
-      return NextResponse.json(
-        { error: `Issue is not assigned to ${agentName}` },
-        { status: 400 },
-      );
+      return errorResponse(`Issue is not assigned to ${agentName}`, 400);
     }
 
     try {
       // Compute the new label set: drop the agent label; if status/in-progress,
-      // flip to status/ready so the issue leaves the In Progress column.
+      // flip to status/ready so the issue leaves the In Progress column. The
+      // status swap itself is routed through the shared helper so it removes
+      // ALL status/* labels (not just in-progress) consistently with the
+      // other label routes.
       let updatedLabels = issue.labels.filter((l) => l !== agentLabel);
       if (updatedLabels.includes("status/in-progress")) {
-        updatedLabels = updatedLabels.filter((l) => l !== "status/in-progress");
-        if (!updatedLabels.includes("status/ready")) {
-          updatedLabels.push("status/ready");
-        }
+        updatedLabels = await transitionIssueStatus(
+          repoFullName as string,
+          issueNumber as number,
+          updatedLabels,
+          "status/ready",
+        );
       }
 
       // Apply label changes to GitHub (conflict-aware: re-applies all
@@ -141,10 +145,10 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Unclaim issue failed:", error);
-    return NextResponse.json({ error: "Failed to unclaim issue" }, { status: 500 });
+    return errorResponse("Failed to unclaim issue", 500);
   }
 }

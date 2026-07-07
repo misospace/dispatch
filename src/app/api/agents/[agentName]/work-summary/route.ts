@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
@@ -29,7 +30,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   const { agentName } = await params;
 
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -112,7 +113,6 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
 
     return NextResponse.json(response);
   } catch (error) {
-    console.error("Failed to fetch work summary:", error);
-    return NextResponse.json({ error: "Failed to fetch work summary" }, { status: 500 });
+    return handleApiError("fetch work summary", error);
   }
 }

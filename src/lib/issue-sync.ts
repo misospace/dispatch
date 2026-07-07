@@ -1,5 +1,7 @@
-import { GitHubIssue } from "@/types";
+import { ACTIVE_STATUS_LABELS, GitHubIssue } from "@/types";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { prisma } from "@/lib/prisma";
+import { fetchIssues } from "@/lib/github";
 
 export interface SyncRepo {
   id: string;
@@ -22,7 +24,7 @@ export interface SyncedIssueData {
 }
 
 export interface IssueStore {
-  findIssue(repositoryId: string, number: number): Promise<{ id: string } | null>;
+  findIssue(repositoryId: string, number: number): Promise<{ id: string; labels: string[] } | null>;
   updateIssue(id: string, data: SyncedIssueData): Promise<void>;
   createIssue(repositoryId: string, data: SyncedIssueData): Promise<void>;
 }
@@ -39,7 +41,7 @@ export interface RefreshIssueResult {
   issueNumber: number;
   action: "created" | "updated";
   error: string | null;
-  issueData?: SingleIssueData;
+  issueData?: SyncedIssueData;
 }
 
 export interface ReconcileClosedIssueResult {
@@ -63,38 +65,6 @@ export interface SyncResponse {
   repos: number;
   syncedCount: number;
   results: SyncResult[];
-}
-
-export interface SingleIssueData {
-  number: number;
-  title: string;
-  body: string | null;
-  url: string;
-  labels: string[];
-  assignees: string[];
-  commentsCount: number;
-  createdAt: Date;
-  updatedAt: Date;
-  closedAt: Date | null;
-  lastSyncedAt: Date;
-  state: string;
-}
-
-export function githubIssueToSingleIssueData(ghIssue: GitHubIssue): SingleIssueData {
-  return {
-    number: ghIssue.number,
-    title: ghIssue.title,
-    body: ghIssue.body,
-    url: ghIssue.html_url,
-    labels: ghIssue.labels.map((label) => label.name),
-    assignees: ghIssue.assignees.map((assignee) => assignee.login),
-    commentsCount: ghIssue.comments,
-    createdAt: new Date(ghIssue.created_at),
-    updatedAt: new Date(ghIssue.updated_at),
-    closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : null,
-    lastSyncedAt: new Date(),
-    state: ghIssue.state,
-  };
 }
 
 export function githubIssueToSyncedIssueData(ghIssue: GitHubIssue, lastSyncedAt = new Date()): SyncedIssueData {
@@ -153,7 +123,7 @@ export function closedIssueStatusFix(
 
 export async function syncIssuesForRepos(
   repos: SyncRepo[],
-  fetchIssues: (repoFullName: string) => Promise<GitHubIssue[]>,
+  fetchIssues: (repo: SyncRepo) => Promise<GitHubIssue[]>,
   store: IssueStore,
   excludedLabels: string[] = [],
   // Optional: push the closed⇒done status-label change to GitHub too, so the
@@ -165,7 +135,7 @@ export async function syncIssuesForRepos(
 
   for (const repo of repos) {
     try {
-      const githubIssues = await fetchIssues(repo.fullName);
+      const githubIssues = await fetchIssues(repo);
       let repoSyncedCount = 0;
 
       for (const ghIssue of githubIssues) {
@@ -182,8 +152,11 @@ export async function syncIssuesForRepos(
         const existingIssue = await store.findIssue(repo.id, ghIssue.number);
 
         if (existingIssue) {
-          // Preserve agent/* labels from Prisma in case GitHub hasn't propagated yet
-          // This is handled by the caller's updateIssue callback via the extended store
+          // Preserve agent/* labels from the cached record in case GitHub hasn't
+          // propagated a concurrent claim yet (see mergeLabels).
+          if (existingIssue.labels.length > 0) {
+            issueData.labels = mergeLabels(issueData.labels, existingIssue.labels);
+          }
           await store.updateIssue(existingIssue.id, issueData);
         } else {
           await store.createIssue(repo.id, issueData);
@@ -225,7 +198,7 @@ export async function syncIssuesForRepos(
  * When a GitHub issue with one of these labels is found to be closed,
  * the old status label is replaced with status/done.
  */
-const RECONCILABLE_STATUS_LABELS = ["status/backlog", "status/ready", "status/in-progress", "status/in-review"] as const;
+const RECONCILABLE_STATUS_LABELS = ["status/backlog", ...ACTIVE_STATUS_LABELS] as const;
 
 export async function reconcileClosedIssues(
   repos: SyncRepo[],
@@ -344,6 +317,116 @@ export async function reconcileClosedIssues(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Shared Prisma/GitHub wiring
+//
+// The manual sync route, the scheduled sync route, and the heartbeat
+// orchestrator all drive syncIssuesForRepos/reconcileClosedIssues with the
+// same fetch wrapper and Prisma-backed stores. Defined once here so the three
+// call sites cannot drift.
+// ---------------------------------------------------------------------------
+
+// Sync must see closed issues, or closedIssueStatusFix never runs: the
+// closed=>done enforcement (#521) only applies to issues in the fetch set,
+// and the default fetch is state=open. Regressed to open-only when the
+// heartbeat cron (whose reconcile did its own closed fetch) was retired.
+//
+// Overlap window subtracted from the sync anchor before it's used as `since`.
+// Covers issues that changed during the previous sync's fetch window (GitHub's
+// `since` filters on updated_at, and a sync run takes nonzero time to
+// complete), so a race can't drop an issue that was updated mid-sync.
+export const SYNC_OVERLAP_BUFFER_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Anchor timestamp for incremental sync: the most recent Issue.lastSyncedAt
+ * cached for this repo, or null when the repo has no cached issues yet.
+ *
+ * There's no dedicated "last successful sync" column on Repository to anchor
+ * against — `getSyncRepos` upserts rows with only fullName/owner/name/enabled,
+ * and Repository has no lastSyncedAt field (only Issue.lastSyncedAt and the
+ * unrelated AutomationRepo.lastSyncedAt exist in the schema). Anchoring on
+ * Issue.lastSyncedAt instead sidesteps the "freshly-created row has a bogus
+ * now() anchor" trap by construction: that column is only ever written when
+ * an issue sync actually persisted a row, so a repo with zero cached issues
+ * (first sync, or all rows purged) naturally yields `null` here — never a
+ * timestamp that looks valid but reflects zero synced issues.
+ */
+async function getRepoSyncAnchor(repositoryId: string): Promise<Date | null> {
+  const result = await prisma.issue.aggregate({
+    where: { repositoryId },
+    _max: { lastSyncedAt: true },
+  });
+  return result._max.lastSyncedAt ?? null;
+}
+
+/**
+ * Fetch wrapper for the shared sync path (manual sync route, scheduled sync
+ * route, heartbeat). Narrows to `since = anchor - SYNC_OVERLAP_BUFFER_MS` when
+ * the repo has a trustworthy prior anchor (i.e. already has cached issues);
+ * otherwise does the full fetch as before. See getRepoSyncAnchor for why
+ * "has cached issues" is the validity guard.
+ */
+export const fetchAllStateIssues = async (repo: SyncRepo): Promise<GitHubIssue[]> => {
+  const anchor = await getRepoSyncAnchor(repo.id);
+  const since = anchor ? new Date(anchor.getTime() - SYNC_OVERLAP_BUFFER_MS) : undefined;
+  return fetchIssues(repo.fullName, { includeClosed: true, since });
+};
+
+/**
+ * Prisma-backed IssueStore for syncIssuesForRepos. findIssue returns the
+ * cached labels so the sync core can merge agent/* labels without a second
+ * lookup per issue.
+ */
+export function makePrismaIssueStore(): IssueStore {
+  return {
+    findIssue(repositoryId: string, number: number) {
+      return prisma.issue.findUnique({
+        where: { repositoryId_number: { repositoryId, number } },
+        select: { id: true, labels: true },
+      });
+    },
+    async updateIssue(id: string, data: SyncedIssueData) {
+      await prisma.issue.update({ where: { id }, data });
+    },
+    async createIssue(repositoryId: string, data: SyncedIssueData) {
+      await prisma.issue.create({ data: { ...data, repositoryId } });
+    },
+  };
+}
+
+/**
+ * Candidate query for reconcileClosedIssues.
+ *
+ * Uses labels.hasSome instead of currentLane (currentLane stores lane IDs
+ * like "normal"/"frontier", not status labels). Also includes issues with
+ * status/done that still have state="open" (stale cache — label was applied
+ * but the state field wasn't updated yet).
+ */
+export function findActiveCachedIssuesForReconcile(
+  repositoryId: string,
+): Promise<Array<{ id: string; number: number; labels: string[]; state: string }>> {
+  return prisma.issue.findMany({
+    where: {
+      repositoryId,
+      OR: [
+        // Issues with active status labels (may be stale if GitHub closed them)
+        {
+          state: { in: ["open", "closed"] as const },
+          labels: {
+            hasSome: ACTIVE_STATUS_LABELS,
+          },
+        },
+        // Issues with status/done that still show as open (stale state field)
+        {
+          state: "open",
+          labels: { has: "status/done" },
+        },
+      ],
+    },
+    select: { id: true, number: true, labels: true, state: true },
+  });
+}
+
 export async function refreshSingleIssue(
   repoFullName: string,
   issueNumber: number,
@@ -351,7 +434,7 @@ export async function refreshSingleIssue(
 ): Promise<RefreshIssueResult> {
   try {
     const ghIssue = await fetchIssueFn(repoFullName, issueNumber);
-    const issueData = githubIssueToSingleIssueData(ghIssue);
+    const issueData = githubIssueToSyncedIssueData(ghIssue);
 
     return {
       success: true,

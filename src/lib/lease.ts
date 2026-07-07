@@ -51,11 +51,11 @@ export async function upsertLease(params: {
 
   if (existing) {
     // Renew: push expiry forward and record renewal timestamp
-    await prisma.lease.update({
+    const lease = await prisma.lease.update({
       where: { id: existing.id },
       data: { expiredAt, renewedAt: now, checkpoint, branch: params.branch, prUrl: params.prUrl },
     });
-    return { created: false, lease: await prisma.lease.findUniqueOrThrow({ where: { id: existing.id } }) };
+    return { created: false, lease };
   }
 
   // Create new lease (checkpoint is required in the schema)
@@ -89,16 +89,6 @@ export async function findActiveLeasesForIssue(issueId: string): Promise<any[]> 
   const now = new Date();
   return prisma.lease.findMany({
     where: { issueId, expiredAt: { gt: now } },
-  });
-}
-
-/**
- * Find all expired leases for the given issue (useful for stale recovery).
- */
-export async function findExpiredLeasesForIssue(issueId: string): Promise<any[]> {
-  const now = new Date();
-  return prisma.lease.findMany({
-    where: { issueId, expiredAt: { lte: now } },
   });
 }
 
@@ -154,12 +144,6 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
   });
 
   if (!lease) return null;
-
-  // Defensive check: skip expired leases (should already be filtered by query)
-  if (isLeaseExpired(lease)) {
-    await releaseLease(lease.id);
-    return null;
-  }
 
   // Validate checkpoint before building context
   if (!isValidCheckpoint(lease.checkpoint)) {

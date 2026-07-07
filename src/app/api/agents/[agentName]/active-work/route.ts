@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { handleApiError } from "@/lib/api-errors";
 import { resolveActiveWork } from "@/lib/lease";
 import type { ActiveWorkResult } from "@/lib/next-action";
 
@@ -19,7 +20,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ age
     };
     return NextResponse.json(response);
   } catch (error) {
-    console.error("Failed to fetch active work:", error);
-    return NextResponse.json({ error: "Failed to fetch active work" }, { status: 500 });
+    return handleApiError("fetch active work", error);
   }
 }

@@ -1,6 +1,34 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubIssue } from "@/types";
-import { IssueStore, syncIssuesForRepos, mergeLabels, reconcileClosedIssues, closedIssueStatusFix } from "./issue-sync";
+
+const { mocks } = vi.hoisted(() => ({
+  mocks: {
+    fetchIssues: vi.fn(),
+    issueAggregate: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/github", () => ({
+  fetchIssues: mocks.fetchIssues,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    issue: {
+      aggregate: mocks.issueAggregate,
+    },
+  },
+}));
+
+import {
+  IssueStore,
+  syncIssuesForRepos,
+  mergeLabels,
+  reconcileClosedIssues,
+  closedIssueStatusFix,
+  fetchAllStateIssues,
+  SYNC_OVERLAP_BUFFER_MS,
+} from "./issue-sync";
 
 function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
@@ -138,7 +166,7 @@ describe("syncIssuesForRepos", () => {
         { id: "repo-2", fullName: "org/good" },
       ],
       async (repo) => {
-        if (repo === "org/bad") throw new Error("GitHub exploded");
+        if (repo.fullName === "org/bad") throw new Error("GitHub exploded");
         return [githubIssue(1)];
       },
       store,
@@ -156,7 +184,7 @@ describe("syncIssuesForRepos", () => {
   });
 
   it("calls updateIssue for existing issues and createIssue for new ones", async () => {
-    const findMock = vi.fn().mockResolvedValueOnce({ id: "existing-1" }).mockResolvedValue(null);
+    const findMock = vi.fn().mockResolvedValueOnce({ id: "existing-1", labels: [] }).mockResolvedValue(null);
     const updateMock = vi.fn().mockResolvedValue(undefined);
     const createMock = vi.fn().mockResolvedValue(undefined);
 
@@ -175,6 +203,26 @@ describe("syncIssuesForRepos", () => {
     expect(findMock).toHaveBeenCalledTimes(2);
     expect(updateMock).toHaveBeenCalledWith("existing-1", expect.objectContaining({ number: 1 }));
     expect(createMock).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 2 }));
+  });
+
+  it("preserves agent/* labels from the cached record when updating", async () => {
+    store = {
+      findIssue: vi.fn().mockResolvedValue({ id: "existing-1", labels: ["agent/saffron", "status/in-progress"] }),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1)],
+      store,
+    );
+
+    // GitHub labels stay the base; only agent/* labels are preserved from the cache.
+    expect(store.updateIssue).toHaveBeenCalledWith(
+      "existing-1",
+      expect.objectContaining({ labels: ["type/bug", "agent/saffron"] }),
+    );
   });
 
   it("stores status/done for a closed issue and mirrors the change to GitHub", async () => {
@@ -338,5 +386,36 @@ describe("reconcileClosedIssues", () => {
 
     expect(result.issuesReconciled).toBe(1);
     expect(result.results[0].action).toBe("released_lease");
+  });
+});
+
+describe("fetchAllStateIssues", () => {
+  beforeEach(() => {
+    mocks.fetchIssues.mockReset().mockResolvedValue([]);
+    mocks.issueAggregate.mockReset();
+  });
+
+  it("does a full fetch (no since) when the repo has no cached issues", async () => {
+    mocks.issueAggregate.mockResolvedValue({ _max: { lastSyncedAt: null } });
+
+    await fetchAllStateIssues({ id: "repo-1", fullName: "org/repo" });
+
+    expect(mocks.issueAggregate).toHaveBeenCalledWith({
+      where: { repositoryId: "repo-1" },
+      _max: { lastSyncedAt: true },
+    });
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { includeClosed: true, since: undefined });
+  });
+
+  it("narrows with since = anchor - SYNC_OVERLAP_BUFFER_MS when the repo has cached issues", async () => {
+    const anchor = new Date("2026-07-01T00:00:00.000Z");
+    mocks.issueAggregate.mockResolvedValue({ _max: { lastSyncedAt: anchor } });
+
+    await fetchAllStateIssues({ id: "repo-1", fullName: "org/repo" });
+
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", {
+      includeClosed: true,
+      since: new Date(anchor.getTime() - SYNC_OVERLAP_BUFFER_MS),
+    });
   });
 });

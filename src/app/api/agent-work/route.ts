@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { handleApiError } from "@/lib/api-errors";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { releaseStaleWork } from "@/lib/agent-work";
@@ -25,6 +25,28 @@ interface AgentWorkItem {
   issueNumber: number | null;
   issueTitle: string | null;
   repoFullName: string | null;
+}
+
+function toItem(w: any): AgentWorkItem {
+  return {
+    id: w.id,
+    agentName: w.agentName,
+    issueId: w.issueId,
+    runId: w.runId,
+    state: w.state,
+    checkpoint: w.checkpoint,
+    branch: w.branch,
+    prUrl: w.prUrl,
+    leaseExpiresAt: w.leaseExpiresAt,
+    lastHeartbeatAt: w.lastHeartbeatAt,
+    summary: w.summary,
+    blockerReason: w.blockerReason,
+    createdAt: w.createdAt,
+    updatedAt: w.updatedAt,
+    issueNumber: w.issue?.number ?? null,
+    issueTitle: w.issue?.title ?? null,
+    repoFullName: w.issue?.repository?.fullName ?? null,
+  };
 }
 
 // Intentionally unauthenticated — consistent with other read-only endpoints
@@ -53,6 +75,15 @@ export async function GET(request: Request) {
       where.agentName = agentNameFilter;
     }
 
+    if (includeStale) {
+      // Stale-work sweep: marks CLAIMED/IN_PROGRESS work as STALE when heartbeat
+      // or lease TTL has expired. Idempotent — once marked STALE, work no longer
+      // matches the WHERE clause, so repeated calls are safe. Also creates history
+      // entries for audit trail. Runs before the query so newly-staled work is
+      // returned with its current state.
+      await releaseStaleWork(prisma, 5 * 60 * 1000);
+    }
+
     const activeItems = await prisma.agentWork.findMany({
       where,
       orderBy: { lastHeartbeatAt: "desc" },
@@ -63,75 +94,7 @@ export async function GET(request: Request) {
       },
     });
 
-    const items: AgentWorkItem[] = activeItems.map((w: any) => ({
-      id: w.id,
-      agentName: w.agentName,
-      issueId: w.issueId,
-      runId: w.runId,
-      state: w.state,
-      checkpoint: w.checkpoint,
-      branch: w.branch,
-      prUrl: w.prUrl,
-      leaseExpiresAt: w.leaseExpiresAt,
-      lastHeartbeatAt: w.lastHeartbeatAt,
-      summary: w.summary,
-      blockerReason: w.blockerReason,
-      createdAt: w.createdAt,
-      updatedAt: w.updatedAt,
-      issueNumber: w.issue?.number ?? null,
-      issueTitle: w.issue?.title ?? null,
-      repoFullName: w.issue?.repository?.fullName ?? null,
-    }));
-
-    if (includeStale) {
-      // Stale-work sweep: marks CLAIMED/IN_PROGRESS work as STALE when heartbeat
-      // or lease TTL has expired. Idempotent — once marked STALE, work no longer
-      // matches the WHERE clause, so repeated calls are safe. Also creates history
-      // entries for audit trail. Returns affected IDs so we can re-query.
-      const potentiallyStale = await releaseStaleWork(prisma, 5 * 60 * 1000);
-      if (potentiallyStale.length > 0) {
-        const refreshedWhere: Record<string, unknown> = {
-          OR: [
-            { state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-            { state: "STALE" },
-          ],
-        };
-        if (agentNameFilter) refreshedWhere.agentName = agentNameFilter;
-
-        const refreshed = await prisma.agentWork.findMany({
-          where: refreshedWhere,
-          orderBy: { lastHeartbeatAt: "desc" },
-          include: {
-            issue: {
-              select: { number: true, title: true, repository: { select: { fullName: true } } },
-            },
-          },
-        });
-
-        items.length = 0;
-        for (const w of refreshed) {
-          items.push({
-            id: w.id,
-            agentName: w.agentName,
-            issueId: w.issueId,
-            runId: w.runId,
-            state: w.state,
-            checkpoint: w.checkpoint,
-            branch: w.branch,
-            prUrl: w.prUrl,
-            leaseExpiresAt: w.leaseExpiresAt,
-            lastHeartbeatAt: w.lastHeartbeatAt,
-            summary: w.summary,
-            blockerReason: w.blockerReason,
-            createdAt: w.createdAt,
-            updatedAt: w.updatedAt,
-            issueNumber: w.issue?.number ?? null,
-            issueTitle: w.issue?.title ?? null,
-            repoFullName: w.issue?.repository?.fullName ?? null,
-          });
-        }
-      }
-    }
+    const items: AgentWorkItem[] = activeItems.map(toItem);
 
     const now = new Date();
     const expiredLeases = await prisma.lease.findMany({
@@ -173,7 +136,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -185,11 +148,11 @@ export async function POST(request: Request) {
     } else if (action === "reassign") {
       return await reassignAgentWork(body);
     } else {
-      return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+      return errorResponse("Unknown action", 400);
     }
   } catch (error) {
     console.error("Failed to process agent work action:", error);
-    return NextResponse.json({ error: "Failed to process request" }, { status: 500 });
+    return errorResponse("Failed to process request", 500);
   }
 }
 
@@ -203,20 +166,16 @@ async function releaseAgentWork(body: Record<string, unknown>) {
 
   // Original release path by workId or leaseId (backward compatible)
   if (workId || leaseId) {
-    if (!workId && !leaseId) {
-      return NextResponse.json({ error: "Missing workId or leaseId" }, { status: 400 });
-    }
-
     try {
       let work = null;
 
       if (workId) {
         const existing = await prisma.agentWork.findUnique({ where: { id: workId } });
         if (!existing) {
-          return NextResponse.json({ error: "Work item not found" }, { status: 404 });
+          return errorResponse("Work item not found", 404);
         }
         if (existing.state === "DONE" || existing.state === "RELEASED") {
-          return NextResponse.json({ error: "Work is already completed or released" }, { status: 400 });
+          return errorResponse("Work is already completed or released", 400);
         }
 
         work = await prisma.$transaction(async (tx) => {
@@ -247,7 +206,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
     if (leaseId) {
         const lease = await prisma.lease.findUnique({ where: { id: leaseId }, include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } } });
         if (!lease) {
-          return NextResponse.json({ error: "Lease not found" }, { status: 404 });
+          return errorResponse("Lease not found", 404);
         }
 
         await prisma.lease.delete({ where: { id: leaseId } });
@@ -277,13 +236,13 @@ async function releaseAgentWork(body: Record<string, unknown>) {
           errorMessage: String(error),
         },
       });
-      return NextResponse.json({ error: "Failed to release agent work" }, { status: 500 });
+      return errorResponse("Failed to release agent work", 500);
     }
   }
 
   // New release path by agentName + issueId (operator recovery for orphaned work)
   if (!agentName) {
-    return NextResponse.json({ error: "Missing workId, leaseId, or agentName" }, { status: 400 });
+    return errorResponse("Missing workId, leaseId, or agentName", 400);
   }
 
   try {
@@ -352,7 +311,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
         }
       }
     } else {
-      return NextResponse.json({ error: "Missing required field: issueId, or set releaseAll: true" }, { status: 400 });
+      return errorResponse("Missing required field: issueId, or set releaseAll: true", 400);
     }
 
     await prisma.auditLog.create({
@@ -384,7 +343,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
         errorMessage: String(error),
       },
     });
-    return NextResponse.json({ error: "Failed to release agent work" }, { status: 500 });
+    return errorResponse("Failed to release agent work", 500);
   }
 }
 
@@ -394,10 +353,10 @@ async function reassignAgentWork(body: Record<string, unknown>) {
   const reason = typeof body.reason === "string" ? body.reason : "Reassigned by operator";
 
   if (!workId) {
-    return NextResponse.json({ error: "Missing workId" }, { status: 400 });
+    return errorResponse("Missing workId", 400);
   }
   if (!newAgentName) {
-    return NextResponse.json({ error: "Missing newAgentName" }, { status: 400 });
+    return errorResponse("Missing newAgentName", 400);
   }
 
   try {
@@ -407,7 +366,7 @@ async function reassignAgentWork(body: Record<string, unknown>) {
     });
 
     if (!existing) {
-      return NextResponse.json({ error: "Work item not found" }, { status: 404 });
+      return errorResponse("Work item not found", 404);
     }
 
     const work = await prisma.$transaction(async (tx) => {
@@ -420,33 +379,17 @@ async function reassignAgentWork(body: Record<string, unknown>) {
         data: { workId, action: "reassigned", summary: `${reason} -> ${newAgentName}` },
       });
 
-      // Release any existing active work for the new agent on the same issue
-      if (existing.issueId) {
-        const newAgentExisting = await tx.agentWork.findFirst({
-          where: { agentName: newAgentName, issueId: existing.issueId, state: { in: ["CLAIMED", "IN_PROGRESS"] } },
-        });
-        if (newAgentExisting) {
-          await tx.agentWork.update({
-            where: { id: newAgentExisting.id },
-            data: { state: "RELEASED", leaseExpiresAt: new Date() },
-          });
-          await tx.agentWorkHistory.create({
-            data: { workId: newAgentExisting.id, action: "released_by_reassignment" },
-          });
-        }
-      }
-
-      // Release any other active work for the new agent
-      const otherActive = await tx.agentWork.findFirst({
+      // Release all existing active work for the new agent (single work per agent)
+      const newAgentActive = await tx.agentWork.findMany({
         where: { agentName: newAgentName, state: { in: ["CLAIMED", "IN_PROGRESS"] } },
       });
-      if (otherActive) {
+      for (const active of newAgentActive) {
         await tx.agentWork.update({
-          where: { id: otherActive.id },
+          where: { id: active.id },
           data: { state: "RELEASED", leaseExpiresAt: new Date() },
         });
         await tx.agentWorkHistory.create({
-          data: { workId: otherActive.id, action: "released_by_reassignment" },
+          data: { workId: active.id, action: "released_by_reassignment" },
         });
       }
 
@@ -481,6 +424,6 @@ async function reassignAgentWork(body: Record<string, unknown>) {
         errorMessage: String(error),
       },
     });
-    return NextResponse.json({ error: "Failed to reassign agent work" }, { status: 500 });
+    return errorResponse("Failed to reassign agent work", 500);
   }
 }

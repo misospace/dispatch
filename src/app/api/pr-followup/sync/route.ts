@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
-import { processPrFollowupEvents, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
+import { getGitHubToken, fetchPaginated, fetchPullRequests, type GithubPR as GithubPRBase } from "@/lib/github";
+import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 
 /**
  * PR Follow-up Sync Endpoint (Pull-based)
@@ -17,32 +19,12 @@ import { processPrFollowupEvents, isAllowedBotAuthor, ingestMergeConflict, clear
  * real-time delivery for comparison.
  */
 
-interface GithubPR {
+/** Open-PR shape from the list endpoint, extending the shared client's type
+ * with the fields this route consumes that the shared type omits. */
+interface GithubPR extends GithubPRBase {
   id: number;
-  number: number;
-  url: string;
-  title: string;
-  body: string | null;
-  state: string;
-  user: { login: string };
-  head: { ref: string };
-  base: { ref: string };
-  created_at: string;
-  updated_at: string;
-  merged_at: string | null;
-  draft: boolean;
   mergeable_state?: string;
   mergeable?: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
-}
-
-/**
- * Extract linked issue numbers from a PR's title and body.
- * Matches patterns like "#42", "Fixes #42", "Closes #42", etc.
- */
-function extractLinkedIssue(pr: GithubPR): number | null {
-  const text = [pr.title, pr.body].filter(Boolean).join("\n");
-  const match = text.match(/#(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
 }
 
 interface GithubComment {
@@ -72,33 +54,22 @@ interface GithubCheckRun {
   output?: { title?: string; summary?: string };
 }
 
-async function fetchWithGithub(url: string, token: string): Promise<any> {
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub API ${url}: ${res.status} ${text}`);
-  }
-  return res.json();
-}
-
 export async function POST(request: NextRequest) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
-    const token = process.env.GITHUB_TOKEN;
-    if (!token) {
-      return NextResponse.json({ error: "GITHUB_TOKEN not configured" }, { status: 500 });
+    // Fail fast when no GitHub credentials are available. getGitHubToken
+    // supports both GitHub App installation tokens and the legacy PAT.
+    try {
+      await getGitHubToken();
+    } catch {
+      return errorResponse("GITHUB_TOKEN not configured", 500);
     }
 
+    const githubApi = "https://api.github.com";
     const repoFullNames = await getTrackedRepos();
 
     if (repoFullNames.length === 0) {
@@ -116,8 +87,7 @@ export async function POST(request: NextRequest) {
       // Fetch open PRs
       let allPrs: GithubPR[] = [];
       try {
-        const pageUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
-        allPrs = await fetchWithGithub(pageUrl, token);
+        allPrs = (await fetchPullRequests(repoFullName)) as GithubPR[];
       } catch (error) {
         console.error(`Failed to fetch PRs for ${repoFullName}:`, error);
         continue;
@@ -130,89 +100,83 @@ export async function POST(request: NextRequest) {
       for (const pr of botPrs) {
         const linkedIssue = extractLinkedIssue(pr);
 
-        // Fetch comments on this PR and collect events
-        try {
-          const commentsUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`;
-          const comments: GithubComment[] = await fetchWithGithub(commentsUrl, token);
+        // Comments, reviews, and check runs are independent — fetch them in
+        // parallel, best effort per source (a failed fetch yields no events).
+        const commentsUrl = `${githubApi}/repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`;
+        const reviewsUrl = `${githubApi}/repos/${owner}/${repo}/pulls/${pr.number}/reviews?per_page=100`;
+        const checksUrl = `${githubApi}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=completed&per_page=100`;
+        const [comments, reviews, checkRuns] = await Promise.all([
+          fetchPaginated<GithubComment>(commentsUrl, 100).catch(() => [] as GithubComment[]),
+          fetchPaginated<GithubReview>(reviewsUrl, 100).catch(() => [] as GithubReview[]),
+          fetchPaginated<GithubCheckRun>(
+            checksUrl,
+            100,
+            (data) => (data as { check_runs?: GithubCheckRun[] }).check_runs ?? [],
+          ).catch(() => [] as GithubCheckRun[]),
+        ]);
 
-          for (const comment of comments) {
-            // Ignore self-comments from the same bot identity
-            if (comment.user.login === pr.user.login) continue;
+        // Collect comment events
+        for (const comment of comments) {
+          // Ignore self-comments from the same bot identity
+          if (comment.user.login === pr.user.login) continue;
 
+          allEvents.push({
+            eventType: "comment" as const,
+            repoFullName,
+            prNumber: pr.number,
+            branch: pr.head.ref ?? null,
+            url: pr.url,
+            title: pr.title,
+            author: pr.user.login,
+            body: comment.body,
+            id: String(comment.id),
+            linkedIssue,
+          });
+        }
+
+        // Collect review events
+        for (const review of reviews) {
+          if (review.state === "CHANGES_REQUESTED") {
             allEvents.push({
-              eventType: "comment" as const,
+              eventType: "review" as const,
               repoFullName,
               prNumber: pr.number,
               branch: pr.head.ref ?? null,
               url: pr.url,
               title: pr.title,
               author: pr.user.login,
-              body: comment.body,
-              id: String(comment.id),
+              body: review.body,
+              id: String(review.id),
+              state: review.state,
+              linkedIssue,
+              prState: pr.state,
+              prMergedAt: pr.merged_at,
+            });
+          } else {
+            totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
+          }
+        }
+
+        // Collect failing check run events
+        for (const checkRun of checkRuns) {
+          if (["failure", "cancelled", "timed_out", "action_required"].includes(checkRun.conclusion ?? "")) {
+            allEvents.push({
+              eventType: "check_run" as const,
+              repoFullName,
+              prNumber: pr.number,
+              branch: pr.head.ref ?? null,
+              url: checkRun.html_url,
+              title: checkRun.name,
+              author: pr.user.login,
+              body: checkRun.output?.summary ?? "",
+              id: String(checkRun.id),
+              conclusion: checkRun.conclusion,
+              checkName: checkRun.name,
               linkedIssue,
             });
+          } else {
+            totalSkipped++;
           }
-        } catch {
-          // Best effort — don't fail on a single repo
-        }
-
-        // Fetch reviews on this PR and collect events
-        try {
-          const reviewsUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/pulls/${pr.number}/reviews?per_page=100`;
-          const reviews: GithubReview[] = await fetchWithGithub(reviewsUrl, token);
-
-          for (const review of reviews) {
-            if (review.state === "CHANGES_REQUESTED") {
-              allEvents.push({
-                eventType: "review" as const,
-                repoFullName,
-                prNumber: pr.number,
-                branch: pr.head.ref ?? null,
-                url: pr.url,
-                title: pr.title,
-                author: pr.user.login,
-                body: review.body,
-                id: String(review.id),
-                state: review.state,
-                linkedIssue,
-                prState: pr.state,
-                prMergedAt: pr.merged_at,
-              });
-            } else {
-              totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
-            }
-          }
-        } catch {
-          // Best effort
-        }
-
-        // Fetch failing check runs for this PR's branch and collect events
-        try {
-          const checksUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=completed&per_page=100`;
-          const checksData: any = await fetchWithGithub(checksUrl, token);
-
-          for (const checkRun of (checksData.check_runs ?? [])) {
-            if (["failure", "cancelled", "timed_out", "action_required"].includes(checkRun.conclusion ?? "")) {
-              allEvents.push({
-                eventType: "check_run" as const,
-                repoFullName,
-                prNumber: pr.number,
-                branch: pr.head.ref ?? null,
-                url: checkRun.html_url,
-                title: checkRun.name,
-                author: pr.user.login,
-                body: checkRun.output?.summary ?? "",
-                id: String(checkRun.id),
-                conclusion: checkRun.conclusion,
-                checkName: checkRun.name,
-                linkedIssue,
-              });
-            } else {
-              totalSkipped++;
-            }
-          }
-        } catch {
-          // Best effort
         }
 
         // Track merge state
@@ -276,6 +240,6 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("PR follow-up sync failed:", error);
-    return NextResponse.json({ error: "PR follow-up sync failed" }, { status: 500 });
+    return errorResponse("PR follow-up sync failed", 500);
   }
 }

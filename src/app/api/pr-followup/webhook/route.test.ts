@@ -22,7 +22,8 @@ vi.mock("@/lib/prisma", () => ({
   asPrFixQueueClient: mocks.prFixQueueClient,
 }));
 
-vi.mock("@/lib/pr-followup-ingestion", () => ({
+vi.mock("@/lib/pr-followup-ingestion", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/pr-followup-ingestion")>()),
   processPrFollowupEvents: mocks.processPrFollowupEvents,
 }));
 

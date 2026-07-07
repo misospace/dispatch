@@ -37,7 +37,7 @@ export interface MarkPrFixInput {
   note?: string | null;
 }
 
-function nonEmpty(value: unknown): value is string {
+export function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 

@@ -6,22 +6,15 @@
  */
 
 import { prisma } from "@/lib/prisma";
-import { fetchIssues, syncStatusLabels } from "@/lib/github";
+import { fetchIssue, syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import {
-
   syncIssuesForRepos,
-  mergeLabels,
   reconcileClosedIssues,
-  type SyncedIssueData,
-  type ClosedIssueReconcileResponse,
+  makePrismaIssueStore,
+  findActiveCachedIssuesForReconcile,
+  fetchAllStateIssues,
 } from "@/lib/issue-sync";
-
-// Sync must see closed issues, or closedIssueStatusFix never runs: the
-// closed=>done enforcement (#521) only applies to issues in the fetch set,
-// and the default fetch is state=open. Regressed to open-only when the
-// heartbeat cron (whose reconcile did its own closed fetch) was retired.
-const fetchAllStateIssues = (repoFullName: string) => fetchIssues(repoFullName, { includeClosed: true });
 
 // ---------------------------------------------------------------------------
 // Sync orchestration
@@ -61,28 +54,7 @@ export async function runSyncBestEffort(
 
     const excludedLabels = opts?.excludedLabels ?? parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
 
-    const result = await syncIssuesForRepos(repos, fetchAllStateIssues, {
-      findIssue(repositoryId: string, number: number) {
-        return prisma.issue.findUnique({
-          where: { repositoryId_number: { repositoryId, number } },
-        });
-      },
-      async updateIssue(id: string, data: SyncedIssueData) {
-        const existing = await prisma.issue.findUnique({
-          where: { id },
-          select: { labels: true },
-        });
-
-        if (existing && existing.labels.length > 0) {
-          data.labels = mergeLabels(data.labels, existing.labels);
-        }
-
-        await prisma.issue.update({ where: { id }, data });
-      },
-      async createIssue(repositoryId: string, data: SyncedIssueData) {
-        await prisma.issue.create({ data: { ...data, repositoryId } });
-      },
-    }, excludedLabels, syncStatusLabels);
+    const result = await syncIssuesForRepos(repos, fetchAllStateIssues, makePrismaIssueStore(), excludedLabels, syncStatusLabels);
 
     syncedCount = result.syncedCount;
     reposProcessed = result.repos;
@@ -138,49 +110,12 @@ export async function runReconcileBestEffort(): Promise<ReconcileStepResult> {
       return { issuesReconciled: 0, issuesChecked: 0, reposProcessed: 0, warnings, errors };
     }
 
-    const result = await reconcileClosedIssues(
-      repos,
-      async (repoFullName: string, issueNumber: number) => {
-        // Fetch the latest issue state from GitHub for reconciliation
-        const issues = await fetchIssues(repoFullName, { includeClosed: true });
-        const found = issues.find((i) => i.number === issueNumber);
-        if (!found) {
-          throw new Error(`Issue #${issueNumber} not found in ${repoFullName}`);
-        }
-        return found;
+    const result = await reconcileClosedIssues(repos, fetchIssue, {
+      findActiveCachedIssues: findActiveCachedIssuesForReconcile,
+      async updateIssue(id: string, data: { labels: string[]; state: string; closedAt: Date | null }) {
+        await prisma.issue.update({ where: { id }, data });
       },
-      {
-        findActiveCachedIssues(repositoryId: string) {
-          // FIX: Use labels.hasSome instead of currentLane (currentLane stores lane IDs
-          // like "normal"/"frontier", not status labels). Also include issues with
-          // status/done that still have state="open" (stale cache — label was applied
-          // but state field wasn't updated yet).
-          return prisma.issue.findMany({
-            where: {
-              repositoryId,
-              OR: [
-                // Issues with active status labels (may be stale if GitHub closed them)
-                {
-                  state: { in: ["open", "closed"] as const },
-                  labels: {
-                    hasSome: ["status/ready", "status/in-progress", "status/in-review"],
-                  },
-                },
-                // Issues with status/done that still show as open (stale state field)
-                {
-                  state: "open",
-                  labels: { has: "status/done" },
-                },
-              ],
-            },
-            select: { id: true, number: true, labels: true, state: true },
-          });
-        },
-        async updateIssue(id: string, data: { labels: string[]; state: string; closedAt?: Date | null }) {
-          await prisma.issue.update({ where: { id }, data });
-        },
-      },
-    );
+    });
 
     for (const r of result.results) {
       if (r.error && !r.reconciled) {

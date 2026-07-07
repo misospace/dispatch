@@ -52,6 +52,7 @@ vi.mock("@/lib/prisma", () => ({
       return arg({
         agentWork: {
           findFirst: vi.fn(),
+          findMany: vi.fn(async () => []),
           update: vi.fn(),
         },
         agentWorkHistory: {
@@ -63,7 +64,6 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token: string | null | undefined) => token === "test-token"),
   isAuthorizedBearerToken: vi.fn((token: string | null | undefined) => token === "test-token"),
   getAcceptedAgentTokens: vi.fn(() => ["test-token"]),
   resetCaches: vi.fn(),
@@ -241,6 +241,7 @@ describe("POST /api/agent-work", () => {
         issue: { number: 10, repository: { fullName: "org/repo" } },
       }));
       const txAgentWorkFindFirst = vi.fn();
+      const txAgentWorkFindMany = vi.fn(async () => []);
       const txAgentWorkHistoryCreate = vi.fn(async () => ({ id: "hist-1" }));
 
       // Handle array of promises (parallel execution)
@@ -252,6 +253,7 @@ describe("POST /api/agent-work", () => {
         agentWork: {
           update: txAgentWorkUpdate,
           findFirst: txAgentWorkFindFirst,
+          findMany: txAgentWorkFindMany,
         },
         agentWorkHistory: {
           create: txAgentWorkHistoryCreate,
@@ -458,18 +460,18 @@ describe("POST /api/agent-work", () => {
             issue: { number: 10, repository: { fullName: "org/repo" } },
           };
         });
-        const txAgentWorkFindFirst = vi.fn(async (args: any) => {
-          if (args.where.agentName === "new-agent" && args.where.issueId === "issue-1") {
-            return { id: "conflict-work", agentName: "new-agent", issueId: "issue-1", state: "CLAIMED" };
+        const txAgentWorkFindMany = vi.fn(async (args: any) => {
+          if (args.where.agentName === "new-agent") {
+            return [{ id: "conflict-work", agentName: "new-agent", issueId: "issue-1", state: "CLAIMED" }];
           }
-          return null;
+          return [];
         });
         const txAgentWorkHistoryCreate = vi.fn(async () => ({ id: "hist-1" }));
 
         return fn({
           agentWork: {
             update: txAgentWorkUpdate,
-            findFirst: txAgentWorkFindFirst,
+            findMany: txAgentWorkFindMany,
           },
           agentWorkHistory: {
             create: txAgentWorkHistoryCreate,
@@ -529,21 +531,18 @@ describe("POST /api/agent-work", () => {
             issue: { number: 10, repository: { fullName: "org/repo" } },
           };
         });
-        const txAgentWorkFindFirst = vi.fn(async (args: any) => {
-          if (args.where.agentName === "new-agent" && args.where.issueId === "issue-1") {
-            return null; // no conflict on same issue
+        const txAgentWorkFindMany = vi.fn(async (args: any) => {
+          if (args.where.agentName === "new-agent") {
+            return [{ id: "other-work", agentName: "new-agent", state: "IN_PROGRESS" }];
           }
-          if (args.where.agentName === "new-agent" && !args.where.issueId) {
-            return { id: "other-work", agentName: "new-agent", state: "IN_PROGRESS" };
-          }
-          return null;
+          return [];
         });
         const txAgentWorkHistoryCreate = vi.fn(async () => ({ id: "hist-1" }));
 
         return fn({
           agentWork: {
             update: txAgentWorkUpdate,
-            findFirst: txAgentWorkFindFirst,
+            findMany: txAgentWorkFindMany,
           },
           agentWorkHistory: {
             create: txAgentWorkHistoryCreate,

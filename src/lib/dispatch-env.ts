@@ -2,8 +2,8 @@
  * Dispatch environment variable resolution.
  *
  * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN, DISPATCH_AGENT_NAME,
- *                     DATABASE_URL, DISPATCH_DATABASE_URL, DISPATCH_AUTH_MODE,
- *                     DISPATCH_AUTH_USERNAME, DISPATCH_AUTH_PASSWORD
+ *                     DISPATCH_AUTH_MODE, DISPATCH_AUTH_USERNAME,
+ *                     DISPATCH_AUTH_PASSWORD
  *
  * NOTE: This module is imported by src/middleware.ts, which runs in the Edge
  * runtime. It must therefore stay free of Node-only APIs (node:crypto, Buffer,
@@ -111,13 +111,6 @@ export function isAuthorizedBearerToken(token: string | null | undefined): boole
 }
 
 /**
- * Backward-compatible alias — check if a request token is authorized.
- */
-export function isAuthorizedAgentToken(token: string | null | undefined): boolean {
-  return isAuthorizedBearerToken(token);
-}
-
-/**
  * Timing-safe string comparison to prevent timing attacks.
  *
  * Pure-JS implementation (no node:crypto / Buffer) so it is safe to call from
@@ -133,60 +126,6 @@ export function safeEqual(a: string, b: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Database URL resolution
-// ---------------------------------------------------------------------------
-
-let _cachedDbUrl: string | undefined;
-
-/**
- * Resolve the database connection URL for Prisma/runtime.
- *
- * Resolution order:
- * 1. DATABASE_URL (canonical)
- * 2. DISPATCH_DATABASE_URL
- *
- * Returns undefined if none are set. This function does NOT mutate process.env;
- * call ensureDatabaseUrl() for startup shim behavior that exports to process.env.
- */
-export function getDatabaseUrl(): string | undefined {
-  if (_cachedDbUrl !== undefined) return _cachedDbUrl;
-
-  const canonical = process.env.DATABASE_URL;
-  if (canonical) {
-    _cachedDbUrl = canonical;
-    return _cachedDbUrl;
-  }
-
-  const dispatch = process.env.DISPATCH_DATABASE_URL;
-  _cachedDbUrl = dispatch;
-  return _cachedDbUrl;
-}
-
-// ---------------------------------------------------------------------------
-// Startup shim — mutates process.env for container entrypoint use
-// ---------------------------------------------------------------------------
-
-let _shimApplied = false;
-
-/**
- * Apply compatibility aliases to process.env.
- * Safe to call multiple times — idempotent.
- * Called by docker-entrypoint.sh before Prisma migrate and app startup.
- */
-export function ensureDatabaseUrl(): void {
-  if (_shimApplied) return;
-  _shimApplied = true;
-
-  if (process.env.DATABASE_URL) {
-    return;
-  }
-
-  if (process.env.DISPATCH_DATABASE_URL) {
-    process.env.DATABASE_URL = process.env.DISPATCH_DATABASE_URL;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Cache reset (for testing)
 // ---------------------------------------------------------------------------
 
@@ -198,6 +137,4 @@ export function resetCaches(): void {
   _cachedToken = undefined;
   _cachedAgentName = undefined;
   _acceptedTokens = undefined;
-  _cachedDbUrl = undefined;
-  _shimApplied = false;
 }

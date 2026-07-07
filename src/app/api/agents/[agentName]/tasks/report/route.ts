@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 
@@ -80,59 +81,44 @@ export async function POST(
 
   // Authenticate
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return errorResponse("Invalid JSON body", 400);
   }
 
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return errorResponse("Invalid JSON body", 400);
   }
 
   const raw = body as Record<string, unknown>;
 
   const taskType = raw.taskType;
   if (typeof taskType !== "string" || !VALID_TASK_TYPES.includes(taskType as ValidTaskType)) {
-    return NextResponse.json(
-      { error: `Invalid taskType. Must be one of: ${VALID_TASK_TYPES.join(", ")}` },
-      { status: 400 },
-    );
+    return errorResponse(`Invalid taskType. Must be one of: ${VALID_TASK_TYPES.join(", ")}`, 400);
   }
 
   const outcome = raw.outcome;
   if (typeof outcome !== "string" || !VALID_OUTCOMES.includes(outcome as ValidOutcome)) {
-    return NextResponse.json(
-      { error: `Invalid outcome. Must be one of: ${VALID_OUTCOMES.join(", ")}` },
-      { status: 400 },
-    );
+    return errorResponse(`Invalid outcome. Must be one of: ${VALID_OUTCOMES.join(", ")}`, 400);
   }
 
   if (raw.issueNumber !== undefined && (typeof raw.issueNumber !== "number" || !Number.isInteger(raw.issueNumber))) {
-    return NextResponse.json(
-      { error: "issueNumber must be an integer" },
-      { status: 400 },
-    );
+    return errorResponse("issueNumber must be an integer", 400);
   }
 
   if (raw.pullRequestNumber !== undefined && (typeof raw.pullRequestNumber !== "number" || !Number.isInteger(raw.pullRequestNumber))) {
-    return NextResponse.json(
-      { error: "pullRequestNumber must be an integer" },
-      { status: 400 },
-    );
+    return errorResponse("pullRequestNumber must be an integer", 400);
   }
 
   const stringFields: readonly string[] = ["repoFullName", "pullRequestUrl", "summary", "error"];
   for (const field of stringFields) {
     if (raw[field] !== undefined && typeof raw[field] !== "string") {
-      return NextResponse.json(
-        { error: `${field} must be a string` },
-        { status: 400 },
-      );
+      return errorResponse(`${field} must be a string`, 400);
     }
   }
 

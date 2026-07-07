@@ -44,8 +44,11 @@ async function getRepos() {
   });
 }
 
-async function getFilterOptions() {
+async function getFilterOptions(includeClosed?: boolean) {
+  // Same base visibility as the board itself (state/retention), but without
+  // the user's active label/agent filters so all selectable options remain.
   const where: Record<string, unknown> = { repository: { enabled: true } };
+  buildVisibleIssueWhere(where, { includeClosed });
   applyRenovateIssueExclusion(where);
 
   const issues = await prisma.issue.findMany({
@@ -89,7 +92,7 @@ export default async function BoardPage({ searchParams }: PageProps) {
   const [issues, repos, filterOptions, syncStatus] = await Promise.all([
     getIssues(params.repo, params.agent, params.owner, params.priority, params.lane, includeClosed),
     getRepos(),
-    getFilterOptions(),
+    getFilterOptions(includeClosed),
     getIssueSyncStatus(),
   ]);
   const lanes = getConfiguredLanes();
