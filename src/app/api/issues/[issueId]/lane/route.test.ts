@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -9,7 +10,6 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/prisma", () => ({
@@ -40,11 +40,10 @@ function makePayload(o = {}) {
 
 function makeRequest(method = "POST", overrides = {}, extraHeaders = {}) {
   const payload = typeof overrides === "object" && !Array.isArray(overrides) ? { ...makePayload(), ...overrides } : overrides;
-  const body = method === "POST" ? JSON.stringify(payload) : undefined;
-  return new Request("http://localhost/api/issues/issue-1/lane", {
+  return authedRequest("http://localhost/api/issues/issue-1/lane", {
     method,
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
-    body,
+    body: method === "POST" ? payload : undefined,
+    headers: extraHeaders,
   }) as unknown as Parameters<typeof POST>[0];
 }
 

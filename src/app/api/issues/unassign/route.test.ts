@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -25,15 +26,9 @@ vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
 }));
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 import { POST } from "./route";
 
@@ -48,15 +43,7 @@ function makePayload(overrides = {}) {
 }
 
 function postRequest(payload = makePayload(), includeAuth = true) {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  return POST(
-    new Request("http://localhost/api/issues/unassign", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    })
-  );
+  return POST(authedRequest("http://localhost/api/issues/unassign", { method: "POST", body: payload, includeAuth }));
 }
 
 describe("POST /api/issues/unassign — auth", () => {

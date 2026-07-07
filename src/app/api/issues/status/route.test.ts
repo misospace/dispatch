@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -10,7 +11,6 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/prisma", () => ({
@@ -33,11 +33,7 @@ function makePayload(o = {}) {
 
 function makeRequest(overrides = {}, extraHeaders = {}) {
   const payload = typeof overrides === "object" && !Array.isArray(overrides) ? { ...makePayload(), ...overrides } : overrides;
-  return new Request("http://localhost/api/issues/status", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
-    body: JSON.stringify(payload),
-  });
+  return authedRequest("http://localhost/api/issues/status", { method: "POST", body: payload, headers: extraHeaders });
 }
 
 describe("POST /api/issues/status — auth", () => {

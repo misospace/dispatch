@@ -1,14 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
-
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-  safeEqual: vi.fn((a, b) => a === b),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMockWithSafeEqual());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {

@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -45,9 +40,7 @@ import { resetAuthCaches } from "@/lib/auth";
 function asNextRequest(r: Request): any { return r; }
 
 function postRequest(includeAuth = true) {
-  const headers: Record<string, string> = {};
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  return POST(asNextRequest(new Request("http://localhost/api/pr-followup/sync", { method: "POST", headers })));
+  return POST(asNextRequest(authedRequest("http://localhost/api/pr-followup/sync", { method: "POST", includeAuth })));
 }
 
 describe("POST /api/pr-followup/sync", () => {

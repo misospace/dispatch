@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 // vi.hoisted() runs at the very top of the file, before vi.mock() hoisting.
 const { mocks } = vi.hoisted(() => ({
@@ -12,7 +13,6 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 // Mock dependencies — return the mock functions directly
@@ -55,13 +55,7 @@ function makePayload(overrides = {}) {
 }
 
 function postRequest(payload = makePayload(), extraHeaders = {}) {
-  return POST(
-    new Request("http://localhost/api/issues/move", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
-      body: JSON.stringify(payload),
-    })
-  );
+  return POST(authedRequest("http://localhost/api/issues/move", { method: "POST", body: payload, headers: extraHeaders }));
 }
 
 describe("POST /api/issues/move — auth", () => {

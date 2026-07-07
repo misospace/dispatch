@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -18,9 +19,7 @@ vi.mock("@/lib/groomer/history", () => ({
 import { GET } from "./route";
 
 function request(url = "/api/groomer/runs", includeAuth = true) {
-  const headers: Record<string, string> = {};
-  if (includeAuth) headers.Authorization = "Bearer test-token";
-  return new Request(`http://localhost${url}`, { method: "GET", headers });
+  return authedRequest(`http://localhost${url}`, { token: "test-token", includeAuth });
 }
 
 describe("GET /api/groomer/runs", () => {
