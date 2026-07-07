@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { releaseStaleWork } from "@/lib/agent-work";
@@ -166,8 +167,7 @@ export async function GET(request: Request) {
 
     return NextResponse.json({ activeWork: items, staleLeases });
   } catch (error) {
-    console.error("Failed to fetch agent work:", error);
-    return NextResponse.json({ error: "Failed to fetch agent work" }, { status: 500 });
+    return handleApiError("fetch agent work", error);
   }
 }
 
