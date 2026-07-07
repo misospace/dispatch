@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -61,12 +56,10 @@ import { POST } from "./route";
 import { getSyncRepos } from "@/lib/config";
 
 function makeRequest(body?: Record<string, unknown>, includeAuth = true) {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  return new Request("http://localhost/api/issues/refresh", {
+  return authedRequest("http://localhost/api/issues/refresh", {
     method: "POST",
-    headers,
-    body: JSON.stringify(body ?? {}),
+    body: body ?? {},
+    includeAuth,
   }) as unknown as Parameters<typeof POST>[0];
 }
 

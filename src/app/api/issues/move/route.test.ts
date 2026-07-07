@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 // vi.hoisted() runs at the very top of the file, before vi.mock() hoisting.
 const { mocks } = vi.hoisted(() => ({
@@ -12,7 +13,6 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 // Mock dependencies — return the mock functions directly
@@ -41,6 +41,7 @@ vi.mock("@/lib/auth-next", () => ({
 // Import the route after mocks are set up
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function makePayload(overrides = {}) {
   return {
@@ -54,13 +55,7 @@ function makePayload(overrides = {}) {
 }
 
 function postRequest(payload = makePayload(), extraHeaders = {}) {
-  return POST(
-    new Request("http://localhost/api/issues/move", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
-      body: JSON.stringify(payload),
-    })
-  );
+  return POST(authedRequest("http://localhost/api/issues/move", { method: "POST", body: payload, headers: extraHeaders }));
 }
 
 describe("POST /api/issues/move — auth", () => {
@@ -69,6 +64,7 @@ describe("POST /api/issues/move — auth", () => {
     delete process.env.DISPATCH_AUTH_USERNAME;
     delete process.env.DISPATCH_AUTH_PASSWORD;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.auth.mockReset();
     mocks.findIssue.mockResolvedValue(null);
@@ -157,6 +153,7 @@ describe("POST /api/issues/move — validation", () => {
     delete process.env.DISPATCH_AUTH_USERNAME;
     delete process.env.DISPATCH_AUTH_PASSWORD;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.auth.mockReset();
     mocks.findIssue.mockResolvedValue(null);
@@ -383,5 +380,19 @@ describe("POST /api/issues/move — validation", () => {
         errorMessage: "github 500",
       }),
     });
+  });
+
+  it("returns 429 with Retry-After after exceeding the rate limit", async () => {
+    // Exhaust the per-actor limit (60/min).
+    for (let i = 0; i < 60; i++) {
+      const res = await postRequest(makePayload());
+      expect(res.status).toBe(200);
+    }
+
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    const body = await res.json();
+    expect(body.error).toBe("Rate limit exceeded");
   });
 });

@@ -1,14 +1,23 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { authorizeGroomerRequest } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
 import { runHostedGroomer } from "@/lib/groomer/run";
 import { getHostedGroomerConfig } from "@/lib/groomer/config";
 import { prisma } from "@/lib/prisma";
 
+// Generous per-actor rate limit — each run costs LLM spend, so this is the
+// tightest of the API limits, but normal grooming flows stay far below it.
+const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
+
 export async function POST(request: Request) {
-  if (!(await authorizeGroomerRequest(request)).authorized) {
+  const auth = await authorizeGroomerRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`groomer/run:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   let body: Record<string, unknown> = {};
   try {

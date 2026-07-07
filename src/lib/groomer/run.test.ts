@@ -747,4 +747,24 @@ Investigate session handling in auth module.`;
 
     expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
   });
+
+  it("normalizes explicit LLM nulls to undefined through the real schema validator", async () => {
+    const { validateGroomerOutput } = await vi.importActual<typeof import("./schema")>("./schema");
+    mocks.validateGroomerOutput.mockImplementation(validateGroomerOutput);
+    const badCandidate = { ...mockCandidate, title: "P0" };
+    mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
+    mocks.callGroomerLLM.mockResolvedValue({
+      ...mockOutput,
+      proposedTitle: null,
+      proposedBody: null,
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.output.proposedTitle).toBeUndefined();
+    expect(result!.output.proposedBody).toBeUndefined();
+    expect(result!.mutationPlan?.titleRewritten).toBe(false);
+    expect(result!.mutationPlan?.bodyEnriched).toBe(false);
+    expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+  });
 });

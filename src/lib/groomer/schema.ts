@@ -294,7 +294,7 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
   // proposedTitle — length guardrails (10-200 chars)
   if ("proposedTitle" in obj) {
     const rawTitle = obj.proposedTitle;
-    if (rawTitle !== null && typeof rawTitle === "string") {
+    if (typeof rawTitle === "string") {
       if (rawTitle.length < 10 || rawTitle.length > 200) {
         errors.push(`proposedTitle must be between 10 and 200 characters, got ${rawTitle.length}`);
         return { valid: false, errors, resolutions };
@@ -305,7 +305,7 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
   // proposedBody — length guardrails (< 10000 chars)
   if ("proposedBody" in obj) {
     const rawBody = obj.proposedBody;
-    if (rawBody !== null && typeof rawBody === "string") {
+    if (typeof rawBody === "string") {
       if (rawBody.length > 10_000) {
         errors.push(`proposedBody must be under 10000 characters, got ${rawBody.length}`);
         return { valid: false, errors, resolutions };
@@ -313,11 +313,12 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
     }
   }
 
-  // Optional string fields — null tolerance (null treated as absent)
+  // Optional string fields — normalize explicit null to absent at the parse
+  // boundary, so downstream consumers only ever see `string | undefined`.
   for (const field of OPTIONAL_STRING_FIELDS) {
     if (!(field in obj)) continue;
     const val = (obj as Record<string, unknown>)[field];
-    if (val === null) continue; // treat as omitted
+    if (val === null) continue; // normalize null → absent (undefined)
     if (typeof val !== "string") {
       errors.push(`${field} must be a string`);
       return { valid: false, errors, resolutions };

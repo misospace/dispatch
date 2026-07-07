@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -13,7 +14,6 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/prisma", () => ({
@@ -52,13 +52,7 @@ function makePayload(overrides = {}) {
 }
 
 function postRequest(payload = makePayload(), extraHeaders = {}) {
-  return POST(
-    new Request("http://localhost/api/issues/unclaim", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}`, ...extraHeaders },
-      body: JSON.stringify(payload),
-    })
-  );
+  return POST(authedRequest("http://localhost/api/issues/unclaim", { method: "POST", body: payload, headers: extraHeaders }));
 }
 
 describe("POST /api/issues/unclaim — auth", () => {
@@ -199,13 +193,11 @@ describe("POST /api/issues/unclaim — operator path", () => {
   function basicAuthRequest() {
     const credentials = Buffer.from("alice:hunter2").toString("base64");
     return POST(
-      new Request("http://localhost/api/issues/unclaim", {
+      authedRequest("http://localhost/api/issues/unclaim", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Basic ${credentials}`,
-        },
-        body: JSON.stringify(makePayload()),
+        body: makePayload(),
+        includeAuth: false,
+        headers: { Authorization: `Basic ${credentials}` },
       })
     );
   }

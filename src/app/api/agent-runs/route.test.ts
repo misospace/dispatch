@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -28,23 +23,14 @@ vi.mock("@/lib/prisma", () => ({
 
 import { GET, POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function getRequest(urlString: string, includeAuth = true) {
-  const headers: Record<string, string> = {};
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  return new Request(urlString, { headers });
+  return authedRequest(urlString, { includeAuth });
 }
 
 function postRequest(body: unknown, includeAuth = true) {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  return POST(
-    new Request("http://localhost/api/agent-runs", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    }),
-  );
+  return POST(authedRequest("http://localhost/api/agent-runs", { method: "POST", body, includeAuth }));
 }
 
 describe("GET /api/agent-runs", () => {
@@ -110,6 +96,7 @@ describe("POST /api/agent-runs", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.agentRunCreate.mockResolvedValue({
       id: "run-1",
@@ -135,15 +122,11 @@ describe("POST /api/agent-runs", () => {
   });
 
   it("returns 401 for bad bearer token", async () => {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: "Bearer wrong-token",
-    };
     const res = await POST(
-      new Request("http://localhost/api/agent-runs", {
+      authedRequest("http://localhost/api/agent-runs", {
         method: "POST",
-        headers,
-        body: JSON.stringify({ agentName: "saffron", runType: "implement", status: "completed", startedAt: new Date().toISOString() }),
+        body: { agentName: "saffron", runType: "implement", status: "completed", startedAt: new Date().toISOString() },
+        headers: { Authorization: "Bearer wrong-token" },
       }),
     );
 
@@ -183,5 +166,26 @@ describe("POST /api/agent-runs", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("Failed to create agent run");
+  });
+
+  it("returns 429 with Retry-After after exceeding the rate limit", async () => {
+    const payload = {
+      agentName: "saffron",
+      runType: "implement",
+      status: "completed",
+      startedAt: new Date().toISOString(),
+    };
+
+    // Exhaust the per-actor limit (120/min).
+    for (let i = 0; i < 120; i++) {
+      const res = await postRequest(payload);
+      expect(res.status).toBe(201);
+    }
+
+    const res = await postRequest(payload);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    const body = await res.json();
+    expect(body.error).toBe("Rate limit exceeded");
   });
 });

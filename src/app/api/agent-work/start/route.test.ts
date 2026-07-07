@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { makeDispatchEnvMock } from "@/test/route-helpers";
 
 const mockAgentWork = {
   create: vi.fn(),
@@ -28,12 +29,7 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token: string | null | undefined) => token === "test-token"),
-  isAuthorizedBearerToken: vi.fn((token: string | null | undefined) => token === "test-token"),
-  getAcceptedAgentTokens: vi.fn(() => ["test-token"]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token"));
 
 import { POST as handleStart } from "./route";
 

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { resetAuthCaches } from "@/lib/auth";
+import { authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -38,16 +39,7 @@ vi.mock("@/lib/auth-next", () => ({
 import { POST } from "./route";
 
 function groomRequest(payload: Record<string, unknown>) {
-  return POST(
-    new Request("http://localhost/api/issues/groom", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer test-token",
-      },
-      body: JSON.stringify(payload),
-    })
-  );
+  return POST(authedRequest("http://localhost/api/issues/groom", { method: "POST", token: "test-token", body: payload }));
 }
 
 function mockIssue(extra?: Record<string, unknown>) {

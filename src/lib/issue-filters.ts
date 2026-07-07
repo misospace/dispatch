@@ -1,6 +1,22 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
 
+/**
+ * Single source of truth for Renovate issue detection. Both the in-memory
+ * predicate (`isRenovateIssue`) and the Prisma where clause
+ * (`buildRenovateIssueExclusionWhere`) derive from these constants — keep
+ * them in sync by editing only this definition.
+ * Author detection is not available since the Issue model does not store author.
+ */
 export const RENOVATE_LABELS = ["renovate", "dependencies", "automated"] as const;
+
+/** Case-insensitive title substrings that identify Renovate dashboard issues. */
+export const RENOVATE_TITLE_SUBSTRINGS = ["dependency dashboard", "renovate dashboard"] as const;
+
+/**
+ * Case-insensitive title prefixes that identify Renovate update issues.
+ * "update dep" covers "update dep...", "update deps...", and "update dependency...".
+ */
+export const RENOVATE_TITLE_PREFIXES = ["update dep", "update image"] as const;
 
 export interface VisibleIssueWhereOptions {
   includeClosed?: boolean;
@@ -78,30 +94,36 @@ export function appendIssueWhere(where: Record<string, unknown>, clause: Record<
 }
 
 /**
- * Detect Renovate issues by title/label heuristics.
- * Author detection is not available since the Issue model does not store author.
+ * Detect Renovate issues by the shared title/label criteria above.
+ * This is the in-memory counterpart of `buildRenovateIssueExclusionWhere`.
  */
 export function isRenovateIssue(issue: { title: string; labels: string[] }): boolean {
   const title = issue.title.toLowerCase();
+
+  if (RENOVATE_TITLE_SUBSTRINGS.some((substring) => title.includes(substring))) return true;
+  if (RENOVATE_TITLE_PREFIXES.some((prefix) => title.startsWith(prefix))) return true;
+
   const labels = issue.labels.map((l) => l.toLowerCase());
-
-  if (title.includes("dependency dashboard")) return true;
-  if (title.includes("renovate dashboard")) return true;
-  if (/^update (?:dependency|image|deps?)/.test(title)) return true;
-
   return labels.some((label) => (RENOVATE_LABELS as readonly string[]).includes(label));
 }
 
+/**
+ * Build a Prisma where clause excluding Renovate issues, derived from the
+ * same criteria as `isRenovateIssue`. Note: label matching via `hasSome` is
+ * case-sensitive (Prisma scalar-list limitation), so mixed-case labels are
+ * only caught by the in-memory predicate.
+ */
 export function buildRenovateIssueExclusionWhere() {
   return {
     NOT: {
       OR: [
         { labels: { hasSome: [...RENOVATE_LABELS] } },
-        { title: { contains: "dependency dashboard", mode: "insensitive" } },
-        { title: { contains: "renovate dashboard", mode: "insensitive" } },
-        { title: { startsWith: "update dependency", mode: "insensitive" } },
-        { title: { startsWith: "update image", mode: "insensitive" } },
-        { title: { startsWith: "update dep", mode: "insensitive" } },
+        ...RENOVATE_TITLE_SUBSTRINGS.map((substring) => ({
+          title: { contains: substring, mode: "insensitive" },
+        })),
+        ...RENOVATE_TITLE_PREFIXES.map((prefix) => ({
+          title: { startsWith: prefix, mode: "insensitive" },
+        })),
       ],
     },
   };

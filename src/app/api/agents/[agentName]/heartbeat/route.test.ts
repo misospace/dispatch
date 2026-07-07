@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks, mockAgentRun } = vi.hoisted(() => ({
   mockAgentRun: {
@@ -84,13 +79,11 @@ function makeRequest(
   includeAuth = true,
   extraHeaders: Record<string, string> = {},
 ) {
-  const headers: Record<string, string> = {};
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  Object.assign(headers, extraHeaders);
-  return new Request(`http://localhost/api/agents/${agentName}/heartbeat`, {
+  return authedRequest(`http://localhost/api/agents/${agentName}/heartbeat`, {
     method: "POST",
-    headers,
-    body: JSON.stringify({}),
+    body: {},
+    includeAuth,
+    headers: extraHeaders,
   }) as unknown as Parameters<typeof POST>[0];
 }
 

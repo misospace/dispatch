@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -25,8 +20,7 @@ vi.mock("@/lib/prisma", () => ({
 import { GET } from "./route";
 
 describe("GET /api/repos", () => {
-  const authed = () =>
-    new Request("http://localhost/api/repos", { headers: { Authorization: `Bearer ${mockToken}` } });
+  const authed = () => authedRequest("http://localhost/api/repos");
 
   beforeEach(() => {
     vi.clearAllMocks();

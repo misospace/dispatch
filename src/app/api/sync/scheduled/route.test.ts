@@ -1,6 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-
-const mockToken = "test-agent-token";
+import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
 function createPrismaMock() {
   let transactionRunId: string | null = null;
@@ -124,15 +123,7 @@ function setupModules(prismaMock: ReturnType<typeof createPrismaMock>, githubMoc
 }
 
 function makeRequest(body?: Record<string, unknown>, extraHeaders: Record<string, string> = {}) {
-  return new Request("http://localhost/api/sync/scheduled", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${mockToken}`,
-      ...extraHeaders,
-    },
-    body: JSON.stringify(body ?? {}),
-  });
+  return authedRequest("http://localhost/api/sync/scheduled", { method: "POST", body: body ?? {}, headers: extraHeaders });
 }
 
 // ---------------------------------------------------------------------------

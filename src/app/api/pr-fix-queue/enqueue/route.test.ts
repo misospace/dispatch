@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => ({
-  isAuthorizedAgentToken: vi.fn((token) => token === mockToken),
-  isAuthorizedBearerToken: vi.fn((token) => token === mockToken),
-  getAcceptedAgentTokens: vi.fn(() => [mockToken]),
-  resetCaches: vi.fn(),
-}));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -35,15 +30,7 @@ import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 
 function postRequest(body: unknown, includeAuth = true) {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (includeAuth) headers.Authorization = `Bearer ${mockToken}`;
-  return POST(
-    new Request("http://localhost/api/pr-fix-queue/enqueue", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    }),
-  );
+  return POST(authedRequest("http://localhost/api/pr-fix-queue/enqueue", { method: "POST", body, includeAuth }));
 }
 
 describe("POST /api/pr-fix-queue/enqueue", () => {

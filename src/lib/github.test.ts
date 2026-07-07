@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
+  __resetGitHubAppState,
   addIssueComment,
   addIssueLabel,
   closeIssue,
@@ -11,6 +13,7 @@ import {
   fetchPullRequestCheckFailures,
   fetchPullRequestHealthSignals,
   fetchRepositoryMetadata,
+  getGitHubToken,
   removeIssueLabel,
   searchRepositoryCode,
   fetchRepositoryFileText,
@@ -813,5 +816,101 @@ describe("fetchLinkedPrHealthInput", () => {
       reviewDecision: "CHANGES_REQUESTED",
       checkFailures: [{ name: "lint", conclusion: "failure" }],
     });
+  });
+});
+
+describe("getGitHubToken (GitHub App auth)", () => {
+  const PAT = "test-token-for-pagination-tests";
+  let appPrivateKeyPem: string;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let nowSpy: MockInstance<() => number>;
+  let base: number;
+
+  // The token fetch signs a real RS256 JWT via crypto.subtle, so the tests
+  // need a genuine PKCS8 RSA key rather than a placeholder string.
+  beforeAll(() => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    appPrivateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+  });
+
+  beforeEach(() => {
+    __resetGitHubAppState();
+    process.env.GITHUB_APP_ID = "12345";
+    process.env.GITHUB_APP_INSTALLATION_ID = "67890";
+    process.env.GITHUB_APP_PRIVATE_KEY = appPrivateKeyPem;
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    base = Date.now();
+    nowSpy = vi.spyOn(Date, "now").mockReturnValue(base);
+  });
+
+  afterEach(() => {
+    nowSpy.mockRestore();
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+    __resetGitHubAppState();
+  });
+
+  function tokenResponse(token: string, expiresAtMs: number): Response {
+    return ok({ token, expires_at: new Date(expiresAtMs).toISOString() });
+  }
+
+  it("deduplicates concurrent initial calls into a single token fetch", async () => {
+    fetchMock.mockResolvedValue(tokenResponse("app-token-1", base + 3_600_000));
+
+    const [a, b] = await Promise.all([getGitHubToken(), getGitHubToken()]);
+
+    expect(a).toBe("app-token-1");
+    expect(b).toBe("app-token-1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toContain("/app/installations/67890/access_tokens");
+  });
+
+  it("deduplicates concurrent calls near expiry into a single refresh fetch", async () => {
+    fetchMock.mockResolvedValueOnce(tokenResponse("app-token-1", base + 3_600_000));
+
+    expect(await getGitHubToken()).toBe("app-token-1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Advance to within the 60s refresh window (cached TTL is 3300s).
+    nowSpy.mockReturnValue(base + 3_250_000);
+    fetchMock.mockResolvedValue(tokenResponse("app-token-2", base + 3_250_000 + 3_600_000));
+
+    const [a, b] = await Promise.all([getGitHubToken(), getGitHubToken()]);
+
+    expect(a).toBe("app-token-2");
+    expect(b).toBe("app-token-2");
+    // Exactly one refresh fetch shared by both callers: 1 init + 1 refresh.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries GitHub App auth on the next call after a transient init failure", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(500, "boom"));
+
+    // Init failed — this call falls back to the PAT.
+    expect(await getGitHubToken()).toBe(PAT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The failure is not latched: the next call retries and succeeds.
+    fetchMock.mockResolvedValueOnce(tokenResponse("app-token-1", base + 3_600_000));
+    expect(await getGitHubToken()).toBe("app-token-1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("latches the deliberate no-app-configured state and uses the PAT", async () => {
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+
+    expect(await getGitHubToken()).toBe(PAT);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Once latched, env vars appearing later are not re-checked.
+    process.env.GITHUB_APP_ID = "12345";
+    process.env.GITHUB_APP_INSTALLATION_ID = "67890";
+    process.env.GITHUB_APP_PRIVATE_KEY = appPrivateKeyPem;
+    expect(await getGitHubToken()).toBe(PAT);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
