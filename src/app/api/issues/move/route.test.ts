@@ -41,6 +41,7 @@ vi.mock("@/lib/auth-next", () => ({
 // Import the route after mocks are set up
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function makePayload(overrides = {}) {
   return {
@@ -69,6 +70,7 @@ describe("POST /api/issues/move — auth", () => {
     delete process.env.DISPATCH_AUTH_USERNAME;
     delete process.env.DISPATCH_AUTH_PASSWORD;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.auth.mockReset();
     mocks.findIssue.mockResolvedValue(null);
@@ -157,6 +159,7 @@ describe("POST /api/issues/move — validation", () => {
     delete process.env.DISPATCH_AUTH_USERNAME;
     delete process.env.DISPATCH_AUTH_PASSWORD;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.auth.mockReset();
     mocks.findIssue.mockResolvedValue(null);
@@ -383,5 +386,19 @@ describe("POST /api/issues/move — validation", () => {
         errorMessage: "github 500",
       }),
     });
+  });
+
+  it("returns 429 with Retry-After after exceeding the rate limit", async () => {
+    // Exhaust the per-actor limit (60/min).
+    for (let i = 0; i < 60; i++) {
+      const res = await postRequest(makePayload());
+      expect(res.status).toBe(200);
+    }
+
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    const body = await res.json();
+    expect(body.error).toBe("Rate limit exceeded");
   });
 });

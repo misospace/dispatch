@@ -95,6 +95,7 @@ vi.mock("@/lib/issue-sync", () => ({
 
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function makeRequest(
   body?: Record<string, unknown> | string,
@@ -119,6 +120,7 @@ describe("POST /api/sync — auth", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.auth.mockReset();
   });
@@ -180,6 +182,7 @@ describe("POST /api/sync — validation", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
   });
 
@@ -207,5 +210,19 @@ describe("POST /api/sync — validation", () => {
   it("returns 400 when body is malformed JSON", async () => {
     const res = await POST(makeRequest("{bad json}"));
     expect(res.status).toBe(400);
+  });
+
+  it("returns 429 with Retry-After after exceeding the rate limit", async () => {
+    // Exhaust the per-actor limit (30/min).
+    for (let i = 0; i < 30; i++) {
+      const res = await POST(makeRequest({}));
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(makeRequest({}));
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    const body = await res.json();
+    expect(body.error).toBe("Rate limit exceeded");
   });
 });

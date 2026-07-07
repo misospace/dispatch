@@ -5,12 +5,21 @@ import { syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, makePrismaIssueStore, fetchAllStateIssues } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 
+// Generous per-actor rate limit — each sync fans out GitHub API fetches, but
+// the shared sync lock already serializes runs, so this only backstops abuse.
+const RATE_LIMIT = { limit: 30, windowMs: 60_000 };
+
 export async function POST(request: NextRequest) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`sync:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const text = await request.text();

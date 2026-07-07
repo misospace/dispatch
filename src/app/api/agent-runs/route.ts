@@ -3,6 +3,11 @@ import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { isValidEscalatedOutcome, VALID_ESCALATED_OUTCOMES } from "@/types";
 import { authorizeRequest } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// Generous per-actor rate limit — agents report runs frequently, so this is
+// the loosest of the API limits and only backstops runaway loops.
+const RATE_LIMIT = { limit: 120, windowMs: 60_000 };
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
@@ -23,9 +28,13 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`agent-runs:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const body = await request.json();

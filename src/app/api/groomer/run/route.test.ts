@@ -35,6 +35,7 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 import { POST } from "./route";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function request(url = "/api/groomer/run", includeAuth = true) {
   const headers: Record<string, string> = {};
@@ -45,6 +46,7 @@ function request(url = "/api/groomer/run", includeAuth = true) {
 describe("POST /api/groomer/run", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     process.env.DISPATCH_AGENT_TOKEN = mockToken;
     mocks.runHostedGroomer.mockResolvedValue({
       candidateNumber: 42,
@@ -317,5 +319,29 @@ describe("POST /api/groomer/run", () => {
     // The guard should not have been triggered (no issueNumber)
     expect(mocks.prisma.issue.findFirst).not.toHaveBeenCalled();
     expect(mocks.runHostedGroomer).toHaveBeenCalled();
+  });
+
+  it("returns 429 with Retry-After after exceeding the rate limit", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({
+      enabled: true,
+      dryRun: true,
+      llmBaseUrl: "https://llm.example.com",
+      apiKey: "sk-test",
+      model: "gpt-4o-mini",
+      timeoutMs: 60000,
+      maxContextBytes: 8192,
+    });
+
+    // Exhaust the per-actor limit (10/min).
+    for (let i = 0; i < 10; i++) {
+      const res = await POST(request());
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(request());
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    const body = await res.json();
+    expect(body.error).toBe("Rate limit exceeded");
   });
 });

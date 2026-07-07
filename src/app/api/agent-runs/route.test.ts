@@ -28,6 +28,7 @@ vi.mock("@/lib/prisma", () => ({
 
 import { GET, POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function getRequest(urlString: string, includeAuth = true) {
   const headers: Record<string, string> = {};
@@ -110,6 +111,7 @@ describe("POST /api/agent-runs", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
     mocks.agentRunCreate.mockResolvedValue({
       id: "run-1",
@@ -183,5 +185,26 @@ describe("POST /api/agent-runs", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("Failed to create agent run");
+  });
+
+  it("returns 429 with Retry-After after exceeding the rate limit", async () => {
+    const payload = {
+      agentName: "saffron",
+      runType: "implement",
+      status: "completed",
+      startedAt: new Date().toISOString(),
+    };
+
+    // Exhaust the per-actor limit (120/min).
+    for (let i = 0; i < 120; i++) {
+      const res = await postRequest(payload);
+      expect(res.status).toBe(201);
+    }
+
+    const res = await postRequest(payload);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    const body = await res.json();
+    expect(body.error).toBe("Rate limit exceeded");
   });
 });
