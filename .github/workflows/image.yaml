@@ -101,6 +101,11 @@ jobs:
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
+          # The severity filter is ignored for SARIF output unless this is set.
+          limit-severities-for-sarif: true
+          # Skip OS-package CVEs Debian hasn't shipped a fix for — nothing
+          # actionable, and they drown out alerts we can actually fix.
+          ignore-unfixed: true
           exit-code: "0"
 
       - name: Upload Trivy results
