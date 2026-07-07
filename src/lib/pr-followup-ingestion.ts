@@ -250,10 +250,15 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
     workItem: (event) => {
       const checkName = event.checkName ?? "unknown";
       return {
-        lane: laneFor(event.body ?? `Check "${checkName}" ${event.conclusion}`),
+        // A failing check is actionable work for coder-revision by definition —
+        // don't classify it by prose (CI checks rarely set output.summary, and an
+        // empty body would misroute to NEEDS_HUMAN). The escalation ladder
+        // (PR_FIX_MAX_ATTEMPTS -> ESCALATED -> NEEDS_HUMAN) handles "coder can't fix it".
+        lane: "NORMAL",
         type: "CI_FAILURE",
         reason: `Failing check: ${checkName} (${event.conclusion})`,
-        feedback: event.body ?? `Check "${checkName}" concluded ${event.conclusion}`,
+        // `||` not `??`: an empty summary ("") must fall back to a real description.
+        feedback: event.body || `Check "${checkName}" concluded ${event.conclusion}`,
       };
     },
   },

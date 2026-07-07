@@ -348,6 +348,33 @@ describe("ingestCheckRunEvent", () => {
     expect(client.items[0].type).toBe("CI_FAILURE");
   });
 
+  it("routes a summary-less failing check to NORMAL, not NEEDS_HUMAN", async () => {
+    // The sync sets body = output.summary ?? "" and most CI jobs (test/e2e/lint)
+    // set no summary, so the event body is empty. A failing check is still
+    // actionable — it must not be parked on a human.
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/KubeTix",
+      prNumber: 207,
+      branch: "foreman/wl-misospace-kubetix-165/issue-165",
+      url: "https://github.com/misospace/KubeTix/actions/runs/1",
+      title: "Test infrastructure fragility",
+      author: "itsmiso-ai",
+      checkName: "e2e-tests",
+      conclusion: "failure",
+      checkRunId: "cr-empty",
+      checkDetails: "",
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("CI_FAILURE");
+    // Empty summary must fall back to a real description, not an empty string.
+    expect(String(client.items[0].feedback)).toContain("e2e-tests");
+  });
+
   it("enqueues cancelled/timed_out checks", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();
