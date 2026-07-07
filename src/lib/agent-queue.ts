@@ -139,6 +139,10 @@ function isClaimableStatus(labels: string[]): boolean {
  *   includeClaimed: whether to show issues claimed by other agents
  *   claimableOnly: whether to filter to only status/ready and status/in-progress
  * Excludes Renovate issues by default; pass includeRenovate=true to include them.
+ * This is the single decision point for Renovate exclusion in the agent queue
+ * path (queue/next-task routes) — callers must not pre-filter Renovate issues
+ * upstream (e.g. at the DB level), or includeRenovate=true would be a no-op.
+ * The criteria live in issue-filters.ts (`isRenovateIssue`).
  * By default, only claimable work is returned (excludes status/backlog).
  * Pass claimableOnly=false to include all actionable issues including backlog.
  * Excludes issues with labels matching DISPATCH_EXCLUDED_LABELS by default.

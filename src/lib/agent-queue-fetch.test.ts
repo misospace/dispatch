@@ -9,7 +9,6 @@ const { mocks } = vi.hoisted(() => ({
     findLeasedIssueIds: vi.fn(),
     resolveRequestLane: vi.fn(),
     getLaneIds: vi.fn(() => ["local", "cloud", "frontier", "backlog"]),
-    applyRenovateIssueExclusion: vi.fn(),
     parseExcludedLabels: vi.fn(() => []),
   },
 }));
@@ -26,7 +25,6 @@ vi.mock("@/lib/pr-fix-queue", () => ({
 vi.mock("@/lib/lease", () => ({ findLeasedIssueIds: mocks.findLeasedIssueIds }));
 vi.mock("@/lib/config", () => ({ parseExcludedLabels: mocks.parseExcludedLabels }));
 vi.mock("@/lib/lane-config", () => ({ resolveRequestLane: mocks.resolveRequestLane, getLaneIds: mocks.getLaneIds }));
-vi.mock("@/lib/issue-filters", () => ({ applyRenovateIssueExclusion: mocks.applyRenovateIssueExclusion }));
 
 import { fetchAgentQueueData } from "./agent-queue-fetch";
 
@@ -76,6 +74,21 @@ describe("fetchAgentQueueData", () => {
 
     const ranked = mocks.buildAgentQueue.mock.calls[0][0] as Array<{ issueId: string }>;
     expect(ranked.map((i) => i.issueId)).toEqual(["keep"]);
+  });
+
+  it("does not filter Renovate issues at the DB level — buildAgentQueue owns that decision", async () => {
+    await fetchAgentQueueData(params());
+
+    const where = mocks.findMany.mock.calls[0][0].where;
+    expect(where).toEqual({ state: "open", repository: { enabled: true } });
+  });
+
+  it("forwards includeRenovate to buildAgentQueue", async () => {
+    await fetchAgentQueueData({ ...params(), includeRenovate: true });
+    expect(mocks.buildAgentQueue).toHaveBeenCalledWith(expect.any(Array), "a", expect.objectContaining({ includeRenovate: true }));
+
+    await fetchAgentQueueData(params());
+    expect(mocks.buildAgentQueue).toHaveBeenLastCalledWith(expect.any(Array), "a", expect.objectContaining({ includeRenovate: false }));
   });
 
   it("returns the ranked queue, mapped pr-fix items, and available lanes", async () => {

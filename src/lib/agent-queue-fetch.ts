@@ -4,7 +4,6 @@ import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue"
 import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
 import { resolveRequestLane, getLaneIds } from "@/lib/lane-config";
-import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -45,7 +44,9 @@ export interface AgentQueueFetchResult {
  * This function:
  * 1. Fetches all open issues from enabled repos
  * 2. Filters out issues leased by other agents
- * 3. Builds a ranked issue queue via `buildAgentQueue`
+ * 3. Builds a ranked issue queue via `buildAgentQueue`, which owns the
+ *    Renovate exclusion (honoring `includeRenovate`) and excluded-label
+ *    filtering — no issue-level filtering happens at the DB layer
  * 4. Lists queued PR fix items
  *
  * Lane resolution uses `resolveRequestLane` which handles alias mapping.
@@ -54,11 +55,14 @@ export async function fetchAgentQueueData(
   params: AgentQueueFetchParams,
 ): Promise<AgentQueueFetchResult> {
   const { agentName, lane, excludeDecomposed, includeClaimed, includeRenovate } = params;
+  // Renovate exclusion is intentionally NOT applied at the DB level here.
+  // `buildAgentQueue` owns that decision (via the `includeRenovate` option and
+  // the shared `isRenovateIssue` criteria in issue-filters.ts), so filtering
+  // here would silently override includeRenovate=true.
   const issueWhere: Record<string, unknown> = {
     state: "open",
     repository: { enabled: true },
   };
-  applyRenovateIssueExclusion(issueWhere);
 
   // The open-issue list, active leases, and queued PR fix items are
   // independent — fetch them in parallel.

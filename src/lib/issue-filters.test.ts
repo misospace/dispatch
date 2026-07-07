@@ -5,6 +5,7 @@ import {
   buildExcludedLabelWhere,
   buildLabelWhere,
   buildNoStatusWhere,
+  buildRenovateIssueExclusionWhere,
   buildVisibleIssueWhere,
   DEFAULT_DONE_RETENTION_DAYS,
   discoverLabelFilterOptions,
@@ -109,6 +110,66 @@ describe("issue exclusion filters", () => {
     expect(isRenovateIssue({ title: "Update image node to v20", labels: [] })).toBe(true);
     expect(isRenovateIssue({ title: "Bump lodash", labels: ["renovate"] })).toBe(true);
     expect(isRenovateIssue({ title: "Fix login bug", labels: ["bug"] })).toBe(false);
+  });
+});
+
+describe("Renovate exclusion criteria agreement (DB vs in-memory)", () => {
+  type Issue = { title: string; labels: string[] };
+
+  // Minimal evaluator for the Prisma where-clause shape produced by
+  // buildRenovateIssueExclusionWhere, mirroring Prisma semantics:
+  // hasSome is case-sensitive; title filters honor mode: "insensitive".
+  function matchesWhere(issue: Issue, clause: Record<string, unknown>): boolean {
+    if ("NOT" in clause) return !matchesWhere(issue, clause.NOT as Record<string, unknown>);
+    if ("OR" in clause) {
+      return (clause.OR as Record<string, unknown>[]).some((c) => matchesWhere(issue, c));
+    }
+    if ("labels" in clause) {
+      const { hasSome } = clause.labels as { hasSome: string[] };
+      return hasSome.some((label) => issue.labels.includes(label));
+    }
+    if ("title" in clause) {
+      const filter = clause.title as { contains?: string; startsWith?: string; mode?: string };
+      const insensitive = filter.mode === "insensitive";
+      const title = insensitive ? issue.title.toLowerCase() : issue.title;
+      const normalize = (needle: string) => (insensitive ? needle.toLowerCase() : needle);
+      if (filter.contains !== undefined) return title.includes(normalize(filter.contains));
+      if (filter.startsWith !== undefined) return title.startsWith(normalize(filter.startsWith));
+    }
+    throw new Error(`Unsupported where clause: ${JSON.stringify(clause)}`);
+  }
+
+  it("DB-level and in-memory exclusion agree on the same fixture set", () => {
+    const fixtures: Issue[] = [
+      // Renovate: title heuristics
+      { title: "Dependency Dashboard", labels: [] },
+      { title: "DEPENDENCY DASHBOARD", labels: [] },
+      { title: "Renovate Dashboard 🤖", labels: [] },
+      { title: "Update dependency lodash to v4.18.0", labels: [] },
+      { title: "Update deps devDependencies", labels: [] },
+      { title: "Update image node to v20", labels: [] },
+      { title: "update dependency foo", labels: [] },
+      // Renovate: label heuristics
+      { title: "Bump lodash", labels: ["renovate"] },
+      { title: "Bump lodash", labels: ["dependencies"] },
+      { title: "Bump lodash", labels: ["automated"] },
+      { title: "Fix login bug", labels: ["bug", "renovate"] },
+      // Not Renovate
+      { title: "Fix login bug", labels: ["bug", "priority/p1"] },
+      { title: "Bump lodash", labels: [] },
+      { title: "Add update dependency docs", labels: [] },
+      { title: "Renovate the dashboard layout", labels: ["frontend"] },
+      { title: "", labels: ["status/ready"] },
+    ];
+
+    const where = buildRenovateIssueExclusionWhere();
+    for (const issue of fixtures) {
+      // The where clause matches issues that SURVIVE the exclusion, so it
+      // must agree with the negation of the in-memory predicate.
+      expect(matchesWhere(issue, where), `disagreement on ${JSON.stringify(issue)}`).toBe(
+        !isRenovateIssue(issue),
+      );
+    }
   });
 });
 
