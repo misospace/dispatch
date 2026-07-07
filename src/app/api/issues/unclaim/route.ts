@@ -1,12 +1,16 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { removeIssueLabel } from "@/lib/github";
+import { removeIssueLabel, updateIssueLabels } from "@/lib/github";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
-import { authorizeRequest } from "@/lib/auth";
-import { releaseLease } from "@/lib/lease";
+import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import {
+  releaseLeaseByAgentAndIssue,
+  releaseAgentWorkByAgentAndIssue,
+} from "@/lib/lease";
 
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -30,11 +34,13 @@ export async function POST(request: Request) {
     }
 
     const agentLabel = `${AGENT_PREFIX}${agentName}` as const;
+    const actor = getAuthorizedActor(auth, request, agentName as string);
+    const isAgentSelfUnclaim = auth.type === "bearer" && actor === agentName;
+    const auditAction = isAgentSelfUnclaim ? "unclaim_issue" : "unclaim_issue_by_operator";
 
     // Fetch the issue from the local database to get current labels
     const issue = await prisma.issue.findUnique({
       where: { id: issueId as string },
-      include: { repository: true },
     });
 
     if (!issue) {
@@ -62,29 +68,56 @@ export async function POST(request: Request) {
     }
 
     try {
-      // Remove the agent label from GitHub
+      // Compute the new label set: drop the agent label; if status/in-progress,
+      // flip to status/ready so the issue leaves the In Progress column.
+      let updatedLabels = issue.labels.filter((l) => l !== agentLabel);
+      if (updatedLabels.includes("status/in-progress")) {
+        updatedLabels = updatedLabels.filter((l) => l !== "status/in-progress");
+        if (!updatedLabels.includes("status/ready")) {
+          updatedLabels.push("status/ready");
+        }
+      }
+
+      // Apply label changes to GitHub (conflict-aware: re-applies all
+      // non-status labels and adds status/ready in one shot).
+      await updateIssueLabels(
+        repoFullName as string,
+        issueNumber as number,
+        updatedLabels,
+      );
+      // Defensive: ensure the agent/* label is removed even if GitHub's API
+      // returned something different than what we expected.
       await removeIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
 
       // Update local cache
-      const updatedLabels = issue.labels.filter((l) => l !== agentLabel);
       await prisma.issue.update({
         where: { id: issueId as string },
         data: { labels: updatedLabels, lastSyncedAt: new Date() },
       });
 
-      // Release the lease (issue #166)
-      await releaseLeaseByAgent(issueId as string, agentName as string);
+      // Release the lease using the shared helper (uses deleteMany under
+      // the hood — see src/lib/lease.ts).
+      await releaseLeaseByAgentAndIssue(agentName as string, issueId as string);
+
+      // For the operator path, also release any AgentWork records for this
+      // agent+issue (mark them RELEASED and write a released_by_operator
+      // history entry). The agent self-unclaim path doesn't need this
+      // because the agent is releasing its own claim.
+      if (!isAgentSelfUnclaim) {
+        await releaseAgentWorkByAgentAndIssue(agentName as string, issueId as string);
+      }
 
       // Write audit log
       await prisma.auditLog.create({
         data: {
-          actor: agentName as string,
-          action: "unclaim_issue",
+          actor,
+          action: auditAction,
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
           issueId: issueId as string,
           beforeLabels: issue.labels,
           afterLabels: updatedLabels,
+          notes: isAgentSelfUnclaim ? null : `Released agent ${agentName} as ${actor}`,
           success: true,
         },
       });
@@ -96,8 +129,8 @@ export async function POST(request: Request) {
       // Write failure audit log
       await prisma.auditLog.create({
         data: {
-          actor: agentName as string,
-          action: "unclaim_issue",
+          actor,
+          action: auditAction,
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
           issueId: issueId as string,
@@ -113,17 +146,5 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("Unclaim issue failed:", error);
     return NextResponse.json({ error: "Failed to unclaim issue" }, { status: 500 });
-  }
-}
-
-/**
- * Release the lease for a specific agent on an issue.
- */
-async function releaseLeaseByAgent(issueId: string, agentName: string): Promise<void> {
-  const lease = await prisma.lease.findUnique({
-    where: { agentName_issueId: { agentName, issueId } },
-  });
-  if (lease) {
-    await prisma.lease.delete({ where: { id: lease.id } });
   }
 }

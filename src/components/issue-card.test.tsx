@@ -1,6 +1,6 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import React from "react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import { IssueCard } from "./issue-card";
 
 vi.mock("next/navigation", () => ({
@@ -23,8 +23,9 @@ vi.mock("@dnd-kit/utilities", () => ({
   CSS: { Transform: { toString: () => "" } },
 }));
 
+const authedFetchMock = vi.fn();
 vi.mock("@/lib/client-auth", () => ({
-  authedFetch: vi.fn(),
+  authedFetch: (...args: unknown[]) => authedFetchMock(...args),
 }));
 
 const makeIssue = (overrides = {}) => ({
@@ -134,5 +135,97 @@ describe("IssueCard lane badge", () => {
     // jsdom normalizes hex colors to rgb/rgba; verify a color was applied
     expect(badge?.style.backgroundColor).toMatch(/rgba?\(/);
     expect(badge?.style.color).toMatch(/rgba?\(/);
+  });
+});
+
+describe("IssueCard unclaim button (issue #564)", () => {
+  beforeEach(() => {
+    authedFetchMock.mockReset();
+  });
+
+  it("renders the Unclaim button when the issue has an agent/* label", () => {
+    const issue = makeIssue({ labels: ["status/in-progress", "agent/claude"] });
+    render(React.createElement(IssueCard, { issue, onIssueUpdate: vi.fn() }));
+
+    const btn = screen.getByTestId("unclaim-button");
+    expect(btn).toBeInTheDocument();
+    expect(btn).toHaveAttribute("aria-label", "Unclaim from claude");
+  });
+
+  it("does not render the Unclaim button when no agent/* label is present", () => {
+    const issue = makeIssue({ labels: ["status/ready"] });
+    render(React.createElement(IssueCard, { issue, onIssueUpdate: vi.fn() }));
+
+    expect(screen.queryByTestId("unclaim-button")).not.toBeInTheDocument();
+  });
+
+  it("opens the confirm dialog when Unclaim is clicked", () => {
+    const issue = makeIssue({ labels: ["status/in-progress", "agent/claude"] });
+    render(React.createElement(IssueCard, { issue, onIssueUpdate: vi.fn() }));
+
+    fireEvent.click(screen.getByTestId("unclaim-button"));
+
+    expect(screen.getByTestId("unclaim-dialog")).toBeInTheDocument();
+    expect(screen.getByText(/Unclaim from/)).toBeInTheDocument();
+    expect(screen.getByText(/agent\/claude/)).toBeInTheDocument();
+  });
+
+  it("clicking Confirm calls POST /api/issues/unclaim with the expected payload and triggers a board refresh", async () => {
+    authedFetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (String(url).endsWith("/api/sync")) {
+        return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      }
+      if (String(url).endsWith("/api/issues/unclaim")) {
+        return Promise.resolve(new Response(JSON.stringify({ success: true, labels: ["status/ready"] }), { status: 200 }));
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
+
+    const onIssueUpdate = vi.fn();
+    const issue = makeIssue({ labels: ["status/in-progress", "agent/claude"] });
+    render(React.createElement(IssueCard, { issue, onIssueUpdate }));
+
+    fireEvent.click(screen.getByTestId("unclaim-button"));
+    fireEvent.click(screen.getByTestId("unclaim-confirm"));
+
+    await waitFor(() => {
+      expect(authedFetchMock).toHaveBeenCalledWith(
+        "/api/issues/unclaim",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            issueId: issue.id,
+            repoFullName: issue.repository.fullName,
+            issueNumber: issue.number,
+            agentName: "claude",
+          }),
+        }),
+      );
+    });
+
+    // Board refresh path: sync + onIssueUpdate are triggered on success.
+    await waitFor(() => {
+      expect(authedFetchMock).toHaveBeenCalledWith("/api/sync", { method: "POST" });
+      expect(onIssueUpdate).toHaveBeenCalled();
+    });
+  });
+
+  it("surfaces the error string in the dialog when the API responds non-2xx", async () => {
+    authedFetchMock.mockImplementation((url: string) => {
+      if (String(url).endsWith("/api/issues/unclaim")) {
+        return Promise.resolve(new Response(JSON.stringify({ error: "Refusing: closed" }), { status: 400 }));
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
+
+    const issue = makeIssue({ labels: ["status/in-progress", "agent/claude"] });
+    render(React.createElement(IssueCard, { issue, onIssueUpdate: vi.fn() }));
+
+    fireEvent.click(screen.getByTestId("unclaim-button"));
+    fireEvent.click(screen.getByTestId("unclaim-confirm"));
+
+    const err = await screen.findByTestId("unclaim-error");
+    expect(err).toHaveTextContent("Refusing: closed");
   });
 });

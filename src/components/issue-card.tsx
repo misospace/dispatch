@@ -68,6 +68,10 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
   const [groomSummary, setGroomSummary] = useState("");
   const [groomReason, setGroomReason] = useState("");
 
+  // Unclaim confirm dialog state (issue #564)
+  const [unclaimConfirmOpen, setUnclaimConfirmOpen] = useState(false);
+  const [unclaimLoading, setUnclaimLoading] = useState(false);
+
   const statusColor = issue.labels
     .filter((l) => l.startsWith("status/"))
     .map((l) => LABEL_COLORS[l] || "6b7280")[0] || "6b7280";
@@ -75,6 +79,7 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
   const agentLabel = issue.labels.find((l) => l.startsWith("agent/"));
   const ownerLabel = issue.labels.find((l) => l.startsWith("owner/"));
   const priorityLabel = issue.labels.find((l) => l.startsWith("priority/"));
+  const agentName = agentLabel?.replace(AGENT_PREFIX, "");
 
   // Fetch available agents on mount (once)
   const fetchAgents = useCallback(async () => {
@@ -183,6 +188,45 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
     }
   }
 
+  /**
+   * Operator-initiated unclaim (issue #564): releases the lease, marks
+   * AgentWork RELEASED, flips status/in-progress -> status/ready, removes
+   * the agent/* label, and writes a unclaim_issue_by_operator audit row.
+   */
+  async function handleUnclaimConfirm() {
+    if (!agentName) return;
+    setUnclaimLoading(true);
+    setError(null);
+    try {
+      const res = await authedFetch("/api/issues/unclaim", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          issueId: issue.id,
+          repoFullName: issue.repository.fullName,
+          issueNumber: issue.number,
+          agentName,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+
+      setUnclaimConfirmOpen(false);
+      await handleSuccess("unclaim");
+    } catch (err) {
+      // Keep the dialog open and surface the error inside it so the user
+      // can dismiss or retry without losing context.
+      const msg = err instanceof Error ? err.message : "Unclaim failed";
+      setError(msg);
+      setLoadingAction(null);
+    } finally {
+      setUnclaimLoading(false);
+    }
+  }
+
   async function handleAssignOwnerSubmit(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = ownerNameInput.trim();
@@ -286,6 +330,25 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
             >
               <ExternalLink className="h-3 w-3" />
             </a>
+            {/* Operator-facing Unclaim button (issue #564). Only shown when the
+                issue actually has an agent/* label so the affordance is
+                discoverable without rummaging through the dropdown. */}
+            {agentLabel && agentName && (
+              <button
+                className="text-xs px-1.5 py-0.5 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setError(null);
+                  setUnclaimConfirmOpen(true);
+                }}
+                disabled={loadingAction !== null || unclaimLoading}
+                aria-label={`Unclaim from ${agentName}`}
+                title={`Unclaim from ${agentName}`}
+                data-testid="unclaim-button"
+              >
+                Unclaim
+              </button>
+            )}
             {/* Assignment controls dropdown trigger */}
             <div className="relative">
               <button
@@ -633,6 +696,68 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
           )}
         </div>
       </CardContent>
+
+      {/* Unclaim confirm dialog (issue #564) */}
+      {unclaimConfirmOpen && agentName && (
+        <>
+          <div
+            className="fixed inset-0 z-[60] bg-black/50"
+            onClick={() => {
+              if (!unclaimLoading) setUnclaimConfirmOpen(false);
+            }}
+            data-testid="unclaim-dialog-backdrop"
+          />
+          <div
+            className="fixed inset-0 z-[70] flex items-center justify-center p-4 pointer-events-none"
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="unclaim-dialog-title"
+              data-testid="unclaim-dialog"
+              className="pointer-events-auto bg-popover text-popover-foreground border rounded-md shadow-lg p-4 w-full max-w-sm"
+            >
+              <h2 id="unclaim-dialog-title" className="text-sm font-semibold">
+                Unclaim from <code>agent/{agentName}</code>?
+              </h2>
+              <p className="text-xs text-muted-foreground mt-2">
+                This releases the lease and moves the issue back to <strong>Ready</strong>.
+              </p>
+              {error && (
+                <div
+                  data-testid="unclaim-error"
+                  className="text-xs text-destructive mt-3 p-2 bg-destructive/10 rounded"
+                >
+                  {error}
+                </div>
+              )}
+              <div className="flex justify-end gap-2 mt-4">
+                <button
+                  className="px-3 py-1 text-xs rounded bg-muted hover:bg-muted-foreground/20 disabled:opacity-50"
+                  onClick={() => {
+                    if (!unclaimLoading) setUnclaimConfirmOpen(false);
+                  }}
+                  disabled={unclaimLoading}
+                  data-testid="unclaim-cancel"
+                >
+                  Cancel
+                </button>
+                <button
+                  className="px-3 py-1 text-xs rounded bg-destructive text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void handleUnclaimConfirm();
+                  }}
+                  disabled={unclaimLoading}
+                  data-testid="unclaim-confirm"
+                >
+                  {unclaimLoading ? "Unclaiming…" : "Confirm"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
     </Card>
   );
 }
