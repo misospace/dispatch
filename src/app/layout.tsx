@@ -5,6 +5,7 @@ import "./globals.css";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { MobileNav } from "@/components/mobile-nav";
 import { AuthControls } from "@/components/auth-controls";
+import { GitHubLink } from "@/components/github-link";
 import { getVersionLabel } from "@/lib/version";
 
 const inter = Inter({ subsets: ["latin"] });
@@ -85,10 +86,11 @@ export default function RootLayout({
               <MobileNav />
 
               <span className="text-xs text-muted-foreground/60 shrink-0">{getVersionLabel()}</span>
-              <div className="ml-auto shrink-0 flex items-center gap-2">
-                <AuthControls />
-                <ThemeToggle />
-              </div>
+<div className="ml-auto shrink-0 flex items-center gap-2">
+            <AuthControls />
+            <GitHubLink />
+            <ThemeToggle />
+          </div>
             </div>
           </header>
           <main className="flex-1 mx-auto w-full max-w-screen-2xl px-4 sm:px-6 lg:px-8 py-6">{children}</main>

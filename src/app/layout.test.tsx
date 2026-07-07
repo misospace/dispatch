@@ -34,8 +34,12 @@ vi.mock("@/components/auth-controls", () => ({
 }));
 
 vi.mock("next/link", () => ({
-  default: function NavLink({ href, children }: { href: string; children: React.ReactNode }) {
-    return React.createElement("a", { href, "data-nav": "true" }, children);
+  default: function NavLink({
+    href,
+    children,
+    ...rest
+  }: React.AnchorHTMLAttributes<HTMLAnchorElement> & { href: string; children: React.ReactNode }) {
+    return React.createElement("a", { href, "data-nav": "true", ...rest }, children);
   },
 }));
 
@@ -155,6 +159,27 @@ describe("RootLayout app shell", () => {
     );
     const desktopToggle = container.querySelector(".ml-auto button[aria-label='Switch to dark mode']");
     expect(desktopToggle).toBeTruthy();
+  });
+
+  it("renders a GitHub link in the desktop header cluster", () => {
+    const { container } = render(
+      <RootLayout>
+        <span />
+      </RootLayout>,
+    );
+    const cluster = container.querySelector(".ml-auto");
+    expect(cluster).toBeTruthy();
+    const link = cluster?.querySelector("a[aria-label='Dispatch on GitHub']");
+    expect(link).toBeTruthy();
+    expect(link?.getAttribute("href")).toBe("https://github.com/misospace/dispatch");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toBe("noopener noreferrer");
+    // The button (rendered as the anchor via Radix `asChild`) should
+    // also carry the aria-label so SR users hear "Dispatch on GitHub"
+    // regardless of which element receives focus.
+    const labeled = cluster?.querySelector("a[aria-label='Dispatch on GitHub']");
+    expect(labeled).toBeTruthy();
+    expect(labeled?.getAttribute("title")).toBe("Dispatch on GitHub");
   });
 
   it("renders version label", () => {
