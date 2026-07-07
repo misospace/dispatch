@@ -188,7 +188,7 @@ export async function POST(request: NextRequest) {
 
         // Fetch failing check runs for this PR's branch and collect events
         try {
-          const checksUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=end&per_page=100`;
+          const checksUrl = `${process.env.GITHUB_API_URL || "https://api.github.com"}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=completed&per_page=100`;
           const checksData: any = await fetchWithGithub(checksUrl, token);
 
           for (const checkRun of (checksData.check_runs ?? [])) {
