@@ -214,6 +214,79 @@ describe("groomer schema validation", () => {
     expect(result.resolutions?.some((r) => r.source === "invariant")).toBe(false);
   });
 
+  // ── dispatch#572: a "ready" issue must carry the status/ready label, otherwise
+  // worker queues (which require a claimable status) silently exclude it and the
+  // issue sits stranded despite being groomed. The LLM sometimes judges an issue
+  // ready but omits status/ready (or even emits a conflicting status/*). Coerce
+  // the status label and record it as an invariant, mirroring the lane coercion.
+  it("adds status/ready when actionability is ready but no status label is present (dispatch#572)", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: ["type/bug"],
+      labelsToRemove: [],
+      lane: { id: "local", confidence: "high", reason: "clear implementation task" },
+      actionability: "ready",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.labelsToAdd).toContain("status/ready");
+    const invariant = result.resolutions?.find(
+      (r) => r.source === "invariant" && r.field === "labelsToAdd",
+    );
+    expect(invariant).toBeDefined();
+    expect(invariant?.resolvedValue).toBe("status/ready");
+  });
+
+  it("leaves status/ready untouched when already present for a ready issue", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: ["status/ready", "type/bug"],
+      labelsToRemove: [],
+      lane: { id: "local", confidence: "high", reason: "clear implementation task" },
+      actionability: "ready",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.labelsToAdd).toEqual(["status/ready", "type/bug"]);
+    expect(
+      result.resolutions?.some(
+        (r) => r.source === "invariant" && r.field === "labelsToAdd",
+      ),
+    ).toBe(false);
+  });
+
+  it("replaces a conflicting status/* with status/ready for a ready issue", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: ["status/backlog", "type/bug"],
+      labelsToRemove: [],
+      lane: { id: "local", confidence: "high", reason: "clear implementation task" },
+      actionability: "ready",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.labelsToAdd).toContain("status/ready");
+    expect(result.parsed?.labelsToAdd).not.toContain("status/backlog");
+    // pre-existing non-ready status is moved into labelsToRemove so the GitHub
+    // label set actually flips rather than keeping both.
+    expect(result.parsed?.labelsToRemove).toContain("status/backlog");
+    const invariant = result.resolutions?.find(
+      (r) => r.source === "invariant" && r.field === "labelsToAdd",
+    );
+    expect(invariant).toMatchObject({
+      rawValue: "status/backlog",
+      resolvedValue: "status/ready",
+    });
+  });
+
+  it("does not coerce status when actionability is not ready", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: ["type/bug"],
+      labelsToRemove: [],
+      lane: { id: "backlog", confidence: "medium", reason: "needs detail" },
+      actionability: "needs_info",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.labelsToAdd).not.toContain("status/ready");
+    expect(
+      result.resolutions?.some((r) => r.source === "invariant" && r.field === "labelsToAdd"),
+    ).toBe(false);
+  });
+
   it("accepts valid frontier lane", () => {
     const result = validateGroomerOutput({
       ...validOutput,
@@ -386,7 +459,7 @@ describe("groomer schema validation", () => {
 
   it("multiple enum fields with aliases: both events appear in resolutions", () => {
     const result = validateGroomerOutput({
-      labelsToAdd: [],
+      labelsToAdd: ["status/ready"],
       labelsToRemove: [],
       lane: { id: "normal", confidence: "high", reason: "test" },
       actionability: "ready",
@@ -400,7 +473,7 @@ describe("groomer schema validation", () => {
 
   it("empty aliases map: behavior matches no-aliases (no spurious events)", () => {
     const result = validateGroomerOutput({
-      labelsToAdd: [],
+      labelsToAdd: ["status/ready"],
       labelsToRemove: [],
       lane: { id: "local", confidence: "high", reason: "test" },
       actionability: "ready",
