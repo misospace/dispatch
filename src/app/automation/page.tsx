@@ -182,6 +182,7 @@ export default function AutomationOverview() {
   const [addError, setAddError] = useState("");
   const [loadError, setLoadError] = useState("");
   const [addLoading, setAddLoading] = useState(false);
+  const [blockedCount, setBlockedCount] = useState<number | null>(null);
 
   useEffect(() => {
     authedFetch("/api/automation/sync")
@@ -204,6 +205,15 @@ export default function AutomationOverview() {
         setLoadError(error instanceof Error ? error.message : "Failed to load repositories");
       })
       .finally(() => setLoading(false));
+
+    authedFetch("/api/pr-fix-queue/queued?include_blocked=true&prioritize_by_type=false")
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (res.ok && Array.isArray(data)) {
+          setBlockedCount(data.filter((i: any) => i.status === "BLOCKED").length);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   async function syncAll() {
@@ -286,6 +296,14 @@ export default function AutomationOverview() {
         <div className="flex gap-2">
           <Button variant="outline" asChild>
             <Link href="/groomer">Hosted Groomer</Link>
+          </Button>
+          <Button variant="outline" asChild>
+            <Link href="/automation/pr-fix-queue">
+              PR Fix Queue
+              {blockedCount !== null && blockedCount > 0 && (
+                <Badge variant="destructive" className="ml-1">{blockedCount}</Badge>
+              )}
+            </Link>
           </Button>
           <Button variant="outline" onClick={() => setShowAddForm(!showAddForm)}>
             {showAddForm ? "Cancel" : "Add Repo"}

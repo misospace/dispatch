@@ -1,4 +1,5 @@
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
+import { surfacePrFixBlocked } from "./pr-fix-surfacing";
 
 export type PrFixQueueClient = {
   prFixQueueItem: {
@@ -108,17 +109,19 @@ function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number
 export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueuePrFixInput) {
   const lane = normalizePrFixLane(input.lane);
   const type = normalizePrFixType(input.type);
-  const status: PrFixStatus = lane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
+  const nextStatus: PrFixStatus = lane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
 
-  return client.$transaction(async (tx) => {
+  let previousStatus: PrFixStatus | undefined;
+  const item = await client.$transaction(async (tx) => {
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
+    previousStatus = existing?.status;
     if (existing) {
-      const item = await tx.prFixQueueItem.update({
+      const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
           lane,
           type,
-          status,
+          status: nextStatus,
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40),
@@ -126,18 +129,18 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         },
       });
       await tx.prFixHistory.create({
-        data: { itemId: item.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
+        data: { itemId: updated.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
       });
-      return item;
+      return updated;
     }
 
-    const item = await tx.prFixQueueItem.create({
+    const created = await tx.prFixQueueItem.create({
       data: {
         repo: input.repo,
         pr: input.pr,
         lane,
         type,
-        status,
+        status: nextStatus,
         reason: input.reason,
         feedback: [input.feedback],
         evidenceKeys: [input.evidenceKey],
@@ -145,10 +148,15 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       },
     });
     await tx.prFixHistory.create({
-      data: { itemId: item.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
+      data: { itemId: created.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
     });
-    return item;
+    return created;
   });
+
+  if (previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
+    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: null });
+  }
+  return item;
 }
 
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
@@ -176,15 +184,23 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
 }
 
 export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixInput) {
-  const status = normalizePrFixStatus(input.status) as PrFixStatus | null;
-  if (!status) throw new Error("Invalid status");
-  return client.$transaction(async (tx) => {
+  const nextStatus = normalizePrFixStatus(input.status) as PrFixStatus | null;
+  if (!nextStatus) throw new Error("Invalid status");
+
+  let previousStatus: PrFixStatus | undefined;
+  const item = await client.$transaction(async (tx) => {
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
     if (!existing) return null;
-    const item = await tx.prFixQueueItem.update({ where: { id: existing.id }, data: { status } });
-    await tx.prFixHistory.create({ data: { itemId: item.id, action: "mark", status, note: input.note ?? undefined } });
-    return item;
+    previousStatus = existing.status;
+    const updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data: { status: nextStatus } });
+    await tx.prFixHistory.create({ data: { itemId: updated.id, action: "mark", status: nextStatus, note: input.note ?? undefined } });
+    return updated;
   });
+
+  if (item && previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
+    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: input.note ?? null });
+  }
+  return item;
 }
 
 /**
