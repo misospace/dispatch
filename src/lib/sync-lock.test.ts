@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -13,6 +13,8 @@ vi.mock("@/lib/prisma", () => ({ prisma: mocks }));
 import { acquireLock, releaseLock } from "./sync-lock";
 
 const MAX_AGE_MS = 30 * 60 * 1000;
+
+const ORIGINAL_ENV = { ...process.env };
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -89,5 +91,42 @@ describe("releaseLock", () => {
     mocks.syncLock.deleteMany.mockResolvedValue({ count: 0 });
     await expect(releaseLock("never-acquired")).resolves.toBeUndefined();
     expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "never-acquired" } });
+  });
+});
+
+describe("MAX_AGE_MS env override", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("DISPATCH_")) delete process.env[key];
+    }
+  });
+  afterAll(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("defaults to 30 minutes when no env var is set", async () => {
+    delete process.env.DISPATCH_SYNC_LOCK_MAX_AGE_MS;
+    const mod = await import("./sync-lock");
+    expect(mod.MAX_AGE_MS).toBe(30 * 60 * 1000);
+  });
+
+  it("uses DISPATCH_SYNC_LOCK_MAX_AGE_MS when set to a valid value", async () => {
+    process.env.DISPATCH_SYNC_LOCK_MAX_AGE_MS = "120000";
+    const mod = await import("./sync-lock");
+    expect(mod.MAX_AGE_MS).toBe(120000);
+  });
+
+  it("falls back to the default for invalid or non-positive values", async () => {
+    process.env.DISPATCH_SYNC_LOCK_MAX_AGE_MS = "not-a-number";
+    expect((await import("./sync-lock")).MAX_AGE_MS).toBe(30 * 60 * 1000);
+
+    vi.resetModules();
+    process.env.DISPATCH_SYNC_LOCK_MAX_AGE_MS = "0";
+    expect((await import("./sync-lock")).MAX_AGE_MS).toBe(30 * 60 * 1000);
+
+    vi.resetModules();
+    process.env.DISPATCH_SYNC_LOCK_MAX_AGE_MS = "-5";
+    expect((await import("./sync-lock")).MAX_AGE_MS).toBe(30 * 60 * 1000);
   });
 });

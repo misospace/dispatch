@@ -16,7 +16,23 @@
 import { prisma } from "@/lib/prisma";
 
 const LOCK_ID = "global" as const;
-const MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Maximum age (ms) before a lock is considered stale and eligible for reclaim.
+ *
+ * Default is 30 minutes. Override with `DISPATCH_SYNC_LOCK_MAX_AGE_MS` for
+ * deployments where a single sync run may take longer than 30 minutes (e.g.
+ * large repos with thousands of issues spread across multiple pages). The
+ * value must be at least 1 ms; invalid or missing values fall back to the
+ * default.
+ */
+export const MAX_AGE_MS = (() => {
+  const raw = process.env.DISPATCH_SYNC_LOCK_MAX_AGE_MS;
+  if (!raw) return DEFAULT_MAX_AGE_MS;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_MAX_AGE_MS;
+})();
 
 export interface AcquiredLock {
   locked: true;

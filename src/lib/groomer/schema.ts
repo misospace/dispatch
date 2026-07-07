@@ -381,5 +381,34 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
     }
   }
 
+  // ── Cross-field invariant: a "ready" issue must carry the status/ready label.
+  // Worker queues only surface issues whose status is claimable (status/ready or
+  // status/in-progress); an issue with no status/* — or a non-ready one — is
+  // silently excluded and sits stranded despite being groomed (dispatch#572). The
+  // groomer LLM sometimes judges an issue ready but omits status/ready, or even
+  // emits a conflicting status/*. Coerce the label set and record it as an
+  // invariant resolution, mirroring the lane coercion above.
+  if (parsed.actionability === "ready" && !parsed.labelsToAdd.includes("status/ready")) {
+    // Redirect any conflicting status/* the LLM tried to add: drop it from add,
+    // push it into remove so the GitHub label set actually flips, and surface it
+    // as the rawValue of the resolution.
+    const conflictingStatus = parsed.labelsToAdd.find(
+      (label) => label.startsWith("status/") && label !== "status/ready",
+    );
+    if (conflictingStatus) {
+      parsed.labelsToAdd = parsed.labelsToAdd.filter((label) => label !== conflictingStatus);
+      if (!parsed.labelsToRemove.includes(conflictingStatus)) {
+        parsed.labelsToRemove.push(conflictingStatus);
+      }
+    }
+    parsed.labelsToAdd.push("status/ready");
+    resolutions.push({
+      field: "labelsToAdd",
+      rawValue: conflictingStatus ?? "(absent)",
+      resolvedValue: "status/ready",
+      source: "invariant",
+    });
+  }
+
   return { valid: true, parsed, resolutions };
 }

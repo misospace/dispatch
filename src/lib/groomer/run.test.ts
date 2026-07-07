@@ -337,6 +337,24 @@ describe("runHostedGroomer", () => {
     expect(result!.appliedMutations?.commentUrl).toBe("https://github.com/org/repo/issues/42#issuecomment-123");
   });
 
+  it("write mode neutralizes @-mentions in posted comment", async () => {
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: {
+        ...mockOutput,
+        githubComment: "@reviewer This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
+      },
+    });
+
+    await runHostedGroomer();
+
+    expect(mocks.addIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      "`@reviewer` This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
+    );
+  });
+
   it("failure after groomingRun creation completes run as failed", async () => {
     mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
 
@@ -446,6 +464,54 @@ describe("runHostedGroomer", () => {
     await runHostedGroomer();
 
     expect(mocks.addIssueComment.mock.calls[0][2]).toHaveLength(4096);
+  });
+
+  it("comment posting is best-effort: a persistent addComment failure does not fail the run", async () => {
+    mocks.addIssueComment.mockRejectedValue(new Error("GitHub API error adding comment: 504"));
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, githubComment: "Likely root cause found." },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result).not.toBeNull();
+    expect(result!.dryRun).toBe(false);
+    // Essential mutations still applied despite the comment failure.
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      expect.arrayContaining(["status/ready"]),
+    );
+    expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ currentLane: "local" }) }),
+    );
+    // Comment failure recorded but did not fail the run or the GroomingRun record.
+    expect(result!.appliedMutations?.commentPosted).toBe(false);
+    expect(result!.appliedMutations?.commentError).toMatch(/504/);
+    expect(mocks.prisma.groomingRun.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "failed" }) }),
+    );
+    // Retried once before giving up.
+    expect(mocks.addIssueComment).toHaveBeenCalledTimes(2);
+  });
+
+  it("comment posting retries once and succeeds on the second attempt", async () => {
+    mocks.addIssueComment
+      .mockRejectedValueOnce(new Error("GitHub API error adding comment: 504"))
+      .mockResolvedValueOnce({ url: "https://github.com/org/repo/issues/42#issuecomment-999" });
+    mocks.validateGroomerOutput.mockReturnValue({
+      valid: true,
+      parsed: { ...mockOutput, githubComment: "Likely root cause found." },
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(mocks.addIssueComment).toHaveBeenCalledTimes(2);
+    expect(result!.appliedMutations?.commentUrl).toBe(
+      "https://github.com/org/repo/issues/42#issuecomment-999",
+    );
+    expect(result!.appliedMutations?.commentError).toBeUndefined();
   });
 
   it("passes targeted issue options to selector", async () => {

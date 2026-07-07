@@ -20,7 +20,11 @@ RUN npx prisma generate
 # DATABASE_URL is needed at build time for Next.js static generation (npm run build).
 # The runner stage does NOT inherit this ENV; production code requires DATABASE_URL
 # at runtime via the check in src/lib/prisma.ts.
-ENV DATABASE_URL=postgresql://localhost:5432/dispatch
+# Inherit from the ARG above so --build-arg DATABASE_URL=... actually flows
+# through to prisma generate and next build. A hardcoded placeholder here would
+# silently override the build arg and could change Prisma client generation
+# (e.g., connector/extension-aware query generation) in unexpected ways.
+ENV DATABASE_URL=${DATABASE_URL}
 RUN npm run build
 
 FROM base AS runner

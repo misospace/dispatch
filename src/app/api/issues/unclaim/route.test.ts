@@ -6,8 +6,9 @@ const { mocks } = vi.hoisted(() => ({
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
-    leaseFindUnique: vi.fn(),
-    leaseDelete: vi.fn(),
+    updateIssueLabels: vi.fn().mockResolvedValue(undefined),
+    releaseLeaseByAgentAndIssue: vi.fn().mockResolvedValue(undefined),
+    releaseAgentWorkByAgentAndIssue: vi.fn().mockResolvedValue(0),
   },
 }));
 
@@ -20,10 +21,6 @@ vi.mock("@/lib/prisma", () => ({
       findUnique: mocks.findUnique,
       update: mocks.updateIssue,
     },
-    lease: {
-      findUnique: mocks.leaseFindUnique,
-      delete: mocks.leaseDelete,
-    },
     auditLog: {
       create: mocks.createAuditLog,
     },
@@ -32,6 +29,12 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/github", () => ({
   removeIssueLabel: mocks.removeIssueLabel,
+  updateIssueLabels: mocks.updateIssueLabels,
+}));
+
+vi.mock("@/lib/lease", () => ({
+  releaseLeaseByAgentAndIssue: mocks.releaseLeaseByAgentAndIssue,
+  releaseAgentWorkByAgentAndIssue: mocks.releaseAgentWorkByAgentAndIssue,
 }));
 
 import { POST } from "./route";
@@ -132,7 +135,7 @@ describe("POST /api/issues/unclaim — validation", () => {
   });
 });
 
-describe("POST /api/issues/unclaim — business logic", () => {
+describe("POST /api/issues/unclaim — agent self-unclaim (regression)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.findUnique.mockResolvedValue({
@@ -143,24 +146,18 @@ describe("POST /api/issues/unclaim — business logic", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.leaseFindUnique.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
-    mocks.leaseDelete.mockResolvedValue({ id: "l-1" });
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
   });
 
-  it("removes agent label and updates local cache", async () => {
+  it("removes agent label and writes unclaim_issue audit with agent actor", async () => {
     const res = await postRequest();
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
 
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({
-        labels: [],
-      }),
-    });
 
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -169,6 +166,133 @@ describe("POST /api/issues/unclaim — business logic", () => {
         actor: "test-agent",
       }),
     });
+  });
+
+  it("agent self-unclaim does NOT call releaseAgentWorkByAgentAndIssue", async () => {
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    expect(mocks.releaseAgentWorkByAgentAndIssue).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+  });
+});
+
+describe("POST /api/issues/unclaim — operator path", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/in-progress"],
+    } as never);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(1);
+  });
+
+  function basicAuthRequest() {
+    const credentials = Buffer.from("alice:hunter2").toString("base64");
+    return POST(
+      new Request("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${credentials}`,
+        },
+        body: JSON.stringify(makePayload()),
+      })
+    );
+  }
+
+  async function withBasicAuth<T>(fn: () => Promise<T>): Promise<T> {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "alice";
+    process.env.DISPATCH_AUTH_PASSWORD = "hunter2";
+    const { resetAuthCaches } = await import("@/lib/auth");
+    resetAuthCaches();
+    try {
+      return await fn();
+    } finally {
+      delete process.env.DISPATCH_AUTH_MODE;
+      delete process.env.DISPATCH_AUTH_USERNAME;
+      delete process.env.DISPATCH_AUTH_PASSWORD;
+      resetAuthCaches();
+    }
+  }
+
+  it("operator unclaim releases the lease via releaseLeaseByAgentAndIssue", async () => {
+    await withBasicAuth(async () => {
+      const res = await basicAuthRequest();
+      expect(res.status).toBe(200);
+      expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+    });
+  });
+
+  it("operator unclaim calls releaseAgentWorkByAgentAndIssue", async () => {
+    await withBasicAuth(async () => {
+      const res = await basicAuthRequest();
+      expect(res.status).toBe(200);
+      expect(mocks.releaseAgentWorkByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+    });
+  });
+
+  it("operator unclaim flips status/in-progress to status/ready on GitHub and in cache", async () => {
+    await withBasicAuth(async () => {
+      const res = await basicAuthRequest();
+      expect(res.status).toBe(200);
+
+      expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+        "org/repo",
+        42,
+        expect.arrayContaining(["status/ready"]),
+      );
+      expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+        "org/repo",
+        42,
+        expect.not.arrayContaining(["status/in-progress"]),
+      );
+      expect(mocks.updateIssue).toHaveBeenCalledWith({
+        where: { id: "issue-1" },
+        data: expect.objectContaining({
+          labels: expect.arrayContaining(["status/ready"]),
+        }),
+      });
+    });
+  });
+
+  it("operator unclaim writes unclaim_issue_by_operator audit with operator actor and notes", async () => {
+    await withBasicAuth(async () => {
+      const res = await basicAuthRequest();
+      expect(res.status).toBe(200);
+
+      expect(mocks.createAuditLog).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: "unclaim_issue_by_operator",
+          success: true,
+          actor: "alice",
+          notes: expect.stringContaining("test-agent"),
+        }),
+      });
+    });
+  });
+});
+
+describe("POST /api/issues/unclaim — guards", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent"],
+    } as never);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
   });
 
   it("returns 404 when issue not found in local cache", async () => {
@@ -233,7 +357,7 @@ describe("POST /api/issues/unclaim — business logic", () => {
   });
 
   it("writes failure audit log when GitHub API fails", async () => {
-    mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
+    mocks.updateIssueLabels.mockRejectedValueOnce(new Error("github 500"));
 
     const res = await postRequest();
     expect(res.status).toBe(500);
@@ -253,7 +377,7 @@ describe("POST /api/issues/unclaim — business logic", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
-      labels: ["agent/test-agent", "status/in-progress", "priority/p1"],
+      labels: ["agent/test-agent", "priority/p1"],
     } as never);
 
     const res = await postRequest();
@@ -262,7 +386,7 @@ describe("POST /api/issues/unclaim — business logic", () => {
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({
-        labels: ["status/in-progress", "priority/p1"],
+        labels: ["priority/p1"],
       }),
     });
   });
