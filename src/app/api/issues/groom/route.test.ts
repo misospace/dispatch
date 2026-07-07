@@ -340,6 +340,20 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "status/ready");
   });
 
+  it("removes ALL existing status labels when an issue carries more than one (approved fix)", async () => {
+    mockIssue({ labels: ["status/backlog", "status/needs-review", "priority/p2"] });
+    mocks.updateIssue.mockResolvedValue({ id: "issue-1", number: 42, labels: ["status/ready", "priority/p2"] });
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(200);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "status/backlog");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "status/needs-review");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "status/ready");
+    const body = await res.json();
+    expect(body.labels).toEqual(expect.arrayContaining(["priority/p2", "status/ready"]));
+    expect(body.labels).not.toContain("status/backlog");
+    expect(body.labels).not.toContain("status/needs-review");
+  });
+
   it("assigns the default claimable lane when the issue has no lane set (dispatch: idle-queue bug)", async () => {
     mockIssue({ labels: ["status/backlog", "priority/p2"], currentLane: null });
     const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });

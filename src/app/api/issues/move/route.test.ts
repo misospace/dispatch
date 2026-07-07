@@ -310,6 +310,20 @@ describe("POST /api/issues/move — validation", () => {
     });
   });
 
+  it("removes all real status labels from GitHub even if the client only sent one (approved fix)", async () => {
+    mocks.findIssue.mockResolvedValue({ id: "issue-1", labels: ["status/backlog", "status/in-review"] });
+    const res = await postRequest(
+      makePayload({
+        oldLabels: ["status/backlog"],
+        newLabels: ["status/in-progress"],
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/backlog");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-review");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+  });
+
   it("does not call github when old and new status are the same", async () => {
     const res = await postRequest(
       makePayload({

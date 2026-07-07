@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, StatusLabel, isStatusLabel } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { transitionIssueStatus } from "@/lib/issue-status";
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -15,28 +16,22 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const { issueId, repoFullName, issueNumber, status, agentName, actor } = body as Record<string, unknown>;
 
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || typeof status !== "string") {
-      return NextResponse.json(
-        { error: "Missing required fields: issueId, repoFullName, issueNumber, status" },
-        { status: 400 },
-      );
+      return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, status", 400);
     }
 
     const targetLabel = `status/${status}` as StatusLabel;
     if (!isStatusLabel(targetLabel)) {
-      return NextResponse.json(
-        { error: `Invalid status label: ${status}. Allowed: ${STATUS_LABELS.join(", ")}` },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid status label: ${status}. Allowed: ${STATUS_LABELS.join(", ")}`, 400);
     }
 
     const actorName = getAuthorizedActor(auth, request, (actor as string | undefined) ?? (agentName as string | undefined));
@@ -48,32 +43,16 @@ export async function POST(request: Request) {
       });
 
       if (!issue) {
-        return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+        return errorResponse("Issue not found in local cache", 404);
       }
-
-      // Find ALL existing status labels (not just the first one).
-      const existingStatusLabels = issue.labels.filter((l) => l.startsWith("status/"));
-      const nonStatusLabels = issue.labels.filter((l) => !l.startsWith("status/"));
-
-      // Build final label set: all non-status labels + target (always, even if already present).
-      const labelsToSet = [...nonStatusLabels, targetLabel];
 
       // Update GitHub labels
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
       const effectiveNumber = issue.number;
 
-      // Remove ALL existing status labels before adding the new one.
-      // Skip removing the target label itself (already on GitHub or will be added).
-      for (const oldLabel of existingStatusLabels) {
-        if (oldLabel !== targetLabel) {
-          await removeIssueLabel(effectiveRepo, effectiveNumber, oldLabel);
-        }
-      }
-
-      // Add the target label if it wasn't already present among the existing status labels.
-      if (!existingStatusLabels.includes(targetLabel)) {
-        await addIssueLabel(effectiveRepo, effectiveNumber, targetLabel);
-      }
+      // Remove ALL existing status labels before adding the new one, via the
+      // shared status-swap helper (also used by claim/groom/move/unclaim).
+      const labelsToSet = await transitionIssueStatus(effectiveRepo, effectiveNumber, issue.labels, targetLabel);
 
       // Update local cache
       await prisma.issue.update({
@@ -113,10 +92,10 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Set issue status failed:", error);
-    return NextResponse.json({ error: "Failed to set issue" }, { status: 500 });
+    return errorResponse("Failed to set issue", 500);
   }
 }

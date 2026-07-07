@@ -1,4 +1,4 @@
-import { getStatusFromLabels, StatusLabel } from "@/types";
+import { getEffectiveStatus, StatusLabel } from "@/types";
 
 export interface ProjectGroup<T> {
   key: string;
@@ -7,12 +7,7 @@ export interface ProjectGroup<T> {
 }
 
 export function getProjectIssueStatus(issue: { labels: string[]; state: string }): StatusLabel {
-  const status = getStatusFromLabels(issue.labels);
-
-  if (issue.state === "closed") return "status/done";
-  if (status) return status;
-
-  return "status/backlog";
+  return getEffectiveStatus(issue.labels, issue.state);
 }
 
 export function groupIssuesByProject<T extends { repository: { fullName: string; name: string } }>(issues: T[]): ProjectGroup<T>[] {

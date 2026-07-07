@@ -1,42 +1,15 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { authorizeRequest } from "@/lib/auth";
 import { getEscalationLane, getDefaultClaimableLane, isClaimableLane } from "@/lib/lane-config";
-
-/**
- * Resolve the actor name for grooming attribution.
- *
- * Resolution order: actor > agentName > "agent" (default).
- */
-function resolveActor(body: unknown): { actor: string; error?: string } {
-  const raw = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
-  if (!raw) return { actor: "agent" };
-
-  let value: unknown;
-  if ("actor" in raw) value = raw.actor;
-  else if ("agentName" in raw) value = raw.agentName;
-  else return { actor: "agent" };
-
-  if (typeof value !== "string") {
-    return { actor: "", error: "'actor'/'agentName' must be a string" };
-  }
-
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    return { actor: "", error: "'actor'/'agentName' must not be empty after trimming" };
-  }
-  if (trimmed.length > 100) {
-    return { actor: "", error: "'actor'/'agentName' must be at most 100 characters" };
-  }
-
-  return { actor: trimmed };
-}
+import { resolveActor } from "@/lib/resolve-actor";
+import { transitionIssueStatus } from "@/lib/issue-status";
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -44,11 +17,11 @@ export async function POST(request: Request) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (typeof body !== "object" || body === null) {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     const {
@@ -65,23 +38,17 @@ export async function POST(request: Request) {
     } = body as Record<string, unknown>;
 
     if (!repoFullName || typeof issueNumber !== "number" || typeof action !== "string") {
-      return NextResponse.json(
-        { error: "Missing required fields: repoFullName, issueNumber, action" },
-        { status: 400 },
-      );
+      return errorResponse("Missing required fields: repoFullName, issueNumber, action", 400);
     }
 
     const validActions = ["promote_to_ready", "escalate", "mark_not_ready", "mark_needs_info", "mark_blocked"];
     if (!validActions.includes(action)) {
-      return NextResponse.json(
-        { error: `Invalid action: ${action}. Allowed: ${validActions.join(", ")}` },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid action: ${action}. Allowed: ${validActions.join(", ")}`, 400);
     }
 
     const { actor: bodyActorName, error: actorError } = resolveActor(body);
     if (actorError) {
-      return NextResponse.json({ error: actorError }, { status: 400 });
+      return errorResponse(actorError, 400);
     }
 
     // Authenticated operator identity (basic/oidc) overrides body actor.
@@ -121,10 +88,7 @@ export async function POST(request: Request) {
       }
 
       if (!issue) {
-        return NextResponse.json(
-          { error: "Issue not found in local cache" },
-          { status: 404 },
-        );
+        return errorResponse("Issue not found in local cache", 404);
       }
 
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
@@ -154,16 +118,11 @@ export async function POST(request: Request) {
 
       switch (action) {
         case "promote_to_ready": {
-          // Remove status/backlog, add status/ready
-          const existingStatus = issue.labels.find((l) => l.startsWith("status/"));
-          if (existingStatus && existingStatus !== "status/ready") {
-            await removeIssueLabel(effectiveRepo, effectiveNumber, existingStatus);
-            afterLabels = afterLabels.filter((l) => !l.startsWith("status/"));
-          }
-          if (!issue.labels.includes("status/ready")) {
-            await addIssueLabel(effectiveRepo, effectiveNumber, "status/ready");
-            afterLabels.push("status/ready");
-          }
+          // Remove ALL existing status labels (not just the first) and add
+          // status/ready via the shared status-swap helper — keeps GitHub
+          // and the Prisma cache from diverging when an issue carries more
+          // than one status label.
+          afterLabels = await transitionIssueStatus(effectiveRepo, effectiveNumber, issue.labels, "status/ready");
           groomingData.nextGroomingAction = null;
 
           // A ready issue must carry a claimable lane, otherwise every
@@ -187,10 +146,7 @@ export async function POST(request: Request) {
 
         case "mark_not_ready": {
           if (!notReadyReason || typeof notReadyReason !== "string" || !notReadyReason.trim()) {
-            return NextResponse.json(
-              { error: "'notReadyReason' is required when action is 'mark_not_ready'" },
-              { status: 400 },
-            );
+            return errorResponse("'notReadyReason' is required when action is 'mark_not_ready'", 400);
           }
           groomingData.notReadyReason = notReadyReason.trim();
           groomingData.nextGroomingAction = (issue.labels.find((l) => l.startsWith("status/")) === "status/backlog")
@@ -201,10 +157,7 @@ export async function POST(request: Request) {
 
         case "mark_needs_info": {
           if (!needsInfoReason || typeof needsInfoReason !== "string" || !needsInfoReason.trim()) {
-            return NextResponse.json(
-              { error: "'needsInfoReason' is required when action is 'mark_needs_info'" },
-              { status: 400 },
-            );
+            return errorResponse("'needsInfoReason' is required when action is 'mark_needs_info'", 400);
           }
           groomingData.needsInfoReason = needsInfoReason.trim();
           groomingData.nextGroomingAction = "Request missing information from the issue author or assignee";
@@ -213,10 +166,7 @@ export async function POST(request: Request) {
 
         case "mark_blocked": {
           if (!blockedReason || typeof blockedReason !== "string" || !blockedReason.trim()) {
-            return NextResponse.json(
-              { error: "'blockedReason' is required when action is 'mark_blocked'" },
-              { status: 400 },
-            );
+            return errorResponse("'blockedReason' is required when action is 'mark_blocked'", 400);
           }
           groomingData.blockedReason = blockedReason.trim();
           groomingData.nextGroomingAction = "Resolve the blocking dependency";
@@ -283,10 +233,10 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      return errorResponse(errorMessage, 500);
     }
   } catch (error) {
     console.error("Groom issue failed:", error);
-    return NextResponse.json({ error: "Failed to groom issue" }, { status: 500 });
+    return errorResponse("Failed to groom issue", 500);
   }
 }

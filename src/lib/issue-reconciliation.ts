@@ -1,105 +1,14 @@
-import { GitHubIssue } from "@/types";
+import { ACTIVE_STATUS_LABELS, GitHubIssue } from "@/types";
 import { GithubPR, closeIssue as githubCloseIssue, addIssueLabel as githubAddIssueLabel, removeIssueLabel as githubRemoveIssueLabel } from "@/lib/github";
-import { classifyLaneFromSignals, getDefaultClaimableLane, isBacklogLane, resolveLaneId, LaneSignals } from "@/lib/lane-config";
+import { getDefaultClaimableLane, isBacklogLane, resolveLaneId } from "@/lib/lane-config";
+import { classifyLaneByHeuristics } from "@/lib/issue-lane";
+import { LinkedPrHealth } from "@/lib/linked-pr-health";
 
 // ─── Lane Classification Helpers ──────────────────────────────────────────────
 
-/**
- * Shared escalation keyword list used by both classifyLaneByHeuristics and
- * shouldReclassifyStaleBacklog.
- */
-const ESCALATION_KEYWORDS = [
-  "architecture",
-  "audit",
-  "design doc",
-  "rfc",
-  "alternatives considered",
-  "migration strategy",
-  "cross-service",
-  "distributed system",
-  "audit parent",
-  "parent issue",
-  "umbrella",
-  "decomposition",
-];
-
-/**
- * Shared backlog signal list.
- */
-const BACKLOG_SIGNALS = [
-  "status/backlog",
-  "type/research",
-  "tbd",
-  "to be determined",
-  "placeholder",
-  "more details needed",
-  "needs more info",
-];
-
-/**
- * Shared escalation label signals.
- */
-const ESCALATION_LABELS = ["needs-escalation", "needs-gpt"];
-
-/**
- * Evaluate heuristic signals for an issue. Returns structured signals that can
- * be mapped to a configured lane via classifyLaneFromSignals.
- */
-export function evaluateLaneSignals(
-  title: string,
-  body: string | null,
-  labels: string[],
-): LaneSignals & { reason: string } {
-  const text = `${title} ${body ?? ""}`.toLowerCase();
-  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
-
-  // Check backlog first (highest priority exclusion)
-  for (const signal of BACKLOG_SIGNALS) {
-    if (text.includes(signal) || labelSet.has(signal)) {
-      return { isBacklog: true, isEscalation: false, reason: `Backlog signal detected: ${signal}` };
-    }
-  }
-
-  // Explicit escalation labels take precedence over text heuristics
-  if (ESCALATION_LABELS.some((s) => labelSet.has(s))) {
-    return { isBacklog: false, isEscalation: true, reason: "Escalation label detected" };
-  }
-
-  // Check escalated signals
-  const escalationMatches = ESCALATION_KEYWORDS.filter((s) => text.includes(s));
-  if (escalationMatches.length > 0 && !labelSet.has("status/backlog")) {
-    return { isBacklog: false, isEscalation: true, reason: `Escalation keywords: ${escalationMatches.join(", ")}` };
-  }
-
-  // Default: concrete, actionable issues
-  return { isBacklog: false, isEscalation: false, reason: "Default classification: concrete implementation work" };
-}
-
-/**
- * Heuristic lane classification when model calls are unavailable.
- * Uses label patterns and issue content to infer the correct execution lane.
- * Returns a configured lane id — never an unknown string.
- */
-export function classifyLaneByHeuristics(
-  title: string,
-  body: string | null,
-  labels: string[],
-): { lane: string; confidence: "high" | "medium" | "low"; reason: string } {
-  const signals = evaluateLaneSignals(title, body, labels);
-
-  let confidence: "high" | "medium" | "low" = "medium";
-  if (signals.isBacklog) {
-    confidence = "high";
-  } else if (signals.isEscalation && ESCALATION_LABELS.some((l) => labels.map((x) => x.toLowerCase()).includes(l))) {
-    confidence = "high";
-  }
-
-  return {
-    lane: classifyLaneFromSignals({ isBacklog: signals.isBacklog, isEscalation: signals.isEscalation }),
-    confidence,
-    reason: signals.reason,
-  };
-}
+// The heuristic lane classifier lives in @/lib/issue-lane (single source of
+// truth shared with the lane route). Re-exported here for existing callers.
+export { evaluateLaneSignals, classifyLaneByHeuristics } from "@/lib/issue-lane";
 
 /**
  * Determine whether a stale backlog lane should be reclassified.
@@ -132,8 +41,7 @@ export function shouldReclassifyStaleBacklog(
   }
 
   // Only reclassify for active statuses
-  const activeStatuses = ["status/ready", "status/in-progress", "status/in-review"];
-  const hasActiveStatus = activeStatuses.some((s) => labelSet.has(s));
+  const hasActiveStatus = ACTIVE_STATUS_LABELS.some((s) => labelSet.has(s));
   if (!hasActiveStatus) {
     return null;
   }
@@ -200,45 +108,52 @@ export interface PrHealthCheck {
   headRefName: string;
   reviewDecision: string | null;
   mergeStateStatus: string | null;
-  hasFailingChecks: boolean;
   status: PrHealthStatus;
   reason: string;
 }
 
 /**
- * Check the health of an open PR. Returns whether it needs another worker pass.
+ * Human-readable reason for a single canonical follow-up reason code, used to
+ * build the audit-log-facing `PrHealthCheck.reason` string.
  */
-export function checkPrHealth(pr: GithubPR): PrHealthCheck {
+function describeFollowupReason(reason: string, health: LinkedPrHealth): string {
+  switch (reason) {
+    case "changes_requested":
+      return "Review changes requested";
+    case "failing_checks": {
+      const names = health.failingChecks.map((c) => c.name).filter(Boolean).join(", ");
+      return names ? `Failing checks: ${names}` : "PR has failing checks";
+    }
+    case "merge_conflict":
+      return `Merge state is ${health.mergeStateStatus}`;
+    default:
+      return `Merge state is ${health.mergeStateStatus}`;
+  }
+}
+
+/**
+ * Check the health of an open PR. Thin adapter over the canonical
+ * `computeLinkedPrHealth` actionability signal (@/lib/linked-pr-health) —
+ * BEHIND/BLOCKED/UNKNOWN merge states are not actionable on their own;
+ * failing checks, CHANGES_REQUESTED reviews, and merge conflicts are.
+ *
+ * `health` is the precomputed LinkedPrHealth for this PR (or null when the
+ * health fetch failed or produced no signal). Missing health is treated
+ * conservatively as healthy so a transient fetch failure never falsely
+ * flags a PR as needing work.
+ */
+export function checkPrHealth(pr: GithubPR, health: LinkedPrHealth | null): PrHealthCheck {
   const reviewDecision = pr.reviewDecision ?? null;
   const mergeStateStatus = pr.mergeStateStatus ?? null;
 
-  // Check for review changes requested
-  if (reviewDecision === "CHANGES_REQUESTED") {
-    return {
-      prNumber: pr.number,
-      url: pr.url,
-      headRefName: pr.head?.ref ?? "",
-      reviewDecision,
-      mergeStateStatus,
-      hasFailingChecks: false,
-      status: "needs_work",
-      reason: "Review changes requested",
-    };
-  }
-
-  // Check for problematic merge states
-  const badStates = ["dirty", "behind", "blocked", "unknown"];
-  if (badStates.includes(mergeStateStatus?.toLowerCase() ?? "")) {
-    return {
-      prNumber: pr.number,
-      url: pr.url,
-      headRefName: pr.head?.ref ?? "",
-      reviewDecision,
-      mergeStateStatus,
-      hasFailingChecks: false,
-      status: "needs_work",
-      reason: `Merge state is ${mergeStateStatus}`,
-    };
+  let status: PrHealthStatus;
+  let reason: string;
+  if (health && health.needsFollowup) {
+    status = "needs_work";
+    reason = health.followupReasons.map((r) => describeFollowupReason(r, health)).join("; ");
+  } else {
+    status = "healthy";
+    reason = "PR is open and healthy/pending";
   }
 
   return {
@@ -247,9 +162,8 @@ export function checkPrHealth(pr: GithubPR): PrHealthCheck {
     headRefName: pr.head?.ref ?? "",
     reviewDecision,
     mergeStateStatus,
-    hasFailingChecks: false,
-    status: "healthy",
-    reason: "PR is open and healthy/pending",
+    status,
+    reason,
   };
 }
 
@@ -259,7 +173,7 @@ export function checkPrHealth(pr: GithubPR): PrHealthCheck {
  * A single reconciliation action to apply to an issue.
  */
 export interface ReconciliationAction {
-  type: "close_issue" | "update_lane" | "add_label" | "remove_label";
+  type: "close_issue" | "add_label" | "remove_label";
   issueNumber: number;
   repoFullName: string;
   label?: string;
@@ -315,6 +229,7 @@ export function reconcileIssue(
   issue: { number: number; title: string; body: string | null; labels: string[]; state: string },
   mergedPrs: Map<number, GithubPR>,
   openPrs: Map<number, GithubPR>,
+  openPrHealth: Map<number, LinkedPrHealth | null> = new Map(),
 ): IssueReconciliationResult {
   const actions: ReconciliationAction[] = [];
   let hasOpenPr = false;
@@ -346,7 +261,8 @@ export function reconcileIssue(
     const matchingOpenPr = openPrs.get(issue.number);
     if (matchingOpenPr) {
       hasOpenPr = true;
-      const health = checkPrHealth(matchingOpenPr);
+      const linkedHealth = openPrHealth.get(issue.number) ?? null;
+      const health = checkPrHealth(matchingOpenPr, linkedHealth);
       openPrNeedsWork = health.status === "needs_work";
 
       // If PR needs work, ensure issue is in a lane where workers can pick it up
@@ -393,21 +309,6 @@ export function reconcileIssue(
     openPrNeedsWork,
     isClosedByMergedPr,
   };
-}
-
-/**
- * Check if a PR references a specific issue by number.
- */
-export function prReferencesIssue(pr: GithubPR, issueNumber: number): boolean {
-  // Check branch name pattern
-  const branch = pr.head?.ref ?? "";
-  if (prBranchMatchesIssue(branch, issueNumber)) {
-    return true;
-  }
-
-  // Note: For full PR body matching, we'd need the PR body which isn't in GithubPR.
-  // The branch-based check covers the majority of cases used by wishlist workers.
-  return false;
 }
 
 // ─── Action Execution ────────────────────────────────────────────────────────
@@ -513,12 +414,6 @@ export async function executeAction(
         }
         break;
       }
-
-      case "update_lane":
-        // update_lane is not yet produced by reconcileIssue() but the handler
-        // may produce it in future. Silently skip for now.
-        result.success = true;
-        break;
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
