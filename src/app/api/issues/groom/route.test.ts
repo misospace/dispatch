@@ -339,6 +339,30 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "status/in-progress");
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "status/ready");
   });
+
+  it("assigns the default claimable lane when the issue has no lane set (dispatch: idle-queue bug)", async () => {
+    mockIssue({ labels: ["status/backlog", "priority/p2"], currentLane: null });
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(200);
+    const call = mocks.updateIssue.mock.calls[0][0];
+    expect(call.data.currentLane).toBe("local");
+  });
+
+  it("reclassifies out of the non-claimable backlog lane on promote", async () => {
+    mockIssue({ labels: ["status/backlog", "priority/p2"], currentLane: "backlog" });
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(200);
+    const call = mocks.updateIssue.mock.calls[0][0];
+    expect(call.data.currentLane).toBe("local");
+  });
+
+  it("preserves an existing claimable lane on promote", async () => {
+    mockIssue({ labels: ["status/backlog", "priority/p2"], currentLane: "frontier" });
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(200);
+    const call = mocks.updateIssue.mock.calls[0][0];
+    expect(call.data.currentLane).toBeUndefined();
+  });
 });
 
 describe("POST /api/issues/groom — escalate", () => {

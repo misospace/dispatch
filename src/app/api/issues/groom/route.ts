@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel, addIssueLabel } from "@/lib/github";
 import { authorizeRequest } from "@/lib/auth";
-import { getEscalationLane } from "@/lib/lane-config";
+import { getEscalationLane, getDefaultClaimableLane, isClaimableLane } from "@/lib/lane-config";
 
 /**
  * Resolve the actor name for grooming attribution.
@@ -165,6 +165,16 @@ export async function POST(request: Request) {
             afterLabels.push("status/ready");
           }
           groomingData.nextGroomingAction = null;
+
+          // A ready issue must carry a claimable lane, otherwise every
+          // lane-filtered agent queue (the bridge claims via ?lane=<id>)
+          // excludes it and it can never be picked up. Preserve an existing
+          // claimable lane (e.g. previously escalated to frontier); only
+          // (re)assign the default claimable lane when the issue has no lane
+          // or is stuck in the non-claimable backlog lane.
+          if (!issue.currentLane || !isClaimableLane(issue.currentLane)) {
+            groomingData.currentLane = getDefaultClaimableLane()?.id ?? "default";
+          }
           break;
         }
 
