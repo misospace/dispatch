@@ -76,14 +76,6 @@ async function generateAppJwt(privateKey: string): Promise<string> {
 }
 
 /**
- * Fetch an installation access token from GitHub App auth.
- */
-async function getInstallationToken(): Promise<string> {
-  const result = await getInstallationTokenWithExpiry();
-  return result.token;
-}
-
-/**
  * Fetch an installation access token with its expiry timestamp.
  */
 async function getInstallationTokenWithExpiry(): Promise<CachedToken> {
@@ -194,16 +186,6 @@ export async function getGitHubToken(): Promise<string> {
  * Get headers for GitHub API requests — ensures token freshness via async refresh.
  */
 async function getHeadersAsync(): Promise<HeadersInit> {
-  await refreshIfNeeded();
-
-  if (useGitHubApp && installationTokenCache) {
-    return {
-      Authorization: `Bearer ${installationTokenCache.token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    };
-  }
-
   const token = await getGitHubToken();
   return {
     Authorization: `Bearer ${token}`,
@@ -273,10 +255,18 @@ export async function fetchPaginated<T>(
   return all;
 }
 
-export async function fetchIssues(repoFullName: string, options?: { includeClosed?: boolean }): Promise<GitHubIssue[]> {
+export async function fetchIssues(
+  repoFullName: string,
+  options?: { includeClosed?: boolean; since?: Date },
+): Promise<GitHubIssue[]> {
   const [owner, repo] = repoFullName.split("/");
   const state = options?.includeClosed ? "all" : "open";
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=${state}&per_page=100`;
+  let url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=${state}&per_page=100`;
+  // `since` filters by updated_at, narrowing the fetch to issues that changed
+  // since the given timestamp. Omit for a full fetch (default behavior).
+  if (options?.since) {
+    url += `&since=${options.since.toISOString()}`;
+  }
 
   // Fetch all pages of issues, then filter out PRs (GitHub returns PRs as issues)
   const all = await fetchPaginated<GitHubIssue>(url);
@@ -502,15 +492,23 @@ export interface GithubRepo {
   pushed_at: string;
 }
 
-export async function fetchRepo(repoFullName: string): Promise<GithubRepo> {
+/**
+ * Shared GET /repos/{fullName} fetch used by fetchRepo and fetchRepositoryMetadata.
+ * `errorPrefix` preserves each caller's original error message.
+ */
+async function fetchRepoJson(repoFullName: string, errorPrefix: string): Promise<any> {
   const response = await fetch(`${GITHUB_API}/repos/${repoFullName}`, {
     headers: await getHeadersAsync(),
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Failed to fetch repo ${repoFullName}: ${response.status} ${text}`);
+    throw new Error(`${errorPrefix}: ${response.status} ${text}`);
   }
   return response.json();
+}
+
+export async function fetchRepo(repoFullName: string): Promise<GithubRepo> {
+  return fetchRepoJson(repoFullName, `Failed to fetch repo ${repoFullName}`);
 }
 
 export interface GithubWorkflow {
@@ -696,27 +694,33 @@ export async function fetchPullRequestHealthSignals(
 ): Promise<PrHealthSignals> {
   const headers = await getHeadersAsync();
 
-  let mergeStateStatus: string | null = null;
-  let reviewDecision: string | null = null;
-
-  try {
-    const detailResp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
-    if (detailResp.ok) {
-      const detail = (await detailResp.json()) as { mergeable_state?: string | null };
-      mergeStateStatus = detail.mergeable_state ?? null;
-    }
-  } catch {
-    // Leave mergeStateStatus null on transient failure.
-  }
-
-  try {
-    const reviews = await fetchPaginated<{ user?: { login?: string } | null; state?: string; submitted_at?: string }>(
-      `${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/reviews?per_page=100`,
-    );
-    reviewDecision = deriveReviewDecision(reviews);
-  } catch {
-    // Leave reviewDecision null on transient failure.
-  }
+  // The two fetches are independent — run them concurrently. Each tolerates
+  // its own transient failures by degrading to a null signal.
+  const [mergeStateStatus, reviewDecision] = await Promise.all([
+    (async (): Promise<string | null> => {
+      try {
+        const detailResp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+        if (detailResp.ok) {
+          const detail = (await detailResp.json()) as { mergeable_state?: string | null };
+          return detail.mergeable_state ?? null;
+        }
+      } catch {
+        // Leave mergeStateStatus null on transient failure.
+      }
+      return null;
+    })(),
+    (async (): Promise<string | null> => {
+      try {
+        const reviews = await fetchPaginated<{ user?: { login?: string } | null; state?: string; submitted_at?: string }>(
+          `${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/reviews?per_page=100`,
+        );
+        return deriveReviewDecision(reviews);
+      } catch {
+        // Leave reviewDecision null on transient failure.
+      }
+      return null;
+    })(),
+  ]);
 
   return { reviewDecision, mergeStateStatus };
 }
@@ -847,14 +851,7 @@ export interface GitHubRepoMetadata {
 }
 
 export async function fetchRepositoryMetadata(repoFullName: string): Promise<GitHubRepoMetadata> {
-  const response = await fetch(`${GITHUB_API}/repos/${repoFullName}`, {
-    headers: await getHeadersAsync(),
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch repo metadata for ${repoFullName}: ${response.status} ${text}`);
-  }
-  const data = await response.json();
+  const data = await fetchRepoJson(repoFullName, `Failed to fetch repo metadata for ${repoFullName}`);
   return {
     fullName: data.full_name ?? repoFullName,
     defaultBranch: data.default_branch ?? "main",

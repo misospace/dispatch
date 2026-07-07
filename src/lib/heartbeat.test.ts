@@ -26,6 +26,7 @@ vi.mock("@/lib/config", () => ({
 
 vi.mock("@/lib/github", () => ({
   fetchIssues: vi.fn(),
+  fetchIssue: vi.fn(),
   syncStatusLabels: vi.fn(),
 }));
 
