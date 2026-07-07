@@ -11,6 +11,14 @@ interface CachedToken {
 
 let installationTokenCache: CachedToken | null = null;
 let useGitHubApp = false;
+// Latched when the App env vars are absent — a deliberate PAT-only setup that
+// should not be re-checked on every call. Transient init failures do NOT set
+// this, so they stay retryable on the next call.
+let appNotConfigured = false;
+// Single-flight guard: the in-flight installation-token fetch. Concurrent
+// callers (init or refresh) await this same promise instead of each starting
+// their own fetch. Cleared when the fetch settles.
+let inFlightTokenFetch: Promise<void> | null = null;
 
 /**
  * Base64url-encode an ArrayBuffer (no padding).
@@ -121,27 +129,48 @@ async function getInstallationTokenWithExpiry(): Promise<CachedToken> {
 }
 
 /**
+ * Fetch an installation token and populate the cache, deduplicating concurrent
+ * callers: if a fetch is already in flight, await it instead of starting a new
+ * one (single-flight). The in-flight promise is cleared once the fetch settles,
+ * so a failure is retryable on the next call.
+ */
+function fetchAndCacheInstallationToken(): Promise<void> {
+  if (!inFlightTokenFetch) {
+    inFlightTokenFetch = getInstallationTokenWithExpiry()
+      .then((cached) => {
+        installationTokenCache = cached;
+        useGitHubApp = true;
+      })
+      .finally(() => {
+        inFlightTokenFetch = null;
+      });
+  }
+  return inFlightTokenFetch;
+}
+
+/**
  * Initialize GitHub App token cache if all required env vars are present.
  * Called lazily on first use of getGitHubToken().
  */
 async function ensureInit(): Promise<void> {
-  if (useGitHubApp) return; // already initialized
+  if (useGitHubApp || appNotConfigured) return; // already decided
 
   const appId = process.env.GITHUB_APP_ID;
   const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
   const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
 
   if (!appId || !installationId || !privateKey) {
-    return; // not configured — will fall back to PAT
+    // Deliberately not configured — latch so we fall back to PAT without
+    // re-checking on every call.
+    appNotConfigured = true;
+    return;
   }
 
-  useGitHubApp = true;
   try {
-    const cached = await getInstallationTokenWithExpiry();
-    installationTokenCache = cached;
+    await fetchAndCacheInstallationToken();
   } catch {
-    // If token fetch fails, mark as failed so we don't retry endlessly
-    useGitHubApp = false;
+    // Transient init failure — fall back to PAT for this call only. Nothing is
+    // latched, so the next call retries GitHub App auth.
   }
 }
 
@@ -153,8 +182,7 @@ async function refreshIfNeeded(): Promise<void> {
 
   // Refresh token 60 seconds before expiry
   if (installationTokenCache.expiresAt <= Date.now() / 1000 + 60) {
-    const cached = await getInstallationTokenWithExpiry();
-    installationTokenCache = cached;
+    await fetchAndCacheInstallationToken();
   }
 }
 
@@ -200,6 +228,8 @@ async function getHeadersAsync(): Promise<HeadersInit> {
 export function __resetGitHubAppState(): void {
   installationTokenCache = null;
   useGitHubApp = false;
+  appNotConfigured = false;
+  inFlightTokenFetch = null;
 }
 
 /**
