@@ -1,6 +1,6 @@
 # Accepted Security Risks
 
-**Last updated: 2026-07-01**
+**Last updated: 2026-07-07**
 
 There are currently no accepted npm runtime advisories.
 
@@ -30,6 +30,20 @@ The following risks are tracked beyond npm advisories:
 - The project uses 19 production dependencies with transitive chains managed by npm.
 - Key deep-chain dependencies: `next` (framework), `@modelcontextprotocol/sdk` (MCP protocol), `prisma` / `@prisma/client` (ORM).
 - **Mitigation:** Renovate keeps dependencies updated; `npm audit --omit=dev` is run on every CI push.
+
+### Groomer Autonomous Issue Rewrites (accepted risk)
+
+- The hosted groomer can rewrite issue titles and enrich issue bodies based purely on LLM output, with no human-in-the-loop confirmation (`src/lib/groomer/run.ts` → `updateTitleAndBody`).
+- Guardrails that bound the blast radius:
+  - Schema validation enforces title length (10–200 chars) and body size (<10K chars), and `shouldRewriteTitle` / `shouldEnrichBody` gates limit when rewrites are attempted.
+  - Rewrites only touch issues the groomer selected for grooming; every run is recorded (`GroomingRun`) and label changes are audit-logged.
+  - `POST /api/groomer/run` is rate-limited (10/min per actor) and requires the groomer token.
+- **Decision:** accepted for this internal single-team tool — original content is recoverable from GitHub issue edit history, and a confirmation gate would defeat the purpose of unattended grooming. Revisit if the tool is exposed to external users or repos with contributors outside the team.
+
+### In-Memory Rate Limiting Is Per-Instance
+
+- Rate limits on mutating endpoints (`src/lib/rate-limit.ts`) use module-level in-memory state; limits reset on restart and are not shared across replicas.
+- **Mitigation:** acceptable for the current single-node deployment; move to a shared store if the app is ever scaled horizontally.
 
 ## Retired Risks
 
