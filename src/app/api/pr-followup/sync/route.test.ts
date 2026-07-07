@@ -99,4 +99,44 @@ describe("POST /api/pr-followup/sync", () => {
 
     expect(mocks.getTrackedRepos).not.toHaveBeenCalled();
   });
+
+  it("queries check-runs with status=completed and enqueues a failing check as an event", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, json: async () => data, text: async () => "" });
+    let checksUrl = "";
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([{
+          id: 1, number: 207, url: "https://gh/pr/207", title: "fix (#165)", body: "Fixes #165",
+          state: "open", user: { login: "itsmiso-ai" }, head: { ref: "foreman/x/issue-165" },
+          base: { ref: "main" }, merged_at: null, draft: false, mergeable_state: "clean",
+        }]);
+      }
+      if (u.includes("/comments")) return jsonRes([]);
+      if (u.includes("/reviews")) return jsonRes([]);
+      if (u.includes("/check-runs")) {
+        checksUrl = u;
+        return jsonRes({ check_runs: [{ id: 99, name: "test", conclusion: "failure", html_url: "https://gh/run/99", output: { summary: "boom" } }] });
+      }
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    // The bug: status=end returns zero check-runs, so failing CI is never seen.
+    expect(checksUrl).toContain("status=completed");
+    expect(checksUrl).not.toContain("status=end");
+
+    // The failing check must reach the ingestion pipeline as a check_run event.
+    const events = mocks.processPrFollowupEvents.mock.calls.at(-1)?.[1] ?? [];
+    expect(events.some((e: { eventType?: string }) => e.eventType === "check_run")).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
 });
