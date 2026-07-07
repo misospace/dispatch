@@ -407,18 +407,16 @@ async function executeGroomerRun(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown groomer error";
 
-    // Complete GroomingRun as failed if it was created
-    if (groomingRun?.id) {
-      try {
-        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
-          status: "failed",
-          stage: getCurrentStage(groomingRun),
-          errorMessage: message,
-          retryable: true,
-        });
-      } catch {
-        // Don't mask the original error
-      }
+    // Complete GroomingRun as failed
+    try {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "failed",
+        stage: groomingRun.stage ?? "selected",
+        errorMessage: message,
+        retryable: true,
+      });
+    } catch {
+      // Don't mask the original error
     }
 
     await deps.prisma.agentRun.create({
@@ -449,10 +447,6 @@ async function executeGroomerRun(
   } finally {
     await deps.releaseLease(lease.id);
   }
-}
-
-function getCurrentStage(run: { stage?: string }): string {
-  return run.stage ?? "selected";
 }
 
 /**
@@ -507,8 +501,9 @@ function computeTitleBodyMutations(
   proposedTitle?: string;
   proposedBody?: string;
 } {
-  const proposedTitle = typeof output.proposedTitle === "string" ? output.proposedTitle : undefined;
-  const proposedBody = typeof output.proposedBody === "string" ? output.proposedBody : undefined;
+  // validateGroomerOutput normalizes explicit nulls to absent at the schema
+  // boundary, so these are always `string | undefined` — no runtime type check.
+  const { proposedTitle, proposedBody } = output;
 
   const shouldRewrite = proposedTitle !== undefined && shouldRewriteTitle(candidate.title);
   const shouldEnrich = proposedBody !== undefined && shouldEnrichBody(candidate.body);

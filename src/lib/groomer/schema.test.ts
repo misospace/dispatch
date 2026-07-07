@@ -577,6 +577,28 @@ describe("groomer schema validation", () => {
     expect(result.parsed?.proposedBody).toBeUndefined();
   });
 
+  it("normalizes explicit nulls on all optional string fields to undefined", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      summary: null as any,
+      githubComment: null as any,
+      needsInfoReason: null as any,
+      blockedReason: null as any,
+      proposedTitle: null as any,
+      proposedBody: null as any,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.summary).toBeUndefined();
+    expect(result.parsed?.githubComment).toBeUndefined();
+    expect(result.parsed?.needsInfoReason).toBeUndefined();
+    expect(result.parsed?.blockedReason).toBeUndefined();
+    expect(result.parsed?.proposedTitle).toBeUndefined();
+    expect(result.parsed?.proposedBody).toBeUndefined();
+    // Nulls are dropped entirely, never carried through as null values
+    expect(result.parsed).not.toHaveProperty("proposedTitle");
+    expect(result.parsed).not.toHaveProperty("proposedBody");
+  });
+
   it("accepts both proposedTitle and proposedBody together", () => {
     const result = validateGroomerOutput({
       ...validOutput,
