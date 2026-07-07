@@ -1,19 +1,9 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { processPrFollowupEvents, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
-
-/**
- * Extract linked issue numbers from PR metadata (title/body).
- */
-function extractLinkedIssueFromPr(pr: Record<string, unknown>): number | null {
-  const title = (pr.title as string) ?? "";
-  const body = (pr.body as string) ?? "";
-  const text = [title, body].filter(Boolean).join("\n");
-  const match = text.match(/#(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
-}
+import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 
 /**
  * GitHub Webhook Handler for PR Follow-up Events
@@ -71,7 +61,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         body: prReview.review?.body ?? "",
         id: String(prReview.review?.id),
         state: prReview.review?.state,
-        linkedIssue: extractLinkedIssueFromPr(pr),
+        linkedIssue: extractLinkedIssue(pr),
         prState: pr.state,
         prMergedAt: pr.merged_at,
       });
@@ -93,7 +83,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         author: pr.user?.login ?? null,
         body: comment.comment?.body ?? "",
         id: String(comment.comment?.id),
-        linkedIssue: extractLinkedIssueFromPr(pr),
+        linkedIssue: extractLinkedIssue(pr),
       });
       break;
     }
@@ -113,7 +103,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         author: issue.user?.login ?? null,
         body: issueComment.comment?.body ?? "",
         id: String(issueComment.comment?.id),
-        linkedIssue: extractLinkedIssueFromPr(issue as Record<string, unknown>),
+        linkedIssue: extractLinkedIssue(issue),
       });
       break;
     }
@@ -135,7 +125,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
           if (match) {
             prNumber = parseInt(match[1], 10);
             prAuthor = firstPr.user?.login ?? null;
-            prLinkedIssue = extractLinkedIssueFromPr(firstPr);
+            prLinkedIssue = extractLinkedIssue(firstPr);
           }
         }
       }
@@ -174,7 +164,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         author: pr.user?.login ?? null,
         mergeStateStatus: pr.mergeable_state,
         id: String(pr.id ?? Date.now()),
-        linkedIssue: extractLinkedIssueFromPr(pr),
+        linkedIssue: extractLinkedIssue(pr),
         prState: pr.state,
         prMergedAt: pr.merged_at,
       });
@@ -192,13 +182,13 @@ export async function POST(request: Request) {
   try {
     const githubEvent = request.headers.get("x-github-event");
     if (!githubEvent) {
-      return NextResponse.json({ error: "Missing x-github-event header" }, { status: 400 });
+      return errorResponse("Missing x-github-event header", 400);
     }
 
     // Authenticate the request (Bearer token, Basic Auth, or OIDC session)
     const auth = await authorizeRequest(request);
     if (!auth.authorized) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return errorResponse("Unauthorized", 401);
     }
 
     // Read raw body once for signature verification and parsing
@@ -213,10 +203,10 @@ export async function POST(request: Request) {
       const webhookSecret = process.env.WEBHOOK_SECRET;
       const signature = request.headers.get("x-hub-signature-256");
       if (!signature) {
-        return NextResponse.json({ error: "Missing x-hub-signature-256 header" }, { status: 401 });
+        return errorResponse("Missing x-hub-signature-256 header", 401);
       }
       if (!verifyWebhookSignature(webhookSecret!, payload, signature)) {
-        return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
+        return errorResponse("Invalid webhook signature", 401);
       }
     }
 
@@ -225,11 +215,11 @@ export async function POST(request: Request) {
     try {
       jsonPayload = JSON.parse(payload.toString());
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return errorResponse("Invalid JSON body", 400);
     }
 
     if (!jsonPayload || typeof jsonPayload !== "object") {
-      return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
+      return errorResponse("Invalid payload", 400);
     }
 
     const body = jsonPayload as Record<string, unknown>;
@@ -253,6 +243,6 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("PR follow-up webhook handler failed:", error);
-    return NextResponse.json({ error: "Webhook processing failed" }, { status: 500 });
+    return errorResponse("Webhook processing failed", 500);
   }
 }

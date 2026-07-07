@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS } from "@/types";
 import { isRenovateIssue } from "@/lib/agent-queue";
@@ -32,7 +33,7 @@ interface UntriagedIssue {
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -100,7 +101,6 @@ export async function GET(request: Request) {
 
     return NextResponse.json(result);
   } catch (error) {
-    console.error("Failed to fetch untriaged issues:", error);
-    return NextResponse.json({ error: "Failed to fetch untriaged issues" }, { status: 500 });
+    return handleApiError("fetch untriaged issues", error);
   }
 }

@@ -1,4 +1,5 @@
 import { normalizeAgentWorkState, normalizeAgentWorkCheckpoint, AgentWorkState, AgentWorkCheckpoint } from "@/types";
+import { nonEmpty } from "./pr-fix-queue";
 
 export type AgentWorkClient = {
   agentWork: {
@@ -84,10 +85,6 @@ export interface FinishAgentWorkInput {
   summary?: string | null;
 }
 
-function nonEmpty(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
 /**
  * Parse and validate a request body for POST /api/agent-work/start.
  * Returns the parsed input object or { error: string } with a descriptive message.
@@ -96,9 +93,6 @@ export function parseStartAgentWorkInput(body: unknown): StartAgentWorkInput | {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body: expected an object" };
   const input = body as Record<string, unknown>;
   if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName (string)" };
-  if (typeof input.agentName === "string" && input.agentName.trim() !== input.agentName) {
-    // Trimmed but original had whitespace — still accept it, just trim
-  }
 
   return {
     agentName: input.agentName.trim(),
@@ -120,7 +114,6 @@ export function parseCheckpointAgentWorkInput(body: unknown): CheckpointAgentWor
   const input = body as Record<string, unknown>;
 
   if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName (string)" };
-  if (typeof input.checkpoint === "object") return { error: "Invalid checkpoint value: expected a string, not an object" };
   if (typeof input.checkpoint !== "string") return { error: `Invalid checkpoint value: expected a string, got ${typeof input.checkpoint}` };
   if (input.checkpoint.trim().length === 0) return { error: "Missing required field: checkpoint (one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)" };
 
@@ -156,7 +149,6 @@ export function parseFinishAgentWorkInput(body: unknown): FinishAgentWorkInput |
   const input = body as Record<string, unknown>;
 
   if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName (string)" };
-  if (typeof input.state === "object") return { error: "Invalid state value: expected a string, not an object" };
   if (typeof input.state !== "string") return { error: `Invalid state value: expected a string, got ${typeof input.state}` };
   if (input.state.trim().length === 0) return { error: "Missing required field: state (one of: CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE)" };
 
@@ -176,33 +168,17 @@ export async function startAgentWork(client: AgentWorkClient, input: StartAgentW
   const leaseExpiresAt = new Date(now.getTime() + leaseDuration);
 
   return client.$transaction(async (tx) => {
-    // Release any existing active work for this agent on the same issue
-    if (input.issueId) {
-      const existing = await tx.agentWork.findFirst({
-        where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS"] } },
-      });
-      if (existing) {
-        await tx.agentWork.update({
-          where: { id: existing.id },
-          data: { state: "RELEASED", leaseExpiresAt: now },
-        });
-        await tx.agentWorkHistory.create({
-          data: { workId: existing.id, action: "released_by_new_claim" },
-        });
-      }
-    }
-
-    // Release any other active work for this agent (single work per agent)
-    const otherActive = await tx.agentWork.findFirst({
-      where: { agentName: input.agentName, state: { in: ["CLAIMED", "IN_PROGRESS"] }, ...(input.issueId ? { issueId: { not: input.issueId } } : {}) },
+    // Release all existing active work for this agent (single work per agent)
+    const active = await tx.agentWork.findMany({
+      where: { agentName: input.agentName, state: { in: ["CLAIMED", "IN_PROGRESS"] } },
     });
-    if (otherActive) {
+    for (const existing of active) {
       await tx.agentWork.update({
-        where: { id: otherActive.id },
+        where: { id: existing.id },
         data: { state: "RELEASED", leaseExpiresAt: now },
       });
       await tx.agentWorkHistory.create({
-        data: { workId: otherActive.id, action: "released_by_new_claim" },
+        data: { workId: existing.id, action: "released_by_new_claim" },
       });
     }
 

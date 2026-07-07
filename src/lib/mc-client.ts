@@ -270,15 +270,7 @@ export async function claimWork(
     try {
       await refreshIssue(repoFullName, issueNumber);
       refreshSucceeded = true;
-
-      try {
-        resolved = await resolveIssue(repoFullName, issueNumber);
-      } catch {
-        throw new DispatchClientError(
-          `Issue #${issueNumber} not found in ${repoFullName} after refresh. The issue may not exist or the repo may not be tracked.`,
-          404,
-        );
-      }
+      resolved = await resolveIssue(repoFullName, issueNumber);
     } catch {
       throw new DispatchClientError(
         `Issue #${issueNumber} not found in ${repoFullName} after refresh. The issue may not exist or the repo may not be tracked.`,

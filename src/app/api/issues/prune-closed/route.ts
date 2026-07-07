@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const retentionDays = parseInt(process.env.DISPATCH_CLOSED_ISSUE_RETENTION_DAYS ?? "30", 10);
   const cutoffDate = new Date();
@@ -27,7 +28,6 @@ export async function POST(request: Request) {
       cutoffDate: cutoffDate.toISOString(),
     });
   } catch (error) {
-    console.error("Failed to prune closed issues:", error);
-    return NextResponse.json({ error: "Failed to prune closed issues" }, { status: 500 });
+    return handleApiError("prune closed issues", error);
   }
 }

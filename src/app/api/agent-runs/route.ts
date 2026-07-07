@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { isValidEscalatedOutcome, VALID_ESCALATED_OUTCOMES } from "@/types";
 import { authorizeRequest } from "@/lib/auth";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const { searchParams } = new URL(request.url);
   const limit = parseInt(searchParams.get("limit") || "50");
@@ -17,14 +18,13 @@ export async function GET(request: Request) {
     });
     return NextResponse.json(runs);
   } catch (error) {
-    console.error("Failed to fetch agent runs:", error);
-    return NextResponse.json({ error: "Failed to fetch agent runs" }, { status: 500 });
+    return handleApiError("fetch agent runs", error);
   }
 }
 
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -43,16 +43,13 @@ export async function POST(request: Request) {
     } = body;
 
     if (!agentName || !runType || !status || !startedAt) {
-      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+      return errorResponse("Missing required fields", 400);
     }
 
     // Validate escalated-lane outcome if provided
     if (outcome !== undefined && outcome !== null) {
       if (!isValidEscalatedOutcome(outcome)) {
-        return NextResponse.json(
-          { error: `Invalid outcome: "${outcome}". Valid values: ${VALID_ESCALATED_OUTCOMES.join(", ")}` },
-          { status: 400 },
-        );
+        return errorResponse(`Invalid outcome: "${outcome}". Valid values: ${VALID_ESCALATED_OUTCOMES.join(", ")}`, 400);
       }
     }
 
@@ -73,7 +70,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json(run, { status: 201 });
   } catch (error) {
-    console.error("Failed to create agent run:", error);
-    return NextResponse.json({ error: "Failed to create agent run" }, { status: 500 });
+    return handleApiError("create agent run", error);
   }
 }

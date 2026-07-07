@@ -6,6 +6,7 @@ import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { StatusBadge } from "@/components/automation/status-badge";
 import { RefreshCw, ExternalLink, AlertTriangle, CheckCircle, XCircle, Clock, GitBranch, Trash2 } from "lucide-react";
 
 interface RepoOverview {
@@ -25,20 +26,6 @@ interface RepoOverview {
   failingRuns: number;
   runningRuns: number;
   enabled: boolean;
-}
-
-function StatusBadge({ status }: { status: string | null }) {
-  if (!status) return <Badge variant="secondary">unknown</Badge>;
-  switch (status) {
-    case "success":
-      return <Badge className="bg-green-100 text-green-700"><CheckCircle className="h-3 w-3 mr-1" /> success</Badge>;
-    case "failure":
-      return <Badge className="bg-red-100 text-red-700"><XCircle className="h-3 w-3 mr-1" /> failed</Badge>;
-    case "in_progress":
-      return <Badge className="bg-blue-100 text-blue-700"><Clock className="h-3 w-3 mr-1" /> running</Badge>;
-    default:
-      return <Badge variant="secondary">{status}</Badge>;
-  }
 }
 
 function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => void }) {
@@ -185,9 +172,6 @@ export default function AutomationOverview() {
   const [blockedCount, setBlockedCount] = useState<number | null>(null);
 
   useEffect(() => {
-    authedFetch("/api/automation/sync")
-      .then((res) => res.json())
-      .catch(() => ({}));
     authedFetch("/api/automation/repos")
       .then(async (res) => {
         const data = await res.json().catch(() => null);

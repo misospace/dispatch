@@ -5,7 +5,6 @@ import {
   parseAuthorizationHeader,
   isAuthorizedBearerToken,
   isAuthorizedBasicAuth,
-  isAuthorized,
   authenticateRequest,
   authorizeRequest,
   resetAuthCaches,
@@ -195,130 +194,6 @@ describe("isAuthorizedBasicAuth", () => {
 
   it("returns false when neither is set", () => {
     expect(isAuthorizedBasicAuth("any", "any")).toBe(false);
-  });
-});
-
-describe("isAuthorized (unified entry point)", () => {
-  beforeEach(() => { clearAll(); resetAuthCaches(); mocks.auth.mockReset(); });
-  afterEach(() => { clearAll(); });
-
-  it('returns true when DISPATCH_AUTH_MODE=disabled', () => {
-    process.env.DISPATCH_AUTH_MODE = "disabled";
-    const request = new Request("http://localhost/api/test");
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it('returns false for unauthenticated request in basic mode', () => {
-    process.env.DISPATCH_AUTH_MODE = "basic";
-    process.env.DISPATCH_AUTH_USERNAME = "operator";
-    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
-    const request = new Request("http://localhost/api/test");
-    expect(isAuthorized(request)).toBe(false);
-  });
-
-  it('returns true for valid Basic Auth in basic mode', () => {
-    process.env.DISPATCH_AUTH_MODE = "basic";
-    process.env.DISPATCH_AUTH_USERNAME = "operator";
-    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
-    // base64("operator:s3cret") = "b3BlcmF0b3I6czNjcmV0"
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
-    });
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it("accepts Bearer token in basic mode for agents and workers", () => {
-    process.env.DISPATCH_AUTH_MODE = "basic";
-    process.env.DISPATCH_AUTH_USERNAME = "operator";
-    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
-    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Bearer agent-token" },
-    });
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it('returns false for wrong Basic Auth credentials in basic mode', () => {
-    process.env.DISPATCH_AUTH_MODE = "basic";
-    process.env.DISPATCH_AUTH_USERNAME = "operator";
-    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Basic d3Jvbmc6d3Jvbmc=" }, // wrong:wrong
-    });
-    expect(isAuthorized(request)).toBe(false);
-  });
-
-  it("accepts Bearer token in legacy mode (no DISPATCH_AUTH_MODE)", () => {
-    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Bearer agent-token" },
-    });
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it("rejects wrong Bearer token in legacy mode", () => {
-    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Bearer wrong-token" },
-    });
-    expect(isAuthorized(request)).toBe(false);
-  });
-
-  it("rejects Basic Auth in legacy mode (only Bearer accepted)", () => {
-    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
-    process.env.DISPATCH_AUTH_MODE = undefined as unknown as string; // ensure not set
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
-    });
-    expect(isAuthorized(request)).toBe(false);
-  });
-
-  it("accepts Bearer token when DISPATCH_AUTH_MODE=disabled", () => {
-    process.env.DISPATCH_AUTH_MODE = "disabled";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Bearer any-token" },
-    });
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it("accepts unauthenticated request when DISPATCH_AUTH_MODE=disabled", () => {
-    process.env.DISPATCH_AUTH_MODE = "disabled";
-    const request = new Request("http://localhost/api/test");
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it("rejects unauthenticated request in oidc mode (via isAuthorized)", () => {
-    process.env.DISPATCH_AUTH_MODE = "oidc";
-    const request = new Request("http://localhost/api/test");
-    expect(isAuthorized(request)).toBe(false);
-  });
-
-  it("accepts Bearer token in oidc mode (agent compatibility)", () => {
-    process.env.DISPATCH_AUTH_MODE = "oidc";
-    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Bearer agent-token" },
-    });
-    expect(isAuthorized(request)).toBe(true);
-  });
-
-  it("rejects wrong Bearer token in oidc mode", () => {
-    process.env.DISPATCH_AUTH_MODE = "oidc";
-    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Bearer wrong-token" },
-    });
-    expect(isAuthorized(request)).toBe(false);
-  });
-
-  it("rejects Basic Auth in oidc mode (only Bearer accepted via isAuthorized)", () => {
-    process.env.DISPATCH_AUTH_MODE = "oidc";
-    process.env.DISPATCH_AUTH_USERNAME = "operator";
-    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
-    const request = new Request("http://localhost/api/test", {
-      headers: { Authorization: "Basic b3BlcmF0b3I6czNjcmV0" },
-    });
-    expect(isAuthorized(request)).toBe(false);
   });
 });
 

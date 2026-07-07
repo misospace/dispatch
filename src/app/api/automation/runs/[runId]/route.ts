@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { rerunWorkflow, triggerWorkflowDispatch } from "@/lib/github";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
@@ -6,7 +7,7 @@ import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 export async function POST(request: Request, { params }: { params: Promise<{ runId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const auditActor = getAuthorizedActor(auth, request);
 
@@ -17,7 +18,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
   const action = searchParams.get("action");
 
   if (!runId || !repoFullName) {
-    return NextResponse.json({ error: "runId and repo required" }, { status: 400 });
+    return errorResponse("runId and repo required", 400);
   }
 
   const run = await prisma.githubWorkflowRun.findUnique({
@@ -26,7 +27,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
   });
 
   if (!run) {
-    return NextResponse.json({ error: "Run not found" }, { status: 404 });
+    return errorResponse("Run not found", 404);
   }
 
   try {
@@ -41,7 +42,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
         where: { id: run.workflowId },
       });
       if (!workflow) {
-        return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
+        return errorResponse("Workflow not found", 404);
       }
       await triggerWorkflowDispatch(repoFullName, Number(workflow.workflowId), run.branch);
       success = true;
@@ -75,6 +76,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
       },
     });
 
-    return NextResponse.json({ error: errorMessage }, { status: 500 });
+    return errorResponse(errorMessage, 500);
   }
 }

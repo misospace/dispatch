@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma, asAgentWorkClient } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { parseCheckpointAgentWorkInput, checkpointAgentWork } from "@/lib/agent-work";
@@ -52,14 +53,14 @@ import { parseCheckpointAgentWorkInput, checkpointAgentWork } from "@/lib/agent-
  */
 export async function POST(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
     const body = await request.json();
     const parsed = parseCheckpointAgentWorkInput(body);
     if ("error" in parsed) {
-      return NextResponse.json({ error: parsed.error }, { status: 400 });
+      return errorResponse(parsed.error, 400);
     }
 
     const work = await checkpointAgentWork(asAgentWorkClient(prisma), parsed);
@@ -87,7 +88,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ releasedOrphan: true, message: "Orphaned lease released — no active work to checkpoint" });
       }
 
-      return NextResponse.json({ error: "No active work found for agent" }, { status: 404 });
+      return errorResponse("No active work found for agent", 404);
     }
 
     await prisma.auditLog.create({
@@ -104,7 +105,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json(work);
   } catch (error) {
-    console.error("Failed to checkpoint agent work:", error);
-    return NextResponse.json({ error: "Failed to checkpoint agent work" }, { status: 500 });
+    return handleApiError("checkpoint agent work", error);
   }
 }

@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { StatusBadge, Duration } from "@/components/automation/status-badge";
 import { ArrowLeft, RefreshCw, ExternalLink, CheckCircle, XCircle, Clock, AlertTriangle } from "lucide-react";
 
 interface RepoDetail {
@@ -74,29 +75,6 @@ interface RepoDetail {
     actor: string | null;
     createdAt: string;
   }[];
-}
-
-function StatusBadge({ status }: { status: string | null }) {
-  if (!status) return <Badge variant="secondary">unknown</Badge>;
-  switch (status) {
-    case "success":
-      return <Badge className="bg-green-100 text-green-700"><CheckCircle className="h-3 w-3 mr-1" /> success</Badge>;
-    case "failure":
-      return <Badge className="bg-red-100 text-red-700"><XCircle className="h-3 w-3 mr-1" /> failed</Badge>;
-    case "in_progress":
-      return <Badge className="bg-blue-100 text-blue-700"><Clock className="h-3 w-3 mr-1" /> running</Badge>;
-    case "queued":
-      return <Badge className="bg-yellow-100 text-yellow-700"><Clock className="h-3 w-3 mr-1" /> queued</Badge>;
-    default:
-      return <Badge variant="secondary">{status}</Badge>;
-  }
-}
-
-function Duration({ seconds }: { seconds: number | null }) {
-  if (!seconds) return <span className="text-muted-foreground">-</span>;
-  if (seconds < 60) return <span>{seconds}s</span>;
-  if (seconds < 3600) return <span>{Math.floor(seconds / 60)}m {seconds % 60}s</span>;
-  return <span>{Math.floor(seconds / 3600)}h {Math.floor((seconds % 3600) / 60)}m</span>;
 }
 
 export default function RepoDetailPage({ params }: { params: Promise<{ repo: string[] }> }) {

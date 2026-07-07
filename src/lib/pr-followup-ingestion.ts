@@ -9,6 +9,7 @@
  */
 
 import { EnqueuePrFixInput, enqueuePrFixItem, PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -165,7 +166,154 @@ export function computeEvidenceKey(
   return `${eventType}:${repoFullName}#${prNumber}:${sourceId}`;
 }
 
+// ─── Linked Issue Extraction ────────────────────────────────────────────────
+
+/**
+ * Extract the linked issue number from a PR's title and body.
+ * Matches the first "#NNN" reference (e.g. "#42", "Fixes #42", "Closes #42").
+ */
+export function extractLinkedIssue(pr: { title?: string | null; body?: string | null }): number | null {
+  const text = [pr.title, pr.body].filter(Boolean).join("\n");
+  const match = text.match(/#(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
 // ─── Event Ingestion ────────────────────────────────────────────────────────
+
+/** Lane + work-item fields derived from an event by its descriptor. */
+interface IngestWorkItem {
+  lane: "NORMAL" | "NEEDS_HUMAN";
+  type: string;
+  reason: string;
+  feedback: string;
+}
+
+/**
+ * Per-event-type ingestion descriptor. All event types share the same
+ * skeleton (gate → terminal-PR filter → author check → owner check →
+ * evidence key → enqueue); descriptors supply the type-specific parts.
+ */
+interface IngestDescriptor {
+  /** Required event fields for batch processing — false counts as skipped. */
+  isIngestible: (event: PrFollowupEvent) => boolean;
+  /** Type-specific precondition — false filters the event out. */
+  gate: (event: PrFollowupEvent) => boolean;
+  /** Whether merged/closed PRs are filtered out for this event type. */
+  filterTerminalPr: boolean;
+  /** Source identifier used in the evidence key. */
+  sourceId: (event: PrFollowupEvent) => string;
+  /** Lane/type/reason/feedback for the enqueued item. */
+  workItem: (event: PrFollowupEvent) => IngestWorkItem;
+}
+
+function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
+  return classifyFeedback(feedback) === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
+}
+
+const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
+
+const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor> = {
+  comment: {
+    isIngestible: (event) => Boolean(event.body && event.id),
+    gate: () => true,
+    filterTerminalPr: false,
+    sourceId: (event) => event.id,
+    workItem: (event) => {
+      const classification = classifyFeedback(event.body ?? "");
+      return {
+        lane: classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL",
+        type: "REVIEW_FEEDBACK",
+        reason: `PR comment: ${classification === "needs_human" ? "ambiguous feedback" : "actionable feedback"}`,
+        feedback: event.body ?? "",
+      };
+    },
+  },
+  review: {
+    isIngestible: (event) => Boolean(event.state && event.id),
+    // Only CHANGES_REQUESTED triggers PR-fix work (not APPROVED or COMMENTED)
+    gate: (event) => event.state === "CHANGES_REQUESTED",
+    filterTerminalPr: true,
+    sourceId: (event) => event.id,
+    workItem: (event) => ({
+      lane: laneFor(event.body ?? ""),
+      type: "REVIEW_FEEDBACK",
+      reason: `PR review: CHANGES_REQUESTED`,
+      feedback: event.body ?? "",
+    }),
+  },
+  check_run: {
+    isIngestible: (event) => Boolean(event.conclusion && event.id),
+    // Only failing checks trigger PR-fix work
+    gate: (event) => FAILURE_CONCLUSIONS.has((event.conclusion ?? "").toLowerCase()),
+    filterTerminalPr: false,
+    sourceId: (event) => event.id,
+    workItem: (event) => {
+      const checkName = event.checkName ?? "unknown";
+      return {
+        lane: laneFor(event.body ?? `Check "${checkName}" ${event.conclusion}`),
+        type: "CI_FAILURE",
+        reason: `Failing check: ${checkName} (${event.conclusion})`,
+        feedback: event.body ?? `Check "${checkName}" concluded ${event.conclusion}`,
+      };
+    },
+  },
+  merge_state: {
+    isIngestible: (event) => Boolean(event.mergeStateStatus),
+    // Only problematic states trigger PR-fix work
+    gate: (event) => PROBLEMATIC_MERGE_STATES.includes((event.mergeStateStatus ?? "").toLowerCase()),
+    filterTerminalPr: true,
+    sourceId: (event) => event.mergeStateStatus ?? "",
+    workItem: (event) => ({
+      lane: "NORMAL",
+      // dirty/conflicting merge states are conflicts; everything else is OTHER
+      type: CONFLICTING_STATUSES.has((event.mergeStateStatus ?? "").toLowerCase())
+        ? "MERGE_CONFLICT"
+        : "OTHER",
+      reason: `Merge state change: ${event.mergeStateStatus}`,
+      feedback: `PR merge state is now ${event.mergeStateStatus}`,
+    }),
+  },
+};
+
+/**
+ * Shared ingestion path for all PR follow-up event types.
+ * Returns the evidence key if the event was eligible and enqueued,
+ * or null if it was filtered out (gated, terminal PR, not bot-authored,
+ * or owner not allowed).
+ */
+async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Promise<string | null> {
+  const descriptor = INGEST_DESCRIPTORS[event.eventType];
+  if (!descriptor.gate(event)) return null;
+
+  // Filter merged/closed PRs — do not enqueue work for terminal PRs
+  if (descriptor.filterTerminalPr && (event.prMergedAt || event.prState === "closed")) return null;
+
+  // Check author eligibility
+  if (!isAllowedBotAuthor(event.author)) return null;
+
+  // Check repo owner eligibility
+  if (!isAllowedBranchOwner(event.repoFullName)) return null;
+
+  const { lane, type, reason, feedback } = descriptor.workItem(event);
+  const evidenceKey = computeEvidenceKey(event.eventType, descriptor.sourceId(event), event.repoFullName, event.prNumber);
+
+  await enqueuePrFixItem(client, {
+    repo: event.repoFullName,
+    pr: event.prNumber,
+    lane,
+    type,
+    reason,
+    feedback,
+    evidenceKey,
+    issue: event.linkedIssue,
+    branch: event.branch,
+    url: event.url,
+    title: event.title,
+    author: event.author,
+  });
+
+  return evidenceKey;
+}
 
 /**
  * Ingest a new PR comment event.
@@ -186,34 +334,18 @@ export async function ingestCommentEvent(
     linkedIssue?: number | null;
   },
 ): Promise<string | null> {
-  // Check author eligibility
-  if (!isAllowedBotAuthor(opts.author)) return null;
-
-  // Check repo owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
-
-  // Classify feedback
-  const classification = classifyFeedback(opts.commentBody);
-  const lane = classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
-
-  const evidenceKey = computeEvidenceKey("comment", opts.commentId, opts.repoFullName, opts.prNumber);
-
-  await enqueuePrFixItem(client, {
-    repo: opts.repoFullName,
-    pr: opts.prNumber,
-    lane,
-    type: "REVIEW_FEEDBACK",
-    reason: `PR comment: ${classification === "needs_human" ? "ambiguous feedback" : "actionable feedback"}`,
-    feedback: opts.commentBody,
-    evidenceKey,
-    issue: opts.linkedIssue,
+  return ingestEvent(client, {
+    eventType: "comment",
+    repoFullName: opts.repoFullName,
+    prNumber: opts.prNumber,
     branch: opts.branch,
     url: opts.url,
     title: opts.title,
     author: opts.author,
+    body: opts.commentBody,
+    id: opts.commentId,
+    linkedIssue: opts.linkedIssue,
   });
-
-  return evidenceKey;
 }
 
 /**
@@ -236,41 +368,21 @@ export async function ingestReviewEvent(
     linkedIssue?: number | null;
   },
 ): Promise<string | null> {
-  // Only CHANGES_REQUESTED triggers PR-fix work (not APPROVED or COMMENTED)
-  if (opts.reviewState !== "CHANGES_REQUESTED") return null;
-
-
-  // Filter merged/closed PRs — do not enqueue work for terminal PRs
-  if (opts.prMergedAt || opts.prState === "closed") {
-    return null;
-  }
-  // Check author eligibility
-  if (!isAllowedBotAuthor(opts.author)) return null;
-
-  // Check repo owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
-
-  const classification = classifyFeedback(opts.reviewBody);
-  const lane = classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
-
-  const evidenceKey = computeEvidenceKey("review", opts.reviewId, opts.repoFullName, opts.prNumber);
-
-  await enqueuePrFixItem(client, {
-    repo: opts.repoFullName,
-    pr: opts.prNumber,
-    lane,
-    type: "REVIEW_FEEDBACK",
-    reason: `PR review: CHANGES_REQUESTED`,
-    feedback: opts.reviewBody,
-    evidenceKey,
-    issue: opts.linkedIssue,
+  return ingestEvent(client, {
+    eventType: "review",
+    repoFullName: opts.repoFullName,
+    prNumber: opts.prNumber,
     branch: opts.branch,
     url: opts.url,
     title: opts.title,
     author: opts.author,
+    body: opts.reviewBody,
+    id: opts.reviewId,
+    state: opts.reviewState,
+    prState: opts.prState,
+    prMergedAt: opts.prMergedAt,
+    linkedIssue: opts.linkedIssue,
   });
-
-  return evidenceKey;
 }
 
 /**
@@ -292,37 +404,20 @@ export async function ingestCheckRunEvent(
     linkedIssue?: number | null;
   },
 ): Promise<string | null> {
-  // Only failing checks trigger PR-fix work
-  const failureConclusions = ["failure", "cancelled", "timed_out", "action_required"];
-  if (!failureConclusions.includes(opts.conclusion.toLowerCase())) return null;
-
-  // Check author eligibility
-  if (!isAllowedBotAuthor(opts.author)) return null;
-
-  // Check repo owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
-
-  const classification = classifyFeedback(opts.checkDetails ?? `Check "${opts.checkName}" ${opts.conclusion}`);
-  const lane = classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
-
-  const evidenceKey = computeEvidenceKey("check_run", opts.checkRunId, opts.repoFullName, opts.prNumber);
-
-  await enqueuePrFixItem(client, {
-    repo: opts.repoFullName,
-    pr: opts.prNumber,
-    lane,
-    type: "CI_FAILURE",
-    reason: `Failing check: ${opts.checkName} (${opts.conclusion})`,
-    feedback: opts.checkDetails ?? `Check "${opts.checkName}" concluded ${opts.conclusion}`,
-    evidenceKey,
-    issue: opts.linkedIssue,
+  return ingestEvent(client, {
+    eventType: "check_run",
+    repoFullName: opts.repoFullName,
+    prNumber: opts.prNumber,
     branch: opts.branch,
     url: opts.url,
     title: opts.title,
     author: opts.author,
+    body: opts.checkDetails,
+    id: opts.checkRunId,
+    conclusion: opts.conclusion,
+    checkName: opts.checkName,
+    linkedIssue: opts.linkedIssue,
   });
-
-  return evidenceKey;
 }
 
 /**
@@ -343,44 +438,21 @@ export async function ingestMergeStateEvent(
     linkedIssue?: number | null;
   },
 ): Promise<string | null> {
-  // Only problematic states trigger PR-fix work
-  const problematicStates = ["behind", "dirty", "unstable", "has_hooks"];
-  if (!problematicStates.includes(opts.mergeStateStatus.toLowerCase())) return null;
-
-
-  // Filter merged/closed PRs — do not enqueue work for terminal PRs
-  if (opts.prMergedAt || opts.prState === "closed") {
-    return null;
-  }
-  // Check author eligibility
-  if (!isAllowedBotAuthor(opts.author)) return null;
-
-  // Check repo owner eligibility
-  if (!isAllowedBranchOwner(opts.repoFullName)) return null;
-
-  const evidenceKey = computeEvidenceKey("merge_state", opts.mergeStateStatus, opts.repoFullName, opts.prNumber);
-
-  // Determine type based on merge state status
-  const mergeType = ["dirty", "conflicting"].includes(opts.mergeStateStatus.toLowerCase()) 
-    ? "MERGE_CONFLICT" 
-    : "OTHER";
-  
-  await enqueuePrFixItem(client, {
-    repo: opts.repoFullName,
-    pr: opts.prNumber,
-    lane: "NORMAL",
-    type: mergeType,
-    reason: `Merge state change: ${opts.mergeStateStatus}`,
-    feedback: `PR merge state is now ${opts.mergeStateStatus}`,
-    evidenceKey,
-    issue: opts.linkedIssue,
+  return ingestEvent(client, {
+    eventType: "merge_state",
+    repoFullName: opts.repoFullName,
+    prNumber: opts.prNumber,
     branch: opts.branch,
     url: opts.url,
     title: opts.title,
     author: opts.author,
+    // The evidence key for merge_state events derives from the status itself.
+    id: opts.mergeStateStatus,
+    mergeStateStatus: opts.mergeStateStatus,
+    prState: opts.prState,
+    prMergedAt: opts.prMergedAt,
+    linkedIssue: opts.linkedIssue,
   });
-
-  return evidenceKey;
 }
 
 
@@ -520,92 +592,13 @@ export async function processPrFollowupEvents(
 
   for (const event of events) {
     try {
-      switch (event.eventType) {
-        case "comment":
-          if (event.body && event.id) {
-            const key = await ingestCommentEvent(client, {
-              repoFullName: event.repoFullName,
-              prNumber: event.prNumber,
-              branch: event.branch,
-              url: event.url,
-              title: event.title,
-              author: event.author,
-              commentBody: event.body,
-              commentId: event.id,
-              linkedIssue: event.linkedIssue,
-            });
-            if (key) enqueued++; else skipped++;
-          } else {
-            skipped++;
-          }
-          break;
-
-        case "review":
-          if (event.state && event.id) {
-            const key = await ingestReviewEvent(client, {
-              repoFullName: event.repoFullName,
-              prNumber: event.prNumber,
-              branch: event.branch,
-              url: event.url,
-              title: event.title,
-              author: event.author,
-              reviewBody: event.body ?? "",
-              reviewId: event.id,
-              reviewState: event.state,
-              linkedIssue: event.linkedIssue,
-              prState: event.prState,
-              prMergedAt: event.prMergedAt,
-            });
-            if (key) enqueued++; else skipped++;
-          } else {
-            skipped++;
-          }
-          break;
-
-        case "check_run":
-          if (event.conclusion && event.id) {
-            const key = await ingestCheckRunEvent(client, {
-              repoFullName: event.repoFullName,
-              prNumber: event.prNumber,
-              branch: event.branch,
-              url: event.url,
-              title: event.title,
-              author: event.author,
-              checkName: event.checkName ?? "unknown",
-              conclusion: event.conclusion,
-              checkRunId: event.id,
-              checkDetails: event.body,
-              linkedIssue: event.linkedIssue,
-            });
-            if (key) enqueued++; else skipped++;
-          } else {
-            skipped++;
-          }
-          break;
-
-        case "merge_state":
-          if (event.mergeStateStatus) {
-            const key = await ingestMergeStateEvent(client, {
-              repoFullName: event.repoFullName,
-              prNumber: event.prNumber,
-              branch: event.branch,
-              url: event.url,
-              title: event.title,
-              author: event.author,
-              mergeStateStatus: event.mergeStateStatus,
-              linkedIssue: event.linkedIssue,
-              prState: event.prState,
-              prMergedAt: event.prMergedAt,
-            });
-            if (key) enqueued++; else skipped++;
-          } else {
-            skipped++;
-          }
-          break;
-
-        default:
-          skipped++;
+      const descriptor = INGEST_DESCRIPTORS[event.eventType];
+      if (!descriptor || !descriptor.isIngestible(event)) {
+        skipped++;
+        continue;
       }
+      const key = await ingestEvent(client, event);
+      if (key) enqueued++; else skipped++;
     } catch (error) {
       console.error(`Failed to ingest PR followup event (${event.eventType} for ${event.repoFullName}#${event.prNumber}):`, error);
       skipped++;

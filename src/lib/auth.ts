@@ -14,7 +14,7 @@
  * route handlers authorize API access for browsers and agents.
  */
 
-import { getAcceptedAgentTokens, isAuthorizedBearerToken as _isAuthed, resetCaches as _resetEnvCaches, safeEqual } from "./dispatch-env";
+import { isAuthorizedBearerToken as _isAuthed, resetCaches as _resetEnvCaches, safeEqual } from "./dispatch-env";
 
 // ---------------------------------------------------------------------------
 // Auth mode resolution
@@ -144,45 +144,6 @@ export function isAuthorizedBasicAuth(username: string, password: string): boole
 // Unified authorization entry point
 // ---------------------------------------------------------------------------
 
-/**
- * Check if a request is authorized.
- *
- * In "basic" mode: Basic Auth credentials or DISPATCH_AGENT_TOKEN Bearer auth
- *   are accepted. Middleware only allows Bearer auth through to API routes.
- * In "oidc" mode: Bearer token via DISPATCH_AGENT_TOKEN is accepted
- *   (for agent/API compatibility). OIDC session auth requires authorizeRequest.
- * In default/legacy mode: Bearer token via DISPATCH_AGENT_TOKEN is accepted.
- * In "disabled" mode: all requests are authorized.
- *
- * This function is safe to call from both middleware and route handlers.
- */
-export function isAuthorized(request: Request): boolean {
-  const authMode = getAuthMode();
-  const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
-
-  // Disabled mode — allow everything
-  if (authMode === "disabled") return true;
-
-  if (parsed?.type === "bearer" && isAuthorizedBearerToken(parsed.token)) {
-    return true;
-  }
-
-  // OIDC mode — accept Bearer token for agent compatibility
-  // OIDC session auth is handled separately via NextAuth in route handlers
-  if (authMode === "oidc") {
-    return false;
-  }
-
-  // Basic auth mode — accept Basic Auth credentials and agent Bearer tokens
-  if (authMode === "basic") {
-    if (!parsed || parsed.type !== "basic") return false;
-    return isAuthorizedBasicAuth(parsed.username, parsed.password);
-  }
-
-  // Legacy mode — accept Bearer token
-  return false;
-}
-
 export type AuthorizedRequest =
   | { authorized: true; type: "basic"; username: string; actor: string }
   | { authorized: true; type: "bearer"; actor: string }
@@ -191,7 +152,7 @@ export type AuthorizedRequest =
   | { authorized: false };
 
 /**
- * Type-safe version of isAuthorized that also returns the parsed auth info.
+ * Check header-based auth (Bearer / Basic) and return the parsed auth info.
  */
 export function authenticateRequest(request: Request):
   | { authorized: true; type: "basic"; username: string }

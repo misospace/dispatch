@@ -63,11 +63,8 @@ async function getRecentRuns(): Promise<AgentRun[]> {
 }
 
 async function getDiscoveredAgents(): Promise<string[]> {
-  const runs = await prisma.agentRun.findMany({
-    distinct: ["agentName"],
-    select: { agentName: true },
-  });
-  return runs.map((r: { agentName: string }) => r.agentName);
+  const groups = await prisma.agentRun.groupBy({ by: ["agentName"] });
+  return groups.map((g: { agentName: string }) => g.agentName);
 }
 
 export default async function AgentsPage() {

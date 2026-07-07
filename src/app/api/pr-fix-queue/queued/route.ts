@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
 import { isValidPrFixLane, VALID_PR_FIX_LANES } from "@/types";
@@ -6,7 +7,7 @@ import { authorizeRequest } from "@/lib/auth";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -18,14 +19,13 @@ export async function GET(request: Request) {
     if (lane) {
       const normalized = lane.trim().toUpperCase().replace(/-/g, "_");
       if (!isValidPrFixLane(normalized)) {
-        return NextResponse.json({ error: `Invalid lane. Valid lanes: ${VALID_PR_FIX_LANES.join(", ")}` }, { status: 400 });
+        return errorResponse(`Invalid lane. Valid lanes: ${VALID_PR_FIX_LANES.join(", ")}`, 400);
       }
     }
 
     const items = await listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane, includeBlocked, prioritizeByType });
     return NextResponse.json(items);
   } catch (error) {
-    console.error("Failed to list PR fix queue:", error);
-    return NextResponse.json({ error: "Failed to list PR fix queue" }, { status: 500 });
+    return handleApiError("list PR fix queue", error);
   }
 }

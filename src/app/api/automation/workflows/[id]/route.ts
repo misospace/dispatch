@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 
@@ -7,7 +8,7 @@ export async function GET(request: Request) {
   const workflowId = searchParams.get("id");
 
   if (!workflowId) {
-    return NextResponse.json({ error: "Workflow ID required" }, { status: 400 });
+    return errorResponse("Workflow ID required", 400);
   }
 
   try {
@@ -26,12 +27,11 @@ export async function GET(request: Request) {
     });
 
     if (!workflow) {
-      return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
+      return errorResponse("Workflow not found", 404);
     }
 
     return NextResponse.json(jsonSafe(workflow));
   } catch (error) {
-    console.error("Failed to fetch workflow:", error);
-    return NextResponse.json({ error: "Failed to fetch workflow" }, { status: 500 });
+    return handleApiError("fetch workflow", error);
   }
 }

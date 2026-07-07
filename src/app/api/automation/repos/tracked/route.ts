@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 
@@ -58,9 +59,6 @@ export async function GET(_request: Request) {
     return NextResponse.json(jsonSafe(result));
   } catch (error) {
     console.error("Failed to fetch tracked repos:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch tracked repositories" },
-      { status: 500 },
-    );
+    return errorResponse("Failed to fetch tracked repositories", 500);
   }
 }

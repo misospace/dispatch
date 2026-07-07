@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import {
@@ -16,7 +17,7 @@ import { STATUS_LABELS } from "@/types";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   const { searchParams } = new URL(request.url);
@@ -62,10 +63,7 @@ export async function GET(request: Request) {
     if (lane) {
       const resolved = resolveRequestLane(lane.toLowerCase());
       if (!resolved) {
-        return NextResponse.json(
-          { error: `Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}` },
-          { status: 400 },
-        );
+        return errorResponse(`Invalid lane: "${lane}". Must be one of: ${getLaneIds().join(", ")}`, 400);
       }
       // Match both the configured lane and any aliases that resolve to it
       const aliases = getLaneAliases();
@@ -82,10 +80,7 @@ export async function GET(request: Request) {
     // Filter by status label (e.g. status/in-progress, status/ready)
     if (status) {
       if (!(STATUS_LABELS as readonly string[]).includes(`status/${status}`)) {
-        return NextResponse.json(
-          { error: `Invalid status: ${status}` },
-          { status: 400 },
-        );
+        return errorResponse(`Invalid status: ${status}`, 400);
       }
       appendIssueWhere(where, { labels: { has: `status/${status}` } });
     }
@@ -98,7 +93,6 @@ export async function GET(request: Request) {
 
     return NextResponse.json(issues);
   } catch (error) {
-    console.error("Failed to fetch issues:", error);
-    return NextResponse.json({ error: "Failed to fetch issues" }, { status: 500 });
+    return handleApiError("fetch issues", error);
   }
 }

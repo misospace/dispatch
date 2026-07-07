@@ -85,29 +85,22 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(body.hasActiveWork).toBe(false);
   });
 
-  it("returns hasActiveWork: false when all leases are expired", async () => {
-    mocks.leaseFindFirst.mockResolvedValueOnce({
-      id: "l-1",
-      agentName: "test-agent",
-      issueId: "issue-abc",
-      checkpoint: "issue_claimed",
-      branch: null,
-      prUrl: null,
-      expiredAt: new Date(Date.now() - 60000),
-      renewedAt: new Date(Date.now() - 120000),
-      issue: {
-        number: 42,
-        repository: { fullName: "org/repo" },
-        state: "status/in-progress",
-        labels: [],
-        currentLane: "local",
-      },
-    });
+  it("excludes expired leases via the lease query", async () => {
+    // The query filters expiredAt > now, so expired leases never come back.
+    mocks.leaseFindFirst.mockResolvedValueOnce(null);
 
     const res = await makeActiveWorkRequest("test-agent");
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.hasActiveWork).toBe(false);
+    expect(mocks.leaseFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          agentName: "test-agent",
+          expiredAt: { gt: expect.any(Date) },
+        }),
+      })
+    );
   });
 
   it("returns hasActiveWork: false when checkpoint is invalid", async () => {

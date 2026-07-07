@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 
@@ -26,7 +27,6 @@ export async function GET(request: Request) {
 
     return NextResponse.json(jsonSafe(workflows));
   } catch (error) {
-    console.error("Failed to fetch workflows:", error);
-    return NextResponse.json({ error: "Failed to fetch workflows" }, { status: 500 });
+    return handleApiError("fetch workflows", error);
   }
 }

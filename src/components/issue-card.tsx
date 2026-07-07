@@ -4,7 +4,7 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction } from "@/types";
+import { Issue, LABEL_COLORS, AGENT_PREFIX, OWNER_PREFIX, GROOM_ACTION_LABELS, GroomAction, isValidGroomAction, getAgentFromLabels, getOwnerFromLabels, getPriorityFromLabels } from "@/types";
 
 interface LaneOption {
   id: string;
@@ -76,9 +76,9 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
     .filter((l) => l.startsWith("status/"))
     .map((l) => LABEL_COLORS[l] || "6b7280")[0] || "6b7280";
 
-  const agentLabel = issue.labels.find((l) => l.startsWith("agent/"));
-  const ownerLabel = issue.labels.find((l) => l.startsWith("owner/"));
-  const priorityLabel = issue.labels.find((l) => l.startsWith("priority/"));
+  const agentLabel = getAgentFromLabels(issue.labels);
+  const ownerLabel = getOwnerFromLabels(issue.labels);
+  const priorityLabel = getPriorityFromLabels(issue.labels);
   const agentName = agentLabel?.replace(AGENT_PREFIX, "");
 
   // Fetch available agents on mount (once)
@@ -105,14 +105,18 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
   };
 
   // Refresh the board after a successful action
-  const handleSuccess = async (actionType: string) => {
+  const handleSuccess = async () => {
     setLoadingAction(null);
     setError(null);
     setOwnerNameInput("");
 
-    // Trigger a sync to pick up label changes from GitHub
+    // Trigger a repo-scoped sync to pick up label changes from GitHub
     try {
-      await authedFetch("/api/sync", { method: "POST" });
+      await authedFetch("/api/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoFullName: issue.repository.fullName }),
+      });
     } catch {
       // Sync failure is non-blocking
     }
@@ -130,20 +134,24 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
     setLoadingAction(null);
   };
 
-  async function handleAssign(type: "agent" | "owner", name: string) {
-    setLoadingAction(`${type}-${name}`);
+  /** Shared POST wrapper for assignment endpoints. */
+  async function postAssignmentAction(
+    endpoint: string,
+    loadingKey: string,
+    payload: Record<string, unknown>,
+    fallbackError: string,
+  ) {
+    setLoadingAction(loadingKey);
     setError(null);
     try {
-      const value = type === "agent" ? `${AGENT_PREFIX}${name}` : `${OWNER_PREFIX}${name}`;
-      const res = await authedFetch("/api/issues/actions", {
+      const res = await authedFetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           issueId: issue.id,
           repoFullName: issue.repository.fullName,
           issueNumber: issue.number,
-          action: type === "agent" ? "assign_agent" : "assign_owner",
-          value,
+          ...payload,
         }),
       });
 
@@ -152,40 +160,32 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
         throw new Error(data.error || `HTTP ${res.status}`);
       }
 
-      await handleSuccess(`${type}-assign`);
+      await handleSuccess();
     } catch (err) {
-      handleError(err instanceof Error ? err.message : "Assignment failed");
-    } finally {
-      setLoadingAction(null);
+      handleError(err instanceof Error ? err.message : fallbackError);
     }
   }
 
+  async function handleAssign(type: "agent" | "owner", name: string) {
+    const value = type === "agent" ? `${AGENT_PREFIX}${name}` : `${OWNER_PREFIX}${name}`;
+    await postAssignmentAction(
+      "/api/issues/actions",
+      `${type}-${name}`,
+      {
+        action: type === "agent" ? "assign_agent" : "assign_owner",
+        value,
+      },
+      "Assignment failed",
+    );
+  }
+
   async function handleUnassign(type: "agent" | "owner") {
-    setLoadingAction(`unassign-${type}`);
-    setError(null);
-    try {
-      const res = await authedFetch("/api/issues/unassign", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          issueId: issue.id,
-          repoFullName: issue.repository.fullName,
-          issueNumber: issue.number,
-          action: type === "agent" ? "unassign_agent" : "unassign_owner",
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-
-      await handleSuccess(`unassign-${type}`);
-    } catch (err) {
-      handleError(err instanceof Error ? err.message : "Unassignment failed");
-    } finally {
-      setLoadingAction(null);
-    }
+    await postAssignmentAction(
+      "/api/issues/unassign",
+      `unassign-${type}`,
+      { action: type === "agent" ? "unassign_agent" : "unassign_owner" },
+      "Unassignment failed",
+    );
   }
 
   /**
@@ -215,7 +215,7 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
       }
 
       setUnclaimConfirmOpen(false);
-      await handleSuccess("unclaim");
+      await handleSuccess();
     } catch (err) {
       // Keep the dialog open and surface the error inside it so the user
       // can dismiss or retry without losing context.
@@ -276,18 +276,16 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
         ...issue,
         ...(action === "promote_to_ready" ? { labels: ["status/ready", ...issue.labels.filter((l) => !l.startsWith("status/"))] } : {}),
         groomedAt: new Date(),
-        groomingSummary: groomSummary.trim() || undefined || null,
+        groomingSummary: groomSummary.trim() || null,
         ...(action === "mark_not_ready" ? { notReadyReason: groomReason.trim() } : {}),
         ...(action === "mark_blocked" ? { blockedReason: groomReason.trim() } : {}),
         ...(action === "mark_needs_info" ? { needsInfoReason: groomReason.trim() } : {}),
       };
 
-      await handleSuccess(`groom-${action}`);
+      await handleSuccess();
       onIssueUpdate?.(groomedIssue);
     } catch (err) {
       handleError(err instanceof Error ? err.message : "Grooming failed");
-    } finally {
-      setLoadingAction(null);
     }
   }
 

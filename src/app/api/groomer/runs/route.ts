@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { listGroomingRuns } from "@/lib/groomer/history";
@@ -6,7 +7,7 @@ import { jsonSafe } from "@/lib/json";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const { searchParams } = new URL(request.url);
   const issueNumber = searchParams.get("issueNumber");
@@ -22,7 +23,6 @@ export async function GET(request: Request) {
     });
     return NextResponse.json(jsonSafe(runs));
   } catch (error) {
-    console.error("Failed to fetch grooming runs:", error);
-    return NextResponse.json({ error: "Failed to fetch grooming runs" }, { status: 500 });
+    return handleApiError("fetch grooming runs", error);
   }
 }

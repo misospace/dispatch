@@ -60,11 +60,6 @@ function rankIssue(issueLabels: string[], agentName: string): { score: number; r
   // Check if this issue is directly assigned to the agent
   const agentMatch = Boolean(agentLabel && agentLabel === `agent/${agentName}`);
 
-  // Exclude done issues entirely
-  if (status === DONE_STATUS) {
-    return { score: Infinity, reason: "excluded: status/done" };
-  }
-
   // Build ranking reason
   const parts: string[] = [];
 
@@ -232,14 +227,11 @@ export function buildAgentQueue(
         })
       : actionable;
 
-  // Rank and filter out excluded items
-  const ranked = filtered
-    .map((issue) => {
-      const { score, reason } = rankIssue(issue.labels, agentName);
-      return { ...issue, score, reason };
-    })
-    // Exclude items with Infinity score (done issues that slipped through)
-    .filter((item) => item.score !== Infinity);
+  // Rank the remaining issues (done issues were already excluded by isActionable)
+  const ranked = filtered.map((issue) => {
+    const { score, reason } = rankIssue(issue.labels, agentName);
+    return { ...issue, score, reason };
+  });
 
   // Sort by score ascending (lower = higher priority)
   ranked.sort((a, b) => a.score - b.score);

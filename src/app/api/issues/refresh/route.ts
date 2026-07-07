@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
@@ -7,7 +8,7 @@ import { authorizeRequest } from "@/lib/auth";
 
 export async function POST(request: NextRequest) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -18,20 +19,14 @@ export async function POST(request: NextRequest) {
     };
 
     if (!repoFullName || !issueNumber || !Number.isInteger(issueNumber) || issueNumber <= 0) {
-      return NextResponse.json(
-        { error: "Missing or invalid required fields: repoFullName (string) and issueNumber (integer)" },
-        { status: 400 },
-      );
+      return errorResponse("Missing or invalid required fields: repoFullName (string) and issueNumber (integer)", 400);
     }
 
     const repos = await getSyncRepos();
     const targetRepo = repos.find((r) => r.fullName === repoFullName);
 
     if (!targetRepo) {
-      return NextResponse.json(
-        { error: `Repo ${repoFullName} is not tracked. Track it first via /api/repos or the UI.` },
-        { status: 404 },
-      );
+      return errorResponse(`Repo ${repoFullName} is not tracked. Track it first via /api/repos or the UI.`, 404);
     }
 
     const refreshResult = await refreshSingleIssue(repoFullName, issueNumber, fetchIssueFromGitHub);
@@ -90,6 +85,6 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("Issue refresh failed:", error);
-    return NextResponse.json({ error: "Issue refresh failed" }, { status: 500 });
+    return errorResponse("Issue refresh failed", 500);
   }
 }

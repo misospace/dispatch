@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
@@ -14,7 +15,7 @@ export async function GET(request: Request, context: RouteContext) {
   const repoFullName = queryRepo ?? decodeURIComponent(pathRepo.join("/"));
 
   if (!repoFullName) {
-    return NextResponse.json({ error: "repo parameter required" }, { status: 400 });
+    return errorResponse("repo parameter required", 400);
   }
 
   try {
@@ -41,7 +42,7 @@ export async function GET(request: Request, context: RouteContext) {
     });
 
     if (!repo) {
-      return NextResponse.json({ error: "Repo not found" }, { status: 404 });
+      return errorResponse("Repo not found", 404);
     }
 
     const failingRuns = await prisma.githubWorkflowRun.count({
@@ -77,15 +78,14 @@ export async function GET(request: Request, context: RouteContext) {
       recentEvents,
     }));
   } catch (error) {
-    console.error("Failed to fetch repo:", error);
-    return NextResponse.json({ error: "Failed to fetch repo" }, { status: 500 });
+    return handleApiError("fetch repo", error);
   }
 }
 
 export async function DELETE(request: Request, context: RouteContext) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
   const auditActor = getAuthorizedActor(auth, request);
 
@@ -93,7 +93,7 @@ export async function DELETE(request: Request, context: RouteContext) {
   const repoFullName = decodeURIComponent(pathRepo.join("/"));
 
   if (!repoFullName) {
-    return NextResponse.json({ error: "repo parameter required" }, { status: 400 });
+    return errorResponse("repo parameter required", 400);
   }
 
   try {
@@ -103,7 +103,7 @@ export async function DELETE(request: Request, context: RouteContext) {
     });
 
     if (!existing) {
-      return NextResponse.json({ error: "Repository not tracked" }, { status: 404 });
+      return errorResponse("Repository not tracked", 404);
     }
 
     // Hard delete AutomationRepo (cascades to workflows/runs/releases/etc).
@@ -143,6 +143,6 @@ export async function DELETE(request: Request, context: RouteContext) {
       },
     });
     console.error("Failed to remove tracked repo:", error);
-    return NextResponse.json({ error: errorMessage }, { status: 500 });
+    return errorResponse(errorMessage, 500);
   }
 }

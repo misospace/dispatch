@@ -3,7 +3,6 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     leaseFindUnique: vi.fn(),
-    leaseFindUniqueOrThrow: vi.fn(),
     leaseCreate: vi.fn(),
     leaseUpdate: vi.fn(),
     leaseDelete: vi.fn(),
@@ -19,7 +18,6 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     lease: {
       findUnique: mocks.leaseFindUnique,
-      findUniqueOrThrow: mocks.leaseFindUniqueOrThrow,
       create: mocks.leaseCreate,
       update: mocks.leaseUpdate,
       delete: mocks.leaseDelete,
@@ -41,7 +39,7 @@ vi.mock("@/lib/next-action", () => ({
   isValidCheckpoint: vi.fn((cp) => ["issue_claimed", "branch_created", "changes_made"].includes(cp)),
 }));
 
-import { upsertLease, isLeaseExpired, findActiveLeasesForIssue, findExpiredLeasesForIssue, releaseLease, releaseExpiredLeases, resolveActiveWork, findLeasedIssueIds, calculateLeaseExpiry, DEFAULT_LEASE_TTL_MS } from "./lease";
+import { upsertLease, isLeaseExpired, findActiveLeasesForIssue, releaseLease, releaseExpiredLeases, resolveActiveWork, findLeasedIssueIds, calculateLeaseExpiry, DEFAULT_LEASE_TTL_MS } from "./lease";
 
 function makeNow() { return new Date(); }
 function makeLease(overrides: Partial<any> = {}) {
@@ -127,10 +125,8 @@ describe("upsertLease", () => {
 
   describe("renew path", () => {
     it("renews an existing lease (same agent, same issue)", async () => {
-      const now = makeNow();
       mocks.leaseFindUnique.mockImplementation(() => Promise.resolve(makeLease({ id: "l-1" })));
       mocks.leaseUpdate.mockImplementation((args: any) => Promise.resolve({ ...makeLease(args.where), ...args.data }));
-      mocks.leaseFindUniqueOrThrow.mockImplementation(() => Promise.resolve(makeLease({ renewedAt: now })));
 
       const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
 
@@ -143,7 +139,6 @@ describe("upsertLease", () => {
     it("updates checkpoint on renewal", async () => {
       mocks.leaseFindUnique.mockImplementation(() => Promise.resolve(makeLease({ id: "l-1" })));
       mocks.leaseUpdate.mockImplementation((args: any) => Promise.resolve({ ...makeLease(args.where), ...args.data }));
-      mocks.leaseFindUniqueOrThrow.mockImplementation(() => Promise.resolve(makeLease({ checkpoint: "branch_created", branch: "fix/123" })));
 
       await upsertLease({ agentName: "saffron", issueId: "i-1", checkpoint: "branch_created", branch: "fix/123" });
 
@@ -172,19 +167,6 @@ describe("findActiveLeasesForIssue", () => {
     const result = await findActiveLeasesForIssue("i-99");
 
     expect(result).toEqual([]);
-  });
-});
-
-describe("findExpiredLeasesForIssue", () => {
-  it("returns leases with expiredAt in the past", async () => {
-    mocks.leaseFindMany.mockImplementation(() => Promise.resolve([makeLease({ id: "l-1", expiredAt: new Date(Date.now() - 1000) })]));
-
-    const result = await findExpiredLeasesForIssue("i-1");
-
-    expect(result).toHaveLength(1);
-    expect(mocks.leaseFindMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ issueId: "i-1", expiredAt: { lte: expect.any(Date) } }),
-    }));
   });
 });
 

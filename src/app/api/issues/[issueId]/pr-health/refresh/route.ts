@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { fetchPullRequests, fetchLinkedPrHealthInput } from "@/lib/github";
@@ -17,7 +18,7 @@ import { computeLinkedPrHealth, toPersistedLinkedPrHealth } from "@/lib/linked-p
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   try {
@@ -29,7 +30,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     });
 
     if (!issue) {
-      return NextResponse.json({ error: "Issue not found in local cache" }, { status: 404 });
+      return errorResponse("Issue not found in local cache", 404);
     }
 
     // Find the linked open PR by branch-name convention (matches reconcile).
@@ -53,6 +54,6 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     return NextResponse.json({ success: true, ...persisted });
   } catch (error) {
     console.error("Linked PR health refresh failed:", error);
-    return NextResponse.json({ error: "Failed to refresh linked PR health" }, { status: 500 });
+    return errorResponse("Failed to refresh linked PR health", 500);
   }
 }

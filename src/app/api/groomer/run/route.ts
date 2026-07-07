@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse } from "@/lib/api-errors";
 import { authorizeGroomerRequest } from "@/lib/auth";
 import { runHostedGroomer } from "@/lib/groomer/run";
 import { getHostedGroomerConfig } from "@/lib/groomer/config";
@@ -6,7 +7,7 @@ import { prisma } from "@/lib/prisma";
 
 export async function POST(request: Request) {
   if (!(await authorizeGroomerRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   let body: Record<string, unknown> = {};
@@ -21,10 +22,7 @@ export async function POST(request: Request) {
 
   const config = getHostedGroomerConfig();
   if (!config.enabled) {
-    return NextResponse.json(
-      { error: "Hosted groomer is disabled. Set DISPATCH_HOSTED_GROOMER_ENABLED=true to enable." },
-      { status: 503 },
-    );
+    return errorResponse("Hosted groomer is disabled. Set DISPATCH_HOSTED_GROOMER_ENABLED=true to enable.", 503);
   }
 
   // Guard: reject grooming of closed issues when issueNumber is explicitly provided.
@@ -45,22 +43,13 @@ export async function POST(request: Request) {
     });
 
     if (!issue) {
-      return NextResponse.json(
-        { error: `Issue #${issueNumber} not found` },
-        { status: 404 },
-      );
+      return errorResponse(`Issue #${issueNumber} not found`, 404);
     }
     if (issue.state === "closed") {
-      return NextResponse.json(
-        { error: "Cannot groom a closed issue" },
-        { status: 400 },
-      );
+      return errorResponse("Cannot groom a closed issue", 400);
     }
     if (issue.labels.includes("status/done")) {
-      return NextResponse.json(
-        { error: "Cannot groom an issue with status/done label" },
-        { status: 400 },
-      );
+      return errorResponse("Cannot groom an issue with status/done label", 400);
     }
   }
 
@@ -91,9 +80,6 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("Hosted groomer run failed:", error);
-    return NextResponse.json(
-      { error: "Hosted groomer run failed" },
-      { status: 500 },
-    );
+    return errorResponse("Hosted groomer run failed", 500);
   }
 }

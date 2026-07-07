@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import {
@@ -18,7 +19,7 @@ export async function GET(
   const { agentName } = await params;
 
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   const { searchParams } = new URL(request.url);
@@ -59,12 +60,7 @@ export async function GET(
     });
 
     if (!laneValid) {
-      return NextResponse.json(
-        {
-          error: `Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`,
-        },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`, 400);
     }
 
     if (prFixItems.length > 0) {
@@ -133,10 +129,6 @@ export async function GET(
 
     return NextResponse.json(createIdleTask("No work available"));
   } catch (error) {
-    console.error("Failed to fetch next task:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch next task" },
-      { status: 500 },
-    );
+    return handleApiError("fetch next task", error);
   }
 }

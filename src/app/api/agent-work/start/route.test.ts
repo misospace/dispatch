@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const mockAgentWork = {
   create: vi.fn(),
-  findFirst: vi.fn(),
+  findMany: vi.fn(),
   update: vi.fn(),
 };
 
@@ -53,7 +53,7 @@ function makeStartRequest(payload: Record<string, unknown>) {
 describe("POST /api/agent-work/start", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAgentWork.findFirst.mockResolvedValue(null);
+    mockAgentWork.findMany.mockResolvedValue([]);
     mockAgentWork.create.mockImplementation((args: any) => {
       const data = args.data || {};
       return Promise.resolve({
@@ -119,12 +119,14 @@ describe("POST /api/agent-work/start", () => {
   });
 
   it("releases existing active work on the same issue before creating new work", async () => {
-    mockAgentWork.findFirst.mockResolvedValueOnce({
-      id: "old-work-1",
-      agentName: "test-agent",
-      issueId: "issue-abc",
-      state: "IN_PROGRESS",
-    });
+    mockAgentWork.findMany.mockResolvedValueOnce([
+      {
+        id: "old-work-1",
+        agentName: "test-agent",
+        issueId: "issue-abc",
+        state: "IN_PROGRESS",
+      },
+    ]);
 
     const res = await makeStartRequest({
       agentName: "test-agent",

@@ -73,7 +73,7 @@ const EXCLUDED_STATES = new Set(["closed", "merged"]);
 /**
  * States indicating a clear merge conflict (actionable regardless of other signals).
  */
-const CONFLICTING_STATUSES = new Set(["dirty", "conflicting"]);
+export const CONFLICTING_STATUSES = new Set(["dirty", "conflicting"]);
 
 /**
  * States that are NOT actionable on their own — they only matter when paired
@@ -84,7 +84,7 @@ const NON_ACTIONABLE_MERGE_STATES = new Set(["behind", "blocked", "unstable", "h
 /**
  * Check conclusions that indicate a failure requiring follow-up.
  */
-const FAILURE_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required"]);
+export const FAILURE_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required"]);
 
 /**
  * Review decisions that indicate work is needed on the PR.
@@ -149,14 +149,6 @@ export function computeLinkedPrHealth(input: PrHealthInput): LinkedPrHealth | nu
   };
 }
 
-/**
- * Compute linked PR health for multiple PRs.
- * Returns only non-null results (excluded PRs are silently dropped).
- */
-export function computeLinkedPrHealthBatch(inputs: PrHealthInput[]): LinkedPrHealth[] {
-  return inputs.map(computeLinkedPrHealth).filter((h): h is LinkedPrHealth => h !== null);
-}
-
 // ─── Persistence Mapping ──────────────────────────────────────────────────────
 
 /**
@@ -204,62 +196,3 @@ export function toPersistedLinkedPrHealth(
   };
 }
 
-// ─── Queue Integration Helper ───────────────────────────────────────────────
-
-/**
- * Enrich a queue item with linked PR health data.
- * Used by the agent queue API to attach health metadata to issues that have open PRs.
- */
-export interface EnrichedQueueItem {
-  type?: string;
-  number: number;
-  title: string;
-  url: string;
-  labels: string[];
-  priority: string | null;
-  status: string | null;
-  agentMatch: boolean;
-  rankingReason: string;
-  lane?: string;
-  decomposed?: boolean;
-  issueId?: string;
-  repoFullName?: string;
-  claimable?: boolean;
-  /** Linked PR health metadata (null if no linked open PR or PR is excluded) */
-  linkedPrHealth: LinkedPrHealth | null;
-}
-
-/**
- * Enrich a list of queue items with linked PR health data.
- * The `prMap` maps issue numbers to their associated PR inputs.
- * In practice, this map would be built by scanning open PRs for each repo
- * and matching them to issues via GitHub's linked references or branch names.
- */
-export function enrichQueueItemsWithPrHealth(
-  items: Array<{
-    type?: string;
-    number: number;
-    title: string;
-    url: string;
-    labels: string[];
-    priority: string | null;
-    status: string | null;
-    agentMatch: boolean;
-    rankingReason: string;
-    lane?: string;
-    decomposed?: boolean;
-    issueId?: string;
-    repoFullName?: string;
-    claimable?: boolean;
-  }>,
-  prMap: Map<number, PrHealthInput>,
-): EnrichedQueueItem[] {
-  return items.map((item) => {
-    const prInput = prMap.get(item.number);
-    const health = prInput ? computeLinkedPrHealth(prInput) : null;
-    return {
-      ...item,
-      linkedPrHealth: health,
-    };
-  });
-}

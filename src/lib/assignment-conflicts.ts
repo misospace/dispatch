@@ -1,4 +1,6 @@
-import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
+import { AGENT_PREFIX, OWNER_PREFIX, isAgentLabel, isOwnerLabel } from "@/types";
+
+export { isAgentLabel, isOwnerLabel };
 
 /**
  * Result of a conflict analysis on an issue's labels.
@@ -82,20 +84,6 @@ export function buildUnassignedLabels(
 ): string[] {
   const isConflict = action === "unassign_agent" ? isAgentLabel : isOwnerLabel;
   return currentLabels.filter((l) => !isConflict(l));
-}
-
-/**
- * Check if a label is an agent label.
- */
-export function isAgentLabel(label: string): boolean {
-  return label.startsWith(AGENT_PREFIX);
-}
-
-/**
- * Check if a label is an owner label.
- */
-export function isOwnerLabel(label: string): boolean {
-  return label.startsWith(OWNER_PREFIX);
 }
 
 /**

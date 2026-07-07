@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildAgentQueue } from "./agent-queue";
-import {
-  VALID_ESCALATED_OUTCOMES,
-  isValidEscalatedOutcome,
-  ESCALATED_OUTCOME_LABELS,
-} from "@/types";
+import { VALID_ESCALATED_OUTCOMES, isValidEscalatedOutcome } from "@/types";
 
 const makeIssue = (
   overrides: Partial<{
@@ -38,23 +34,6 @@ describe("Escalated outcome validation", () => {
     expect(isValidEscalatedOutcome("completed")).toBe(false);
     expect(isValidEscalatedOutcome("")).toBe(false);
     expect(isValidEscalatedOutcome("random")).toBe(false);
-  });
-
-  it("provides human-readable labels for all outcomes", () => {
-    for (const outcome of VALID_ESCALATED_OUTCOMES) {
-      expect(ESCALATED_OUTCOME_LABELS[outcome]).toBeDefined();
-      expect(typeof ESCALATED_OUTCOME_LABELS[outcome]).toBe("string");
-      expect(ESCALATED_OUTCOME_LABELS[outcome].length).toBeGreaterThan(0);
-    }
-  });
-
-  it("labels match expected human-readable descriptions", () => {
-    expect(ESCALATED_OUTCOME_LABELS.PR_OPENED).toBe("PR opened");
-    expect(ESCALATED_OUTCOME_LABELS.PR_UPDATED).toBe("PR updated");
-    expect(ESCALATED_OUTCOME_LABELS.FOLLOW_UP_CREATED).toBe("Follow-up issues created");
-    expect(ESCALATED_OUTCOME_LABELS.DESIGN_COMMENT_POSTED).toBe("Design/RFC comment posted");
-    expect(ESCALATED_OUTCOME_LABELS.DECOMPOSED_SKIPPED).toBe("Decomposed/skipped");
-    expect(ESCALATED_OUTCOME_LABELS.STUCK).toBe("Stuck");
   });
 });
 

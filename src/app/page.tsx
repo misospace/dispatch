@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableRow } from "@/components/ui/table";
-import { STATUS_LABELS } from "@/types";
+import { STATUS_LABELS, getAgentFromLabels } from "@/types";
 import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 export const dynamic = "force-dynamic";
@@ -13,7 +13,7 @@ async function getStats() {
   const [issues, recentRuns, recentLogs] = await Promise.all([
     prisma.issue.findMany({
       where: issueWhere,
-      include: { repository: true },
+      select: { labels: true, updatedAt: true },
     }),
     prisma.agentRun.findMany({
       take: 10,
@@ -35,7 +35,7 @@ async function getStats() {
 
   const byAgent = issues.reduce(
     (acc, issue) => {
-      const agent = issue.labels.find((l) => l.startsWith("agent/"));
+      const agent = getAgentFromLabels(issue.labels);
       if (agent) {
         acc[agent] = (acc[agent] || 0) + 1;
       }

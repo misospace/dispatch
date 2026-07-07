@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest } from "@/lib/auth";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 
@@ -6,7 +7,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   const { agentName } = await params;
 
   if (!(await authorizeRequest(request)).authorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return errorResponse("Unauthorized", 401);
   }
 
   const { searchParams } = new URL(request.url);
@@ -25,17 +26,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     });
 
     if (!laneValid) {
-      return NextResponse.json(
-        {
-          error: `Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`,
-        },
-        { status: 400 },
-      );
+      return errorResponse(`Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`, 400);
     }
 
     return NextResponse.json([...prFixItems, ...rankedQueue]);
   } catch (error) {
-    console.error("Failed to fetch agent queue:", error);
-    return NextResponse.json({ error: "Failed to fetch agent queue" }, { status: 500 });
+    return handleApiError("fetch agent queue", error);
   }
 }
