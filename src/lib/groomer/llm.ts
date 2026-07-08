@@ -16,6 +16,12 @@ function buildSystemPrompt(): string {
   const laneIds = getConfiguredLanes().map((lane) => lane.id).join("|");
   const claimableIds = getClaimableLanes().map((lane) => lane.id).join("|");
   const backlogLane = getBacklogLane();
+  const claimableLanes = getClaimableLanes();
+  const defaultLane = claimableLanes.find((l) => l.role === "default") ?? claimableLanes[0];
+  const escalationLane = claimableLanes.find((l) => l.role === "escalation");
+  const laneGuide = claimableLanes
+    .map((l) => `  - "${l.id}"${l.role ? ` (${l.role})` : ""}: ${l.description ?? l.title ?? l.id}`)
+    .join("\n");
   const statusLabels = STATUS_LABELS.join(", ");
   const priorityLabels = PRIORITY_LABELS.join(", ");
   const typeLabels = VALID_TYPE_LABELS.join(", ");
@@ -44,7 +50,9 @@ Rules:
 - Valid type labels: ${typeLabels}
 - Never remove agent/* labels
 - Lane must be one of the configured lane ids
-- When actionability is "ready", lane.id MUST be a claimable worker lane (${claimableIds})${backlogLane ? `, NEVER "${backlogLane.id}"` : ""}${backlogLane ? `. The "${backlogLane.id}" lane is non-claimable — use it only when actionability is not "ready" (needs_info/blocked/backlog/already_done). Priority (P2/P3/low) does NOT mean backlog: a low-priority but ready issue still goes to a claimable lane.` : ""}
+- When actionability is "ready", lane.id MUST be a claimable worker lane (${claimableIds})${backlogLane ? `, NEVER "${backlogLane.id}"` : ""}. Claimable lanes:
+${laneGuide}
+  Default to "${defaultLane.id}" for the large majority of ready work. The local model is a capable coding model — it handles bug fixes, small-to-medium features, config/YAML/docs changes, and single-module refactors well, even when the change spans a few files. Do NOT escalate just because an issue touches multiple files or looks non-trivial.${escalationLane ? ` Choose "${escalationLane.id}" ONLY for genuinely hard work: large cross-cutting or cross-stack changes (e.g. an auth migration spanning backend and frontend), deep architectural redesign, or a change requiring reasoning across many modules at once. When unsure, choose "${defaultLane.id}" — the bridge automatically escalates to "${escalationLane.id}" if a local attempt is exhausted, so you never need to pre-escalate a borderline case.` : ""}${backlogLane ? `\n- The "${backlogLane.id}" lane is non-claimable — use it only when actionability is not "ready" (needs_info/blocked/backlog/already_done). Priority (P2/P3/low) does NOT mean backlog: a low-priority but ready issue still goes to a claimable lane.` : ""}
 - Be concise in summary and reason fields
 
 Title rewriting rules:
