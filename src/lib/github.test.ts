@@ -914,3 +914,38 @@ describe("getGitHubToken (GitHub App auth)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("extractLogExcerpt / jobIdFromCheckRunUrl", () => {
+  it("parses the job id from a check-run url", async () => {
+    const { jobIdFromCheckRunUrl } = await import("./github");
+    expect(jobIdFromCheckRunUrl("https://github.com/o/r/actions/runs/5/job/42")).toBe("42");
+    expect(jobIdFromCheckRunUrl("https://gh/run/99")).toBeNull();
+    expect(jobIdFromCheckRunUrl(undefined)).toBeNull();
+  });
+
+  it("returns the error region, strips timestamps, and skips trailing cleanup noise", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const log = [
+      "2026-07-08T21:00:00.0Z ##[group]Run tests",
+      "2026-07-08T21:00:01.0Z Running test_reservations.gd",
+      "2026-07-08T21:00:02.0Z ##[error]test_reservations: FAIL expected 3 got 2",
+      "2026-07-08T21:00:03.0Z ##[endgroup]",
+      "2026-07-08T21:00:04.0Z Post Run actions/checkout",
+      "2026-07-08T21:00:05.0Z Cleaning up orphan processes",
+    ].join("\n");
+    const out = extractLogExcerpt(log);
+    expect(out).toContain("test_reservations: FAIL expected 3 got 2");
+    expect(out).not.toContain("2026-07-08T21:00:02"); // timestamp stripped
+  });
+
+  it("returns empty string for empty input", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    expect(extractLogExcerpt("")).toBe("");
+  });
+
+  it("caps the excerpt length", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const huge = Array.from({ length: 5000 }, (_, i) => `line ${i} ERROR: boom`).join("\n");
+    expect(extractLogExcerpt(huge, 2000).length).toBeLessThanOrEqual(2002);
+  });
+});

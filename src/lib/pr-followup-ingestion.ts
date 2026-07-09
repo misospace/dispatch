@@ -249,16 +249,32 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
     sourceId: (event) => event.id,
     workItem: (event) => {
       const checkName = event.checkName ?? "unknown";
+      // event.body carries the job-log excerpt the sync fetched server-side (CI
+      // checks rarely set output.summary, so without this the coder gets a
+      // contentless "check failed" and fixes blind). Present the real error +
+      // the log URL for reference; degrade to reason + URL when no excerpt.
+      const excerpt = event.body?.trim();
+      const lines = [`CI check "${checkName}" failed (${event.conclusion}) on this PR.`];
+      if (excerpt) {
+        lines.push("", "Error from the job log:", excerpt);
+      }
+      if (event.url) {
+        lines.push("", `Full log: ${event.url}`);
+      }
+      if (!excerpt) {
+        lines.push("Read the full log at the URL above to find the error, then fix the root cause.");
+      } else {
+        lines.push("", "Fix the root cause the log shows.");
+      }
       return {
         // A failing check is actionable work for coder-revision by definition —
-        // don't classify it by prose (CI checks rarely set output.summary, and an
-        // empty body would misroute to NEEDS_HUMAN). The escalation ladder
-        // (PR_FIX_MAX_ATTEMPTS -> ESCALATED -> NEEDS_HUMAN) handles "coder can't fix it".
+        // don't classify it by prose (an empty body would misroute to NEEDS_HUMAN).
+        // The escalation ladder (PR_FIX_MAX_ATTEMPTS -> ESCALATED -> NEEDS_HUMAN)
+        // handles "coder can't fix it".
         lane: "NORMAL",
         type: "CI_FAILURE",
         reason: `Failing check: ${checkName} (${event.conclusion})`,
-        // `||` not `??`: an empty summary ("") must fall back to a real description.
-        feedback: event.body || `Check "${checkName}" concluded ${event.conclusion}`,
+        feedback: lines.join("\n"),
       };
     },
   },

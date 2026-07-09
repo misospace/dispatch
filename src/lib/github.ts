@@ -756,6 +756,84 @@ export async function fetchPullRequestHealthSignals(
 }
 
 /**
+ * Parse the Actions job id from a check-run's html_url/details_url
+ * (`.../actions/runs/<run>/job/<jobId>`). Returns null when absent.
+ */
+export function jobIdFromCheckRunUrl(url: string | undefined | null): string | null {
+  const m = /\/job\/(\d+)/.exec(url ?? "");
+  return m ? m[1] : null;
+}
+
+/**
+ * Extract the failure-relevant slice of a GitHub Actions job log.
+ *
+ * Raw job logs are large and end in cleanup/"Post" noise, so a naive tail misses
+ * the actual error. This strips the per-line ISO timestamp prefix, finds the last
+ * error marker (`##[error]`, `::error::`, `ERROR:`, Godot's `SCRIPT ERROR`,
+ * asserts, tracebacks, non-zero exit), and returns a bounded window around it.
+ * Falls back to the last lines before the job-cleanup noise when no marker
+ * matches. Pure + exported so it can be unit-tested without the network.
+ */
+export function extractLogExcerpt(rawLog: string, maxChars = 6000): string {
+  if (!rawLog.trim()) return "";
+  const stripTs = (l: string) => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, "");
+  const lines = rawLog.split("\n").map(stripTs);
+  const errRe = /##\[error\]|::error::|\bERROR:|SCRIPT ERROR|AssertionError|Traceback|\bFAIL(ED|URE)?\b|exit code [1-9]|\berror:/i;
+
+  let lastHit = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (errRe.test(lines[i])) { lastHit = i; break; }
+  }
+
+  let slice: string[];
+  if (lastHit >= 0) {
+    slice = lines.slice(Math.max(0, lastHit - 80), Math.min(lines.length, lastHit + 15));
+  } else {
+    const noiseRe = /^(Post |Cleaning up orphan|Complete job|Removing |\[command\])/;
+    let end = lines.length;
+    while (end > 0 && (!lines[end - 1].trim() || noiseRe.test(lines[end - 1]))) end--;
+    slice = lines.slice(Math.max(0, end - 120), end);
+  }
+
+  let excerpt = slice.join("\n").trim();
+  if (excerpt.length > maxChars) excerpt = "…\n" + excerpt.slice(excerpt.length - maxChars);
+  return excerpt;
+}
+
+/**
+ * Fetch the failure excerpt of a GitHub Actions job's log by job id.
+ *
+ * Server-side counterpart to giving the coder log access: dispatch reads the log
+ * with its own credential (needs Actions:read) and hands the coder a trimmed
+ * excerpt, so the coder token stays minimal. The logs endpoint 302-redirects to a
+ * pre-signed blob URL that rejects an Authorization header, so we resolve the
+ * redirect manually and fetch the blob unauthenticated. Returns "" on any failure
+ * (e.g. missing Actions:read) so feedback degrades to reason + URL.
+ */
+export async function fetchFailedJobLogExcerpt(repoFullName: string, jobId: string | number): Promise<string> {
+  const headers = await getHeadersAsync();
+  try {
+    const resp = await fetch(`${GITHUB_API}/repos/${repoFullName}/actions/jobs/${jobId}/logs`, {
+      headers,
+      redirect: "manual",
+    });
+    let logText = "";
+    if (resp.status === 301 || resp.status === 302) {
+      const loc = resp.headers.get("location");
+      if (loc) {
+        const blob = await fetch(loc); // signed URL — must NOT carry the auth header
+        if (blob.ok) logText = await blob.text();
+      }
+    } else if (resp.ok) {
+      logText = await resp.text();
+    }
+    return extractLogExcerpt(logText);
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Fetch a PR's mergeability via the per-PR detail GET.
  *
  * The list endpoint (fetchPullRequests) omits `mergeable`/`mergeable_state`, so
