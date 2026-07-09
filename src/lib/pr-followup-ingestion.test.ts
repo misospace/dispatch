@@ -375,7 +375,7 @@ describe("ingestCheckRunEvent", () => {
     expect(String(client.items[0].feedback)).toContain("e2e-tests");
   });
 
-  it("feedback carries the job-log URL and a pull recipe (coder fetches the real error)", async () => {
+  it("feedback carries the server-fetched log excerpt + the log URL", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();
 
@@ -389,15 +389,38 @@ describe("ingestCheckRunEvent", () => {
       checkName: "Export validation (macOS)",
       conclusion: "failure",
       checkRunId: "cr-mac",
-      checkDetails: "", // null summary — the real reason is only in the log
+      // The sync sets body to the bounded log excerpt it fetched server-side.
+      checkDetails: "##[error]No export template found for preset 'macOS'",
     });
 
     expect(client.items).toHaveLength(1);
     const feedback = String(client.items[0].feedback);
-    // The actionable bits: which check, where the log is, and how to pull it.
     expect(feedback).toContain("Export validation (macOS)");
-    expect(feedback).toContain("actions/jobs/85986677458/logs");
-    expect(feedback).toContain("GITHUB_TOKEN");
+    expect(feedback).toContain("No export template found for preset 'macOS'"); // the real error
+    expect(feedback).toContain("actions/runs/28977045019/job/85986677458"); // log URL for reference
+  });
+
+  it("degrades to reason + log URL when no excerpt could be fetched", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/windowstead",
+      prNumber: 266,
+      branch: "foreman/x/issue-237",
+      url: "https://github.com/misospace/windowstead/actions/runs/1/job/2",
+      title: "smoke",
+      author: "itsmiso-ai",
+      checkName: "Headless smoke test",
+      conclusion: "failure",
+      checkRunId: "cr-smoke",
+      checkDetails: "", // no excerpt (e.g. dispatch token lacks Actions:read)
+    });
+
+    const feedback = String(client.items[0].feedback);
+    expect(feedback).toContain("Headless smoke test");
+    expect(feedback).toContain("Full log: https://github.com/misospace/windowstead/actions/runs/1/job/2");
+    expect(feedback).toContain("Read the full log");
   });
 
   it("enqueues cancelled/timed_out checks", async () => {

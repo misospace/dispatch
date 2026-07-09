@@ -3,7 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
-import { getGitHubToken, fetchPaginated, fetchPullRequests, type GithubPR as GithubPRBase } from "@/lib/github";
+import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchFailedJobLogExcerpt, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 
 /**
@@ -160,6 +160,13 @@ export async function POST(request: NextRequest) {
         // Collect failing check run events
         for (const checkRun of checkRuns) {
           if (["failure", "cancelled", "timed_out", "action_required"].includes(checkRun.conclusion ?? "")) {
+            // These CI jobs rarely populate output.summary, so the actual error
+            // lives only in the job log. Fetch a bounded excerpt server-side (with
+            // dispatch's own credential) so the coder's feedback carries the real
+            // failure instead of a contentless "check failed" stub. Degrades to the
+            // summary/"" when the log can't be read (e.g. no Actions:read).
+            const jobId = jobIdFromCheckRunUrl(checkRun.html_url);
+            const excerpt = jobId ? await fetchFailedJobLogExcerpt(repoFullName, jobId) : "";
             allEvents.push({
               eventType: "check_run" as const,
               repoFullName,
@@ -168,7 +175,7 @@ export async function POST(request: NextRequest) {
               url: checkRun.html_url,
               title: checkRun.name,
               author: pr.user.login,
-              body: checkRun.output?.summary ?? "",
+              body: excerpt || checkRun.output?.summary || "",
               id: String(checkRun.id),
               conclusion: checkRun.conclusion,
               checkName: checkRun.name,

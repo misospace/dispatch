@@ -249,27 +249,22 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
     sourceId: (event) => event.id,
     workItem: (event) => {
       const checkName = event.checkName ?? "unknown";
-      // CI checks rarely populate output.summary, so the actual error lives only
-      // in the job log. Rather than force-feed the whole log (or hand over a
-      // contentless "check failed" stub that leaves the coder guessing blind),
-      // give it the reason + the job-log URL + how to pull it: the sandbox has
-      // python3 and $GITHUB_TOKEN (no curl/gh), so it fetches and greps the real
-      // error itself. Requires the token to carry actions:read.
-      const jobId = /\/job\/(\d+)/.exec(event.url ?? "")?.[1];
-      const logsApi = jobId
-        ? `https://api.github.com/repos/${event.repoFullName}/actions/jobs/${jobId}/logs`
-        : null;
-      const summary = event.body?.trim();
+      // event.body carries the job-log excerpt the sync fetched server-side (CI
+      // checks rarely set output.summary, so without this the coder gets a
+      // contentless "check failed" and fixes blind). Present the real error +
+      // the log URL for reference; degrade to reason + URL when no excerpt.
+      const excerpt = event.body?.trim();
       const lines = [`CI check "${checkName}" failed (${event.conclusion}) on this PR.`];
-      if (summary) lines.push(`Check summary: ${summary}`);
-      if (logsApi) {
-        lines.push(
-          `The failure detail is in the job log, not this message — read it before editing:`,
-          `  python3 -c 'import os,urllib.request as u; print(u.urlopen(u.Request("${logsApi}", headers={"Authorization":"Bearer "+os.environ["GITHUB_TOKEN"],"Accept":"application/vnd.github+json"})).read().decode())' | grep -Ei "error|fail|assert" -A3`,
-          `Then fix the root cause the log shows.`,
-        );
-      } else if (event.url) {
-        lines.push(`Job log: ${event.url}`);
+      if (excerpt) {
+        lines.push("", "Error from the job log:", excerpt);
+      }
+      if (event.url) {
+        lines.push("", `Full log: ${event.url}`);
+      }
+      if (!excerpt) {
+        lines.push("Read the full log at the URL above to find the error, then fix the root cause.");
+      } else {
+        lines.push("", "Fix the root cause the log shows.");
       }
       return {
         // A failing check is actionable work for coder-revision by definition —
