@@ -133,4 +133,68 @@ describe("POST /api/pr-followup/sync", () => {
 
     vi.unstubAllGlobals();
   });
+
+  it("detects a merge conflict via the per-PR detail fetch (list endpoint omits mergeability)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      // List endpoint: NO mergeable/mergeable_state (as GitHub actually behaves).
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([{
+          id: 1, number: 263, url: "https://gh/pr/263", title: "dedup worker cap", body: "Fixes #229",
+          state: "open", user: { login: "itsmiso-ai" }, head: { ref: "foreman/x/issue-229" },
+          base: { ref: "main" }, merged_at: null, draft: false,
+        }]);
+      }
+      // Per-PR detail GET: carries mergeable_state=dirty (the conflict signal).
+      if (/\/pulls\/\d+$/.test(u)) return jsonRes({ mergeable_state: "dirty", mergeable: false });
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    // The gap this closes: a conflicting PR now reaches ingestMergeConflict.
+    expect(mocks.ingestMergeConflict).toHaveBeenCalledTimes(1);
+    expect(mocks.ingestMergeConflict.mock.calls[0][1]).toMatchObject({
+      prNumber: 263,
+      mergeable: "CONFLICTING",
+    });
+    expect(mocks.clearResolvedConflictItems).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not enqueue or clear when mergeability is still 'unknown' (GitHub computing)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([{
+          id: 1, number: 264, url: "https://gh/pr/264", title: "wip", body: "Fixes #254",
+          state: "open", user: { login: "itsmiso-ai" }, head: { ref: "foreman/x/issue-254" },
+          base: { ref: "main" }, merged_at: null, draft: false,
+        }]);
+      }
+      if (/\/pulls\/\d+$/.test(u)) return jsonRes({ mergeable_state: "unknown", mergeable: null });
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+    expect(mocks.ingestMergeConflict).not.toHaveBeenCalled();
+    expect(mocks.clearResolvedConflictItems).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
 });
