@@ -360,12 +360,18 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
     }
   }
 
-  // ── Cross-field invariant: a "ready" issue must land in a claimable worker
-  // lane, never the non-claimable backlog lane (dispatch#492). The groomer LLM
-  // sometimes conflates "backlog" (low priority) with the non-claimable backlog
-  // lane, stranding ready issues where no worker queue can see them. Coerce to
-  // the default claimable lane and record it as an invariant resolution.
-  if (parsed.actionability === "ready" && !isClaimableLane(parsed.lane.id)) {
+  // A groomer can express readiness through actionability, its explicit next
+  // action, or its lane choice. Treat every one of those signals consistently:
+  // a promoted issue must be claimable and carry status/ready. This also covers
+  // small models that omit optional actionability while selecting `local`.
+  const readyForWork =
+    parsed.actionability === "ready" ||
+    parsed.nextGroomingAction === "promote_to_ready" ||
+    isClaimableLane(parsed.lane.id);
+
+  // ── Cross-field invariant: a ready issue must land in a claimable worker
+  // lane, never the non-claimable backlog lane (dispatch#492).
+  if (readyForWork && !isClaimableLane(parsed.lane.id)) {
     const target = getDefaultClaimableLane();
     if (target) {
       resolutions.push({
@@ -382,14 +388,14 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
     }
   }
 
-  // ── Cross-field invariant: a "ready" issue must carry the status/ready label.
+  // ── Cross-field invariant: a ready issue must carry the status/ready label.
   // Worker queues only surface issues whose status is claimable (status/ready or
   // status/in-progress); an issue with no status/* — or a non-ready one — is
   // silently excluded and sits stranded despite being groomed (dispatch#572). The
   // groomer LLM sometimes judges an issue ready but omits status/ready, or even
   // emits a conflicting status/*. Coerce the label set and record it as an
   // invariant resolution, mirroring the lane coercion above.
-  if (parsed.actionability === "ready" && !parsed.labelsToAdd.includes("status/ready")) {
+  if (readyForWork && !parsed.labelsToAdd.includes("status/ready")) {
     // Redirect any conflicting status/* the LLM tried to add: drop it from add,
     // push it into remove so the GitHub label set actually flips, and surface it
     // as the rawValue of the resolution.
