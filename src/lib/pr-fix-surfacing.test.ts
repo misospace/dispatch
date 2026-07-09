@@ -5,12 +5,14 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueComment: vi.fn().mockResolvedValue({ url: null }),
+    fetchIssueComments: vi.fn().mockResolvedValue([]),
   },
 }));
 
 vi.mock("@/lib/github", () => ({
   addIssueLabel: mocks.addIssueLabel,
   addIssueComment: mocks.addIssueComment,
+  fetchIssueComments: mocks.fetchIssueComments,
 }));
 
 const baseInput = { repo: "org/repo", pr: 42, reason: "merge conflict" };
@@ -47,6 +49,32 @@ describe("surfacePrFixBlocked", () => {
     vi.clearAllMocks();
     mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
+    mocks.fetchIssueComments.mockResolvedValue([]);
+  });
+
+  it("does NOT re-post when a marker comment already exists (the #264 spam fix)", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { body: "unrelated" },
+      { body: `${NEEDS_HUMAN_COMMENT_MARKER}\n> already surfaced earlier` },
+    ]);
+
+    const result = await surfacePrFixBlocked(baseInput);
+
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(result.commentPosted).toBe(false);
+    expect(result.errors).toEqual([]);
+    expect(result.labelApplied).toBe(true); // label is idempotent, still applied
+  });
+
+  it("does not post (and does not throw) when the comment lookup fails", async () => {
+    mocks.fetchIssueComments.mockRejectedValue(new Error("GitHub API error: 502"));
+
+    const result = await surfacePrFixBlocked(baseInput);
+
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(result.commentPosted).toBe(false);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toMatch(/^comment:/);
   });
 
   it("calls addIssueLabel and addIssueComment with correct args", async () => {
