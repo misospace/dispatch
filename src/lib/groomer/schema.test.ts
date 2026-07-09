@@ -235,6 +235,34 @@ describe("groomer schema validation", () => {
     expect(invariant?.resolvedValue).toBe("status/ready");
   });
 
+  it("adds status/ready when a claimable lane is selected without actionability", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: ["type/security"],
+      labelsToRemove: ["status/backlog"],
+      lane: { id: "local", confidence: "high", reason: "concrete security hardening" },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.labelsToAdd).toContain("status/ready");
+    expect(result.resolutions).toContainEqual({
+      field: "labelsToAdd",
+      rawValue: "(absent)",
+      resolvedValue: "status/ready",
+      source: "invariant",
+    });
+  });
+
+  it("promotes an explicit promote_to_ready action out of backlog", () => {
+    const result = validateGroomerOutput({
+      labelsToAdd: ["type/security"],
+      labelsToRemove: ["status/backlog"],
+      lane: { id: "backlog", confidence: "high", reason: "incorrectly left in backlog" },
+      nextGroomingAction: "promote_to_ready",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.lane.id).toBe("local");
+    expect(result.parsed?.labelsToAdd).toContain("status/ready");
+  });
+
   it("leaves status/ready untouched when already present for a ready issue", () => {
     const result = validateGroomerOutput({
       labelsToAdd: ["status/ready", "type/bug"],
@@ -407,7 +435,7 @@ describe("groomer schema validation", () => {
 
   it("resolves lane alias: raw 'normal' -> resolved 'local', mutation applied, resolution event recorded", () => {
     const result = validateGroomerOutput({
-      labelsToAdd: [],
+      labelsToAdd: ["status/ready"],
       labelsToRemove: [],
       lane: { id: "normal", confidence: "high", reason: "test" },
     });
@@ -424,7 +452,7 @@ describe("groomer schema validation", () => {
 
   it("resolves lane alias: raw 'escalated' -> resolved 'frontier'", () => {
     const result = validateGroomerOutput({
-      labelsToAdd: [],
+      labelsToAdd: ["status/ready"],
       labelsToRemove: [],
       lane: { id: "escalated", confidence: "medium", reason: "complex task" },
     });
@@ -437,7 +465,7 @@ describe("groomer schema validation", () => {
 
   it("lane configured directly: no resolution event", () => {
     const result = validateGroomerOutput({
-      labelsToAdd: [],
+      labelsToAdd: ["status/ready"],
       labelsToRemove: [],
       lane: { id: "local", confidence: "high", reason: "test" },
     });
