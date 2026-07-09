@@ -756,6 +756,32 @@ export async function fetchPullRequestHealthSignals(
 }
 
 /**
+ * Fetch a PR's mergeability via the per-PR detail GET.
+ *
+ * The list endpoint (fetchPullRequests) omits `mergeable`/`mergeable_state`, so
+ * conflict detection needs this per-PR call. GitHub computes mergeability lazily:
+ * the first GET after a change may return `mergeable_state: "unknown"` (and null
+ * `mergeable`) while it recomputes, converging on a subsequent sync. Transient
+ * failures degrade to null rather than throwing.
+ */
+export async function fetchPullRequestMergeState(
+  repoFullName: string,
+  prNumber: number,
+): Promise<{ mergeableState: string | null; mergeable: boolean | null }> {
+  const headers = await getHeadersAsync();
+  try {
+    const resp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (resp.ok) {
+      const detail = (await resp.json()) as { mergeable_state?: string | null; mergeable?: boolean | null };
+      return { mergeableState: detail.mergeable_state ?? null, mergeable: detail.mergeable ?? null };
+    }
+  } catch {
+    // Leave signals null on transient failure; next sync retries.
+  }
+  return { mergeableState: null, mergeable: null };
+}
+
+/**
  * Fetch failing CI check runs for a PR's head ref.
  *
  * Uses the check-runs endpoint for the head branch. Only completed runs with a
