@@ -3,7 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
-import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchFailedJobLogExcerpt, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
+import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 
 /**
@@ -105,7 +105,7 @@ export async function POST(request: NextRequest) {
         const commentsUrl = `${githubApi}/repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`;
         const reviewsUrl = `${githubApi}/repos/${owner}/${repo}/pulls/${pr.number}/reviews?per_page=100`;
         const checksUrl = `${githubApi}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=completed&per_page=100`;
-        const [comments, reviews, checkRuns] = await Promise.all([
+        const [comments, reviews, checkRuns, mergeState] = await Promise.all([
           fetchPaginated<GithubComment>(commentsUrl, 100).catch(() => [] as GithubComment[]),
           fetchPaginated<GithubReview>(reviewsUrl, 100).catch(() => [] as GithubReview[]),
           fetchPaginated<GithubCheckRun>(
@@ -113,7 +113,24 @@ export async function POST(request: NextRequest) {
             100,
             (data) => (data as { check_runs?: GithubCheckRun[] }).check_runs ?? [],
           ).catch(() => [] as GithubCheckRun[]),
+          // The list endpoint omits mergeability; the per-PR GET carries it. Without
+          // this, pr.mergeable is always undefined and merge conflicts are invisible
+          // to the ingestion below.
+          fetchPullRequestMergeState(repoFullName, pr.number),
         ]);
+
+        // Map the REST merge_state to the enum the conflict ingestion expects.
+        // "dirty" is GitHub's conflict signal. Leave pr.mergeable unset when the
+        // state is "unknown"/null (GitHub still computing) so the block below
+        // neither enqueues a conflict nor prematurely clears a real one — it
+        // resolves on a later sync once GitHub finishes computing.
+        const mergeableState = (mergeState.mergeableState ?? "").toLowerCase();
+        pr.mergeable =
+          mergeableState === "dirty"
+            ? "CONFLICTING"
+            : mergeableState && mergeableState !== "unknown"
+              ? "MERGEABLE"
+              : undefined;
 
         // Collect comment events
         for (const comment of comments) {
