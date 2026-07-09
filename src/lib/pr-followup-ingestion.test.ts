@@ -375,6 +375,31 @@ describe("ingestCheckRunEvent", () => {
     expect(String(client.items[0].feedback)).toContain("e2e-tests");
   });
 
+  it("feedback carries the job-log URL and a pull recipe (coder fetches the real error)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/windowstead",
+      prNumber: 264,
+      branch: "foreman/x/issue-254",
+      url: "https://github.com/misospace/windowstead/actions/runs/28977045019/job/85986677458",
+      title: "Add macOS export",
+      author: "itsmiso-ai",
+      checkName: "Export validation (macOS)",
+      conclusion: "failure",
+      checkRunId: "cr-mac",
+      checkDetails: "", // null summary — the real reason is only in the log
+    });
+
+    expect(client.items).toHaveLength(1);
+    const feedback = String(client.items[0].feedback);
+    // The actionable bits: which check, where the log is, and how to pull it.
+    expect(feedback).toContain("Export validation (macOS)");
+    expect(feedback).toContain("actions/jobs/85986677458/logs");
+    expect(feedback).toContain("GITHUB_TOKEN");
+  });
+
   it("enqueues cancelled/timed_out checks", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();

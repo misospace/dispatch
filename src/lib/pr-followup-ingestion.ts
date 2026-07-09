@@ -249,16 +249,37 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
     sourceId: (event) => event.id,
     workItem: (event) => {
       const checkName = event.checkName ?? "unknown";
+      // CI checks rarely populate output.summary, so the actual error lives only
+      // in the job log. Rather than force-feed the whole log (or hand over a
+      // contentless "check failed" stub that leaves the coder guessing blind),
+      // give it the reason + the job-log URL + how to pull it: the sandbox has
+      // python3 and $GITHUB_TOKEN (no curl/gh), so it fetches and greps the real
+      // error itself. Requires the token to carry actions:read.
+      const jobId = /\/job\/(\d+)/.exec(event.url ?? "")?.[1];
+      const logsApi = jobId
+        ? `https://api.github.com/repos/${event.repoFullName}/actions/jobs/${jobId}/logs`
+        : null;
+      const summary = event.body?.trim();
+      const lines = [`CI check "${checkName}" failed (${event.conclusion}) on this PR.`];
+      if (summary) lines.push(`Check summary: ${summary}`);
+      if (logsApi) {
+        lines.push(
+          `The failure detail is in the job log, not this message — read it before editing:`,
+          `  python3 -c 'import os,urllib.request as u; print(u.urlopen(u.Request("${logsApi}", headers={"Authorization":"Bearer "+os.environ["GITHUB_TOKEN"],"Accept":"application/vnd.github+json"})).read().decode())' | grep -Ei "error|fail|assert" -A3`,
+          `Then fix the root cause the log shows.`,
+        );
+      } else if (event.url) {
+        lines.push(`Job log: ${event.url}`);
+      }
       return {
         // A failing check is actionable work for coder-revision by definition —
-        // don't classify it by prose (CI checks rarely set output.summary, and an
-        // empty body would misroute to NEEDS_HUMAN). The escalation ladder
-        // (PR_FIX_MAX_ATTEMPTS -> ESCALATED -> NEEDS_HUMAN) handles "coder can't fix it".
+        // don't classify it by prose (an empty body would misroute to NEEDS_HUMAN).
+        // The escalation ladder (PR_FIX_MAX_ATTEMPTS -> ESCALATED -> NEEDS_HUMAN)
+        // handles "coder can't fix it".
         lane: "NORMAL",
         type: "CI_FAILURE",
         reason: `Failing check: ${checkName} (${event.conclusion})`,
-        // `||` not `??`: an empty summary ("") must fall back to a real description.
-        feedback: event.body || `Check "${checkName}" concluded ${event.conclusion}`,
+        feedback: lines.join("\n"),
       };
     },
   },
