@@ -526,7 +526,7 @@ export interface GithubRepo {
  * Shared GET /repos/{fullName} fetch used by fetchRepo and fetchRepositoryMetadata.
  * `errorPrefix` preserves each caller's original error message.
  */
-async function fetchRepoJson(repoFullName: string, errorPrefix: string): Promise<any> {
+async function fetchRepoJson(repoFullName: string, errorPrefix: string): Promise<Record<string, unknown>> {
   const response = await fetch(`${GITHUB_API}/repos/${repoFullName}`, {
     headers: await getHeadersAsync(),
   });
@@ -538,7 +538,7 @@ async function fetchRepoJson(repoFullName: string, errorPrefix: string): Promise
 }
 
 export async function fetchRepo(repoFullName: string): Promise<GithubRepo> {
-  return fetchRepoJson(repoFullName, `Failed to fetch repo ${repoFullName}`);
+  return (await fetchRepoJson(repoFullName, `Failed to fetch repo ${repoFullName}`)) as unknown as GithubRepo;
 }
 
 export interface GithubWorkflow {
@@ -987,9 +987,9 @@ export interface GitHubRepoMetadata {
 export async function fetchRepositoryMetadata(repoFullName: string): Promise<GitHubRepoMetadata> {
   const data = await fetchRepoJson(repoFullName, `Failed to fetch repo metadata for ${repoFullName}`);
   return {
-    fullName: data.full_name ?? repoFullName,
-    defaultBranch: data.default_branch ?? "main",
-    description: data.description ?? null,
+    fullName: typeof data.full_name === "string" ? data.full_name : repoFullName,
+    defaultBranch: typeof data.default_branch === "string" ? data.default_branch : "main",
+    description: typeof data.description === "string" ? data.description : null,
   };
 }
 
