@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import {
   classifyFeedback,
+  parseAiReviewerFindings,
   computeEvidenceKey,
   isAllowedBotAuthor,
   isAllowedBranchOwner,
@@ -77,6 +78,42 @@ describe("classifyFeedback", () => {
   it("defaults to needs_human when no pattern matches", () => {
     // A random sentence that doesn't match any pattern should default to needs_human
     expect(classifyFeedback("The weather is nice today")).toBe("needs_human");
+  });
+});
+
+// ─── AI-reviewer structured findings ────────────────────────────────────────
+
+describe("parseAiReviewerFindings", () => {
+  it("extracts the ai-pr-reviewer JSON payload from a review body", () => {
+    const body = [
+      "<!-- ai-pr-reviewer -->",
+      `<!-- ai-pr-reviewer:${JSON.stringify({
+        review_result: "issues",
+        open_findings: [{ severity: "blocker", message: "no upgrade performed" }],
+      })} -->`,
+      "<!-- ai-pr-review-sha:deadbeef -->",
+      "# AI Automated Review",
+    ].join("\n");
+    const parsed = parseAiReviewerFindings(body);
+    expect(parsed?.review_result).toBe("issues");
+    expect(parsed?.open_findings).toHaveLength(1);
+    expect(parsed?.open_findings?.[0].message).toBe("no upgrade performed");
+  });
+
+  it("ignores the bare marker and sibling sha/fingerprint comments", () => {
+    const body = [
+      "<!-- ai-pr-reviewer -->",
+      "<!-- ai-pr-review-sha:deadbeef -->",
+      "<!-- ai-pr-review-fingerprint:abc123 -->",
+    ].join("\n");
+    expect(parseAiReviewerFindings(body)).toBeNull();
+  });
+
+  it("returns null for absent, empty, or malformed payloads", () => {
+    expect(parseAiReviewerFindings(null)).toBeNull();
+    expect(parseAiReviewerFindings("")).toBeNull();
+    expect(parseAiReviewerFindings("no comment here")).toBeNull();
+    expect(parseAiReviewerFindings("<!-- ai-pr-reviewer:{not json} -->")).toBeNull();
   });
 });
 
@@ -236,6 +273,61 @@ describe("ingestReviewEvent", () => {
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
     expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
+  });
+
+  it("routes an ai-pr-reviewer review with findings to NORMAL, not needs_human", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    // Narrative prose that matches no classifyFeedback pattern (as the
+    // ai-pr-reviewer writes them), plus the structured findings it embeds.
+    const body = [
+      `<!-- ai-pr-reviewer:${JSON.stringify({
+        review_result: "issues",
+        open_findings: [
+          { severity: "blocker", category: "bug", message: "PR does not satisfy the issue acceptance criteria: no package upgrade performed." },
+          { severity: "major", category: "bug", file: "package.json", line: 38, message: "package.json still shows '^0.1.2' — no upgrade performed." },
+        ],
+      })} -->`,
+      "# AI Automated Review",
+      "## Review: Request Changes",
+      "This PR only partially addresses the linked issue. It updates documentation but does not perform the actual package upgrade.",
+    ].join("\n");
+
+    // Guard: the prose (payload included) would otherwise dead-end at needs_human.
+    expect(classifyFeedback(body)).toBe("needs_human");
+
+    await ingestReviewEvent(client, {
+      repoFullName: "misospace/miso-chat",
+      prNumber: 691,
+      branch: "foreman/wl-misospace-miso-chat-687/issue-687",
+      url: "https://github.com/misospace/miso-chat/pull/691",
+      title: "Verify passport-openidconnect is current",
+      author: "itsmiso-ai",
+      reviewBody: body,
+      reviewId: "r-saffron",
+      reviewState: "CHANGES_REQUESTED",
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
+  });
+
+  it("routes a CHANGES_REQUESTED review with no payload and vague prose to NEEDS_HUMAN", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    await ingestReviewEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 43,
+      branch: "fix/x",
+      url: "https://github.com/misospace/dispatch/pull/43",
+      title: "Fix",
+      author: "itsmiso-ai",
+      reviewBody: "This looks wrong, please take another look.",
+      reviewId: "r-human",
+      reviewState: "CHANGES_REQUESTED",
+    });
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NEEDS_HUMAN");
   });
 
   it("skips APPROVED reviews", async () => {
