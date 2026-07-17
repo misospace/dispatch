@@ -151,6 +151,48 @@ export function classifyFeedback(content: string): FeedbackClassification {
   return "needs_human";
 }
 
+// ─── Structured AI-reviewer findings ────────────────────────────────────────
+
+/** A single finding from the ai-pr-reviewer structured payload. */
+export interface AiReviewerFinding {
+  severity?: string;
+  category?: string;
+  file?: string | null;
+  line?: number | null;
+  message?: string;
+}
+
+/** The machine-readable verdict the ai-pr-reviewer embeds in a review body. */
+export interface AiReviewerPayload {
+  review_result?: string;
+  open_findings?: AiReviewerFinding[];
+}
+
+/**
+ * The ai-pr-reviewer embeds a machine-readable verdict in the review body as an
+ * HTML comment: `<!-- ai-pr-reviewer:{...json...} -->`. Parse it so the router
+ * can act on the structured findings instead of keyword-classifying the review
+ * prose — the reviewer writes long narrative markdown that matches none of the
+ * classifyFeedback patterns and would always fall through to needs_human,
+ * dead-ending every AI review at human escalation.
+ *
+ * The bare `<!-- ai-pr-reviewer -->` marker and the sibling `ai-pr-review-sha:` /
+ * `ai-pr-review-fingerprint:` comments are ignored (only the `ai-pr-reviewer:`
+ * JSON payload matches). Returns null when absent or unparseable.
+ */
+export function parseAiReviewerFindings(body: string | undefined | null): AiReviewerPayload | null {
+  if (!body) return null;
+  // Capture up to the closing `-->`; JSON never contains it, so a non-greedy
+  // match yields the whole object even though it has nested braces.
+  const match = body.match(/<!--\s*ai-pr-reviewer:\s*([\s\S]*?)-->/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[1].trim()) as AiReviewerPayload;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Evidence Key ───────────────────────────────────────────────────────────
 
 /**
@@ -210,6 +252,23 @@ function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
   return classifyFeedback(feedback) === "needs_human" ? "NEEDS_HUMAN" : "NORMAL";
 }
 
+/**
+ * Lane for a CHANGES_REQUESTED review. An ai-pr-reviewer verdict carrying
+ * concrete findings is actionable by definition, so route it to NORMAL and let
+ * the coder attempt a fix — the PR_FIX_MAX_ATTEMPTS → ESCALATED → NEEDS_HUMAN
+ * ladder handles "coder can't fix it", exactly as it does for CI failures.
+ * Without this, the reviewer's narrative prose matches no classifyFeedback
+ * pattern and every AI review dead-ends at needs_human. Human prose reviews
+ * (no structured payload) still fall back to the keyword classifier.
+ */
+function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
+  const findings = parseAiReviewerFindings(body)?.open_findings ?? [];
+  if (findings.some((f) => (f.message ?? "").trim().length > 0)) {
+    return "NORMAL";
+  }
+  return laneFor(body);
+}
+
 const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
 
 const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor> = {
@@ -235,7 +294,7 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
     filterTerminalPr: true,
     sourceId: (event) => event.id,
     workItem: (event) => ({
-      lane: laneFor(event.body ?? ""),
+      lane: reviewLane(event.body ?? ""),
       type: "REVIEW_FEEDBACK",
       reason: `PR review: CHANGES_REQUESTED`,
       feedback: event.body ?? "",
