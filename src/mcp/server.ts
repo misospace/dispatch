@@ -5,6 +5,12 @@ import { z } from "zod";
 import {
   claimIssue,
   claimWork,
+  unclaimIssue,
+  getQueue,
+  listIssues,
+  listPrFixes,
+  markPrFix,
+  runGroomer,
   resolveAgentName,
   refreshIssue,
   syncRepo,
@@ -87,6 +93,103 @@ export async function claimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
       resolvedAgentName,
       args.force as boolean | undefined,
     ),
+  );
+}
+
+export async function unclaimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
+  const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
+
+  if (!resolvedAgentName) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
+          }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return wrapToolCall(() =>
+    unclaimIssue(
+      args.repoFullName as string,
+      args.issueNumber as number,
+      resolvedAgentName,
+    ),
+  );
+}
+
+export async function getQueueHandler(args: ExtraArgs): Promise<ToolResult> {
+  const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
+
+  if (!resolvedAgentName) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
+          }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return wrapToolCall(() =>
+    getQueue(resolvedAgentName, {
+      lane: args.lane as string | undefined,
+      excludeDecomposed: args.excludeDecomposed as boolean | undefined,
+      includeClaimed: args.includeClaimed as boolean | undefined,
+      includeRenovate: args.includeRenovate as boolean | undefined,
+    }),
+  );
+}
+
+export async function listIssuesHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    listIssues({
+      repo: args.repo as string | undefined,
+      status: args.status as string | undefined,
+      lane: args.lane as string | undefined,
+      agent: args.agent as string | undefined,
+      priority: args.priority as string | undefined,
+      includeClosed: args.includeClosed as boolean | undefined,
+    }),
+  );
+}
+
+export async function listPrFixesHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    listPrFixes({
+      lane: args.lane as string | undefined,
+      includeBlocked: args.includeBlocked as boolean | undefined,
+    }),
+  );
+}
+
+export async function markPrFixHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    markPrFix({
+      repo: args.repo as string,
+      pr: args.pr as number,
+      status: args.status as string,
+      note: args.note as string | undefined,
+    }),
+  );
+}
+
+export async function runGroomerHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    runGroomer({
+      repoFullName: args.repoFullName as string | undefined,
+      issueNumber: args.issueNumber as number | undefined,
+    }),
   );
 }
 
@@ -178,6 +281,106 @@ export function createServer(): McpServerType {
       },
     },
     claimIssueHandler,
+  );
+
+  // ── unclaim_issue ────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "unclaim_issue",
+    {
+      description:
+        "Release an agent's claim on a Dispatch issue: removes the agent/* label, releases the lease (and AgentWork records on the operator path), and flips status/in-progress to status/ready — the issue keeps its groomed lane, so it is immediately re-claimable. Refuses closed/done issues and issues not assigned to the given agent. If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var. Error if neither is set — do not use generic identities like 'Dispatch MCP'.",
+      inputSchema: {
+        repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+        issueNumber: z.number().int().positive().describe("GitHub issue number"),
+        agentName: z.string().optional().describe("Agent whose claim is being released. Falls back to DISPATCH_AGENT_NAME env var if omitted. Required unless DISPATCH_AGENT_NAME is set."),
+      },
+    },
+    unclaimIssueHandler,
+  );
+
+  // ── get_queue ────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "get_queue",
+    {
+      description:
+        "Fetch an agent's ranked work queue (PR-fix items first, then ranked issues). Optionally filter by lane. If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var.",
+      inputSchema: {
+        agentName: z.string().optional().describe("Agent whose queue to fetch. Falls back to DISPATCH_AGENT_NAME env var if omitted."),
+        lane: z.string().optional().describe("Filter to a single execution lane (e.g. 'local', 'frontier')"),
+        excludeDecomposed: z.boolean().optional().describe("Exclude issues already decomposed into sub-issues"),
+        includeClaimed: z.boolean().optional().describe("Include issues already claimed by an agent (agent/* labels)"),
+        includeRenovate: z.boolean().optional().describe("Include Renovate-authored issues (excluded by default)"),
+      },
+    },
+    getQueueHandler,
+  );
+
+  // ── list_issues ──────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "list_issues",
+    {
+      description:
+        "List Dispatch-tracked issues with optional filters: repo, status (backlog|ready|in-progress|in-review|done), lane, agent, priority. Open issues only unless includeClosed.",
+      inputSchema: {
+        repo: z.string().optional().describe("Filter by repo full name (e.g. 'org/repo')"),
+        status: z.string().optional().describe("Filter by status label value (e.g. 'ready', 'in-progress')"),
+        lane: z.string().optional().describe("Filter by execution lane"),
+        agent: z.string().optional().describe("Filter by claiming agent name"),
+        priority: z.string().optional().describe("Filter by priority label value (e.g. 'p1')"),
+        includeClosed: z.boolean().optional().describe("Include closed issues (default false)"),
+      },
+    },
+    listIssuesHandler,
+  );
+
+  // ── list_pr_fixes ────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "list_pr_fixes",
+    {
+      description:
+        "List queued PR-fix items (CI failures, CHANGES_REQUESTED reviews, merge conflicts) awaiting a fix push. Optionally filter by lane (e.g. 'NORMAL', 'ESCALATED') or include BLOCKED items.",
+      inputSchema: {
+        lane: z.string().optional().describe("Filter by PR-fix lane (e.g. 'NORMAL', 'ESCALATED', 'NEEDS_HUMAN')"),
+        includeBlocked: z.boolean().optional().describe("Include BLOCKED (needs-human) items (default false)"),
+      },
+    },
+    listPrFixesHandler,
+  );
+
+  // ── mark_pr_fix ──────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "mark_pr_fix",
+    {
+      description:
+        "Mark a PR-fix queue item's outcome after working it: status one of 'fixed', 'blocked', 'stale', or 'ignored', with an optional note. Writes an audit row.",
+      inputSchema: {
+        repo: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+        pr: z.number().int().positive().describe("Pull request number"),
+        status: z.string().describe("Outcome: fixed, blocked, stale, or ignored"),
+        note: z.string().optional().describe("Optional note explaining the outcome"),
+      },
+    },
+    markPrFixHandler,
+  );
+
+  // ── run_groomer ──────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "run_groomer",
+    {
+      description:
+        "Trigger a hosted groomer run immediately instead of waiting for the scheduled cron: grooms one backlog candidate into a claimable lane. Optionally target a specific issue via repoFullName + issueNumber. Rate-limited server-side.",
+      inputSchema: {
+        repoFullName: z.string().optional().describe("Target repo full name (requires issueNumber)"),
+        issueNumber: z.number().int().positive().optional().describe("Target a specific issue to groom"),
+      },
+    },
+    runGroomerHandler,
   );
 
   // ── set_issue_status ─────────────────────────────────────────────────────
