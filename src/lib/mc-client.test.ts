@@ -743,3 +743,71 @@ describe("unclaimIssue", () => {
     await expect(unclaimIssue("org/repo", 99, "test-agent")).rejects.toThrow(/not found/);
   });
 });
+
+describe("queue, issues, pr-fix, groomer clients", () => {
+  beforeEach(async () => {
+    clearEnv();
+    setEnv();
+    vi.resetModules();
+    await import("./mc-client");
+    vi.restoreAllMocks();
+  });
+
+  it("getQueue hits the agent queue with lane + flags", async () => {
+    const { getQueue } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
+    await getQueue("test-agent", { lane: "local", includeClaimed: true });
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/agents/test-agent/queue");
+    expect(url).toContain("lane=local");
+    expect(url).toContain("includeClaimed=true");
+  });
+
+  it("listIssues builds the filter query", async () => {
+    const { listIssues } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
+    await listIssues({ repo: "org/repo", status: "ready", lane: "local" });
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/issues?");
+    expect(url).toContain("repo=org%2Frepo");
+    expect(url).toContain("status=ready");
+    expect(url).toContain("lane=local");
+  });
+
+  it("listPrFixes passes lane and include_blocked", async () => {
+    const { listPrFixes } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
+    await listPrFixes({ lane: "NORMAL", includeBlocked: true });
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/pr-fix-queue/queued");
+    expect(url).toContain("lane=NORMAL");
+    expect(url).toContain("include_blocked=true");
+  });
+
+  it("markPrFix POSTs the mark body", async () => {
+    const { markPrFix } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ status: "FIXED" }));
+    await markPrFix({ repo: "org/repo", pr: 7, status: "fixed", note: "done" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/pr-fix-queue/mark"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ repo: "org/repo", pr: 7, status: "fixed", note: "done" }),
+      }),
+    );
+  });
+
+  it("runGroomer POSTs an empty body by default and a target when given", async () => {
+    const { runGroomer } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ candidateNumber: 12 }))
+      .mockResolvedValueOnce(jsonResponse({ candidateNumber: 43 }));
+    await runGroomer();
+    await runGroomer({ repoFullName: "org/repo", issueNumber: 43 });
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST", body: JSON.stringify({}) });
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ repoFullName: "org/repo", issueNumber: 43 }),
+    });
+  });
+});

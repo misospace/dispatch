@@ -3,6 +3,11 @@ import {
   resolveIssueHandler,
   claimIssueHandler,
   unclaimIssueHandler,
+  getQueueHandler,
+  listIssuesHandler,
+  listPrFixesHandler,
+  markPrFixHandler,
+  runGroomerHandler,
   setIssueStatusHandler,
   claimWorkHandler,
   refreshIssueHandler,
@@ -870,5 +875,59 @@ describe("unclaimIssueHandler", () => {
     const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent" }));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not assigned/);
+  });
+});
+
+describe("queue / pr-fix / groomer handlers", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("getQueueHandler returns the queue and falls back to env agent name", async () => {
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    try {
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ number: 1 }]));
+      const result = await getQueueHandler(makeArgs({ lane: "local" }));
+      expect(result.isError).toBeUndefined();
+      expect(String(fetchMock.mock.calls[0][0])).toContain("/api/agents/env-agent/queue");
+    } finally {
+      delete process.env.DISPATCH_AGENT_NAME;
+    }
+  });
+
+  it("getQueueHandler errors without an agent name", async () => {
+    const saved = process.env.DISPATCH_AGENT_NAME;
+    delete process.env.DISPATCH_AGENT_NAME;
+    try {
+      const result = await getQueueHandler(makeArgs({}));
+      expect(result.isError).toBe(true);
+    } finally {
+      if (saved !== undefined) process.env.DISPATCH_AGENT_NAME = saved;
+    }
+  });
+
+  it("listIssuesHandler returns issues as JSON text", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ number: 42 }]));
+    const result = await listIssuesHandler(makeArgs({ repo: "org/repo", status: "ready" }));
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text as string)).toHaveLength(1);
+  });
+
+  it("listPrFixesHandler returns queue items", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ pr: 7 }]));
+    const result = await listPrFixesHandler(makeArgs({ includeBlocked: true }));
+    expect(result.isError).toBeUndefined();
+  });
+
+  it("markPrFixHandler surfaces API errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(errorResponse("PR fix queue item not found", 404));
+    const result = await markPrFixHandler(makeArgs({ repo: "org/repo", pr: 7, status: "fixed" }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/not found/);
+  });
+
+  it("runGroomerHandler returns the groom result", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ candidateNumber: 12 }));
+    const result = await runGroomerHandler(makeArgs({}));
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text as string).candidateNumber).toBe(12);
   });
 });
