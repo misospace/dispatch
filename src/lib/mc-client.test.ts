@@ -702,3 +702,44 @@ describe("DispatchClientError", () => {
     expect(err.statusCode).toBeNull();
   });
 });
+
+describe("unclaimIssue", () => {
+  beforeEach(async () => {
+    clearEnv();
+    setEnv();
+    vi.resetModules();
+    await import("./mc-client");
+    vi.restoreAllMocks();
+  });
+
+  it("calls resolve then POST /api/issues/unclaim", async () => {
+    const { unclaimIssue } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([mockIssue])) // resolve
+      .mockResolvedValueOnce(jsonResponse({ success: true, labels: ["priority/p1", "status/ready"] })); // unclaim
+
+    const result = await unclaimIssue("org/repo", 42, "test-agent");
+
+    expect(result.success).toBe(true);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/api/issues/unclaim"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          issueId: "issue-cuid-1",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          agentName: "test-agent",
+        }),
+      }),
+    );
+  });
+
+  it("throws when the issue is not found", async () => {
+    const { unclaimIssue } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
+    await expect(unclaimIssue("org/repo", 99, "test-agent")).rejects.toThrow(/not found/);
+  });
+});

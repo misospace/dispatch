@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   claimIssue,
   claimWork,
+  unclaimIssue,
   resolveAgentName,
   refreshIssue,
   syncRepo,
@@ -86,6 +87,33 @@ export async function claimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
       args.issueNumber as number,
       resolvedAgentName,
       args.force as boolean | undefined,
+    ),
+  );
+}
+
+export async function unclaimIssueHandler(args: ExtraArgs): Promise<ToolResult> {
+  const resolvedAgentName = resolveAgentName(args.agentName as string | undefined);
+
+  if (!resolvedAgentName) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            error: "agentName is required. Either pass an explicit agentName argument or set the DISPATCH_AGENT_NAME environment variable. Do not use generic identities like 'Dispatch MCP'.",
+          }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return wrapToolCall(() =>
+    unclaimIssue(
+      args.repoFullName as string,
+      args.issueNumber as number,
+      resolvedAgentName,
     ),
   );
 }
@@ -178,6 +206,22 @@ export function createServer(): McpServerType {
       },
     },
     claimIssueHandler,
+  );
+
+  // ── unclaim_issue ────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "unclaim_issue",
+    {
+      description:
+        "Release an agent's claim on a Dispatch issue: removes the agent/* label, releases the lease (and AgentWork records on the operator path), and flips status/in-progress to status/ready — the issue keeps its groomed lane, so it is immediately re-claimable. Refuses closed/done issues and issues not assigned to the given agent. If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var. Error if neither is set — do not use generic identities like 'Dispatch MCP'.",
+      inputSchema: {
+        repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+        issueNumber: z.number().int().positive().describe("GitHub issue number"),
+        agentName: z.string().optional().describe("Agent whose claim is being released. Falls back to DISPATCH_AGENT_NAME env var if omitted. Required unless DISPATCH_AGENT_NAME is set."),
+      },
+    },
+    unclaimIssueHandler,
   );
 
   // ── set_issue_status ─────────────────────────────────────────────────────

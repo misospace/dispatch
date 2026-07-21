@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   resolveIssueHandler,
   claimIssueHandler,
+  unclaimIssueHandler,
   setIssueStatusHandler,
   claimWorkHandler,
   refreshIssueHandler,
@@ -774,5 +775,100 @@ describe("startup DISPATCH_AGENT_NAME warning", () => {
       expect.stringContaining("DISPATCH_AGENT_NAME is not set"),
     );
     delete process.env.DISPATCH_AGENT_NAME;
+  });
+});
+
+describe("unclaimIssueHandler", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("resolves then POSTs /api/issues/unclaim and returns the result", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: ["agent/test-agent", "priority/p1", "status/in-progress"],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "local",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ success: true, labels: ["priority/p1", "status/ready"] }),
+      );
+
+    const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent" }));
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text as string);
+    expect(parsed.success).toBe(true);
+    expect(parsed.labels).toContain("status/ready");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/api/issues/unclaim"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          issueId: "issue-cuid-1",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          agentName: "test-agent",
+        }),
+      }),
+    );
+  });
+
+  it("errors when agentName is missing and DISPATCH_AGENT_NAME is unset", async () => {
+    const saved = process.env.DISPATCH_AGENT_NAME;
+    delete process.env.DISPATCH_AGENT_NAME;
+    try {
+      const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+      expect(result.isError).toBe(true);
+      const parsed = JSON.parse(result.content[0].text as string);
+      expect(parsed.error).toMatch(/agentName is required/);
+    } finally {
+      if (saved !== undefined) process.env.DISPATCH_AGENT_NAME = saved;
+    }
+  });
+
+  it("returns error when the unclaim API rejects", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: ["priority/p1", "status/ready"],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "local",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(errorResponse("Issue is not assigned to test-agent", 400));
+
+    const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent" }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/not assigned/);
   });
 });

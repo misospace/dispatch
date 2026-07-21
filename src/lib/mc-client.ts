@@ -34,6 +34,11 @@ export interface ClaimIssueResult {
   labels: string[];
 }
 
+export interface UnclaimIssueResult {
+  success: boolean;
+  labels: string[];
+}
+
 export interface SetStatusResult {
   success: boolean;
   status: string;
@@ -217,6 +222,24 @@ export async function claimIssue(
       issueNumber,
       agentName,
       force: force ?? false,
+    }),
+  });
+}
+
+export async function unclaimIssue(
+  repoFullName: string,
+  issueNumber: number,
+  agentName: string,
+): Promise<UnclaimIssueResult> {
+  const resolved = await resolveIssue(repoFullName, issueNumber);
+
+  return mcJson<UnclaimIssueResult>("/api/issues/unclaim", {
+    method: "POST",
+    body: JSON.stringify({
+      issueId: resolved.issueId,
+      repoFullName,
+      issueNumber,
+      agentName,
     }),
   });
 }
