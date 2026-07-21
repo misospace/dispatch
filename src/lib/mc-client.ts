@@ -34,6 +34,11 @@ export interface ClaimIssueResult {
   labels: string[];
 }
 
+export interface UnclaimIssueResult {
+  success: boolean;
+  labels: string[];
+}
+
 export interface SetStatusResult {
   success: boolean;
   status: string;
@@ -218,6 +223,102 @@ export async function claimIssue(
       agentName,
       force: force ?? false,
     }),
+  });
+}
+
+export async function unclaimIssue(
+  repoFullName: string,
+  issueNumber: number,
+  agentName: string,
+): Promise<UnclaimIssueResult> {
+  const resolved = await resolveIssue(repoFullName, issueNumber);
+
+  return mcJson<UnclaimIssueResult>("/api/issues/unclaim", {
+    method: "POST",
+    body: JSON.stringify({
+      issueId: resolved.issueId,
+      repoFullName,
+      issueNumber,
+      agentName,
+    }),
+  });
+}
+
+export async function getQueue(
+  agentName: string,
+  options?: {
+    lane?: string;
+    excludeDecomposed?: boolean;
+    includeClaimed?: boolean;
+    includeRenovate?: boolean;
+  },
+): Promise<unknown[]> {
+  const params = new URLSearchParams();
+  if (options?.lane) params.set("lane", options.lane);
+  if (options?.excludeDecomposed) params.set("exclude_decomposed", "true");
+  if (options?.includeClaimed) params.set("includeClaimed", "true");
+  if (options?.includeRenovate) params.set("includeRenovate", "true");
+  const qs = params.toString();
+
+  return mcJson<unknown[]>(
+    `/api/agents/${encodeURIComponent(agentName)}/queue${qs ? `?${qs}` : ""}`,
+    { method: "GET" },
+  );
+}
+
+export async function listIssues(filters?: {
+  repo?: string;
+  status?: string;
+  lane?: string;
+  agent?: string;
+  priority?: string;
+  includeClosed?: boolean;
+}): Promise<unknown[]> {
+  const params = new URLSearchParams();
+  if (filters?.repo) params.set("repo", filters.repo);
+  if (filters?.status) params.set("status", filters.status);
+  if (filters?.lane) params.set("lane", filters.lane);
+  if (filters?.agent) params.set("agent", filters.agent);
+  if (filters?.priority) params.set("priority", filters.priority);
+  if (filters?.includeClosed) params.set("includeClosed", "true");
+  const qs = params.toString();
+
+  return mcJson<unknown[]>(`/api/issues${qs ? `?${qs}` : ""}`, { method: "GET" });
+}
+
+export async function listPrFixes(options?: {
+  lane?: string;
+  includeBlocked?: boolean;
+}): Promise<unknown[]> {
+  const params = new URLSearchParams();
+  if (options?.lane) params.set("lane", options.lane);
+  if (options?.includeBlocked) params.set("include_blocked", "true");
+  const qs = params.toString();
+
+  return mcJson<unknown[]>(`/api/pr-fix-queue/queued${qs ? `?${qs}` : ""}`, {
+    method: "GET",
+  });
+}
+
+export async function markPrFix(input: {
+  repo: string;
+  pr: number;
+  status: string;
+  note?: string;
+}): Promise<unknown> {
+  return mcJson<unknown>("/api/pr-fix-queue/mark", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function runGroomer(target?: {
+  repoFullName?: string;
+  issueNumber?: number;
+}): Promise<unknown> {
+  return mcJson<unknown>("/api/groomer/run", {
+    method: "POST",
+    body: JSON.stringify(target ?? {}),
   });
 }
 

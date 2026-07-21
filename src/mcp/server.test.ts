@@ -2,6 +2,12 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   resolveIssueHandler,
   claimIssueHandler,
+  unclaimIssueHandler,
+  getQueueHandler,
+  listIssuesHandler,
+  listPrFixesHandler,
+  markPrFixHandler,
+  runGroomerHandler,
   setIssueStatusHandler,
   claimWorkHandler,
   refreshIssueHandler,
@@ -774,5 +780,154 @@ describe("startup DISPATCH_AGENT_NAME warning", () => {
       expect.stringContaining("DISPATCH_AGENT_NAME is not set"),
     );
     delete process.env.DISPATCH_AGENT_NAME;
+  });
+});
+
+describe("unclaimIssueHandler", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("resolves then POSTs /api/issues/unclaim and returns the result", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: ["agent/test-agent", "priority/p1", "status/in-progress"],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "local",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ success: true, labels: ["priority/p1", "status/ready"] }),
+      );
+
+    const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent" }));
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text as string);
+    expect(parsed.success).toBe(true);
+    expect(parsed.labels).toContain("status/ready");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/api/issues/unclaim"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          issueId: "issue-cuid-1",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          agentName: "test-agent",
+        }),
+      }),
+    );
+  });
+
+  it("errors when agentName is missing and DISPATCH_AGENT_NAME is unset", async () => {
+    const saved = process.env.DISPATCH_AGENT_NAME;
+    delete process.env.DISPATCH_AGENT_NAME;
+    try {
+      const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42 }));
+      expect(result.isError).toBe(true);
+      const parsed = JSON.parse(result.content[0].text as string);
+      expect(parsed.error).toMatch(/agentName is required/);
+    } finally {
+      if (saved !== undefined) process.env.DISPATCH_AGENT_NAME = saved;
+    }
+  });
+
+  it("returns error when the unclaim API rejects", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            id: "issue-cuid-1",
+            number: 42,
+            title: "Fix the thing",
+            body: null,
+            state: "open",
+            url: "https://github.com/org/repo/issues/42",
+            labels: ["priority/p1", "status/ready"],
+            assignees: [],
+            commentsCount: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            closedAt: null,
+            lastSyncedAt: new Date(),
+            currentLane: "local",
+            repository: { fullName: "org/repo" },
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(errorResponse("Issue is not assigned to test-agent", 400));
+
+    const result = await unclaimIssueHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent" }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/not assigned/);
+  });
+});
+
+describe("queue / pr-fix / groomer handlers", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("getQueueHandler returns the queue and falls back to env agent name", async () => {
+    process.env.DISPATCH_AGENT_NAME = "env-agent";
+    try {
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ number: 1 }]));
+      const result = await getQueueHandler(makeArgs({ lane: "local" }));
+      expect(result.isError).toBeUndefined();
+      expect(String(fetchMock.mock.calls[0][0])).toContain("/api/agents/env-agent/queue");
+    } finally {
+      delete process.env.DISPATCH_AGENT_NAME;
+    }
+  });
+
+  it("getQueueHandler errors without an agent name", async () => {
+    const saved = process.env.DISPATCH_AGENT_NAME;
+    delete process.env.DISPATCH_AGENT_NAME;
+    try {
+      const result = await getQueueHandler(makeArgs({}));
+      expect(result.isError).toBe(true);
+    } finally {
+      if (saved !== undefined) process.env.DISPATCH_AGENT_NAME = saved;
+    }
+  });
+
+  it("listIssuesHandler returns issues as JSON text", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ number: 42 }]));
+    const result = await listIssuesHandler(makeArgs({ repo: "org/repo", status: "ready" }));
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text as string)).toHaveLength(1);
+  });
+
+  it("listPrFixesHandler returns queue items", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ pr: 7 }]));
+    const result = await listPrFixesHandler(makeArgs({ includeBlocked: true }));
+    expect(result.isError).toBeUndefined();
+  });
+
+  it("markPrFixHandler surfaces API errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(errorResponse("PR fix queue item not found", 404));
+    const result = await markPrFixHandler(makeArgs({ repo: "org/repo", pr: 7, status: "fixed" }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/not found/);
+  });
+
+  it("runGroomerHandler returns the groom result", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ candidateNumber: 12 }));
+    const result = await runGroomerHandler(makeArgs({}));
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text as string).candidateNumber).toBe(12);
   });
 });
