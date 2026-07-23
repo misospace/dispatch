@@ -226,6 +226,23 @@ describe("selectGroomingCandidate", () => {
     expect(result!.number).toBe(50);
   });
 
+  it("selects fully classified issue with status/backlog label even when currentLane is claimable", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        number: 70,
+        title: "Backlog-labeled but frontier lane",
+        url: "https://github.com/org/repo/issues/70",
+        labels: ["status/backlog", "priority/p1", "agent/alice"],
+        currentLane: "frontier",
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+    const result = await selectGroomingCandidate();
+    expect(result).not.toBeNull();
+    expect(result!.number).toBe(70);
+    expect(result!.currentLane).toBe("frontier");
+  });
+
   it("returns missing lane issue as eligible", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {
