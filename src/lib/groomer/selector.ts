@@ -75,7 +75,8 @@ export async function selectGroomingCandidate(
       const hasPriority = issue.labels.some((l) => l.startsWith("priority/"));
       const hasAgent = issue.labels.some((l) => l.startsWith("agent/"));
       const hasLane = !!issue.currentLane;
-      const isBacklog = issue.currentLane ? isBacklogLane(issue.currentLane) : false;
+      const isBacklogLaneValue = issue.currentLane ? isBacklogLane(issue.currentLane) : false;
+      const isBacklog = isBacklogLaneValue || issue.labels.includes("status/backlog");
       const isUnlabeled = issue.labels.length === 0;
 
       const eligible =
