@@ -185,14 +185,15 @@ export async function POST(request: Request) {
       return errorResponse("Missing x-github-event header", 400);
     }
 
+    // Read raw body before authorization so that if authorizeRequest ever
+    // consumes the body stream, HMAC verification still operates on the real payload.
+    const rawBody = await request.arrayBuffer();
+
     // Authenticate the request (Bearer token, Basic Auth, or OIDC session)
     const auth = await authorizeRequest(request);
     if (!auth.authorized) {
       return errorResponse("Unauthorized", 401);
     }
-
-    // Read raw body once for signature verification and parsing
-    const rawBody = await request.arrayBuffer();
     const payload = Buffer.from(rawBody);
 
     // Webhook signature verification: fail-closed by default.
