@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { schedulerConfigFromEnv, runJob, startScheduler, type SchedulerConfig, type SchedulerDeps } from "./scheduler";
+import { schedulerConfigFromEnv, schedulerHealthCheck, runJob, startScheduler, type SchedulerConfig, type SchedulerDeps } from "./scheduler";
 
 function fakeDeps(overrides: Partial<SchedulerDeps> = {}): SchedulerDeps & { logs: Array<[string, unknown]> } {
   const logs: Array<[string, unknown]> = [];
@@ -120,7 +120,41 @@ describe("startScheduler", () => {
     // fire the startup timer -> it runs once and arms the interval
     const startupCb = (deps.setTimeout as ReturnType<typeof vi.fn>).mock.calls[0][0] as () => void;
     startupCb();
-    expect(deps.fetch).toHaveBeenCalledTimes(1);
+    expect(deps.fetch).toHaveBeenCalledTimes(2); // health check + job
     expect(deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 900000);
+  });
+});
+
+describe("schedulerHealthCheck", () => {
+  it("returns true when health endpoint responds with 200", async () => {
+    const mockFetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof globalThis.fetch;
+    const deps = fakeDeps({ fetch: mockFetch });
+    const result = await schedulerHealthCheck(CONFIG, deps);
+
+    expect(result).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith("http://127.0.0.1:3000/api/health", {
+      headers: { Authorization: "Bearer tok" },
+    });
+  });
+
+  it("returns false and logs when health endpoint returns non-ok status", async () => {
+    const mockFetch = vi.fn(async () => new Response(null, { status: 503 })) as unknown as typeof globalThis.fetch;
+    const log = vi.fn();
+    const deps = fakeDeps({ fetch: mockFetch, log });
+    const result = await schedulerHealthCheck(CONFIG, deps);
+
+    expect(result).toBe(false);
+    expect(log).toHaveBeenCalledWith("scheduler health check failed — HTTP 503");
+  });
+
+  it("returns false and logs when fetch throws", async () => {
+    const mockFetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof globalThis.fetch;
+    const log = vi.fn();
+    const deps = fakeDeps({ fetch: mockFetch, log });
+    const result = await schedulerHealthCheck(CONFIG, deps);
+
+    expect(result).toBe(false);
+    expect(log).toHaveBeenCalledWith("scheduler health check failed: ECONNREFUSED", expect.any(Error));
   });
 });
