@@ -112,14 +112,15 @@ describe("startScheduler", () => {
     expect(deps.logs.some(([m]) => m.includes("DISPATCH_AGENT_TOKEN is unset"))).toBe(true);
   });
 
-  it("schedules each job after the startup delay, then on an interval", () => {
+  it("schedules a single health check and each job after the startup delay, then on an interval", () => {
     const deps = fakeDeps();
     startScheduler(CONFIG, deps);
-    expect(deps.setTimeout).toHaveBeenCalledTimes(1);
+    // one setTimeout for the health check, one for the job
+    expect(deps.setTimeout).toHaveBeenCalledTimes(2);
     expect(deps.setTimeout).toHaveBeenCalledWith(expect.any(Function), 5000);
-    // fire the startup timer -> it runs once and arms the interval
-    const startupCb = (deps.setTimeout as ReturnType<typeof vi.fn>).mock.calls[0][0] as () => void;
-    startupCb();
+    // fire both startup timers
+    const calls = (deps.setTimeout as ReturnType<typeof vi.fn>).mock.calls;
+    for (const c of calls) (c[0] as () => void)();
     expect(deps.fetch).toHaveBeenCalledTimes(2); // health check + job
     expect(deps.setInterval).toHaveBeenCalledWith(expect.any(Function), 900000);
   });

@@ -170,10 +170,15 @@ export function startScheduler(config: SchedulerConfig, deps: SchedulerDeps): un
   }
 
   const handles: unknown[] = [];
+
+  // Single health check after startup delay, not per-job
+  deps.setTimeout(() => {
+    void schedulerHealthCheck(config, deps);
+  }, config.startupDelayMs);
+
   for (const job of config.jobs) {
     deps.log(`scheduling "${job.name}" every ${job.intervalMs}ms -> ${job.path}`);
     deps.setTimeout(() => {
-      void schedulerHealthCheck(config, deps);
       void runJob(job, config, deps);
       const handle = deps.setInterval(() => void runJob(job, config, deps), job.intervalMs);
       handles.push(handle);
