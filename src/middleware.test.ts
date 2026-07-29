@@ -135,3 +135,108 @@ describe("middleware auth protection", () => {
     expect(mocks.getToken).not.toHaveBeenCalled();
   });
 });
+
+describe("security headers", () => {
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    mocks.getToken.mockReset();
+  });
+
+  afterEach(() => {
+    clearAll();
+    resetAuthCaches();
+  });
+
+  it("injects security headers on disabled mode responses", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=31536000");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("injects security headers on basic auth success responses", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const res = await middleware(makeRequest("/board", {
+      Authorization: "Basic b3BlcmF0b3I6czNjcmV0",
+    }));
+
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=31536000");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("injects security headers on basic auth 401 responses", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=31536000");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("injects security headers on oidc authenticated responses", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    mocks.getToken.mockResolvedValue({ sub: "user-1" });
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=31536000");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("injects security headers on oidc redirect responses", async () => {
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    mocks.getToken.mockResolvedValue(null);
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.status).toBe(307);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=31536000");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("injects security headers on legacy mode responses", async () => {
+    // No DISPATCH_AUTH_MODE set — legacy mode
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=31536000");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("CSP allows inline scripts and styles for Next.js compatibility", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const res = await middleware(makeRequest("/board"));
+
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("'unsafe-inline'");
+  });
+});
