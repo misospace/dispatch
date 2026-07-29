@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { parseLaneClassification, classifyLaneByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
 import { authorizeRequest } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 interface LaneRequestBody {
   force?: boolean;
@@ -10,13 +11,19 @@ interface LaneRequestBody {
   classification?: Record<string, unknown>;
 }
 
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
+
 /**
  * POST /api/issues/[issueId]/lane — Classify or reclassify an issue's execution lane.
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`lane:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const params = await context.params;

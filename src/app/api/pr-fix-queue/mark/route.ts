@@ -3,12 +3,19 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`pr-fix-mark:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
+
   const auditActor = getAuthorizedActor(auth, request);
 
   try {

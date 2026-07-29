@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 /**
  * GitHub Webhook Handler for PR Follow-up Events
@@ -194,6 +195,10 @@ export async function POST(request: Request) {
     if (!auth.authorized) {
       return errorResponse("Unauthorized", 401);
     }
+
+    const limited = enforceRateLimit(`pr-followup-webhook:${auth.actor ?? "webhook"}`, { limit: 30, windowMs: 10_000 });
+    if (limited) return limited;
+
     const payload = Buffer.from(rawBody);
 
     // Webhook signature verification: fail-closed by default.
