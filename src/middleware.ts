@@ -5,6 +5,22 @@ import { safeEqual } from "@/lib/dispatch-env";
 
 type AuthMode = "basic" | "oidc" | "disabled" | undefined;
 
+// Security headers applied to all responses
+const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy":
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+};
+
+function applySecurityHeaders(response: NextResponse): void {
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
+    response.headers.set(key, value);
+  }
+}
+
 function getAuthMode(): AuthMode {
   const mode = process.env.DISPATCH_AUTH_MODE;
   if (mode === "basic" || mode === "oidc" || mode === "disabled") return mode;
@@ -80,12 +96,16 @@ export async function middleware(request: NextRequest) {
 
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
-    return NextResponse.next();
+    const response = NextResponse.next();
+    applySecurityHeaders(response);
+    return response;
   }
 
   if (authMode === "oidc") {
     if (isApiRoute) {
-      return NextResponse.next();
+      const response = NextResponse.next();
+      applySecurityHeaders(response);
+      return response;
     }
 
     const token = await getToken({
@@ -94,32 +114,44 @@ export async function middleware(request: NextRequest) {
       secureCookie: shouldUseSecureAuthCookie(request),
     });
     if (token) {
-      return NextResponse.next();
+      const response = NextResponse.next();
+      applySecurityHeaders(response);
+      return response;
     }
 
     const loginUrl = new URL("/login", request.url);
     loginUrl.searchParams.set("callbackUrl", request.nextUrl.pathname + request.nextUrl.search);
-    return NextResponse.redirect(loginUrl);
+    const redirectResponse = NextResponse.redirect(loginUrl);
+    applySecurityHeaders(redirectResponse);
+    return redirectResponse;
   }
 
   // No auth mode set (legacy) — no middleware enforcement; routes handle their own auth
   if (!authMode) {
-    return NextResponse.next();
+    const response = NextResponse.next();
+    applySecurityHeaders(response);
+    return response;
   }
 
   const authHeader = request.headers.get("authorization");
 
   if (isApiRoute && (isBearerAuthorized(authHeader) || isBasicAuthorized(authHeader))) {
-    return NextResponse.next();
+    const response = NextResponse.next();
+    applySecurityHeaders(response);
+    return response;
   }
 
   // "basic" mode — enforce Basic Auth on operator UI routes
   if (isBasicAuthorized(authHeader)) {
-    return NextResponse.next();
+    const response = NextResponse.next();
+    applySecurityHeaders(response);
+    return response;
   }
 
   // No valid Basic Auth header — reject
-  return unauthorizedResponse(request);
+  const unauthorizedResp = unauthorizedResponse(request);
+  applySecurityHeaders(unauthorizedResp);
+  return unauthorizedResp;
 }
 
 /**
