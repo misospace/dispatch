@@ -5,19 +5,11 @@ import "@testing-library/jest-dom/vitest";
 // Tests that need real DB access mock/override as needed.
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/dispatch_test";
 
-// Patch React.act for React 19 + @testing-library/react v16 compat.
-// React 19 removed React.act, but older react-dom/test-utils still calls it.
-const React = require("react");
-if (typeof React.act !== "function") {
-  Object.defineProperty(React, "act", {
-    value: function act(cb) {
-      return typeof cb === "function" ? cb() : cb;
-    },
-    writable: true,
-    configurable: true,
-    enumerable: false,
-  });
-}
+// React 19 + jsdom v30: IS_REACT_ACT_ENVIRONMENT must be set so React.act()
+// flushes synchronously. Without this, createRoot defers via MessageChannel
+// and @testing-library/react renders empty containers.
+// @testing-library/react v16 sets this in jest, but not always in vitest.
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const localStorageStore = new Map<string, string>();
 const localStorageMock = {
