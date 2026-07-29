@@ -1,3 +1,14 @@
+/**
+ * GitHub REST + GraphQL client wrapper.
+ *
+ * Size note: this file is intentionally kept as a single ~1000-line module
+ * rather than split by domain (auth / issues / CI / code-search). The split
+ * proposed in #618 was closed as declined by #655 after review showed the
+ * domain facades added no value beyond `export * from "./github"`. See the
+ * sibling facade files (`./github-auth`, `./github-ci`,
+ * `./github-code-search`, `./github-issues`) for the documented split points
+ * and #655 for the reconciliation decision.
+ */
 import { GitHubIssue } from "@/types";
 import type { CheckFailure, PrHealthInput } from "./linked-pr-health";
 
