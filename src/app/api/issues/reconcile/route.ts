@@ -14,6 +14,9 @@ import { isBacklogLane } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest } from "@/lib/auth";
 import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 /**
  * Reconcile issue state against PR state for all tracked repos.
@@ -28,9 +31,13 @@ import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
  * state current without relying on GitHub ProjectV2 columns.
  */
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`reconcile:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     let body: unknown;

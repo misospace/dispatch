@@ -4,6 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { fetchPullRequests, fetchLinkedPrHealthInput } from "@/lib/github";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth } from "@/lib/linked-pr-health";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 
 /**
  * POST /api/issues/[issueId]/pr-health/refresh
@@ -17,9 +20,13 @@ import { computeLinkedPrHealth, toPersistedLinkedPrHealth } from "@/lib/linked-p
  * open PR exists, any stale snapshot is cleared.
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`pr-health-refresh:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const { issueId } = await context.params;

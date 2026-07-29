@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { releaseStaleWork } from "@/lib/agent-work";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -135,9 +136,13 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`agent-work:${auth.actor}`, { limit: 30, windowMs: 10_000 });
+  if (limited) return limited;
 
   try {
     const body = await request.json();

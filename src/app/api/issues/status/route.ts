@@ -4,12 +4,18 @@ import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS, StatusLabel, isStatusLabel } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`status:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     let body: unknown;

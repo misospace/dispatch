@@ -5,6 +5,7 @@ import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 /**
  * PR Follow-up Sync Endpoint (Pull-based)
@@ -59,6 +60,9 @@ export async function POST(request: NextRequest) {
   if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`pr-followup-sync:${auth.actor}`, { limit: 10, windowMs: 60_000 });
+  if (limited) return limited;
 
   try {
     // Fail fast when no GitHub credentials are available. getGitHubToken
