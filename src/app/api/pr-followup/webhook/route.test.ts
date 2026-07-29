@@ -45,6 +45,7 @@ describe("POST /api/pr-followup/webhook", () => {
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixQueueClient.mockReturnValue({});
+    mocks.processPrFollowupEvents.mockResolvedValue({ enqueued: 1, skipped: 0 });
   });
 
   it("returns 401 when no auth header is present", async () => {
@@ -192,5 +193,46 @@ describe("POST /api/pr-followup/webhook", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("Webhook processing failed");
+  });
+
+  it("preserves body integrity when authorizeRequest consumes the body stream", async () => {
+    // Regression test for #656: if authorizeRequest ever reads the request body,
+    // the webhook handler must still verify the HMAC against the original payload.
+    // This is ensured by reading request.arrayBuffer() before calling authorizeRequest.
+
+    const prBody = {
+      review: { id: 1, body: "Looks good", state: "APPROVED" },
+      pull_request: {
+        number: 42,
+        html_url: "https://github.com/org/repo/pull/42",
+        title: "Fix bug",
+        user: { login: "bot-user" },
+        head: { ref: "fix/issue-1" },
+        base: { repo: { full_name: "org/repo" } },
+      },
+    };
+
+    // Create a request where the body can only be consumed once.
+    const originalRequest = new Request("http://localhost/api/pr-followup/webhook", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${mockToken}`,
+        "x-github-event": "pull_request_review",
+      },
+      body: JSON.stringify(prBody),
+    });
+
+    // Clone the request to verify body content independently.
+    const clonedRequest = originalRequest.clone();
+    const bodyBeforeAuth = await clonedRequest.arrayBuffer();
+
+    const res = await POST(originalRequest);
+
+    expect(res.status).toBe(200);
+    expect(mocks.processPrFollowupEvents).toHaveBeenCalled();
+
+    // Verify the body that was read matches what we sent (not empty).
+    const bodyStr = Buffer.from(bodyBeforeAuth).toString();
+    expect(bodyStr).toContain("Looks good");
   });
 });

@@ -109,6 +109,31 @@ export function schedulerConfigFromEnv(env: Record<string, string | undefined>):
   };
 }
 
+/**
+ * Startup health check: verify the scheduler can reach its own endpoints.
+ * Returns true on HTTP 200, false otherwise. Does not prevent the scheduler
+ * from running — provides visibility into misconfiguration without blocking
+ * periodic work.
+ */
+export async function schedulerHealthCheck(config: SchedulerConfig, deps: SchedulerDeps): Promise<boolean> {
+  try {
+    const res = await deps.fetch(`${config.baseUrl}/api/health`, {
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+      },
+    });
+    if (!res.ok) {
+      deps.log(`scheduler health check failed — HTTP ${res.status}`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    deps.log(`scheduler health check failed: ${msg}`, error);
+    return false;
+  }
+}
+
 /** Fire one job. Never throws — a transient failure must not kill the interval. */
 export async function runJob(job: ScheduledJob, config: SchedulerConfig, deps: SchedulerDeps): Promise<void> {
   try {
@@ -145,6 +170,12 @@ export function startScheduler(config: SchedulerConfig, deps: SchedulerDeps): un
   }
 
   const handles: unknown[] = [];
+
+  // Single health check after startup delay, not per-job
+  deps.setTimeout(() => {
+    void schedulerHealthCheck(config, deps);
+  }, config.startupDelayMs);
+
   for (const job of config.jobs) {
     deps.log(`scheduling "${job.name}" every ${job.intervalMs}ms -> ${job.path}`);
     deps.setTimeout(() => {
