@@ -68,6 +68,8 @@ model Issue {
   linkedPrHealthCheckedAt DateTime?
 
   @@unique([repositoryId, number])
+  @@index([currentLane])
+  @@index([currentLane, state])
   @@index([state])
   @@index([labels])
   @@index([linkedPrNeedsFollowup])
