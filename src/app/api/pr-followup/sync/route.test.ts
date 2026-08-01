@@ -13,6 +13,7 @@ const { mocks } = vi.hoisted(() => ({
     clearResolvedConflictItems: vi.fn().mockResolvedValue(undefined),
     getTrackedRepos: vi.fn().mockResolvedValue([]),
     isAllowedBotAuthor: vi.fn(() => false),
+    reconcileStalePrFixItems: vi.fn().mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 }),
   },
 }));
 
@@ -33,6 +34,10 @@ vi.mock("@/lib/config", () => ({
   getTrackedRepos: mocks.getTrackedRepos,
 }));
 
+vi.mock("@/lib/pr-fix-queue", () => ({
+  reconcileStalePrFixItems: mocks.reconcileStalePrFixItems,
+}));
+
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 
@@ -50,6 +55,7 @@ describe("POST /api/pr-followup/sync", () => {
     vi.clearAllMocks();
     mocks.prFixQueueClient.mockReturnValue({});
     mocks.getTrackedRepos.mockResolvedValue([]);
+    mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
   });
 
   it("returns 401 when no auth header is present", async () => {
@@ -194,6 +200,32 @@ describe("POST /api/pr-followup/sync", () => {
     expect(res.status).toBe(200);
     expect(mocks.ingestMergeConflict).not.toHaveBeenCalled();
     expect(mocks.clearResolvedConflictItems).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("calls reconcileStalePrFixItems during sync to reap stale queue items", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+    mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 5, markedStale: 3, errored: 0 });
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([]);
+      }
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.staleReaped).toBe(3);
+    expect(mocks.reconcileStalePrFixItems).toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });

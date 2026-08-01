@@ -191,7 +191,42 @@ describe("reconcileStalePrFixItems", () => {
     expect(byId.get(568)?.status).toBe("STALE");
   });
 
-  it("does not touch items already in non-QUEUED status", async () => {
+  it("marks BLOCKED items stale when the upstream PR is merged/closed", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 580,
+      lane: "NEEDS_HUMAN",
+      reason: "needs human",
+      feedback: "f",
+      evidenceKey: "k1",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 581,
+      lane: "NEEDS_HUMAN",
+      reason: "needs human",
+      feedback: "f",
+      evidenceKey: "k2",
+    });
+
+    const mergedOrClosed = new Map<string, Set<number>>([
+      ["misospace/miso-chat", new Set([580])],
+    ]);
+    const states = new Map<string, Map<number, "merged" | "closed">>([
+      ["misospace/miso-chat", new Map([[580, "merged"]])],
+    ]);
+
+    const result = await reconcileStalePrFixItems(client, mergedOrClosed, states);
+    expect(result.checked).toBe(1);
+    expect(result.markedStale).toBe(1);
+
+    const byId = new Map(client.items.map((i) => [i.pr, i]));
+    expect(byId.get(580)?.status).toBe("STALE");
+    expect(byId.get(581)?.status).toBe("BLOCKED"); // not in merged/closed set
+  });
+
+  it("does not touch items already in terminal status", async () => {
     const client = makeClient();
     await enqueuePrFixItem(client, {
       repo: "misospace/miso-chat",

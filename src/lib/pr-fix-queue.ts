@@ -225,15 +225,15 @@ export async function reconcileStalePrFixItems(
 
   for (const [repo, prNumbers] of mergedOrClosedPrsByRepo) {
     if (prNumbers.size === 0) continue;
-    const queued = await client.prFixQueueItem.findMany({
+    const staleCandidates = await client.prFixQueueItem.findMany({
       where: {
         repo,
         pr: { in: Array.from(prNumbers) },
-        status: "QUEUED",
+        status: { in: ["QUEUED", "BLOCKED"] },
       },
     });
-    checked += queued.length;
-    for (const item of queued) {
+    checked += staleCandidates.length;
+    for (const item of staleCandidates) {
       try {
         const state = prStateByRepo.get(repo)?.get(item.pr) ?? "merged";
         await client.$transaction(async (tx) => {
