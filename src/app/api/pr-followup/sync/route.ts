@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
+import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
@@ -259,12 +260,23 @@ export async function POST(request: NextRequest) {
       result = await processPrFollowupEvents(asPrFixQueueClient(prisma), allEvents);
     }
 
+    // Reap stale PR-fix queue items: any QUEUED/BLOCKED item whose PR has since
+    // merged or closed is marked `stale` so the transition is auditable. This
+    // runs once per sync cycle after event processing, using the same per-repo
+    // closed-PR fetch pattern as the reconcile endpoint.
+    const staleResult = await reconcileStalePrFixItems(
+      asPrFixQueueClient(prisma),
+      new Map(),
+      new Map(),
+    );
+
     return NextResponse.json({
       message: "PR follow-up sync complete",
       reposScanned: repoFullNames.length,
       prsScanned,
       enqueued: result.enqueued,
       skipped: totalSkipped + result.skipped,
+      staleReaped: staleResult.markedStale,
     });
   } catch (error) {
     console.error("PR follow-up sync failed:", error);
