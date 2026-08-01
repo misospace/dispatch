@@ -4,7 +4,7 @@ import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
-import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
+import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -264,10 +264,23 @@ export async function POST(request: NextRequest) {
     // merged or closed is marked `stale` so the transition is auditable. This
     // runs once per sync cycle after event processing, using the same per-repo
     // closed-PR fetch pattern as the reconcile endpoint.
+    const mergedOrClosedPrsByRepo = new Map<string, Set<number>>();
+    const prStatesByRepo = new Map<string, Map<number, "merged" | "closed">>();
+    for (const repoFullName of repoFullNames) {
+      const closedPrs = await fetchClosedPullRequests(repoFullName, 30);
+      if (closedPrs.length > 0) {
+        mergedOrClosedPrsByRepo.set(repoFullName, new Set(closedPrs.map((pr) => pr.number)));
+        const statesMap = new Map<number, "merged" | "closed">();
+        for (const pr of closedPrs) {
+          statesMap.set(pr.number, pr.merged_at != null ? "merged" : "closed");
+        }
+        prStatesByRepo.set(repoFullName, statesMap);
+      }
+    }
     const staleResult = await reconcileStalePrFixItems(
       asPrFixQueueClient(prisma),
-      new Map(),
-      new Map(),
+      mergedOrClosedPrsByRepo,
+      prStatesByRepo,
     );
 
     return NextResponse.json({
