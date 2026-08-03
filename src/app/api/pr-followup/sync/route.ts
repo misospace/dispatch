@@ -84,6 +84,8 @@ export async function POST(request: NextRequest) {
     let totalEnqueued = 0;
     let totalSkipped = 0;
     let prsScanned = 0;
+    let reposFailed = 0;
+    let rateLimited = false;
     const allEvents: any[] = [];
 
     for (const repoFullName of repoFullNames) {
@@ -93,7 +95,14 @@ export async function POST(request: NextRequest) {
       let allPrs: GithubPR[] = [];
       try {
         allPrs = (await fetchPullRequests(repoFullName)) as GithubPR[];
-      } catch (error) {
+      } catch (error: any) {
+        reposFailed++;
+        const isRateLimit = error.response?.status === 403 || (error.message ?? "").includes("Rate limit");
+        if (isRateLimit) {
+          console.warn(`[pr-followup] Rate limited on ${repoFullName}. Skipping remaining repos.`);
+          rateLimited = true;
+          break;
+        }
         console.error(`Failed to fetch PRs for ${repoFullName}:`, error);
         continue;
       }
@@ -267,14 +276,25 @@ export async function POST(request: NextRequest) {
     const mergedOrClosedPrsByRepo = new Map<string, Set<number>>();
     const prStatesByRepo = new Map<string, Map<number, "merged" | "closed">>();
     for (const repoFullName of repoFullNames) {
-      const closedPrs = await fetchClosedPullRequests(repoFullName, 30);
-      if (closedPrs.length > 0) {
-        mergedOrClosedPrsByRepo.set(repoFullName, new Set(closedPrs.map((pr) => pr.number)));
-        const statesMap = new Map<number, "merged" | "closed">();
-        for (const pr of closedPrs) {
-          statesMap.set(pr.number, pr.merged_at != null ? "merged" : "closed");
+      if (rateLimited) break;
+      try {
+        const closedPrs = await fetchClosedPullRequests(repoFullName, 30);
+        if (closedPrs.length > 0) {
+          mergedOrClosedPrsByRepo.set(repoFullName, new Set(closedPrs.map((pr) => pr.number)));
+          const statesMap = new Map<number, "merged" | "closed">();
+          for (const pr of closedPrs) {
+            statesMap.set(pr.number, pr.merged_at != null ? "merged" : "closed");
+          }
+          prStatesByRepo.set(repoFullName, statesMap);
         }
-        prStatesByRepo.set(repoFullName, statesMap);
+      } catch (error: any) {
+        const isRateLimit = error.response?.status === 403 || (error.message ?? "").includes("Rate limit");
+        if (isRateLimit && !rateLimited) {
+          console.warn(`[pr-followup] Rate limited while fetching closed PRs for ${repoFullName}. Skipping remaining.`);
+          rateLimited = true;
+          break;
+        }
+        console.error(`Failed to fetch closed PRs for ${repoFullName}:`, error);
       }
     }
     const staleResult = await reconcileStalePrFixItems(
@@ -283,13 +303,22 @@ export async function POST(request: NextRequest) {
       prStatesByRepo,
     );
 
+    if (reposFailed > 0) {
+      console.warn(
+        `[pr-followup] Sync completed with ${reposFailed} repo failure(s). ` +
+        `${rateLimited ? "Rate limited — some repos were skipped." : ""}`,
+      );
+    }
+
     return NextResponse.json({
       message: "PR follow-up sync complete",
-      reposScanned: repoFullNames.length,
+      reposScanned: repoFullNames.length - reposFailed,
+      reposFailed,
       prsScanned,
       enqueued: result.enqueued,
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
+      rateLimited,
     });
   } catch (error) {
     console.error("PR follow-up sync failed:", error);

@@ -229,4 +229,116 @@ describe("POST /api/pr-followup/sync", () => {
 
     vi.unstubAllGlobals();
   });
+
+  it("includes reposFailed in response when a repo fetch fails (non-rate-limit)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix", "misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        // First repo fails with a generic error
+        if (u.includes("KubeTix")) throw new Error("network error");
+        return jsonRes([]);
+      }
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.reposFailed).toBe(1);
+    expect(body.reposScanned).toBe(1);
+    expect(body.rateLimited).toBe(false);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("stops fetching remaining repos on rate limit and sets rateLimited flag", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix", "misospace/windowstead", "misospace/other"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        // First repo succeeds, second hits rate limit
+        if (u.includes("KubeTix")) return jsonRes([]);
+        if (u.includes("windowstead")) {
+          const err: any = new Error("Rate limit exceeded");
+          err.response = { status: 403 };
+          throw err;
+        }
+        // This should never be called because we break on rate limit
+        return jsonRes([]);
+      }
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.reposFailed).toBe(1);
+    expect(body.rateLimited).toBe(true);
+
+    // "other" should never have been fetched
+    expect(fetchMock.mock.calls.some((call: [string]) => call[0].includes("other"))).toBe(false);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("stops fetching remaining repos on rate limit detected via error message", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix", "misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        if (u.includes("KubeTix")) return jsonRes([]);
+        throw new Error("Rate limit exceeded for installation");
+      }
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.reposFailed).toBe(1);
+    expect(body.rateLimited).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("reports reposFailed=0 and rateLimited=false on successful sync", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.reposFailed).toBe(0);
+    expect(body.rateLimited).toBe(false);
+    expect(body.reposScanned).toBe(1);
+
+    vi.unstubAllGlobals();
+  });
 });
