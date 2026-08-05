@@ -45,9 +45,9 @@ describe("schedulerConfigFromEnv", () => {
     expect(schedulerConfigFromEnv({ PORT: "" }).baseUrl).toBe("http://127.0.0.1:3000");
   });
 
-  it("configures sync + groomer + pr-followup + prune-closed with defaults", () => {
+  it("configures sync + groomer + pr-followup + prune-closed + reconcile with defaults", () => {
     const jobs = schedulerConfigFromEnv({}).jobs;
-    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "prune-closed"]);
+    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "prune-closed", "reconcile"]);
     const byName = (n: string) => jobs.find((j) => j.name === n)!;
     expect(byName("groomer").path).toBe("/api/groomer/run");
     expect(byName("groomer").intervalMs).toBe(10 * 60 * 1000);
@@ -55,6 +55,13 @@ describe("schedulerConfigFromEnv", () => {
     expect(byName("pr-followup").intervalMs).toBe(15 * 60 * 1000);
     expect(byName("prune-closed").path).toBe("/api/issues/prune-closed");
     expect(byName("prune-closed").intervalMs).toBe(24 * 60 * 60 * 1000);
+    expect(byName("reconcile").path).toBe("/api/issues/reconcile");
+    expect(byName("reconcile").intervalMs).toBe(30 * 60 * 1000);
+  });
+
+  it("disables reconcile when DISPATCH_RECONCILE_INTERVAL_MS is 0", () => {
+    const jobs = schedulerConfigFromEnv({ DISPATCH_RECONCILE_INTERVAL_MS: "0" }).jobs;
+    expect(jobs.map((j) => j.name)).not.toContain("reconcile");
   });
 
   it("disables an individual job when its interval env is 0", () => {
