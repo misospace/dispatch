@@ -776,29 +776,67 @@ export function jobIdFromCheckRunUrl(url: string | undefined | null): string | n
 }
 
 /**
+ * High-signal test-runner failure markers, in the form the runners actually emit.
+ *
+ * These beat a generic error scan because they name the failing test and carry the
+ * assertion. Deliberately case-sensitive: runners emit uppercase tokens, while
+ * lowercase "failure" appears constantly in benign diagnostic output (a kubectl
+ * probe spec reads `#failure=6`).
+ */
+const TEST_FAILURE_RE = /(^|\s)(FAILED\s+\S|--- FAIL:|FAIL\s+\S+\s|short test summary info|=+ FAILURES =+|AssertionError|Traceback \(most recent call last\))/;
+
+/**
  * Extract the failure-relevant slice of a GitHub Actions job log.
  *
  * Raw job logs are large and end in cleanup/"Post" noise, so a naive tail misses
- * the actual error. This strips the per-line ISO timestamp prefix, finds the last
- * error marker (`##[error]`, `::error::`, `ERROR:`, Godot's `SCRIPT ERROR`,
- * asserts, tracebacks, non-zero exit), and returns a bounded window around it.
- * Falls back to the last lines before the job-cleanup noise when no marker
- * matches. Pure + exported so it can be unit-tested without the network.
+ * the actual error. This strips the per-line ISO timestamp prefix and anchors on
+ * the most informative failure it can find, returning a bounded window around it.
+ *
+ * Anchor order matters. A workflow whose failure path runs an `if: failure()`
+ * diagnostics step (kubectl describe/logs, helm status) emits hundreds of lines
+ * AFTER the real failure, and that dump both trips a generic error scan and
+ * usually exits non-zero itself. Anchoring on the last error marker therefore
+ * returned a pod spec instead of the test failures — observed on KubeTix#315,
+ * where the pr-fix loop burned all three attempts reasoning from probe config
+ * while `FAILED test_15 ... assert 429 == 401` sat just outside the window.
+ *
+ * So: prefer the FIRST test-runner failure marker (the causal one, and it precedes
+ * any diagnostics dump), then fall back to the LAST generic error marker, then to
+ * the tail before cleanup noise. Pure + exported so it can be unit-tested without
+ * the network.
  */
 export function extractLogExcerpt(rawLog: string, maxChars = 6000): string {
   if (!rawLog.trim()) return "";
   const stripTs = (l: string) => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, "");
   const lines = rawLog.split("\n").map(stripTs);
-  const errRe = /##\[error\]|::error::|\bERROR:|SCRIPT ERROR|AssertionError|Traceback|\bFAIL(ED|URE)?\b|exit code [1-9]|\berror:/i;
+  // Generic fallback markers. FAIL tokens are case-sensitive here for the same
+  // reason as TEST_FAILURE_RE; ERROR:/error: stay loose since they are usually real.
+  const errRe = /##\[error\]|::error::|\bERROR:|SCRIPT ERROR|AssertionError|Traceback|\bFAIL(ED|URE)?\b|exit code [1-9]|\berror:/;
 
-  let lastHit = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (errRe.test(lines[i])) { lastHit = i; break; }
+  let anchor = -1;
+  let trailing = 15;
+  for (let i = 0; i < lines.length; i++) {
+    if (TEST_FAILURE_RE.test(lines[i])) { anchor = i; break; }
+  }
+  const testAnchored = anchor >= 0;
+  if (anchor >= 0) {
+    // Test failures are followed by the summary block naming every failing test,
+    // so weight the window forward rather than backward — but stop at the next
+    // step boundary. An `if: failure()` diagnostics step is a NEW group, and its
+    // kubectl/helm dump is exactly the noise this anchoring exists to avoid.
+    trailing = 80;
+    for (let i = anchor + 1; i < Math.min(lines.length, anchor + trailing); i++) {
+      if (/##\[group\]/.test(lines[i])) { trailing = i - anchor; break; }
+    }
+  } else {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (errRe.test(lines[i])) { anchor = i; break; }
+    }
   }
 
   let slice: string[];
-  if (lastHit >= 0) {
-    slice = lines.slice(Math.max(0, lastHit - 80), Math.min(lines.length, lastHit + 15));
+  if (anchor >= 0) {
+    slice = lines.slice(Math.max(0, anchor - 40), Math.min(lines.length, anchor + trailing));
   } else {
     const noiseRe = /^(Post |Cleaning up orphan|Complete job|Removing |\[command\])/;
     let end = lines.length;
@@ -807,7 +845,20 @@ export function extractLogExcerpt(rawLog: string, maxChars = 6000): string {
   }
 
   let excerpt = slice.join("\n").trim();
-  if (excerpt.length > maxChars) excerpt = "…\n" + excerpt.slice(excerpt.length - maxChars);
+  if (excerpt.length > maxChars) {
+    if (testAnchored) {
+      // Keep BOTH ends. The causal failure and its traceback open the region,
+      // and the runner's summary block — which names every failing test and its
+      // assertion — closes it. Trimming either end loses something a fixer needs:
+      // tail-only drops the traceback, head-only drops the summary.
+      const head = Math.floor(maxChars * 0.4);
+      const tail = maxChars - head;
+      excerpt = excerpt.slice(0, head) + "\n…\n" + excerpt.slice(excerpt.length - tail);
+    } else {
+      // Anchored on the last error marker: the error sits at the window's end.
+      excerpt = "…\n" + excerpt.slice(excerpt.length - maxChars);
+    }
+  }
   return excerpt;
 }
 
