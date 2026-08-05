@@ -73,6 +73,7 @@ export async function fetchAgentQueueData(
       select: {
         id: true,
         number: true,
+        createdAt: true,
         title: true,
         url: true,
         labels: true,

@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { buildAgentQueue, isRenovateIssue } from "./agent-queue";
+import { buildAgentQueue, isRenovateIssue, issueAgeDays } from "./agent-queue";
 import { setLaneConfig, resetLaneConfig } from "./lane-config";
 
 const makeIssue = (overrides: Partial<{ number: number; title: string; url: string; labels: string[]; lane?: string }> = {}) => ({
@@ -985,5 +985,123 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
       expect(result).toHaveLength(3);
       expect(result.map((i) => i.number)).toEqual([2, 1, 3]); // p0 frontier, p1 local, p2 local
     });
+  });
+});
+
+
+// ─── Anti-starvation aging ──────────────────────────────────────────────────
+
+const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
+
+// Age-carrying issue builder; the base makeIssue has no createdAt.
+const agedIssue = (number: number, labels: string[], ageDays: number) => ({
+  number,
+  title: `issue ${number}`,
+  url: `https://github.com/test/repo/issues/${number}`,
+  labels,
+  createdAt: daysAgo(ageDays),
+});
+
+describe("issueAgeDays", () => {
+  it("counts whole days and floors at zero", () => {
+    expect(issueAgeDays(daysAgo(20))).toBe(20);
+    expect(issueAgeDays(daysAgo(0))).toBe(0);
+    expect(issueAgeDays(new Date(Date.now() + 86_400_000))).toBe(0);
+  });
+
+  it("returns 0 for missing or invalid dates", () => {
+    expect(issueAgeDays(null)).toBe(0);
+    expect(issueAgeDays(undefined)).toBe(0);
+    expect(issueAgeDays("not-a-date")).toBe(0);
+  });
+
+  it("accepts ISO strings", () => {
+    expect(issueAgeDays(daysAgo(9).toISOString())).toBe(9);
+  });
+});
+
+describe("buildAgentQueue — aging", () => {
+  afterEach(() => {
+    delete process.env.DISPATCH_QUEUE_AGING_DAYS_PER_TIER;
+    delete process.env.DISPATCH_QUEUE_AGING_MAX_TIERS;
+  });
+
+  it("promotes a long-waiting p2 above a fresh p1 (the #620 case)", () => {
+    const q = buildAgentQueue(
+      [
+        agedIssue(1, ["priority/p1", "status/ready"], 0),
+        agedIssue(620, ["priority/p2", "status/ready"], 20),
+      ],
+      "worker",
+    );
+    expect(q[0].number).toBe(620);
+    expect(q[0].rankingReason).toContain("aged 20d (+1 tier)");
+  });
+
+  it("never lets an aged issue outrank a genuine p0", () => {
+    const q = buildAgentQueue(
+      [
+        agedIssue(620, ["priority/p2", "status/ready"], 400),
+        agedIssue(1, ["priority/p0", "status/ready"], 0),
+      ],
+      "worker",
+    );
+    expect(q[0].number).toBe(1);
+    expect(q[0].priority).toBe("priority/p0");
+  });
+
+  it("caps the promotion at DISPATCH_QUEUE_AGING_MAX_TIERS", () => {
+    // 400 days would earn 57 tiers uncapped; p3 may climb to p1 at best.
+    const q = buildAgentQueue([agedIssue(9, ["priority/p3", "status/ready"], 400)], "worker");
+    expect(q[0].rankingReason).toContain("+2 tiers");
+  });
+
+  it("does not age p0/p1 (already at or above the aged ceiling)", () => {
+    const q = buildAgentQueue(
+      [
+        agedIssue(1, ["priority/p0", "status/ready"], 90),
+        agedIssue(2, ["priority/p1", "status/ready"], 90),
+      ],
+      "worker",
+    );
+    expect(q[0].rankingReason).not.toContain("aged");
+    expect(q[1].rankingReason).not.toContain("aged");
+  });
+
+  it("breaks ties within a tier oldest-first", () => {
+    const q = buildAgentQueue(
+      [
+        agedIssue(10, ["priority/p1", "status/ready"], 1),
+        agedIssue(11, ["priority/p1", "status/ready"], 30),
+        agedIssue(12, ["priority/p1", "status/ready"], 5),
+      ],
+      "worker",
+    );
+    expect(q.map((i) => i.number)).toEqual([11, 12, 10]);
+  });
+
+  it("restores strict priority ordering when aging is disabled", () => {
+    process.env.DISPATCH_QUEUE_AGING_MAX_TIERS = "0";
+    const q = buildAgentQueue(
+      [
+        agedIssue(620, ["priority/p2", "status/ready"], 400),
+        agedIssue(1, ["priority/p1", "status/ready"], 0),
+      ],
+      "worker",
+    );
+    expect(q[0].number).toBe(1);
+    expect(q[0].rankingReason).not.toContain("aged");
+  });
+
+  it("honours a custom days-per-tier", () => {
+    process.env.DISPATCH_QUEUE_AGING_DAYS_PER_TIER = "30";
+    const q = buildAgentQueue([agedIssue(620, ["priority/p2", "status/ready"], 20)], "worker");
+    // 20 days < 30 -> no tier earned yet
+    expect(q[0].rankingReason).not.toContain("aged");
+  });
+
+  it("leaves issues without createdAt unaged", () => {
+    const q = buildAgentQueue([makeIssue({ labels: ["priority/p2", "status/ready"] })], "worker");
+    expect(q[0].rankingReason).not.toContain("aged");
   });
 });
