@@ -9,6 +9,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "audit": "npm audit --omit=dev --audit-level=high",
     "lint": "NODE_ENV=development eslint .",
     "test": "NODE_ENV=development vitest run",
     "test:watch": "NODE_ENV=development vitest",
