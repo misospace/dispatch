@@ -3,6 +3,7 @@ import { GithubPR, closeIssue as githubCloseIssue, addIssueLabel as githubAddIss
 import { getDefaultClaimableLane, isBacklogLane, resolveLaneId } from "@/lib/lane-config";
 import { classifyLaneByHeuristics } from "@/lib/issue-lane";
 import { LinkedPrHealth } from "@/lib/linked-pr-health";
+import { transitionIssueStatus } from "@/lib/issue-status";
 
 // ─── Lane Classification Helpers ──────────────────────────────────────────────
 
@@ -173,7 +174,7 @@ export function checkPrHealth(pr: GithubPR, health: LinkedPrHealth | null): PrHe
  * A single reconciliation action to apply to an issue.
  */
 export interface ReconciliationAction {
-  type: "close_issue" | "add_label" | "remove_label";
+  type: "close_issue" | "add_label" | "remove_label" | "set_status";
   issueNumber: number;
   repoFullName: string;
   label?: string;
@@ -265,15 +266,19 @@ export function reconcileIssue(
       const health = checkPrHealth(matchingOpenPr, linkedHealth);
       openPrNeedsWork = health.status === "needs_work";
 
-      // If PR needs work, ensure issue is in a lane where workers can pick it up
-      if (openPrNeedsWork) {
-        // Check if issue has status/in-progress or status/done labels
-        const hasInProgress = issue.labels.includes("status/in-progress");
-        const hasDone = issue.labels.includes("status/done");
+      const hasInProgress = issue.labels.includes("status/in-progress");
+      const hasDone = issue.labels.includes("status/done");
+      const hasInReview = issue.labels.includes("status/in-review");
 
-        if (!hasInProgress && !hasDone) {
+      // If PR needs work, ensure issue is in a lane where workers can pick it up.
+      // in-review counts as already-placed: adding in-progress on top of it left
+      // issues carrying two status labels, and an in-progress issue with no live
+      // Workload is what the bridge's stranded reconciler resets to ready — which
+      // re-dispatches and force-pushes over the open PR's branch.
+      if (openPrNeedsWork) {
+        if (!hasInProgress && !hasDone && !hasInReview) {
           actions.push({
-            type: "add_label",
+            type: "set_status",
             issueNumber: issue.number,
             repoFullName: "",
             label: "status/in-progress",
@@ -284,13 +289,9 @@ export function reconcileIssue(
 
       // If PR is healthy and not already in review/done, mark as in-review
       if (!openPrNeedsWork) {
-        const hasInProgress = issue.labels.includes("status/in-progress");
-        const hasDone = issue.labels.includes("status/done");
-        const hasInReview = issue.labels.includes("status/in-review");
-
         if (!hasInProgress && !hasDone && !hasInReview) {
           actions.push({
-            type: "add_label",
+            type: "set_status",
             issueNumber: issue.number,
             repoFullName: "",
             label: "status/in-review",
@@ -298,6 +299,23 @@ export function reconcileIssue(
           });
         }
       }
+    } else if (issue.labels.includes("status/in-review")) {
+      // in-review means a PR existed. No open PR and no merged fixing PR means it
+      // is gone (closed unmerged, or emptied and autoclosed by a force-push over
+      // the branch) and nothing will ever advance this issue: it is claimed, so
+      // the queue skips it, and no Workload backs it. Release it to ready.
+      //
+      // Deliberately scoped to in-review only. in-progress is NOT reaped here:
+      // a running Workload that has not opened its PR yet looks identical from
+      // GitHub, and resetting it would double-dispatch. Only the bridge can see
+      // Workloads, so in-progress staleness stays its job.
+      actions.push({
+        type: "set_status",
+        issueNumber: issue.number,
+        repoFullName: "",
+        label: "status/ready",
+        reason: "in-review but no open or merged PR — releasing to ready",
+      });
     }
   }
 
@@ -408,6 +426,24 @@ export async function executeAction(
         if (label && currentLabels.includes(label)) {
           await retryWithBackoff(() => githubRemoveIssueLabel(action.repoFullName, action.issueNumber, label), maxRetries);
           result.afterLabels = currentLabels.filter((l) => l !== label);
+          result.success = true;
+        } else {
+          result.success = true;
+        }
+        break;
+      }
+
+      case "set_status": {
+        // Swap, never add: transitionIssueStatus strips every existing status/*
+        // label before applying the target, so an issue can only ever carry one.
+        // This is the same helper claim/groom/move/unclaim and /api/issues/status
+        // use, so reconcile can no longer diverge from them.
+        const label = action.label;
+        if (label && !(currentLabels.includes(label) && currentLabels.filter((l) => l.startsWith("status/")).length === 1)) {
+          result.afterLabels = await retryWithBackoff(
+            () => transitionIssueStatus(action.repoFullName, action.issueNumber, currentLabels, label),
+            maxRetries,
+          );
           result.success = true;
         } else {
           result.success = true;

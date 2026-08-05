@@ -522,6 +522,97 @@ describe("reconcileIssue", () => {
 
     expect(result.openPrNeedsWork).toBe(false);
   });
+
+  // An in-review issue whose PR started failing used to get status/in-progress
+  // ADDED on top, leaving two status labels. An in-progress issue with no live
+  // Workload is what the bridge's stranded reconciler resets to ready, which
+  // re-dispatches and force-pushes over the open PR's branch.
+  it("does not stack in-progress onto an in-review issue when the PR needs work", () => {
+    const openPrs = new Map([[42, makeOpenPr()]]);
+    const openPrHealth = new Map([[42, computeLinkedPrHealth({
+      url: "https://github.com/test/repo/pull/42",
+      number: 42,
+      state: "open",
+      draft: false,
+      mergedAt: null,
+      mergeStateStatus: "clean",
+      reviewDecision: null,
+      checkFailures: [{ name: "ci/test", conclusion: "failure" }],
+    })]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: ["status/in-review"], state: "open" },
+      new Map(),
+      openPrs,
+      openPrHealth,
+    );
+
+    expect(result.openPrNeedsWork).toBe(true);
+    expect(result.actions).toEqual([]);
+  });
+
+  it("emits set_status (a swap), never add_label, for status transitions", () => {
+    const openPrs = new Map([[42, makeOpenPr()]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: ["status/ready"], state: "open" },
+      new Map(),
+      openPrs,
+    );
+
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]?.type).toBe("set_status");
+    expect(result.actions[0]?.label).toBe("status/in-review");
+  });
+
+  it("releases an in-review issue to ready when no open or merged PR exists", () => {
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: ["status/in-review"], state: "open" },
+      new Map(),
+      new Map(),
+    );
+
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]?.type).toBe("set_status");
+    expect(result.actions[0]?.label).toBe("status/ready");
+  });
+
+  it("does not release an in-review issue whose fixing PR merged", () => {
+    const mergedPrs = new Map([[42, makeOpenPr({ state: "closed", merged_at: "2026-01-03T00:00:00Z" })]]);
+
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: ["status/in-review"], state: "open" },
+      mergedPrs,
+      new Map(),
+    );
+
+    // Merged wins: the issue is closed, not recycled back into the queue.
+    expect(result.actions[0]?.type).toBe("close_issue");
+    expect(result.actions.some((a) => a.label === "status/ready")).toBe(false);
+  });
+
+  // in-progress is the bridge's to reap: a running Workload that has not opened
+  // its PR yet is indistinguishable from a stranded one via the GitHub API, so
+  // resetting here would double-dispatch live work.
+  it("leaves an in-progress issue with no PR alone", () => {
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: ["status/in-progress"], state: "open" },
+      new Map(),
+      new Map(),
+    );
+
+    expect(result.actions).toEqual([]);
+  });
+
+  it("leaves a ready issue with no PR alone", () => {
+    const result = reconcileIssue(
+      { number: 42, title: "Bug fix", body: null, labels: ["status/ready"], state: "open" },
+      new Map(),
+      new Map(),
+    );
+
+    expect(result.actions).toEqual([]);
+  });
 });
 
 describe("executeAction", () => {
