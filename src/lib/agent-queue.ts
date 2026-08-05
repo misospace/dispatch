@@ -49,10 +49,63 @@ export interface RankedIssue {
   linkedPrHealth?: QueueLinkedPrHealth | null;
 }
 
+// ─── Anti-starvation aging ──────────────────────────────────────────────────
+
+/**
+ * Queue order is strictly priority-first, so low-priority work starves whenever
+ * higher-priority work arrives faster than the fleet drains it — which is the
+ * steady state when a weekly audit files p0/p1 findings into a queue served at
+ * MAX_IN_PROGRESS concurrency. Observed: misospace/dispatch#620 (p2) sat
+ * unclaimed for 20 days at rank 20 of 26, overtaken indefinitely.
+ *
+ * Aging promotes an issue one effective priority tier per
+ * DISPATCH_QUEUE_AGING_DAYS_PER_TIER days of waiting, capped at
+ * DISPATCH_QUEUE_AGING_MAX_TIERS. Set the cap to 0 to disable aging entirely
+ * and restore strict priority ordering.
+ */
+const DEFAULT_AGING_DAYS_PER_TIER = 7;
+const DEFAULT_AGING_MAX_TIERS = 2;
+
+function agingConfig(): { daysPerTier: number; maxTiers: number } {
+  const days = Number(process.env.DISPATCH_QUEUE_AGING_DAYS_PER_TIER);
+  const tiers = Number(process.env.DISPATCH_QUEUE_AGING_MAX_TIERS);
+  return {
+    daysPerTier: Number.isFinite(days) && days > 0 ? days : DEFAULT_AGING_DAYS_PER_TIER,
+    maxTiers: Number.isFinite(tiers) && tiers >= 0 ? tiers : DEFAULT_AGING_MAX_TIERS,
+  };
+}
+
+/** Whole days between `createdAt` and now; 0 when the date is absent or invalid. */
+export function issueAgeDays(createdAt: Date | string | null | undefined, now = new Date()): number {
+  if (!createdAt) return 0;
+  const created = createdAt instanceof Date ? createdAt : new Date(createdAt);
+  const ms = created.getTime();
+  if (!Number.isFinite(ms)) return 0;
+  const days = Math.floor((now.getTime() - ms) / 86_400_000);
+  return days > 0 ? days : 0;
+}
+
+/**
+ * Effective priority tier after aging. A genuine p0 always sorts first and an
+ * aged issue can climb no higher than p1, so aging reorders the tail without
+ * ever letting a stale chore preempt a critical bug.
+ */
+function agedPriorityScore(priorityScore: number, ageDays: number): { score: number; tiers: number } {
+  const { daysPerTier, maxTiers } = agingConfig();
+  if (maxTiers === 0 || priorityScore <= 1) return { score: priorityScore, tiers: 0 };
+  const earned = Math.min(Math.floor(ageDays / daysPerTier), maxTiers);
+  const aged = Math.max(1, priorityScore - earned);
+  return { score: aged, tiers: priorityScore - aged };
+}
+
 /**
  * Score an issue for a given agent. Lower score = higher priority.
  */
-function rankIssue(issueLabels: string[], agentName: string): { score: number; reason: string } {
+function rankIssue(
+  issueLabels: string[],
+  agentName: string,
+  ageDays = 0,
+): { score: number; reason: string } {
   const status = getStatusFromLabels(issueLabels);
   const agentLabel = getAgentFromLabels(issueLabels);
   const priority = getPriorityFromLabels(issueLabels);
@@ -98,7 +151,13 @@ function rankIssue(issueLabels: string[], agentName: string): { score: number; r
     parts.push("no-status");
   }
 
-  const score = priorityScore * 100 + agentScore * 10 + statusScore;
+  // Aging promotes long-waiting issues so the tail cannot starve (see above).
+  const { score: effectivePriority, tiers } = agedPriorityScore(priorityScore, ageDays);
+  if (tiers > 0) {
+    parts.push(`aged ${ageDays}d (+${tiers} tier${tiers === 1 ? "" : "s"})`);
+  }
+
+  const score = effectivePriority * 100 + agentScore * 10 + statusScore;
   return { score, reason: parts.join(", ") };
 }
 
@@ -158,6 +217,7 @@ export function buildAgentQueue(
     issueId?: string;
     repoFullName?: string;
     linkedPrHealth?: QueueLinkedPrHealth | null;
+    createdAt?: Date | string | null;
   }>,
   agentName: string,
   options?: {
@@ -232,13 +292,17 @@ export function buildAgentQueue(
       : actionable;
 
   // Rank the remaining issues (done issues were already excluded by isActionable)
+  const now = new Date();
   const ranked = filtered.map((issue) => {
-    const { score, reason } = rankIssue(issue.labels, agentName);
-    return { ...issue, score, reason };
+    const ageDays = issueAgeDays(issue.createdAt, now);
+    const { score, reason } = rankIssue(issue.labels, agentName, ageDays);
+    return { ...issue, score, reason, ageDays };
   });
 
-  // Sort by score ascending (lower = higher priority)
-  ranked.sort((a, b) => a.score - b.score);
+  // Sort by score ascending (lower = higher priority), then oldest first so
+  // that within one tier the queue drains front-to-back instead of leaving the
+  // same items perpetually behind newer arrivals.
+  ranked.sort((a, b) => a.score - b.score || b.ageDays - a.ageDays);
 
   // Build result
   return ranked.map((item) => {
