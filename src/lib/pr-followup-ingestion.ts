@@ -193,6 +193,40 @@ export function parseAiReviewerFindings(body: string | undefined | null): AiRevi
   }
 }
 
+// ─── Informational bot comments ─────────────────────────────────────────────
+
+/**
+ * Markers identifying comments that report state rather than request work:
+ * CI size-diff tables, coverage summaries, and dispatch's own BLOCKED notice.
+ * The sticky-comment convention (marvinpinto/sticky-pull-request-comment and
+ * friends) embeds a hidden marker so the action can update its comment in
+ * place — which makes it a structural discriminator, not a prose guess.
+ */
+const INFORMATIONAL_COMMENT_MARKERS = [
+  "<!-- Sticky Pull Request Comment",
+  "<!-- dispatch-pr-fix-blocked -->",
+];
+
+/**
+ * Report whether a comment is informational rather than review feedback.
+ *
+ * The comment path previously ingested every non-author comment on a bot PR,
+ * so a CI bot posting "size change: +0 B" became a REVIEW_FEEDBACK item;
+ * classifyFeedback finds no actionable pattern in a markdown table, defaults
+ * to needs_human, and the PR is BLOCKED on a human forever. Observed on
+ * misospace/llmkube-images#114: a mergeable PR blocked by a size-diff table
+ * reporting no change at all.
+ *
+ * An ai-pr-reviewer comment is exempt even when it carries a marker: it ships
+ * a structured findings payload and is genuine review feedback that the
+ * routing in `reviewLane` is built to act on.
+ */
+export function isInformationalComment(body: string | undefined | null): boolean {
+  if (!body) return false;
+  if (parseAiReviewerFindings(body)) return false;
+  return INFORMATIONAL_COMMENT_MARKERS.some((marker) => body.includes(marker));
+}
+
 // ─── Evidence Key ───────────────────────────────────────────────────────────
 
 /**
@@ -274,7 +308,10 @@ const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
 const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor> = {
   comment: {
     isIngestible: (event) => Boolean(event.body && event.id),
-    gate: () => true,
+    // Informational bot comments (CI tables, dispatch's own BLOCKED notice)
+    // are state reports, not work requests — ingesting them strands mergeable
+    // PRs in NEEDS_HUMAN.
+    gate: (event) => !isInformationalComment(event.body),
     filterTerminalPr: false,
     sourceId: (event) => event.id,
     workItem: (event) => {

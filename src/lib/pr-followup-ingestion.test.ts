@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import {
   classifyFeedback,
   parseAiReviewerFindings,
+  isInformationalComment,
   computeEvidenceKey,
   isAllowedBotAuthor,
   isAllowedBranchOwner,
@@ -779,5 +780,81 @@ describe("no hardcoded agent or repo names", () => {
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
     delete process.env.PR_FOLLOWUP_BRANCH_OWNERS;
+  });
+});
+
+// ─── Informational bot comments ─────────────────────────────────────────────
+
+// The real body shape from misospace/llmkube-images#114: a size-diff table
+// reporting no change at all, which blocked a mergeable PR in NEEDS_HUMAN.
+const SIZE_DIFF_COMMENT = `## 📦 App Size Analysis
+
+| OS/Platform |  Previous |  Current  |   Change   | Trend |
+| :---------- | :-------: | :-------: | :--------: | :---: |
+| linux/amd64 | 191.12 MB | 191.12 MB | +0 B (+0%) |   🔄  |
+<!-- Sticky Pull Request Commentapp-size-diff-llmkube-coder-node -->`;
+
+describe("isInformationalComment", () => {
+  it("flags sticky CI comments", () => {
+    expect(isInformationalComment(SIZE_DIFF_COMMENT)).toBe(true);
+  });
+
+  it("flags dispatch's own BLOCKED notice", () => {
+    expect(isInformationalComment("<!-- dispatch-pr-fix-blocked -->\n> ⚠️ needs human")).toBe(true);
+  });
+
+  it("does NOT flag an ai-pr-reviewer comment even with a marker", () => {
+    const body = `<!-- Sticky Pull Request Comment -->
+<!-- ai-pr-reviewer:${JSON.stringify({ review_result: "issues", open_findings: [{ severity: "blocker", message: "no upgrade performed" }] })} -->
+## Review: Request Changes`;
+    expect(isInformationalComment(body)).toBe(false);
+  });
+
+  it("does NOT flag ordinary review prose", () => {
+    expect(isInformationalComment("Please change `fetch` to `axios` here.")).toBe(false);
+    expect(isInformationalComment("")).toBe(false);
+    expect(isInformationalComment(null)).toBe(false);
+  });
+});
+
+describe("ingestCommentEvent — informational comments", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+
+  it("does not enqueue a size-diff CI comment (llmkube-images#114 regression)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const key = await ingestCommentEvent(client, {
+      repoFullName: "misospace/llmkube-images",
+      prNumber: 114,
+      branch: "foreman/wl-misospace-llmkube-images-89/issue-89",
+      url: "https://github.com/misospace/llmkube-images/pull/114",
+      title: "Add .dockerignore files to all app directories",
+      author: "itsmiso-ai",
+      commentBody: SIZE_DIFF_COMMENT,
+      commentId: "c-size-diff",
+    });
+
+    expect(key).toBeNull();
+    expect(client.items).toHaveLength(0);
+  });
+
+  it("still enqueues a genuine prose comment", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    await ingestCommentEvent(client, {
+      repoFullName: "misospace/llmkube-images",
+      prNumber: 115,
+      branch: "foreman/x",
+      url: "https://github.com/misospace/llmkube-images/pull/115",
+      title: "Something",
+      author: "itsmiso-ai",
+      commentBody: "Change `fetch` to `axios` for better error handling",
+      commentId: "c-real",
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
   });
 });
