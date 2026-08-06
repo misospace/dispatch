@@ -809,9 +809,17 @@ export function extractLogExcerpt(rawLog: string, maxChars = 6000): string {
   if (!rawLog.trim()) return "";
   const stripTs = (l: string) => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, "");
   const lines = rawLog.split("\n").map(stripTs);
-  // Generic fallback markers. FAIL tokens are case-sensitive here for the same
-  // reason as TEST_FAILURE_RE; ERROR:/error: stay loose since they are usually real.
-  const errRe = /##\[error\]|::error::|\bERROR:|SCRIPT ERROR|AssertionError|Traceback|\bFAIL(ED|URE)?\b|exit code [1-9]|\berror:/;
+  // Generic fallback markers, split because case sensitivity differs per token and
+  // a JS regex flag cannot be scoped to one alternative.
+  //
+  // Error markers stay case-insensitive: tools emit every casing, and `Error:` in
+  // particular is what helm prints ("Error: release: not found").
+  const errReAnyCase = /##\[error\]|::error::|\berror:|SCRIPT ERROR|AssertionError|Traceback|exit code [1-9]/i;
+  // FAIL tokens must be uppercase, for the same reason as TEST_FAILURE_RE: runners
+  // shout them, while lowercase "failure" is constant in benign diagnostic output
+  // (a kubectl probe spec reads `#failure=6`).
+  const errReUpperFail = /\bFAIL(ED|URE)?\b/;
+  const errRe = { test: (l: string) => errReAnyCase.test(l) || errReUpperFail.test(l) };
 
   let anchor = -1;
   let trailing = 15;

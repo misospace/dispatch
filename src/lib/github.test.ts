@@ -967,6 +967,21 @@ describe("extractLogExcerpt / jobIdFromCheckRunUrl", () => {
     expect(out).not.toContain("#failure=6");
   });
 
+  // Review catch on #722: making FAIL case-sensitive by dropping the /i flag from
+  // the whole fallback regex also broke mixed-case `Error:` — which is precisely
+  // what helm prints, in these same logs.
+  it("still anchors on mixed-case Error: in the fallback scan", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const log = [
+      "2026-08-05T22:00:00.0Z Deploying chart",
+      "2026-08-05T22:00:01.0Z Error: release: not found",
+      "2026-08-05T22:00:02.0Z Post Run actions/checkout",
+    ].join("\n");
+
+    const out = extractLogExcerpt(log);
+    expect(out).toContain("Error: release: not found");
+  });
+
   it("does not treat lowercase 'failure' in diagnostic output as an error marker", async () => {
     const { extractLogExcerpt } = await import("./github");
     const log = [
