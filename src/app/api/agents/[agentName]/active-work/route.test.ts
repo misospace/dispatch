@@ -8,6 +8,10 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
+vi.mock("@/lib/auth", () => ({
+  authorizeRequest: vi.fn(),
+}));
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     lease: {
@@ -29,6 +33,9 @@ vi.mock("@/lib/next-action", () => ({
 }));
 
 import { GET as handleActiveWork } from "./route";
+import { authorizeRequest } from "@/lib/auth";
+
+const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 
 function makeActiveWorkRequest(agentName: string) {
   return handleActiveWork(
@@ -40,6 +47,7 @@ function makeActiveWorkRequest(agentName: string) {
 describe("GET /api/agents/:agentName/active-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
     // Default: return the same lease for both findFirst calls (resolveActiveWork and leaseId fetch)
     mocks.leaseFindFirst.mockResolvedValue({
       id: "l-1",
@@ -59,6 +67,15 @@ describe("GET /api/agents/:agentName/active-work", () => {
       },
     });
     mocks.issueFindUnique.mockResolvedValue({ id: "issue-abc" });
+  });
+
+  it("returns 401 when not authenticated", async () => {
+    mockAuthorizeRequest.mockResolvedValue({ authorized: false });
+
+    const res = await makeActiveWorkRequest("test-agent");
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
   });
 
   it("returns hasActiveWork: true with context and leaseId when agent has an active lease", async () => {

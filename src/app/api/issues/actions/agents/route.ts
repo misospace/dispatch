@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { parseAgentList } from "@/lib/config";
+import { authorizeRequest } from "@/lib/auth";
 
 /**
  * GET /api/issues/actions/agents
@@ -11,6 +12,11 @@ import { parseAgentList } from "@/lib/config";
  * The combined set has no duplicates and is sorted alphabetically.
  */
 export async function GET(request: Request) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return errorResponse("Unauthorized", 401);
+  }
+
   try {
     // 1. Configured agents from env
     const configuredAgents = parseAgentList(process.env.AGENTS);

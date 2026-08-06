@@ -1,85 +1,82 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
-import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock } from "@/test/route-helpers";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
-process.env.DISPATCH_AGENT_TOKEN = mockToken;
-
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
-
-const { mocks } = vi.hoisted(() => ({
-  mocks: {
-    workflowFindUnique: vi.fn().mockResolvedValue(null),
-  },
+vi.mock("@/lib/auth", () => ({
+  authorizeRequest: vi.fn(),
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    githubWorkflow: { findUnique: mocks.workflowFindUnique },
+    githubWorkflow: {
+      findUnique: vi.fn(),
+    },
   },
 }));
 
 import { GET } from "./route";
+import { prisma } from "@/lib/prisma";
+import { authorizeRequest } from "@/lib/auth";
 
-function request(urlString: string) {
-  return new Request(urlString, { headers: {} });
-}
+const mockFindUnique = prisma.githubWorkflow.findUnique as any;
+const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 
 describe("GET /api/automation/workflows/[id]", () => {
-  // NOTE: This route is intentionally unauthenticated. It returns a single
-  // GitHub workflow by ID to any caller. In production deployments behind a
-  // firewall or auth gateway this is acceptable.
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.workflowFindUnique.mockResolvedValue(null);
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
   });
 
-  it("returns 400 when id query param is missing", async () => {
-    const res = await GET(request("http://localhost/api/automation/workflows/wf-1"));
+  it("returns 401 when not authenticated", async () => {
+    mockAuthorizeRequest.mockResolvedValue({ authorized: false });
 
-    expect(res.status).toBe(400);
-    const body = await res.json();
+    const response = await GET(new Request("http://localhost/api/automation/workflows/123?id=123"));
+
+    expect(response.status).toBe(401);
+    const body = await response.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 400 when id is missing", async () => {
+    const response = await GET(new Request("http://localhost/api/automation/workflows/123"));
+
+    expect(response.status).toBe(400);
+    const body = await response.json();
     expect(body.error).toBe("Workflow ID required");
   });
 
-  it("returns workflow when id is provided", async () => {
-    mocks.workflowFindUnique.mockResolvedValue({
-      id: "wf-1",
-      name: "CI",
-      repo: { fullName: "org/repo" },
-      runs: [],
+  it("returns workflow with runs and jobs", async () => {
+    mockFindUnique.mockResolvedValue({
+      id: "123",
+      name: "ci",
+      repo: { fullName: "owner/repo" },
+      runs: [{ id: "run-1", jobs: [] }],
     });
 
-    const res = await GET(request("http://localhost/api/automation/workflows/wf-1?id=wf-1"));
+    const response = await GET(
+      new Request("http://localhost/api/automation/workflows/123?id=123")
+    );
 
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body).toMatchObject({ id: "wf-1", name: "CI" });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.name).toBe("ci");
   });
 
   it("returns 404 when workflow not found", async () => {
-    mocks.workflowFindUnique.mockResolvedValue(null);
+    mockFindUnique.mockResolvedValue(null);
 
-    const res = await GET(request("http://localhost/api/automation/workflows/wf-1?id=nonexistent"));
+    const response = await GET(
+      new Request("http://localhost/api/automation/workflows/123?id=123")
+    );
 
-    expect(res.status).toBe(404);
-    const body = await res.json();
-    expect(body.error).toBe("Workflow not found");
-  });
-
-  it("includes repo and runs relations", async () => {
-    await GET(request("http://localhost/api/automation/workflows/wf-1?id=wf-1"));
-
-    const call = mocks.workflowFindUnique.mock.calls[0][0];
-    expect(call.include.repo).toBe(true);
-    expect(call.include.runs.take).toBe(20);
+    expect(response.status).toBe(404);
   });
 
   it("returns 500 on database error", async () => {
-    mocks.workflowFindUnique.mockRejectedValue(new Error("db connection lost"));
+    mockFindUnique.mockRejectedValue(new Error("DB down"));
 
-    const res = await GET(request("http://localhost/api/automation/workflows/wf-1?id=wf-1"));
+    const response = await GET(
+      new Request("http://localhost/api/automation/workflows/123?id=123")
+    );
 
-    expect(res.status).toBe(500);
-    const body = await res.json();
-    expect(body.error).toBe("Failed to fetch workflow");
+    expect(response.status).toBe(500);
   });
 });

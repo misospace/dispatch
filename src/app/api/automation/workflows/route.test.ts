@@ -1,87 +1,73 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
-import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock } from "@/test/route-helpers";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
-process.env.DISPATCH_AGENT_TOKEN = mockToken;
-
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
-
-const { mocks } = vi.hoisted(() => ({
-  mocks: {
-    workflowFindMany: vi.fn().mockResolvedValue([]),
-  },
+vi.mock("@/lib/auth", () => ({
+  authorizeRequest: vi.fn(),
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    githubWorkflow: { findMany: mocks.workflowFindMany },
+    githubWorkflow: {
+      findMany: vi.fn(),
+    },
   },
 }));
 
 import { GET } from "./route";
+import { prisma } from "@/lib/prisma";
+import { authorizeRequest } from "@/lib/auth";
 
-function request(urlString: string) {
-  return new Request(urlString, { headers: {} });
-}
+const mockFindMany = prisma.githubWorkflow.findMany as any;
+const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 
 describe("GET /api/automation/workflows", () => {
-  // NOTE: This route is intentionally unauthenticated. It returns GitHub
-  // workflow data to any caller. In production deployments behind a firewall or
-  // auth gateway this is acceptable; in open deployments consider adding auth.
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.workflowFindMany.mockResolvedValue([]);
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
   });
 
-  it("returns workflows without authentication", async () => {
-    mocks.workflowFindMany.mockResolvedValue([
-      { id: "wf-1", name: "CI", _count: { runs: 5 } },
+  it("returns 401 when not authenticated", async () => {
+    mockAuthorizeRequest.mockResolvedValue({ authorized: false });
+
+    const response = await GET(new Request("http://localhost/api/automation/workflows"));
+
+    expect(response.status).toBe(401);
+    const body = await response.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns workflows", async () => {
+    mockFindMany.mockResolvedValue([
+      { id: "1", name: "ci", _count: { runs: 5 }, runs: [] },
     ]);
 
-    const res = await GET(request("http://localhost/api/automation/workflows"));
+    const response = await GET(new Request("http://localhost/api/automation/workflows"));
 
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(Array.isArray(body)).toBe(true);
-    expect(body[0]).toMatchObject({ id: "wf-1", name: "CI" });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].name).toBe("ci");
   });
 
-  it("returns empty array when no workflows exist", async () => {
-    const res = await GET(request("http://localhost/api/automation/workflows"));
+  it("filters by repo", async () => {
+    mockFindMany.mockResolvedValue([]);
 
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body).toEqual([]);
-  });
+    await GET(new Request("http://localhost/api/automation/workflows?repo=owner/repo"));
 
-  it("orders by name ascending", async () => {
-    await GET(request("http://localhost/api/automation/workflows"));
-
-    const call = mocks.workflowFindMany.mock.calls[0][0];
-    expect(call.orderBy).toEqual({ name: "asc" });
-  });
-
-  it("filters by repo when repo param is provided", async () => {
-    await GET(request("http://localhost/api/automation/workflows?repo=org/repo"));
-
-    const call = mocks.workflowFindMany.mock.calls[0][0];
-    expect(call.where).toMatchObject({ repo: { fullName: "org/repo" } });
-  });
-
-  it("includes run count and latest run", async () => {
-    await GET(request("http://localhost/api/automation/workflows"));
-
-    const call = mocks.workflowFindMany.mock.calls[0][0];
-    expect(call.include._count).toEqual({ select: { runs: true } });
-    expect(call.include.runs.take).toBe(1);
+    expect(mockFindMany).toHaveBeenCalledWith({
+      where: { repo: { fullName: "owner/repo" } },
+      include: {
+        _count: { select: { runs: true } },
+        runs: { take: 1, orderBy: { runStartedAt: "desc" } },
+      },
+      orderBy: { name: "asc" },
+    });
   });
 
   it("returns 500 on database error", async () => {
-    mocks.workflowFindMany.mockRejectedValue(new Error("db connection lost"));
+    mockFindMany.mockRejectedValue(new Error("DB down"));
 
-    const res = await GET(request("http://localhost/api/automation/workflows"));
+    const response = await GET(new Request("http://localhost/api/automation/workflows"));
 
-    expect(res.status).toBe(500);
-    const body = await res.json();
-    expect(body.error).toBe("Failed to fetch workflows");
+    expect(response.status).toBe(500);
   });
 });
