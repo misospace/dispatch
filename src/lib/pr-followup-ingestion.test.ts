@@ -313,7 +313,13 @@ describe("ingestReviewEvent", () => {
     expect(client.items[0].lane).toBe("NORMAL");
   });
 
-  it("routes a CHANGES_REQUESTED review with no payload and vague prose to NEEDS_HUMAN", async () => {
+  // Contract change: even vague prose goes to the fix lane. The coder reads the
+  // review and reports back; if it genuinely cannot act, PR_FIX_MAX_ATTEMPTS
+  // escalates to NEEDS_HUMAN on evidence. Predicting unactionability with a
+  // keyword list cost more than it saved — it dead-ended a detailed review with
+  // file:line references (pr-reviewer-action#467) for 13 hours, while vague
+  // reviews are cheap to attempt and the attempt itself is useful signal.
+  it("routes a CHANGES_REQUESTED review with vague prose to the fix lane anyway", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();
     await ingestReviewEvent(client, {
@@ -325,6 +331,26 @@ describe("ingestReviewEvent", () => {
       author: "itsmiso-ai",
       reviewBody: "This looks wrong, please take another look.",
       reviewId: "r-human",
+      reviewState: "CHANGES_REQUESTED",
+    });
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
+  });
+
+  it("routes an empty CHANGES_REQUESTED review to NEEDS_HUMAN", async () => {
+    // Nothing to read means nothing to act on — the one case still worth routing
+    // straight to a human rather than spending attempts on it.
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    await ingestReviewEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 44,
+      branch: "fix/x",
+      url: "https://github.com/misospace/dispatch/pull/44",
+      title: "Fix",
+      author: "itsmiso-ai",
+      reviewBody: "   ",
+      reviewId: "r-empty",
       reviewState: "CHANGES_REQUESTED",
     });
     expect(client.items).toHaveLength(1);
@@ -856,5 +882,25 @@ describe("ingestCommentEvent — informational comments", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
+  });
+});
+
+// pr-reviewer-action#467: a detailed human review — file:line references, explicit
+// asks — matched no actionable keyword and no ambiguous keyword, fell through
+// classifyFeedback's needs_human default, and sat BLOCKED in NEEDS_HUMAN for 13
+// hours. CHANGES_REQUESTED is itself the signal that a reviewer decided what must
+// change; "matched no keyword" is not evidence that a human is needed.
+describe("reviewLane via ingestReviewEvent", () => {
+  it("routes a detailed prose review to the fix lane, not NEEDS_HUMAN", () => {
+    // pr-reviewer-action#467: matched no actionable keyword and no ambiguous
+    // keyword, so the old classifier defaulted it to needs_human and it sat
+    // BLOCKED for 13 hours. The coder reads the review body directly.
+    const body = [
+      "**Request changes.** The PR deletes the entire test suite.",
+      "**Important — `ci.yaml:20`:** The replacement YAML validation does not catch duplicate keys.",
+    ].join("\n\n");
+    // classifyFeedback still says needs_human — that default is precisely what
+    // the review path no longer consults.
+    expect(classifyFeedback(body)).toBe("needs_human");
   });
 });
