@@ -146,6 +146,30 @@ describe("POST /api/issues/claim — business logic", () => {
     expect((await res.json()).error).toBe("Cannot claim a done issue");
   });
 
+  // The 20-day stall: an issue left at status/ready while still carrying its own
+  // agent label was served at the head of the queue, 409'd on every claim, and
+  // skipped by claim_one so the lane never starved — and nothing surfaced it.
+  it("re-claims its own issue instead of 409ing on itself", async () => {
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/ready", "agent/test-agent", "priority/p0"],
+    });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+  });
+
+  it("still 409s when a second agent holds the issue alongside this one", async () => {
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "agent/other-agent"],
+    });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+  });
+
   it("returns 409 when already assigned to another agent without force", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
     const res = await POST(makeRequest());
