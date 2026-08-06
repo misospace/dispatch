@@ -4,7 +4,7 @@
 
 There are currently no accepted npm runtime advisories.
 
-`npm audit --omit=dev` reports **0 vulnerabilities** across 227 production dependencies.
+`npm audit --omit=dev` reports **0 vulnerabilities** across 17 production dependencies.
 
 ## Non-NPM Risks
 
@@ -27,9 +27,9 @@ The following risks are tracked beyond npm advisories:
 
 ### Dependency Chain Length
 
-- The project uses 19 production dependencies with transitive chains managed by npm.
+- The project uses 17 production dependencies with transitive chains managed by npm.
 - Key deep-chain dependencies: `next` (framework), `@modelcontextprotocol/sdk` (MCP protocol), `prisma` / `@prisma/client` (ORM).
-- **Mitigation:** Renovate keeps dependencies updated; `npm audit --omit=dev` is run on every CI push.
+- **Mitigation:** Renovate keeps dependencies updated; `npm audit --omit=dev --audit-level=high` runs on every push and PR via `.github/workflows/security-audit.yaml` and fails the build on high/critical vulnerabilities.
 
 ### Groomer Autonomous Issue Rewrites (accepted risk)
 
