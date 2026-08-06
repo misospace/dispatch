@@ -234,7 +234,7 @@ export function isInformationalComment(body: string | undefined | null): boolean
  * Format: {eventType}:{source}:{identifier}
  */
 export function computeEvidenceKey(
-  eventType: "comment" | "review" | "check_run" | "merge_state" | "merge_conflict",
+  eventType: "comment" | "review" | "review_comment" | "check_run" | "merge_state" | "merge_conflict",
   sourceId: string, // comment ID, review ID, check run ID
   repoFullName: string,
   prNumber: number,
@@ -347,6 +347,33 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
       type: "REVIEW_FEEDBACK",
       reason: `PR review: CHANGES_REQUESTED`,
       feedback: event.body ?? "",
+    }),
+  },
+  review_comment: {
+    isIngestible: (event) => Boolean(event.body && event.id),
+    // Inline review comments are the reviewer's actual findings, and they arrive
+    // independently of the review's verdict — which is what makes them worth
+    // ingesting on their own. An APPROVED review carrying four "Minor (bug)" nits
+    // was dropped entirely: the review path only acts on CHANGES_REQUESTED, and
+    // these comments live on pulls/N/comments, an endpoint the sync never read.
+    gate: (event) => !isInformationalComment(event.body),
+    // A nit on an already-merged PR is not actionable.
+    filterTerminalPr: true,
+    sourceId: (event) => event.id,
+    workItem: (event) => ({
+      // Deliberately NOT run through classifyFeedback. A reviewer anchoring a
+      // comment to a file and line has already done the triage that
+      // classification guesses at; running review prose through a keyword list is
+      // what stranded human reviews in NEEDS_HUMAN (#729). If the coder cannot
+      // act on it, attempt-exhaustion escalates on evidence instead.
+      lane: "NORMAL",
+      type: "REVIEW_FEEDBACK",
+      reason: event.path
+        ? `Review comment on ${event.path}${event.line ? `:${event.line}` : ""}`
+        : "Review comment",
+      feedback: event.path
+        ? `${event.path}${event.line ? `:${event.line}` : ""} — ${event.body ?? ""}`
+        : (event.body ?? ""),
     }),
   },
   check_run: {
@@ -508,6 +535,51 @@ export async function ingestReviewEvent(
     body: opts.reviewBody,
     id: opts.reviewId,
     state: opts.reviewState,
+    prState: opts.prState,
+    prMergedAt: opts.prMergedAt,
+    linkedIssue: opts.linkedIssue,
+  });
+}
+
+/**
+ * Ingest a single inline review comment (a reviewer finding anchored to a file).
+ *
+ * Separate from ingestReviewEvent because these are independent of the review
+ * verdict: an APPROVED review still carries findings, and dropping them on state
+ * alone loses real feedback — observed on foreman-dispatch-bridge#111, whose
+ * approving review held four minor findings, two of them on silently swallowed
+ * errors.
+ */
+export async function ingestReviewCommentEvent(
+  client: PrFixQueueClient,
+  opts: {
+    repoFullName: string;
+    prNumber: number;
+    branch: string | null;
+    url: string;
+    title: string;
+    author: string | null;
+    commentBody: string;
+    commentId: string;
+    path?: string | null;
+    line?: number | null;
+    prState?: string | null;
+    prMergedAt?: string | null;
+    linkedIssue?: number | null;
+  },
+): Promise<string | null> {
+  return ingestEvent(client, {
+    eventType: "review_comment",
+    repoFullName: opts.repoFullName,
+    prNumber: opts.prNumber,
+    branch: opts.branch,
+    url: opts.url,
+    title: opts.title,
+    author: opts.author,
+    body: opts.commentBody,
+    id: opts.commentId,
+    path: opts.path ?? null,
+    line: opts.line ?? null,
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
@@ -685,7 +757,7 @@ export async function clearResolvedConflictItems(
  * This is used by the periodic sync to catch up on missed events.
  */
 export interface PrFollowupEvent {
-  eventType: "comment" | "review" | "check_run" | "merge_state";
+  eventType: "comment" | "review" | "review_comment" | "check_run" | "merge_state";
   repoFullName: string;
   prNumber: number;
   branch: string | null;
@@ -701,6 +773,9 @@ export interface PrFollowupEvent {
   prState?: string | null;
   prMergedAt?: string | null;
   linkedIssue?: number | null;
+  /** review_comment only: the file and line the inline comment is anchored to. */
+  path?: string | null;
+  line?: number | null;
 }
 
 /**
