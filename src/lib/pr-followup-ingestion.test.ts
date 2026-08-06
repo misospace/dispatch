@@ -8,6 +8,7 @@ import {
   isAllowedBranchOwner,
   ingestCommentEvent,
   ingestReviewEvent,
+  ingestReviewCommentEvent,
   ingestCheckRunEvent,
   ingestMergeStateEvent,
   processPrFollowupEvents,
@@ -902,5 +903,105 @@ describe("reviewLane via ingestReviewEvent", () => {
     // classifyFeedback still says needs_human — that default is precisely what
     // the review path no longer consults.
     expect(classifyFeedback(body)).toBe("needs_human");
+  });
+});
+
+// foreman-dispatch-bridge#111: an APPROVED review carrying four "Minor (bug)" nits
+// — two of them about silently swallowed errors — was dropped entirely. The review
+// path only acts on CHANGES_REQUESTED, and the findings live on pulls/N/comments,
+// an endpoint the sync never fetched. Ingesting the inline comments directly makes
+// the feedback reachable regardless of the review's verdict.
+describe("ingestReviewCommentEvent", () => {
+  beforeEach(() => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+  });
+
+  const base = {
+    repoFullName: "misospace/foreman-dispatch-bridge",
+    prNumber: 111,
+    branch: "foreman/wl-x/issue-1",
+    url: "https://github.com/misospace/foreman-dispatch-bridge/pull/111",
+    title: "Parallelize lane queue GETs",
+    author: "itsmiso-ai",
+  };
+
+  it("enqueues an inline finding as NORMAL review feedback", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      ...base,
+      commentBody: "**Minor (bug):** `queues()` propagates transport exceptions on the single-lane path but degrades to [] on the multi-lane path.",
+      commentId: "rc-1",
+      path: "bridge/claim.py",
+      line: 99,
+    });
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
+  });
+
+  it("carries the file and line so the coder knows where the nit points", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      ...base,
+      commentBody: "swallowed with no log line",
+      commentId: "rc-2",
+      path: "bridge/claim.py",
+      line: 109,
+    });
+    expect(client.items[0].reason).toContain("bridge/claim.py:109");
+    expect(client.items[0].feedback[0]).toContain("bridge/claim.py:109");
+  });
+
+  it("does not depend on the review verdict — no state is consulted", async () => {
+    // The whole point: these arrive from an APPROVED review and still enqueue.
+    const client = makeClient();
+    const key = await ingestReviewCommentEvent(client, {
+      ...base,
+      commentBody: "prefer a structured log line here",
+      commentId: "rc-3",
+      path: "bridge/claim.py",
+      line: 211,
+    });
+    expect(key).toBeTruthy();
+    expect(client.items).toHaveLength(1);
+  });
+
+  it("skips a nit on an already-merged PR", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      ...base,
+      commentBody: "minor style point",
+      commentId: "rc-4",
+      path: "bridge/claim.py",
+      line: 1,
+      prState: "closed",
+      prMergedAt: "2026-08-06T09:00:00Z",
+    });
+    expect(client.items).toHaveLength(0);
+  });
+
+  it("skips informational bot comments", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      ...base,
+      commentBody: "<!-- Sticky Pull Request Comment -->\nCoverage: 85%",
+      commentId: "rc-5",
+      path: "bridge/claim.py",
+      line: 2,
+    });
+    expect(client.items).toHaveLength(0);
+  });
+
+  it("falls back to original_line semantics when line is absent", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      ...base,
+      commentBody: "stale anchor but still a finding",
+      commentId: "rc-6",
+      path: "bridge/claim.py",
+      line: null,
+    });
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].reason).toContain("bridge/claim.py");
   });
 });

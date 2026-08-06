@@ -45,6 +45,23 @@ interface GithubReview {
   submitted_at: string;
 }
 
+/**
+ * An inline review comment from `pulls/N/comments` — per-file feedback, distinct
+ * from the conversation comments on `issues/N/comments`.
+ *
+ * `line` is null once a comment's anchor goes stale (the diff moved under it);
+ * `original_line` still points at the line it was written against, so it is worth
+ * falling back to for the coder's benefit.
+ */
+interface GithubReviewComment {
+  id: number;
+  body: string;
+  user?: { login: string };
+  path?: string;
+  line?: number | null;
+  original_line?: number | null;
+}
+
 interface GithubCheckRun {
   id: number;
   name: string;
@@ -118,10 +135,16 @@ export async function POST(request: NextRequest) {
         // parallel, best effort per source (a failed fetch yields no events).
         const commentsUrl = `${githubApi}/repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`;
         const reviewsUrl = `${githubApi}/repos/${owner}/${repo}/pulls/${pr.number}/reviews?per_page=100`;
+        // Inline review comments. Distinct from issues/N/comments above: that is the
+        // conversation timeline, this is per-file review feedback, and only this one
+        // carries a reviewer's anchored findings. Never fetched before, which is why
+        // an APPROVED review's nits vanished entirely.
+        const reviewCommentsUrl = `${githubApi}/repos/${owner}/${repo}/pulls/${pr.number}/comments?per_page=100`;
         const checksUrl = `${githubApi}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=completed&per_page=100`;
-        const [comments, reviews, checkRuns, mergeState] = await Promise.all([
+        const [comments, reviews, reviewComments, checkRuns, mergeState] = await Promise.all([
           fetchPaginated<GithubComment>(commentsUrl, 100).catch(() => [] as GithubComment[]),
           fetchPaginated<GithubReview>(reviewsUrl, 100).catch(() => [] as GithubReview[]),
+          fetchPaginated<GithubReviewComment>(reviewCommentsUrl, 100).catch(() => [] as GithubReviewComment[]),
           fetchPaginated<GithubCheckRun>(
             checksUrl,
             100,
@@ -162,6 +185,29 @@ export async function POST(request: NextRequest) {
             body: comment.body,
             id: String(comment.id),
             linkedIssue,
+          });
+        }
+
+        // Collect inline review-comment events. Independent of the review verdict:
+        // an APPROVED review still carries findings, and dropping them on state
+        // alone loses real feedback.
+        for (const rc of reviewComments) {
+          if (rc.user?.login === pr.user.login) continue; // ignore self-comments
+          allEvents.push({
+            eventType: "review_comment" as const,
+            repoFullName,
+            prNumber: pr.number,
+            branch: pr.head.ref ?? null,
+            url: pr.url,
+            title: pr.title,
+            author: pr.user.login,
+            body: rc.body,
+            id: String(rc.id),
+            path: rc.path ?? null,
+            line: rc.line ?? rc.original_line ?? null,
+            linkedIssue,
+            prState: pr.state,
+            prMergedAt: pr.merged_at,
           });
         }
 
