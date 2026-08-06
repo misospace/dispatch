@@ -944,6 +944,76 @@ describe("extractLogExcerpt / jobIdFromCheckRunUrl", () => {
     expect(extractLogExcerpt("")).toBe("");
   });
 
+  // KubeTix#315: the workflow's `if: failure()` diagnostics step dumps kubectl
+  // output after the real failure, and a pod's probe spec reads "#failure=6",
+  // which the old case-insensitive scan treated as the last error marker. The
+  // pr-fix loop spent all three attempts reasoning from that pod spec while the
+  // pytest failures sat outside the returned window.
+  it("prefers the test-failure region over a trailing diagnostics dump", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const log = [
+      "2026-08-05T22:26:29.0Z tests/e2e/test_e2e.py::test_01_api_health PASSED",
+      "2026-08-05T22:26:37.0Z FAILED tests/e2e/test_e2e.py::test_15_wrong_password_login - assert 429 == 401",
+      "2026-08-05T22:26:37.1Z ##[error]Process completed with exit code 1.",
+      "2026-08-05T22:26:38.0Z ##[group]Run kubectl describe pods",
+      ...Array.from({ length: 60 }, (_, i) => `2026-08-05T22:26:38.${i}Z     Startup: http-get http://:http/health delay=10s #success=1 #failure=6`),
+      "2026-08-05T22:26:39.0Z Error: release: not found",
+      "2026-08-05T22:26:39.1Z ##[error]Process completed with exit code 1.",
+    ].join("\n");
+
+    const out = extractLogExcerpt(log);
+    expect(out).toContain("assert 429 == 401");
+    expect(out).toContain("test_15_wrong_password_login");
+    expect(out).not.toContain("#failure=6");
+  });
+
+  // Review catch on #722: making FAIL case-sensitive by dropping the /i flag from
+  // the whole fallback regex also broke mixed-case `Error:` — which is precisely
+  // what helm prints, in these same logs.
+  it("still anchors on mixed-case Error: in the fallback scan", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const log = [
+      "2026-08-05T22:00:00.0Z Deploying chart",
+      "2026-08-05T22:00:01.0Z Error: release: not found",
+      "2026-08-05T22:00:02.0Z Post Run actions/checkout",
+    ].join("\n");
+
+    const out = extractLogExcerpt(log);
+    expect(out).toContain("Error: release: not found");
+  });
+
+  it("does not treat lowercase 'failure' in diagnostic output as an error marker", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const log = [
+      "2026-08-05T22:00:00.0Z ##[error]npm ERR! build failed at step 3",
+      ...Array.from({ length: 30 }, () => "2026-08-05T22:00:01.0Z   Liveness: http-get :8080/healthz #failure=3"),
+    ].join("\n");
+
+    // The real error is first and the tail is benign; anchoring must not drift to the dump.
+    const out = extractLogExcerpt(log);
+    expect(out).toContain("npm ERR! build failed at step 3");
+  });
+
+  // Over the cap, a test-anchored excerpt must keep both ends: the causal failure
+  // opens the region and the runner's summary closes it. Head-only trimming dropped
+  // pytest's "short test summary info" block on the real KubeTix#315 log.
+  it("keeps both ends when a test-anchored excerpt exceeds the cap", async () => {
+    const { extractLogExcerpt } = await import("./github");
+    const log = [
+      "--- FAIL: TestThing (0.01s)",
+      "    thing_test.go:42: expected 7, got 9",
+      ...Array.from({ length: 400 }, (_, i) => `    trailing context line ${i} ${"x".repeat(40)}`),
+      "--- FAIL: TestOther (0.02s)",
+      "FAIL	github.com/example/pkg	0.05s",
+    ].join("\n");
+
+    const out = extractLogExcerpt(log, 800);
+    expect(out.length).toBeLessThanOrEqual(810);
+    expect(out).toContain("--- FAIL: TestThing"); // head kept
+    expect(out).toContain("expected 7, got 9");
+    expect(out).toContain("…"); // middle elided
+  });
+
   it("caps the excerpt length", async () => {
     const { extractLogExcerpt } = await import("./github");
     const huge = Array.from({ length: 5000 }, (_, i) => `line ${i} ERROR: boom`).join("\n");
