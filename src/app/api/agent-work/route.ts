@@ -50,11 +50,12 @@ function toItem(w: any): AgentWorkItem {
   };
 }
 
-// Intentionally unauthenticated — consistent with other read-only endpoints
-// such as GET /api/agents/[agentName]/active-work and GET /api/issues.
-// The board UI and operator dashboards need to query active/stale work without
-// requiring a DISPATCH_AGENT_TOKEN. POST mutations remain auth-gated below.
 export async function GET(request: Request) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return errorResponse("Unauthorized", 401);
+  }
+
   const { searchParams } = new URL(request.url);
   const stateFilter = searchParams.get("state");
   const agentNameFilter = searchParams.get("agent");

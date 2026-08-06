@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { makeDispatchEnvMock } from "@/test/route-helpers";
 
+vi.mock("@/lib/auth", () => ({
+  authorizeRequest: vi.fn(),
+}));
+
 const mockAgentWork = {
   findMany: vi.fn(),
   findFirst: vi.fn(),
@@ -78,6 +82,7 @@ vi.mock("@/lib/lease", () => ({
 
 import { prisma } from "@/lib/prisma";
 import * as leaseModule from "@/lib/lease";
+import { authorizeRequest } from "@/lib/auth";
 import { GET, POST } from "./route";
 
 const agentWork = prisma.agentWork as any;
@@ -92,6 +97,8 @@ const releaseLeaseByAgentAndIssueMock = leaseModule.releaseLeaseByAgentAndIssue 
 const releaseAllLeasesByAgentMock = leaseModule.releaseAllLeasesByAgent as any;
 const releaseAgentWorkByAgentAndIssueMock = leaseModule.releaseAgentWorkByAgentAndIssue as any;
 
+const mockAuthorizeRequest = vi.mocked(authorizeRequest);
+
 // ─── GET Tests ───────────────────────────────────────────────────────────────
 
 function makeGetRequest(url: string) {
@@ -101,8 +108,18 @@ function makeGetRequest(url: string) {
 describe("GET /api/agent-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
     agentWork.findMany.mockResolvedValue([]);
     lease.findMany.mockResolvedValue([]);
+  });
+
+  it("returns 401 when not authenticated", async () => {
+    mockAuthorizeRequest.mockResolvedValue({ authorized: false });
+
+    const res = await makeGetRequest("http://localhost/api/agent-work");
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
   });
 
   it("returns empty activeWork and staleLeases when none exist", async () => {
@@ -708,8 +725,14 @@ describe("POST /api/agent-work", () => {
   });
 
   describe("POST auth", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+    });
+
     it("returns 401 when token is invalid", async () => {
-      const res = POST(
+      mockAuthorizeRequest.mockResolvedValue({ authorized: false });
+      const res = await POST(
         new Request("http://localhost/api/agent-work", {
           method: "POST",
           headers: {
@@ -719,7 +742,7 @@ describe("POST /api/agent-work", () => {
           body: JSON.stringify({ action: "release", workId: "work-1" }),
         })
       );
-      expect((await res).status).toBe(401);
+      expect(res.status).toBe(401);
     });
 
     it("returns 400 for unknown action", async () => {

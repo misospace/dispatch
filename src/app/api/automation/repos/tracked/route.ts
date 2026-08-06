@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
+import { authorizeRequest } from "@/lib/auth";
 
 /**
  * GET /api/automation/repos/tracked
@@ -15,7 +16,12 @@ import { jsonSafe } from "@/lib/json";
  * - `source` comes from the linked AutomationRepo row (e.g. "user", "env").
  * - `lastSyncedAt` is only present when an AutomationRepo row exists.
  */
-export async function GET(_request: Request) {
+export async function GET(request: Request) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return errorResponse("Unauthorized", 401);
+  }
+
   try {
     const repos = await prisma.repository.findMany({
       where: { enabled: true },

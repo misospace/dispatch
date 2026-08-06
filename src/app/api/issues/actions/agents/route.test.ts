@@ -10,6 +10,10 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
+vi.mock("@/lib/auth", () => ({
+  authorizeRequest: vi.fn(),
+}));
+
 vi.mock("@/lib/config", () => ({
   parseAgentList: mocks.parseAgentList,
   parseExcludedLabels: vi.fn().mockReturnValue([]),
@@ -22,15 +26,28 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 import { GET } from "./route";
+import { authorizeRequest } from "@/lib/auth";
+
+const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 
 describe("GET /api/issues/actions/agents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
     mocks.parseAgentList.mockReturnValue(["worker", "reviewer"]);
     mocks.findMany.mockResolvedValue([
       { labels: ["status/backlog", "agent/handler", "type/feature"] },
       { labels: ["agent/discovered-agent", "priority/p1"] },
     ]);
+  });
+
+  it("returns 401 when not authenticated", async () => {
+    mockAuthorizeRequest.mockResolvedValue({ authorized: false });
+
+    const res = await GET(new Request("http://localhost/api/issues/actions/agents"));
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
   });
 
   it("returns configured and discovered agents combined", async () => {
