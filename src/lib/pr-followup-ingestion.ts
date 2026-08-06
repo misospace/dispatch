@@ -97,6 +97,19 @@ export function isAllowedBranchOwner(repoFullName: string): boolean {
  * - Requests that could break behavior (refactors, dependency updates)
  * - Missing context or unclear acceptance criteria
  */
+const AMBIGUOUS_FEEDBACK_PATTERNS = [
+    // Vague requests
+    /\b(make|fix|improve|update|change)\s+(it|this|that|the\s+\w+)\s+(better|more|up|around)\b/i,
+    /\blooks?\s+(wrong|bad|off|weird|suspicious)\b/i,
+    /\bsomething\s+is?\s+(wrong|broken|off)\b/i,
+    /\bcan\s+you\s+(fix|handle|look\s+at|check)\s+(this|it)\b/i,
+    // Missing context
+    /\bno\s+(context|explanation|details|description|repro)\b/i,
+    /\bunclear|ambiguous|vague\b/i,
+    // Security-sensitive without specifics
+    /\bsecurity\s+(concern|issue|flag)\b.*\bwithout\s+\b(repro|example|detail)\b/i,
+  ];
+
 export function classifyFeedback(content: string): FeedbackClassification {
   if (!content || !content.trim()) return "needs_human";
 
@@ -129,22 +142,9 @@ export function classifyFeedback(content: string): FeedbackClassification {
 
   // ── Ambiguous / high-risk patterns (NEEDS_HUMAN) ────────────────────────
 
-  const ambiguousPatterns = [
-    // Vague requests
-    /\b(make|fix|improve|update|change)\s+(it|this|that|the\s+\w+)\s+(better|more|up|around)\b/i,
-    /\blooks?\s+(wrong|bad|off|weird|suspicious)\b/i,
-    /\bsomething\s+is?\s+(wrong|broken|off)\b/i,
-    /\bcan\s+you\s+(fix|handle|look\s+at|check)\s+(this|it)\b/i,
-    // Missing context
-    /\bno\s+(context|explanation|details|description|repro)\b/i,
-    /\bunclear|ambiguous|vague\b/i,
-    // Security-sensitive without specifics
-    /\bsecurity\s+(concern|issue|flag)\b.*\bwithout\s+\b(repro|example|detail)\b/i,
-  ];
+  // (patterns live at module scope — see AMBIGUOUS_FEEDBACK_PATTERNS)
 
-  for (const pattern of ambiguousPatterns) {
-    if (pattern.test(text)) return "needs_human";
-  }
+  if (AMBIGUOUS_FEEDBACK_PATTERNS.some((pattern) => pattern.test(text))) return "needs_human";
 
   // ── Default: needs human review when uncertain ─────────────────────────
 
@@ -296,12 +296,24 @@ function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
  * (no structured payload) still fall back to the keyword classifier.
  */
 function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
-  const findings = parseAiReviewerFindings(body)?.open_findings ?? [];
-  if (findings.some((f) => (f.message ?? "").trim().length > 0)) {
-    return "NORMAL";
-  }
-  return laneFor(body);
+  // CHANGES_REQUESTED goes to the fix lane. Full stop.
+  //
+  // This used to run the review body through classifyFeedback's keyword list, so a
+  // regex decided whether a MODEL would be able to act on prose — while the thing
+  // downstream is a model that receives the whole review as its feedback. It reads
+  // "restore the validate job" and "ci.yaml:20 does not catch duplicate keys" fine.
+  // Predicting on its behalf only produced false negatives: pr-reviewer-action#467,
+  // a review with file:line references and explicit asks, matched no actionable
+  // pattern and no ambiguous pattern, hit the needs_human default, and sat BLOCKED
+  // for 13 hours while nothing acted on it.
+  //
+  // Escalation still exists, but on evidence instead of prediction: the coder
+  // attempts the fix, and PR_FIX_MAX_ATTEMPTS moves it to NEEDS_HUMAN once it has
+  // actually failed. "A model tried and could not" beats "a regex guessed it would
+  // not". An empty body carries nothing to act on, so that alone stays human.
+  return body && body.trim() ? "NORMAL" : "NEEDS_HUMAN";
 }
+
 
 const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
 
