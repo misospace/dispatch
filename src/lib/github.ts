@@ -912,6 +912,38 @@ export async function fetchFailedJobLogExcerpt(repoFullName: string, jobId: stri
  * `mergeable`) while it recomputes, converging on a subsequent sync. Transient
  * failures degrade to null rather than throwing.
  */
+/**
+ * Fetch a PR's lifecycle state: `open`/`closed` plus the merge timestamp.
+ *
+ * Distinct from fetchPullRequestMergeState, which reports *mergeability*. Callers
+ * that must not act on finished PRs need the lifecycle instead.
+ *
+ * Returns `{ state: null, mergedAt: null }` on any failure so the caller can
+ * distinguish "unknown" from "open" and choose its own direction — inferring
+ * "open" from a failed lookup is how you end up writing to a PR that closed
+ * months ago.
+ */
+export async function fetchPullRequestState(
+  repoFullName: string,
+  prNumber: number,
+): Promise<{ state: string | null; mergedAt: string | null }> {
+  try {
+    // Inside the try on purpose: token acquisition throws when GITHUB_TOKEN is
+    // absent, and callers of this treat "unknown" as a decision input rather than
+    // an error. A caller documented as never-throwing must not start throwing
+    // because a credential went missing.
+    const headers = await getHeadersAsync();
+    const resp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (resp.ok) {
+      const detail = (await resp.json()) as { state?: string | null; merged_at?: string | null };
+      return { state: detail.state ?? null, mergedAt: detail.merged_at ?? null };
+    }
+  } catch {
+    // Unknown rather than open; the caller decides what to do with that.
+  }
+  return { state: null, mergedAt: null };
+}
+
 export async function fetchPullRequestMergeState(
   repoFullName: string,
   prNumber: number,

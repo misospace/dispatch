@@ -1,4 +1,4 @@
-import { addIssueComment, addIssueLabel, fetchIssueComments } from "@/lib/github";
+import { addIssueComment, addIssueLabel, fetchIssueComments, fetchPullRequestState } from "@/lib/github";
 
 export const NEEDS_HUMAN_LABEL = "needs-human";
 export const NEEDS_HUMAN_COMMENT_MARKER = "<!-- dispatch-pr-fix-blocked -->";
@@ -13,6 +13,8 @@ export interface SurfacePrFixBlockedInput {
 export interface SurfacePrFixBlockedResult {
   labelApplied: boolean;
   commentPosted: boolean;
+  /** True when the PR was already merged or closed, so nothing was written. */
+  skippedTerminal: boolean;
   errors: string[];
 }
 
@@ -48,8 +50,30 @@ export async function surfacePrFixBlocked(input: SurfacePrFixBlockedInput): Prom
   const result: SurfacePrFixBlockedResult = {
     labelApplied: false,
     commentPosted: false,
+    skippedTerminal: false,
     errors: [],
   };
+
+  // Never write to a finished PR. A BLOCKED item can outlive its PR — a leftover
+  // queue row, a late status transition, a re-queue racing a merge — and asking for
+  // "human attention" on something merged months ago is pure noise. Observed on a
+  // PR merged 2026-05-14 that received this comment on 2026-08-06.
+  //
+  // Unknown state (lookup failed) is treated as terminal and skipped, matching the
+  // choice the comment-idempotency guard below already makes: when in doubt, do not
+  // write. A missed first notification is recoverable from the queue; a comment on
+  // a long-dead PR is not retractable and erodes trust in the notifications that
+  // are real.
+  const prState = await fetchPullRequestState(input.repo, input.pr);
+  const isTerminal = prState.state === null || prState.state === "closed" || Boolean(prState.mergedAt);
+  if (isTerminal) {
+    result.skippedTerminal = true;
+    console.warn(
+      `pr-fix-surfacing: skipping ${input.repo}#${input.pr} — PR state=${prState.state ?? "unknown"}` +
+        `${prState.mergedAt ? ` merged=${prState.mergedAt}` : ""}; not labelling or commenting on a finished PR`,
+    );
+    return result;
+  }
 
   try {
     await addIssueLabel(input.repo, input.pr, NEEDS_HUMAN_LABEL);
