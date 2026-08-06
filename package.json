@@ -1,6 +1,6 @@
 {
   "name": "dispatch",
-  "version": "0.5.32",
+  "version": "0.5.33",
   "private": true,
   "engines": {
     "node": ">=24"
