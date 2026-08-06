@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
+import { AGENT_PREFIX } from "@/types";
 import { authorizeRequest } from "@/lib/auth";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
@@ -81,8 +82,10 @@ export async function POST(request: Request) {
       console.warn(`Released ${staleWorkCount} stale AgentWork record(s) for issue #${issueNumber}`);
     }
 
-    // Analyze assignment conflicts using the shared conflict resolution module
-    const analysis = analyzeAssignmentConflict(issue.labels);
+    // Analyze assignment conflicts using the shared conflict resolution module.
+    // Passing this agent's own label makes a re-claim idempotent: an issue still
+    // carrying agent/<this agent> is ours to take, not a conflict to 409 on.
+    const analysis = analyzeAssignmentConflict(issue.labels, `${AGENT_PREFIX}${agentName}`);
 
     // Check for agent conflict — if another agent is assigned, require force-claim
     if (analysis.hasAgentConflict) {

@@ -21,8 +21,21 @@ export interface ConflictAnalysis {
 /**
  * Analyze an issue's labels for assignment conflicts.
  * Returns a structured analysis of what agent/owner labels exist and which would be replaced.
+ *
+ * Pass `assigningAgentLabel` (e.g. `agent/foreman-coder`) to make a re-claim by the
+ * SAME agent conflict-free. Without it, an agent re-claiming an issue it already
+ * holds counts as a conflict with itself and the claim route 409s
+ * ("already assigned to foreman-coder"). That is not hypothetical: an issue left
+ * as status/ready while still carrying its own agent label — an unclaim that only
+ * reset the status, a groom, a manual edit — sits at the head of the queue and is
+ * rejected on every tick, forever. Two p0s stalled 20 days that way, and because
+ * `claim_one` skips a failing candidate to avoid starving the lane, nothing
+ * surfaced it.
  */
-export function analyzeAssignmentConflict(labels: string[]): ConflictAnalysis {
+export function analyzeAssignmentConflict(
+  labels: string[],
+  assigningAgentLabel?: string,
+): ConflictAnalysis {
   const existingAgents: string[] = [];
   const existingOwners: string[] = [];
   const preservedLabels: string[] = [];
@@ -40,7 +53,11 @@ export function analyzeAssignmentConflict(labels: string[]): ConflictAnalysis {
   return {
     existingAgents,
     existingOwners,
-    hasAgentConflict: existingAgents.length > 0,
+    // A label identical to the one being assigned is not a conflict — re-claiming
+    // your own issue is idempotent, not a collision with another agent.
+    hasAgentConflict: assigningAgentLabel
+      ? existingAgents.some((l) => l !== assigningAgentLabel)
+      : existingAgents.length > 0,
     hasOwnerConflict: existingOwners.length > 0,
     preservedLabels,
   };

@@ -83,6 +83,29 @@ describe("GET /api/issues/claimed", () => {
     });
   });
 
+  // The stuck-claim shape: still holding its agent label while back at
+  // status/ready, invisible to every reaper because this endpoint only ever
+  // returned in-progress. Two p0s sat like that for 20 days.
+  it("lists ready+claimed issues when status=ready", async () => {
+    await makeRequest("http://localhost/api/issues/claimed?agentName=opencode&status=ready");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.labels).toEqual({ hasEvery: ["status/ready", "agent/opencode"] });
+  });
+
+  it("defaults to in-progress when status is omitted", async () => {
+    await makeRequest("http://localhost/api/issues/claimed?agentName=opencode");
+
+    const call = mocks.findManyIssues.mock.calls[0][0];
+    expect(call.where.labels).toEqual({ hasEvery: ["status/in-progress", "agent/opencode"] });
+  });
+
+  it("rejects a status outside the allow-list", async () => {
+    const res = await makeRequest("http://localhost/api/issues/claimed?agentName=opencode&status=done");
+    expect(res.status).toBe(400);
+    expect(mocks.findManyIssues).not.toHaveBeenCalled();
+  });
+
   it("includes repository relation", async () => {
     await makeRequest("http://localhost/api/issues/claimed?agentName=opencode");
 

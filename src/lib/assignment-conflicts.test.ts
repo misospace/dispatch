@@ -243,3 +243,30 @@ describe("getAgentLabels / getOwnerLabels", () => {
     expect(getOwnerLabels(["type/feature", "status/done"])).toEqual([]);
   });
 });
+
+// Two p0s stalled 20 days because a re-claim by the same agent counted as a
+// conflict with itself: the claim route 409'd "already assigned to foreman-coder"
+// on every tick, and claim_one skipped the candidate rather than starving the lane,
+// so nothing ever surfaced it.
+describe("analyzeAssignmentConflict — self-claim", () => {
+  it("does not report a conflict when the only agent label is the assigning agent", () => {
+    const a = analyzeAssignmentConflict(["status/ready", "agent/foreman-coder"], "agent/foreman-coder");
+    expect(a.hasAgentConflict).toBe(false);
+    expect(a.existingAgents).toEqual(["agent/foreman-coder"]);
+  });
+
+  it("still reports a conflict for a different agent", () => {
+    const a = analyzeAssignmentConflict(["status/ready", "agent/other-bot"], "agent/foreman-coder");
+    expect(a.hasAgentConflict).toBe(true);
+  });
+
+  it("reports a conflict when another agent is present alongside the assigning agent", () => {
+    const a = analyzeAssignmentConflict(["agent/foreman-coder", "agent/other-bot"], "agent/foreman-coder");
+    expect(a.hasAgentConflict).toBe(true);
+  });
+
+  it("keeps the old behaviour when no assigning agent is supplied", () => {
+    const a = analyzeAssignmentConflict(["agent/foreman-coder"]);
+    expect(a.hasAgentConflict).toBe(true);
+  });
+});
