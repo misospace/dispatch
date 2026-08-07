@@ -65,6 +65,14 @@ export interface Issue {
   linkedPrHealthCheckedAt?: Date | null;
 }
 
+/**
+ * Issue with full repository relation included.
+ * Used by the projects page where issues are fetched with `include: { repository: true }`.
+ */
+export interface IssueWithRepo extends Omit<Issue, "repository"> {
+  repository: Repository;
+}
+
 export interface AgentRun {
   id: string;
   agentName: string;
