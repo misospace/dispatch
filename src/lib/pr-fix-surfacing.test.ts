@@ -6,6 +6,9 @@ const { mocks } = vi.hoisted(() => ({
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueComment: vi.fn().mockResolvedValue({ url: null }),
     fetchIssueComments: vi.fn().mockResolvedValue([]),
+    // Default: an open PR, so the existing cases keep exercising the label/comment
+    // paths rather than short-circuiting on the terminal guard.
+    fetchPullRequestState: vi.fn().mockResolvedValue({ state: "open", mergedAt: null }),
   },
 }));
 
@@ -13,6 +16,7 @@ vi.mock("@/lib/github", () => ({
   addIssueLabel: mocks.addIssueLabel,
   addIssueComment: mocks.addIssueComment,
   fetchIssueComments: mocks.fetchIssueComments,
+  fetchPullRequestState: mocks.fetchPullRequestState,
 }));
 
 const baseInput = { repo: "org/repo", pr: 42, reason: "merge conflict" };
@@ -125,5 +129,72 @@ describe("surfacePrFixBlocked", () => {
     expect(result.errors).toHaveLength(2);
     expect(result.errors[0]).toMatch(/^label:/);
     expect(result.errors[1]).toMatch(/^comment:/);
+  });
+});
+
+// A PR merged 2026-05-14 received a "needs human attention" comment on 2026-08-06.
+// A BLOCKED item can outlive its PR — a leftover queue row, a late status
+// transition, a re-queue racing a merge — and writing to a finished PR is pure
+// noise that erodes trust in the notifications that are real.
+describe("surfacePrFixBlocked — terminal PR guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueComment.mockResolvedValue({ url: null });
+    mocks.fetchIssueComments.mockResolvedValue([]);
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
+  });
+
+  it("writes nothing when the PR is merged", async () => {
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "closed", mergedAt: "2026-05-14T22:00:19Z" });
+    const res = await surfacePrFixBlocked(baseInput);
+    expect(res.skippedTerminal).toBe(true);
+    expect(res.labelApplied).toBe(false);
+    expect(res.commentPosted).toBe(false);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when the PR is closed unmerged", async () => {
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "closed", mergedAt: null });
+    const res = await surfacePrFixBlocked(baseInput);
+    expect(res.skippedTerminal).toBe(true);
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when the state is unknown", async () => {
+    // Unknown is treated as terminal, matching the idempotency guard's existing
+    // choice: when in doubt, do not write. A missed notification is recoverable
+    // from the queue; a comment on a dead PR is not retractable.
+    mocks.fetchPullRequestState.mockResolvedValue({ state: null, mergedAt: null });
+    const res = await surfacePrFixBlocked(baseInput);
+    expect(res.skippedTerminal).toBe(true);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("reports no errors when it skips — a finished PR is not a failure", async () => {
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "closed", mergedAt: "2026-05-14T22:00:19Z" });
+    const res = await surfacePrFixBlocked(baseInput);
+    expect(res.errors).toEqual([]);
+  });
+
+  it("still labels and comments on an open PR", async () => {
+    const res = await surfacePrFixBlocked(baseInput);
+    expect(res.skippedTerminal).toBe(false);
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, NEEDS_HUMAN_LABEL);
+    expect(mocks.addIssueComment).toHaveBeenCalled();
+  });
+
+  it("checks the PR state before writing anything", async () => {
+    // Ordering matters: a label applied before the check would still be noise.
+    const order: string[] = [];
+    mocks.fetchPullRequestState.mockImplementation(async () => {
+      order.push("state");
+      return { state: "closed", mergedAt: null };
+    });
+    mocks.addIssueLabel.mockImplementation(async () => { order.push("label"); });
+    await surfacePrFixBlocked(baseInput);
+    expect(order).toEqual(["state"]);
   });
 });
