@@ -60,6 +60,8 @@ export async function POST(request: Request) {
       results,
     });
   } finally {
-    await releaseLock(runId).catch(() => {});
+    await releaseLock(runId).catch((error) => {
+      console.error("Failed to release automation sync lock:", error);
+    });
   }
 }

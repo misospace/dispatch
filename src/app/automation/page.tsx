@@ -197,7 +197,9 @@ export default function AutomationOverview() {
           setBlockedCount(data.filter((i: any) => i.status === "BLOCKED").length);
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        console.error("Failed to load PR fix queue:", error);
+      });
   }, []);
 
   async function syncAll() {

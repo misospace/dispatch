@@ -70,7 +70,9 @@ export async function POST(request: NextRequest) {
 
       return NextResponse.json(result);
     } finally {
-      await releaseLock(runId).catch(() => {});
+      await releaseLock(runId).catch((error) => {
+        console.error("Failed to release sync lock:", error);
+      });
     }
   } catch (error) {
     console.error("Sync failed:", error);
