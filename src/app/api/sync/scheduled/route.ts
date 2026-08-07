@@ -185,9 +185,13 @@ export async function POST(request: Request) {
         completedAt: new Date(),
         errorMessage,
       },
-    }).catch(() => {});
+    }).catch((error) => {
+      console.error("Failed to update sync run with error state:", error);
+    });
 
-    await releaseLock(runId).catch(() => {});
+    await releaseLock(runId).catch((error) => {
+      console.error("Failed to release scheduled sync lock:", error);
+    });
 
     return NextResponse.json({ success: false, error: errorMessage }, { status: 500 });
   }

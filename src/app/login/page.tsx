@@ -28,7 +28,9 @@ function LoginContent() {
           router.replace(callbackUrl);
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        console.error("Failed to check session:", error);
+      });
   }, [callbackUrl, router]);
 
   const handleSignIn = () => {

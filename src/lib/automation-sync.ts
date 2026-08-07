@@ -366,7 +366,9 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
     await prisma.automationRepo.update({
       where: { id: repo.id },
       data: { syncError: errorMessage, lastSyncedAt: new Date() },
-    }).catch(() => {});
+    }).catch((error) => {
+      console.error(`Failed to update automation repo ${repo.id} with error state:`, error);
+    });
 
     await prisma.automationSyncRun.update({
       where: { id: syncRun.id },
