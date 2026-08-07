@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { BOARD_COLUMNS, STATUS_LABELS } from "@/types";
+import type { IssueWithRepo } from "@/types";
 import { applyRenovateIssueExclusion, buildVisibleIssueWhere } from "@/lib/issue-filters";
 import { getProjectIssueStatus, groupIssuesByProject } from "@/lib/projects";
 
@@ -73,7 +74,7 @@ export default async function ProjectsPage(_props: PageProps) {
                 >
                   {BOARD_COLUMNS.map((column) => {
                     const statusIssues = project.issues.filter(
-                      (i: any) => getProjectIssueStatus(i as any) === column.id
+                      (i: IssueWithRepo) => getProjectIssueStatus(i) === column.id
                     );
                     return (
                       <div key={column.id} className="space-y-2">
@@ -84,7 +85,7 @@ export default async function ProjectsPage(_props: PageProps) {
                           <p className="text-xs text-muted-foreground">No issues</p>
                         ) : (
                           <div className="space-y-1">
-                            {(statusIssues as any).map((issue: any) => (
+                            {statusIssues.map((issue: IssueWithRepo) => (
                               <a
                                 key={issue.id}
                                 href={issue.url}
