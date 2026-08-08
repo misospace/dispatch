@@ -210,7 +210,7 @@ describe("ingestCommentEvent", () => {
     expect(client.items[0].reason).toContain("actionable feedback");
   });
 
-  it("enqueues ambiguous comments from bot authors with NEEDS_HUMAN lane", async () => {
+  it("does NOT enqueue an ambiguous comment (it no longer blocks the PR)", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();
 
@@ -225,10 +225,9 @@ describe("ingestCommentEvent", () => {
       commentId: "c2",
     });
 
-    expect(client.items).toHaveLength(1);
-    expect(client.items[0].lane).toBe("NEEDS_HUMAN");
-    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
-    expect(client.items[0].status).toBe("BLOCKED");
+    // Previously this enqueued as NEEDS_HUMAN/BLOCKED, so any unclassifiable
+    // comment stopped the PR until a human intervened.
+    expect(client.items).toHaveLength(0);
   });
 
   it("skips comments from non-bot authors", async () => {
@@ -704,7 +703,7 @@ describe("processPrFollowupEvents", () => {
         url: "https://github.com/org/repo/pull/1",
         title: "Fix A",
         author: "itsmiso-ai",
-        body: "Test failed",
+        body: "Test failed: expected 200 but got 500",
         id: "c1",
       },
       {
@@ -1003,5 +1002,74 @@ describe("ingestReviewCommentEvent", () => {
     });
     expect(client.items).toHaveLength(1);
     expect(client.items[0].reason).toContain("bridge/claim.py");
+  });
+});
+
+// ─── Comment gate: actionable-only ──────────────────────────────────────────
+
+describe("comment ingestion requires actionable signal", () => {
+  function commentEvent(body: string, id = "c-gate") {
+    return {
+      eventType: "comment" as const,
+      repoFullName: "org/repo",
+      prNumber: 1,
+      branch: "fix/a",
+      url: "https://github.com/org/repo/pull/1",
+      title: "Fix A",
+      author: "itsmiso-ai",
+      body,
+      id,
+    };
+  }
+
+  it("skips the CI image-publish comment that re-queued pinchflat#25 every sweep", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    const result = await processPrFollowupEvents(client, [
+      commentEvent("🐳 Image for commit 933847b published: `ghcr.io/misospace/pinchflat-dev:pr-25-933847b`"),
+    ]);
+    expect(result.enqueued).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+
+  it.each([
+    ["status chatter", "Looks good to me, nice work"],
+    ["a question", "Why did we go with SQLite here?"],
+    ["an empty body", "   "],
+  ])("does not enqueue %s", async (_label, body) => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    const result = await processPrFollowupEvents(client, [commentEvent(body)]);
+    expect(result.enqueued).toBe(0);
+  });
+
+  it("still enqueues a comment with actionable signal", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    const result = await processPrFollowupEvents(client, [
+      commentEvent("Error: Cannot read property 'id' of undefined in worker.ts"),
+    ]);
+    expect(result.enqueued).toBe(1);
+  });
+
+  it("enqueues an @-mention even when the prose is not classifiable", async () => {
+    // The explicit opt-in: a human directing the loop should not have to phrase
+    // the request so that a regex recognises it.
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    const result = await processPrFollowupEvents(client, [
+      commentEvent("@itsmiso-ai please take another pass at this one"),
+    ]);
+    expect(result.enqueued).toBe(1);
+  });
+
+  it("enqueued comments are NORMAL, never NEEDS_HUMAN", async () => {
+    // Ambiguous comments no longer reach workItem at all, so the lane that used
+    // to strand mergeable PRs cannot be produced by this path.
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    await processPrFollowupEvents(client, [commentEvent("lint error: unused import")]);
+    expect(client.items.length).toBeGreaterThan(0);
+    for (const item of client.items) expect(item.lane).toBe("NORMAL");
   });
 });

@@ -227,6 +227,20 @@ export function isInformationalComment(body: string | undefined | null): boolean
   return INFORMATIONAL_COMMENT_MARKERS.some((marker) => body.includes(marker));
 }
 
+/**
+ * Report whether a comment explicitly directs the loop at itself.
+ *
+ * An @-mention of a configured bot identity is the only unambiguous "this one is
+ * for you" signal a comment carries, so it takes precedence over classification:
+ * a human who deliberately asks for a fix should not need to phrase it so that a
+ * regex recognises it.
+ */
+export function mentionsBotIdentity(body: string | undefined | null): boolean {
+  if (!body) return false;
+  const { botIdentities } = getConfig();
+  return botIdentities.some((identity) => body.includes(`@${identity}`));
+}
+
 // ─── Evidence Key ───────────────────────────────────────────────────────────
 
 /**
@@ -320,21 +334,32 @@ const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
 const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor> = {
   comment: {
     isIngestible: (event) => Boolean(event.body && event.id),
-    // Informational bot comments (CI tables, dispatch's own BLOCKED notice)
-    // are state reports, not work requests — ingesting them strands mergeable
-    // PRs in NEEDS_HUMAN.
-    gate: (event) => !isInformationalComment(event.body),
+    // A comment enqueues work only when it carries actionable signal, or when it
+    // @-mentions the loop. Everything else — CI chatter, status reports, human
+    // discussion — is left alone.
+    //
+    // This default used to point the other way: an unclassifiable comment became
+    // NEEDS_HUMAN and blocked the PR, so any comment nobody had anticipated
+    // stopped the loop. The costs are lopsided. Ignoring a real ask delays it
+    // until someone follows up; ingesting a state report re-enqueues the item on
+    // every sweep, burns a coder each time, and needs a human to unstick.
+    // Observed on misospace/pinchflat#25, where a "🐳 Image for commit ...
+    // published" comment re-queued the item four sweeps running.
+    //
+    // Marker-matching alone loses this race: INFORMATIONAL_COMMENT_MARKERS was
+    // extended once already for a size-diff table (llmkube-images#114) and the
+    // next bot's format walked straight through it.
+    gate: (event) =>
+      !isInformationalComment(event.body) &&
+      (mentionsBotIdentity(event.body) || classifyFeedback(event.body ?? "") === "actionable"),
     filterTerminalPr: false,
     sourceId: (event) => event.id,
-    workItem: (event) => {
-      const classification = classifyFeedback(event.body ?? "");
-      return {
-        lane: classification === "needs_human" ? "NEEDS_HUMAN" : "NORMAL",
-        type: "REVIEW_FEEDBACK",
-        reason: `PR comment: ${classification === "needs_human" ? "ambiguous feedback" : "actionable feedback"}`,
-        feedback: event.body ?? "",
-      };
-    },
+    workItem: (event) => ({
+      lane: "NORMAL",
+      type: "REVIEW_FEEDBACK",
+      reason: "PR comment: actionable feedback",
+      feedback: event.body ?? "",
+    }),
   },
   review: {
     isIngestible: (event) => Boolean(event.state && event.id),
