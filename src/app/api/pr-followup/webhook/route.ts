@@ -20,25 +20,35 @@ import { enforceRateLimit } from "@/lib/rate-limit";
  * with the WEBHOOK_SECRET environment variable.
  *
  * Default behavior is fail-closed: if WEBHOOK_SECRET is not configured,
- * requests are rejected unless WEBHOOK_GATEWAY_MODE is explicitly set to "true",
+ * requests are rejected (503) unless WEBHOOK_GATEWAY_MODE is explicitly set to "true",
  * which indicates the endpoint is behind a gateway that performs its own
  * authentication and signature verification.
  */
 
-/** Is webhook signature verification enabled (fail-closed default)? */
-function isSignatureVerificationEnabled(): boolean {
+/**
+ * Determine signature verification mode.
+ *
+ * - "verify": WEBHOOK_SECRET is set — verify HMAC-SHA256 signature
+ * - "skip": WEBHOOK_GATEWAY_MODE is "true" — skip verification (behind API gateway)
+ * - "reject": neither configured — fail-closed, reject all requests
+ */
+function getSignatureVerificationMode(): "verify" | "skip" | "reject" {
   const secret = process.env.WEBHOOK_SECRET;
-  if (secret) return true;
-  // Gateway mode: caller explicitly opts out of local signature verification
-  return process.env.WEBHOOK_GATEWAY_MODE === "true";
+  if (secret) return "verify";
+  if (process.env.WEBHOOK_GATEWAY_MODE === "true") return "skip";
+  // Fail-closed: reject requests when neither WEBHOOK_SECRET nor WEBHOOK_GATEWAY_MODE is configured
+  return "reject";
 }
 
 function verifyWebhookSignature(secret: string, payload: Buffer, signature: string): boolean {
   if (!signature.startsWith("sha256=")) return false;
-  const expected = signature.slice(9);
+  const expected = signature.slice(7);
   const hmac = createHmac("sha256", secret);
   hmac.update(payload);
   const computed = hmac.digest("hex");
+
+  // Constant-time comparison; timingSafeEqual requires equal-length buffers
+  if (computed.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(computed), Buffer.from(expected));
 }
 
@@ -204,14 +214,20 @@ export async function POST(request: Request) {
     // Webhook signature verification: fail-closed by default.
     // If WEBHOOK_SECRET is set, always verify. If not set, only skip when
     // WEBHOOK_GATEWAY_MODE=true (explicit opt-out for gateway deployments).
-    const sigVerificationEnabled = isSignatureVerificationEnabled();
-    if (sigVerificationEnabled) {
-      const webhookSecret = process.env.WEBHOOK_SECRET;
+    const sigMode = getSignatureVerificationMode();
+    if (sigMode === "reject") {
+      return errorResponse(
+        "Webhook signature verification is not configured. Set WEBHOOK_SECRET or enable WEBHOOK_GATEWAY_MODE.",
+        503,
+      );
+    }
+    if (sigMode === "verify") {
+      const webhookSecret = process.env.WEBHOOK_SECRET!;
       const signature = request.headers.get("x-hub-signature-256");
       if (!signature) {
         return errorResponse("Missing x-hub-signature-256 header", 401);
       }
-      if (!verifyWebhookSignature(webhookSecret!, payload, signature)) {
+      if (!verifyWebhookSignature(webhookSecret, payload, signature)) {
         return errorResponse("Invalid webhook signature", 401);
       }
     }
