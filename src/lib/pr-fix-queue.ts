@@ -116,12 +116,24 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
     previousStatus = existing?.status;
     if (existing) {
+      // Evidence this item has already recorded must not move it back to QUEUED.
+      // The sync re-reads every open PR each sweep, so an event that never goes
+      // away — an undismissed CHANGES_REQUESTED review, a comment — otherwise
+      // resurrects the item after every resolution and dispatches a coder again
+      // 15 minutes later. Observed on misospace/pinchflat#25.
+      //
+      // The enqueue is still recorded in history: knowing the sync re-observed
+      // the evidence is useful, and it is the status flip that causes the churn.
+      // New evidence flows through normally.
+      const isKnownEvidence =
+        !!input.evidenceKey && (existing.evidenceKeys ?? []).includes(input.evidenceKey);
+
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
           lane,
           type,
-          status: nextStatus,
+          status: isKnownEvidence ? existing.status : nextStatus,
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40),
