@@ -389,3 +389,47 @@ describe("pr-fix surfacing integration", () => {
     expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
   });
 });
+
+describe("enqueuePrFixItem evidence dedupe", () => {
+  it("does not move a resolved item back to QUEUED on evidence it already has", async () => {
+    // The pinchflat#25 loop: an undismissed CHANGES_REQUESTED review is re-read
+    // every sweep, so each resolution was undone 15 minutes later.
+    const client = makeClient();
+    const input = {
+      repo: "misospace/pinchflat", pr: 25, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "changes please",
+      evidenceKey: "review:misospace/pinchflat#25:r1",
+    };
+    await enqueuePrFixItem(client, input);
+    client.items[0].status = "FIXED";
+
+    const again = await enqueuePrFixItem(client, input);
+
+    expect(again.status).toBe("FIXED");
+  });
+
+  it("still records the repeat enqueue in history", async () => {
+    // The status flip causes the churn, not the audit row — knowing the sync
+    // re-observed the evidence stays visible.
+    const client = makeClient();
+    const input = {
+      repo: "o/r", pr: 1, lane: "NORMAL", type: "REVIEW_FEEDBACK", reason: "r", feedback: "f",
+      evidenceKey: "review:o/r#1:r1",
+    };
+    await enqueuePrFixItem(client, input);
+    const afterFirst = client.history.length;
+    await enqueuePrFixItem(client, input);
+    expect(client.history.length).toBeGreaterThan(afterFirst);
+  });
+
+  it("new evidence re-queues a resolved item as before", async () => {
+    const client = makeClient();
+    const base = {
+      repo: "o/r", pr: 2, lane: "NORMAL", type: "REVIEW_FEEDBACK", reason: "r", feedback: "f",
+    };
+    await enqueuePrFixItem(client, { ...base, evidenceKey: "review:o/r#2:r1" });
+    client.items[0].status = "FIXED";
+    const again = await enqueuePrFixItem(client, { ...base, evidenceKey: "review:o/r#2:r2" });
+    expect(again.status).toBe("QUEUED");
+  });
+});
