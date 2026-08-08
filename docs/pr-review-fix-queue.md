@@ -46,7 +46,12 @@ Configuration:
 - `check_run` — failing CI checks
 - `pull_request` — merge state changes
 
-Signature verification uses HMAC-SHA256 with `WEBHOOK_SECRET`. If not set, verification is skipped (e.g., behind an API gateway).
+Signature verification uses HMAC-SHA256 with `WEBHOOK_SECRET`.
+
+**Fail-closed default:** If `WEBHOOK_SECRET` is not configured, requests are
+rejected with a 503 response unless `WEBHOOK_GATEWAY_MODE` is explicitly set to
+`"true"` (indicating the endpoint is behind an API gateway that handles its own
+authentication and signature verification).
 
 ## Feedback classification
 

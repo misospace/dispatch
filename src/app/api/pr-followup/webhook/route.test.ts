@@ -25,6 +25,7 @@ vi.mock("@/lib/pr-followup-ingestion", async (importOriginal) => ({
 
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import crypto from "node:crypto";
 
 function postRequest(body: unknown, headers: Record<string, string> = {}) {
   return POST(
@@ -41,11 +42,106 @@ describe("POST /api/pr-followup/webhook", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     delete process.env.WEBHOOK_SECRET;
-    delete process.env.WEBHOOK_GATEWAY_MODE;
+    // Default to gateway mode so existing tests pass without signature headers.
+    // Signature-specific tests below explicitly unset this.
+    process.env.WEBHOOK_GATEWAY_MODE = "true";
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixQueueClient.mockReturnValue({});
     mocks.processPrFollowupEvents.mockResolvedValue({ enqueued: 1, skipped: 0 });
+  });
+
+  describe("signature verification (fail-closed default)", () => {
+    it("rejects with 503 when neither WEBHOOK_SECRET nor WEBHOOK_GATEWAY_MODE is configured", async () => {
+      delete process.env.WEBHOOK_GATEWAY_MODE;
+
+      const res = await postRequest(
+        { action: "submitted", review: { state: "CHANGES_REQUESTED" } },
+        {
+          Authorization: `Bearer ${mockToken}`,
+          "x-github-event": "pull_request_review",
+        },
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.error).toContain("not configured");
+    });
+
+    it("processes without signature when WEBHOOK_GATEWAY_MODE is true", async () => {
+      // WEBHOOK_GATEWAY_MODE is already "true" from beforeEach
+      delete process.env.WEBHOOK_SECRET;
+
+      const res = await postRequest(
+        { action: "submitted", review: { state: "CHANGES_REQUESTED" } },
+        {
+          Authorization: `Bearer ${mockToken}`,
+          "x-github-event": "pull_request_review",
+        },
+      );
+
+      expect(res.status).toBe(200);
+    });
+
+    it("rejects with 401 when WEBHOOK_SECRET is set but no signature header", async () => {
+      delete process.env.WEBHOOK_GATEWAY_MODE;
+      process.env.WEBHOOK_SECRET = "test-secret";
+
+      const res = await postRequest(
+        { action: "submitted", review: { state: "CHANGES_REQUESTED" } },
+        {
+          Authorization: `Bearer ${mockToken}`,
+          "x-github-event": "pull_request_review",
+        },
+      );
+
+      expect(res.status).toBe(401);
+      const body = await res.json();
+      expect(body.error).toContain("Missing x-hub-signature-256");
+    });
+
+    it("rejects with 401 when signature is invalid", async () => {
+      delete process.env.WEBHOOK_GATEWAY_MODE;
+      process.env.WEBHOOK_SECRET = "test-secret";
+
+      const res = await postRequest(
+        { action: "submitted", review: { state: "CHANGES_REQUESTED" } },
+        {
+          Authorization: `Bearer ${mockToken}`,
+          "x-github-event": "pull_request_review",
+          "x-hub-signature-256": "sha256=invalid",
+        },
+      );
+
+      expect(res.status).toBe(401);
+      const body = await res.json();
+      expect(body.error).toContain("Invalid webhook signature");
+    });
+
+    it("processes successfully with valid signature", async () => {
+      delete process.env.WEBHOOK_GATEWAY_MODE;
+      process.env.WEBHOOK_SECRET = "test-secret";
+
+      const payload = { action: "submitted", review: { state: "CHANGES_REQUESTED" } };
+      const bodyStr = JSON.stringify(payload);
+      const sig =
+        "sha256=" + crypto.createHmac("sha256", "test-secret").update(bodyStr).digest("hex");
+
+      // Use a direct Request so the body bytes are exactly what we computed the HMAC over.
+      const req = new Request("http://localhost/api/pr-followup/webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${mockToken}`,
+          "x-github-event": "pull_request_review",
+          "x-hub-signature-256": sig,
+        },
+        body: bodyStr,
+      });
+      const res = await POST(req);
+
+      expect(res.status).toBe(200);
+    });
   });
 
   it("returns 401 when no auth header is present", async () => {
