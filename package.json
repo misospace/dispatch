@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "NODE_ENV=production next build",
     "start": "next start",
     "audit": "npm audit --omit=dev --audit-level=high",
     "lint": "NODE_ENV=development eslint .",
