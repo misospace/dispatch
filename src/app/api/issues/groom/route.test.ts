@@ -10,6 +10,7 @@ const { mocks } = vi.hoisted(() => ({
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
+    fetchIssue: vi.fn().mockResolvedValue(undefined),
     auth: vi.fn(),
   },
 }));
@@ -30,6 +31,7 @@ vi.mock("@/lib/prisma", () => ({
 vi.mock("@/lib/github", () => ({
   removeIssueLabel: mocks.removeIssueLabel,
   addIssueLabel: mocks.addIssueLabel,
+  fetchIssue: mocks.fetchIssue,
 }));
 
 vi.mock("@/lib/auth-next", () => ({
@@ -368,6 +370,30 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
     expect(res.status).toBe(200);
     const call = mocks.updateIssue.mock.calls[0][0];
     expect(call.data.currentLane).toBeUndefined();
+  });
+
+  it("refreshes the cached row from GitHub after writing labels", async () => {
+    mockIssue({ labels: ["status/backlog", "priority/p2"] });
+    mocks.updateIssue.mockResolvedValue({ id: "issue-1", number: 42, labels: ["status/ready", "priority/p2"] });
+    mocks.fetchIssue.mockResolvedValue({
+      number: 42,
+      title: "Issue title",
+      body: "body",
+      html_url: "https://github.com/misospace/dispatch/issues/42",
+      labels: [{ name: "status/ready" }, { name: "priority/p2" }],
+      assignees: [],
+      comments: 0,
+      created_at: "2026-08-15T03:00:00Z",
+      updated_at: "2026-08-15T04:00:00Z",
+      closed_at: null,
+      state: "open",
+    });
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(200);
+    expect(mocks.fetchIssue).toHaveBeenCalledWith("misospace/dispatch", 42);
+    // The refresh writes the freshly-fetched labels back to the cached row.
+    const refreshCall = mocks.updateIssue.mock.calls.at(-1)![0];
+    expect(refreshCall.data!.labels).toEqual(["status/ready", "priority/p2"]);
   });
 });
 

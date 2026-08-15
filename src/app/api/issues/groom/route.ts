@@ -5,6 +5,8 @@ import { authorizeRequest } from "@/lib/auth";
 import { getEscalationLane, getDefaultClaimableLane, isClaimableLane } from "@/lib/lane-config";
 import { resolveActor } from "@/lib/resolve-actor";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { refreshSingleIssue } from "@/lib/issue-sync";
+import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
@@ -180,6 +182,35 @@ export async function POST(request: Request) {
           where: { id: effectiveIssueId },
           data: { ...groomingData, labels: afterLabels, lastSyncedAt: new Date() },
         });
+
+        // Refresh the cached row from GitHub so the board and the selector's
+        // own inputs (labels, currentLane) reflect the labels we just wrote,
+        // instead of showing stale state until something else re-syncs.
+        // Best-effort: a refresh failure must not fail the groom, since the
+        // label change itself already succeeded.
+        try {
+          const refreshResult = await refreshSingleIssue(effectiveRepo, effectiveNumber, fetchIssueFromGitHub);
+          if (refreshResult.success && refreshResult.issueData) {
+            const issueData = refreshResult.issueData;
+            await prisma.issue.update({
+              where: { id: effectiveIssueId },
+              data: {
+                title: issueData.title,
+                body: issueData.body,
+                url: issueData.url,
+                labels: issueData.labels,
+                assignees: issueData.assignees,
+                commentsCount: issueData.commentsCount,
+                updatedAt: issueData.updatedAt,
+                closedAt: issueData.closedAt,
+                state: issueData.state,
+                lastSyncedAt: issueData.lastSyncedAt,
+              },
+            });
+          }
+        } catch {
+          // Refresh is best-effort; the groomed labels are already persisted.
+        }
       } else {
         await prisma.issue.update({
           where: { id: effectiveIssueId },
