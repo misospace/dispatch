@@ -1,6 +1,6 @@
 # Accepted Security Risks
 
-**Last updated: 2026-07-07**
+**Last updated: 2026-08-15**
 
 There are currently no accepted npm runtime advisories.
 
@@ -29,7 +29,7 @@ The following risks are tracked beyond npm advisories:
 
 - The project uses 17 production dependencies with transitive chains managed by npm.
 - Key deep-chain dependencies: `next` (framework), `@modelcontextprotocol/sdk` (MCP protocol), `prisma` / `@prisma/client` (ORM).
-- **Mitigation:** Renovate keeps dependencies updated; `npm audit --omit=dev --audit-level=high` runs on every push and PR via `.github/workflows/security-audit.yaml` and fails the build on high/critical vulnerabilities.
+- **Mitigation:** Renovate keeps dependencies updated; `npm audit --omit=dev --audit-level=high` runs on every push to `main` and every pull request via `.github/workflows/security-audit.yaml` (separate from the main CI workflow) and fails the build on high/critical vulnerabilities.
 
 ### Groomer Autonomous Issue Rewrites (accepted risk)
 
