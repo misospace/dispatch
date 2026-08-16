@@ -1,14 +1,21 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, PrFixQueueClient } from "./pr-fix-queue";
 
-const { surfacingMocks } = vi.hoisted(() => ({
+const { surfacingMocks, lessonFeedMocks } = vi.hoisted(() => ({
   surfacingMocks: {
     surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] }),
+  },
+  lessonFeedMocks: {
+    extractLessonFromFixOutcome: vi.fn().mockResolvedValue({ kind: "no_lesson" as const }),
   },
 }));
 
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: surfacingMocks.surfacePrFixBlocked,
+}));
+
+vi.mock("./lesson-feed", () => ({
+  extractLessonFromFixOutcome: lessonFeedMocks.extractLessonFromFixOutcome,
 }));
 
 function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
@@ -387,6 +394,92 @@ describe("pr-fix surfacing integration", () => {
     await markPrFixItem(client, { repo: "org/repo", pr: 50, status: "FIXED" });
 
     expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+});
+
+describe("pr-fix lesson feed trigger (#754)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockClear();
+    lessonFeedMocks.extractLessonFromFixOutcome.mockClear();
+  });
+
+  it("fires extractLessonFromFixOutcome on QUEUED -> FIXED when feedback.length >= 2", async () => {
+    // Enqueue twice with different feedback so feedback.length reaches 2
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 60,
+      lane: "NORMAL",
+      reason: "ci failure",
+      feedback: "first attempt",
+      evidenceKey: "k1",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 60,
+      lane: "NORMAL",
+      reason: "ci failure",
+      feedback: "second attempt",
+      evidenceKey: "k2",
+    });
+    lessonFeedMocks.extractLessonFromFixOutcome.mockClear();
+
+    await markPrFixItem(client, { repo: "org/repo", pr: 60, status: "FIXED" });
+
+    // The trigger is fire-and-forget (void + .then), so wait a microtask
+    await new Promise((r) => setTimeout(r, 0));
+    expect(lessonFeedMocks.extractLessonFromFixOutcome).toHaveBeenCalledTimes(1);
+    const call = lessonFeedMocks.extractLessonFromFixOutcome.mock.calls[0][0];
+    expect(call.repo).toBe("org/repo");
+    expect(call.feedback.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not fire when feedback.length < 2", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 61,
+      lane: "NORMAL",
+      reason: "ci failure",
+      feedback: "f",
+      evidenceKey: "k1",
+    });
+    // No additional feedback entries — feedback.length stays 1
+    lessonFeedMocks.extractLessonFromFixOutcome.mockClear();
+
+    await markPrFixItem(client, { repo: "org/repo", pr: 61, status: "FIXED" });
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(lessonFeedMocks.extractLessonFromFixOutcome).not.toHaveBeenCalled();
+  });
+
+  it("does not fire on FIXED -> FIXED (only on the transition INTO FIXED)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 62,
+      lane: "NORMAL",
+      reason: "ci failure",
+      feedback: "first",
+      evidenceKey: "k1",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 62,
+      lane: "NORMAL",
+      reason: "ci failure",
+      feedback: "second",
+      evidenceKey: "k2",
+    });
+    // First FIXED transition — this one should fire
+    await markPrFixItem(client, { repo: "org/repo", pr: 62, status: "FIXED" });
+    lessonFeedMocks.extractLessonFromFixOutcome.mockClear();
+
+    // Re-marking FIXED should NOT fire again
+    await markPrFixItem(client, { repo: "org/repo", pr: 62, status: "FIXED" });
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(lessonFeedMocks.extractLessonFromFixOutcome).not.toHaveBeenCalled();
   });
 });
 
