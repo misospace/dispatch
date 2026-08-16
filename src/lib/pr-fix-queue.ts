@@ -1,5 +1,6 @@
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { surfacePrFixBlocked } from "./pr-fix-surfacing";
+import { extractLessonFromFixOutcome } from "./lesson-feed";
 
 export type PrFixQueueClient = {
   prFixQueueItem: {
@@ -211,6 +212,24 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
 
   if (item && previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
     await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: input.note ?? null });
+  }
+  // Trigger the lesson feed (#754) only on a clean transition into FIXED
+  // AND only when feedback burned ≥2 attempts — the same bar the issue calls
+  // out for "something non-obvious about the repo". Errors are advisory; the
+  // queue item must never block on the feed.
+  if (item && previousStatus !== "FIXED" && item.status === "FIXED" && (item.feedback?.length ?? 0) >= 2) {
+    void extractLessonFromFixOutcome({
+      repo: input.repo,
+      reason: item.reason,
+      feedback: item.feedback,
+    }).then((outcome) => {
+      if (outcome.kind === "lesson") {
+        // Downstream (out of scope for this trigger-only wiring): dedupe via
+        // lesson-feed.ts#lessonAlreadyCovered, then open a docs PR appending
+        // under `## Learned by the loop` in the repo's AGENTS.md.
+        console.info("[lesson-feed] proposed", { repo: input.repo, itemId: item.id, text: outcome.text.slice(0, 200) });
+      }
+    }).catch(() => { /* swallow — feed is advisory */ });
   }
   return item;
 }
