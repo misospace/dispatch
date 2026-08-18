@@ -138,6 +138,48 @@ Dispatch supports optional GitHub App authentication to provide a separate ident
 
 **Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` (for instance URL).
 
+### Auth, Triage, Queue, and Webhooks
+
+These variables tune the OIDC callback, the operator-UI triage surface, the queue
+view, the inbound webhook (PR followup) handler, and the lesson feed. Most have
+safe defaults and can be omitted in small deployments.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AUTH_URL` | No | Public base URL used to construct the OIDC callback (`/api/auth/callback/...`). Optional; falls back to `NEXTAUTH_URL`. Set this when Dispatch sits behind a reverse proxy that rewrites the public origin. |
+| `AGENTS` | No | Comma-separated agent identifiers exposed by `GET /api/issues/actions/agents`. When unset, Dispatch returns the built-in default set (e.g. `foreman-coder`, `foreman-reviewer`). |
+| `DISPATCH_EXCLUDED_LABELS` | No | Comma-separated label names excluded from triage, grooming, and queue calculations. Useful for hiding labels like `wontfix` or `duplicate` from the operator UI. |
+| `DISPATCH_LANE_CONFIG_JSON` | No | JSON-encoded lane configuration. Schema: `{ "<lane-name>": { "labels": ["priority/high", ...], "tier": 0\|1\|2 } }`. Tiers render as prioritized columns in the queue UI. When unset, lanes are auto-derived from labels prefixed with `lane/`. |
+| `DISPATCH_QUEUE_AGING_DAYS_PER_TIER` | No | Comma-separated numbers (days) defining the aging buckets per queue tier. The first entry applies to the highest-priority tier, the second to the next, and so on. Issues older than the matching bucket are highlighted in the queue UI. |
+| `DISPATCH_QUEUE_AGING_MAX_TIERS` | No | Maximum number of aging buckets the queue UI will render, regardless of how many entries `DISPATCH_QUEUE_AGING_DAYS_PER_TIER` contains. |
+| `DISPATCH_SYNC_LOCK_MAX_AGE_MS` | No | Maximum age (ms) before a stale sync lock is considered abandoned and may be reclaimed by a new sync run. Defaults to `1_800_000` (30 minutes). |
+| `WEBHOOK_SECRET` | Conditional | HMAC-SHA256 shared secret used to verify inbound webhook payloads. Required for `POST /api/pr-followup/webhook` when `WEBHOOK_GATEWAY_MODE` is not `true`. See `docs/pr-review-fix-queue.md` for the event contract. Use a long random string (>= 32 bytes recommended). |
+| `WEBHOOK_GATEWAY_MODE` | No | When set to `true`, disables the built-in signature check because an upstream API gateway has already verified the request. Must be the literal string `"true"` or `"false"` (parsed as a string, not a boolean). |
+| `PR_FOLLOWUP_BOT_IDENTITIES` | No | JSON object mapping bot logins (e.g. `dependabot[bot]`) to a behaviour label. When a webhook event arrives from a listed identity, Dispatch skips its followup handling. Example: `'{"dependabot[bot]":"auto-merge"}'`. |
+| `PR_FOLLOWUP_BRANCH_OWNERS` | No | Comma-separated GitHub logins considered the canonical owner of a followup branch. Used to suppress "needs author" nudges. |
+| `OPENAI_API_KEY` | Conditional | OpenAI API key used by the lesson feed. Ignored when `DISPATCH_LLM_API_KEY` is set. |
+| `OPENAI_BASE_URL` | No | OpenAI-compatible base URL for the lesson feed. Ignored when `DISPATCH_LLM_BASE_URL` is set. |
+| `OPENAI_MODEL` | No | Default model for the lesson feed. The groomer uses `DISPATCH_GROOMER_MODEL` instead when set. |
+| `DISPATCH_AGENT_NAME` | No | Display name used by the agent when posting heartbeats. Defaults to the host's `HOSTNAME` env var. |
+| `DISPATCH_CLOSED_ISSUE_RETENTION_DAYS` | No | Days that a closed issue is kept before `/api/issues/prune-closed` is allowed to remove it. Defaults to `30`. |
+| `DISPATCH_DONE_RETENTION_DAYS` | No | Days that a done issue is kept before the issue list endpoint filters it out. Defaults to `7`. |
+| `DISPATCH_SCHEDULER_ENABLED` | No | Set to `"true"` to enable the in-process scheduler. When unset or `"false"`, the scheduler is disabled and jobs must be triggered externally (e.g. by a cron or k8s CronJob hitting the `/api/*/scheduled` endpoints). |
+| `DISPATCH_SCHEDULER_STARTUP_DELAY_MS` | No | Milliseconds the scheduler waits after server start before firing its first job. |
+| `DISPATCH_SYNC_INTERVAL_MS` | No | Interval (ms) between automated `/api/sync/scheduled` runs. Set to `"0"` to disable this job while keeping the scheduler enabled. |
+| `DISPATCH_GROOMER_INTERVAL_MS` | No | Interval (ms) between automated `/api/groomer/run` runs. Set to `"0"` to disable. |
+| `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | Interval (ms) between automated `/api/pr-followup/sync` runs. Set to `"0"` to disable. |
+| `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Interval (ms) between automated `/api/issues/prune-closed` runs. Set to `"0"` to disable. |
+
+> **Legacy aliases (do not set):** `MISSION_CONTROL_URL` and
+> `MISSION_CONTROL_AGENT_TOKEN` were renamed to `DISPATCH_URL` and
+> `DISPATCH_AGENT_TOKEN`. They are referenced only by legacy test fixtures and
+> ignored at runtime; they appear in `.env.example` for discoverability.
+
+> **Framework / build-time vars:** `NODE_ENV`, `NEXT_RUNTIME`, and
+> `NEXT_PUBLIC_DISPATCH_VERSION` are managed by the Next.js runtime or the
+> build process. They are intentionally omitted from `.env.example` to avoid
+> confusion.
+
 ## First-Run Flow
 
 To get started with Dispatch:
