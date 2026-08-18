@@ -1,0 +1,76 @@
+---
+# Packages and pushes the Helm chart for a published release.
+#
+# Split out of publish-release.yml when release-please took over cutting the
+# tag and release. release-please stamps charts/dispatch/Chart.yaml in the
+# release PR (see extra-files in release-please-config.json), so this only
+# packages what is already committed and asserts it agrees with the tag.
+name: Publish Chart
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package or republish (for example v0.5.38)'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish-chart:
+    name: Publish Chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      # Replaces the "exactly package.json + package-lock.json" allow-list that
+      # publish-release.yml enforced on the release PR: the chart is only pushed
+      # when the committed Chart.yaml already matches the tag being released.
+      - name: Verify Chart.yaml matches the release tag
+        id: chart
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          CHART_VERSION="${TAG#v}"
+          if [[ ! "$CHART_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag $TAG is not a semver release tag"
+            exit 1
+          fi
+          FILE_VERSION=$(yq -r '.version' charts/dispatch/Chart.yaml)
+          FILE_APPVERSION=$(yq -r '.appVersion' charts/dispatch/Chart.yaml)
+          if [ "$FILE_VERSION" != "$CHART_VERSION" ] || [ "$FILE_APPVERSION" != "$CHART_VERSION" ]; then
+            echo "Chart.yaml is $FILE_VERSION/$FILE_APPVERSION but the tag is $CHART_VERSION"
+            exit 1
+          fi
+          echo "chart_version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.4
+
+      - name: Package and push Helm chart to OCI registry
+        env:
+          # The Actions token (not the app token): GHCR package creation is
+          # scoped to the repo's own token — the app token 403s on the first
+          # push of a new package (ghcr.io/misospace/charts/dispatch).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHART_VERSION: ${{ steps.chart.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm dependency build charts/dispatch
+          helm package charts/dispatch --destination /tmp/charts
+          helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin <<< "${GH_TOKEN}"
+          helm push "/tmp/charts/dispatch-${CHART_VERSION}.tgz" oci://ghcr.io/misospace/charts
