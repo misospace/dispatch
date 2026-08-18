@@ -312,6 +312,18 @@ export async function markPrFix(input: {
   });
 }
 
+export async function requeuePrFix(input: {
+  repo: string;
+  pr: number;
+  isPrMergedOrClosed?: boolean;
+  note?: string | null;
+}): Promise<unknown> {
+  return mcJson<unknown>("/api/pr-fix-queue/requeue", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function runGroomer(target?: {
   repoFullName?: string;
   issueNumber?: number;

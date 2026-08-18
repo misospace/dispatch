@@ -36,6 +36,8 @@ export default function PrFixQueuePage() {
   const [items, setItems] = useState<PrFixItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [requeueingKey, setRequeueingKey] = useState<string | null>(null);
+  const [requeueError, setRequeueError] = useState("");
 
   const fetchData = useCallback(async () => {
     try {
@@ -56,6 +58,44 @@ export default function PrFixQueuePage() {
 
   useEffect(() => {
     fetchData();
+  }, [fetchData]);
+
+  const requeueBlocked = useCallback(async (item: PrFixItem) => {
+    const key = `${item.repo}#${item.pr}`;
+    setRequeueingKey(key);
+    setRequeueError("");
+    try {
+      // Fetch the current PR state so we can refuse requeue when the upstream
+      // PR is already merged or closed (consistent with classify_pr_lifecycle
+      // treating those as nothing-left-to-fix).
+      const prRes = await authedFetch(`/api/github/prs/${item.repo}/${item.pr}`).catch(() => null);
+      let isPrMergedOrClosed = false;
+      if (prRes && prRes.ok) {
+        const pr = await prRes.json().catch(() => null);
+        if (pr && (pr.state === "closed" || pr.merged === true || pr.state === "merged")) {
+          isPrMergedOrClosed = true;
+        }
+      }
+      const res = await authedFetch("/api/pr-fix-queue/requeue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repo: item.repo,
+          pr: item.pr,
+          isPrMergedOrClosed,
+          note: "requeue from queue page",
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to requeue");
+      }
+      await fetchData();
+    } catch (err) {
+      setRequeueError(err instanceof Error ? err.message : "Failed to requeue");
+    } finally {
+      setRequeueingKey(null);
+    }
   }, [fetchData]);
 
   const blocked = items.filter((i) => i.status === "BLOCKED");
@@ -81,6 +121,11 @@ export default function PrFixQueuePage() {
       {error && (
         <Card className="border-destructive">
           <CardContent className="py-4 text-sm text-destructive">{error}</CardContent>
+        </Card>
+      )}
+      {requeueError && (
+        <Card className="border-destructive">
+          <CardContent className="py-4 text-sm text-destructive">Requeue failed: {requeueError}</CardContent>
         </Card>
       )}
 
@@ -117,6 +162,15 @@ export default function PrFixQueuePage() {
                 {blocked.map((item) => (
                   <TableRow key={item.id}>
                     <TableCell>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => requeueBlocked(item)}
+                        disabled={requeueingKey === `${item.repo}#${item.pr}`}
+                        className="mb-1"
+                      >
+                        {requeueingKey === `${item.repo}#${item.pr}` ? "Requeueing…" : "Requeue"}
+                      </Button>
                       <div className="font-medium text-sm">{prTitle(item)}</div>
                       <div className="text-xs text-muted-foreground">{item.repo}</div>
                     </TableCell>

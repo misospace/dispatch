@@ -10,6 +10,7 @@ import {
   listIssues,
   listPrFixes,
   markPrFix,
+  requeuePrFix,
   runGroomer,
   resolveAgentName,
   refreshIssue,
@@ -180,6 +181,17 @@ export async function markPrFixHandler(args: ExtraArgs): Promise<ToolResult> {
       pr: args.pr as number,
       status: args.status as string,
       note: args.note as string | undefined,
+    }),
+  );
+}
+
+export async function requeuePrFixHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    requeuePrFix({
+      repo: args.repo as string,
+      pr: args.pr as number,
+      isPrMergedOrClosed: args.isPrMergedOrClosed === true,
+      note: typeof args.note === "string" ? args.note : null,
     }),
   );
 }
@@ -366,6 +378,25 @@ export function createServer(): McpServerType {
       },
     },
     markPrFixHandler,
+  );
+
+  // ── requeue_pr_fix ───────────────────────────────────────────────────────
+
+  server.registerTool(
+    "requeue_pr_fix",
+    {
+      description:
+        "Return a BLOCKED pr-fix item to QUEUED with its attempt counter reset, so the loop works it again. Refuses if the upstream PR is already merged or closed. Writes an audit row.",
+      inputSchema: {
+        repo: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+        pr: z.number().int().positive().describe("Pull request number"),
+        isPrMergedOrClosed: z
+          .boolean()
+          .describe("Pass true to refuse requeue because the upstream PR is already merged or closed"),
+        note: z.string().optional().describe("Optional note explaining the requeue"),
+      },
+    },
+    requeuePrFixHandler,
   );
 
   // ── run_groomer ──────────────────────────────────────────────────────────
