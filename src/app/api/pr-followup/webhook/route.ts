@@ -199,21 +199,17 @@ export async function POST(request: Request) {
     // Read raw body before authorization so that if authorizeRequest ever
     // consumes the body stream, HMAC verification still operates on the real payload.
     const rawBody = await request.arrayBuffer();
-
-    // Authenticate the request (Bearer token, Basic Auth, or OIDC session)
-    const auth = await authorizeRequest(request);
-    if (!auth.authorized) {
-      return errorResponse("Unauthorized", 401);
-    }
-
-    const limited = enforceRateLimit(`pr-followup-webhook:${auth.actor ?? "webhook"}`, { limit: 30, windowMs: 10_000 });
-    if (limited) return limited;
-
     const payload = Buffer.from(rawBody);
 
     // Webhook signature verification: fail-closed by default.
     // If WEBHOOK_SECRET is set, always verify. If not set, only skip when
     // WEBHOOK_GATEWAY_MODE=true (explicit opt-out for gateway deployments).
+    //
+    // When WEBHOOK_SECRET is configured, a valid HMAC signature is treated as
+    // sufficient authentication for the webhook (matches GitHub's delivery
+    // shape, which carries no Authorization header). authorizeRequest is then
+    // skipped so direct GitHub deliveries work in oidc/legacy/basic auth modes.
+    // Invalid signatures are still rejected with 401.
     const sigMode = getSignatureVerificationMode();
     if (sigMode === "reject") {
       return errorResponse(
@@ -231,6 +227,22 @@ export async function POST(request: Request) {
         return errorResponse("Invalid webhook signature", 401);
       }
     }
+
+    // Authenticate the request (Bearer token, Basic Auth, or OIDC session).
+    // When sigMode === "verify" the HMAC check above is the authentication
+    // gate, so we skip authorizeRequest to let signature-only GitHub deliveries
+    // through. In all other modes we still require the normal auth layer.
+    let actor = "webhook";
+    if (sigMode !== "verify") {
+      const auth = await authorizeRequest(request);
+      if (!auth.authorized) {
+        return errorResponse("Unauthorized", 401);
+      }
+      actor = auth.actor ?? "webhook";
+    }
+
+    const limited = enforceRateLimit(`pr-followup-webhook:${actor}`, { limit: 30, windowMs: 10_000 });
+    if (limited) return limited;
 
     // Parse JSON payload from the already-read buffer
     let jsonPayload: unknown;
