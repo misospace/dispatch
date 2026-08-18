@@ -142,6 +142,61 @@ describe("POST /api/pr-followup/webhook", () => {
 
       expect(res.status).toBe(200);
     });
+
+    // Regression for issue #761: a GitHub-shaped delivery carries only a
+    // valid x-hub-signature-256 (no Authorization header). With WEBHOOK_SECRET
+    // configured this must be sufficient to reach the event handler in every
+    // DISPATCH_AUTH_MODE (oidc, legacy, basic), because the route's HMAC check
+    // is the authentication gate.
+    it.each(["oidc", "legacy", "basic"] as const)(
+      "accepts GitHub-shaped delivery (valid HMAC, no Authorization) in %s auth mode",
+      async (authMode) => {
+        delete process.env.WEBHOOK_GATEWAY_MODE;
+        process.env.WEBHOOK_SECRET = "test-secret";
+        process.env.DISPATCH_AUTH_MODE = authMode;
+        resetAuthCaches();
+
+        const payload = { action: "submitted", review: { state: "CHANGES_REQUESTED" } };
+        const bodyStr = JSON.stringify(payload);
+        const sig =
+          "sha256=" + crypto.createHmac("sha256", "test-secret").update(bodyStr).digest("hex");
+
+        const req = new Request("http://localhost/api/pr-followup/webhook", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-github-event": "pull_request_review",
+            "x-hub-signature-256": sig,
+          },
+          body: bodyStr,
+        });
+        const res = await POST(req);
+
+        expect(res.status).toBe(200);
+      },
+    );
+
+    it("still 401s a signature-only delivery when the HMAC is invalid in every auth mode", async () => {
+      delete process.env.WEBHOOK_GATEWAY_MODE;
+      process.env.WEBHOOK_SECRET = "test-secret";
+      process.env.DISPATCH_AUTH_MODE = "basic";
+      resetAuthCaches();
+
+      const req = new Request("http://localhost/api/pr-followup/webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-github-event": "pull_request_review",
+          "x-hub-signature-256": "sha256=deadbeef",
+        },
+        body: JSON.stringify({ action: "submitted", review: { state: "CHANGES_REQUESTED" } }),
+      });
+      const res = await POST(req);
+
+      expect(res.status).toBe(401);
+      const body = await res.json();
+      expect(body.error).toContain("Invalid webhook signature");
+    });
   });
 
   it("returns 401 when no auth header is present", async () => {

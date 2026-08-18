@@ -133,6 +133,18 @@ export async function middleware(request: NextRequest) {
     return response;
   }
 
+  // The GitHub PR-followup webhook authenticates via HMAC signature when
+  // WEBHOOK_SECRET is configured. GitHub's delivery shape carries no
+  // Authorization header, so we must let the request reach the route handler
+  // (which performs the signature check) instead of rejecting it here in
+  // basic mode. Without this exemption, direct GitHub deliveries always 401
+  // before the signature is ever checked. See issue #761.
+  if (request.nextUrl.pathname.startsWith("/api/pr-followup/webhook") && process.env.WEBHOOK_SECRET) {
+    const response = NextResponse.next();
+    applySecurityHeaders(response);
+    return response;
+  }
+
   const authHeader = request.headers.get("authorization");
 
   if (isApiRoute && (isBearerAuthorized(authHeader) || isBasicAuthorized(authHeader))) {
