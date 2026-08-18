@@ -62,10 +62,11 @@
     "vitest": "^4.1.8"
   },
   "//": {
-    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory), sharp ^0.35.0 (libvips CVE-2026-33327/33328/35590/35591, #675 — already satisfied transitively by next@16.3.0's optional dep `sharp: ^0.35.3`, but the override survives any future `next` downgrade). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
+    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory), sharp ^0.35.0 (libvips CVE-2026-33327/33328/35590/35591, #675 \u2014 already satisfied transitively by next@16.3.0's optional dep `sharp: ^0.35.3`, but the override survives any future `next` downgrade, deepmerge-ts ^8.0.0 (stack-exhaustion GHSA-ggr8-5vv4-36mx, published 2026-08-17 \u2014 reaches us transitively via prisma > @prisma/config; npm's only advertised stable fix is downgrading prisma to 6.12.0, a breaking change, so the override is the cheaper path)). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
   },
   "overrides": {
     "postcss": "^8.5.10",
-    "sharp": "^0.35.0"
+    "sharp": "^0.35.0",
+    "deepmerge-ts": "^8.0.0"
   }
 }
