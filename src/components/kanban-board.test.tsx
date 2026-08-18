@@ -325,11 +325,11 @@ describe("KanbanBoard horizontal scroll layout", () => {
     expect(grid).toHaveStyle({ minWidth: "fit-content" });
   });
 
-  it("renders all five columns in canonical order", () => {
+  it("renders all six columns in canonical order", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
     // Column titles are in aria-label of section elements, not visible text
-    const columnTitles = ["Backlog", "Ready", "In Progress", "In Review", "Done"];
+    const columnTitles = ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"];
     columnTitles.forEach((title) => {
       expect(screen.getByRole("region", { name: title })).toBeInTheDocument();
     });
@@ -340,6 +340,6 @@ describe("KanbanBoard horizontal scroll layout", () => {
 
     // Each KanbanColumn renders as a section with aria-label
     const sections = document.querySelectorAll("section[aria-label]");
-    expect(sections).toHaveLength(5);
+    expect(sections).toHaveLength(6);
   });
 });

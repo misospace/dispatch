@@ -16,6 +16,7 @@ const IN_PROGRESS_STATUS: string = "status/in-progress";
 const IN_REVIEW_STATUS: string = "status/in-review";
 const BACKLOG_STATUS: string = "status/backlog";
 const READY_STATUS: string = "status/ready";
+const BLOCKED_STATUS: string = "status/blocked";
 
 /**
  * Compact linked-PR-health summary carried on queue items, sourced from the
@@ -165,26 +166,33 @@ function rankIssue(
  * Determine if an issue is actionable for the agent queue.
  * - Must be open (not closed)
  * - Must not have status/done
+ * - Must not have status/blocked (parks the issue until a human moves it back)
  */
 function isActionable(issueLabels: string[]): boolean {
   const status = getStatusFromLabels(issueLabels);
 
   // Exclude done
   if (status === DONE_STATUS) return false;
+  // Exclude blocked: a human flagged this as needing intervention, so it
+  // stays out of agent circulation until a human moves it back to a
+  // claimable status (the way status/done does).
+  if (status === BLOCKED_STATUS) return false;
 
-  // Include all non-done statuses including no-status
+  // Include all non-done, non-blocked statuses including no-status
   return true;
 }
 
 /**
  * Check if an issue's status is claimable for the default worker queue.
  * Only status/ready and status/in-progress are worker-actionable.
- * Excludes: no-status, status/in-review, status/backlog (filtered earlier).
+ * Excludes: no-status, status/in-review, status/backlog (filtered earlier),
+ * status/blocked (also filtered earlier via isActionable).
  */
 function isClaimableStatus(labels: string[]): boolean {
   const status = getStatusFromLabels(labels);
   if (status === null) return false;
   if (status === IN_REVIEW_STATUS) return false;
+  if (status === BLOCKED_STATUS) return false;
   // status/backlog already filtered above; remaining statuses (ready, in-progress) are actionable
   return true;
 }

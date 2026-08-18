@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { BOARD_COLUMNS, STATUS_LABELS, StatusLabel } from "./index";
 
 describe("BOARD_COLUMNS", () => {
-  it("has exactly five columns", () => {
-    expect(BOARD_COLUMNS).toHaveLength(5);
+  it("has exactly six columns", () => {
+    expect(BOARD_COLUMNS).toHaveLength(6);
   });
 
   it("defines columns in canonical order", () => {
@@ -12,13 +12,21 @@ describe("BOARD_COLUMNS", () => {
       "status/ready",
       "status/in-progress",
       "status/in-review",
+      "status/blocked",
       "status/done",
     ];
     expect(BOARD_COLUMNS.map((c) => c.id)).toEqual(expected);
   });
 
   it("provides human-readable titles", () => {
-    const expectedTitles = ["Backlog", "Ready", "In Progress", "In Review", "Done"];
+    const expectedTitles = [
+      "Backlog",
+      "Ready",
+      "In Progress",
+      "In Review",
+      "Blocked",
+      "Done",
+    ];
     expect(BOARD_COLUMNS.map((c) => c.title)).toEqual(expectedTitles);
   });
 
@@ -33,12 +41,13 @@ describe("STATUS_LABELS derivation", () => {
     expect(STATUS_LABELS).toEqual(BOARD_COLUMNS.map((c) => c.id));
   });
 
-  it("contains all five status labels", () => {
+  it("contains all six status labels", () => {
     const expected: StatusLabel[] = [
       "status/backlog",
       "status/ready",
       "status/in-progress",
       "status/in-review",
+      "status/blocked",
       "status/done",
     ];
     expect(STATUS_LABELS).toEqual(expected);
