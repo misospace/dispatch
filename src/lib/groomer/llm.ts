@@ -156,6 +156,17 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOu
     }
 
     return parsed;
+  } catch (err) {
+    // Attribute timeouts to the model so aborts can be correlated with pool
+    // members. The raw AbortError message is "This operation was aborted" and
+    // carries no model info; without this wrapper, every timeout looks the
+    // same in the GroomingRun.errorMessage column.
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(
+        `Groomer LLM call to model '${options.model}' aborted after ${options.timeoutMs}ms timeout`,
+      );
+    }
+    throw err;
   } finally {
     clearTimeout(timeoutId);
   }
