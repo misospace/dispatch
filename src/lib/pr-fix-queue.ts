@@ -38,6 +38,13 @@ export interface MarkPrFixInput {
   note?: string | null;
 }
 
+export interface RequeuePrFixInput {
+  repo: string;
+  pr: number;
+  note?: string | null;
+  isPrMergedOrClosed?: boolean;
+}
+
 export function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -201,11 +208,22 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
   if (!nextStatus) throw new Error("Invalid status");
 
   let previousStatus: PrFixStatus | undefined;
+  let previousLane: PrFixLane | undefined;
   const item = await client.$transaction(async (tx) => {
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
     if (!existing) return null;
     previousStatus = existing.status;
-    const updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data: { status: nextStatus } });
+    previousLane = existing.lane;
+    // Give-up: BLOCKED items always land in NEEDS_HUMAN so the existing red badge
+    // actually means something and so the bridge's ACTIONABLE_LANES filter
+    // continues to skip them. See bridge/prfix.py ACTIONABLE_LANES.
+    const data: Record<string, unknown> = { status: nextStatus };
+    if (nextStatus === "BLOCKED") {
+      data.lane = "NEEDS_HUMAN";
+    } else if (nextStatus === "QUEUED") {
+      data.lane = "NORMAL";
+    }
+    const updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data });
     await tx.prFixHistory.create({ data: { itemId: updated.id, action: "mark", status: nextStatus, note: input.note ?? undefined } });
     return updated;
   });
@@ -313,5 +331,54 @@ export function toAgentQueuePrFixItem(item: any) {
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,
+  };
+}
+
+/**
+ * Return a BLOCKED pr-fix item to QUEUED with its attempt counter reset, so
+ * the loop works it again without needing a hand-pushed commit to retrigger.
+ *
+ * Refuses if the upstream PR is already merged or closed — consistent with
+ * `classify_pr_lifecycle` treating those as nothing-left-to-fix. The caller
+ * passes `isPrMergedOrClosed` (computed upstream) so this stays a pure db op.
+ */
+export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeuePrFixInput) {
+  if (input.isPrMergedOrClosed) {
+    throw new Error("Cannot requeue: upstream PR is merged or closed");
+  }
+
+  const item = await client.$transaction(async (tx) => {
+    const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
+    if (!existing) return null;
+    if (existing.status !== "BLOCKED") {
+      throw new Error(`Cannot requeue: item is ${existing.status}, not BLOCKED`);
+    }
+    const updated = await tx.prFixQueueItem.update({
+      where: { id: existing.id },
+      data: { status: "QUEUED", lane: "NORMAL" },
+    });
+    await tx.prFixHistory.create({
+      data: {
+        itemId: updated.id,
+        action: "requeue",
+        status: "QUEUED",
+        note: input.note ?? "operator requeue",
+      },
+    });
+    return updated;
+  });
+  return item;
+}
+
+export function parseRequeuePrFixInput(body: unknown): RequeuePrFixInput | { error: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Invalid JSON body" };
+  const input = body as Record<string, unknown>;
+  if (!nonEmpty(input.repo)) return { error: "Missing required field: repo" };
+  if (input.pr === undefined || input.pr === null || !Number.isInteger(Number(input.pr))) return { error: "Missing required field: pr" };
+  return {
+    repo: input.repo.trim(),
+    pr: Number(input.pr),
+    note: typeof input.note === "string" ? input.note : null,
+    isPrMergedOrClosed: input.isPrMergedOrClosed === true,
   };
 }
