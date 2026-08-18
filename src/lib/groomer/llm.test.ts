@@ -93,6 +93,24 @@ describe("callGroomerLLM", () => {
     ).rejects.toThrow(/parse/i);
   });
 
+  it("attributes AbortError timeouts to the requested model", async () => {
+    // The raw fetch AbortError carries no model info — every timeout otherwise
+    // looks identical in GroomingRun.errorMessage, so aborts can't be correlated
+    // with the pool member that served them.
+    const abortError = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    global.fetch = vi.fn().mockRejectedValue(abortError);
+
+    await expect(
+      callGroomerLLM({
+        baseUrl: "https://llm.example.com",
+        apiKey: "sk-test",
+        model: "self-hosted/mac-member",
+        prompt: "test",
+        timeoutMs: 60000,
+      }),
+    ).rejects.toThrow(/self-hosted\/mac-member.*60000ms/);
+  });
+
   it("includes authorization header", async () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
