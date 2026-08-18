@@ -53,7 +53,7 @@ Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL`. `DISPATCH_AGENT_TOKE
 
 Labels follow a `category/value` pattern:
 
-- **Status**: `status/backlog`, `status/ready`, `status/in-progress`, `status/in-review`, `status/done`
+- **Status**: `status/backlog`, `status/ready`, `status/in-progress`, `status/in-review`, `status/blocked`, `status/done`
 - **Owner**: `owner/*` (e.g., `owner/alice`); Board owner filtering is label-based and does not use GitHub assignees
 - **Agent**: `agent/*` (e.g., `agent/alpha`); Board agent filtering is label-based and does not use AgentRun names, configured agents, or GitHub assignees
 - **Project**: `project/*` (e.g., `project/k8s`)

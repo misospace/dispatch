@@ -110,7 +110,7 @@ describe("POST /api/issues/status — validation", () => {
     mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.removeIssueLabel.mockResolvedValue(undefined);
 
-    for (const s of ["backlog", "in-progress", "in-review", "done"]) {
+    for (const s of ["backlog", "in-progress", "in-review", "blocked", "done"]) {
       const res = await POST(makeRequest({ status: s }));
       expect(res.status).toBe(200);
     }
@@ -244,5 +244,25 @@ describe("POST /api/issues/status — business logic", () => {
     expect(body.labels).toContain("priority/p0");
     expect(body.labels).toContain("type/bug");
     expect(body.labels).toContain("status/in-progress");
+  });
+
+  it("transitions an issue to status/blocked", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"], number: 42, repository: { fullName: "org/repo" } });
+    const res = await POST(makeRequest({ status: "blocked" }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/blocked");
+  });
+
+  it("transitions an issue from status/blocked back to status/ready", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/blocked"], number: 42, repository: { fullName: "org/repo" } });
+    const res = await POST(makeRequest({ status: "ready" }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/blocked");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
   });
 });

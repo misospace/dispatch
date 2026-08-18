@@ -420,13 +420,15 @@ export function createServer(): McpServerType {
     "set_issue_status",
     {
       description:
-        "Set the status label on a Dispatch issue (e.g. 'in-progress', 'in-review', 'done'). Transitions the status/ label on GitHub and in the local cache.",
+        "Set the status label on a Dispatch issue (e.g. 'in-progress', 'in-review', 'done', 'blocked'). Transitions the status/ label on GitHub and in the local cache. Setting 'blocked' parks the issue out of agent circulation until a human moves it back.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
         status: z
           .string()
-          .describe("Status label value: backlog, ready, in-progress, in-review, or done"),
+          .describe(
+            "Status label value: backlog, ready, in-progress, in-review, blocked, or done",
+          ),
         agentName: z
           .string()
           .optional()

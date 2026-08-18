@@ -99,7 +99,13 @@ export interface AuditLog {
   createdAt: Date;
 }
 
-export type StatusLabel = "status/backlog" | "status/ready" | "status/in-progress" | "status/in-review" | "status/done";
+export type StatusLabel =
+  | "status/backlog"
+  | "status/ready"
+  | "status/in-progress"
+  | "status/in-review"
+  | "status/blocked"
+  | "status/done";
 export type AgentLabel = `agent/${string}`;
 export type OwnerLabel = `owner/${string}`;
 export type PriorityLabel = "priority/p0" | "priority/p1" | "priority/p2" | "priority/p3";
@@ -116,6 +122,7 @@ export const BOARD_COLUMNS: BoardColumn[] = [
   { id: "status/ready", title: "Ready" },
   { id: "status/in-progress", title: "In Progress" },
   { id: "status/in-review", title: "In Review" },
+  { id: "status/blocked", title: "Blocked" },
   { id: "status/done", title: "Done" },
 ];
 
@@ -186,6 +193,7 @@ export const LABEL_COLORS: Record<string, string> = {
   "status/ready": "f59e0b",
   "status/in-progress": "3b82f6",
   "status/in-review": "a855f7",
+  "status/blocked": "dc2626",
   "status/done": "22c55e",
   "priority/p0": "ef4444",
   "priority/p1": "f97316",

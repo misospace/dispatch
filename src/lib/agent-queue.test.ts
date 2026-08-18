@@ -73,6 +73,31 @@ describe("buildAgentQueue", () => {
     expect(result).toHaveLength(0);
   });
 
+  it("excludes blocked issues from default queue", () => {
+    const issues = [makeIssue({ labels: ["status/blocked", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(0);
+  });
+
+  it("excludes blocked issues even with agent label and includeClaimed", () => {
+    const issues = [makeIssue({ labels: ["agent/worker-agent", "status/blocked", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent", { includeClaimed: true });
+    expect(result).toHaveLength(0);
+  });
+
+  it("excludes blocked issues with claimableOnly=true", () => {
+    const issues = [makeIssue({ labels: ["status/blocked", "priority/p1"] })];
+    const result = buildAgentQueue(issues, "worker-agent", { claimableOnly: true });
+    expect(result).toHaveLength(0);
+  });
+
+  it("returns blocked issues to circulation once the label is removed", () => {
+    const ready = makeIssue({ number: 1, labels: ["status/ready", "priority/p1"] });
+    const blocked = makeIssue({ number: 2, labels: ["status/blocked", "priority/p1"] });
+    const result = buildAgentQueue([ready, blocked], "worker-agent");
+    expect(result.map((i) => i.number)).toEqual([1]);
+  });
+
   it("excludes same-agent claimed backlog issues by default", () => {
     const issues = [makeIssue({ labels: ["agent/worker-agent", "status/backlog", "priority/p1"] })];
     const result = buildAgentQueue(issues, "worker-agent");
