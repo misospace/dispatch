@@ -74,6 +74,250 @@ describe("middleware auth protection", () => {
 
     expect(res.status).toBe(200);
   });
+});
+
+describe("basic-auth rate limiting", () => {
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    mocks.getToken.mockReset();
+  });
+
+  afterEach(() => {
+    clearAll();
+    resetAuthCaches();
+  });
+
+  it("returns 429 after five failed Basic-auth attempts from the same IP", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+
+    for (let i = 0; i < 5; i++) {
+      const res = await middleware(makeRequest("/board", {
+        "x-forwarded-for": "10.0.0.5",
+        Authorization: badCreds,
+      }));
+      expect(res.status).toBe(401);
+    }
+
+    const locked = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "10.0.0.5",
+      Authorization: badCreds,
+    }));
+
+    expect(locked.status).toBe(429);
+    expect(locked.headers.get("retry-after")).toBeTruthy();
+  });
+
+  it("attaches security headers to the 429 lockout response", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+
+    for (let i = 0; i < 5; i++) {
+      await middleware(makeRequest("/board", {
+        "x-forwarded-for": "10.0.0.6",
+        Authorization: badCreds,
+      }));
+    }
+
+    const locked = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "10.0.0.6",
+      Authorization: badCreds,
+    }));
+
+    expect(locked.status).toBe(429);
+    expect(locked.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(locked.headers.get("x-frame-options")).toBe("DENY");
+    expect(locked.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(locked.headers.get("strict-transport-security")).toContain("max-age=31536000");
+  });
+
+  it("does not count unauthenticated hits toward the rate limit", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    // The browser's first unauthenticated request to /board returns 401 with
+    // no Authorization header — this should not consume a failure slot.
+    for (let i = 0; i < 10; i++) {
+      const res = await middleware(makeRequest("/board", {
+        "x-forwarded-for": "10.0.0.7",
+      }));
+      expect(res.status).toBe(401);
+    }
+
+    // A valid Basic auth should still succeed because no failures were counted.
+    const ok = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "10.0.0.7",
+      Authorization: "Basic " + Buffer.from("operator:s3cret").toString("base64"),
+    }));
+    expect(ok.status).toBe(200);
+  });
+
+  it("rotating the leftmost X-Forwarded-For hop cannot bypass the lockout", async () => {
+    // Envoy Gateway appends the observed peer address to the right of the
+    // X-Forwarded-For chain rather than replacing it. The attacker controls
+    // the leftmost entry but cannot influence the rightmost, so taking the
+    // last hop means rotating the first hop does not grant a fresh bucket.
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+
+    for (let i = 0; i < 5; i++) {
+      const res = await middleware(makeRequest("/board", {
+        // Varying attacker-controlled first hop; fixed gateway-appended last hop.
+        "x-forwarded-for": `attacker-forged-${i}, 10.0.0.8`,
+        Authorization: badCreds,
+      }));
+      expect(res.status).toBe(401);
+    }
+
+    // A sixth attempt with a fresh forged first hop is still locked out,
+    // because the last hop (the gateway-appended peer address) is unchanged.
+    const locked = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "attacker-forged-fresh, 10.0.0.8",
+      Authorization: badCreds,
+    }));
+    expect(locked.status).toBe(429);
+  });
+
+  it("buckets failed attempts by the last X-Forwarded-For hop", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+
+    // Exhaust the bucket for last-hop 10.0.0.9.
+    for (let i = 0; i < 5; i++) {
+      await middleware(makeRequest("/board", {
+        "x-forwarded-for": "9.9.9.9, 10.0.0.9",
+        Authorization: badCreds,
+      }));
+    }
+
+    // A request from a different last hop should NOT be locked out.
+    const fromDifferentLastHop = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "9.9.9.9, 10.0.0.10",
+      Authorization: badCreds,
+    }));
+    expect(fromDifferentLastHop.status).toBe(401);
+  });
+
+  it("successful Basic auth resets the counter for that IP", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+    const goodCreds = "Basic " + Buffer.from("operator:s3cret").toString("base64");
+
+    // Burn four failures, then succeed — the counter must reset so that a
+    // full second window of five failures is permitted afterward.
+    for (let i = 0; i < 4; i++) {
+      const res = await middleware(makeRequest("/board", {
+        "x-forwarded-for": "10.0.0.11",
+        Authorization: badCreds,
+      }));
+      expect(res.status).toBe(401);
+    }
+
+    const ok = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "10.0.0.11",
+      Authorization: goodCreds,
+    }));
+    expect(ok.status).toBe(200);
+
+    // Five further failures should now be permitted (counter was reset).
+    for (let i = 0; i < 5; i++) {
+      const res = await middleware(makeRequest("/board", {
+        "x-forwarded-for": "10.0.0.11",
+        Authorization: badCreds,
+      }));
+      expect(res.status).toBe(401);
+    }
+
+    const locked = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "10.0.0.11",
+      Authorization: badCreds,
+    }));
+    expect(locked.status).toBe(429);
+  });
+
+  it("falls back to x-real-ip when x-forwarded-for is absent", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+
+    // No XFF — only X-Real-IP. Five attempts should still lock the IP.
+    for (let i = 0; i < 5; i++) {
+      await middleware(makeRequest("/board", {
+        "x-real-ip": "192.168.1.20",
+        Authorization: badCreds,
+      }));
+    }
+
+    const locked = await middleware(makeRequest("/board", {
+      "x-real-ip": "192.168.1.20",
+      Authorization: badCreds,
+    }));
+    expect(locked.status).toBe(429);
+  });
+
+  it("counts Basic-auth failures on API routes the same as UI routes", async () => {
+    // Moving Basic first in the auth check is what makes the counter reset on
+    // any route when the user proves they know the password. Both UI and API
+    // paths must therefore share the same per-IP lockout window.
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const badCreds = "Basic " + Buffer.from("admin:wrong").toString("base64");
+
+    for (let i = 0; i < 3; i++) {
+      const uiRes = await middleware(makeRequest("/board", {
+        "x-forwarded-for": "10.0.0.12",
+        Authorization: badCreds,
+      }));
+      expect(uiRes.status).toBe(401);
+    }
+    for (let i = 0; i < 2; i++) {
+      const apiRes = await middleware(makeRequest("/api/sync", {
+        "x-forwarded-for": "10.0.0.12",
+        Authorization: badCreds,
+      }));
+      expect(apiRes.status).toBe(401);
+    }
+
+    const locked = await middleware(makeRequest("/board", {
+      "x-forwarded-for": "10.0.0.12",
+      Authorization: badCreds,
+    }));
+    expect(locked.status).toBe(429);
+  });
+});
+
+describe("oidc mode (DISPATCH_AUTH_MODE=oidc)", () => {
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    mocks.getToken.mockReset();
+  });
+
+  afterEach(() => {
+    clearAll();
+    resetAuthCaches();
+  });
 
   it("redirects unauthenticated UI routes in oidc mode", async () => {
     process.env.DISPATCH_AUTH_MODE = "oidc";

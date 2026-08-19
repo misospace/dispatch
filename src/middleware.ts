@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { getToken } from "next-auth/jwt";
 import { safeEqual } from "@/lib/dispatch-env";
+import { enforceRateLimit, resetRateLimitKey } from "@/lib/rate-limit";
 
 type AuthMode = "basic" | "oidc" | "disabled" | undefined;
 
@@ -80,6 +81,52 @@ function isBasicAuthorized(authHeader: string | null): boolean {
 }
 
 /**
+ * Rate limit for failed Basic-auth attempts per source IP. Five attempts per
+ * minute. With this, an exposed instance can be brute-forced at most five
+ * guesses per minute per IP before being locked out, and a successful auth
+ * resets the counter. The limiter is in-memory and per-instance; see the
+ * Operational Notes section of the README for the implications under
+ * horizontal scaling.
+ */
+const BASIC_AUTH_RATE_LIMIT = { limit: 5, windowMs: 60_000 };
+
+/**
+ * Extract the source IP for rate limiting. Prefer the rightmost entry of
+ * `X-Forwarded-For` because Envoy Gateway appends the observed peer address
+ * to the right of the chain rather than replacing the header. The leftmost
+ * entry is whatever the client sent, so an attacker rotating it would evade
+ * the per-IP bucket — taking the last hop discards the attacker-controlled
+ * portion. Fall back to `X-Real-IP` (which Envoy also sets to the peer
+ * address) when the chain is absent, and finally to the literal string
+ * `"unknown"`. The unknown bucket is only reachable when no proxy header
+ * arrives at all (e.g. in-cluster or port-forward in dev); under a gateway
+ * the request always has one of the two headers set, so it is a coarse but
+ * safe last resort rather than an attacker-controllable bypass.
+ */
+function clientIp(request: NextRequest): string {
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const last = forwarded.split(",").pop()?.trim();
+    if (last) return last;
+  }
+  const realIp = request.headers.get("x-real-ip")?.trim();
+  if (realIp) return realIp;
+  return "unknown";
+}
+
+/**
+ * True when the request carries a syntactically valid Basic credential pair
+ * (decoded username:password) — i.e. it is an actual Basic-auth attempt
+ * rather than a Bearer call or an unauthenticated hit. Only such attempts
+ * count toward the rate-limit tally; the browser's first unauthenticated
+ * request to a guarded page is excluded by this filter so that an honest
+ * user loading the page does not burn a failure against their own IP.
+ */
+function isBasicAttempt(authHeader: string | null): boolean {
+  return parseBasicCredentials(authHeader) !== null;
+}
+
+/**
  * Next.js middleware that enforces Basic Auth when DISPATCH_AUTH_MODE="basic".
  *
  * Auth mode behavior:
@@ -147,20 +194,39 @@ export async function middleware(request: NextRequest) {
 
   const authHeader = request.headers.get("authorization");
 
-  if (isApiRoute && (isBearerAuthorized(authHeader) || isBasicAuthorized(authHeader))) {
-    const response = NextResponse.next();
-    applySecurityHeaders(response);
-    return response;
-  }
-
-  // "basic" mode — enforce Basic Auth on operator UI routes
+  // "basic" mode — enforce Basic Auth. Basic is checked before Bearer so that
+  // a successful password authentication resets the rate-limit counter on any
+  // route (UI or API), and so that a syntactically valid Basic attempt with a
+  // wrong password is the only thing counted toward the lockout. Bearer is
+  // retained as the API-route credential (DISPATCH_AGENT_TOKEN) for agents
+  // and workers that do not speak Basic.
   if (isBasicAuthorized(authHeader)) {
+    resetRateLimitKey(`basic-auth:${clientIp(request)}`);
     const response = NextResponse.next();
     applySecurityHeaders(response);
     return response;
   }
 
-  // No valid Basic Auth header — reject
+  if (isApiRoute && isBearerAuthorized(authHeader)) {
+    const response = NextResponse.next();
+    applySecurityHeaders(response);
+    return response;
+  }
+
+  // A request with a syntactically valid Basic credential pair but the wrong
+  // password is the only thing we count toward the lockout — a missing
+  // header, a malformed header, or a Bearer-only call does not burn a
+  // failure against the source IP.
+  if (isBasicAttempt(authHeader)) {
+    const ip = clientIp(request);
+    const lockedResponse = enforceRateLimit(`basic-auth:${ip}`, BASIC_AUTH_RATE_LIMIT);
+    if (lockedResponse) {
+      applySecurityHeaders(lockedResponse);
+      return lockedResponse;
+    }
+  }
+
+  // No valid credentials — reject
   const unauthorizedResp = unauthorizedResponse(request);
   applySecurityHeaders(unauthorizedResp);
   return unauthorizedResp;

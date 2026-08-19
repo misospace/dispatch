@@ -97,3 +97,12 @@ function pruneExpired(now: number): void {
 export function resetRateLimits(): void {
   windows.clear();
 }
+
+/**
+ * Reset a single key's window. Used by the auth middleware when a successful
+ * credential check occurs, so that the caller gets a fresh bucket after they
+ * prove they know the password. Returns true if a window was cleared.
+ */
+export function resetRateLimitKey(key: string): boolean {
+  return windows.delete(key);
+}
