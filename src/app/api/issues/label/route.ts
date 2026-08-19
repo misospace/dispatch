@@ -14,7 +14,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
  * on GitHub and in the local cache.
  *
  * Payload (matches bridge/claim.py add_label / remove_label):
- *   { issueId, repoFullName, number, label, action?: "add" | "remove" }
+ *   { issueId, repoFullName, issueNumber, label, action?: "add" | "remove" }
  *
  * - Adding a label that is already present succeeds (idempotent — the bridge
  *   retries parks on later ticks).
@@ -43,18 +43,18 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName, number, label, action, agentName, actor } =
+    const { issueId, repoFullName, issueNumber, label, action, agentName, actor } =
       body as Record<string, unknown>;
 
     if (
       !issueId ||
       !repoFullName ||
-      typeof number !== "number" ||
+      typeof issueNumber !== "number" ||
       typeof label !== "string" ||
       !label.trim()
     ) {
       return errorResponse(
-        "Missing required fields: issueId, repoFullName, number, label",
+        "Missing required fields: issueId, repoFullName, issueNumber, label",
         400,
       );
     }
@@ -75,7 +75,7 @@ export async function POST(request: Request) {
 
     if (!issue) {
       return errorResponse(
-        `Issue not found in local cache: ${repoFullName}#${number} (issueId: ${issueId})`,
+        `Issue not found in local cache: ${repoFullName}#${issueNumber} (issueId: ${issueId})`,
         404,
       );
     }

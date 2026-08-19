@@ -13,7 +13,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
  * Posts a comment on an issue via the GitHub API.
  *
  * Payload (matches bridge/claim.py comment):
- *   { issueId, repoFullName, number, body }
+ *   { issueId, repoFullName, issueNumber, body }
  *
  * - `body` must be non-empty.
  * - An unknown issue returns 404 naming the issue.
@@ -39,18 +39,18 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName, number, body, agentName, actor } =
+    const { issueId, repoFullName, issueNumber, body, agentName, actor } =
       payload as Record<string, unknown>;
 
     if (
       !issueId ||
       !repoFullName ||
-      typeof number !== "number" ||
+      typeof issueNumber !== "number" ||
       typeof body !== "string" ||
       !body.trim()
     ) {
       return errorResponse(
-        "Missing required fields: issueId, repoFullName, number, body",
+        "Missing required fields: issueId, repoFullName, issueNumber, body",
         400,
       );
     }
@@ -70,7 +70,7 @@ export async function POST(request: Request) {
 
     if (!issue) {
       return errorResponse(
-        `Issue not found in local cache: ${repoFullName}#${number} (issueId: ${issueId})`,
+        `Issue not found in local cache: ${repoFullName}#${issueNumber} (issueId: ${issueId})`,
         404,
       );
     }
