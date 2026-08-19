@@ -133,6 +133,7 @@ model PrFixHistory {
   at          DateTime       @default(now())
   action      String
   status      String?
+  lane        String?
   reason      String?        @db.Text
   note        String?        @db.Text
   evidenceKey String?

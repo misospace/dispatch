@@ -13,6 +13,7 @@ export {
   type GitHubIssueComment,
   fetchIssueComments,
   addIssueComment,
+  updateIssueComment,
   addIssueLabel,
   type UpdateIssueFields,
   updateIssueTitleAndBody,

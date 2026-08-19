@@ -81,6 +81,7 @@ export async function GET(request: Request) {
         at: h.at,
         action: h.action,
         status: h.status,
+        lane: h.lane ?? null,
         reason: h.reason,
         note: h.note,
         evidenceKey: h.evidenceKey,

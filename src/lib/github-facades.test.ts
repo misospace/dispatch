@@ -24,6 +24,7 @@ describe("github domain modules expose expected exports", () => {
       "fetchIssues",
       "removeIssueLabel",
       "syncStatusLabels",
+      "updateIssueComment",
       "updateIssueLabels",
       "updateIssueTitleAndBody",
     ]);
@@ -72,8 +73,8 @@ describe("github domain modules expose expected exports", () => {
     const expected = [
       "getGitHubToken", "__resetGitHubAppState", "fetchPaginated", "validateGitHubToken",
       "fetchIssues", "fetchIssue", "updateIssueLabels", "fetchIssueComments",
-      "addIssueComment", "addIssueLabel", "updateIssueTitleAndBody",
-      "removeIssueLabel", "syncStatusLabels", "closeIssue",
+      "addIssueComment", "addIssueLabel", "updateIssueComment",
+      "updateIssueTitleAndBody", "removeIssueLabel", "syncStatusLabels", "closeIssue",
       "fetchRepo", "fetchWorkflows", "fetchWorkflowRuns", "fetchRecentRunsAllWorkflows",
       "fetchRunJobs", "fetchReleases", "fetchPackages", "rerunWorkflow",
       "triggerWorkflowDispatch", "fetchLatestCommit", "jobIdFromCheckRunUrl",

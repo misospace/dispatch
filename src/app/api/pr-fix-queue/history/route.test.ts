@@ -39,8 +39,8 @@ const ITEM = {
 };
 
 const HISTORY = [
-  { at: new Date("2026-08-06T15:47:33Z"), action: "mark", status: "BLOCKED", reason: null, note: "attempts exhausted", evidenceKey: null },
-  { at: new Date("2026-05-14T21:49:00Z"), action: "enqueue", status: null, reason: "PR review: CHANGES_REQUESTED", note: null, evidenceKey: "review:1:misospace/dispatch#44" },
+  { at: new Date("2026-08-06T15:47:33Z"), action: "mark", status: "BLOCKED", lane: "NEEDS_HUMAN", reason: null, note: "attempts exhausted", evidenceKey: null },
+  { at: new Date("2026-05-14T21:49:00Z"), action: "enqueue", status: null, lane: "NORMAL", reason: "PR review: CHANGES_REQUESTED", note: null, evidenceKey: "review:1:misospace/dispatch#44" },
 ];
 
 describe("GET /api/pr-fix-queue/history", () => {
@@ -98,8 +98,10 @@ describe("GET /api/pr-fix-queue/history", () => {
     const body = await res.json();
     expect(body.history[0].action).toBe("mark");
     expect(body.history[0].status).toBe("BLOCKED");
+    expect(body.history[0].lane).toBe("NEEDS_HUMAN");
     expect(body.history[0].note).toBe("attempts exhausted");
     expect(body.history[1].action).toBe("enqueue");
+    expect(body.history[1].lane).toBe("NORMAL");
   });
 
   it("returns 404 when no item exists for that PR", async () => {

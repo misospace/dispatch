@@ -1,9 +1,14 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, PrFixQueueClient } from "./pr-fix-queue";
+import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, PrFixQueueClient } from "./pr-fix-queue";
 
 const { surfacingMocks, lessonFeedMocks } = vi.hoisted(() => ({
   surfacingMocks: {
     surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] }),
+    surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] }),
+    extractUrlsFromText: vi.fn((text: string) => {
+      const passed = text.matchAll(/https:\/\/[^\s"'<>]+/g);
+      return Array.from(passed).map((m) => m[0]);
+    }),
   },
   lessonFeedMocks: {
     extractLessonFromFixOutcome: vi.fn().mockResolvedValue({ kind: "no_lesson" as const }),
@@ -12,6 +17,8 @@ const { surfacingMocks, lessonFeedMocks } = vi.hoisted(() => ({
 
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: surfacingMocks.surfacePrFixBlocked,
+  surfacePrFixRequeued: surfacingMocks.surfacePrFixRequeued,
+  extractUrlsFromText: surfacingMocks.extractUrlsFromText,
 }));
 
 vi.mock("./lesson-feed", () => ({
@@ -69,6 +76,22 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
         history.push(row);
         return row;
       },
+      findMany: async ({ where, orderBy }: any) => {
+        let result = history.slice();
+        if (where?.item?.repo) {
+          const repo = where.item.repo;
+          result = result.filter((h) => {
+            const item = items.find((i) => i.id === h.itemId);
+            return item?.repo === repo && (where.item.pr == null || item?.pr === where.item.pr);
+          });
+        }
+        if (orderBy?.at) {
+          result.sort((a, b) => (orderBy.at === "desc"
+            ? new Date(b.at).getTime() - new Date(a.at).getTime()
+            : new Date(a.at).getTime() - new Date(b.at).getTime()));
+        }
+        return result;
+      },
     },
   };
   return client;
@@ -81,6 +104,8 @@ describe("PR review-fix queue", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixRequeued.mockReset();
+    surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
   });
 
   it("dedupes by repo and PR while preserving unique evidence keys and feedback", async () => {
@@ -269,6 +294,8 @@ describe("pr-fix surfacing integration", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixRequeued.mockReset();
+    surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
   });
 
   it("enqueue with NEEDS_HUMAN lane (BLOCKED) calls surfacePrFixBlocked once", async () => {
@@ -282,12 +309,14 @@ describe("pr-fix surfacing integration", () => {
     });
 
     expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
-    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledWith({
-      repo: "org/repo",
-      pr: 10,
-      reason: "needs human review",
-      latestNote: null,
-    });
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repo: "org/repo",
+        pr: 10,
+        reason: "needs human review",
+        latestNote: null,
+      }),
+    );
   });
 
   it("enqueue with NORMAL lane (QUEUED) does not call surfacePrFixBlocked", async () => {
@@ -340,12 +369,14 @@ describe("pr-fix surfacing integration", () => {
     await markPrFixItem(client, { repo: "org/repo", pr: 20, status: "BLOCKED", note: "operator reviewed" });
 
     expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
-    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledWith({
-      repo: "org/repo",
-      pr: 20,
-      reason: "ci failure",
-      latestNote: "operator reviewed",
-    });
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repo: "org/repo",
+        pr: 20,
+        reason: "ci failure",
+        latestNote: "operator reviewed",
+      }),
+    );
   });
 
   it("mark BLOCKED -> BLOCKED does not call surfacePrFixBlocked", async () => {
@@ -524,5 +555,131 @@ describe("enqueuePrFixItem evidence dedupe", () => {
     client.items[0].status = "FIXED";
     const again = await enqueuePrFixItem(client, { ...base, evidenceKey: "review:o/r#2:r2" });
     expect(again.status).toBe("QUEUED");
+  });
+});
+
+describe("buildPrFixBlockedContext", () => {
+  it("derives totalAttempts and lastAttemptSummary from feedback", async () => {
+    const client = makeClient();
+    const item = { repo: "org/repo", pr: 7, feedback: ["first attempt", "final attempt"] };
+    const context = await buildPrFixBlockedContext(client, item);
+    expect(context.totalAttempts).toBe(2);
+    expect(context.lastAttemptSummary).toBe("final attempt");
+  });
+
+  it("records the BLOCKED mark note as the final failure signature and groups attempts by lane", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 7, lane: "NORMAL", reason: "ci failure", feedback: "first", evidenceKey: "k1",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 7, lane: "ESCALATED", reason: "still failing", feedback: "second", evidenceKey: "k2",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 7, status: "BLOCKED", note: "tests failed after 3 attempts" });
+    const item = client.items.find((i) => i.pr === 7);
+    const context = await buildPrFixBlockedContext(client, item);
+    expect(context.finalFailureSignature).toBe("tests failed after 3 attempts");
+    expect(context.attemptsByLane).toEqual({ NORMAL: 1, ESCALATED: 1 });
+  });
+
+  it("extracts and dedupes failing run links from feedback", async () => {
+    const client = makeClient();
+    const item = {
+      repo: "org/repo",
+      pr: 7,
+      feedback: [
+        "run: https://github.com/org/repo/actions/runs/1",
+        "again https://github.com/org/repo/actions/runs/1",
+      ],
+    };
+    const context = await buildPrFixBlockedContext(client, item);
+    expect(context.failingRunLinks).toEqual(["https://github.com/org/repo/actions/runs/1"]);
+  });
+
+  it("uses uncapped history for totalAttempts", async () => {
+    const client = makeClient();
+    for (let i = 0; i < 13; i += 1) {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo",
+        pr: 8,
+        lane: "NORMAL",
+        reason: `failure ${i}`,
+        feedback: `attempt ${i}`,
+        evidenceKey: `k${i}`,
+      });
+    }
+
+    const context = await buildPrFixBlockedContext(client, client.items.find((item) => item.pr === 8));
+    expect(context.totalAttempts).toBe(13);
+    expect(context.attemptsByLane).toEqual({ NORMAL: 13 });
+  });
+
+  it("returns no per-lane/signature data when absent (backwards compatible)", async () => {
+    const client = makeClient();
+    const context = await buildPrFixBlockedContext(client, { repo: "org/repo", pr: 1, feedback: [] });
+    expect(context.totalAttempts).toBeUndefined();
+    expect(context.finalFailureSignature).toBeUndefined();
+    expect(context.lastAttemptSummary).toBeUndefined();
+    expect(context.failingRunLinks).toBeUndefined();
+  });
+});
+
+describe("requeuePrFixItem surface cleanup", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixRequeued.mockReset();
+    surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+  });
+
+  it("requeues a BLOCKED item and calls surfacePrFixRequeued cleanup", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 70, lane: "NEEDS_HUMAN", reason: "blocked", feedback: "f", evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 70, status: "BLOCKED", note: "tombstone" });
+    surfacingMocks.surfacePrFixRequeued.mockClear();
+
+    const item = await requeuePrFixItem(client, { repo: "org/repo", pr: 70, note: "back to work" });
+
+    expect(item?.status).toBe("QUEUED");
+    expect(surfacingMocks.surfacePrFixRequeued).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixRequeued).toHaveBeenCalledWith("org/repo", 70, "back to work");
+  });
+
+  it("preserves the terminal guard and skips cleanup on a merged/closed PR", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 71, lane: "NEEDS_HUMAN", reason: "blocked", feedback: "f", evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 71, status: "BLOCKED" });
+    surfacingMocks.surfacePrFixRequeued.mockClear();
+
+    await expect(requeuePrFixItem(client, { repo: "org/repo", pr: 71, isPrMergedOrClosed: true }))
+      .rejects.toThrow("upstream PR is merged or closed");
+    expect(surfacingMocks.surfacePrFixRequeued).not.toHaveBeenCalled();
+  });
+
+  it("preserves the wrong-status guard and skips cleanup for a non-BLOCKED item", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 72, lane: "NORMAL", reason: "queued", feedback: "f", evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 72, status: "FIXED" });
+    surfacingMocks.surfacePrFixRequeued.mockClear();
+
+    await expect(requeuePrFixItem(client, { repo: "org/repo", pr: 72 }))
+      .rejects.toThrow("not BLOCKED");
+    expect(surfacingMocks.surfacePrFixRequeued).not.toHaveBeenCalled();
+  });
+
+  it("cleanup failure does not fail the requeue", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 73, lane: "NEEDS_HUMAN", reason: "blocked", feedback: "f", evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 73, status: "BLOCKED" });
+    surfacingMocks.surfacePrFixRequeued.mockRejectedValue(new Error("network down"));
+
+    const item = await requeuePrFixItem(client, { repo: "org/repo", pr: 73 });
+
+    expect(item?.status).toBe("QUEUED");
   });
 });

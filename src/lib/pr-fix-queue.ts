@@ -1,5 +1,5 @@
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
-import { surfacePrFixBlocked } from "./pr-fix-surfacing";
+import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
 import { extractLessonFromFixOutcome } from "./lesson-feed";
 
 export type PrFixQueueClient = {
@@ -11,6 +11,7 @@ export type PrFixQueueClient = {
   };
   prFixHistory: {
     create: (args: any) => Promise<any>;
+    findMany?: (args: any) => Promise<any[]>;
   };
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
 };
@@ -99,6 +100,84 @@ function uniqueAppend(values: string[], value: string, maxItems: number): string
  * Build a Prisma update patch from enqueue input.
  * `issue` maps to Prisma PrFixQueueItem.issue (Int?) which stores the linked GitHub issue number.
  */
+function laneLabel(lane: string | null | undefined): string {
+  if (!lane) return "unknown";
+  const normalized = lane.trim().toUpperCase();
+  return normalized || "unknown";
+}
+
+/**
+ * Build the surfacing context for a BLOCKED item from data Dispatch actually has:
+ * the item's feedback (one entry per enqueue/attempt proxy — the latest is the
+ * best available last-attempt context) and its history rows. All fields are
+ * optional/fallback-safe so historical rows and old callers still surface
+ * something useful. Never throws.
+ */
+export async function buildPrFixBlockedContext(
+  client: PrFixQueueClient,
+  item: { repo: string; pr: number; feedback?: string[] | null },
+): Promise<import("./pr-fix-surfacing").PrFixSurfaceContext> {
+  const context: import("./pr-fix-surfacing").PrFixSurfaceContext = {};
+
+  const feedback = Array.isArray(item.feedback) ? item.feedback : [];
+  const totalAttempts = feedback.length > 0 ? feedback.length : undefined;
+  if (typeof totalAttempts === "number") context.totalAttempts = totalAttempts;
+
+  const links: string[] = [];
+  let lastAttemptSummary: string | null = null;
+  let historyLoaded = false;
+  for (const entry of feedback) {
+    if (!entry) continue;
+    lastAttemptSummary = entry;
+    const urls = extractUrlsFromTextSafe(entry);
+    for (const u of urls) if (!links.includes(u)) links.push(u);
+  }
+  if (links.length > 0) context.failingRunLinks = links;
+  if (lastAttemptSummary) context.lastAttemptSummary = lastAttemptSummary;
+
+  // Attempts grouped by lane, plus the final failure signature from the BLOCKED
+  // tombstone note. Historical rows without a lane are counted under "unknown".
+  try {
+    if (client.prFixHistory?.findMany) {
+      const history = await client.prFixHistory.findMany({
+        where: { item: { repo: item.repo, pr: item.pr } },
+        orderBy: { at: "desc" },
+      });
+      historyLoaded = true;
+
+      const attemptsByLane: Record<string, number> = {};
+      let enqueueCount = 0;
+      for (const h of history) {
+        if (h.action !== "enqueue") continue;
+        enqueueCount += 1;
+        const lane = laneLabel(h.lane);
+        attemptsByLane[lane] = (attemptsByLane[lane] ?? 0) + 1;
+      }
+      if (enqueueCount > 0) context.totalAttempts = enqueueCount;
+      if (Object.keys(attemptsByLane).length > 0) context.attemptsByLane = attemptsByLane;
+
+      const blocked = history.find((h) => h.action === "mark" && h.status === "BLOCKED" && h.note);
+      if (blocked?.note) context.finalFailureSignature = blocked.note;
+    }
+  } catch {
+    // Failure to load history is non-fatal; we still surface with the rest.
+  }
+
+  if (!historyLoaded && typeof totalAttempts === "number") {
+    context.totalAttempts = totalAttempts;
+  }
+
+  return context;
+}
+
+function extractUrlsFromTextSafe(text: string): string[] {
+  try {
+    return extractUrlsFromText(text);
+  } catch {
+    return [];
+  }
+}
+
 function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number> {
   const patch: Record<string, string | number> = {};
   for (const [key, value] of Object.entries({
@@ -149,7 +228,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         },
       });
       await tx.prFixHistory.create({
-        data: { itemId: updated.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
+        data: { itemId: updated.id, action: "enqueue", lane: updated.lane, reason: input.reason, evidenceKey: input.evidenceKey },
       });
       return updated;
     }
@@ -168,13 +247,14 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       },
     });
     await tx.prFixHistory.create({
-      data: { itemId: created.id, action: "enqueue", reason: input.reason, evidenceKey: input.evidenceKey },
+      data: { itemId: created.id, action: "enqueue", lane: created.lane, reason: input.reason, evidenceKey: input.evidenceKey },
     });
     return created;
   });
 
   if (previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
-    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: null });
+    const context = await buildPrFixBlockedContext(client, item);
+    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: null, context });
   }
   return item;
 }
@@ -224,12 +304,15 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
       data.lane = "NORMAL";
     }
     const updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data });
-    await tx.prFixHistory.create({ data: { itemId: updated.id, action: "mark", status: nextStatus, note: input.note ?? undefined } });
+    await tx.prFixHistory.create({
+      data: { itemId: updated.id, action: "mark", status: nextStatus, lane: updated.lane, note: input.note ?? undefined },
+    });
     return updated;
   });
 
   if (item && previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
-    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: input.note ?? null });
+    const context = await buildPrFixBlockedContext(client, item);
+    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: input.note ?? null, context });
   }
   // Trigger the lesson feed (#754) only on a clean transition into FIXED
   // AND only when feedback burned ≥2 attempts — the same bar the issue calls
@@ -295,6 +378,7 @@ export async function reconcileStalePrFixItems(
               itemId: item.id,
               action: "mark",
               status: "STALE",
+              lane: item.lane,
               note: `Upstream PR state=${state} at reconcile time`,
             },
           });
@@ -362,11 +446,19 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
         itemId: updated.id,
         action: "requeue",
         status: "QUEUED",
+        lane: "NORMAL",
         note: input.note ?? "operator requeue",
       },
     });
     return updated;
   });
+  if (item) {
+    // Best-effort cleanup: drop the needs-human label and fold the existing marker
+    // comment into a concise requeued/active notice. Never blocks the requeue.
+    await surfacePrFixRequeued(input.repo, input.pr, input.note ?? undefined).catch((error) => {
+      console.error(`pr-fix-queue requeue cleanup error for ${input.repo}#${input.pr}:`, error);
+    });
+  }
   return item;
 }
 

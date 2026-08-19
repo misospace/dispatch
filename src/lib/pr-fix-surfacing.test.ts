@@ -1,10 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { buildNeedsHumanComment, surfacePrFixBlocked, NEEDS_HUMAN_LABEL, NEEDS_HUMAN_COMMENT_MARKER } from "./pr-fix-surfacing";
+import { buildNeedsHumanComment, surfacePrFixBlocked, surfacePrFixRequeued, NEEDS_HUMAN_LABEL, NEEDS_HUMAN_COMMENT_MARKER } from "./pr-fix-surfacing";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueComment: vi.fn().mockResolvedValue({ url: null }),
+    updateIssueComment: vi.fn().mockResolvedValue(undefined),
+    removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     fetchIssueComments: vi.fn().mockResolvedValue([]),
     // Default: an open PR, so the existing cases keep exercising the label/comment
     // paths rather than short-circuiting on the terminal guard.
@@ -15,6 +17,8 @@ const { mocks } = vi.hoisted(() => ({
 vi.mock("@/lib/github", () => ({
   addIssueLabel: mocks.addIssueLabel,
   addIssueComment: mocks.addIssueComment,
+  updateIssueComment: mocks.updateIssueComment,
+  removeIssueLabel: mocks.removeIssueLabel,
   fetchIssueComments: mocks.fetchIssueComments,
   fetchPullRequestState: mocks.fetchPullRequestState,
 }));
@@ -53,7 +57,10 @@ describe("surfacePrFixBlocked", () => {
     vi.clearAllMocks();
     mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
+    mocks.updateIssueComment.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
     mocks.fetchIssueComments.mockResolvedValue([]);
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
   });
 
   it("does NOT re-post when a marker comment already exists (the #264 spam fix)", async () => {
@@ -68,6 +75,50 @@ describe("surfacePrFixBlocked", () => {
     expect(result.commentPosted).toBe(false);
     expect(result.errors).toEqual([]);
     expect(result.labelApplied).toBe(true); // label is idempotent, still applied
+  });
+
+  it("updates an existing marker comment in place when it has an id (re-block)", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 9, body: `${NEEDS_HUMAN_COMMENT_MARKER}\n> old block` },
+    ]);
+
+    const result = await surfacePrFixBlocked(baseInput);
+
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(result.commentPosted).toBe(false);
+    expect(result.commentUpdated).toBe(true);
+    expect(mocks.updateIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      9,
+      expect.stringContaining(NEEDS_HUMAN_COMMENT_MARKER),
+    );
+    expect(result.errors).toEqual([]);
+  });
+
+  it("does not duplicate or update when the marker has no id (old/mocked caller)", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { body: `${NEEDS_HUMAN_COMMENT_MARKER}\n> some block` },
+    ]);
+
+    const result = await surfacePrFixBlocked(baseInput);
+
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(mocks.updateIssueComment).not.toHaveBeenCalled();
+    expect(result.commentPosted).toBe(false);
+    expect(result.commentUpdated).toBe(false);
+  });
+
+  it("does not edit a human comment that only quotes the marker", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 10, body: `I found this marker: ${NEEDS_HUMAN_COMMENT_MARKER}` },
+    ]);
+
+    const result = await surfacePrFixBlocked(baseInput);
+
+    expect(mocks.addIssueComment).toHaveBeenCalled();
+    expect(mocks.updateIssueComment).not.toHaveBeenCalled();
+    expect(result.commentPosted).toBe(true);
+    expect(result.commentUpdated).toBe(false);
   });
 
   it("does not post (and does not throw) when the comment lookup fails", async () => {
@@ -141,6 +192,8 @@ describe("surfacePrFixBlocked — terminal PR guard", () => {
     vi.clearAllMocks();
     mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
+    mocks.updateIssueComment.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
     mocks.fetchIssueComments.mockResolvedValue([]);
     mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
   });
@@ -173,6 +226,15 @@ describe("surfacePrFixBlocked — terminal PR guard", () => {
     expect(mocks.addIssueComment).not.toHaveBeenCalled();
   });
 
+  it("does not throw when the PR state lookup throws", async () => {
+    mocks.fetchPullRequestState.mockRejectedValue(new Error("network down"));
+    const res = await surfacePrFixBlocked(baseInput);
+    expect(res.skippedTerminal).toBe(true);
+    expect(res.errors).toEqual([]);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
   it("reports no errors when it skips — a finished PR is not a failure", async () => {
     mocks.fetchPullRequestState.mockResolvedValue({ state: "closed", mergedAt: "2026-05-14T22:00:19Z" });
     const res = await surfacePrFixBlocked(baseInput);
@@ -196,5 +258,111 @@ describe("surfacePrFixBlocked — terminal PR guard", () => {
     mocks.addIssueLabel.mockImplementation(async () => { order.push("label"); });
     await surfacePrFixBlocked(baseInput);
     expect(order).toEqual(["state"]);
+  });
+});
+
+describe("buildNeedsHumanComment — richer context", () => {
+  it("renders totalAttempts, attemptsByLane, finalFailure, run links, and last attempt", () => {
+    const body = buildNeedsHumanComment({
+      ...baseInput,
+      context: {
+        totalAttempts: 3,
+        attemptsByLane: { NORMAL: 2, ESCALATED: 1 },
+        finalFailureSignature: "tests failed after 3 attempts",
+        failingRunLinks: ["https://github.com/org/repo/actions/runs/42"],
+        lastAttemptSummary: "final attempt still failing",
+      },
+    });
+
+    expect(body).toContain("**Total attempts:** 3");
+    expect(body).toContain("**NORMAL:** 2 attempts");
+    expect(body).toContain("**ESCALATED:** 1 attempt");
+    expect(body).toContain("**Final failure:** tests failed after 3 attempts");
+    expect(body).toContain("https://github.com/org/repo/actions/runs/42");
+    expect(body).toContain("**Last attempt:** final attempt still failing");
+  });
+
+  it("omits context sections that are absent (backwards compatible)", () => {
+    const body = buildNeedsHumanComment(baseInput);
+    expect(body).not.toContain("Total attempts");
+    expect(body).not.toContain("Attempts by lane");
+    expect(body).not.toContain("Final failure");
+    expect(body).not.toContain("Last attempt");
+  });
+
+  it("omits empty attemptsByLane and no-op context", () => {
+    const body = buildNeedsHumanComment({ ...baseInput, context: { attemptsByLane: {} } });
+    expect(body).not.toContain("Attempts by lane");
+  });
+});
+
+describe("surfacePrFixRequeued", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueComment.mockResolvedValue(undefined);
+    mocks.fetchIssueComments.mockResolvedValue([]);
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
+  });
+
+  it("removes the label and folds the marker comment into a requeued notice", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 5, body: `${NEEDS_HUMAN_COMMENT_MARKER}\n> old block` },
+    ]);
+
+    const result = await surfacePrFixRequeued("org/repo", 42, "re-running");
+
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, NEEDS_HUMAN_LABEL);
+    expect(result.labelRemoved).toBe(true);
+    expect(mocks.updateIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      5,
+      expect.stringContaining("requeued"),
+    );
+    expect(result.commentUpdated).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("does nothing on a terminal PR (no label, no comment write)", async () => {
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "closed", mergedAt: "2026-05-14T22:00:19Z" });
+    mocks.fetchIssueComments.mockResolvedValue([{ id: 5, body: `${NEEDS_HUMAN_COMMENT_MARKER}` }]);
+
+    const result = await surfacePrFixRequeued("org/repo", 42);
+
+    expect(result.skippedTerminal).toBe(true);
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("does not throw when the requeue PR state lookup throws", async () => {
+    mocks.fetchPullRequestState.mockRejectedValue(new Error("network down"));
+    const result = await surfacePrFixRequeued("org/repo", 42);
+    expect(result.skippedTerminal).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("does not update a human comment that only quotes the marker", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 6, body: `Quoted marker: ${NEEDS_HUMAN_COMMENT_MARKER}` },
+    ]);
+
+    const result = await surfacePrFixRequeued("org/repo", 42);
+
+    expect(mocks.removeIssueLabel).toHaveBeenCalled();
+    expect(mocks.updateIssueComment).not.toHaveBeenCalled();
+    expect(result.commentUpdated).toBe(false);
+  });
+
+  it("is best-effort and captures label errors", async () => {
+    mocks.removeIssueLabel.mockRejectedValue(new Error("GitHub API error: 500 label fail"));
+
+    const result = await surfacePrFixRequeued("org/repo", 42);
+
+    expect(result.labelRemoved).toBe(false);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toMatch(/^label:/);
+    expect(result.commentUpdated).toBe(false);
   });
 });
