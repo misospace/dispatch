@@ -225,6 +225,14 @@ Dispatch supports three authentication models:
 
 ### Operational Notes
 
+#### Basic-auth brute-force protection
+
+In `DISPATCH_AUTH_MODE=basic`, `src/middleware.ts` rate-limits failed Basic-auth attempts to **5 attempts per minute per source IP**; a successful password authentication resets the counter. A request that exceeds the limit receives `429 Too Many Requests` with `Retry-After` and security headers until the window resets.
+
+The source IP is taken from the **rightmost** entry of `X-Forwarded-For` (because Envoy Gateway appends the observed peer address to the right of the chain rather than replacing the header), falling back to `X-Real-IP` if the chain is absent, and finally to a shared `"unknown"` bucket when no proxy header is present. The rightmost entry is the trust anchor because the client can forge any value to the left of it, so taking the last hop prevents an attacker from rotating the chain to obtain a fresh bucket on every attempt.
+
+The limiter is in-memory and **per-instance**: behind a horizontally scaled deployment each replica tracks its own counter, so the effective per-IP limit is `5 × replicas` per minute. For deployments with more than one replica behind a gateway, front the auth path with a limiter that is shared across instances (e.g. the rate-limit / WAF features of the ingress) — the in-process counter is a defence-in-depth control, not the primary one.
+
 #### DISPATCH_AUTH_MODE=disabled — Security Warnings and Deployment Checks
 
 Setting `DISPATCH_AUTH_MODE=disabled` disables all authentication enforcement for both operator UI routes and API routes. **This means every endpoint is publicly accessible without any credentials.**

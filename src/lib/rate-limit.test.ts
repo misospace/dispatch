@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { checkRateLimit, enforceRateLimit, resetRateLimits } from "./rate-limit";
+import { checkRateLimit, enforceRateLimit, resetRateLimits, resetRateLimitKey } from "./rate-limit";
 
 const OPTS = { limit: 3, windowMs: 60_000 };
 
@@ -70,6 +70,21 @@ describe("checkRateLimit", () => {
     resetRateLimits();
 
     expect(checkRateLimit("actor-1", OPTS).allowed).toBe(true);
+  });
+
+  it("resetRateLimitKey clears only the named key", () => {
+    for (let i = 0; i <= OPTS.limit; i++) {
+      checkRateLimit("actor-1", OPTS);
+      checkRateLimit("actor-2", OPTS);
+    }
+    expect(checkRateLimit("actor-1", OPTS).allowed).toBe(false);
+    expect(checkRateLimit("actor-2", OPTS).allowed).toBe(false);
+
+    expect(resetRateLimitKey("actor-1")).toBe(true);
+    expect(checkRateLimit("actor-1", OPTS).allowed).toBe(true);
+    expect(checkRateLimit("actor-2", OPTS).allowed).toBe(false);
+
+    expect(resetRateLimitKey("never-existed")).toBe(false);
   });
 
   it("reports at least 1 second of retry-after near the window edge", () => {
