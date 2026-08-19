@@ -70,7 +70,9 @@
           "path": "charts/dispatch/Chart.yaml",
           "jsonpath": "$.appVersion"
         }
-      ]
+      ],
+      "include-component-in-tag": false,
+      "component": ""
     }
   }
 }
