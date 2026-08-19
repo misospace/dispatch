@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.40](https://github.com/misospace/dispatch/compare/v0.5.39...v0.5.40) (2026-08-19)
+
+
+### Features
+
+* **pr-fix:** surface blocked handoffs ([#815](https://github.com/misospace/dispatch/issues/815)) ([94229af](https://github.com/misospace/dispatch/commit/94229af0d8952b70fa3ac94781d598f3199a6343))
+
+
+### Bug Fixes
+
+* **api:** align bridge issue number payloads ([#813](https://github.com/misospace/dispatch/issues/813)) ([ef065b6](https://github.com/misospace/dispatch/commit/ef065b67f81dd103c361495065f6a47b3a75115f))
+* **board:** scroll the columns sideways instead of wrapping Done ([#814](https://github.com/misospace/dispatch/issues/814)) ([be394b5](https://github.com/misospace/dispatch/commit/be394b554f76acfe5bf4eab5e34eda31b1dbbd04))
+* **helm:** point liveness/readiness probes at /api/health ([#810](https://github.com/misospace/dispatch/issues/810)) ([ea3fff7](https://github.com/misospace/dispatch/commit/ea3fff7eadf92ce47fa9c9821fae0d242175888f)), closes [#800](https://github.com/misospace/dispatch/issues/800)
+
 ## [0.5.39](https://github.com/misospace/dispatch/compare/v0.5.38...v0.5.39) (2026-08-19)
 
 

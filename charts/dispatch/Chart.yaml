@@ -4,8 +4,8 @@ description: >-
   GitHub issue assignment layer for coding agents — sync, grooming, lanes, and a
   work queue.
 type: application
-version: 0.5.39
-appVersion: 0.5.39
+version: 0.5.40
+appVersion: 0.5.40
 home: https://github.com/misospace/dispatch
 sources:
   - https://github.com/misospace/dispatch
