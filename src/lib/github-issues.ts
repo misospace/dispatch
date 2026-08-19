@@ -56,6 +56,7 @@ export async function updateIssueLabels(
 }
 
 export interface GitHubIssueComment {
+  id?: number;
   user?: { login?: string };
   body?: string | null;
   created_at?: string;
@@ -65,10 +66,11 @@ export async function fetchIssueComments(
   repoFullName: string,
   issueNumber: number,
   maxComments = 5,
+  direction: "asc" | "desc" = "asc",
 ): Promise<GitHubIssueComment[]> {
   const [owner, repo] = repoFullName.split("/");
   const perPage = Math.max(1, Math.min(maxComments, 100));
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=${perPage}&sort=created&direction=asc`;
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=${perPage}&sort=created&direction=${direction}`;
 
   const response = await fetch(url, { headers: await getHeadersAsync() });
   if (!response.ok) {
@@ -108,6 +110,26 @@ export async function addIssueComment(
     return { url: data.html_url ?? null };
   } catch {
     return { url: null };
+  }
+}
+
+export async function updateIssueComment(
+  repoFullName: string,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  const [owner, repo] = repoFullName.split("/");
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/comments/${commentId}`;
+
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: await getHeadersAsync(),
+    body: JSON.stringify({ body }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API error updating comment ${commentId}: ${response.status} ${text}`);
   }
 }
 

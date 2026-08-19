@@ -19,6 +19,7 @@ import {
   searchRepositoryCode,
   fetchRepositoryFileText,
   syncStatusLabels,
+  updateIssueComment,
   updateIssueLabels,
   updateIssueTitleAndBody,
   validateGitHubToken,
@@ -492,6 +493,14 @@ describe("fetchIssueComments", () => {
 
     await fetchIssueComments("org/repo", 1, 500);
     expect(fetchMock.mock.calls[0][0]).toContain("per_page=100");
+    expect(fetchMock.mock.calls[0][0]).toContain("direction=asc");
+  });
+
+  it("supports newest-first comment lookup", async () => {
+    fetchMock.mockResolvedValue(ok([]));
+
+    await fetchIssueComments("org/repo", 1, 100, "desc");
+    expect(fetchMock.mock.calls[0][0]).toContain("direction=desc");
   });
 
   it("slices the response down to maxComments", async () => {
@@ -563,6 +572,23 @@ describe("issue mutations", () => {
     const [, init] = fetchMock.mock.calls[0];
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body)).toEqual({ state: "closed" });
+  });
+
+  it("updateIssueComment PATCHes the comment body by id", async () => {
+    fetchMock.mockResolvedValueOnce(ok({}));
+
+    await updateIssueComment("org/repo", 987, "new body");
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/repos/org/repo/issues/comments/987");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ body: "new body" });
+  });
+
+  it("updateIssueComment throws on non-ok response", async () => {
+    fetchMock.mockResolvedValueOnce(httpError(404));
+
+    await expect(updateIssueComment("org/repo", 987, "x")).rejects.toThrow("GitHub API error updating comment 987");
   });
 
   it("removeIssueLabel DELETEs the url-encoded label", async () => {
