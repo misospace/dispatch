@@ -13,7 +13,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
  * Removes a label from an issue on GitHub and in the local cache.
  *
  * Payload (matches bridge/claim.py remove_label):
- *   { issueId, repoFullName, number, label }
+ *   { issueId, repoFullName, issueNumber, label }
  *
  * - Removing a label that is not present is idempotent (removeIssueLabel
  *   tolerates a 404 from the GitHub API for missing labels).
@@ -40,18 +40,18 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName, number, label, agentName, actor } =
+    const { issueId, repoFullName, issueNumber, label, agentName, actor } =
       body as Record<string, unknown>;
 
     if (
       !issueId ||
       !repoFullName ||
-      typeof number !== "number" ||
+      typeof issueNumber !== "number" ||
       typeof label !== "string" ||
       !label.trim()
     ) {
       return errorResponse(
-        "Missing required fields: issueId, repoFullName, number, label",
+        "Missing required fields: issueId, repoFullName, issueNumber, label",
         400,
       );
     }
@@ -71,7 +71,7 @@ export async function POST(request: Request) {
 
     if (!issue) {
       return errorResponse(
-        `Issue not found in local cache: ${repoFullName}#${number} (issueId: ${issueId})`,
+        `Issue not found in local cache: ${repoFullName}#${issueNumber} (issueId: ${issueId})`,
         404,
       );
     }
