@@ -18,7 +18,7 @@ export function KanbanColumn({ id, title, count, children }: KanbanColumnProps) 
     <div
       ref={setNodeRef}
       className={cn(
-        "bg-muted/50 rounded-lg p-3 min-h-[200px]",
+        "bg-muted/50 rounded-lg p-3 min-h-[200px] lg:w-72 lg:shrink-0",
         isOver && "ring-2 ring-primary bg-primary/5"
       )}
     >

@@ -66,18 +66,17 @@ export default async function ProjectsPage(_props: PageProps) {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {/* Horizontal scroll wrapper for status columns on narrow screens */}
+              {/* Stacks on small screens, then becomes one scrollable row. A grid
+                  with a fixed column count adds a ROW when BOARD_COLUMNS outgrows
+                  it rather than overflowing this wrapper. */}
               <div className="overflow-x-auto pb-2">
-                <div
-                  className="grid grid-cols-1 lg:grid-cols-5 gap-4"
-                  style={{ minWidth: "fit-content" }}
-                >
+                <div className="grid grid-cols-1 gap-4 lg:flex lg:min-w-max">
                   {BOARD_COLUMNS.map((column) => {
                     const statusIssues = project.issues.filter(
                       (i: IssueWithRepo) => getProjectIssueStatus(i) === column.id
                     );
                     return (
-                      <div key={column.id} className="space-y-2">
+                      <div key={column.id} className="space-y-2 lg:w-72 lg:shrink-0">
                         <h4 className="text-sm font-medium text-muted-foreground">
                           {column.title}
                         </h4>
