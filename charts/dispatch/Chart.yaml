@@ -1,10 +1,11 @@
 apiVersion: v2
 name: dispatch
-description: GitHub issue assignment layer for coding agents — sync, grooming, lanes, and a work queue.
+description: >-
+  GitHub issue assignment layer for coding agents — sync, grooming, lanes, and a
+  work queue.
 type: application
-# version/appVersion are stamped by the release workflow from the release tag.
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.5.39
+appVersion: 0.5.39
 home: https://github.com/misospace/dispatch
 sources:
   - https://github.com/misospace/dispatch
