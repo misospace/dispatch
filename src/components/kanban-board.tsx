@@ -303,11 +303,13 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
-        {/* Horizontal scroll wrapper for 5-column grid on narrow screens */}
+        {/* Stacks on small screens, then becomes one scrollable row: a grid with
+            a fixed column count adds a ROW when BOARD_COLUMNS outgrows it, which
+            is what pushed Done below the fold, and a grid cannot overflow this
+            wrapper horizontally. */}
         <div className="overflow-x-auto pb-2">
           <div
-            className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4"
-            style={{ minWidth: "fit-content" }}
+            className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:flex lg:min-w-max"
           >
             {BOARD_COLUMNS.map((column) => {
               const columnIssues = getIssuesByStatus(issues, column.id);

@@ -108,28 +108,31 @@ describe("ProjectsPage five-column layout", () => {
     expect(hasOverflowWrapper).toBe(true);
   });
 
-  it("applies lg:grid-cols-5 to the status column grid", async () => {
+  it("lays the status columns out as one scrollable row, not a fixed-count grid", async () => {
     mocks.findManyIssues.mockResolvedValue([mockIssue({ labels: ["status/ready"] })]);
 
     const page = await ProjectsPage({ searchParams: Promise.resolve({}) });
 
-    let hasGridCols5 = false;
+    let hasScrollRow = false;
 
     function walk(node: React.ReactNode) {
       if (typeof node !== "object" || !React.isValidElement(node)) return;
       const props = node.props as { className?: string };
-      if (typeof props.className === "string" && props.className.includes("lg:grid-cols-5")) {
-        hasGridCols5 = true;
+      if (typeof props.className === "string"
+          && props.className.includes("lg:flex")
+          && props.className.includes("lg:min-w-max")
+          && !/lg:grid-cols-\d/.test(props.className)) {
+        hasScrollRow = true;
       }
       const children = React.Children.toArray((node.props as { children?: React.ReactNode }).children);
       children.forEach(walk);
     }
 
     walk(page);
-    expect(hasGridCols5).toBe(true);
+    expect(hasScrollRow).toBe(true);
   });
 
-  it("applies minWidth fit-content style to the grid", async () => {
+  it("no longer pins the grid with an inline minWidth", async () => {
     mocks.findManyIssues.mockResolvedValue([mockIssue({ labels: ["status/ready"] })]);
 
     const page = await ProjectsPage({ searchParams: Promise.resolve({}) });
@@ -147,7 +150,7 @@ describe("ProjectsPage five-column layout", () => {
     }
 
     walk(page);
-    expect(hasFitContent).toBe(true);
+    expect(hasFitContent).toBe(false);
   });
 
   it("renders Done column even when no issues have status/done label", async () => {

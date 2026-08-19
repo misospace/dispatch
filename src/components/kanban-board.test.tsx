@@ -317,12 +317,16 @@ describe("KanbanBoard horizontal scroll layout", () => {
     expect(grid?.parentElement?.className).toContain("overflow-x-auto");
   });
 
-  it("sets minWidth fit-content on the column grid to enable horizontal scrolling", () => {
+  it("lays the columns out as one scrollable row rather than a fixed-count grid", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
-    // The min-width: fit-content style is directly on the grid div
+    // A fixed lg:grid-cols-N wraps the (N+1)th column onto a second row instead
+    // of overflowing the scroll wrapper, which is what pushed Done below the
+    // fold once BOARD_COLUMNS grew to six. lg:flex + lg:min-w-max scrolls.
     const grid = document.querySelector("div.grid");
-    expect(grid).toHaveStyle({ minWidth: "fit-content" });
+    expect(grid?.className).toContain("lg:flex");
+    expect(grid?.className).toContain("lg:min-w-max");
+    expect(grid?.className).not.toMatch(/lg:grid-cols-\d/);
   });
 
   it("renders all six columns in canonical order", () => {
