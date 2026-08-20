@@ -257,4 +257,45 @@ describe("selectGroomingCandidate", () => {
     const result = await selectGroomingCandidate();
     expect(result!.number).toBe(60);
   });
+
+  // Regression for #793: a parked issue (non-null blockedReason) must remain
+  // reachable by a targeted re-groom. Without the bypass, the exclusion was
+  // applied after the issueNumber filter, so even calling selectGroomingCandidate
+  // with { issueNumber: 36 } for a parked issue returned nothing — a one-way door.
+  it("issueNumber bypasses the blocked/not-ready grooming-state exclusion", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        number: 36,
+        title: "Alert triage parking deadlock",
+        url: "https://github.com/alert-triage/repo/issues/36",
+        labels: ["status/backlog"],
+        currentLane: "backlog",
+        blockedReason: "Blocked by unresolved dependencies and validation gate ...",
+        notReadyReason: null,
+        groomedAt: new Date("2026-08-13T05:58:37Z"),
+        repository: { fullName: "alert-triage/repo" },
+      },
+    ]);
+    const result = await selectGroomingCandidate({ issueNumber: 36 });
+    expect(result).not.toBeNull();
+    expect(result!.number).toBe(36);
+
+    // Verify the exclusion was actually skipped — the findMany call must NOT
+    // contain the { blockedReason: null } / { notReadyReason: null } predicates
+    // when issueNumber is supplied.
+    const callArgs = mocks.issueFindMany.mock.calls[0][0];
+    const serialized = JSON.stringify(callArgs);
+    expect(serialized).not.toContain('"blockedReason":null');
+    expect(serialized).not.toContain('"notReadyReason":null');
+  });
+
+  it("without issueNumber, blocked issues are still excluded from the candidate pool", async () => {
+    mocks.issueFindMany.mockResolvedValue([]);
+    await selectGroomingCandidate();
+    const callArgs = mocks.issueFindMany.mock.calls[0][0];
+    const serialized = JSON.stringify(callArgs);
+    // The default pool run still applies the exclusion — the bypass is targeted only.
+    expect(serialized).toContain('"blockedReason":null');
+    expect(serialized).toContain('"notReadyReason":null');
+  });
 });

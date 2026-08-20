@@ -41,15 +41,23 @@ export async function selectGroomingCandidate(
   applyRenovateIssueExclusion(issueWhere);
   applyUmbrellaIssueExclusion(issueWhere);
 
-  const groomingStateWhere = buildGroomingStateExclusionWhere(24);
-  if (groomingStateWhere.AND) {
-    const existing = issueWhere.AND;
-    if (Array.isArray(existing)) {
-      existing.push(...groomingStateWhere.AND);
-    } else if (existing) {
-      issueWhere.AND = [existing, ...groomingStateWhere.AND];
-    } else {
-      issueWhere.AND = groomingStateWhere.AND;
+  // A targeted re-groom (issueNumber supplied) bypasses the blocked/not-ready
+  // exclusion so parked issues can be revisited manually. Without this lever,
+  // once the groomer parks an issue the field that parked it is only cleared
+  // inside the groom route, which never runs for a parked issue — a one-way
+  // door. See issue #793.
+  const skipGroomingStateExclusion = options.issueNumber !== undefined;
+  if (!skipGroomingStateExclusion) {
+    const groomingStateWhere = buildGroomingStateExclusionWhere(24);
+    if (groomingStateWhere.AND) {
+      const existing = issueWhere.AND;
+      if (Array.isArray(existing)) {
+        existing.push(...groomingStateWhere.AND);
+      } else if (existing) {
+        issueWhere.AND = [existing, ...groomingStateWhere.AND];
+      } else {
+        issueWhere.AND = groomingStateWhere.AND;
+      }
     }
   }
 
