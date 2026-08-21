@@ -1,5 +1,5 @@
 import type { CheckFailure, PrHealthInput } from "./linked-pr-health";
-import { GITHUB_API, getHeadersAsync, fetchPaginated } from "./github-auth";
+import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
 
 export interface GithubPR {
   number: number;
@@ -64,7 +64,7 @@ export async function fetchPullRequestHealthSignals(
   const [mergeStateStatus, reviewDecision] = await Promise.all([
     (async (): Promise<string | null> => {
       try {
-        const detailResp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+        const detailResp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
         if (detailResp.ok) {
           const detail = (await detailResp.json()) as { mergeable_state?: string | null };
           return detail.mergeable_state ?? null;
@@ -94,7 +94,7 @@ export async function fetchPullRequestState(
 ): Promise<{ state: string | null; mergedAt: string | null }> {
   try {
     const headers = await getHeadersAsync();
-    const resp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
     if (resp.ok) {
       const detail = (await resp.json()) as { state?: string | null; merged_at?: string | null };
       return { state: detail.state ?? null, mergedAt: detail.merged_at ?? null };
@@ -110,7 +110,7 @@ export async function fetchPullRequestMergeState(
 ): Promise<{ mergeableState: string | null; mergeable: boolean | null }> {
   const headers = await getHeadersAsync();
   try {
-    const resp = await fetch(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
     if (resp.ok) {
       const detail = (await resp.json()) as { mergeable_state?: string | null; mergeable?: boolean | null };
       return { mergeableState: detail.mergeable_state ?? null, mergeable: detail.mergeable ?? null };
@@ -123,7 +123,7 @@ export async function fetchPullRequestMergeState(
 export async function fetchPullRequestCheckFailures(repoFullName: string, ref: string): Promise<CheckFailure[]> {
   const FAILURE_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required"]);
   try {
-    const response = await fetch(
+    const response = await fetchWithRetry(
       `${GITHUB_API}/repos/${repoFullName}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`,
       { headers: await getHeadersAsync() },
     );

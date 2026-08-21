@@ -164,6 +164,72 @@ export async function getHeadersAsync(): Promise<HeadersInit> {
   };
 }
 
+/**
+ * Statuses that indicate a transient GitHub failure worth retrying:
+ * rate limiting (429) and server-side errors (5xx).
+ */
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+export interface FetchWithRetryOptions {
+  /** Total attempts including the first (default 3). */
+  maxAttempts?: number;
+  /** Injectable sleep for tests (default: real setTimeout). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Backoff delay for the given attempt (1-indexed): 1s, 2s, 4s, ...
+ * On 429 the GitHub `Retry-After` header (seconds or HTTP date) and the
+ * `x-ratelimit-reset` header (unix epoch seconds) are honored when they
+ * ask for a longer wait than the exponential base.
+ */
+function retryDelayMs(response: Response, attempt: number): number {
+  const base = 1000 * 2 ** (attempt - 1);
+  const headers = response.headers;
+  if (!headers) return base;
+
+  const retryAfter = headers.get("Retry-After");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(base, seconds * 1000);
+    const date = Date.parse(retryAfter);
+    if (!Number.isNaN(date)) return Math.max(base, date - Date.now());
+  }
+
+  const reset = Number(headers.get("x-ratelimit-reset"));
+  if (Number.isFinite(reset) && reset > 0) {
+    return Math.max(base, reset * 1000 - Date.now() + 100);
+  }
+
+  return base;
+}
+
+/**
+ * fetch() with retry-with-backoff for transient GitHub failures.
+ *
+ * Retries 429 and 5xx responses up to `maxAttempts` times with exponential
+ * backoff, honoring `Retry-After` / `x-ratelimit-reset` on 429. Non-retryable
+ * responses (e.g. 404) are returned immediately so callers keep their existing
+ * error handling. Only use for idempotent reads (GET).
+ */
+export async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  options: FetchWithRetryOptions = {},
+): Promise<Response> {
+  const maxAttempts = options.maxAttempts ?? 3;
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  for (let attempt = 1; ; attempt++) {
+    const response = await fetch(url, init);
+    if (response.ok || !RETRYABLE_STATUS.has(response.status) || attempt === maxAttempts) {
+      return response;
+    }
+    await sleep(retryDelayMs(response, attempt));
+  }
+}
+
 export function __resetGitHubAppState(): void {
   installationTokenCache = null;
   useGitHubApp = false;
@@ -187,7 +253,7 @@ export async function fetchPaginated<T>(
   let currentUrl: string | null = url;
 
   while (currentUrl && all.length < maxItems) {
-    const response = await fetch(currentUrl, { headers: await getHeadersAsync() });
+    const response = await fetchWithRetry(currentUrl, { headers: await getHeadersAsync() });
 
     if (!response.ok) {
       const text = await response.text();
@@ -212,7 +278,7 @@ export async function fetchPaginated<T>(
 
 export async function validateGitHubToken(): Promise<boolean> {
   try {
-    const response = await fetch(`${GITHUB_API}/user`, {
+    const response = await fetchWithRetry(`${GITHUB_API}/user`, {
       headers: await getHeadersAsync(),
     });
     return response.ok;

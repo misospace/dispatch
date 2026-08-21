@@ -1,4 +1,4 @@
-import { GITHUB_API, getHeadersAsync, fetchPaginated } from "./github-auth";
+import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
 
 export interface GithubWorkflow {
   id: number;
@@ -11,7 +11,7 @@ export interface GithubWorkflow {
 }
 
 export async function fetchWorkflows(repoFullName: string): Promise<GithubWorkflow[]> {
-  const response = await fetch(`${GITHUB_API}/repos/${repoFullName}/actions/workflows`, {
+  const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/actions/workflows`, {
     headers: await getHeadersAsync(),
   });
   if (!response.ok) {
@@ -64,7 +64,7 @@ export interface GithubJob {
 }
 
 export async function fetchRunJobs(repoFullName: string, runId: number): Promise<GithubJob[]> {
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/actions/runs/${runId}/jobs`,
     { headers: await getHeadersAsync() }
   );
@@ -148,7 +148,7 @@ export interface GithubCommit {
 }
 
 export async function fetchLatestCommit(repoFullName: string, branch: string): Promise<GithubCommit | null> {
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/commits/${branch}?per_page=1`,
     { headers: await getHeadersAsync() }
   );
@@ -218,7 +218,7 @@ export function extractLogExcerpt(rawLog: string, maxChars = 6000): string {
 export async function fetchFailedJobLogExcerpt(repoFullName: string, jobId: string | number): Promise<string> {
   const headers = await getHeadersAsync();
   try {
-    const resp = await fetch(`${GITHUB_API}/repos/${repoFullName}/actions/jobs/${jobId}/logs`, {
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/actions/jobs/${jobId}/logs`, {
       headers,
       redirect: "manual",
     });
@@ -226,7 +226,7 @@ export async function fetchFailedJobLogExcerpt(repoFullName: string, jobId: stri
     if (resp.status === 301 || resp.status === 302) {
       const loc = resp.headers.get("location");
       if (loc) {
-        const blob = await fetch(loc); // signed URL — must NOT carry the auth header
+        const blob = await fetchWithRetry(loc, {}); // signed URL — must NOT carry the auth header
         if (blob.ok) logText = await blob.text();
       }
     } else if (resp.ok) {

@@ -478,6 +478,24 @@ describe("fetchIssue", () => {
 
     await expect(fetchIssue("org/repo", 42)).rejects.toThrow("GitHub API error for org/repo#42: 404");
   });
+
+  it("retries a transient 429 and succeeds on the next attempt", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }))
+      .mockResolvedValueOnce(ok({ number: 42, title: "hello" }));
+
+    const result = await fetchIssue("org/repo", 42);
+
+    expect(result).toMatchObject({ number: 42, title: "hello" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces the 429 after exhausting retries", async () => {
+    fetchMock.mockResolvedValue(new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }));
+
+    await expect(fetchIssue("org/repo", 42)).rejects.toThrow("GitHub API error for org/repo#42: 429");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
 });
 
 describe("fetchIssueComments", () => {
@@ -519,9 +537,10 @@ describe("fetchIssueComments", () => {
   });
 
   it("throws on non-ok response", async () => {
-    fetchMock.mockResolvedValueOnce(httpError(500));
+    fetchMock.mockResolvedValue(httpError(500));
 
     await expect(fetchIssueComments("org/repo", 1)).rejects.toThrow("comments: 500");
+    expect(fetchMock).toHaveBeenCalledTimes(3); // 500 is transient: retried before surfacing
   });
 });
 
@@ -714,9 +733,14 @@ describe("fetchPullRequestHealthSignals", () => {
   });
 
   it("degrades to null merge state when the detail GET is not ok", async () => {
-    mockDetailThenReviews(httpError(500), [
-      { user: { login: "alice" }, state: "APPROVED", submitted_at: "2026-01-01T00:00:00Z" },
-    ]);
+    // The detail GET is transient-retried: three 500s exhaust the retries.
+    fetchMock
+      .mockResolvedValueOnce(httpError(500))
+      .mockResolvedValueOnce(httpError(500))
+      .mockResolvedValueOnce(httpError(500))
+      .mockResolvedValueOnce(makeResponse([
+        { user: { login: "alice" }, state: "APPROVED", submitted_at: "2026-01-01T00:00:00Z" },
+      ]));
 
     expect(await fetchPullRequestHealthSignals("org/repo", 7)).toEqual({
       reviewDecision: "APPROVED",
