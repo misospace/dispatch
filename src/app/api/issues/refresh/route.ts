@@ -5,11 +5,18 @@ import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import { refreshSingleIssue } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 10, windowMs: 60_000 } as const;
 
 export async function POST(request: NextRequest) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`route:issues/refresh:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const body = await request.json();

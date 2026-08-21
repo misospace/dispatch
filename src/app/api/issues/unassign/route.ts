@@ -4,6 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
 type UnassignPayload = {
   issueId: string;
@@ -24,6 +27,9 @@ export async function POST(request: Request) {
     return errorResponse("Unauthorized", 401);
   }
   const auditActor = getAuthorizedActor(auth, request);
+
+  const limited = enforceRateLimit(`route:issues/unassign:${auditActor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     let body: unknown;
