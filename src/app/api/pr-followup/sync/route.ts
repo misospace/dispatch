@@ -7,6 +7,7 @@ import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
 
 /**
  * PR Follow-up Sync Endpoint (Pull-based)
@@ -82,7 +83,12 @@ export async function POST(request: NextRequest) {
   const limited = enforceRateLimit(`pr-followup-sync:${auth.actor}`, { limit: 10, windowMs: 60_000 });
   if (limited) return limited;
 
+  let lock: AcquiredLock | LockConflict | undefined;
   try {
+    lock = await acquireLock("pr-followup");
+    if (!lock?.locked) {
+      return NextResponse.json({ error: "PR follow-up sync is already running", locked: true }, { status: 409 });
+    }
     // Fail fast when no GitHub credentials are available. getGitHubToken
     // supports both GitHub App installation tokens and the legacy PAT.
     try {
@@ -369,5 +375,9 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error("PR follow-up sync failed:", error);
     return errorResponse("PR follow-up sync failed", 500);
+  } finally {
+    if (lock && lock.locked) {
+      await releaseLock(lock.runId);
+    }
   }
 }

@@ -16,7 +16,7 @@
  *     endpoint's DB lock makes concurrent fires collapse to one via 409).
  *
  * Opt-in via DISPATCH_SCHEDULER_ENABLED so dev/CI don't spin timers, and so it
- * can be confined to a single replica until per-job locks exist for the others.
+ * can be confined to a single replica when needed.
  */
 
 export interface ScheduledJob {
