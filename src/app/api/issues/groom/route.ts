@@ -7,12 +7,18 @@ import { resolveActor } from "@/lib/resolve-actor";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { refreshSingleIssue } from "@/lib/issue-sync";
 import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`route:issues/groom:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     let body: unknown;

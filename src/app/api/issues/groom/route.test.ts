@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 import { authedRequest } from "@/test/route-helpers";
 
 const { mocks } = vi.hoisted(() => ({
@@ -63,6 +64,7 @@ function mockIssue(extra?: Record<string, unknown>) {
 describe("POST /api/issues/groom — auth", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -85,6 +87,7 @@ describe("POST /api/issues/groom — auth", () => {
 describe("POST /api/issues/groom — validation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -147,6 +150,7 @@ describe("POST /api/issues/groom — validation", () => {
 describe("POST /api/issues/groom — actor resolution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -227,6 +231,7 @@ describe("POST /api/issues/groom — actor resolution", () => {
 describe("POST /api/issues/groom — promote_to_ready", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -400,6 +405,7 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
 describe("POST /api/issues/groom — escalate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -455,6 +461,7 @@ describe("POST /api/issues/groom — escalate", () => {
 describe("POST /api/issues/groom — mark_not_ready", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -530,6 +537,7 @@ describe("POST /api/issues/groom — mark_not_ready", () => {
 describe("POST /api/issues/groom — mark_needs_info", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -591,6 +599,7 @@ describe("POST /api/issues/groom — mark_needs_info", () => {
 describe("POST /api/issues/groom — mark_blocked", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -652,6 +661,7 @@ describe("POST /api/issues/groom — mark_blocked", () => {
 describe("POST /api/issues/groom — error handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     process.env.DISPATCH_AGENT_TOKEN = "test-token";
     process.env.DISPATCH_AUTH_MODE = "disabled";
@@ -684,6 +694,7 @@ describe("POST /api/issues/groom — error handling", () => {
 describe("POST /api/issues/groom — auth modes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
     mocks.findFirstIssue.mockResolvedValue(null);
     resetAuthCaches();
     mocks.findIssue.mockResolvedValue({

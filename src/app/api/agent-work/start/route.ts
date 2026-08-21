@@ -3,6 +3,9 @@ import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma, asAgentWorkClient } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { parseStartAgentWorkInput, startAgentWork } from "@/lib/agent-work";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
 /**
  * POST /api/agent-work/start
@@ -44,9 +47,13 @@ import { parseStartAgentWorkInput, startAgentWork } from "@/lib/agent-work";
  * { "error": "Failed to start agent work" }
  */
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
     return errorResponse("Unauthorized", 401);
   }
+
+  const limited = enforceRateLimit(`route:agent-work/start:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const body = await request.json();
