@@ -6,6 +6,8 @@
  *   - Scheduled sync (`/api/sync/scheduled`)
  *   - Manual issue sync (`/api/sync`)
  *   - Automation sync (`/api/automation/sync`)
+ *   - PR follow-up sync (`/api/pr-followup/sync`)
+ *   - Issue reconciliation (`/api/issues/reconcile`)
  *
  * Lock semantics:
  *   - First writer wins; subsequent writers get a 409 Conflict.
@@ -43,6 +45,13 @@ export interface LockConflict {
   locked: false;
 }
 
+export type SyncType =
+  | "scheduled"
+  | "manual"
+  | "automation"
+  | "pr-followup"
+  | "reconcile";
+
 /**
  * Attempt to acquire the global sync lock.
  *
@@ -52,7 +61,7 @@ export interface LockConflict {
  * Creates an IssueSyncRun record so we can track which sync type acquired it.
  */
 export async function acquireLock(
-  syncType: "scheduled" | "manual" | "automation",
+  syncType: SyncType,
 ): Promise<AcquiredLock | LockConflict> {
   try {
     const existing = await prisma.syncLock.findUnique({ where: { id: LOCK_ID } });

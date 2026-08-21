@@ -7,6 +7,8 @@ vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
+    acquireLock: vi.fn().mockResolvedValue({ locked: true, runId: "test-run" }),
+    releaseLock: vi.fn().mockResolvedValue(undefined),
     auditLogFindMany: vi.fn().mockResolvedValue([]),
   },
 }));
@@ -17,18 +19,46 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
-import { GET } from "./route";
+vi.mock("@/lib/sync-lock", () => ({
+  acquireLock: mocks.acquireLock,
+  releaseLock: mocks.releaseLock,
+}));
+
+import { GET, POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 
 function request(urlString: string, includeAuth = true) {
   return authedRequest(urlString, { includeAuth });
 }
 
+describe("POST /api/issues/reconcile", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
+    mocks.releaseLock.mockResolvedValue(undefined);
+  });
+
+  it("returns 409 when another reconciliation holds the lock", async () => {
+    mocks.acquireLock.mockResolvedValue({ locked: false });
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST" }));
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ locked: true });
+    expect(mocks.acquireLock).toHaveBeenCalledWith("reconcile");
+    expect(mocks.releaseLock).not.toHaveBeenCalled();
+  });
+});
+
 describe("GET /api/issues/reconcile", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
     vi.clearAllMocks();
+    mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
+    mocks.releaseLock.mockResolvedValue(undefined);
     mocks.auditLogFindMany.mockResolvedValue([]);
   });
 

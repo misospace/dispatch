@@ -15,6 +15,7 @@ import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth }
 import { authorizeRequest } from "@/lib/auth";
 import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
@@ -39,7 +40,13 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(`reconcile:${auth.actor}`, RATE_LIMIT);
   if (limited) return limited;
 
+  let lock: AcquiredLock | LockConflict | undefined;
   try {
+    lock = await acquireLock("reconcile");
+    if (!lock?.locked) {
+      return NextResponse.json({ error: "Issue reconciliation is already running", locked: true }, { status: 409 });
+    }
+
     let body: unknown;
     try {
       body = await request.json();
@@ -320,6 +327,10 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("Reconciliation failed:", error);
     return errorResponse("Reconciliation failed", 500);
+  } finally {
+    if (lock && lock.locked) {
+      await releaseLock(lock.runId);
+    }
   }
 }
 

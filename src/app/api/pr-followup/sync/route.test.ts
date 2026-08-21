@@ -7,6 +7,8 @@ vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
+    acquireLock: vi.fn().mockResolvedValue({ locked: true, runId: "test-run" }),
+    releaseLock: vi.fn().mockResolvedValue(undefined),
     prFixQueueClient: vi.fn(),
     processPrFollowupEvents: vi.fn().mockResolvedValue({ enqueued: 0, skipped: 0 }),
     ingestMergeConflict: vi.fn().mockResolvedValue(null),
@@ -20,6 +22,11 @@ const { mocks } = vi.hoisted(() => ({
 vi.mock("@/lib/prisma", () => ({
   prisma: {},
   asPrFixQueueClient: mocks.prFixQueueClient,
+}));
+
+vi.mock("@/lib/sync-lock", () => ({
+  acquireLock: mocks.acquireLock,
+  releaseLock: mocks.releaseLock,
 }));
 
 vi.mock("@/lib/pr-followup-ingestion", async (importOriginal) => ({
@@ -40,6 +47,7 @@ vi.mock("@/lib/pr-fix-queue", () => ({
 
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 // Cast Request as NextRequest for type compatibility in tests
 function asNextRequest(r: Request): any { return r; }
@@ -52,7 +60,10 @@ describe("POST /api/pr-followup/sync", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
+    resetRateLimits();
     vi.clearAllMocks();
+    mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
+    mocks.releaseLock.mockResolvedValue(undefined);
     mocks.prFixQueueClient.mockReturnValue({});
     mocks.getTrackedRepos.mockResolvedValue([]);
     mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
@@ -92,6 +103,18 @@ describe("POST /api/pr-followup/sync", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.message).toBe("No tracked repos configured");
+  });
+
+  it("returns 409 when another pr-followup sync holds the lock", async () => {
+    mocks.acquireLock.mockResolvedValue({ locked: false });
+
+    const res = await postRequest(true);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ locked: true });
+    expect(mocks.acquireLock).toHaveBeenCalledWith("pr-followup");
+    expect(mocks.getTrackedRepos).not.toHaveBeenCalled();
+    expect(mocks.releaseLock).not.toHaveBeenCalled();
   });
 
   it("unauthorized request does not call getTrackedRepos", async () => {
