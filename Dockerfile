@@ -64,3 +64,23 @@ ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
+
+# MCP server image (stdio transport) for the in-cluster toolhive gateway. It
+# talks to the dispatch API over HTTP, so it needs neither prisma nor the Next
+# build -- only tsx and the client code.
+FROM base AS mcp
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json tsconfig.json ./
+COPY src/lib ./src/lib
+COPY src/mcp ./src/mcp
+
+RUN addgroup --system --gid 1001 nodejs \
+    && adduser --system --uid 1001 --ingroup nodejs mcp
+
+USER mcp
+
+ENTRYPOINT ["./node_modules/.bin/tsx", "src/mcp/server.ts"]
