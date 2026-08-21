@@ -59,6 +59,10 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
+          # Explicit: build-push-action defaults to the LAST stage in the
+          # Dockerfile, so adding any stage below runner would silently
+          # retarget this build.
+          target: runner
           # BuildKit can't load and push from the same build, so PRs load into
           # the local daemon (for the validation step below) and main/tags push
           # to GHCR. The validation step picks the right one.
