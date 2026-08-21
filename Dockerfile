@@ -75,8 +75,10 @@ ENV NODE_ENV=production
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./
-COPY src/lib ./src/lib
-COPY src/mcp ./src/mcp
+# Only the server's import closure -- copying all of src/lib would put 111
+# unrelated files, tests included, into a published image.
+COPY src/mcp/server.ts ./src/mcp/
+COPY src/lib/mc-client.ts src/lib/dispatch-env.ts src/lib/lane-config.ts ./src/lib/
 
 RUN addgroup --system --gid 1001 nodejs \
     && adduser --system --uid 1001 --ingroup nodejs mcp
