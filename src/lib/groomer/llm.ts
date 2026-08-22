@@ -77,9 +77,10 @@ export function buildGroomerResponseSchema(): Record<string, unknown> {
       },
       summary: { type: "string" },
       githubComment: { type: "string" },
-      needsInfoReason: { type: "string" },
-      blockedReason: { type: "string" },
-      nextGroomingAction: {
+          needsInfoReason: { type: "string" },
+          blockedReason: { type: "string" },
+          notReadyReason: { type: "string" },
+          nextGroomingAction: {
         type: "string",
         enum: ["promote_to_ready", "escalate", "mark_not_ready", "mark_needs_info", "mark_blocked"],
       },
