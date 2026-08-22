@@ -475,12 +475,14 @@ describe("security headers", () => {
     expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
   });
 
-  it("CSP allows inline scripts and styles for Next.js compatibility", async () => {
+  it("does not allow inline scripts in the CSP", async () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
     const res = await middleware(makeRequest("/board"));
 
     const csp = res.headers.get("content-security-policy") ?? "";
-    expect(csp).toContain("'unsafe-inline'");
+    const scriptSrc = csp.match(/script-src[^;]*/)?.[0] ?? "";
+    expect(scriptSrc).toBe("script-src 'self'");
+    expect(scriptSrc).not.toContain("'unsafe-inline'");
   });
 });
