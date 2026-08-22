@@ -339,6 +339,7 @@ async function executeGroomerRun(
     if (output.summary) issueData.groomingSummary = output.summary;
     if (output.needsInfoReason) issueData.needsInfoReason = output.needsInfoReason;
     if (output.blockedReason) issueData.blockedReason = output.blockedReason;
+    if (output.notReadyReason) issueData.notReadyReason = output.notReadyReason;
     if (output.nextGroomingAction) issueData.nextGroomingAction = output.nextGroomingAction;
 
     await deps.prisma.issue.update({
