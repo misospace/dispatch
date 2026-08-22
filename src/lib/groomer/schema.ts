@@ -17,6 +17,7 @@ export interface GroomerOutput {
   githubComment?: string;
   needsInfoReason?: string;
   blockedReason?: string;
+  notReadyReason?: string;
   nextGroomingAction?: GroomAction;
   proposedTitle?: string;
   proposedBody?: string;
@@ -125,11 +126,12 @@ const baseSchema = z.object({
 
 // ─── Optional String Fields ───────────────────────────────────────────────────
 
-const OPTIONAL_STRING_FIELDS: (keyof Pick<GroomerOutput, "summary" | "githubComment" | "needsInfoReason" | "blockedReason" | "proposedTitle" | "proposedBody">)[] = [
+const OPTIONAL_STRING_FIELDS: (keyof Pick<GroomerOutput, "summary" | "githubComment" | "needsInfoReason" | "blockedReason" | "notReadyReason" | "proposedTitle" | "proposedBody">)[] = [
   "summary",
   "githubComment",
   "needsInfoReason",
   "blockedReason",
+  "notReadyReason",
   "proposedTitle",
   "proposedBody",
 ];
@@ -358,6 +360,11 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
         });
       }
     }
+  }
+
+  if (parsed.nextGroomingAction === "mark_not_ready" && !parsed.notReadyReason) {
+    errors.push("notReadyReason is required when nextGroomingAction is mark_not_ready");
+    return { valid: false, errors, resolutions };
   }
 
   // A groomer can express readiness through actionability, its explicit next
