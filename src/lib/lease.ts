@@ -6,6 +6,7 @@
 // cron workers and harnesses resume interrupted work without overlapping
 // another agent's claimed work.
 
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import type { CheckpointValue, ResumeContext, ResumeContextWithLease } from "./next-action";
 import { buildResumeContext, isValidCheckpoint } from "./next-action";
@@ -58,18 +59,36 @@ export async function upsertLease(params: {
     return { created: false, lease };
   }
 
-  // Create new lease (checkpoint is required in the schema)
-  const lease = await prisma.lease.create({
-    data: {
-      agentName: params.agentName,
-      issueId: params.issueId,
-      expiredAt,
-      checkpoint,
-      branch: params.branch,
-      prUrl: params.prUrl,
-    },
-  });
-  return { created: true, lease };
+  // Create new lease (checkpoint is required in the schema).
+  // Two callers can race here when no lease exists yet: both pass the
+  // findUnique null check, and one create wins the
+  // @@unique([agentName, issueId]) constraint. The loser hits a P2002
+  // unique violation — re-read and return the lease the winner created
+  // instead of surfacing a 500 to the caller.
+  try {
+    const lease = await prisma.lease.create({
+      data: {
+        agentName: params.agentName,
+        issueId: params.issueId,
+        expiredAt,
+        checkpoint,
+        branch: params.branch,
+        prUrl: params.prUrl,
+      },
+    });
+    return { created: true, lease };
+  } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === "P2002"
+    ) {
+      const winner = await prisma.lease.findUnique({
+        where: { agentName_issueId: { agentName: params.agentName, issueId: params.issueId } },
+      });
+      if (winner) return { created: false, lease: winner };
+    }
+    throw err;
+  }
 }
 
 // ─── Lease expiry helpers ────────────────────────────────────────────────────

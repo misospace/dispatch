@@ -39,6 +39,7 @@ vi.mock("@/lib/next-action", () => ({
   isValidCheckpoint: vi.fn((cp) => ["issue_claimed", "branch_created", "changes_made"].includes(cp)),
 }));
 
+import { Prisma } from "@prisma/client";
 import { upsertLease, isLeaseExpired, findActiveLeasesForIssue, releaseLease, releaseExpiredLeases, resolveActiveWork, findLeasedIssueIds, calculateLeaseExpiry, DEFAULT_LEASE_TTL_MS } from "./lease";
 
 function makeNow() { return new Date(); }
@@ -120,6 +121,47 @@ describe("upsertLease", () => {
 
       const callData = (mocks.leaseCreate.mock.calls[0] as any)[0].data;
       expect(callData.prUrl).toBe("https://github.com/org/repo/pull/456");
+    });
+  });
+
+  describe("concurrent create race", () => {
+    it("returns the winner's lease when a concurrent create hits the unique constraint", async () => {
+      // Both callers pass the findUnique null check before either lease
+      // exists. The first create wins; the second hits P2002 on
+      // @@unique([agentName, issueId]) and must re-read the winner.
+      const winner = makeLease({ id: "l-winner" });
+      let createCount = 0;
+      mocks.leaseFindUnique.mockImplementation(() => {
+        // First call per caller: no lease yet. Re-read after P2002: winner.
+        return Promise.resolve(createCount > 0 ? winner : null);
+      });
+      mocks.leaseCreate.mockImplementation(() => {
+        createCount += 1;
+        if (createCount === 1) return Promise.resolve(winner);
+        return Promise.reject(
+          new Prisma.PrismaClientKnownRequestError("unique", { code: "P2002", clientVersion: "test" })
+        );
+      });
+
+      const [a, b] = await Promise.all([
+        upsertLease({ agentName: "saffron", issueId: "i-1" }),
+        upsertLease({ agentName: "saffron", issueId: "i-1" }),
+      ]);
+
+      expect(mocks.leaseCreate).toHaveBeenCalledTimes(2);
+      // Both callers end up with the winner's lease, no 500.
+      expect(a.lease.id).toBe("l-winner");
+      expect(b.lease.id).toBe("l-winner");
+      expect(a.created).toBe(true);
+      expect(b.created).toBe(false);
+    });
+
+    it("re-throws non-unique create errors", async () => {
+      mocks.leaseFindUnique.mockImplementation(() => Promise.resolve(null));
+      mocks.leaseCreate.mockImplementation(() => Promise.reject(new Error("connection lost")));
+
+      await expect(upsertLease({ agentName: "saffron", issueId: "i-1" })).rejects.toThrow("connection lost");
+      expect(mocks.leaseFindUnique).toHaveBeenCalledTimes(1);
     });
   });
 
