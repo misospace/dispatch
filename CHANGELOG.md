@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.41](https://github.com/misospace/dispatch/compare/v0.5.40...v0.5.41) (2026-08-22)
+
+
+### Features
+
+* **deps:** update dependency @vitejs/plugin-react (6.0.5 → 6.1.0) ([#816](https://github.com/misospace/dispatch/issues/816)) ([4c8260b](https://github.com/misospace/dispatch/commit/4c8260b111253438a08deb7a6720b18fa70a0fb9))
+* **deps:** update dependency eslint (10.8.1 → 10.9.0) ([#823](https://github.com/misospace/dispatch/issues/823)) ([d9bafc4](https://github.com/misospace/dispatch/commit/d9bafc4d378ff18c0e28982013b6d972c945d30d))
+* **mcp:** publish a stdio MCP server image ([#824](https://github.com/misospace/dispatch/issues/824)) ([8b1ba6c](https://github.com/misospace/dispatch/commit/8b1ba6c65566353168bf9e30daddd40d8a8842b0))
+
+
+### Bug Fixes
+
+* **api:** apply enforceRateLimit to mutating POST endpoints ([#796](https://github.com/misospace/dispatch/issues/796)) ([#819](https://github.com/misospace/dispatch/issues/819)) ([3ff68ee](https://github.com/misospace/dispatch/commit/3ff68ee3836c41f42bc711672d934df9694c228f))
+* **deps:** update dependency @testing-library/user-event (14.6.5 → 14.6.6) ([#828](https://github.com/misospace/dispatch/issues/828)) ([5e495fb](https://github.com/misospace/dispatch/commit/5e495fb620b3637b7a99ef761e11643dbbb02535))
+* **deps:** update nextjs monorepo (16.3.1 → 16.3.2) ([#821](https://github.com/misospace/dispatch/issues/821)) ([31db0b7](https://github.com/misospace/dispatch/commit/31db0b7c135d2e8c7425316775733bc9eac45262))
+* **github:** retry transient 429/5xx responses with exponential backoff ([#820](https://github.com/misospace/dispatch/issues/820)) ([f48c9ef](https://github.com/misospace/dispatch/commit/f48c9efa928ff8b25933750703587fc0523000e2)), closes [#795](https://github.com/misospace/dispatch/issues/795)
+* **groomer:** let targeted re-groom bypass the parked-issue exclusion ([#818](https://github.com/misospace/dispatch/issues/818)) ([cc17ecd](https://github.com/misospace/dispatch/commit/cc17ecd0c9d9ad5b8e269377b7b455d731ef357e)), closes [#793](https://github.com/misospace/dispatch/issues/793)
+* **groomer:** persist not-ready reasons from hosted decisions ([#833](https://github.com/misospace/dispatch/issues/833)) ([bf74114](https://github.com/misospace/dispatch/commit/bf74114e80e5bfd44be3e3449da342e806153078))
+* **lease:** make upsertLease atomic against the (agentName, issueId) unique constraint ([#826](https://github.com/misospace/dispatch/issues/826)) ([b4adce6](https://github.com/misospace/dispatch/commit/b4adce648553730012ca6010feba4adf0dd5fc5f)), closes [#797](https://github.com/misospace/dispatch/issues/797)
+* **mcp:** ship only the server's import closure ([#825](https://github.com/misospace/dispatch/issues/825)) ([e4eaba8](https://github.com/misospace/dispatch/commit/e4eaba8aa5267df430ddc920f9672a05ee94b1e1))
+* **security:** remove unsafe inline scripts from CSP ([#829](https://github.com/misospace/dispatch/issues/829)) ([3c0d642](https://github.com/misospace/dispatch/commit/3c0d642987acacbfa8185fe3c3712c89fe347f64)), closes [#798](https://github.com/misospace/dispatch/issues/798)
+* **sync:** lock pr follow-up and reconciliation jobs ([#822](https://github.com/misospace/dispatch/issues/822)) ([0d1c2a8](https://github.com/misospace/dispatch/commit/0d1c2a87d70ad330e6535b8acb7c6de78ca8538f)), closes [#801](https://github.com/misospace/dispatch/issues/801)
+
+
+### Documentation
+
+* **env:** align .env.example scheduler defaults with scheduler.ts ([#827](https://github.com/misospace/dispatch/issues/827)) ([d44b12c](https://github.com/misospace/dispatch/commit/d44b12c35deeb51f5593d83361101718017e20f2)), closes [#802](https://github.com/misospace/dispatch/issues/802)
+
 ## [0.5.40](https://github.com/misospace/dispatch/compare/v0.5.39...v0.5.40) (2026-08-19)
 
 
