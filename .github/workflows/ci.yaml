@@ -80,7 +80,11 @@ jobs:
         run: npm run db:deploy
       - name: Verify current-lane indexes
         run: npx prisma db execute --file scripts/verify-current-lane-indexes.sql
+      - name: Create production compatibility database
+        run: echo 'CREATE DATABASE dispatch_production;' | npx prisma db execute --stdin
       - name: Verify production migration compatibility
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production"
         run: |
           npx prisma db execute --file scripts/seed-applied-current-lane-migration.sql
           npm run db:deploy
