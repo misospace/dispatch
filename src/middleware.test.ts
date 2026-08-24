@@ -539,15 +539,14 @@ describe("security headers", () => {
     );
   });
 
-  it("computes the same nonce for every proxy pass of one request", async () => {
-    // Next 16 invokes the proxy several times per document request, each
-    // pass seeing the original incoming request, and the browser intersects
-    // multiple CSP response headers. Every pass must therefore set the SAME
-    // nonce — which is only possible if the nonce is a pure function of the
-    // request (an HMAC digest, see middleware.ts). Two independent
-    // invocations for the same request must agree, or the framework's
-    // flight scripts (which carry one nonce) are blocked by the other
-    // passes' policies.
+  it("issues a unique nonce per response, even for the same request twice", async () => {
+    // The nonce must be unguessable and unique per response (CSP spec): the
+    // value is readable by the client (the policy header plus the nonce= attribute
+    // on every script tag in the DOM), so a nonce that is a stable function
+    // of the request could be harvested from one page load and replayed on
+    // injected content — script-src 'self' 'nonce-…' would become
+    // 'unsafe-inline' for anyone who has loaded the page once. Two responses
+    // for the identical request must therefore differ.
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
     const first = await middleware(makeRequest("/board"));
@@ -557,7 +556,29 @@ describe("security headers", () => {
       (res.headers.get("content-security-policy") ?? "").match(/'nonce-([^']+)'/)?.[1];
 
     expect(nonce(first)).toBeTruthy();
-    expect(nonce(first)).toBe(nonce(second));
+    expect(nonce(first)).not.toBe(nonce(second));
+  });
+
+  it("does not emit a CSP header in development mode (dev's multi-pass proxy would intersect divergent nonces)", async () => {
+    // In `next dev`, Next 16 invokes the proxy several times per document
+    // request and each pass accumulates its own CSP header onto the response;
+    // the browser intersects them and the framework's nonce-stamped scripts
+    // are blocked — a broken policy, and it cannot be fixed from inside the
+    // proxy (see applySecurityHeaders in middleware.ts). Dev therefore skips
+    // the CSP entirely; the deployment target (`next start`) enforces it.
+    // The static security headers still apply.
+    vi.stubEnv("NODE_ENV", "development");
+    try {
+      process.env.DISPATCH_AUTH_MODE = "disabled";
+
+      const res = await middleware(makeRequest("/board"));
+
+      expect(res.headers.get("content-security-policy")).toBeNull();
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("derives different nonces for different requests", async () => {
