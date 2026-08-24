@@ -84,6 +84,7 @@ jobs:
         run: |
           npx prisma db execute --file scripts/seed-applied-current-lane-migration.sql
           npm run db:deploy
+          npx prisma db execute --file scripts/verify-current-lane-indexes.sql
 
   coverage:
     name: Coverage
