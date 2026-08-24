@@ -6,8 +6,10 @@ name: PR Smoke
 # inline theme script, a sync lock that wedged, and a groomer that 500s. All
 # three needed a running app.
 #
-# Runs on the self-hosted misospace pool in the test cluster, deploys into a
-# throwaway namespace, and deletes it afterwards. Nothing persists.
+# Runs on the self-hosted misospace pool in the test cluster. The runner has no
+# cluster-wide permissions and cannot create namespaces, so every PR shares the
+# misospace-ci namespace and is separated by instance name. See
+# joryirving/home-ops#9383 for why it is scoped that way.
 
 on:
   pull_request:
@@ -22,59 +24,69 @@ permissions:
 
 jobs:
   smoke:
-    # Fork PRs get no secrets and cannot pull the PR image, so skip rather than
-    # fail confusingly.
+    # Fork PRs get no registry credentials and cannot pull the PR image, so skip
+    # rather than fail confusingly. This is a convenience, NOT a security
+    # control: a fork controls its own workflow file and can remove this line.
+    # The real boundary is the runner's namespaced RBAC.
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: misospace-test
     timeout-minutes: 20
     env:
-      NS: dispatch-pr-${{ github.event.pull_request.number }}
+      NS: misospace-ci
+      INSTANCE: pr${{ github.event.pull_request.number }}
       IMAGE: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Create namespace
-        run: kubectl create namespace "$NS"
+      - name: Clear any leftovers from a previous run
+        run: |
+          kubectl delete deploy,svc,pod -n "$NS" \
+            -l "smoke-instance=${INSTANCE}" --ignore-not-found --wait=true
 
       - name: Deploy Postgres
         run: |
-          kubectl apply -n "$NS" -f deploy/ci/postgres.yaml
-          kubectl rollout status -n "$NS" deploy/postgres --timeout=180s
+          sed "s|INSTANCE|${INSTANCE}|g" deploy/ci/postgres.yaml \
+            | kubectl apply -n "$NS" -f -
+          kubectl rollout status -n "$NS" "deploy/postgres-${INSTANCE}" --timeout=180s
 
       - name: Deploy dispatch
         run: |
-          sed "s|IMAGE_PLACEHOLDER|${IMAGE}|" deploy/ci/dispatch.yaml \
-            | kubectl apply -n "$NS" -f -
-          kubectl rollout status -n "$NS" deploy/dispatch --timeout=300s
+          sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|" -e "s|INSTANCE|${INSTANCE}|g" \
+            deploy/ci/dispatch.yaml | kubectl apply -n "$NS" -f -
+          kubectl rollout status -n "$NS" "deploy/dispatch-${INSTANCE}" --timeout=300s
 
       - name: Inline scripts survive the CSP
-        run: node scripts/smoke-csp.mjs "http://dispatch.${NS}:3000"
+        run: node scripts/smoke-csp.mjs "http://dispatch-${INSTANCE}.${NS}:3000"
 
-      - name: Sync does not fail on a wedged lock
+      - name: Sync does not wedge on a stale lock
         run: |
-          # A throwaway token means GitHub calls fail, which is fine. What must
-          # not happen is a P2002 on SyncLock: that is the #840 class, where the
-          # lock row survives a crash and every later run 500s forever.
-          code=$(kubectl run smoke-sync-$RANDOM -n "$NS" --rm -i --restart=Never \
-            --image=curlimages/curl:latest --quiet -- \
-            -s -o /tmp/body -w '%{http_code}' -X POST \
-            "http://dispatch.${NS}:3000/api/sync" || true)
+          # The GitHub token here is fake, so the sync call is expected to fail
+          # on auth. What must not appear is a P2002 on SyncLock: that is the
+          # #840 class, where the lock row outlives its holder and every later
+          # run 500s forever. Asserting "not this failure" rather than success
+          # is what lets this run without real credentials.
+          code=$(kubectl run "smoke-sync-${INSTANCE}-$RANDOM" -n "$NS" --rm -i \
+            --restart=Never --image=curlimages/curl:latest --quiet -- \
+            -s -o /dev/null -w '%{http_code}' -X POST \
+            "http://dispatch-${INSTANCE}.${NS}:3000/api/sync" || true)
           echo "POST /api/sync -> ${code}"
-          if kubectl logs -n "$NS" deploy/dispatch --tail=200 | grep -q "SyncLock"; then
-            echo "FAIL: SyncLock error in the app log after a single sync attempt"
-            kubectl logs -n "$NS" deploy/dispatch --tail=200 | grep -B2 -A6 "SyncLock"
+          if kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=300 | grep -q "SyncLock"; then
+            echo "FAIL: SyncLock error after a single sync attempt"
+            kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=300 | grep -B2 -A6 "SyncLock"
             exit 1
           fi
           echo "OK  no SyncLock contention on a first run"
 
-      - name: Dump logs on failure
+      - name: Dump state on failure
         if: failure()
         run: |
-          kubectl get all -n "$NS" || true
-          kubectl logs -n "$NS" deploy/dispatch --tail=200 || true
-          kubectl describe pods -n "$NS" || true
+          kubectl get all -n "$NS" -l "smoke-instance=${INSTANCE}" || true
+          kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=200 || true
+          kubectl describe pods -n "$NS" -l "smoke-instance=${INSTANCE}" || true
 
-      - name: Tear down
+      - name: Tear down this instance
         if: always()
-        run: kubectl delete namespace "$NS" --wait=false || true
+        run: |
+          kubectl delete deploy,svc,pod -n "$NS" \
+            -l "smoke-instance=${INSTANCE}" --ignore-not-found --wait=false || true

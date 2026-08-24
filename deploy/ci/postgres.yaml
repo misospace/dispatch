@@ -1,13 +1,19 @@
 ---
 # Throwaway Postgres for one PR's smoke run. emptyDir on purpose: the data dies
-# with the namespace, so there is no PVC to provision or leak.
+# with the pod, so there is no PVC to provision or leak.
+#
+# INSTANCE is replaced by the smoke workflow with pr<n>. The runner has no
+# permission to create namespaces (deliberately, see joryirving/home-ops#9383),
+# so every PR shares the misospace-ci namespace and is kept apart by name.
 apiVersion: v1
 kind: Service
 metadata:
-  name: postgres
+  name: postgres-INSTANCE
+  labels:
+    smoke-instance: INSTANCE
 spec:
   selector:
-    app: postgres
+    app: postgres-INSTANCE
   ports:
     - port: 5432
       targetPort: 5432
@@ -15,16 +21,19 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: postgres
+  name: postgres-INSTANCE
+  labels:
+    smoke-instance: INSTANCE
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: postgres
+      app: postgres-INSTANCE
   template:
     metadata:
       labels:
-        app: postgres
+        app: postgres-INSTANCE
+        smoke-instance: INSTANCE
     spec:
       containers:
         - name: postgres

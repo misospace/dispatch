@@ -2,10 +2,12 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: dispatch
+  name: dispatch-INSTANCE
+  labels:
+    smoke-instance: INSTANCE
 spec:
   selector:
-    app: dispatch
+    app: dispatch-INSTANCE
   ports:
     - port: 3000
       targetPort: 3000
@@ -13,16 +15,19 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dispatch
+  name: dispatch-INSTANCE
+  labels:
+    smoke-instance: INSTANCE
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dispatch
+      app: dispatch-INSTANCE
   template:
     metadata:
       labels:
-        app: dispatch
+        app: dispatch-INSTANCE
+        smoke-instance: INSTANCE
     spec:
       containers:
         - name: dispatch
@@ -30,10 +35,9 @@ spec:
           image: IMAGE_PLACEHOLDER
           env:
             - name: DATABASE_URL
-              value: postgresql://dispatch:dispatch@postgres:5432/dispatch
-            # Deliberately fake. The checks in this environment must not depend
-            # on reaching GitHub; a check that needs real credentials belongs in
-            # a different job.
+              value: postgresql://dispatch:dispatch@postgres-INSTANCE:5432/dispatch
+            # Deliberately fake. Nothing checked here may depend on reaching
+            # GitHub; a check that needs real credentials belongs in another job.
             - name: GITHUB_TOKEN
               value: ci-smoke-not-a-real-token
             - name: DISPATCH_AGENT_TOKEN
