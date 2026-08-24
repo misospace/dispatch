@@ -90,6 +90,40 @@ jobs:
           npm run db:deploy
           npx prisma db execute --file scripts/verify-current-lane-indexes.sql
 
+  database-integration:
+    name: Database integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18@sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: dispatch_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d dispatch_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Setup
+        uses: ./.github/actions/setup-node
+      - name: Apply the schema
+        run: npm run db:deploy
+      # The mocked suite cannot fail for the reason production did: a mock can
+      # reject with a P2002-shaped error, but only a real PostgreSQL aborts the
+      # surrounding transaction, and that abort is what broke #843 (P2039,
+      # #850). Two fixes to this lock shipped green against mocks and failed in
+      # the cluster, so this job is the guard rather than a nicety.
+      - name: Sync-lock concurrency against a real PostgreSQL
+        env:
+          RUN_DB_INTEGRATION: "1"
+        run: npx vitest run src/lib/sync-lock.integration.test.ts
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
