@@ -22,6 +22,16 @@ export const metadata: Metadata = {
   },
 };
 
+// The CSP sets `script-src 'self' 'nonce-<per-request>'` (see
+// src/middleware.ts). The nonce is stamped onto the App Router's inline RSC
+// flight scripts at *render* time, so a page prerendered at build time ships
+// with flight scripts that carry no nonce and are blocked by its own CSP —
+// hydration fails and the page renders as inert static HTML (this is why
+// the grooming page "will not load", dispatch#841). Forcing dynamic
+// rendering makes every page render per request, so every page's flight
+// scripts carry the nonce for that request.
+export const dynamic = "force-dynamic";
+
 export default function RootLayout({
   children,
 }: {
