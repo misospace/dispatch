@@ -16,6 +16,7 @@ export interface GroomingCandidate {
   repoFullName: string;
   labels: string[];
   currentLane: string | null;
+  groomingSummary: string | null;
 }
 
 export interface SelectGroomingCandidateOptions {
@@ -71,6 +72,9 @@ export async function selectGroomingCandidate(
       url: true,
       labels: true,
       currentLane: true,
+      // Carried so run.ts can fall back to it as notReadyReason when the model
+      // omits the field on a mark_not_ready decision (dispatch#839).
+      groomingSummary: true,
       repository: { select: { fullName: true } },
     },
     orderBy: { number: "asc" },
@@ -117,5 +121,6 @@ export async function selectGroomingCandidate(
     repoFullName: best.repository.fullName,
     labels: best.labels,
     currentLane: best.currentLane ?? getBacklogLane()?.id ?? "backlog",
+    groomingSummary: best.groomingSummary,
   };
 }

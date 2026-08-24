@@ -199,6 +199,38 @@ async function executeGroomerRun(
 
     const output = validation.parsed!;
 
+    // mark_not_ready degrades instead of failing the run (dispatch#839). The
+    // model is not obliged to emit notReadyReason, so a routine omission must
+    // not 500 the whole run. Fallback order, best to worst:
+    //  1. the model's notReadyReason (normal case),
+    //  2. this run's own summary — it is about to be written to
+    //     groomingSummary anyway and already reads like a not-ready reason.
+    //     This is the common case for a first-time groom, where the issue has
+    //     no prior summary; without it the action would persist with no
+    //     reason, buildGroomingStateExclusionWhere would not engage, and the
+    //     24h cooldown would be the only guard again (the re-groom treadmill
+    //     #831 removed),
+    //  3. the issue's existing groomingSummary,
+    //  4. nothing — persist the action without a reason.
+    let notReadyReason = output.notReadyReason?.trim() || undefined;
+    if (output.nextGroomingAction === "mark_not_ready") {
+      if (!notReadyReason && output.summary?.trim()) {
+        notReadyReason = output.summary.trim();
+        console.warn(
+          `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason; used this run's summary: ${notReadyReason}`,
+        );
+      } else if (!notReadyReason && candidate.groomingSummary?.trim()) {
+        notReadyReason = candidate.groomingSummary.trim();
+        console.warn(
+          `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason; fell back to existing groomingSummary: ${notReadyReason}`,
+        );
+      } else if (!notReadyReason) {
+        console.warn(
+          `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason and has no summary to fall back on; persisting the action without a reason`,
+        );
+      }
+    }
+
 
     // Record structured alias-resolution warnings for observability
     if (validation.resolutions && validation.resolutions.length > 0) {
@@ -218,6 +250,7 @@ async function executeGroomerRun(
       labelsToRemove: output.labelsToRemove,
       lane: output.lane,
       summary: output.summary ?? null,
+      notReadyReason: notReadyReason ?? null,
       willComment: Boolean(output.githubComment?.trim()),
       titleRewritten: titleBodyMutations.shouldRewrite,
       originalTitle: titleBodyMutations.shouldRewrite ? candidate.title : undefined,
@@ -339,7 +372,7 @@ async function executeGroomerRun(
     if (output.summary) issueData.groomingSummary = output.summary;
     if (output.needsInfoReason) issueData.needsInfoReason = output.needsInfoReason;
     if (output.blockedReason) issueData.blockedReason = output.blockedReason;
-    if (output.notReadyReason) issueData.notReadyReason = output.notReadyReason;
+    if (notReadyReason) issueData.notReadyReason = notReadyReason;
     if (output.nextGroomingAction) issueData.nextGroomingAction = output.nextGroomingAction;
 
     await deps.prisma.issue.update({
