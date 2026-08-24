@@ -40,6 +40,7 @@ Return ONLY valid JSON with this exact schema:
   "githubComment": "optional comment to post on the issue (omit if nothing to say)",
   "needsInfoReason": "optional reason if info is needed",
   "blockedReason": "optional reason if blocked",
+  "notReadyReason": "optional reason why the issue is not ready; ALWAYS include it when nextGroomingAction is mark_not_ready",
   "nextGroomingAction": "optional: promote_to_ready|escalate|mark_not_ready|mark_needs_info|mark_blocked",
   "proposedTitle": "optional: rewritten title if current one is bad",
   "proposedBody": "optional: enriched body if current one is sparse"

@@ -362,10 +362,11 @@ export function validateGroomerOutput(data: unknown): ValidationResult {
     }
   }
 
-  if (parsed.nextGroomingAction === "mark_not_ready" && !parsed.notReadyReason) {
-    errors.push("notReadyReason is required when nextGroomingAction is mark_not_ready");
-    return { valid: false, errors, resolutions };
-  }
+  // Note: a mark_not_ready decision may omit notReadyReason — the model is not
+  // obliged to emit it. Rejecting it here took down the entire groomer run for
+  // one decision's omission (dispatch#839), so the schema validator no longer
+  // hard-fails on it; run.ts degrades instead (falls back to the issue's
+  // existing groomingSummary, then persists the action without a reason).
 
   // A groomer can express readiness through actionability, its explicit next
   // action, or its lane choice. Treat every one of those signals consistently:
