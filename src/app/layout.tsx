@@ -40,7 +40,10 @@ export default function RootLayout({
           #829), so an inline script here is blocked and dark mode never
           applies (dispatch#841). A classic <head> script is render-blocking,
           so it still runs before first paint. See public/theme-init.js.
+          Synchronous on purpose: async/defer would let the page paint before
+          the theme is known (dispatch#841).
         */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts -- render-blocking by design: the theme class must be applied before first paint (dispatch#841); see public/theme-init.js */}
         <script src="/theme-init.js" />
       </head>
       <body className={`${inter.className} bg-background text-foreground`}>
