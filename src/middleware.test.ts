@@ -475,14 +475,72 @@ describe("security headers", () => {
     expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
   });
 
-  it("does not allow inline scripts in the CSP", async () => {
+  it("does not allow inline scripts in the CSP except via a per-request nonce", async () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
     const res = await middleware(makeRequest("/board"));
 
     const csp = res.headers.get("content-security-policy") ?? "";
     const scriptSrc = csp.match(/script-src[^;]*/)?.[0] ?? "";
-    expect(scriptSrc).toBe("script-src 'self'");
+    // 'self' plus exactly one base64 nonce — and never 'unsafe-inline'
+    // (the policy that let #841 ship with dark mode silently broken).
+    expect(scriptSrc).toMatch(/^script-src 'self' 'nonce-[A-Za-z0-9+/]{16,}={0,2}'$/);
     expect(scriptSrc).not.toContain("'unsafe-inline'");
+  });
+
+  it("passes the same nonce to the framework via the request CSP header", async () => {
+    // The App Router's own inline scripts (the RSC flight payload) are only
+    // unblocked if the framework stamps its nonce on them. Next reads that
+    // nonce from the *incoming request's* content-security-policy header
+    // (parseRequestHeaders / getScriptNonceFromHeader in next's app-render),
+    // so the middleware forwards its generated nonce there. The two must
+    // agree: a divergent request nonce means every flight script is blocked
+    // and hydration fails on every page.
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const req = makeRequest("/board");
+    const res = await middleware(req);
+
+    const responseCsp = res.headers.get("content-security-policy") ?? "";
+    const responseNonce = responseCsp.match(/'nonce-([^']+)'/)?.[1];
+    expect(responseNonce).toBeTruthy();
+    expect(req.headers.get("content-security-policy")).toBe(
+      `script-src 'nonce-${responseNonce}'`,
+    );
+  });
+
+  it("computes the same nonce for every proxy pass of one request", async () => {
+    // Next 16 invokes the proxy several times per document request, each
+    // pass seeing the original incoming request, and the browser intersects
+    // multiple CSP response headers. Every pass must therefore set the SAME
+    // nonce — which is only possible if the nonce is a pure function of the
+    // request (an HMAC digest, see middleware.ts). Two independent
+    // invocations for the same request must agree, or the framework's
+    // flight scripts (which carry one nonce) are blocked by the other
+    // passes' policies.
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const first = await middleware(makeRequest("/board"));
+    const second = await middleware(makeRequest("/board"));
+
+    const nonce = (res: Awaited<ReturnType<typeof middleware>>) =>
+      (res.headers.get("content-security-policy") ?? "").match(/'nonce-([^']+)'/)?.[1];
+
+    expect(nonce(first)).toBeTruthy();
+    expect(nonce(first)).toBe(nonce(second));
+  });
+
+  it("derives different nonces for different requests", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const board = await middleware(makeRequest("/board"));
+    const grooming = await middleware(makeRequest("/grooming"));
+
+    const nonce = (res: Awaited<ReturnType<typeof middleware>>) =>
+      (res.headers.get("content-security-policy") ?? "").match(/'nonce-([^']+)'/)?.[1];
+
+    expect(nonce(board)).toBeTruthy();
+    expect(nonce(grooming)).toBeTruthy();
+    expect(nonce(board)).not.toBe(nonce(grooming));
   });
 });

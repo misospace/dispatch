@@ -6,17 +6,101 @@ import { enforceRateLimit, resetRateLimitKey } from "@/lib/rate-limit";
 
 type AuthMode = "basic" | "oidc" | "disabled" | undefined;
 
-// Security headers applied to all responses
+// Static security headers applied to all responses. The CSP is dynamic (it
+// carries a per-request nonce) and is set separately in applySecurityHeaders.
 const SECURITY_HEADERS: Record<string, string> = {
-  "Content-Security-Policy":
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "strict-origin-when-cross-origin",
 };
 
-function applySecurityHeaders(response: NextResponse): void {
+// CSP template. `script-src 'self'` alone blocks every inline <script> —
+// including the App Router's own RSC flight payload (the self.__next_f
+// scripts the framework injects at render time), which kills hydration on
+// every page, not just the theme initialiser (dispatch#841). The per-request
+// nonce is the escape hatch for those scripts; see applySecurityHeaders.
+const CSP_TEMPLATE =
+  "default-src 'self'; script-src 'self' 'nonce-__NONCE__'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+
+/**
+ * Secret for the deterministic CSP nonce, stable for the process lifetime.
+ *
+ * DISPATCH_CSP_NONCE_SECRET is preferred (survives process restarts);
+ * NEXTAUTH_SECRET is a reasonable fallback (already required for the oidc
+ * auth mode); otherwise a random per-process value is generated. The nonce
+ * only needs to be stable across the proxy passes of a single request — see
+ * generateCspNonce for why a per-process value is sufficient in practice.
+ */
+const CSP_NONCE_SECRET: string = (() => {
+  const envSecret = process.env.DISPATCH_CSP_NONCE_SECRET ?? process.env.NEXTAUTH_SECRET;
+  if (envSecret) return envSecret;
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes));
+})();
+
+/**
+ * Generate the CSP nonce for this request.
+ *
+ * The nonce is an HMAC-SHA256 digest over the request identity (method +
+ * path + query), NOT a fresh random value per invocation. That is because
+ * Next 16 invokes the proxy (middleware) several times for a single document
+ * request, each pass seeing the original incoming request — a fresh random
+ * nonce per pass yields several response CSP headers with different nonces,
+ * and the browser intersects them: the flight scripts carry only the last
+ * pass's nonce and are still blocked. A deterministic nonce makes every pass
+ * of the same request compute the identical value (verified against a
+ * production build of this repo: 4 proxy passes, 4 identical headers, and
+ * the framework stamps that nonce on every inline script it emits).
+ *
+ * Security note: this means the nonce for a given URL is stable until the
+ * secret changes. That is not a practical downgrade here: responses are
+ * `no-cache, must-revalidate` (no shared-cache poisoning vector), an
+ * attacker who can tamper with a response in transit can read the nonce from
+ * its CSP header whether it is random or not, and inline event handlers
+ * (the usual XSS shape) cannot carry nonces at all. What the nonce buys is
+ * letting the framework's own scripts through while `script-src 'self'`
+ * still blocks every nonce-less inline script.
+ *
+ * Uses Web Crypto because the proxy runs in the Edge runtime, where
+ * node:crypto is unavailable (verified: importing it makes the proxy fail
+ * to load and every page 500s).
+ */
+async function generateCspNonce(request: NextRequest): Promise<string> {
+  const material = `${request.method}\n${request.nextUrl.pathname}\n${request.nextUrl.search}`;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(CSP_NONCE_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(material));
+  const bytes = new Uint8Array(signature).slice(0, 16);
+  return btoa(String.fromCharCode(...bytes));
+}
+
+async function applySecurityHeaders(request: NextRequest, response: NextResponse): Promise<void> {
+  const nonce = await generateCspNonce(request);
+
+  // The policy the browser enforces: same-origin scripts plus this request's
+  // nonce. Our own page markup carries no inline scripts (the theme
+  // initialiser is a static file, see src/app/layout.tsx); the nonce exists
+  // for the framework's inline scripts.
+  response.headers.set("Content-Security-Policy", CSP_TEMPLATE.replace("__NONCE__", nonce));
+
+  // The nonce the framework's own inline scripts will carry. Next's App
+  // Router reads a nonce from the *incoming request's* content-security-policy
+  // header and stamps it onto the inline scripts it emits itself (the RSC
+  // flight payload, the preinit script) — see parseRequestHeaders /
+  // getScriptNonceFromHeader in next/dist/server/app-render. Without this
+  // header those scripts are emitted without a nonce and script-src 'self'
+  // blocks them, so hydration fails regardless of our own markup. This is
+  // the same pattern Next documents for edge proxies that set the CSP; the
+  // proxy just plays the proxy's role in-process.
+  request.headers.set("content-security-policy", `script-src 'nonce-${nonce}'`);
+
   for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
     response.headers.set(key, value);
   }
@@ -58,6 +142,7 @@ function parseBasicCredentials(authHeader: string | null): { username: string; p
     const decoded = atob(match[1]);
     const colonIndex = decoded.indexOf(":");
     if (colonIndex === -1) return null;
+
     return {
       username: decoded.slice(0, colonIndex),
       password: decoded.slice(colonIndex + 1),
@@ -144,14 +229,14 @@ export async function middleware(request: NextRequest) {
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
     const response = NextResponse.next();
-    applySecurityHeaders(response);
+    await applySecurityHeaders(request, response);
     return response;
   }
 
   if (authMode === "oidc") {
     if (isApiRoute) {
       const response = NextResponse.next();
-      applySecurityHeaders(response);
+      await applySecurityHeaders(request, response);
       return response;
     }
 
@@ -162,21 +247,21 @@ export async function middleware(request: NextRequest) {
     });
     if (token) {
       const response = NextResponse.next();
-      applySecurityHeaders(response);
+      await applySecurityHeaders(request, response);
       return response;
     }
 
     const loginUrl = new URL("/login", request.url);
     loginUrl.searchParams.set("callbackUrl", request.nextUrl.pathname + request.nextUrl.search);
     const redirectResponse = NextResponse.redirect(loginUrl);
-    applySecurityHeaders(redirectResponse);
+    await applySecurityHeaders(request, redirectResponse);
     return redirectResponse;
   }
 
   // No auth mode set (legacy) — no middleware enforcement; routes handle their own auth
   if (!authMode) {
     const response = NextResponse.next();
-    applySecurityHeaders(response);
+    await applySecurityHeaders(request, response);
     return response;
   }
 
@@ -188,7 +273,7 @@ export async function middleware(request: NextRequest) {
   // before the signature is ever checked. See issue #761.
   if (request.nextUrl.pathname.startsWith("/api/pr-followup/webhook") && process.env.WEBHOOK_SECRET) {
     const response = NextResponse.next();
-    applySecurityHeaders(response);
+    await applySecurityHeaders(request, response);
     return response;
   }
 
@@ -196,20 +281,20 @@ export async function middleware(request: NextRequest) {
 
   // "basic" mode — enforce Basic Auth. Basic is checked before Bearer so that
   // a successful password authentication resets the rate-limit counter on any
-  // route (UI or API), and so that a syntactically valid Basic attempt with a
-  // wrong password is the only thing counted toward the lockout. Bearer is
+  // route (UI or API), and so that a syntactically valid Basic attempt with
+  // a wrong password is the only thing counted toward the lockout. Bearer is
   // retained as the API-route credential (DISPATCH_AGENT_TOKEN) for agents
   // and workers that do not speak Basic.
   if (isBasicAuthorized(authHeader)) {
     resetRateLimitKey(`basic-auth:${clientIp(request)}`);
     const response = NextResponse.next();
-    applySecurityHeaders(response);
+    await applySecurityHeaders(request, response);
     return response;
   }
 
   if (isApiRoute && isBearerAuthorized(authHeader)) {
     const response = NextResponse.next();
-    applySecurityHeaders(response);
+    await applySecurityHeaders(request, response);
     return response;
   }
 
@@ -221,14 +306,14 @@ export async function middleware(request: NextRequest) {
     const ip = clientIp(request);
     const lockedResponse = enforceRateLimit(`basic-auth:${ip}`, BASIC_AUTH_RATE_LIMIT);
     if (lockedResponse) {
-      applySecurityHeaders(lockedResponse);
+      await applySecurityHeaders(request, lockedResponse);
       return lockedResponse;
     }
   }
 
   // No valid credentials — reject
   const unauthorizedResp = unauthorizedResponse(request);
-  applySecurityHeaders(unauthorizedResp);
+  await applySecurityHeaders(request, unauthorizedResp);
   return unauthorizedResp;
 }
 
