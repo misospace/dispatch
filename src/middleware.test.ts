@@ -475,14 +475,123 @@ describe("security headers", () => {
     expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
   });
 
-  it("does not allow inline scripts in the CSP", async () => {
+  it("applies security headers to /login without enforcing auth (basic mode)", async () => {
+    // /login is publicly reachable in every auth mode; it must not 401,
+    // but it must still carry the full header set (previously it was
+    // excluded from the matcher and shipped with no security headers).
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const res = await middleware(makeRequest("/login"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("content-security-policy")).toContain("script-src 'self' 'nonce-");
+  });
+
+  it("does not redirect /login back to itself in oidc mode", async () => {
+    // The oidc flow redirects unauthenticated UI requests to /login; /login
+    // itself must be exempt from that redirect or the browser loops.
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    mocks.getToken.mockResolvedValue(null);
+
+    const res = await middleware(makeRequest("/login"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+    expect(res.headers.get("content-security-policy")).toContain("script-src 'self' 'nonce-");
+  });
+
+  it("does not allow inline scripts in the CSP except via a per-request nonce", async () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
     const res = await middleware(makeRequest("/board"));
 
     const csp = res.headers.get("content-security-policy") ?? "";
     const scriptSrc = csp.match(/script-src[^;]*/)?.[0] ?? "";
-    expect(scriptSrc).toBe("script-src 'self'");
+    // 'self' plus exactly one base64 nonce — and never 'unsafe-inline'
+    // (the policy that let #841 ship with dark mode silently broken).
+    expect(scriptSrc).toMatch(/^script-src 'self' 'nonce-[A-Za-z0-9+/]{16,}={0,2}'$/);
     expect(scriptSrc).not.toContain("'unsafe-inline'");
+  });
+
+  it("passes the same nonce to the framework via the request CSP header", async () => {
+    // The App Router's own inline scripts (the RSC flight payload) are only
+    // unblocked if the framework stamps its nonce on them. Next reads that
+    // nonce from the *incoming request's* content-security-policy header
+    // (parseRequestHeaders / getScriptNonceFromHeader in next's app-render),
+    // so the middleware forwards its generated nonce there. The two must
+    // agree: a divergent request nonce means every flight script is blocked
+    // and hydration fails on every page.
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const req = makeRequest("/board");
+    const res = await middleware(req);
+
+    const responseCsp = res.headers.get("content-security-policy") ?? "";
+    const responseNonce = responseCsp.match(/'nonce-([^']+)'/)?.[1];
+    expect(responseNonce).toBeTruthy();
+    expect(req.headers.get("content-security-policy")).toBe(
+      `script-src 'nonce-${responseNonce}'`,
+    );
+  });
+
+  it("issues a unique nonce per response, even for the same request twice", async () => {
+    // The nonce must be unguessable and unique per response (CSP spec): the
+    // value is readable by the client (the policy header plus the nonce= attribute
+    // on every script tag in the DOM), so a nonce that is a stable function
+    // of the request could be harvested from one page load and replayed on
+    // injected content — script-src 'self' 'nonce-…' would become
+    // 'unsafe-inline' for anyone who has loaded the page once. Two responses
+    // for the identical request must therefore differ.
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const first = await middleware(makeRequest("/board"));
+    const second = await middleware(makeRequest("/board"));
+
+    const nonce = (res: Awaited<ReturnType<typeof middleware>>) =>
+      (res.headers.get("content-security-policy") ?? "").match(/'nonce-([^']+)'/)?.[1];
+
+    expect(nonce(first)).toBeTruthy();
+    expect(nonce(first)).not.toBe(nonce(second));
+  });
+
+  it("does not emit a CSP header in development mode (dev's multi-pass proxy would intersect divergent nonces)", async () => {
+    // In `next dev`, Next 16 invokes the proxy several times per document
+    // request and each pass accumulates its own CSP header onto the response;
+    // the browser intersects them and the framework's nonce-stamped scripts
+    // are blocked — a broken policy, and it cannot be fixed from inside the
+    // proxy (see applySecurityHeaders in middleware.ts). Dev therefore skips
+    // the CSP entirely; the deployment target (`next start`) enforces it.
+    // The static security headers still apply.
+    vi.stubEnv("NODE_ENV", "development");
+    try {
+      process.env.DISPATCH_AUTH_MODE = "disabled";
+
+      const res = await middleware(makeRequest("/board"));
+
+      expect(res.headers.get("content-security-policy")).toBeNull();
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("derives different nonces for different requests", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const board = await middleware(makeRequest("/board"));
+    const grooming = await middleware(makeRequest("/grooming"));
+
+    const nonce = (res: Awaited<ReturnType<typeof middleware>>) =>
+      (res.headers.get("content-security-policy") ?? "").match(/'nonce-([^']+)'/)?.[1];
+
+    expect(nonce(board)).toBeTruthy();
+    expect(nonce(grooming)).toBeTruthy();
+    expect(nonce(board)).not.toBe(nonce(grooming));
   });
 });

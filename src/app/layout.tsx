@@ -22,6 +22,16 @@ export const metadata: Metadata = {
   },
 };
 
+// The CSP sets `script-src 'self' 'nonce-<per-request>'` (see
+// src/middleware.ts). The nonce is stamped onto the App Router's inline RSC
+// flight scripts at *render* time, so a page prerendered at build time ships
+// with flight scripts that carry no nonce and are blocked by its own CSP —
+// hydration fails and the page renders as inert static HTML (this is why
+// the grooming page "will not load", dispatch#841). Forcing dynamic
+// rendering makes every page render per request, so every page's flight
+// scripts carry the nonce for that request.
+export const dynamic = "force-dynamic";
+
 export default function RootLayout({
   children,
 }: {
@@ -34,14 +44,17 @@ export default function RootLayout({
         <link rel="icon" href="/images/favicon-32.png" sizes="32x32" type="image/png" />
         <link rel="apple-touch-icon" href="/images/apple-touch-icon.png" />
         <meta name="theme-color" content="#000000" />
-        <script dangerouslySetInnerHTML={{ __html: `
-          (function() {
-            var theme = localStorage.getItem('dispatch-theme');
-            if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-              document.documentElement.classList.add('dark');
-            }
-          })();
-        `}} />
+        {/*
+          Theme initialiser, loaded from a static file rather than inline: the
+          CSP sets `script-src 'self'` with no 'unsafe-inline' (tightened in
+          #829), so an inline script here is blocked and dark mode never
+          applies (dispatch#841). A classic <head> script is render-blocking,
+          so it still runs before first paint. See public/theme-init.js.
+          Synchronous on purpose: async/defer would let the page paint before
+          the theme is known (dispatch#841).
+        */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts -- render-blocking by design: the theme class must be applied before first paint (dispatch#841); see public/theme-init.js */}
+        <script src="/theme-init.js" />
       </head>
       <body className={`${inter.className} bg-background text-foreground`}>
         <div className="min-h-screen flex flex-col bg-background">
