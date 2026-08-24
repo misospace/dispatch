@@ -34,14 +34,14 @@ export default function RootLayout({
         <link rel="icon" href="/images/favicon-32.png" sizes="32x32" type="image/png" />
         <link rel="apple-touch-icon" href="/images/apple-touch-icon.png" />
         <meta name="theme-color" content="#000000" />
-        <script dangerouslySetInnerHTML={{ __html: `
-          (function() {
-            var theme = localStorage.getItem('dispatch-theme');
-            if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-              document.documentElement.classList.add('dark');
-            }
-          })();
-        `}} />
+        {/*
+          Theme initialiser, loaded from a static file rather than inline: the
+          CSP sets `script-src 'self'` with no 'unsafe-inline' (tightened in
+          #829), so an inline script here is blocked and dark mode never
+          applies (dispatch#841). A classic <head> script is render-blocking,
+          so it still runs before first paint. See public/theme-init.js.
+        */}
+        <script src="/theme-init.js" />
       </head>
       <body className={`${inter.className} bg-background text-foreground`}>
         <div className="min-h-screen flex flex-col bg-background">
