@@ -1,0 +1,158 @@
+---
+name: PR Smoke
+
+# Stands the app up for real and checks things a unit test cannot see. 0.5.41
+# shipped three regressions with CI green: a CSP that blocked the page's own
+# inline theme script, a sync lock that wedged, and a groomer that 500s. All
+# three needed a running app.
+#
+# Runs on the self-hosted misospace pool in the test cluster. The runner has no
+# cluster-wide permissions and cannot create namespaces, so every PR shares the
+# misospace-ci namespace and is separated by instance name. See
+# joryirving/home-ops#9383 for why it is scoped that way.
+
+on:
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: pr-smoke-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    # Fork PRs get no registry credentials and cannot pull the PR image, so skip
+    # rather than fail confusingly. This is a convenience, NOT a security
+    # control: a fork controls its own workflow file and can remove this line.
+    # The real boundary is the runner's namespaced RBAC.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: misospace-test
+    timeout-minutes: 20
+    env:
+      NS: misospace-ci
+      INSTANCE: pr${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve this commit's image tag
+        run: |
+          # Immutable per-commit tag, not the mutable pr-<n> one. Both this
+          # workflow and Build Dispatch Image fire on the same push, so pr-<n>
+          # races: the smoke job can pull the previous build and test code that
+          # is not in this push (seen on 2026-08-24, where a stale image still
+          # carried the broken migration chain from before dispatch#848).
+          # docker/metadata-action's `type=sha,prefix=sha-` emits a 7-character
+          # short sha of GITHUB_SHA. On a pull_request event that is the merge
+          # commit GitHub synthesises, not the PR head, and both workflows run
+          # on the same event so they agree. Verified against the registry:
+          # head 3fe23d6 published as sha-67c76a3.
+          SHORT="${GITHUB_SHA:0:7}"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY}:sha-${SHORT}" >> "$GITHUB_ENV"
+          echo "resolved image tag sha-${SHORT} (GITHUB_SHA=${GITHUB_SHA})"
+
+      - name: Wait for this commit's image to be published
+        run: |
+          # Build Dispatch Image runs in parallel with this workflow, so poll
+          # for the tag rather than assuming it exists. Queried over the
+          # registry API with curl: this runner has no docker (containerMode is
+          # kubernetes) and the package is public, so an anonymous pull token
+          # is enough.
+          ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
+          TAG="${IMAGE##*:}"
+          for i in $(seq 1 60); do
+            TOKEN=$(curl -sSL "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull&service=ghcr.io" \
+              | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+            CODE=$(curl -sSL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+              "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${TAG}")
+            if [ "$CODE" = "200" ]; then echo "found ${IMAGE}"; exit 0; fi
+            echo "waiting for ${IMAGE} (http ${CODE}, $((i*10))s)"
+            sleep 10
+          done
+          echo "::error::${IMAGE} was never published; did Build Dispatch Image fail?"
+          exit 1
+
+      - name: Install Node
+        # Deliberately not ./.github/actions/setup-node: that composite also
+        # runs `npm ci --include=dev` and `prisma generate`, and the only Node
+        # this job runs is scripts/smoke-csp.mjs, which has no dependencies and
+        # uses global fetch. Version matches the composite and package.json.
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Point kubectl at this cluster
+        run: |
+          # The runner pod carries a projected ServiceAccount token, but kubectl
+          # does not use in-cluster credentials on its own the way a controller
+          # does, so build a kubeconfig from what is mounted.
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          kubectl config set-cluster in-cluster \
+            --server="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" \
+            --certificate-authority="$SA/ca.crt" --embed-certs=true
+          kubectl config set-credentials runner --token="$(cat $SA/token)"
+          kubectl config set-context in-cluster \
+            --cluster=in-cluster --user=runner --namespace="$NS"
+          kubectl config use-context in-cluster
+          # Fail here with a clear message rather than three steps later.
+          kubectl auth can-i create deployments -n "$NS"
+
+      - name: Clear any leftovers from a previous run
+        run: |
+          kubectl delete deploy,svc,pod -n "$NS" \
+            -l "smoke-instance=${INSTANCE}" --ignore-not-found --wait=true
+
+      - name: Deploy Postgres
+        run: |
+          sed "s|INSTANCE|${INSTANCE}|g" deploy/ci/postgres.yaml \
+            | kubectl apply -n "$NS" -f -
+          kubectl rollout status -n "$NS" "deploy/postgres-${INSTANCE}" --timeout=180s
+
+      - name: Deploy dispatch
+        run: |
+          sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|" -e "s|INSTANCE|${INSTANCE}|g" \
+            deploy/ci/dispatch.yaml | kubectl apply -n "$NS" -f -
+          kubectl rollout status -n "$NS" "deploy/dispatch-${INSTANCE}" --timeout=300s
+
+      - name: Inline scripts survive the CSP
+        run: node scripts/smoke-csp.mjs "http://dispatch-${INSTANCE}.${NS}:3000"
+
+      - name: Sync does not wedge on a stale lock
+        run: |
+          # The GitHub token here is fake, so the sync call is expected to fail
+          # on auth. What must not appear is a P2002 on SyncLock: that is the
+          # #840 class, where the lock row outlives its holder and every later
+          # run 500s forever. Asserting "not this failure" rather than success
+          # is what lets this run without real credentials.
+          code=$(kubectl run "smoke-sync-${INSTANCE}-$RANDOM" -n "$NS" --rm -i \
+            --restart=Never --image=curlimages/curl:latest --quiet -- \
+            -s -o /dev/null -w '%{http_code}' -X POST \
+            "http://dispatch-${INSTANCE}.${NS}:3000/api/sync" || true)
+          echo "POST /api/sync -> ${code}"
+          if kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=300 | grep -q "SyncLock"; then
+            echo "FAIL: SyncLock error after a single sync attempt"
+            kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=300 | grep -B2 -A6 "SyncLock"
+            exit 1
+          fi
+          echo "OK  no SyncLock contention on a first run"
+
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          # Not `get all`: the runner Role covers a deliberate subset, so that
+          # prints a screenful of Forbidden lines and buries the real cause.
+          kubectl get deploy,svc,pod -n "$NS" -l "smoke-instance=${INSTANCE}" || true
+          kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=200 || true
+          kubectl describe pods -n "$NS" -l "smoke-instance=${INSTANCE}" || true
+
+      - name: Tear down this instance
+        if: always()
+        run: |
+          kubectl delete deploy,svc,pod -n "$NS" \
+            -l "smoke-instance=${INSTANCE}" --ignore-not-found --wait=false || true

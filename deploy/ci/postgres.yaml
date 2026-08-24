@@ -1,0 +1,69 @@
+---
+# Throwaway Postgres for one PR's smoke run. Pinned to the same major version
+# production runs (17), because testing migrations against a different major is
+# how you get a green CI and a broken deploy — or, as happened here, a real
+# migration bug diagnosed as a version mismatch. emptyDir on purpose: the data dies
+# with the pod, so there is no PVC to provision or leak.
+#
+# INSTANCE is replaced by the smoke workflow with pr<n>. The runner has no
+# permission to create namespaces (deliberately, see joryirving/home-ops#9383),
+# so every PR shares the misospace-ci namespace and is kept apart by name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-INSTANCE
+  labels:
+    smoke-instance: INSTANCE
+spec:
+  selector:
+    app: postgres-INSTANCE
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-INSTANCE
+  labels:
+    smoke-instance: INSTANCE
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-INSTANCE
+  template:
+    metadata:
+      labels:
+        app: postgres-INSTANCE
+        smoke-instance: INSTANCE
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_USER
+              value: dispatch
+            - name: POSTGRES_PASSWORD
+              value: dispatch
+            - name: POSTGRES_DB
+              value: dispatch
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "dispatch", "-d", "dispatch"]
+            initialDelaySeconds: 3
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
