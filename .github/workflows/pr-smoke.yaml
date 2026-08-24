@@ -75,6 +75,15 @@ jobs:
           echo "::error::${IMAGE} was never published; did Build Dispatch Image fail?"
           exit 1
 
+      - name: Install Node
+        # Deliberately not ./.github/actions/setup-node: that composite also
+        # runs `npm ci --include=dev` and `prisma generate`, and the only Node
+        # this job runs is scripts/smoke-csp.mjs, which has no dependencies and
+        # uses global fetch. Version matches the composite and package.json.
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
