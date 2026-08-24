@@ -226,6 +226,18 @@ export async function middleware(request: NextRequest) {
   const authMode = getAuthMode();
   const isApiRoute = request.nextUrl.pathname.startsWith("/api/");
 
+  // /login must stay publicly reachable in every auth mode — the oidc flow
+  // redirects unauthenticated users there, so enforcing auth on it would
+  // loop. But it is still our markup (the same flight scripts, the same
+  // theme toggle), so it gets the full security header set, including the
+  // CSP whose nonce its own inline scripts carry. It was previously excluded
+  // from the matcher entirely and shipped with no security headers at all.
+  if (request.nextUrl.pathname === "/login" || request.nextUrl.pathname.startsWith("/login/")) {
+    const response = NextResponse.next();
+    await applySecurityHeaders(request, response);
+    return response;
+  }
+
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
     const response = NextResponse.next();
@@ -336,8 +348,10 @@ export const config = {
      * - _next/static (static files)
      * - _next/image (image optimization files)
      * - favicon.ico (favicon file)
-     * - /login (public login page)
+     *
+     * /login intentionally matches: it is publicly reachable (no auth
+     * enforced, see above) but still receives the security headers.
      */
-    "/((?!api/auth|api/health|_next/static|_next/image|favicon\\.ico|login).*)",
+    "/((?!api/auth|api/health|_next/static|_next/image|favicon\\.ico).*)",
   ],
 };

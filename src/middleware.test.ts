@@ -475,6 +475,36 @@ describe("security headers", () => {
     expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
   });
 
+  it("applies security headers to /login without enforcing auth (basic mode)", async () => {
+    // /login is publicly reachable in every auth mode; it must not 401,
+    // but it must still carry the full header set (previously it was
+    // excluded from the matcher and shipped with no security headers).
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    const res = await middleware(makeRequest("/login"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("content-security-policy")).toContain("script-src 'self' 'nonce-");
+  });
+
+  it("does not redirect /login back to itself in oidc mode", async () => {
+    // The oidc flow redirects unauthenticated UI requests to /login; /login
+    // itself must be exempt from that redirect or the browser loops.
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    mocks.getToken.mockResolvedValue(null);
+
+    const res = await middleware(makeRequest("/login"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+    expect(res.headers.get("content-security-policy")).toContain("script-src 'self' 'nonce-");
+  });
+
   it("does not allow inline scripts in the CSP except via a per-request nonce", async () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
