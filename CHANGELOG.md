@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.42](https://github.com/misospace/dispatch/compare/v0.5.41...v0.5.42) (2026-08-24)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.33.0 → 1.34.0) ([#837](https://github.com/misospace/dispatch/issues/837)) ([3887606](https://github.com/misospace/dispatch/commit/38876061bcad275819321ea01045836bec288262))
+
+
+### Bug Fixes
+
+* **csp:** serve the theme initialiser from a static file and add a per-request CSP nonce ([#845](https://github.com/misospace/dispatch/issues/845)) ([5fdfe51](https://github.com/misospace/dispatch/commit/5fdfe515bd6a53d8f068f5fb3497e3d23011403d))
+* **deps:** update dependency @types/react-dom (19.2.4 → 19.2.5) ([#834](https://github.com/misospace/dispatch/issues/834)) ([4d79ac7](https://github.com/misospace/dispatch/commit/4d79ac779020b01b1735549ffb3fb1bca0ab980d))
+* **deps:** update dependency eslint (10.9.0 → 10.9.1) ([#846](https://github.com/misospace/dispatch/issues/846)) ([7102b99](https://github.com/misospace/dispatch/commit/7102b992cbf93d5aaad34c56f8a2f8f143a1093c))
+* **groomer:** degrade instead of failing runs when notReadyReason is omitted ([#842](https://github.com/misospace/dispatch/issues/842)) ([503d73b](https://github.com/misospace/dispatch/commit/503d73b8997b349d3811493c1a5e1e592c027ca8))
+* **prisma:** make fresh database migrations succeed ([#848](https://github.com/misospace/dispatch/issues/848)) ([5213255](https://github.com/misospace/dispatch/commit/521325545a31fbd5601363e2a574370d5b9d644c))
+* **sync:** make sync-lock acquisition survive stale and orphaned lock rows ([#843](https://github.com/misospace/dispatch/issues/843)) ([80a5c87](https://github.com/misospace/dispatch/commit/80a5c87eac38934feb495aa7819442be8d3a980e))
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#836](https://github.com/misospace/dispatch/issues/836)) ([aecacbb](https://github.com/misospace/dispatch/commit/aecacbbeba0b189f70ae5f7ae0ed2f8e9f915683))
+
 ## [0.5.41](https://github.com/misospace/dispatch/compare/v0.5.40...v0.5.41) (2026-08-22)
 
 
