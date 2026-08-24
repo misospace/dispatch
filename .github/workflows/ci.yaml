@@ -80,6 +80,10 @@ jobs:
         run: npm run db:deploy
       - name: Verify current-lane indexes
         run: npx prisma db execute --file scripts/verify-current-lane-indexes.sql
+      - name: Verify production migration compatibility
+        run: |
+          npx prisma db execute --file scripts/seed-applied-current-lane-migration.sql
+          npm run db:deploy
 
   coverage:
     name: Coverage
