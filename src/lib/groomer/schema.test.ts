@@ -25,6 +25,26 @@ describe("groomer schema validation", () => {
     expect(result.valid).toBe(true);
   });
 
+  it("accepts mark_not_ready without notReadyReason (degrades downstream, dispatch#839)", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      lane: { id: "backlog", confidence: "medium", reason: "not ready" },
+      nextGroomingAction: "mark_not_ready",
+    });
+    expect(result.valid).toBe(true);
+  });
+
+  it("accepts mark_not_ready with a notReadyReason", () => {
+    const result = validateGroomerOutput({
+      ...validOutput,
+      lane: { id: "backlog", confidence: "medium", reason: "not ready" },
+      nextGroomingAction: "mark_not_ready",
+      notReadyReason: "auditor prioritized it low and moved to backlog",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.parsed?.notReadyReason).toBe("auditor prioritized it low and moved to backlog");
+  });
+
   it("rejects invalid nextGroomingAction", () => {
     const result = validateGroomerOutput({
       ...validOutput,

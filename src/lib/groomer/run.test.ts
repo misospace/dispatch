@@ -102,6 +102,7 @@ const mockCandidate: GroomingCandidate = {
   repoFullName: "org/repo",
   labels: ["priority/p0"],
   currentLane: "backlog",
+  groomingSummary: null,
 };
 
 const mockOutput: GroomerOutput = {
@@ -766,5 +767,96 @@ Investigate session handling in auth module.`;
     expect(result!.mutationPlan?.titleRewritten).toBe(false);
     expect(result!.mutationPlan?.bodyEnriched).toBe(false);
     expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+  });
+
+  describe("mark_not_ready notReadyReason degradation (dispatch#839)", () => {
+    const notReadyOutput: GroomerOutput = {
+      labelsToAdd: ["status/backlog"],
+      labelsToRemove: [],
+      lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
+      summary: "Not ready.",
+      nextGroomingAction: "mark_not_ready",
+    };
+
+    it("persists the model-supplied notReadyReason in the normal case", async () => {
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: { ...notReadyOutput, notReadyReason: "auditor prioritized it low" },
+      });
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            nextGroomingAction: "mark_not_ready",
+            notReadyReason: "auditor prioritized it low",
+          }),
+        }),
+      );
+    });
+
+    it("falls back to the existing groomingSummary when the model omits notReadyReason", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.selectGroomingCandidate.mockResolvedValue({
+        ...mockCandidate,
+        groomingSummary: "auditor prioritized it low and moved to backlog",
+      });
+      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: notReadyOutput });
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            nextGroomingAction: "mark_not_ready",
+            notReadyReason: "auditor prioritized it low and moved to backlog",
+          }),
+        }),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("fell back to existing groomingSummary"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("persists the action without a reason and warns when neither is available", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: notReadyOutput });
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ nextGroomingAction: "mark_not_ready" }),
+        }),
+      );
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.not.objectContaining({ notReadyReason: expect.anything() }),
+        }),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("persisting the action without a reason"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("surfaces the effective notReadyReason in the dry-run mutation plan", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.selectGroomingCandidate.mockResolvedValue({
+        ...mockCandidate,
+        groomingSummary: "deferred by maintainer",
+      });
+      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: notReadyOutput });
+
+      const result = await runHostedGroomer();
+
+      expect(result!.mutationPlan?.notReadyReason).toBe("deferred by maintainer");
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
   });
 });
