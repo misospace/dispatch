@@ -201,19 +201,32 @@ async function executeGroomerRun(
 
     // mark_not_ready degrades instead of failing the run (dispatch#839). The
     // model is not obliged to emit notReadyReason, so a routine omission must
-    // not 500 the whole run. Fall back to the issue's existing groomingSummary
-    // — it already reads exactly like a not-ready reason — and, if that is
-    // also absent, persist the action without a reason.
+    // not 500 the whole run. Fallback order, best to worst:
+    //  1. the model's notReadyReason (normal case),
+    //  2. this run's own summary — it is about to be written to
+    //     groomingSummary anyway and already reads like a not-ready reason.
+    //     This is the common case for a first-time groom, where the issue has
+    //     no prior summary; without it the action would persist with no
+    //     reason, buildGroomingStateExclusionWhere would not engage, and the
+    //     24h cooldown would be the only guard again (the re-groom treadmill
+    //     #831 removed),
+    //  3. the issue's existing groomingSummary,
+    //  4. nothing — persist the action without a reason.
     let notReadyReason = output.notReadyReason?.trim() || undefined;
     if (output.nextGroomingAction === "mark_not_ready") {
-      if (!notReadyReason && candidate.groomingSummary?.trim()) {
+      if (!notReadyReason && output.summary?.trim()) {
+        notReadyReason = output.summary.trim();
+        console.warn(
+          `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason; used this run's summary: ${notReadyReason}`,
+        );
+      } else if (!notReadyReason && candidate.groomingSummary?.trim()) {
         notReadyReason = candidate.groomingSummary.trim();
         console.warn(
           `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason; fell back to existing groomingSummary: ${notReadyReason}`,
         );
       } else if (!notReadyReason) {
         console.warn(
-          `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason and has no groomingSummary; persisting the action without a reason`,
+          `[groomer] ${candidate.repoFullName}#${candidate.number}: mark_not_ready omitted notReadyReason and has no summary to fall back on; persisting the action without a reason`,
         );
       }
     }
