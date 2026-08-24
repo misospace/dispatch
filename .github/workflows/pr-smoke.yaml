@@ -34,10 +34,46 @@ jobs:
     env:
       NS: misospace-ci
       INSTANCE: pr${{ github.event.pull_request.number }}
-      IMAGE: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve this commit's image tag
+        run: |
+          # Immutable per-commit tag, not the mutable pr-<n> one. Both this
+          # workflow and Build Dispatch Image fire on the same push, so pr-<n>
+          # races: the smoke job can pull the previous build and test code that
+          # is not in this push (seen on 2026-08-24, where a stale image still
+          # carried the broken migration chain from before dispatch#848).
+          # docker/metadata-action's `type=sha,prefix=sha-` emits a 7-character
+          # short sha of GITHUB_SHA. On a pull_request event that is the merge
+          # commit GitHub synthesises, not the PR head, and both workflows run
+          # on the same event so they agree. Verified against the registry:
+          # head 3fe23d6 published as sha-67c76a3.
+          SHORT="${GITHUB_SHA:0:7}"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY}:sha-${SHORT}" >> "$GITHUB_ENV"
+          echo "resolved image tag sha-${SHORT} (GITHUB_SHA=${GITHUB_SHA})"
+
+      - name: Wait for this commit's image to be published
+        run: |
+          # Build Dispatch Image runs in parallel with this workflow, so poll
+          # for the tag rather than assuming it exists. Queried over the
+          # registry API with curl: this runner has no docker (containerMode is
+          # kubernetes) and the package is public, so an anonymous pull token
+          # is enough.
+          ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
+          TAG="${IMAGE##*:}"
+          for i in $(seq 1 60); do
+            TOKEN=$(curl -sSL "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY}:pull&service=ghcr.io" \
+              | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+            CODE=$(curl -sSL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+              "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${TAG}")
+            if [ "$CODE" = "200" ]; then echo "found ${IMAGE}"; exit 0; fi
+            echo "waiting for ${IMAGE} (http ${CODE}, $((i*10))s)"
+            sleep 10
+          done
+          echo "::error::${IMAGE} was never published; did Build Dispatch Image fail?"
+          exit 1
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -100,7 +136,9 @@ jobs:
       - name: Dump state on failure
         if: failure()
         run: |
-          kubectl get all -n "$NS" -l "smoke-instance=${INSTANCE}" || true
+          # Not `get all`: the runner Role covers a deliberate subset, so that
+          # prints a screenful of Forbidden lines and buries the real cause.
+          kubectl get deploy,svc,pod -n "$NS" -l "smoke-instance=${INSTANCE}" || true
           kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=200 || true
           kubectl describe pods -n "$NS" -l "smoke-instance=${INSTANCE}" || true
 
