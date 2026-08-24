@@ -4,20 +4,30 @@ import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpe
 function createPrismaMock() {
   let transactionRunId: string | null = null;
 
+  const syncLockFindUnique = vi.fn();
+  const syncLockDeleteMany = vi.fn().mockResolvedValue({ count: 0 });
+  const syncLockCreate = vi.fn().mockResolvedValue({ id: "global" });
+  // Atomic claim used by acquireLock's UPDATE ... WHERE flow. Default
+  // count 0 routes acquisition down the insert path, like an absent row.
+  const syncLockUpdateMany = vi.fn().mockResolvedValue({ count: 0 });
+  const issueSyncRunCreate = vi.fn().mockImplementation(async () => {
+    const id = `run-${Date.now()}`;
+    transactionRunId = id;
+    return { id, status: "running", syncType: "scheduled" };
+  });
+
   return {
     get transactionRunId() { return transactionRunId; },
     prisma: {
       syncLock: {
-        findUnique: vi.fn(),
+        findUnique: syncLockFindUnique,
         delete: vi.fn().mockResolvedValue(undefined),
-        deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+        deleteMany: syncLockDeleteMany,
+        create: syncLockCreate,
+        updateMany: syncLockUpdateMany,
       },
       issueSyncRun: {
-        create: vi.fn().mockImplementation(async () => {
-          const id = `run-${Date.now()}`;
-          transactionRunId = id;
-          return { id, status: "running", syncType: "scheduled" };
-        }),
+        create: issueSyncRunCreate,
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
       automationRepo: {
@@ -60,17 +70,16 @@ function createPrismaMock() {
         aggregate: vi.fn().mockResolvedValue({ _max: { lastSyncedAt: null } }),
       },
       $transaction: vi.fn(async (fn: (tx: any) => Promise<string>) => {
+        // The tx delegates share the outer mocks so tests can observe and
+        // steer the in-transaction claim (updateMany) and insert (create).
         const tx = {
           syncLock: {
-            findUnique: vi.fn(),
-            create: vi.fn().mockResolvedValue({ id: "global" }),
+            findUnique: syncLockFindUnique,
+            create: syncLockCreate,
+            updateMany: syncLockUpdateMany,
           },
           issueSyncRun: {
-            create: vi.fn().mockImplementation(async () => {
-              const id = `run-${Date.now()}`;
-              transactionRunId = id;
-              return { id, status: "running", syncType: "scheduled" };
-            }),
+            create: issueSyncRunCreate,
           },
         };
         return fn(tx);
@@ -268,9 +277,19 @@ describe("POST /api/sync/scheduled — locking", () => {
       syncRunId: "sync-run-old",
       acquiredAt: new Date(Date.now() - 31 * 60 * 1000), // 31 min ago
     });
+    // The atomic conditional claim takes the stale row over in place
+    // (no delete + re-create anymore).
+    prismaMock.prisma.syncLock.updateMany.mockResolvedValue({ count: 1 });
 
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
+    expect(prismaMock.prisma.syncLock.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "global" }),
+        data: expect.objectContaining({ syncRunId: expect.any(String) }),
+      }),
+    );
+    expect(prismaMock.prisma.syncLock.delete).not.toHaveBeenCalled();
   });
 
   it("releases lock by deleting the row on normal completion", async () => {
