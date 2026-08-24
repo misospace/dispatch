@@ -1,5 +1,8 @@
 ---
-# Throwaway Postgres for one PR's smoke run. emptyDir on purpose: the data dies
+# Throwaway Postgres for one PR's smoke run. Pinned to the same major version
+# production runs (17), because testing migrations against a different major is
+# how you get a green CI and a broken deploy — or, as happened here, a real
+# migration bug diagnosed as a version mismatch. emptyDir on purpose: the data dies
 # with the pod, so there is no PVC to provision or leak.
 #
 # INSTANCE is replaced by the smoke workflow with pr<n>. The runner has no
@@ -37,7 +40,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:18-alpine
+          image: postgres:17-alpine
           env:
             - name: POSTGRES_USER
               value: dispatch
