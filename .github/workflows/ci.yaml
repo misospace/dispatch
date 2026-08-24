@@ -54,6 +54,42 @@ jobs:
       - name: Run tests
         run: npm run test
 
+  database-migrations:
+    name: Database migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: dispatch_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d dispatch_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Setup
+        uses: ./.github/actions/setup-node
+      - name: Deploy migrations against an empty database
+        run: npm run db:deploy
+      - name: Verify current-lane indexes
+        run: npx prisma db execute --file scripts/verify-current-lane-indexes.sql
+      - name: Create production compatibility database
+        run: echo 'CREATE DATABASE dispatch_production;' | npx prisma db execute --stdin
+      - name: Verify production migration compatibility
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost:5432/dispatch_production"
+        run: |
+          npx prisma db execute --file scripts/seed-applied-current-lane-migration.sql
+          npm run db:deploy
+          npx prisma db execute --file scripts/verify-current-lane-indexes.sql
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
