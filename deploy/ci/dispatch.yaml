@@ -1,0 +1,57 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dispatch
+spec:
+  selector:
+    app: dispatch
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dispatch
+  template:
+    metadata:
+      labels:
+        app: dispatch
+    spec:
+      containers:
+        - name: dispatch
+          # Replaced by the smoke workflow with the PR's own image tag.
+          image: IMAGE_PLACEHOLDER
+          env:
+            - name: DATABASE_URL
+              value: postgresql://dispatch:dispatch@postgres:5432/dispatch
+            # Deliberately fake. The checks in this environment must not depend
+            # on reaching GitHub; a check that needs real credentials belongs in
+            # a different job.
+            - name: GITHUB_TOKEN
+              value: ci-smoke-not-a-real-token
+            - name: DISPATCH_AGENT_TOKEN
+              value: ci-smoke-agent-token
+            - name: DISPATCH_AUTH_MODE
+              value: none
+            - name: NODE_ENV
+              value: production
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 40
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
