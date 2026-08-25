@@ -14,6 +14,21 @@ describe("KanbanColumn", () => {
     useDroppableMock.mockReturnValue({ setNodeRef: vi.fn(), isOver: false });
   });
 
+  it("scrolls its own card list instead of stretching the page", () => {
+    // Done holds every issue closed inside the retention window — 92 cards as
+    // of 2026-08-25 — which stretched the board far past the viewport and
+    // buried the other columns below the fold.
+    const { container } = render(
+      <KanbanColumn id="status/done" title="Done" count={1}>
+        <div>card</div>
+      </KanbanColumn>
+    );
+
+    const list = container.querySelector("div.overflow-y-auto");
+    expect(list).not.toBeNull();
+    expect(list?.className).toContain("max-h-");
+  });
+
   it("renders the column title, count, and issue cards", () => {
     render(
       <KanbanColumn id="status/ready" title="Ready" count={2}>

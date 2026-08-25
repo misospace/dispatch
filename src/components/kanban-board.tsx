@@ -23,6 +23,20 @@ import { IssueCard } from "./issue-card";
 import { Button } from "@/components/ui/button";
 import { BOARD_COLUMNS, Issue, StatusLabel } from "@/types";
 
+/**
+ * xl track count for the board, keyed by BOARD_COLUMNS.length. Tailwind scans
+ * source for literal class names, so this cannot be interpolated.
+ */
+const XL_GRID_COLS: Record<number, string> = {
+  4: "xl:grid-cols-4",
+  5: "xl:grid-cols-5",
+  6: "xl:grid-cols-6",
+  7: "xl:grid-cols-7",
+  8: "xl:grid-cols-8",
+};
+
+const BOARD_GRID_COLUMNS = XL_GRID_COLS[BOARD_COLUMNS.length] ?? "xl:grid-cols-6";
+
 interface LaneOption {
   id: string;
   title: string;
@@ -303,13 +317,16 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
-        {/* Stacks on small screens, then becomes one scrollable row: a grid with
-            a fixed column count adds a ROW when BOARD_COLUMNS outgrows it, which
-            is what pushed Done below the fold, and a grid cannot overflow this
-            wrapper horizontally. */}
+        {/* Stacks on small screens, then fits every column on screen at once.
+            Fixed-width columns in a scrolling row meant Done (the sixth) sat
+            off the right edge and had to be scrolled to. Column widths are
+            fractional instead, and the track count is derived from
+            BOARD_COLUMNS so adding a seventh column re-fits rather than
+            wrapping it onto a second row. overflow-x-auto stays as a fallback
+            for viewports too narrow for the tracks to hold their min width. */}
         <div className="overflow-x-auto pb-2">
           <div
-            className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:flex lg:min-w-max"
+            className={cn("grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4", BOARD_GRID_COLUMNS)}
           >
             {BOARD_COLUMNS.map((column) => {
               const columnIssues = getIssuesByStatus(issues, column.id);
