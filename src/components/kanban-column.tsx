@@ -18,7 +18,7 @@ export function KanbanColumn({ id, title, count, children }: KanbanColumnProps) 
     <div
       ref={setNodeRef}
       className={cn(
-        "bg-muted/50 rounded-lg p-3 min-h-[200px] lg:w-72 lg:shrink-0",
+        "bg-muted/50 rounded-lg p-3 min-h-[200px] min-w-0",
         isOver && "ring-2 ring-primary bg-primary/5"
       )}
     >
@@ -28,7 +28,11 @@ export function KanbanColumn({ id, title, count, children }: KanbanColumnProps) 
           {count}
         </span>
       </div>
-      <div className="space-y-2">{children}</div>
+      {/* A single column can hold every issue closed inside the Done retention
+          window — 92 of them as of 2026-08-25 — which stretched the page far
+          past the viewport and buried the other columns. Cap the list and let
+          the column scroll itself instead. */}
+      <div className="space-y-2 max-h-[calc(100vh-20rem)] overflow-y-auto pr-1">{children}</div>
     </div>
   );
 }

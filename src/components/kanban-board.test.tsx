@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Issue } from "@/types";
+import { BOARD_COLUMNS, Issue } from "@/types";
 import { KanbanBoard } from "./kanban-board";
 
 const dnd = vi.hoisted(() => ({
@@ -317,16 +317,16 @@ describe("KanbanBoard horizontal scroll layout", () => {
     expect(grid?.parentElement?.className).toContain("overflow-x-auto");
   });
 
-  it("lays the columns out as one scrollable row rather than a fixed-count grid", () => {
+  it("fits every column on screen instead of scrolling the last ones off the edge", () => {
     render(<KanbanBoard initialIssues={[issue()]} />);
 
-    // A fixed lg:grid-cols-N wraps the (N+1)th column onto a second row instead
-    // of overflowing the scroll wrapper, which is what pushed Done below the
-    // fold once BOARD_COLUMNS grew to six. lg:flex + lg:min-w-max scrolls.
+    // Fixed-width columns in a scrolling row left Done (the sixth) off the
+    // right edge. The track count must match BOARD_COLUMNS so no column wraps
+    // to a second row or lands outside the viewport.
     const grid = document.querySelector("div.grid");
-    expect(grid?.className).toContain("lg:flex");
-    expect(grid?.className).toContain("lg:min-w-max");
-    expect(grid?.className).not.toMatch(/lg:grid-cols-\d/);
+    expect(grid?.className).toContain(`xl:grid-cols-${BOARD_COLUMNS.length}`);
+    expect(grid?.className).not.toContain("lg:flex");
+    expect(grid?.className).not.toContain("lg:min-w-max");
   });
 
   it("renders all six columns in canonical order", () => {
