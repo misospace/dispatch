@@ -270,13 +270,24 @@ describe("POST /api/issues/status — business logic", () => {
     });
   });
 
-  it("transitions an issue from status/blocked back to status/ready", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/blocked"], number: 42, repository: { fullName: "org/repo" } });
+  it("transitions an issue from status/blocked back to status/ready and clears the reason", async () => {
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/blocked"],
+      blockedReason: "Waiting on API team",
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
     const res = await POST(makeRequest({ status: "ready" }));
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/blocked");
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ blockedReason: null }),
+    });
   });
 });

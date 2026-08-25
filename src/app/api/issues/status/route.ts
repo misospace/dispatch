@@ -70,7 +70,9 @@ export async function POST(request: Request) {
         data: {
           labels: labelsToSet,
           lastSyncedAt: new Date(),
-          ...(targetLabel === "status/blocked" ? { blockedReason: (blockedReason as string).trim() } : {}),
+          ...(targetLabel === "status/blocked"
+            ? { blockedReason: (blockedReason as string).trim() }
+            : { blockedReason: null }),
         },
       });
 
