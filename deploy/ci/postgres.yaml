@@ -54,7 +54,15 @@ spec:
             - containerPort: 5432
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "dispatch", "-d", "dispatch"]
+              # -h 127.0.0.1 forces the check over TCP, which is what clients
+              # actually use. Without it pg_isready talks to the unix socket,
+              # and the entrypoint's init phase runs a temporary server with
+              # listen_addresses='' — socket up, TCP refused. The probe passed
+              # during that window, so `kubectl rollout status` returned, the
+              # workflow deployed the app against a server not yet accepting
+              # connections, and `prisma migrate deploy` exited 1 with
+              # "P1001: Can't reach database server".
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "dispatch", "-d", "dispatch"]
             initialDelaySeconds: 3
             periodSeconds: 2
           resources:
