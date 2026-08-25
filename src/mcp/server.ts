@@ -212,6 +212,7 @@ export async function setIssueStatusHandler(args: ExtraArgs): Promise<ToolResult
       args.issueNumber as number,
       args.status as string,
       args.agentName as string | undefined,
+      args.blockedReason as string | undefined,
     ),
   );
 }
@@ -420,7 +421,7 @@ export function createServer(): McpServerType {
     "set_issue_status",
     {
       description:
-        "Set the status label on a Dispatch issue (e.g. 'in-progress', 'in-review', 'done', 'blocked'). Transitions the status/ label on GitHub and in the local cache. Setting 'blocked' parks the issue out of agent circulation until a human moves it back.",
+        "Set the status label on a Dispatch issue (e.g. 'in-progress', 'in-review', 'done', 'blocked'). Transitions the status/ label on GitHub and in the local cache. Setting 'blocked' requires a non-empty blockedReason and parks the issue out of agent circulation until a human or targeted groomer run revisits it.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),
@@ -433,6 +434,10 @@ export function createServer(): McpServerType {
           .string()
           .optional()
           .describe("Agent name for audit trail (optional)"),
+        blockedReason: z
+          .string()
+          .optional()
+          .describe("Required when status is 'blocked'; explain the blocking condition"),
       },
     },
     setIssueStatusHandler,

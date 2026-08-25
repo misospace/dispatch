@@ -43,10 +43,10 @@ export async function selectGroomingCandidate(
   applyUmbrellaIssueExclusion(issueWhere);
 
   // A targeted re-groom (issueNumber supplied) bypasses the blocked/not-ready
-  // exclusion so parked issues can be revisited manually. Without this lever,
-  // once the groomer parks an issue the field that parked it is only cleared
-  // inside the groom route, which never runs for a parked issue — a one-way
-  // door. See issue #793.
+  // exclusion and the later eligibility check so parked or fully classified
+  // issues can be revisited manually. Without this lever, once the groomer
+  // parks an issue the field that parked it is only cleared inside the groom
+  // route, which never runs for a parked issue — a one-way door. See #793/#862.
   const skipGroomingStateExclusion = options.issueNumber !== undefined;
   if (!skipGroomingStateExclusion) {
     const groomingStateWhere = buildGroomingStateExclusionWhere(24);
@@ -72,6 +72,7 @@ export async function selectGroomingCandidate(
       url: true,
       labels: true,
       currentLane: true,
+      blockedReason: true,
       // Carried so run.ts can fall back to it as notReadyReason when the model
       // omits the field on a mark_not_ready decision (dispatch#839).
       groomingSummary: true,
@@ -90,9 +91,19 @@ export async function selectGroomingCandidate(
       const isBacklogLaneValue = issue.currentLane ? isBacklogLane(issue.currentLane) : false;
       const isBacklog = isBacklogLaneValue || issue.labels.includes("status/backlog");
       const isUnlabeled = issue.labels.length === 0;
+      const isUnexplainedBlocked = issue.labels.includes("status/blocked") && issue.blockedReason == null;
 
+      // Targeted runs are an explicit operator request, so they must reach
+      // fully classified issues as well as issues parked by grooming.
       const eligible =
-        isUnlabeled || !hasStatus || !hasPriority || !hasAgent || !hasLane || isBacklog;
+        options.issueNumber !== undefined ||
+        isUnexplainedBlocked ||
+        isUnlabeled ||
+        !hasStatus ||
+        !hasPriority ||
+        !hasAgent ||
+        !hasLane ||
+        isBacklog;
 
       let score = 0;
       if (isUnlabeled) score += 1000;

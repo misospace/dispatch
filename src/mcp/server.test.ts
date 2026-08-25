@@ -282,6 +282,42 @@ describe("claimIssueHandler", () => {
 describe("setIssueStatusHandler", () => {
   beforeEach(() => { vi.restoreAllMocks(); });
 
+  it("passes blockedReason to the status client", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse([
+        {
+          id: "issue-cuid-1",
+          number: 42,
+          title: "Fix the thing",
+          body: null,
+          state: "open",
+          url: "https://github.com/org/repo/issues/42",
+          labels: ["agent/test-agent"],
+          assignees: [],
+          commentsCount: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          closedAt: null,
+          lastSyncedAt: new Date(),
+          currentLane: "local",
+          repository: { fullName: "org/repo" },
+        },
+      ]))
+      .mockResolvedValueOnce(jsonResponse({ success: true, status: "status/blocked", labels: [] }));
+
+    const result = await setIssueStatusHandler(makeArgs({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      status: "blocked",
+      blockedReason: "Waiting on API team",
+    }));
+
+    expect(result.isError).toBeUndefined();
+    const call = fetchSpy.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(call[1].body as string).blockedReason).toBe("Waiting on API team");
+  });
+
   it("returns status update result as JSON text", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(

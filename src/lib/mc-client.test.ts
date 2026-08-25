@@ -378,6 +378,20 @@ describe("setIssueStatus", () => {
     );
     expect(body.agentName).toBeUndefined();
   });
+
+  it("includes blockedReason when setting blocked status", async () => {
+    const { setIssueStatus } = await import("./mc-client");
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse([mockIssue]))
+      .mockResolvedValueOnce(jsonResponse({ success: true, status: "status/blocked", labels: [] }));
+
+    await setIssueStatus("org/repo", 42, "blocked", "worker-1", "Waiting on API team");
+
+    const body = JSON.parse(
+      (vi.mocked(fetch).mock.calls[1] as [string, RequestInit])[1].body as string,
+    );
+    expect(body.blockedReason).toBe("Waiting on API team");
+  });
 });
 
 describe("claimWork", () => {
