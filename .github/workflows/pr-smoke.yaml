@@ -120,6 +120,31 @@ jobs:
             deploy/ci/dispatch.yaml | kubectl apply -n "$NS" -f -
           kubectl rollout status -n "$NS" "deploy/dispatch-${INSTANCE}" --timeout=300s
 
+      - name: Wait for the app to serve a stable response
+        run: |
+          # rollout status only proves readiness once. The container can crash
+          # and restart seconds later (seen 2026-08-24: RESTARTS 1, Last State
+          # Terminated/Error), and a single fetch landing in that window fails
+          # the whole run for a reason that has nothing to do with the
+          # assertions. Require consecutive successes so a restarting pod is
+          # not mistaken for a healthy one.
+          ok=0
+          for i in $(seq 1 60); do
+            if kubectl run "probe-${INSTANCE}-$RANDOM" -n "$NS" --rm -i --restart=Never \
+                 --image=curlimages/curl:latest --quiet -- \
+                 -sf -o /dev/null --max-time 5 "http://dispatch-${INSTANCE}.${NS}:3000/api/health" 2>/dev/null; then
+              ok=$((ok+1))
+              echo "healthy ($ok/3)"
+              [ "$ok" -ge 3 ] && exit 0
+            else
+              [ "$ok" -gt 0 ] && echo "lost readiness after $ok success(es); restarting count"
+              ok=0
+            fi
+            sleep 5
+          done
+          echo "::error::app never served 3 consecutive healthy responses"
+          exit 1
+
       - name: Inline scripts survive the CSP
         run: node scripts/smoke-csp.mjs "http://dispatch-${INSTANCE}.${NS}:3000"
 
@@ -149,6 +174,9 @@ jobs:
           # prints a screenful of Forbidden lines and buries the real cause.
           kubectl get deploy,svc,pod -n "$NS" -l "smoke-instance=${INSTANCE}" || true
           kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=200 || true
+          # A crashed-and-restarted container hides its cause in the previous
+          # instance, which is exactly the case that is hard to diagnose.
+          kubectl logs -n "$NS" "deploy/dispatch-${INSTANCE}" --tail=200 --previous || true
           kubectl describe pods -n "$NS" -l "smoke-instance=${INSTANCE}" || true
 
       - name: Tear down this instance

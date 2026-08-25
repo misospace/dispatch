@@ -84,16 +84,6 @@ function claimableWhere(): Record<string, unknown> {
   };
 }
 
-/** True when Prisma reports a unique-constraint violation (P2002). */
-function isUniqueConstraintViolation(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    "code" in err &&
-    (err as { code?: unknown }).code === "P2002"
-  );
-}
-
 /**
  * Attempt to acquire the global sync lock.
  *
@@ -139,25 +129,34 @@ export async function acquireLock(
 
       // No row to update: an insert wins only when the row is absent
       // entirely (e.g. first run, or after a release).
-      try {
-        await tx.syncLock.create({
-          data: { id: LOCK_ID, syncRunId: run.id, acquiredAt: new Date() },
-        });
-        return run.id;
-      } catch (err) {
-        if (!isUniqueConstraintViolation(err)) throw err;
-        // The row appeared between the update and the insert. If a
-        // competing transaction just aborted and left the row claimable
-        // again (stale or orphaned), take it; otherwise a live lock holds
-        // it and we conflict. Retrying the update avoids a spurious
-        // conflict in that abort race.
-        const retry = await tx.syncLock.updateMany({
-          where: claimableWhere(),
-          data: { syncRunId: run.id, acquiredAt: new Date() },
-        });
-        if (retry.count === 1) return run.id;
-        throw new Error("already_locked");
-      }
+      //
+      // ON CONFLICT DO NOTHING rather than create()-and-catch. Postgres
+      // aborts the whole transaction the moment a statement fails, so a
+      // unique-constraint violation from create() poisons this transaction:
+      // catching it in application code does not un-abort it, and every
+      // later command — including the recovery updateMany that used to live
+      // in the catch — fails with P2039 "current transaction is aborted".
+      // That is what #843 shipped and what #850 observed in production, and
+      // a mocked Prisma client cannot reproduce it because the abort is the
+      // database's behaviour, not the driver's. Never raising is the fix:
+      // this statement returns 0 affected rows instead of throwing.
+      const inserted = await tx.$executeRaw`
+        INSERT INTO "sync_lock" ("id", "syncRunId", "acquiredAt")
+        VALUES (${LOCK_ID}, ${run.id}, ${new Date()})
+        ON CONFLICT ("id") DO NOTHING
+      `;
+      if (inserted === 1) return run.id;
+
+      // The row appeared between the update and the insert. The transaction
+      // is still healthy, so this retry actually runs. If a competing
+      // transaction just released or left the row claimable (stale or
+      // orphaned) we take it; otherwise a live lock holds it and we lose.
+      const retry = await tx.syncLock.updateMany({
+        where: claimableWhere(),
+        data: { syncRunId: run.id, acquiredAt: new Date() },
+      });
+      if (retry.count === 1) return run.id;
+      throw new Error("already_locked");
     });
 
     // Log a takeover only when we actually won it, with the previous holder

@@ -71,7 +71,13 @@ function createPrismaMock() {
       },
       $transaction: vi.fn(async (fn: (tx: any) => Promise<string>) => {
         // The tx delegates share the outer mocks so tests can observe and
-        // steer the in-transaction claim (updateMany) and insert (create).
+        // steer the in-transaction claim (updateMany) and insert.
+        //
+        // The insert is `INSERT ... ON CONFLICT DO NOTHING` via $executeRaw,
+        // not create(): a create() that raises would leave PostgreSQL's
+        // transaction aborted, which is what #843 shipped and #850 observed
+        // as P2039. 1 = the insert won. A mock cannot express the abort, so
+        // the real guard is src/lib/sync-lock.integration.test.ts.
         const tx = {
           syncLock: {
             findUnique: syncLockFindUnique,
@@ -81,6 +87,7 @@ function createPrismaMock() {
           issueSyncRun: {
             create: issueSyncRunCreate,
           },
+          $executeRaw: vi.fn().mockResolvedValue(1),
         };
         return fn(tx);
       }),
