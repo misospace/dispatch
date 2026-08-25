@@ -4,13 +4,19 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     syncLock: {
       findUnique: vi.fn(),
-      create: vi.fn(),
       delete: vi.fn(),
       deleteMany: vi.fn(),
       updateMany: vi.fn(),
     },
     issueSyncRun: { create: vi.fn() },
     $transaction: vi.fn(),
+    // Acquisition inserts with ON CONFLICT DO NOTHING rather than create(),
+    // so the fake tx needs this delegate. Note what a mock cannot express:
+    // the real statement's value is that it never raises, and therefore never
+    // leaves PostgreSQL's transaction aborted. That property is only
+    // observable against a real database — see the concurrency test in
+    // src/lib/sync-lock.integration.test.ts.
+    $executeRaw: vi.fn(),
   },
 }));
 
@@ -22,18 +28,12 @@ const MAX_AGE_MS = 30 * 60 * 1000;
 
 const ORIGINAL_ENV = { ...process.env };
 
-/** Simulated Prisma P2002 unique-constraint violation. */
-const P2002 = Object.assign(new Error("Unique constraint failed on the fields: (`id`)"), {
-  code: "P2002",
-  name: "PrismaClientKnownRequestError",
-});
-
 beforeEach(() => {
   vi.clearAllMocks();
   // $transaction runs the callback with a tx that has the same delegates.
+  mocks.$executeRaw.mockResolvedValue(1);
   mocks.$transaction.mockImplementation(async (fn: (tx: typeof mocks) => Promise<unknown>) => fn(mocks));
   mocks.issueSyncRun.create.mockResolvedValue({ id: "run-1" });
-  mocks.syncLock.create.mockResolvedValue({});
   mocks.syncLock.delete.mockResolvedValue({});
   mocks.syncLock.deleteMany.mockResolvedValue({ count: 1 });
   mocks.syncLock.updateMany.mockResolvedValue({ count: 0 });
@@ -50,9 +50,10 @@ describe("acquireLock", () => {
     expect(mocks.issueSyncRun.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: "running", syncType: "scheduled" }) }),
     );
-    expect(mocks.syncLock.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ id: "global", syncRunId: "run-1" }) }),
-    );
+    // The insert is an ON CONFLICT DO NOTHING raw statement rather than
+    // create(), so assert the acquisition happened (above) and that the
+    // statement ran, not which delegate the implementation reached for.
+    expect(mocks.$executeRaw).toHaveBeenCalled();
 
     await releaseLock(result.locked ? result.runId : "run-1");
     expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "run-1" } });
@@ -71,11 +72,12 @@ describe("acquireLock", () => {
 
   it("a second acquire against a live lock fails, even inside the transaction", async () => {
     // Outer snapshot saw no row, but a live holder appeared; the claim
-    // updates 0 rows, the insert hits the unique constraint, and the retry
-    // claim still matches nothing -> conflict.
+    // updates 0 rows, the insert conflicts (0 affected rows rather than a
+    // raised P2002 -- see the ON CONFLICT DO NOTHING comment in sync-lock.ts),
+    // and the retry claim still matches nothing -> conflict.
     mocks.syncLock.findUnique.mockResolvedValue(null);
     mocks.syncLock.updateMany.mockResolvedValue({ count: 0 });
-    mocks.syncLock.create.mockRejectedValue(P2002);
+    mocks.$executeRaw.mockResolvedValue(0);
 
     const result = await acquireLock("scheduled");
 
@@ -103,7 +105,8 @@ describe("acquireLock", () => {
 
     expect(result).toEqual({ locked: true, runId: "run-1" });
     expect(mocks.syncLock.delete).not.toHaveBeenCalled();
-    expect(mocks.syncLock.create).not.toHaveBeenCalled();
+    // The claim matched, so the insert path is never reached.
+    expect(mocks.$executeRaw).not.toHaveBeenCalled();
     expect(mocks.syncLock.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ id: "global" }),
@@ -138,12 +141,14 @@ describe("acquireLock", () => {
   it("recovers when a competing transaction aborts between claim and insert", async () => {
     mocks.syncLock.findUnique.mockResolvedValue(null);
     // First claim matches nothing (row appeared mid-flight), the insert
-    // collides, then the retry claim finds the row claimable again because
-    // the competitor aborted.
+    // collides (0 affected rows, no raise), then the retry claim finds the row
+    // claimable again because the competitor aborted. The retry is the whole
+    // point: under the old create()-and-catch it ran inside a transaction
+    // PostgreSQL had already aborted, so it failed with P2039 (#850).
     mocks.syncLock.updateMany
       .mockResolvedValueOnce({ count: 0 })
       .mockResolvedValueOnce({ count: 1 });
-    mocks.syncLock.create.mockRejectedValue(P2002);
+    mocks.$executeRaw.mockResolvedValue(0);
 
     const result = await acquireLock("pr-followup");
 
