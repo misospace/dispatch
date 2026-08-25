@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.45](https://github.com/misospace/dispatch/compare/v0.5.44...v0.5.45) (2026-08-25)
+
+
+### Bug Fixes
+
+* **deps:** update nextjs monorepo (16.3.2 → 16.3.3) ([#860](https://github.com/misospace/dispatch/issues/860)) ([5395214](https://github.com/misospace/dispatch/commit/539521409565bff1474d44ce7f35ae3ecdd988bc))
+* make status/blocked recoverable ([#863](https://github.com/misospace/dispatch/issues/863)) ([37b26a4](https://github.com/misospace/dispatch/commit/37b26a4fcf82aefc0b2e9fcba1a9fb1c0e78dd91))
+* **smoke:** probe Postgres over TCP so readiness means what the workflow assumes ([#864](https://github.com/misospace/dispatch/issues/864)) ([b396908](https://github.com/misospace/dispatch/commit/b396908842c9558ed6bdcd6ad4ebe3dd489bd0db))
+
 ## [0.5.44](https://github.com/misospace/dispatch/compare/v0.5.43...v0.5.44) (2026-08-25)
 
 
