@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.44](https://github.com/misospace/dispatch/compare/v0.5.43...v0.5.44) (2026-08-25)
+
+
+### Features
+
+* **deps:** update dependency prisma (7.9.1 → 7.10.0) ([#857](https://github.com/misospace/dispatch/issues/857)) ([c672896](https://github.com/misospace/dispatch/commit/c6728964456091c060c59d91f59279b4b1ac6de9))
+* **deps:** update prisma monorepo (7.9.1 → 7.10.0) ([#856](https://github.com/misospace/dispatch/issues/856)) ([9df3342](https://github.com/misospace/dispatch/commit/9df33423bd75a4ae486ebb0fb7054691b85cf030))
+
+
+### Bug Fixes
+
+* **board:** fit every column on screen and scroll long columns internally ([#858](https://github.com/misospace/dispatch/issues/858)) ([dcf72aa](https://github.com/misospace/dispatch/commit/dcf72aa95f9d775b2d2297529916dcca5cd2df9e))
+
 ## [0.5.43](https://github.com/misospace/dispatch/compare/v0.5.42...v0.5.43) (2026-08-25)
 
 
