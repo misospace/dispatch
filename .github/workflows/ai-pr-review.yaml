@@ -55,6 +55,13 @@ jobs:
           ai_fallback_model: ${{ vars.FALLBACK_MODEL }}
           ai_fallback_api_key: ${{ secrets.LITELLM_API_KEY }}
           review_routing_mode: auto
+          # public_route_changes is dropped from the default risk flags here.
+          # It matches any file named route.<ext>, which under the Next.js App
+          # Router is every API handler — 58 of them in src/app/api — so it
+          # routes essentially every backend PR to the smart model before the
+          # primary has run. The flag carries real signal in repos where the
+          # filename marks the routing layer; in this one it marks nothing.
+          escalate_on_risk_flags: "linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes"
           ai_smart_base_url: ${{ vars.LITELLM_URL }}
           ai_smart_api_format: ${{ vars.SMART_FORMAT }}
           ai_smart_model: ${{ vars.SMART_MODEL }}
