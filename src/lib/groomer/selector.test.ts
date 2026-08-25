@@ -43,6 +43,7 @@ describe("selectGroomingCandidate", () => {
         url: "https://github.com/org/repo/issues/10",
         labels: ["status/ready", "priority/p0", "agent/alice"],
         currentLane: "local",
+        blockedReason: null,
         repository: { fullName: "org/repo" },
       },
     ]);
@@ -196,6 +197,39 @@ describe("selectGroomingCandidate", () => {
     expect(result!.number).toBe(40);
   });
 
+  it("selects a blocked issue with no reason for routine grooming", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        number: 35,
+        title: "Unexplained blocked issue",
+        url: "https://github.com/org/repo/issues/35",
+        labels: ["status/blocked", "priority/p1", "agent/alice"],
+        currentLane: "local",
+        blockedReason: null,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+    const result = await selectGroomingCandidate();
+    expect(result).not.toBeNull();
+    expect(result!.number).toBe(35);
+  });
+
+  it("keeps a blocked issue with a reason excluded from routine grooming", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        number: 36,
+        title: "Explained blocked issue",
+        url: "https://github.com/org/repo/issues/36",
+        labels: ["status/blocked", "priority/p1", "agent/alice"],
+        currentLane: "local",
+        blockedReason: "Waiting on an external dependency",
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+    const result = await selectGroomingCandidate();
+    expect(result).toBeNull();
+  });
+
   it("returns missing priority issue as eligible", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {
@@ -258,18 +292,18 @@ describe("selectGroomingCandidate", () => {
     expect(result!.number).toBe(60);
   });
 
-  // Regression for #793: a parked issue (non-null blockedReason) must remain
-  // reachable by a targeted re-groom. Without the bypass, the exclusion was
-  // applied after the issueNumber filter, so even calling selectGroomingCandidate
-  // with { issueNumber: 36 } for a parked issue returned nothing — a one-way door.
-  it("issueNumber bypasses the blocked/not-ready grooming-state exclusion", async () => {
+  // Regression for #793/#862: a parked or fully classified issue must remain
+  // reachable by a targeted re-groom. Without both bypasses, the exclusion was
+  // applied after the issueNumber filter and the eligibility check rejected
+  // fully classified issues — a one-way door.
+  it("targeted issueNumber bypasses eligibility and the blocked/not-ready grooming-state exclusion", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {
         number: 36,
         title: "Alert triage parking deadlock",
         url: "https://github.com/alert-triage/repo/issues/36",
-        labels: ["status/backlog"],
-        currentLane: "backlog",
+        labels: ["status/blocked", "priority/p1", "agent/alice"],
+        currentLane: "local",
         blockedReason: "Blocked by unresolved dependencies and validation gate ...",
         notReadyReason: null,
         groomedAt: new Date("2026-08-13T05:58:37Z"),
@@ -280,7 +314,7 @@ describe("selectGroomingCandidate", () => {
     expect(result).not.toBeNull();
     expect(result!.number).toBe(36);
 
-    // Verify the exclusion was actually skipped — the findMany call must NOT
+    // Verify the exclusions were actually skipped — the findMany call must NOT
     // contain the { blockedReason: null } / { notReadyReason: null } predicates
     // when issueNumber is supplied.
     const callArgs = mocks.issueFindMany.mock.calls[0][0];

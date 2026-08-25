@@ -111,7 +111,10 @@ describe("POST /api/issues/status — validation", () => {
     mocks.removeIssueLabel.mockResolvedValue(undefined);
 
     for (const s of ["backlog", "in-progress", "in-review", "blocked", "done"]) {
-      const res = await POST(makeRequest({ status: s }));
+      const res = await POST(makeRequest({
+        status: s,
+        ...(s === "blocked" ? { blockedReason: "Waiting on an external dependency" } : {}),
+      }));
       expect(res.status).toBe(200);
     }
   });
@@ -246,14 +249,25 @@ describe("POST /api/issues/status — business logic", () => {
     expect(body.labels).toContain("status/in-progress");
   });
 
-  it("transitions an issue to status/blocked", async () => {
+  it("rejects status/blocked without a non-empty reason", async () => {
+    const res = await POST(makeRequest({ status: "blocked", blockedReason: "  " }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("blockedReason");
+    expect(mocks.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("transitions an issue to status/blocked and persists a trimmed reason", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"], number: 42, repository: { fullName: "org/repo" } });
-    const res = await POST(makeRequest({ status: "blocked" }));
+    const res = await POST(makeRequest({ status: "blocked", blockedReason: "  Waiting on API team  " }));
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/blocked");
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ blockedReason: "Waiting on API team" }),
+    });
   });
 
   it("transitions an issue from status/blocked back to status/ready", async () => {

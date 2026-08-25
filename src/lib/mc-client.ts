@@ -339,6 +339,7 @@ export async function setIssueStatus(
   issueNumber: number,
   status: string,
   agentName?: string,
+  blockedReason?: string,
 ): Promise<SetStatusResult> {
   const resolved = await resolveIssue(repoFullName, issueNumber);
 
@@ -350,6 +351,7 @@ export async function setIssueStatus(
       issueNumber,
       status,
       agentName,
+      ...(blockedReason !== undefined ? { blockedReason } : {}),
     }),
   });
 }

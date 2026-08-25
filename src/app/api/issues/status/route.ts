@@ -29,7 +29,7 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName, issueNumber, status, agentName, actor } = body as Record<string, unknown>;
+    const { issueId, repoFullName, issueNumber, status, agentName, actor, blockedReason } = body as Record<string, unknown>;
 
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || typeof status !== "string") {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, status", 400);
@@ -38,6 +38,10 @@ export async function POST(request: Request) {
     const targetLabel = `status/${status}` as StatusLabel;
     if (!isStatusLabel(targetLabel)) {
       return errorResponse(`Invalid status label: ${status}. Allowed: ${STATUS_LABELS.join(", ")}`, 400);
+    }
+
+    if (targetLabel === "status/blocked" && (!blockedReason || typeof blockedReason !== "string" || !blockedReason.trim())) {
+      return errorResponse("'blockedReason' is required when status is 'blocked'", 400);
     }
 
     const actorName = getAuthorizedActor(auth, request, (actor as string | undefined) ?? (agentName as string | undefined));
@@ -63,7 +67,11 @@ export async function POST(request: Request) {
       // Update local cache
       await prisma.issue.update({
         where: { id: issueId as string },
-        data: { labels: labelsToSet, lastSyncedAt: new Date() },
+        data: {
+          labels: labelsToSet,
+          lastSyncedAt: new Date(),
+          ...(targetLabel === "status/blocked" ? { blockedReason: (blockedReason as string).trim() } : {}),
+        },
       });
 
       // Write audit log

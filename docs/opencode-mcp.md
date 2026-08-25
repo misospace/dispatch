@@ -121,13 +121,14 @@ Claim a Dispatch issue for an agent. Adds the `agent/*` label on GitHub and in t
 
 ### `set_issue_status`
 
-Set the status label on a Dispatch issue (e.g. `'in-progress'`, `'in-review'`, `'done'`).
+Set the status label on a Dispatch issue (e.g. `'in-progress'`, `'in-review'`, `'done'`, `'blocked'`). Setting `'blocked'` requires a non-empty `blockedReason`; issues with a missing reason are eligible for groomer recovery.
 
 **Inputs:**
 - `repoFullName` (string) — GitHub repo full name
 - `issueNumber` (number) — GitHub issue number
-- `status` (string) — Status label value: `backlog`, `in-progress`, `in-review`, or `done`
+- `status` (string) — Status label value: `backlog`, `ready`, `in-progress`, `in-review`, `blocked`, or `done`
 - `agentName` (string, optional) — Agent name for audit trail
+- `blockedReason` (string, required when `status` is `blocked`) — Explanation of the blocking condition
 
 **Returns:** `success`, `status`, `labels`
 
