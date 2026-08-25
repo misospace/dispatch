@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.43](https://github.com/misospace/dispatch/compare/v0.5.42...v0.5.43) (2026-08-25)
+
+
+### Bug Fixes
+
+* **sync:** acquire the lock without raising inside the transaction ([#853](https://github.com/misospace/dispatch/issues/853)) ([a497ae4](https://github.com/misospace/dispatch/commit/a497ae43b3745b989ac5e5642571d4e72b9849e3))
+
 ## [0.5.42](https://github.com/misospace/dispatch/compare/v0.5.41...v0.5.42) (2026-08-24)
 
 
