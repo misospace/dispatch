@@ -28,6 +28,18 @@
  * legitimately exceed that can raise it via DISPATCH_SYNC_LOCK_MAX_AGE_MS;
  * lowering it only makes takeover more eager (a still-live but slow run gets
  * its lock reclaimed mid-flight), so the default errs on the slow side.
+ *
+ * Why the lock-acquisition INSERT must not raise inside the transaction:
+ * Postgres aborts the whole transaction on the first failing statement, and
+ * nothing in application code can un-abort it. Catching P2002 there is too
+ * late: the catch block's follow-up UPDATE then fails with P2039
+ * ("current transaction is aborted") and the whole sync request 500s
+ * (dispatch#850, after dispatch#843's catch-P2002-inside-the-tx fix). The
+ * fix used here is to use `INSERT ... ON CONFLICT DO NOTHING`, which never
+ * raises on conflict, so the transaction is never poisoned. The
+ * zero-rows-affected result is the "lost the race" signal, and we re-run the
+ * conditional UPDATE to take the lock if the conflict was actually a stale
+ * row being reclaimed.
  */
 
 import { prisma } from "@/lib/prisma";
@@ -84,16 +96,6 @@ function claimableWhere(): Record<string, unknown> {
   };
 }
 
-/** True when Prisma reports a unique-constraint violation (P2002). */
-function isUniqueConstraintViolation(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    "code" in err &&
-    (err as { code?: unknown }).code === "P2002"
-  );
-}
-
 /**
  * Attempt to acquire the global sync lock.
  *
@@ -102,12 +104,15 @@ function isUniqueConstraintViolation(err: unknown): boolean {
  *
  * Creates an IssueSyncRun record so we can track which sync type acquired it.
  *
- * The claim is an atomic `UPDATE ... WHERE <claimable>` followed by an
- * `INSERT` only when no row exists. Unlike the previous check-then-create
- * flow, an existing row is never fatal: a row with a null holder (the stuck
- * row from dispatch#840) or an expired row is taken over in place, and the
- * row-level lock of the UPDATE serializes concurrent claimants so exactly
- * one wins a stale row.
+ * The claim is an atomic `UPDATE ... WHERE <claimable>` plus an `INSERT ...
+ * ON CONFLICT DO NOTHING` only when no row exists. The INSERT uses raw SQL
+ * because Prisma's `create()` raises on unique-constraint violation, and a
+ * raised statement poisons the surrounding Postgres transaction; the
+ * follow-up retry inside the transaction then fails with P2039 and the sync
+ * 500s (dispatch#850). ON CONFLICT DO NOTHING never raises, so the
+ * transaction is never poisoned: a zero row count means we lost the race,
+ * and we then re-run the conditional UPDATE to take the lock if the racing
+ * insert actually left the row stale/orphaned.
  */
 export async function acquireLock(
   syncType: SyncType,
@@ -123,60 +128,52 @@ export async function acquireLock(
     }
   }
 
-  try {
-    const runId = await prisma.$transaction(async (tx) => {
-      const run = await tx.issueSyncRun.create({
-        data: { status: "running", syncType, startedAt: new Date() },
-      });
-
-      // Atomic conditional claim. count === 1 wins; count === 0 means no
-      // claimable row (absent, or held live).
-      const claimed = await tx.syncLock.updateMany({
-        where: claimableWhere(),
-        data: { syncRunId: run.id, acquiredAt: new Date() },
-      });
-      if (claimed.count === 1) return run.id;
-
-      // No row to update: an insert wins only when the row is absent
-      // entirely (e.g. first run, or after a release).
-      try {
-        await tx.syncLock.create({
-          data: { id: LOCK_ID, syncRunId: run.id, acquiredAt: new Date() },
-        });
-        return run.id;
-      } catch (err) {
-        if (!isUniqueConstraintViolation(err)) throw err;
-        // The row appeared between the update and the insert. If a
-        // competing transaction just aborted and left the row claimable
-        // again (stale or orphaned), take it; otherwise a live lock holds
-        // it and we conflict. Retrying the update avoids a spurious
-        // conflict in that abort race.
-        const retry = await tx.syncLock.updateMany({
-          where: claimableWhere(),
-          data: { syncRunId: run.id, acquiredAt: new Date() },
-        });
-        if (retry.count === 1) return run.id;
-        throw new Error("already_locked");
-      }
+  const runId = await prisma.$transaction(async (tx) => {
+    const run = await tx.issueSyncRun.create({
+      data: { status: "running", syncType, startedAt: new Date() },
     });
 
-    // Log a takeover only when we actually won it, with the previous holder
-    // and its age, so a recurring takeover is visible rather than silent.
-    if (existing) {
-      const holder = existing.syncRunId ?? "(no holder)";
-      const age = Date.now() - existing.acquiredAt.getTime();
-      console.warn(
-        `[sync-lock] ${syncType}: took over ${existing.syncRunId ? "expired" : "orphaned"} lock row held by ${holder} (age ${Math.round(age / 1000)}s)`,
-      );
-    }
+    // Atomic conditional claim. count === 1 wins; count === 0 means no
+    // claimable row (absent, or held live).
+    const claimed = await tx.syncLock.updateMany({
+      where: claimableWhere(),
+      data: { syncRunId: run.id, acquiredAt: new Date() },
+    });
+    if (claimed.count === 1) return run.id;
 
-    return { locked: true, runId };
-  } catch (err) {
-    if (err instanceof Error && err.message === "already_locked") {
-      return { locked: false };
-    }
-    throw err;
+    // No row to update: an insert wins only when the row is absent
+    // entirely (e.g. first run, or after a release). ON CONFLICT DO NOTHING
+    // never raises, so this statement cannot poison the transaction.
+    const inserted = await tx.$executeRaw`
+      INSERT INTO "SyncLock" ("id", "syncRunId", "acquiredAt")
+      VALUES (${LOCK_ID}, ${run.id}, ${new Date()})
+      ON CONFLICT ("id") DO NOTHING
+    `;
+    if (inserted === 1) return run.id;
+
+    // The row exists and we did not get to update it: a live lock holds
+    // it. If the row is actually stale or orphaned (e.g. a racing
+    // transaction just created the row then aborted), one more try at
+    // the conditional UPDATE is enough to take it.
+    const retry = await tx.syncLock.updateMany({
+      where: claimableWhere(),
+      data: { syncRunId: run.id, acquiredAt: new Date() },
+    });
+    if (retry.count === 1) return run.id;
+    throw new Error("already_locked");
+  });
+
+  // Log a takeover only when we actually won it, with the previous holder
+  // and its age, so a recurring takeover is visible rather than silent.
+  if (existing) {
+    const holder = existing.syncRunId ?? "(no holder)";
+    const age = Date.now() - existing.acquiredAt.getTime();
+    console.warn(
+      `[sync-lock] ${syncType}: took over ${existing.syncRunId ? "expired" : "orphaned"} lock row held by ${holder} (age ${Math.round(age / 1000)}s)`,
+    );
   }
+
+  return { locked: true, runId };
 }
 
 /**

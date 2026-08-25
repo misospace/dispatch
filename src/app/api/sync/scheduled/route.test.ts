@@ -71,16 +71,24 @@ function createPrismaMock() {
       },
       $transaction: vi.fn(async (fn: (tx: any) => Promise<string>) => {
         // The tx delegates share the outer mocks so tests can observe and
-        // steer the in-transaction claim (updateMany) and insert (create).
+        // steer the in-transaction claim (updateMany) and insert
+        // (`$executeRaw` for INSERT ... ON CONFLICT DO NOTHING, since a
+        // raised Prisma create() poisons the surrounding transaction with
+        // P2039; dispatch#850).
         const tx = {
           syncLock: {
             findUnique: syncLockFindUnique,
-            create: syncLockCreate,
             updateMany: syncLockUpdateMany,
           },
           issueSyncRun: {
             create: issueSyncRunCreate,
           },
+          // Mirror the real Prisma transaction client's `$executeRaw`:
+          // INSERT ... ON CONFLICT DO NOTHING returns 1 when a row was
+          // inserted, 0 when a conflict was skipped. The acquisition path
+          // uses this to detect "lost the race" without raising inside
+          // the transaction.
+          $executeRaw: vi.fn().mockResolvedValue(1),
         };
         return fn(tx);
       }),
