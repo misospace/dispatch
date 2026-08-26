@@ -55,7 +55,7 @@ Dispatch supports custom lane configurations that override the default `normal`,
 
 ### Configuring Custom Lanes
 
-Custom lanes are configured via the `DISPATCH_LANE_CONFIG` environment variable, which accepts a JSON object:
+Custom lanes are configured via the `DISPATCH_LANE_CONFIG_JSON` environment variable, which accepts a JSON object:
 
 ```json
 {

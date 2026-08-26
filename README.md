@@ -44,7 +44,7 @@ Agent Runs → Dispatch → Agent Activity Page
 
 ### Execution Lanes
 
-Issues are classified into execution lanes that control agent queue behavior and claimability. The default setup provides three lanes: `normal` (standard work), `escalated` (higher-judgment tasks), and `backlog` (non-actionable). Lanes are fully configurable via the `DISPATCH_LANE_CONFIG` environment variable, supporting custom lane IDs, migration aliases, and role-based classification routing. See [Configurable Execution Lanes](docs/configurable-lanes.md) for details.
+Issues are classified into execution lanes that control agent queue behavior and claimability. The default setup provides two lanes: `default` (standard work) and `backlog` (non-actionable). Lanes are fully configurable via the `DISPATCH_LANE_CONFIG_JSON` environment variable, supporting custom lane IDs, migration aliases, and role-based classification routing. See [Configurable Execution Lanes](docs/configurable-lanes.md) for details.
 
 ## Required Labels
 
@@ -53,6 +53,7 @@ Issues are classified into execution lanes that control agent queue behavior and
 - `status/ready` - Issue is groomed and actionable; available for agents to claim
 - `status/in-progress` - Issue is being worked on
 - `status/in-review` - Issue has an open PR pending review/merge
+- `status/blocked` - Issue is parked out of agent circulation; excluded from the work queue. A block carrying a `blockedReason` needs a human; one without a reason is picked back up by the groomer
 - `status/done` - Issue is completed (closed)
 
 ### Owner Labels
@@ -117,7 +118,7 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_GROOMER_MAX_FILE_BYTES` | No | Maximum bytes per fetched file snippet. Defaults to `4096`. |
 | `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | No | Suppresses repeated hosted-groomer comments on the same issue. Defaults to `24`. |
 | `DISPATCH_GROOMER_TOKEN` | No | Optional bearer token for scheduled/admin groomer invocations. |
-| `DISPATCH_GROOMER_INTERVAL_SECONDS` | No | Suggested external scheduler cadence; Dispatch runs at most one issue per request. |
+| `DISPATCH_GROOMER_INTERVAL_MS` | No | Interval for the scheduler's `groomer` job (default 600000). Dispatch runs at most one issue per run. |
 
 ### GitHub App Authentication (Optional)
 
@@ -155,7 +156,7 @@ safe defaults and can be omitted in small deployments.
 | `DISPATCH_SYNC_LOCK_MAX_AGE_MS` | No | Maximum age (ms) before a stale sync lock is considered abandoned and may be reclaimed by a new sync run. Defaults to `1_800_000` (30 minutes). |
 | `WEBHOOK_SECRET` | Conditional | HMAC-SHA256 shared secret used to verify inbound webhook payloads. Required for `POST /api/pr-followup/webhook` when `WEBHOOK_GATEWAY_MODE` is not `true`. See `docs/pr-review-fix-queue.md` for the event contract. Use a long random string (>= 32 bytes recommended). |
 | `WEBHOOK_GATEWAY_MODE` | No | When set to `true`, disables the built-in signature check because an upstream API gateway has already verified the request. Must be the literal string `"true"` or `"false"` (parsed as a string, not a boolean). |
-| `PR_FOLLOWUP_BOT_IDENTITIES` | No | JSON object mapping bot logins (e.g. `dependabot[bot]`) to a behaviour label. When a webhook event arrives from a listed identity, Dispatch skips its followup handling. Example: `'{"dependabot[bot]":"auto-merge"}'`. |
+| `PR_FOLLOWUP_BOT_IDENTITIES` | No | Comma-separated bot logins whose PR events are ingested (default `github-actions[bot]`). Example: `github-actions[bot],dependabot[bot]`. |
 | `PR_FOLLOWUP_BRANCH_OWNERS` | No | Comma-separated GitHub logins considered the canonical owner of a followup branch. Used to suppress "needs author" nudges. |
 | `OPENAI_API_KEY` | Conditional | OpenAI API key used by the lesson feed. Ignored when `DISPATCH_LLM_API_KEY` is set. |
 | `OPENAI_BASE_URL` | No | OpenAI-compatible base URL for the lesson feed. Ignored when `DISPATCH_LLM_BASE_URL` is set. |
@@ -565,7 +566,7 @@ Only flip the agent's workflow over once all ten steps pass.
 
 ## Scheduled Issue Sync Strategy
 
-Dispatch keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by **agent harness heartbeat sync** rather than by a Dispatch background worker or new cluster CronJob.
+Dispatch keeps GitHub as the source of truth and stores issues only as a local cache. Cache freshness is owned by the **in-process scheduler** (`src/lib/scheduler.ts`), which runs sync, groomer, pr-followup, prune-closed and reconcile on intervals, with agent harness heartbeat sync as a secondary path.
 
 Decision:
 - At the start of each heartbeat, the agent harness should make a best-effort `POST` request to Dispatch's `/api/sync` endpoint.
@@ -579,11 +580,11 @@ Rationale:
 
 Rejected alternatives for the first implementation:
 - **Kubernetes CronJob**: valid later if heartbeat-driven sync is too sparse, but it adds deployment and auth plumbing for little immediate benefit.
-- **Dispatch internal scheduler**: would couple cache freshness to app process lifetime and introduces timer/queue behavior that Phase 1 intentionally avoids.
+- **External cluster CronJob**: would duplicate what the in-process scheduler already does, and split ownership of cache freshness across two places.
 
 Operational notes:
 - Configure the agent harness with `DISPATCH_URL` and any required network access to reach Dispatch.
-- `/api/sync` currently does not require `DISPATCH_AGENT_TOKEN`; if auth is added later, update the heartbeat caller and this section together.
+- `/api/sync` requires `DISPATCH_AGENT_TOKEN` like the other agent endpoints (`authorizeRequest` in `src/app/api/sync/route.ts`).
 - Treat sync failures as freshness warnings, not heartbeat failures, unless the heartbeat itself cannot complete.
 
 ### Known Limitations
@@ -593,7 +594,7 @@ Operational notes:
 3. **No check runs/check suites**: Job-level visibility is limited to Actions jobs; separate status checks from other integrations are not fetched.
 4. **No Secrets scanning**: Secret detection results from GitHub's secret scanning are not fetched (requires additional API endpoint).
 5. **Package visibility**: GitHub packages require the user to have appropriate permissions to view; private packages may not be visible.
-6. **No webhook receiver for real-time updates**: Issue cache refresh is heartbeat-driven and best-effort, not push-based from GitHub.
+6. **Partial webhook coverage**: a GitHub webhook receiver at `/api/pr-followup/webhook` ingests PR events. Issue-label events are not consumed, so issue cache refresh remains interval- and heartbeat-driven.
 7. **No workflow run logs**: Full logs are not stored; only run metadata and job status.
 
 ### Deferred Phase 2 Items
