@@ -302,7 +302,7 @@ export function createServer(): McpServerType {
     "unclaim_issue",
     {
       description:
-        "Release an agent's claim on a Dispatch issue: removes the agent/* label, releases the lease (and AgentWork records on the operator path), and flips status/in-progress to status/ready — the issue keeps its groomed lane, so it is immediately re-claimable. Refuses closed/done issues and issues not assigned to the given agent. If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var. Error if neither is set — do not use generic identities like 'Dispatch MCP'.",
+        "Release an agent's claim on a Dispatch issue: removes the agent/* label, releases the lease (and AgentWork records on the operator path), and reports the resulting status in the response. Status handling: status/in-progress flips to status/ready, so it is immediately re-claimable; status/blocked flips to status/ready only when blockedReason is null — a blocked issue with a recorded reason stays blocked; status/in-review is left unchanged while its linked PR is still open. Refuses closed/done issues and issues not assigned to the given agent. If agentName is omitted, falls back to DISPATCH_AGENT_NAME env var. Error if neither is set — do not use generic identities like 'Dispatch MCP'.",
       inputSchema: {
         repoFullName: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
         issueNumber: z.number().int().positive().describe("GitHub issue number"),

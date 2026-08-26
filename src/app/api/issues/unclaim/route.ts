@@ -9,6 +9,7 @@ import {
   releaseAgentWorkByAgentAndIssue,
 } from "@/lib/lease";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { fetchPullRequestState } from "@/lib/github-prs";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -73,20 +74,61 @@ export async function POST(request: Request) {
     }
 
     try {
-      // Compute the new label set: drop the agent label; if status/in-progress,
-      // flip to status/ready so the issue leaves the In Progress column. The
-      // status swap itself is routed through the shared helper so it removes
-      // ALL status/* labels (not just in-progress) consistently with the
-      // other label routes.
+      // Compute the new label set: drop the agent label, then decide the
+      // resting status per the unclaim contract (one behaviour per status,
+      // so the result is predictable for every status):
+      //   in-progress → ready (as before)
+      //   blocked with a null blockedReason → ready (nothing recorded a
+      //     reason to stay parked)
+      //   blocked with a blockedReason → unchanged (the block was a
+      //     deliberate decision; unclaim must not silently undo it)
+      //   in-review → unchanged while the linked PR is still open (do not
+      //     drag work backwards while a PR is in flight)
       let updatedLabels = issue.labels.filter((l) => l !== agentLabel);
+      let statusNote: string | null = null;
+
       if (updatedLabels.includes("status/in-progress")) {
+        // The status swap itself is routed through the shared helper so it
+        // removes ALL status/* labels (not just in-progress) consistently
+        // with the other label routes.
         updatedLabels = await transitionIssueStatus(
           repoFullName as string,
           issueNumber as number,
           updatedLabels,
           "status/ready",
         );
+      } else if (updatedLabels.includes("status/blocked")) {
+        if (issue.blockedReason == null) {
+          updatedLabels = await transitionIssueStatus(
+            repoFullName as string,
+            issueNumber as number,
+            updatedLabels,
+            "status/ready",
+          );
+        } else {
+          statusNote =
+            "status/blocked retained: blockedReason is set, so the block was a deliberate decision";
+        }
+      } else if (updatedLabels.includes("status/in-review")) {
+        if (issue.linkedPrNumber != null) {
+          const pr = await fetchPullRequestState(
+            repoFullName as string,
+            issue.linkedPrNumber,
+          );
+          if (pr.state === "open") {
+            statusNote = `status/in-review retained: linked PR #${issue.linkedPrNumber} is still open`;
+          } else {
+            statusNote = `status/in-review retained: linked PR #${issue.linkedPrNumber} is no longer open; use set_issue_status to move the issue`;
+          }
+        } else {
+          statusNote =
+            "status/in-review retained: no linked PR recorded; use set_issue_status to move the issue";
+        }
       }
+
+      // The resulting status label, reported so a caller can tell whether
+      // the issue is workable instead of inferring it from the labels.
+      const resultingStatus = updatedLabels.find((l) => l.startsWith("status/")) ?? null;
 
       // Apply label changes to GitHub (conflict-aware: re-applies all
       // non-status labels and adds status/ready in one shot).
@@ -132,7 +174,12 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ success: true, labels: updatedLabels });
+      return NextResponse.json({
+        success: true,
+        labels: updatedLabels,
+        status: resultingStatus,
+        statusNote,
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
 

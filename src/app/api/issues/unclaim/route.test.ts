@@ -11,6 +11,7 @@ const { mocks } = vi.hoisted(() => ({
     updateIssueLabels: vi.fn().mockResolvedValue(undefined),
     releaseLeaseByAgentAndIssue: vi.fn().mockResolvedValue(undefined),
     releaseAgentWorkByAgentAndIssue: vi.fn().mockResolvedValue(0),
+    fetchPullRequestState: vi.fn().mockResolvedValue({ state: "open" }),
   },
 }));
 
@@ -37,6 +38,10 @@ vi.mock("@/lib/github", () => ({
 vi.mock("@/lib/lease", () => ({
   releaseLeaseByAgentAndIssue: mocks.releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue: mocks.releaseAgentWorkByAgentAndIssue,
+}));
+
+vi.mock("@/lib/github-prs", () => ({
+  fetchPullRequestState: mocks.fetchPullRequestState,
 }));
 
 import { POST } from "./route";
@@ -271,6 +276,121 @@ describe("POST /api/issues/unclaim — operator path", () => {
           notes: expect.stringContaining("test-agent"),
         }),
       });
+    });
+  });
+});
+
+describe("POST /api/issues/unclaim — status handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
+  });
+
+  it("flips in-progress to ready and reports status/ready", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/in-progress"],
+      blockedReason: null,
+      linkedPrNumber: null,
+    } as never);
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toEqual(["status/ready"]);
+    expect(body.status).toBe("status/ready");
+    expect(body.statusNote).toBeNull();
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
+      "status/ready",
+    ]);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/ready"] }),
+    });
+  });
+
+  it("flips blocked with a null blockedReason to ready and reports status/ready", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/blocked"],
+      blockedReason: null,
+      linkedPrNumber: null,
+    } as never);
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toEqual(["status/ready"]);
+    expect(body.status).toBe("status/ready");
+    expect(body.statusNote).toBeNull();
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
+      "status/ready",
+    ]);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/ready"] }),
+    });
+  });
+
+  it("keeps blocked with a blockedReason unchanged and says so in the response", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/blocked"],
+      blockedReason: "waiting on upstream API change",
+      linkedPrNumber: null,
+    } as never);
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toEqual(["status/blocked"]);
+    expect(body.status).toBe("status/blocked");
+    expect(body.statusNote).toContain("blockedReason is set");
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
+      "status/blocked",
+    ]);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/blocked"] }),
+    });
+  });
+
+  it("keeps in-review unchanged while the linked PR is still open and says so", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/in-review"],
+      blockedReason: null,
+      linkedPrNumber: 7,
+    } as never);
+    mocks.fetchPullRequestState.mockResolvedValueOnce({
+      state: "open",
+      mergedAt: null,
+    });
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toEqual(["status/in-review"]);
+    expect(body.status).toBe("status/in-review");
+    expect(body.statusNote).toContain("PR #7 is still open");
+    expect(mocks.fetchPullRequestState).toHaveBeenCalledWith("org/repo", 7);
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
+      "status/in-review",
+    ]);
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/in-review"] }),
     });
   });
 });
