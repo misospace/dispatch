@@ -213,6 +213,11 @@ This section is the source of truth for how any agent (Saffron, or any other har
 
 Every agent heartbeat follows this loop:
 
+> `normal` is not a built-in lane ID. It works because this deployment maps it
+> through `laneAliases` (`normal` → `local`) in `DISPATCH_LANE_CONFIG_JSON`. The
+> shipped defaults are `default` and `backlog`, so an unaliased deployment must
+> use a configured lane ID or `next-task` returns HTTP 400.
+
 1. **`GET /api/agents/{agentName}/next-task?lane=normal`** (bearer-auth required). Returns exactly one `AgentTask`. If idle (`shouldRun: false`), stop immediately — do not start the model.
 2. **Execute exactly one task.** The task type determines what to do (see Task Types below).
 3. **`POST /api/agents/{agentName}/tasks/report`** (bearer-auth required). Report the outcome, then stop.

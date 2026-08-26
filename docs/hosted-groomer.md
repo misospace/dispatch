@@ -28,7 +28,7 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_MAX_FILE_BYTES` | `4096` | Maximum bytes per fetched file snippet. |
 | `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | `24` | Suppresses repeated hosted-groomer comments on the same issue. A comment is skipped (and recorded on the run) when a prior run posted a comment within this window, unless `force` is true. |
 | `DISPATCH_GROOMER_TOKEN` | unset | Optional bearer token for scheduled or admin groomer invocations. When set, `POST /api/groomer/run` accepts this token in addition to `DISPATCH_AGENT_TOKEN`. |
-| `DISPATCH_GROOMER_INTERVAL_SECONDS` | unset | Suggested cadence for an external scheduler. Dispatch runs at most one issue per request and does not run a background loop. |
+| `DISPATCH_GROOMER_INTERVAL_MS` | 600000 | Interval for the in-process scheduler's `groomer` job. Dispatch still processes at most one issue per run. |
 
 ## Endpoint
 
@@ -78,4 +78,4 @@ Repository context is best-effort: fetch warnings are recorded on the `GroomingR
 
 ## Scheduling
 
-Dispatch exposes a one-run endpoint (`POST /api/groomer/run`) instead of running a background loop inside Next.js. External schedulers (cron, systemd timer, GitHub Actions schedule) invoke the endpoint with `DISPATCH_AGENT_TOKEN` or `DISPATCH_GROOMER_TOKEN` when configured. `DISPATCH_GROOMER_INTERVAL_SECONDS` documents the suggested scheduler cadence; Dispatch still processes at most one issue per request.
+Dispatch exposes a one-run endpoint (`POST /api/groomer/run`), driven by the in-process scheduler in `src/lib/scheduler.ts` on the `DISPATCH_GROOMER_INTERVAL_MS` interval (default 10 minutes). The endpoint remains callable directly — by an external scheduler, or by hand with `DISPATCH_AGENT_TOKEN` or `DISPATCH_GROOMER_TOKEN` — and processes at most one issue per run either way.

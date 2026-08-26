@@ -17,13 +17,16 @@ For queue behavior and worker contracts, see [Worker Execution Contract](./worke
 
 ## Default Lane Setup
 
-Out of the box, Dispatch configures three lanes:
+Out of the box, Dispatch configures two lanes:
 
 | ID | Title | Claimable | Role | Color | Description |
 |----|-------|-----------|------|-------|-------------|
-| `normal` | Normal | Yes | `default` | `#3b82f6` (blue) | Standard execution lane for concrete, scoped implementation work |
-| `escalated` | Escalated | Yes | `escalation` | `#f97316` (orange) | Higher-judgment tasks: architecture, design, cross-service |
+| `default` | Default | Yes | `default` | `#3b82f6` (blue) | Standard execution lane for concrete, scoped implementation work |
 | `backlog` | Backlog | No | — | `#6b7280` (gray) | Not actionable yet; needs grooming before work can start |
+
+A multi-lane setup (for example `local` / `frontier` / `backlog`) is configured
+through `DISPATCH_LANE_CONFIG_JSON`; `normal` and `escalated` are not built in.
+Use `laneAliases` to keep older stored lane IDs resolving after a rename.
 
 This default configuration requires no environment variables. Issues are classified into these lanes during sync via heuristic or model-backed classification.
 
@@ -283,10 +286,10 @@ This behavior ensures no issues are silently lost when deploying a new lane conf
 
 ## Configuring via Environment Variable
 
-Custom lane configurations are set via the `DISPATCH_LANE_CONFIG` environment variable:
+Custom lane configurations are set via the `DISPATCH_LANE_CONFIG_JSON` environment variable:
 
 ```bash
-export DISPATCH_LANE_CONFIG='{"lanes":[{"id":"local","title":"Local","claimable":true,"role":"default","color":"#22c55e"},{"id":"frontier","title":"Frontier","claimable":true,"role":"escalation","color":"#f97316"},{"id":"parking-lot","title":"Parking Lot","claimable":false,"color":"#6b7280"}],"laneAliases":{"normal":"local","escalated":"frontier","backlog":"parking-lot"}}'
+export DISPATCH_LANE_CONFIG_JSON='{"lanes":[{"id":"local","title":"Local","claimable":true,"role":"default","color":"#22c55e"},{"id":"frontier","title":"Frontier","claimable":true,"role":"escalation","color":"#f97316"},{"id":"parking-lot","title":"Parking Lot","claimable":false,"color":"#6b7280"}],"laneAliases":{"normal":"local","escalated":"frontier","backlog":"parking-lot"}}'
 ```
 
 The value must be a valid JSON string matching the `LaneConfigSet` interface. Dispatch validates the configuration at startup and throws on errors:
@@ -296,7 +299,7 @@ The value must be a valid JSON string matching the `LaneConfigSet` interface. Di
 - At least one claimable lane is required
 - Aliases must point to configured lane IDs
 
-If `DISPATCH_LANE_CONFIG` is not set, Dispatch uses the [default lane setup](#default-lane-setup).
+If `DISPATCH_LANE_CONFIG_JSON` is not set, Dispatch uses the [default lane setup](#default-lane-setup).
 
 ---
 
