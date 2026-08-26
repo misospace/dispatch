@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
+import { resolvePrFixFromAgentReport } from "@/lib/pr-fix-queue";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr", "groom"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -155,10 +156,23 @@ export async function POST(
     },
   });
 
+  // If the report corresponds to a queued pr-fix item, resolve it. Without
+  // this, non-bridge agents (anything driven through MCP tools or the generic
+  // harness loop) leave the item QUEUED and it is re-served ahead of issue
+  // work on every poll. See issue #868.
+  const prFixResolution = await resolvePrFixFromAgentReport({
+    repoFullName: report.repoFullName,
+    pullRequestNumber: report.pullRequestNumber,
+    pullRequestUrl: report.pullRequestUrl,
+    outcome: report.outcome,
+    summary: report.summary,
+  });
+
   return NextResponse.json({
     ok: true,
     agentName,
     report,
     agentRunId: run.id,
+    prFixResolution,
   });
 }

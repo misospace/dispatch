@@ -1,6 +1,8 @@
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
 import { extractLessonFromFixOutcome } from "./lesson-feed";
+import { prisma } from "@/lib/prisma";
+import { fetchPullRequestMergeState } from "./github-prs";
 
 export type PrFixQueueClient = {
   prFixQueueItem: {
@@ -472,5 +474,156 @@ export function parseRequeuePrFixInput(body: unknown): RequeuePrFixInput | { err
     pr: Number(input.pr),
     note: typeof input.note === "string" ? input.note : null,
     isPrMergedOrClosed: input.isPrMergedOrClosed === true,
+  };
+}
+
+/**
+ * Outcome shape used by `tasks/report`. Mirrors the `tasks/report` route's
+ * permitted outcomes so the resolution logic does not have to inspect a raw
+ * union from a foreign file.
+ */
+export type AgentReportOutcome =
+  | "pr_opened"
+  | "pr_updated"
+  | "issue_updated"
+  | "issue_closed"
+  | "no_changes_needed"
+  | "blocked"
+  | "failed";
+
+export interface ResolvePrFixFromAgentReportInput {
+  repoFullName?: string | null;
+  pullRequestNumber?: number | null;
+  pullRequestUrl?: string | null;
+  outcome: AgentReportOutcome;
+  summary?: string | null;
+  client?: PrFixQueueClient;
+}
+
+export interface ResolvePrFixFromAgentReportResult {
+  matched: boolean;
+  action: "none" | "blocked" | "fixed" | "deferred" | "skipped";
+  itemId?: number | null;
+  reason: string;
+}
+
+/**
+ * Resolve a queued pr-fix item when an agent reports back through
+ * `tasks/report`. Without this, non-bridge agents (anything driven through
+ * MCP tools or the generic harness loop in AGENTS.md, e.g. pi/opencode) get
+ * the pr-fix item served first, do the work, report — and the PrFixQueueItem
+ * stays QUEUED, so the next poll serves it again ahead of issue work.
+ *
+ * Behaviour, matching the bridge's own marking:
+ * - No matching item or no PR coordinates → no-op (issue-work reports pass
+ *   through untouched).
+ * - Outcome `blocked` → mark BLOCKED immediately. Doesn't need PR state; the
+ *   agent hit a wall.
+ * - Outcome `failed` → no-op. We don't synthesize BLOCKED off a generic
+ *   failure — the bridge's reconcile pass still owns that decision.
+ * - Anything else (pr_opened/pr_updated/issue_closed/issue_updated/
+ *   no_changes_needed) is "done"-like. Verify PR merge state before marking
+ *   FIXED so a red PR isn't marked fixed off unverified success — that is
+ *   exactly the failure mode the bridge deliberately avoids. If the PR is
+ *   not mergeable/merged/closed (e.g. CONFLICTING or unknown), do NOT mark
+ *   FIXED; leave the item for the bridge's reconcile pass to settle.
+ * - Idempotent: a repeat report for an already-resolved item is a no-op.
+ */
+export async function resolvePrFixFromAgentReport(
+  input: ResolvePrFixFromAgentReportInput,
+): Promise<ResolvePrFixFromAgentReportResult> {
+  const repo = input.repoFullName?.trim();
+  const pr =
+    typeof input.pullRequestNumber === "number" && Number.isInteger(input.pullRequestNumber)
+      ? input.pullRequestNumber
+      : null;
+
+  if (!repo || pr === null || pr === undefined) {
+    return { matched: false, action: "none", reason: "no pr coordinates in report" };
+  }
+
+  const client = input.client ?? prisma;
+  const existing = await client.prFixQueueItem.findUnique({
+    where: { repo_pr: { repo, pr } },
+  });
+  if (!existing) {
+    return { matched: false, action: "none", reason: "no matching pr-fix queue item" };
+  }
+
+  const currentStatus = normalizePrFixStatus(existing.status) as PrFixStatus | null;
+  if (!currentStatus || currentStatus !== "QUEUED") {
+    // Already settled (FIXED / BLOCKED / STALE). Idempotent — nothing to do.
+    return {
+      matched: true,
+      action: "skipped",
+      itemId: existing.id ?? null,
+      reason: `pr-fix item already ${existing.status}`,
+    };
+  }
+
+  if (input.outcome === "blocked") {
+    await markPrFixItem(client as PrFixQueueClient, {
+      repo,
+      pr,
+      status: "BLOCKED",
+      note: input.summary ?? null,
+    });
+    return {
+      matched: true,
+      action: "blocked",
+      itemId: existing.id ?? null,
+      reason: "agent reported blocked",
+    };
+  }
+
+  if (input.outcome === "failed") {
+    // Don't second-guess a failure — leave the item queued for the bridge
+    // reconcile pass (see reconcileStalePrFixItems / markPrFixItem callers).
+    return {
+      matched: true,
+      action: "skipped",
+      itemId: existing.id ?? null,
+      reason: "agent reported failed; leaving for bridge reconcile",
+    };
+  }
+
+  // "Done"-like outcomes. Gate on PR merge state so we don't mark FIXED
+  // off an unverified success — the same check the bridge applies.
+  try {
+    const mergeState = await fetchPullRequestMergeState(repo, pr);
+    if (mergeState.mergeable !== true) {
+      // Either CONFLICTING, BLOCKED, unknown (null), or explicitly false.
+      // Leave queued so the bridge reconcile pass can re-verify on a later
+      // tick rather than us putting a tombstone on a red PR.
+      return {
+        matched: true,
+        action: "deferred",
+        itemId: existing.id ?? null,
+        reason: `pr not mergeable (mergeable_state=${mergeState.mergeableState ?? "unknown"})`,
+      };
+    }
+  } catch (error) {
+    // If we can't reach GitHub, defer rather than guess — the bridge will
+    // re-verify on the next reconcile pass.
+    console.error(`pr-fix-queue resolve: pr merge state check failed for ${repo}#${pr}:`, error);
+    return {
+      matched: true,
+      action: "deferred",
+      itemId: existing.id ?? null,
+      reason: "pr merge state check failed; leaving for bridge reconcile",
+    };
+  }
+
+  await markPrFixItem(client as PrFixQueueClient, {
+    repo,
+    pr,
+    status: "FIXED",
+    note: input.summary ?? null,
+  });
+  return {
+    matched: true,
+    action: "fixed",
+    itemId: existing.id ?? null,
+    reason: "pr merge state verified",
   };
 }

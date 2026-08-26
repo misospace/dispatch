@@ -34,6 +34,13 @@ vi.mock("@/lib/prisma", () => ({
     issue: {
       findUnique: mocks.issueFindUnique,
     },
+    // `tasks/report` resolves a queued pr-fix item when the agent reports
+    // back on PR coordinates. Tests that send `repoFullName` +
+    // `pullRequestNumber` should keep the pr-fix queue empty by default;
+    // tests that want the resolution path can override per-test.
+    prFixQueueItem: {
+      findUnique: vi.fn(async () => null),
+    },
   },
 }));
 
