@@ -1,13 +1,22 @@
 /**
  * Shared sync-locking module.
  *
- * Provides a DB-backed single-row lock (syncLock table) that all sync
- * entry-points share to prevent overlapping concurrent runs across:
- *   - Scheduled sync (`/api/sync/scheduled`)
- *   - Manual issue sync (`/api/sync`)
- *   - Automation sync (`/api/automation/sync`)
- *   - PR follow-up sync (`/api/pr-followup/sync`)
- *   - Issue reconciliation (`/api/issues/reconcile`)
+ * Provides DB-backed locks (syncLock table), keyed per job by
+ * LOCK_KEY_BY_TYPE below. Each entry-point excludes only the runs it can
+ * actually corrupt:
+ *   - Scheduled sync (`/api/sync/scheduled`) and manual issue sync (`/api/sync`)
+ *     share the `issue-sync` key — same full-sync write path over the same rows.
+ *   - Automation sync (`/api/automation/sync`) — disjoint tables.
+ *   - PR follow-up sync (`/api/pr-followup/sync`) — PrFixQueueItem only.
+ *   - Issue reconciliation (`/api/issues/reconcile`) — column-disjoint writes.
+ *   - Stale-work sweep (`/api/agent-work/sweep`) — conditional transitions.
+ *
+ * This used to be one `"global"` row shared by all six. That made every job
+ * exclude every other, and because the scheduler arms all jobs with the same
+ * startup delay their intervals stay phase-locked, so the same jobs lost every
+ * race: `pr-followup` and `reconcile` recorded zero successful runs over a
+ * pod's lifetime while a full sync held the lock for minutes. No PR-fix work
+ * was queued at all as a result.
  *
  * Lock semantics:
  *   - First writer wins; subsequent writers get a 409 Conflict.
@@ -32,7 +41,6 @@
 
 import { prisma } from "@/lib/prisma";
 
-const LOCK_ID = "global" as const;
 const DEFAULT_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
@@ -69,15 +77,40 @@ export type SyncType =
   | "stale-work";
 
 /**
+ * Lock key per sync type. One row per key in the same `sync_lock` table that
+ * `groomer-lock.ts` already uses for its own `"groomer"` row, so the multi-row
+ * pattern is established rather than new — never reuse that id here.
+ *
+ * `scheduled` and `manual` deliberately share a key. Both run the full issue
+ * sync over the same Issue rows, and `makePrismaIssueStore().createIssue` is a
+ * plain `create`, not an upsert, so two concurrent runs that both see a new
+ * issue as absent race into P2002 (#333).
+ *
+ * Everything else only needs to exclude ITSELF — overlapping replicas of the
+ * same job (#822) — because each mutates disjoint tables or writes
+ * conditionally and idempotently. Sharing one key made them exclude each
+ * other instead: `pr-followup` and `reconcile` lost every race and never ran
+ * once over a pod's lifetime, so no PR-fix work was ever queued.
+ */
+const LOCK_KEY_BY_TYPE: Record<SyncType, string> = {
+  scheduled: "issue-sync",
+  manual: "issue-sync",
+  automation: "automation",
+  "pr-followup": "pr-followup",
+  reconcile: "reconcile",
+  "stale-work": "stale-work",
+};
+
+/**
  * Where-clause for the atomic claim: a row is claimable when it has no
  * recorded holder (an orphan — nothing can be holding the lock without one,
  * since every acquisition records its run id) or when it is older than the
  * TTL. A fresh row with a live holder matches neither, so two simultaneous
  * acquisitions of a live lock can never both succeed.
  */
-function claimableWhere(): Record<string, unknown> {
+function claimableWhere(lockId: string): Record<string, unknown> {
   return {
-    id: LOCK_ID,
+    id: lockId,
     OR: [
       { syncRunId: null },
       { acquiredAt: { lt: new Date(Date.now() - MAX_AGE_MS) } },
@@ -103,7 +136,8 @@ function claimableWhere(): Record<string, unknown> {
 export async function acquireLock(
   syncType: SyncType,
 ): Promise<AcquiredLock | LockConflict> {
-  const existing = await prisma.syncLock.findUnique({ where: { id: LOCK_ID } });
+  const lockId = LOCK_KEY_BY_TYPE[syncType];
+  const existing = await prisma.syncLock.findUnique({ where: { id: lockId } });
 
   // Fast path: a live lock conflicts without creating a run record, so
   // scheduler ticks during a running sync don't pollute the sync history.
@@ -123,7 +157,7 @@ export async function acquireLock(
       // Atomic conditional claim. count === 1 wins; count === 0 means no
       // claimable row (absent, or held live).
       const claimed = await tx.syncLock.updateMany({
-        where: claimableWhere(),
+        where: claimableWhere(lockId),
         data: { syncRunId: run.id, acquiredAt: new Date() },
       });
       if (claimed.count === 1) return run.id;
@@ -143,7 +177,7 @@ export async function acquireLock(
       // this statement returns 0 affected rows instead of throwing.
       const inserted = await tx.$executeRaw`
         INSERT INTO "sync_lock" ("id", "syncRunId", "acquiredAt")
-        VALUES (${LOCK_ID}, ${run.id}, ${new Date()})
+        VALUES (${lockId}, ${run.id}, ${new Date()})
         ON CONFLICT ("id") DO NOTHING
       `;
       if (inserted === 1) return run.id;
@@ -153,7 +187,7 @@ export async function acquireLock(
       // transaction just released or left the row claimable (stale or
       // orphaned) we take it; otherwise a live lock holds it and we lose.
       const retry = await tx.syncLock.updateMany({
-        where: claimableWhere(),
+        where: claimableWhere(lockId),
         data: { syncRunId: run.id, acquiredAt: new Date() },
       });
       if (retry.count === 1) return run.id;
@@ -184,7 +218,8 @@ export async function acquireLock(
  * Uses a conditional delete to avoid releasing another run's lock.
  */
 export async function releaseLock(runId: string): Promise<void> {
-  await prisma.syncLock.deleteMany({
-    where: { id: LOCK_ID, syncRunId: runId },
-  });
+  // Keyed on the run id alone, so callers need not know which lock key their
+  // sync type maps to. Safe because a run id is either an IssueSyncRun cuid or
+  // groomer-lock's randomUUID token — unique across every key.
+  await prisma.syncLock.deleteMany({ where: { syncRunId: runId } });
 }

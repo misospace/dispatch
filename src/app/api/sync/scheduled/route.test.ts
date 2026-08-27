@@ -6,7 +6,7 @@ function createPrismaMock() {
 
   const syncLockFindUnique = vi.fn();
   const syncLockDeleteMany = vi.fn().mockResolvedValue({ count: 0 });
-  const syncLockCreate = vi.fn().mockResolvedValue({ id: "global" });
+  const syncLockCreate = vi.fn().mockResolvedValue({ id: "issue-sync" });
   // Atomic claim used by acquireLock's UPDATE ... WHERE flow. Default
   // count 0 routes acquisition down the insert path, like an absent row.
   const syncLockUpdateMany = vi.fn().mockResolvedValue({ count: 0 });
@@ -266,7 +266,7 @@ describe("POST /api/sync/scheduled — locking", () => {
   it("returns 409 when a sync is already running", async () => {
     const { POST } = await import("./route");
     prismaMock.prisma.syncLock.findUnique.mockResolvedValue({
-      id: "global",
+      id: "issue-sync",
       syncRunId: "sync-run-123",
       acquiredAt: new Date(),
     });
@@ -280,7 +280,7 @@ describe("POST /api/sync/scheduled — locking", () => {
   it("allows sync when existing lock is stale (>30 min)", async () => {
     const { POST } = await import("./route");
     prismaMock.prisma.syncLock.findUnique.mockResolvedValue({
-      id: "global",
+      id: "issue-sync",
       syncRunId: "sync-run-old",
       acquiredAt: new Date(Date.now() - 31 * 60 * 1000), // 31 min ago
     });
@@ -292,7 +292,8 @@ describe("POST /api/sync/scheduled — locking", () => {
     expect(res.status).toBe(200);
     expect(prismaMock.prisma.syncLock.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ id: "global" }),
+        // This route is "scheduled", which maps to the issue-sync key.
+        where: expect.objectContaining({ id: "issue-sync" }),
         data: expect.objectContaining({ syncRunId: expect.any(String) }),
       }),
     );
@@ -306,10 +307,11 @@ describe("POST /api/sync/scheduled — locking", () => {
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
 
-    // deleteMany should have been called to remove the lock row
+    // releaseLock keys on the run id alone now, so callers need not know
+    // which lock key their sync type maps to.
     expect(prismaMock.prisma.syncLock.deleteMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ id: "global" }),
+        where: expect.objectContaining({ syncRunId: expect.any(String) }),
       }),
     );
   });

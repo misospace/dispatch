@@ -56,11 +56,11 @@ describe("acquireLock", () => {
     expect(mocks.$executeRaw).toHaveBeenCalled();
 
     await releaseLock(result.locked ? result.runId : "run-1");
-    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "run-1" } });
+    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { syncRunId: "run-1" } });
   });
 
   it("conflicts when a fresh (live) lock is held", async () => {
-    mocks.syncLock.findUnique.mockResolvedValue({ id: "global", syncRunId: "other", acquiredAt: new Date() });
+    mocks.syncLock.findUnique.mockResolvedValue({ id: "issue-sync", syncRunId: "other", acquiredAt: new Date() });
 
     const result = await acquireLock("manual");
 
@@ -85,7 +85,7 @@ describe("acquireLock", () => {
   });
 
   it("two simultaneous acquires of a live lock cannot both succeed", async () => {
-    mocks.syncLock.findUnique.mockResolvedValue({ id: "global", syncRunId: "other", acquiredAt: new Date() });
+    mocks.syncLock.findUnique.mockResolvedValue({ id: "issue-sync", syncRunId: "other", acquiredAt: new Date() });
 
     const [a, b] = await Promise.all([acquireLock("scheduled"), acquireLock("reconcile")]);
 
@@ -97,7 +97,7 @@ describe("acquireLock", () => {
   it("reclaims an expired lock, and logs the takeover with holder and age", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const stale = new Date(Date.now() - (MAX_AGE_MS + 60_000));
-    mocks.syncLock.findUnique.mockResolvedValue({ id: "global", syncRunId: "old", acquiredAt: stale });
+    mocks.syncLock.findUnique.mockResolvedValue({ id: "automation", syncRunId: "old", acquiredAt: stale });
     // Atomic claim wins in place (no delete).
     mocks.syncLock.updateMany.mockResolvedValue({ count: 1 });
 
@@ -109,7 +109,8 @@ describe("acquireLock", () => {
     expect(mocks.$executeRaw).not.toHaveBeenCalled();
     expect(mocks.syncLock.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ id: "global" }),
+        // "automation" maps to its own key, not the shared issue-sync one.
+        where: expect.objectContaining({ id: "automation" }),
         data: expect.objectContaining({ syncRunId: "run-1" }),
       }),
     );
@@ -126,7 +127,7 @@ describe("acquireLock", () => {
     // Fresh acquiredAt but no holder: the row #840 left stuck. A null holder
     // is claimable regardless of age because a live run always records its
     // run id.
-    mocks.syncLock.findUnique.mockResolvedValue({ id: "global", syncRunId: null, acquiredAt: new Date() });
+    mocks.syncLock.findUnique.mockResolvedValue({ id: "issue-sync", syncRunId: null, acquiredAt: new Date() });
     mocks.syncLock.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await acquireLock("reconcile");
@@ -180,14 +181,14 @@ describe("acquireLock", () => {
     }).rejects.toThrow();
 
     await releaseLock(lock.locked ? lock.runId : "run-1");
-    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "run-1" } });
+    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { syncRunId: "run-1" } });
   });
 });
 
 describe("releaseLock", () => {
   it("deletes only this run's lock row", async () => {
     await releaseLock("run-1");
-    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "run-1" } });
+    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { syncRunId: "run-1" } });
   });
 
   it("is a safe no-op when no matching row exists (release-on-any-path)", async () => {
@@ -196,7 +197,7 @@ describe("releaseLock", () => {
     // nothing → no throw.
     mocks.syncLock.deleteMany.mockResolvedValue({ count: 0 });
     await expect(releaseLock("never-acquired")).resolves.toBeUndefined();
-    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { id: "global", syncRunId: "never-acquired" } });
+    expect(mocks.syncLock.deleteMany).toHaveBeenCalledWith({ where: { syncRunId: "never-acquired" } });
   });
 });
 

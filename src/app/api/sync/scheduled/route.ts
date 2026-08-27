@@ -93,7 +93,20 @@ export async function POST(request: Request) {
     }
 
     // Automation sync (optional, opt-in)
+    //
+    // Held under the automation key, not this route's issue-sync one: the two
+    // write the same automation tables, and concurrent Prisma upserts on the
+    // same unique keys abort the batch transactions in automation-sync.ts.
+    // Skipping rather than failing keeps a lost race from taking the issue
+    // sync down with it — the scheduler never sets this flag, so only a manual
+    // call reaches here.
+    let automationSkipped = false;
     if (syncAutomation) {
+      const automationLock = await acquireLock("automation");
+      if (!automationLock.locked) {
+        automationSkipped = true;
+      } else {
+      try {
       const trackedRepos = await getTrackedRepos();
       const results: { repo: string; result: { success: boolean } }[] = [];
 
@@ -115,6 +128,12 @@ export async function POST(request: Request) {
         synced: results.filter((r) => r.result.success).length,
         failed: results.filter((r) => !r.result.success).length,
       };
+      } finally {
+        await releaseLock(automationLock.runId).catch((e) =>
+          console.error("Failed to release automation lock:", e),
+        );
+      }
+      }
     }
 
     // Update the sync run record
@@ -148,6 +167,13 @@ export async function POST(request: Request) {
       startedAt,
       finishedAt,
     };
+
+    // Report a skipped automation pass explicitly rather than reporting zero
+    // synced, which reads as "ran and found nothing".
+    if (automationSkipped) {
+      response.automationSkipped = true;
+      response.automationSkippedReason = "another automation sync holds the lock";
+    }
 
     if (syncIssues && issueSync) {
       response.issues = {
