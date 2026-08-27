@@ -302,8 +302,14 @@ describe("releaseStaleWork", () => {
     const result = await releaseStaleWork(tx, 5 * 60 * 1000); // 5 minute threshold
 
     expect(result).toHaveLength(1);
-    expect(tx.agentWork.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ state: "STALE" }) })
+    expect(tx.agentWork.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+          OR: expect.any(Array),
+        }),
+        data: expect.objectContaining({ state: "STALE" }),
+      }),
     );
   });
 });
@@ -315,6 +321,7 @@ function createMockTransaction() {
     findMany: vi.fn().mockResolvedValue([]),
     create: vi.fn().mockResolvedValue({ id: "work-1", state: "CLAIMED", checkpoint: "CLAIMED" }),
     update: vi.fn().mockResolvedValue({ id: "work-1" }),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
   };
   const agentWorkHistory = {
     create: vi.fn().mockResolvedValue({ id: "hist-1" }),

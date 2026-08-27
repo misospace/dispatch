@@ -528,9 +528,10 @@ model AgentWork {
   checkpoint      AgentWorkCheckpoint @default(CLAIMED)
   branch          String?
   prUrl           String?
-  leaseExpiresAt  DateTime?
-  lastHeartbeatAt DateTime          @default(now())
-  summary         String?           @db.Text
+  leaseExpiresAt            DateTime?
+  lastHeartbeatAt           DateTime          @default(now())
+  staleClaimReleasePending Boolean           @default(false)
+  summary                   String?           @db.Text
   blockerReason   String?           @db.Text
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
