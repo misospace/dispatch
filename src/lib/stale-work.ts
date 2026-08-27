@@ -12,25 +12,6 @@ export interface StaleWorkReport {
   errors: Array<{ workId: string; error: string }>;
 }
 
-export interface StaleWorkClient {
-  agentWork: {
-    findMany: (args: any) => Promise<any[]>;
-  };
-  issue: {
-    update: (args: any) => Promise<unknown>;
-  };
-  lease: {
-    deleteMany: (args: any) => Promise<unknown>;
-  };
-  agentWorkHistory: {
-    create: (args: any) => Promise<unknown>;
-  };
-  auditLog: {
-    create: (args: any) => Promise<unknown>;
-  };
-  $transaction: <T>(fn: (tx: StaleWorkTransactionClient) => Promise<T>) => Promise<T>;
-}
-
 interface StaleWorkTransactionClient {
   agentWork: {
     updateMany: (args: any) => Promise<{ count: number }>;
@@ -43,9 +24,27 @@ interface StaleWorkTransactionClient {
   };
 }
 
+export interface StaleWorkClient {
+  agentWork: {
+    findMany: (args: any) => Promise<any[]>;
+  };
+  issue: IssueClaimClient["issue"];
+  lease: {
+    deleteMany: (args: any) => Promise<unknown>;
+  };
+  agentWorkHistory: {
+    create: (args: any) => Promise<unknown>;
+  };
+  auditLog: {
+    create: (args: any) => Promise<unknown>;
+  };
+  $transaction: <T>(fn: (tx: StaleWorkTransactionClient) => Promise<T>) => Promise<T>;
+}
+
 /**
- * Reclaim expired AgentWork rows. GitHub is updated before the local row is
- * marked STALE, so an interrupted run leaves the row eligible for retry.
+ * Reclaim expired AgentWork rows. A row is first moved to STALE with a
+ * retryable marker in the database, then its GitHub claim is released. If the
+ * process dies between those steps, the next sweep retries the marked row.
  */
 export async function sweepStaleWork(
   client: StaleWorkClient = prisma as unknown as StaleWorkClient,
@@ -56,10 +55,16 @@ export async function sweepStaleWork(
   const cutoff = new Date(now.getTime() - maxAgeMs);
   const candidates = await client.agentWork.findMany({
     where: {
-      state: { in: [...ACTIVE_WORK_STATES] },
       OR: [
-        { lastHeartbeatAt: { lt: cutoff } },
-        { leaseExpiresAt: { lt: cutoff } },
+        {
+          state: { in: [...ACTIVE_WORK_STATES] },
+          staleClaimReleasePending: false,
+          OR: [
+            { lastHeartbeatAt: { lt: cutoff } },
+            { leaseExpiresAt: { lt: cutoff } },
+          ],
+        },
+        { state: "STALE", staleClaimReleasePending: true },
       ],
     },
     orderBy: { lastHeartbeatAt: "asc" },
@@ -69,8 +74,10 @@ export async function sweepStaleWork(
         select: {
           id: true,
           number: true,
-          labels: true,
           state: true,
+          labels: true,
+          blockedReason: true,
+          linkedPrNumber: true,
           repository: { select: { fullName: true } },
         },
       },
@@ -86,9 +93,58 @@ export async function sweepStaleWork(
 
   for (const work of candidates) {
     try {
+      // Claim the stale transition before external I/O. A heartbeat that
+      // commits first makes the conditional update miss; a heartbeat after
+      // this point sees a terminal STALE row and cannot revive it midway.
+      const marked = await client.$transaction(async (tx) => {
+        if (work.state === "STALE") {
+          const result = await tx.agentWork.updateMany({
+            where: { id: work.id, state: "STALE", staleClaimReleasePending: true },
+            data: { leaseExpiresAt: now },
+          });
+          if (result.count !== 1) return false;
+        } else {
+          const result = await tx.agentWork.updateMany({
+            where: {
+              id: work.id,
+              state: { in: [...ACTIVE_WORK_STATES] },
+              staleClaimReleasePending: false,
+              OR: [
+                { lastHeartbeatAt: { lt: cutoff } },
+                { leaseExpiresAt: { lt: cutoff } },
+              ],
+            },
+            data: {
+              state: "STALE",
+              leaseExpiresAt: now,
+              staleClaimReleasePending: true,
+            },
+          });
+          if (result.count !== 1) return false;
+
+          await tx.agentWorkHistory.create({
+            data: { workId: work.id, action: "stale" },
+          });
+        }
+
+        // Releasing the lease in the same transaction as the stale marker
+        // keeps the database-side queue blockers consistent across retries.
+        if (work.issueId) {
+          await tx.lease.deleteMany({
+            where: { agentName: work.agentName, issueId: work.issueId },
+          });
+        }
+        return true;
+      });
+
+      if (!marked) {
+        report.skipped++;
+        continue;
+      }
+
       if (work.issue) {
         await releaseIssueClaim({
-          prisma: client as IssueClaimClient,
+          prisma: client,
           issue: work.issue,
           repoFullName: work.issue.repository.fullName,
           issueNumber: work.issue.number,
@@ -97,32 +153,15 @@ export async function sweepStaleWork(
         });
       }
 
-      const marked = await client.$transaction(async (tx) => {
+      const finalized = await client.$transaction(async (tx) => {
         const result = await tx.agentWork.updateMany({
-          where: {
-            id: work.id,
-            state: { in: [...ACTIVE_WORK_STATES] },
-            OR: [
-              { lastHeartbeatAt: { lt: cutoff } },
-              { leaseExpiresAt: { lt: cutoff } },
-            ],
-          },
-          data: { state: "STALE", leaseExpiresAt: now },
+          where: { id: work.id, state: "STALE", staleClaimReleasePending: true },
+          data: { staleClaimReleasePending: false },
         });
-        if (result.count !== 1) return false;
-
-        if (work.issueId) {
-          await tx.lease.deleteMany({
-            where: { agentName: work.agentName, issueId: work.issueId },
-          });
-        }
-        await tx.agentWorkHistory.create({
-          data: { workId: work.id, action: "stale" },
-        });
-        return true;
+        return result.count === 1;
       });
 
-      if (!marked) {
+      if (!finalized) {
         report.skipped++;
         continue;
       }
