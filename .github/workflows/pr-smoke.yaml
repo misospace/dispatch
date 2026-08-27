@@ -148,29 +148,45 @@ jobs:
       - name: Inline scripts survive the CSP
         run: |
           URL="http://dispatch-${INSTANCE}.${NS}:3000"
-          if node scripts/smoke-csp.mjs "$URL"; then
-            exit 0
+          POD="csp-${INSTANCE}-$RANDOM"
+
+          # Fetch from INSIDE the cluster, not from the runner.
+          #
+          # The runner is a long-lived pod in another namespace. When the app's
+          # pod restarts its IP changes, and the runner's connection to the
+          # Service then times out while fresh in-cluster pods reach the same
+          # address fine — observed repeatedly: the health gate above passed
+          # three times from throwaway pods at :31, :39 and :47, and the
+          # runner's own fetch timed out at :48 against a pod that was still
+          # 1/1 Running with no further restart. That asymmetry failed this
+          # assertion without anything being wrong with the app.
+          #
+          # A throwaway pod per run removes the runner's connection state from
+          # the equation entirely. curl -i keeps headers and body in ONE
+          # request, so the CSP header and the scripts it governs are
+          # guaranteed to describe the same response.
+          kubectl run "$POD" -n "$NS" --restart=Never --attach=false \
+            --image=curlimages/curl:latest --command -- \
+            curl -sSi --max-time 20 "$URL/"
+
+          # --attach=false because the runner's Role has pods/log but not
+          # pods/attach; `kubectl run -i` silently degrades and loses output.
+          for i in $(seq 1 30); do
+            phase=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            case "$phase" in Succeeded|Failed) break;; esac
+            sleep 2
+          done
+
+          kubectl logs "$POD" -n "$NS" > response.http || true
+          kubectl delete pod "$POD" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+          if [ ! -s response.http ]; then
+            echo "::error::in-cluster fetch produced no response (pod phase: ${phase:-unknown})"
+            kubectl get pod -n "$NS" -l "app=dispatch-${INSTANCE}" -o wide || true
+            exit 1
           fi
 
-          # The assertion failed. Before calling it a real defect, establish
-          # WHERE it failed, because the health gate above and this step do not
-          # use the same client or the same network path: the gate runs curl
-          # from a fresh in-cluster pod, this runs undici from the long-lived
-          # runner pod in another namespace. A failure here with the app still
-          # serving in-cluster is a harness problem; a failure from both is the
-          # app, and the smoke test is doing its job. Do not paper this over
-          # with retries — that would make a real defect look like a flake.
-          echo "::group::differential probe"
-          echo "--- same URL, fresh in-cluster pod ---"
-          kubectl run "diag-${INSTANCE}-$RANDOM" -n "$NS" --rm -i --restart=Never \
-            --image=curlimages/curl:latest --command -- \
-            curl -sS -o /dev/null -w 'in-cluster HTTP %{http_code} in %{time_total}s\n' \
-            --max-time 15 "$URL/" || echo "in-cluster fetch ALSO failed"
-          echo "--- endpoints backing the service ---"
-          kubectl get endpointslice -n "$NS" -l "kubernetes.io/service-name=dispatch-${INSTANCE}" -o wide || true
-          kubectl get pod -n "$NS" -l "app=dispatch-${INSTANCE}" -o wide || true
-          echo "::endgroup::"
-          exit 1
+          node scripts/smoke-csp.mjs --raw-response response.http
 
       - name: Sync does not wedge on a stale lock
         run: |
