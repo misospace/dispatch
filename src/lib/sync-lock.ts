@@ -65,7 +65,8 @@ export type SyncType =
   | "manual"
   | "automation"
   | "pr-followup"
-  | "reconcile";
+  | "reconcile"
+  | "stale-work";
 
 /**
  * Where-clause for the atomic claim: a row is claimable when it has no

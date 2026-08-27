@@ -51,6 +51,7 @@ const DEFAULT_GROOMER_INTERVAL_MS = 10 * 60 * 1000; // 10m
 const DEFAULT_PR_FOLLOWUP_INTERVAL_MS = 15 * 60 * 1000; // 15m
 const DEFAULT_PRUNE_CLOSED_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 const DEFAULT_RECONCILE_INTERVAL_MS = 30 * 60 * 1000; // 30m
+const DEFAULT_STALE_WORK_INTERVAL_MS = 5 * 60 * 1000; // 5m
 const DEFAULT_STARTUP_DELAY_MS = 5 * 1000;
 
 function intFromEnv(raw: string | undefined, fallback: number): number {
@@ -105,6 +106,12 @@ export function schedulerConfigFromEnv(env: Record<string, string | undefined>):
       path: "/api/issues/reconcile",
       body: {},
       intervalMs: jobIntervalFromEnv(env.DISPATCH_RECONCILE_INTERVAL_MS, DEFAULT_RECONCILE_INTERVAL_MS),
+    },
+    {
+      name: "stale-work",
+      path: "/api/agent-work/sweep",
+      body: {},
+      intervalMs: jobIntervalFromEnv(env.DISPATCH_STALE_WORK_INTERVAL_MS, DEFAULT_STALE_WORK_INTERVAL_MS),
     },
   ];
   return {
