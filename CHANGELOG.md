@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.47](https://github.com/misospace/dispatch/compare/v0.5.46...v0.5.47) (2026-08-27)
+
+
+### Bug Fixes
+
+* **scheduler:** share liveness state across chunk graphs ([#877](https://github.com/misospace/dispatch/issues/877)) ([79a2789](https://github.com/misospace/dispatch/commit/79a278981a851dbd5646a397cdfb9f885867704a))
+* **sync-lock:** key the lock per job so jobs stop starving each other ([#879](https://github.com/misospace/dispatch/issues/879)) ([430e84a](https://github.com/misospace/dispatch/commit/430e84a3d61c6e1f2db72a02741470f28242b7df))
+
 ## [0.5.46](https://github.com/misospace/dispatch/compare/v0.5.45...v0.5.46) (2026-08-27)
 
 
