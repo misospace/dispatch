@@ -1,15 +1,13 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { removeIssueLabel, updateIssueLabels } from "@/lib/github";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 import {
   releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue,
 } from "@/lib/lease";
-import { transitionIssueStatus } from "@/lib/issue-status";
-import { fetchPullRequestState } from "@/lib/github-prs";
+import { releaseIssueClaim } from "@/lib/issue-claim";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -74,81 +72,20 @@ export async function POST(request: Request) {
     }
 
     try {
-      // Compute the new label set: drop the agent label, then decide the
-      // resting status per the unclaim contract (one behaviour per status,
-      // so the result is predictable for every status):
-      //   in-progress → ready (as before)
-      //   blocked with a null blockedReason → ready (nothing recorded a
-      //     reason to stay parked)
-      //   blocked with a blockedReason → unchanged (the block was a
-      //     deliberate decision; unclaim must not silently undo it)
-      //   in-review → unchanged while the linked PR is still open (do not
-      //     drag work backwards while a PR is in flight)
-      let updatedLabels = issue.labels.filter((l) => l !== agentLabel);
-      let statusNote: string | null = null;
-
-      if (updatedLabels.includes("status/in-progress")) {
-        // The status swap itself is routed through the shared helper so it
-        // removes ALL status/* labels (not just in-progress) consistently
-        // with the other label routes.
-        updatedLabels = await transitionIssueStatus(
-          repoFullName as string,
-          issueNumber as number,
-          updatedLabels,
-          "status/ready",
-        );
-      } else if (updatedLabels.includes("status/blocked")) {
-        if (issue.blockedReason == null) {
-          updatedLabels = await transitionIssueStatus(
-            repoFullName as string,
-            issueNumber as number,
-            updatedLabels,
-            "status/ready",
-          );
-        } else {
-          statusNote =
-            "status/blocked retained: blockedReason is set, so the block was a deliberate decision";
-        }
-      } else if (updatedLabels.includes("status/in-review")) {
-        if (issue.linkedPrNumber != null) {
-          const pr = await fetchPullRequestState(
-            repoFullName as string,
-            issue.linkedPrNumber,
-          );
-          if (pr.state === "open") {
-            statusNote = `status/in-review retained: linked PR #${issue.linkedPrNumber} is still open`;
-          } else {
-            statusNote = `status/in-review retained: linked PR #${issue.linkedPrNumber} is no longer open; use set_issue_status to move the issue`;
-          }
-        } else {
-          statusNote =
-            "status/in-review retained: no linked PR recorded; use set_issue_status to move the issue";
-        }
-      }
-
-      // The resulting status label, reported so a caller can tell whether
-      // the issue is workable instead of inferring it from the labels.
-      const resultingStatus = updatedLabels.find((l) => l.startsWith("status/")) ?? null;
-
-      // Apply label changes to GitHub (conflict-aware: re-applies all
-      // non-status labels and adds status/ready in one shot).
-      await updateIssueLabels(
-        repoFullName as string,
-        issueNumber as number,
-        updatedLabels,
-      );
-      // Defensive: ensure the agent/* label is removed even if GitHub's API
-      // returned something different than what we expected.
-      await removeIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
-
-      // Update local cache
-      await prisma.issue.update({
-        where: { id: issueId as string },
-        data: { labels: updatedLabels, lastSyncedAt: new Date() },
+      // The shared core keeps operator and scheduled claim release behaviour
+      // consistent while allowing stale retries to be idempotent.
+      const released = await releaseIssueClaim({
+        prisma,
+        issue,
+        repoFullName: repoFullName as string,
+        issueNumber: issueNumber as number,
+        agentName: agentName as string,
       });
 
-      // Release the lease using the shared helper (uses deleteMany under
-      // the hood — see src/lib/lease.ts).
+      const updatedLabels = released.labels;
+      const statusNote = released.statusNote;
+
+      // Release the durable lease after GitHub and the local cache agree.
       await releaseLeaseByAgentAndIssue(agentName as string, issueId as string);
 
       // For the operator path, also release any AgentWork records for this
@@ -177,7 +114,7 @@ export async function POST(request: Request) {
       return NextResponse.json({
         success: true,
         labels: updatedLabels,
-        status: resultingStatus,
+        status: released.status,
         statusNote,
       });
     } catch (error) {

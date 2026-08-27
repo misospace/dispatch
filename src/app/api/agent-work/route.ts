@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
-import { releaseStaleWork } from "@/lib/agent-work";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -75,15 +74,6 @@ export async function GET(request: Request) {
 
     if (agentNameFilter) {
       where.agentName = agentNameFilter;
-    }
-
-    if (includeStale) {
-      // Stale-work sweep: marks CLAIMED/IN_PROGRESS work as STALE when heartbeat
-      // or lease TTL has expired. Idempotent — once marked STALE, work no longer
-      // matches the WHERE clause, so repeated calls are safe. Also creates history
-      // entries for audit trail. Runs before the query so newly-staled work is
-      // returned with its current state.
-      await releaseStaleWork(prisma, 5 * 60 * 1000);
     }
 
     const activeItems = await prisma.agentWork.findMany({

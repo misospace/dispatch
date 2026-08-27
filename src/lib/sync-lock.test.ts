@@ -155,6 +155,17 @@ describe("acquireLock", () => {
     expect(result).toEqual({ locked: true, runId: "run-1" });
   });
 
+  it("supports the stale-work lock namespace", async () => {
+    mocks.syncLock.findUnique.mockResolvedValue(null);
+
+    const result = await acquireLock("stale-work");
+
+    expect(result.locked).toBe(true);
+    expect(mocks.issueSyncRun.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ syncType: "stale-work" }),
+    });
+  });
+
   it("an error inside the critical section still releases the lock", async () => {
     mocks.syncLock.findUnique.mockResolvedValue(null);
     mocks.syncLock.updateMany.mockResolvedValue({ count: 1 });

@@ -8,6 +8,7 @@ export type AgentWorkClient = {
     findMany: (args?: any) => Promise<any[]>;
     create: (args: any) => Promise<any>;
     update: (args: any) => Promise<any>;
+    updateMany: (args: any) => Promise<{ count: number }>;
   };
   agentWorkHistory: {
     create: (args: any) => Promise<any>;
@@ -306,7 +307,7 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
   return client.$transaction(async (tx) => {
     const stale = await tx.agentWork.findMany({
       where: {
-        state: { in: ["CLAIMED", "IN_PROGRESS"] },
+        state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
         OR: [
           { lastHeartbeatAt: { lt: cutoff } },
           { leaseExpiresAt: { lt: cutoff } },
@@ -315,10 +316,18 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
     });
 
     for (const work of stale) {
-      await tx.agentWork.update({
-        where: { id: work.id },
+      const updated = await tx.agentWork.updateMany({
+        where: {
+          id: work.id,
+          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+          OR: [
+            { lastHeartbeatAt: { lt: cutoff } },
+            { leaseExpiresAt: { lt: cutoff } },
+          ],
+        },
         data: { state: "STALE", leaseExpiresAt: new Date() },
       });
+      if (updated.count !== 1) continue;
       await tx.agentWorkHistory.create({
         data: { workId: work.id, action: "stale" },
       });
