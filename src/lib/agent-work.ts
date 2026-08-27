@@ -316,7 +316,7 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
     });
 
     for (const work of stale) {
-      await tx.agentWork.updateMany({
+      const updated = await tx.agentWork.updateMany({
         where: {
           id: work.id,
           state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
@@ -327,6 +327,7 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
         },
         data: { state: "STALE", leaseExpiresAt: new Date() },
       });
+      if (updated.count !== 1) continue;
       await tx.agentWorkHistory.create({
         data: { workId: work.id, action: "stale" },
       });
