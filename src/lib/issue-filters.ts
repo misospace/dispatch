@@ -160,16 +160,37 @@ export function buildGroomingStateExclusionWhere(cooldownHours: number = 24) {
   const cutoff = new Date();
   cutoff.setHours(cutoff.getHours() - cooldownHours);
 
+  // A deferral expires. notReadyReason used to exclude an issue from grooming
+  // permanently, which made a single sentence irreversible — and the groomer
+  // writes that sentence itself. Four issues were parked indefinitely by
+  // reasons like "Explicitly deferred by maintainer", "Kept in backlog per
+  // audit decision" and "awaiting maintainer clarification", none of which
+  // any maintainer said. After the TTL the issue is groomed again and can be
+  // re-deferred on its merits, so a wrong call costs one cycle, not forever.
+  const deferralCutoff = new Date();
+  deferralCutoff.setDate(deferralCutoff.getDate() - getDeferralTtlDays());
+
   return {
     AND: [
       // Not recently groomed (or never groomed)
       { OR: [{ groomedAt: null }, { groomedAt: { lt: cutoff } }] },
       // Not currently blocked
       { blockedReason: null },
-      // Not currently marked not-ready
-      { notReadyReason: null },
+      // Not currently marked not-ready, unless the deferral has aged out
+      { OR: [{ notReadyReason: null }, { groomedAt: { lt: deferralCutoff } }] },
     ],
   };
+}
+
+export const DEFAULT_DEFERRAL_TTL_DAYS = 14;
+
+/** How long a not-ready deferral suppresses grooming before it is revisited. */
+export function getDeferralTtlDays(): number {
+  const parsed = parseInt(
+    process.env.DISPATCH_DEFERRAL_TTL_DAYS ?? String(DEFAULT_DEFERRAL_TTL_DAYS),
+    10,
+  );
+  return parsed > 0 ? parsed : DEFAULT_DEFERRAL_TTL_DAYS;
 }
 
 export const DEFAULT_DONE_RETENTION_DAYS = 7;

@@ -3,6 +3,7 @@ import {
   appendIssueWhere,
   applyRenovateIssueExclusion,
   buildExcludedLabelWhere,
+  buildGroomingStateExclusionWhere,
   buildLabelWhere,
   buildNoStatusWhere,
   buildRenovateIssueExclusionWhere,
@@ -281,5 +282,33 @@ describe("getDoneRetentionDays", () => {
 
     process.env.DISPATCH_DONE_RETENTION_DAYS = "-5";
     expect(getDoneRetentionDays()).toBe(DEFAULT_DONE_RETENTION_DAYS);
+  });
+});
+
+describe("deferral TTL", () => {
+  // Four issues were parked indefinitely by groomer-written reasons that
+  // asserted maintainer decisions nobody made ("Explicitly deferred by
+  // maintainer", "Kept in backlog per audit decision"). notReadyReason
+  // excluded them from grooming forever, so one fabricated sentence was
+  // irreversible. A deferral now expires and the issue is reconsidered.
+  it("keeps a fresh deferral excluded but lets an aged one back in", () => {
+    const where = buildGroomingStateExclusionWhere(24) as {
+      AND: Array<Record<string, unknown>>;
+    };
+    const deferralClause = where.AND.find(
+      (c) => Array.isArray(c.OR) && JSON.stringify(c.OR).includes("notReadyReason"),
+    ) as { OR: Array<Record<string, unknown>> };
+
+    expect(deferralClause).toBeDefined();
+    // Either no deferral at all, or one whose last groom is older than the TTL.
+    expect(deferralClause.OR).toEqual([
+      { notReadyReason: null },
+      { groomedAt: { lt: expect.any(Date) } },
+    ]);
+
+    const cutoff = (deferralClause.OR[1].groomedAt as { lt: Date }).lt;
+    const daysAgo = (Date.now() - cutoff.getTime()) / 86_400_000;
+    expect(daysAgo).toBeGreaterThan(13);
+    expect(daysAgo).toBeLessThan(15);
   });
 });
