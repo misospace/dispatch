@@ -30,6 +30,7 @@ export interface ReleaseIssueClaimResult {
 export interface IssueClaimClient {
   issue: {
     update: (args: any) => Promise<unknown>;
+    findUnique?: (args: any) => Promise<any>;
   };
 }
 
@@ -73,14 +74,18 @@ export async function releaseIssueClaim(params: {
     // DELETE is idempotent in the GitHub adapter (404 means already gone), so
     // this repairs a cache that is behind GitHub without touching other labels.
     await removeIssueLabel(repoFullName, issueNumber, agentLabel);
+    const latestIssue = prisma.issue.findUnique
+      ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
+      : null;
+    const cacheLabels = latestIssue?.labels ?? issue.labels;
     await prisma.issue.update({
       where: { id: issue.id },
-      data: { labels: issue.labels, lastSyncedAt: new Date() },
+      data: { labels: cacheLabels, lastSyncedAt: new Date() },
     });
     return {
       released: true,
-      labels: issue.labels,
-      status: issue.labels.find((label) => label.startsWith("status/")) ?? null,
+      labels: cacheLabels,
+      status: cacheLabels.find((label: string) => label.startsWith("status/")) ?? null,
       statusNote: "agent claim already released: agent label is absent",
     };
   }
@@ -92,14 +97,18 @@ export async function releaseIssueClaim(params: {
   // must not drag an in-review or blocked issue back into the ready column.
   if (options.preserveStatus) {
     await removeIssueLabel(repoFullName, issueNumber, agentLabel);
+    const latestIssue = prisma.issue.findUnique
+      ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
+      : null;
+    const cacheLabels = latestIssue?.labels?.filter((label: string) => label !== agentLabel) ?? updatedLabels;
     await prisma.issue.update({
       where: { id: issue.id },
-      data: { labels: updatedLabels, lastSyncedAt: new Date() },
+      data: { labels: cacheLabels, lastSyncedAt: new Date() },
     });
     return {
       released: true,
-      labels: updatedLabels,
-      status: updatedLabels.find((label) => label.startsWith("status/")) ?? null,
+      labels: cacheLabels,
+      status: cacheLabels.find((label: string) => label.startsWith("status/")) ?? null,
       statusNote: null,
     };
   }
