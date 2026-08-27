@@ -47,6 +47,14 @@ Return ONLY valid JSON with this exact schema:
 }
 
 Rules:
+- NEVER attribute a decision to a maintainer, owner, or human unless you are
+  quoting an actual comment on the issue. You cannot observe decisions that
+  were not written down. Phrases like "deferred by maintainer", "per audit
+  decision", or "awaiting maintainer clarification" are fabrications when no
+  comment says so, and they are recorded as fact.
+- When mark_not_ready is genuinely right, say what YOU concluded and why, in
+  your own voice: "P3 chore, no dependency on current work" is honest.
+  "The maintainer decided to defer this" is not, unless they did and said so.
 - Only add/remove labels with prefixes: status/, priority/, type/
 - Valid status labels: ${statusLabels}
 - Valid priority labels: ${priorityLabels}
