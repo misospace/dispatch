@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.48](https://github.com/misospace/dispatch/compare/v0.5.47...v0.5.48) (2026-08-27)
+
+
+### Bug Fixes
+
+* **deps:** update dependency @testing-library/react (16.3.2 → 16.3.3) ([#880](https://github.com/misospace/dispatch/issues/880)) ([a0e5729](https://github.com/misospace/dispatch/commit/a0e572902c16f949c4b00d56e25e2653ea1eb146))
+* **groomer:** stop fabricated deferrals from parking issues forever ([#881](https://github.com/misospace/dispatch/issues/881)) ([b7258b3](https://github.com/misospace/dispatch/commit/b7258b32ef97c3dc5f4754d1ff7efbdd174983c0))
+
 ## [0.5.47](https://github.com/misospace/dispatch/compare/v0.5.46...v0.5.47) (2026-08-27)
 
 
