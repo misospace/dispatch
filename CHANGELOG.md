@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.46](https://github.com/misospace/dispatch/compare/v0.5.45...v0.5.46) (2026-08-27)
+
+
+### Bug Fixes
+
+* **agent-work:** reclaim stale claims automatically ([#874](https://github.com/misospace/dispatch/issues/874)) ([8255215](https://github.com/misospace/dispatch/commit/8255215551c7be3dd1d6fe1ba40783e4d3e5e553))
+* **pr-fix:** resolve queued items from tasks/report ([#868](https://github.com/misospace/dispatch/issues/868)) ([#872](https://github.com/misospace/dispatch/issues/872)) ([21ca74b](https://github.com/misospace/dispatch/commit/21ca74bfed752f1a834584b9a048acf51b75ac87))
+* **scheduler:** detect and recover when a job's timer stops firing ([#875](https://github.com/misospace/dispatch/issues/875)) ([2de79de](https://github.com/misospace/dispatch/commit/2de79ded7cb393d56d720592ac0550f8686cb7b9))
+* **smoke:** assert the CSP from inside the cluster, not from the runner ([#876](https://github.com/misospace/dispatch/issues/876)) ([242c616](https://github.com/misospace/dispatch/commit/242c61628f4dfa30e361f09f3d2c4c416d1b01f3))
+* **unclaim:** make the resting status predictable for every status ([#873](https://github.com/misospace/dispatch/issues/873)) ([39fbcb6](https://github.com/misospace/dispatch/commit/39fbcb6601e096d3191c59621c48659dd524b27b)), closes [#869](https://github.com/misospace/dispatch/issues/869)
+
+
+### Documentation
+
+* correct drift between the docs and the running system ([#870](https://github.com/misospace/dispatch/issues/870)) ([523fcc4](https://github.com/misospace/dispatch/commit/523fcc435381d3d4a166c8a5936698b2616bb582))
+
 ## [0.5.45](https://github.com/misospace/dispatch/compare/v0.5.44...v0.5.45) (2026-08-25)
 
 
