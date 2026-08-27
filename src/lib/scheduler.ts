@@ -160,8 +160,20 @@ export async function schedulerHealthCheck(config: SchedulerConfig, deps: Schedu
 /** How often the supervisor checks for stopped timers. */
 const SUPERVISOR_INTERVAL_MS = 60_000;
 
-const lastRunAt = new Map<string, number>();
-const armedIntervalMs = new Map<string, number>();
+// Held on globalThis, not in module scope. startScheduler runs from
+// instrumentation.ts, which Turbopack standalone isolates into its own chunk
+// graph — the same isolation the header of instrumentation.ts describes for
+// lane config. A module-level Map there is a different instance from the one
+// /api/health imports, so the endpoint reported an empty job list while the
+// jobs were demonstrably running. globalThis is shared across both graphs and
+// is the pattern already used for the Prisma singleton in src/lib/prisma.ts.
+const globalForScheduler = globalThis as unknown as {
+  __schedulerLastRunAt?: Map<string, number>;
+  __schedulerArmedIntervalMs?: Map<string, number>;
+};
+
+const lastRunAt = (globalForScheduler.__schedulerLastRunAt ??= new Map<string, number>());
+const armedIntervalMs = (globalForScheduler.__schedulerArmedIntervalMs ??= new Map<string, number>());
 
 /** Scheduler liveness for /api/health: per job, when it last completed. */
 export function schedulerState(): {
