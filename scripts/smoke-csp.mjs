@@ -7,19 +7,57 @@
 // test asserted the policy string rather than whether the page's scripts could
 // run under it. This checks the relationship instead of either side alone.
 //
-// Usage: node scripts/smoke-csp.mjs http://dispatch:3000
+// Usage:
+//   node scripts/smoke-csp.mjs http://dispatch:3000        fetch it directly
+//   node scripts/smoke-csp.mjs --raw-response <file>       parse a saved response
+//
+// The --raw-response form takes the output of `curl -i` (status line, headers,
+// blank line, body). CI uses it so the request is made from inside the cluster
+// rather than from the runner: the runner is a long-lived pod, and immediately
+// after the app's pod IP changes its connection to the Service times out while
+// fresh in-cluster pods reach the same address fine. That asymmetry failed the
+// assertion repeatedly without anything being wrong with the app.
 
-const base = process.argv[2];
-if (!base) {
-  console.error("usage: smoke-csp.mjs <base-url>");
-  process.exit(2);
+import { readFile } from "node:fs/promises";
+
+const [arg1, arg2] = process.argv.slice(2);
+let html;
+let csp;
+let source;
+
+if (arg1 === "--raw-response") {
+  if (!arg2) {
+    console.error("usage: smoke-csp.mjs --raw-response <file>");
+    process.exit(2);
+  }
+  source = arg2;
+  const raw = await readFile(arg2, "utf8");
+  // curl -i emits CRLF between headers; tolerate both. The first blank line
+  // ends the header block, and a proxy may prepend a 100-continue block.
+  const parts = raw.split(/\r?\n\r?\n/);
+  const headerBlock = parts.shift() ?? "";
+  html = parts.join("\n\n");
+  const header = (name) =>
+    headerBlock
+      .split(/\r?\n/)
+      .find((l) => l.toLowerCase().startsWith(`${name}:`))
+      ?.slice(name.length + 1)
+      .trim();
+  csp = header("content-security-policy") ?? header("content-security-policy-report-only");
+} else {
+  if (!arg1) {
+    console.error("usage: smoke-csp.mjs <base-url> | --raw-response <file>");
+    process.exit(2);
+  }
+  source = arg1;
+  const res = await fetch(arg1, { redirect: "manual" });
+  html = await res.text();
+  csp =
+    res.headers.get("content-security-policy") ??
+    res.headers.get("content-security-policy-report-only");
 }
 
-const res = await fetch(base, { redirect: "manual" });
-const html = await res.text();
-const csp =
-  res.headers.get("content-security-policy") ??
-  res.headers.get("content-security-policy-report-only");
+const base = source;
 
 if (!csp) {
   console.error(`FAIL no Content-Security-Policy header on ${base}`);
