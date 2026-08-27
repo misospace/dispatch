@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { schedulerConfigFromEnv, schedulerHealthCheck, runJob, startScheduler, type SchedulerConfig, type SchedulerDeps } from "./scheduler";
+import { schedulerConfigFromEnv, schedulerHealthCheck, runJob, startScheduler, schedulerState, type SchedulerConfig, type SchedulerDeps } from "./scheduler";
 
 function fakeDeps(overrides: Partial<SchedulerDeps> = {}): SchedulerDeps & { logs: Array<[string, unknown]> } {
   const logs: Array<[string, unknown]> = [];
@@ -83,13 +83,20 @@ describe("runJob", () => {
       headers: { "Content-Type": "application/json", Authorization: "Bearer tok" },
       body: JSON.stringify({ issues: true }),
     });
-    expect(deps.logs).toHaveLength(0); // 200 -> quiet
+    // A successful run logs. Staying quiet on success was what made a stopped
+    // scheduler indistinguishable from a healthy one: pr-followup silently
+    // stopped firing for 15+ hours and the only symptom was an empty queue.
+    expect(deps.logs).toHaveLength(1);
+    expect(deps.logs[0][0]).toContain('job "sync" ok');
   });
 
   it("treats 409 as expected (lock held), not an error", async () => {
     const deps = fakeDeps({ fetch: vi.fn(async () => new Response(null, { status: 409 })) as unknown as typeof fetch });
     await runJob(CONFIG.jobs[0], CONFIG, deps);
-    expect(deps.logs).toHaveLength(0);
+    // A lock collision is a healthy run, so it logs as ok rather than as a
+    // failure — but it must still log, because it is evidence the timer fired.
+    expect(deps.logs).toHaveLength(1);
+    expect(deps.logs[0][0]).toContain('job "sync" ok');
   });
 
   it("logs non-ok statuses without throwing", async () => {
@@ -164,5 +171,61 @@ describe("schedulerHealthCheck", () => {
 
     expect(result).toBe(false);
     expect(log).toHaveBeenCalledWith("scheduler health check failed: ECONNREFUSED", expect.any(Error));
+  });
+});
+
+describe("supervisor", () => {
+  // Regression for the 2026-08-27 stall: pr-followup stopped firing on a pod
+  // that kept serving requests, for at least 15 hours. A manual POST to the
+  // same endpoint enqueued 35 items immediately, so the endpoint was fine and
+  // the timer was not. Root cause in the standalone runtime is unproven, so
+  // the contract here is detect-and-recover, not prevent.
+  function capture() {
+    const intervals: Array<() => void> = [];
+    const timeouts: Array<() => void> = [];
+    const deps = fakeDeps({
+      setInterval: vi.fn((fn: () => void) => { intervals.push(fn); return "h"; }) as unknown as SchedulerDeps["setInterval"],
+      setTimeout: vi.fn((fn: () => void) => { timeouts.push(fn); return "h"; }) as unknown as SchedulerDeps["setTimeout"],
+    });
+    return { deps, intervals, timeouts };
+  }
+
+  it("re-arms a job whose timer stopped, and reports it overdue", async () => {
+    // A 1ms interval makes "two missed cycles" arrive in real time, which
+    // avoids fake timers fighting the async finally{} that records the run.
+    // Distinct job name: lastRunAt is module state and bleeds between cases.
+    const cfg: SchedulerConfig = {
+      ...CONFIG,
+      startupDelayMs: 0,
+      jobs: [{ ...CONFIG.jobs[0], name: "stalled", intervalMs: 1 }],
+    };
+    const { deps, intervals, timeouts } = capture();
+    startScheduler(cfg, deps);
+
+    for (const t of timeouts) t();
+    await vi.waitFor(() => expect(deps.fetch).toHaveBeenCalled());
+    const before = (deps.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    await new Promise((r) => globalThis.setTimeout(r, 20));
+    expect(schedulerState().jobs.find((j) => j.name === "stalled")!.overdue).toBe(true);
+
+    // The supervisor is armed inside startScheduler, before any startup
+    // timeout fires, so it is the FIRST interval — the job's own interval is
+    // pushed later, when its setTimeout callback runs.
+    intervals[0]!();
+    await vi.waitFor(() =>
+      expect((deps.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(before),
+    );
+    expect(deps.logs.some(([m]) => m.includes("re-arming"))).toBe(true);
+  });
+
+  it("does not re-arm a job that has simply never run yet", () => {
+    const cfg: SchedulerConfig = { ...CONFIG, jobs: [{ ...CONFIG.jobs[0], name: "never-ran" }] };
+    const { deps, intervals } = capture();
+    startScheduler(cfg, deps);
+    const before = (deps.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    intervals[0]!();
+    expect((deps.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+    expect(deps.logs.some(([m]) => m.includes("re-arming"))).toBe(false);
   });
 });
