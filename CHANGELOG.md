@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.49](https://github.com/misospace/dispatch/compare/v0.5.48...v0.5.49) (2026-08-31)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.34.0 → 1.35.0) ([#884](https://github.com/misospace/dispatch/issues/884)) ([c60ddd3](https://github.com/misospace/dispatch/commit/c60ddd35a0cd172cfa2e9f6742c839065277e725))
+* **deps:** update dependency lucide-react (1.35.0 → 1.37.0) ([#888](https://github.com/misospace/dispatch/issues/888)) ([803db7b](https://github.com/misospace/dispatch/commit/803db7be8f70b3b6beeaed7611527ef0637a9f38))
+* **deps:** update dependency zod (4.4.3 → 4.5.1) ([#885](https://github.com/misospace/dispatch/issues/885)) ([2201c4c](https://github.com/misospace/dispatch/commit/2201c4c139f82f05e35689d38a521bcd7540dd85))
+
+
+### Bug Fixes
+
+* **auth:** send state as well as pkce, and document sslmode ([#893](https://github.com/misospace/dispatch/issues/893)) ([18bf4bf](https://github.com/misospace/dispatch/commit/18bf4bf5a1e05cacdc52640cf655b8a1b74ca23f))
+* **deps:** update dependency @vitejs/plugin-react (6.1.0 → 6.1.1) ([#883](https://github.com/misospace/dispatch/issues/883)) ([49e2cee](https://github.com/misospace/dispatch/commit/49e2ceef3be9592eebd6f5eb689aabc37e86c649))
+* **deps:** update dependency tsx (4.23.12 → 4.23.13) ([#892](https://github.com/misospace/dispatch/issues/892)) ([ba0f827](https://github.com/misospace/dispatch/commit/ba0f827ff1fcd9f6b6cb165c80297979d6d67ef0))
+* **deps:** update dependency zod (4.5.1 → 4.5.2) ([#887](https://github.com/misospace/dispatch/issues/887)) ([f48fb02](https://github.com/misospace/dispatch/commit/f48fb029632c2242f05c7b3a193c95c7fbbb0585))
+* **deps:** update dependency zod (4.5.2 → 4.5.4) ([#890](https://github.com/misospace/dispatch/issues/890)) ([d93df03](https://github.com/misospace/dispatch/commit/d93df0391f6fd7a06abe8cc6591ea450881161dd))
+
 ## [0.5.48](https://github.com/misospace/dispatch/compare/v0.5.47...v0.5.48) (2026-08-27)
 
 
