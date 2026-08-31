@@ -139,6 +139,17 @@ Dispatch supports optional GitHub App authentication to provide a separate ident
 
 **Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` (for instance URL).
 
+**TLS to Postgres:** put `sslmode` in the connection string — there is no separate setting. The URL is handed to `@prisma/adapter-pg`, so node-postgres parses it:
+
+| `sslmode` | Result |
+|---|---|
+| `disable` | no TLS |
+| `require` | TLS on, **certificate verified** |
+| `no-verify` | TLS on, certificate not verified |
+| `verify-full&sslrootcert=/path/ca.crt` | TLS on, verified against that CA |
+
+Note that `require` differs from libpq here. In libpq it means encrypt without verifying; node-postgres applies Node's default verification instead, so an in-cluster Postgres with a self-signed CA fails with `SELF_SIGNED_CERT_IN_CHAIN` under `require`. Use `no-verify`, or mount the cluster CA and use `verify-full` with `sslrootcert`. Editing `pg_hba.conf` to allow non-TLS is not necessary.
+
 ### Auth, Triage, Queue, and Webhooks
 
 These variables tune the OIDC callback, the operator-UI triage surface, the queue

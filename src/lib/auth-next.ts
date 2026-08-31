@@ -22,7 +22,15 @@ function getOidcProvider(): OIDCConfig<Record<string, unknown>> {
         scope: "openid profile email",
       },
     },
-    checks: ["pkce"],
+    // pkce alone sends no `state`, which some providers reject outright:
+    // Authelia refuses the authorization request with "The state is missing or
+    // does not have enough characters and is therefore considered too weak".
+    // Authentik does not enforce it, which is why this went unnoticed.
+    //
+    // state is the standard CSRF protection for the authorization code flow
+    // and is wanted regardless of which IdP is in front; pkce covers code
+    // interception, not request forgery. Auth.js generates and verifies it.
+    checks: ["pkce", "state"],
   };
 
   if (issuerOrDiscovery) {

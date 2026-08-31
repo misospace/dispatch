@@ -78,4 +78,18 @@ describe("auth-next OIDC configuration", () => {
     expect(provider.wellKnown).toBe("https://auth.example.com/.well-known/openid-configuration");
     expect(provider.issuer).toBeUndefined();
   });
+
+  it("sends state as well as pkce", async () => {
+    // pkce alone omits `state`, and Authelia rejects the authorization
+    // request outright: "The state is missing or does not have enough
+    // characters and is therefore considered too weak." Authentik does not
+    // enforce it, so the gap only shows up on some providers.
+    process.env.DISPATCH_OIDC_ISSUER = "https://auth.example.com";
+
+    const config = await loadConfig();
+    const provider = config.providers[0];
+
+    expect(provider.checks).toContain("state");
+    expect(provider.checks).toContain("pkce");
+  });
 });
