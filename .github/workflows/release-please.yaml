@@ -11,6 +11,22 @@ on:
   push:
     branches: ["main"]
 
+# Serialize runs. Several pushes land on main in quick succession when a batch
+# of PRs merges, and without this the runs overlap: two of them both decide to
+# create the same release, the second loses, and the job goes red with
+# `Validation Failed: {"resource":"Release","code":"already_exists"}`. Observed
+# in the sibling repo on v0.7.5 (runs at 16:38, 16:39, 16:42) — the release and
+# the image were both fine and only the third run failed, which is worse than
+# useless: a release job that is red for harmless reasons is the reason a tag
+# with no image behind it went unnoticed for twelve hours.
+#
+# cancel-in-progress is false on purpose: a cancelled run could stop between
+# creating the tag and creating the release. Queueing instead lets the later
+# run observe the finished state and no-op.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
