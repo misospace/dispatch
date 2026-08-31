@@ -1,5 +1,6 @@
 import { PrismaClient, Prisma } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { Pool } from "pg";
 import { PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { AgentWorkClient } from "@/lib/agent-work";
 
@@ -27,7 +28,13 @@ function initClient(): PrismaClient {
     );
   }
 
-  const adapter = new PrismaPg(url);
+  // Build the pg Pool from the URL so libpq-style `sslmode` query params
+  // (require, verify-ca, verify-full, no-verify, disable) are honored.
+  // `new PrismaPg(url)` passes the string straight to pg, which ignores
+  // sslmode entirely - servers that require SSL reject the connection with
+  // `no pg_hba.conf entry ... no encryption` (issue #898).
+  const pool = new Pool({ connectionString: url });
+  const adapter = new PrismaPg(pool);
   const client = new PrismaClient({
     adapter,
     log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
