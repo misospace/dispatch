@@ -22,7 +22,7 @@ type AuthNextConfigForTest = {
       session: { user: Record<string, unknown> };
     }): Promise<{ user: Record<string, unknown> }>;
   };
-  providers: Array<{ issuer?: string; wellKnown?: string }>;
+  providers: Array<{ issuer?: string; wellKnown?: string; checks?: string[] }>;
 };
 
 async function loadConfig() {
