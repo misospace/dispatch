@@ -265,3 +265,100 @@ describe("callGroomerLLM response_format", () => {
     expect(result.lane.confidence).toBe("high");
   });
 });
+
+describe("callGroomerLLM exploration findings", () => {
+  const baseOptions = {
+    baseUrl: "https://llm.example.com/v1",
+    apiKey: "sk-test",
+    model: "local-pool",
+    prompt: "Issue #899: sslmode=no-verify does not turn TLS on",
+    timeoutMs: 60_000,
+  };
+
+  function okResponse() {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify({ labelsToAdd: [], labelsToRemove: [], lane: { id: "local", confidence: "high", reason: "r" } }) } }],
+      }),
+      text: async () => "",
+    };
+  }
+
+  function userContentFrom(fetchMock: ReturnType<typeof vi.fn>): string {
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    return body.messages.find((m: { role: string }) => m.role === "user").content;
+  }
+
+  it("appends findings to the user turn", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({
+      ...baseOptions,
+      explorationFindings: "## Repository investigation\n\nFiles: src/lib/prisma.ts",
+    });
+    const content = userContentFrom(fetchMock);
+    expect(content).toContain("Issue #899");
+    expect(content).toContain("src/lib/prisma.ts");
+    vi.unstubAllGlobals();
+  });
+
+  it("sends the prompt unchanged when there are no findings", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM(baseOptions);
+    expect(userContentFrom(fetchMock)).toBe(baseOptions.prompt);
+    vi.unstubAllGlobals();
+  });
+
+  it("ignores whitespace-only findings", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({ ...baseOptions, explorationFindings: "   \n  " });
+    expect(userContentFrom(fetchMock)).toBe(baseOptions.prompt);
+    vi.unstubAllGlobals();
+  });
+
+  it("still constrains the final call with the response schema", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({ ...baseOptions, explorationFindings: "findings" });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.response_format.type).toBe("json_schema");
+    expect(body.tools).toBeUndefined();
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("callGroomerLLM findings cap", () => {
+  function okResponse2() {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify({ labelsToAdd: [], labelsToRemove: [], lane: { id: "local", confidence: "high", reason: "r" } }) } }],
+      }),
+      text: async () => "",
+    };
+  }
+
+  it("truncates findings past the byte cap so the final call stays bounded", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse2());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({
+      baseUrl: "https://llm.example.com/v1",
+      apiKey: "sk-test",
+      model: "local-pool",
+      prompt: "issue",
+      timeoutMs: 60_000,
+      explorationFindings: "z".repeat(50_000),
+      maxFindingsBytes: 1000,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    const content = body.messages.find((m: { role: string }) => m.role === "user").content;
+    expect(content).toContain("(findings truncated)");
+    expect(content.length).toBeLessThan(2000);
+    vi.unstubAllGlobals();
+  });
+});

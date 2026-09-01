@@ -30,6 +30,7 @@ const { mocks } = vi.hoisted(() => ({
     addIssueLabel: vi.fn(),
     removeIssueLabel: vi.fn(),
     buildRepositoryContext: vi.fn(),
+    exploreRepository: vi.fn(),
     acquireGroomerLock: vi.fn(),
     releaseGroomerLock: vi.fn(),
     prisma: {
@@ -84,6 +85,7 @@ vi.mock("@/lib/lease", () => ({
 
 vi.mock("./repository-context", () => ({
   buildRepositoryContext: mocks.buildRepositoryContext,
+  exploreRepository: mocks.exploreRepository,
 }));
 
 vi.mock("./groomer-lock", () => ({
@@ -126,6 +128,10 @@ const mockConfig: HostedGroomerConfig = {
   maxFileBytes: 4096,
   commentCooldownHours: 24,
   groomerToken: null,
+  toolLoopEnabled: false,
+  maxToolCalls: 12,
+  maxSearchResults: 10,
+  maxDirEntries: 60,
 };
 
 const mockAutomationRepo = { id: "repo-1", fullName: "org/repo", enabled: true };

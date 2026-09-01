@@ -74,7 +74,26 @@ describe("buildGroomerSystemPrompt", () => {
   it("includes body enrichment rules", () => {
     const prompt = buildGroomerSystemPrompt(baseParams);
     expect(prompt).toContain("Body enrichment rules:");
-    expect(prompt).toContain("< 100 characters");
+    expect(prompt).toContain("does not orient a worker in");
+  });
+
+  it("gates enrichment on repo orientation, not on body length", () => {
+    // A detailed report from someone who does not know the codebase is long
+    // and still needs enrichment. Gating on length skipped exactly those.
+    const prompt = buildGroomerSystemPrompt(baseParams);
+    expect(prompt).not.toContain("< 100 characters");
+    expect(prompt).toContain("Length is NOT the test");
+  });
+
+  it("requires naming real files and forbids guessing paths", () => {
+    const prompt = buildGroomerSystemPrompt(baseParams);
+    expect(prompt).toContain("name the specific files a worker will need to change");
+    expect(prompt).toContain("never guess a path");
+  });
+
+  it("keeps the rule against clobbering an existing body", () => {
+    const prompt = buildGroomerSystemPrompt(baseParams);
+    expect(prompt).toContain("Do NOT clobber existing body content");
   });
 
   it("includes comment rules about @mentions", () => {

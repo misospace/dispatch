@@ -64,6 +64,7 @@ describe("github domain modules expose expected exports", () => {
       "fetchRepo",
       "fetchRepositoryFileText",
       "fetchRepositoryMetadata",
+      "listRepositoryDirectory",
       "searchRepositoryCode",
     ]);
   });

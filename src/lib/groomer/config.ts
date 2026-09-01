@@ -12,6 +12,10 @@ export interface HostedGroomerConfig {
   maxFileBytes: number;
   commentCooldownHours: number;
   groomerToken: string | null;
+  toolLoopEnabled: boolean;
+  maxToolCalls: number;
+  maxSearchResults: number;
+  maxDirEntries: number;
 }
 
 const parseBool = (value: string | undefined, defaultValue = false): boolean => {
@@ -48,6 +52,10 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
       timeoutMs: 60000,
       maxContextBytes: 8192,
       repoContextEnabled: false,
+      toolLoopEnabled: false,
+      maxToolCalls: 0,
+      maxSearchResults: 0,
+      maxDirEntries: 0,
       maxContextFiles: 5,
       maxSearches: 3,
       maxFileBytes: 4096,
@@ -84,6 +92,10 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
     maxFileBytes: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_FILE_BYTES, 4096),
     commentCooldownHours: parseIntEnv(process.env.DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS, 24),
     groomerToken: process.env.DISPATCH_GROOMER_TOKEN?.trim() || null,
+    toolLoopEnabled: parseBool(process.env.DISPATCH_GROOMER_TOOL_LOOP_ENABLED, true),
+    maxToolCalls: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_TOOL_CALLS, 12),
+    maxSearchResults: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_SEARCH_RESULTS, 10),
+    maxDirEntries: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_DIR_ENTRIES, 60),
   };
 
   // timeoutMs: env override wins; otherwise scale with maxContextBytes.

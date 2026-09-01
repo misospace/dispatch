@@ -58,6 +58,8 @@ export {
 export {
   type GithubRepo,
   fetchRepo,
+  type GitHubDirectoryEntry,
+  listRepositoryDirectory,
   type GitHubRepoMetadata,
   fetchRepositoryMetadata,
   type GitHubCodeSearchResult,
