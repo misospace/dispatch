@@ -232,6 +232,22 @@ export async function middleware(request: NextRequest) {
     return response;
   }
 
+  // Static assets (favicon, theme-init script, Next.js chunks) must load
+  // without auth so the OIDC login page can render its icon and theme.
+  // Without this, the browser requests /favicon.ico and /_next/static/...
+  // before the user is authenticated, gets redirected to /login, and the
+  // page shows a broken icon and no theme.
+  if (
+    request.nextUrl.pathname === "/favicon.ico" ||
+    request.nextUrl.pathname === "/theme-init.js" ||
+    request.nextUrl.pathname.startsWith("/_next/static/") ||
+    request.nextUrl.pathname.startsWith("/_next/image")
+  ) {
+    const response = NextResponse.next();
+    await applySecurityHeaders(request, response);
+    return response;
+  }
+
   // "disabled" mode — no enforcement
   if (authMode === "disabled") {
     const response = NextResponse.next();
