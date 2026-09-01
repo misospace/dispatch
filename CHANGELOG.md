@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.50](https://github.com/misospace/dispatch/compare/v0.5.49...v0.5.50) (2026-09-01)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.37.0 → 1.38.0) ([#895](https://github.com/misospace/dispatch/issues/895)) ([cc81874](https://github.com/misospace/dispatch/commit/cc8187466c9510f6f2d0bbd416f5e2b31285a49b))
+* **deps:** update dependency lucide-react (1.38.0 → 1.39.0) ([#903](https://github.com/misospace/dispatch/issues/903)) ([fd6698d](https://github.com/misospace/dispatch/commit/fd6698d3ddb6c57d2f57fa85532098f19221634d))
+
+
+### Bug Fixes
+
+* **deps:** update nextjs monorepo (16.3.3 → 16.3.4) ([#902](https://github.com/misospace/dispatch/issues/902)) ([088936c](https://github.com/misospace/dispatch/commit/088936c8ed62d312e3b7d277045626e36bc33285))
+* **groomer:** stop treating its own comments as authority to defer ([#904](https://github.com/misospace/dispatch/issues/904)) ([67f6f27](https://github.com/misospace/dispatch/commit/67f6f27378df4f8c1671fe92d1fffe7480e963bb))
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#894](https://github.com/misospace/dispatch/issues/894)) ([aa80e52](https://github.com/misospace/dispatch/commit/aa80e52ae668b1fccd77e83605f13584436c0311))
+
 ## [0.5.49](https://github.com/misospace/dispatch/compare/v0.5.48...v0.5.49) (2026-08-31)
 
 
