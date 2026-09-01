@@ -8,6 +8,7 @@ import { callGroomerLLM } from "./llm";
 import { validateGroomerOutput, type GroomerOutput } from "./schema";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
+import { exploreRepository } from "./explore";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { neutralizeMentions } from "./sanitize";
@@ -49,6 +50,7 @@ export interface GroomerDeps {
   releaseLease: typeof releaseLease;
   prisma: typeof prisma;
   buildRepositoryContext: typeof buildRepositoryContext;
+  exploreRepository: typeof exploreRepository;
   acquireGroomerLock: typeof acquireGroomerLock;
   releaseGroomerLock: typeof releaseGroomerLock;
 }
@@ -68,6 +70,7 @@ const defaultDeps: GroomerDeps = {
   releaseLease,
   prisma,
   buildRepositoryContext,
+  exploreRepository,
   acquireGroomerLock,
   releaseGroomerLock,
 };
@@ -182,6 +185,49 @@ async function executeGroomerRun(
       repositoryContext,
     });
 
+    // Let the groomer drive its own look at the repository. This is where it
+    // finds the files the issue is actually about; the issue itself is usually
+    // written by someone who does not know the codebase. Never fatal — a failed
+    // exploration degrades grooming, it does not fail the run.
+    const exploration = config.toolLoopEnabled
+      ? await deps.exploreRepository({
+          baseUrl: config.llmBaseUrl!,
+          apiKey: config.apiKey!,
+          model: config.model,
+          repoFullName: candidate.repoFullName,
+          prompt: context,
+          timeoutMs: config.timeoutMs,
+          maxToolCalls: config.maxToolCalls,
+          maxTotalBytes: config.maxContextBytes,
+          maxSearchResults: config.maxSearchResults,
+          maxFileBytes: config.maxFileBytes,
+          maxDirEntries: config.maxDirEntries,
+        })
+      : null;
+
+    if (exploration) {
+      // Persisted so a bad grooming run can be read back afterwards. Before
+      // this, the only evidence of what the groomer saw was whatever comment
+      // it happened to leave on the issue.
+      await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
+        stage: "explored",
+        contextWarnings: [...contextWarnings, ...exploration.warnings],
+        contextSummary: {
+          commentCount: comments.length,
+          repositorySources: repositoryContext.sources,
+          repositoryQueries: repositoryContext.queries,
+          repositoryBytes: repositoryContext.bytes,
+          exploration: {
+            files: exploration.files,
+            ask: exploration.ask,
+            sources: exploration.sources,
+            bytes: exploration.bytes,
+            toolCalls: exploration.toolCalls,
+          },
+        },
+      });
+    }
+
     // Call LLM
     const rawOutput = await deps.callLLM({
       baseUrl: config.llmBaseUrl!,
@@ -189,6 +235,7 @@ async function executeGroomerRun(
       model: config.model,
       prompt: context,
       timeoutMs: config.timeoutMs,
+      explorationFindings: exploration?.findings,
     });
 
     // Validate output

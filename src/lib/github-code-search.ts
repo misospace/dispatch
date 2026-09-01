@@ -89,3 +89,42 @@ export async function fetchRepositoryFileText(
   }
   return Buffer.from(data.content, "base64").toString("utf8");
 }
+
+export interface GitHubDirectoryEntry {
+  path: string;
+  name: string;
+  type: "file" | "dir";
+  size: number | null;
+}
+
+/**
+ * List one directory in a repo. `path` may be "" for the repository root.
+ * Returns [] when the path is a file rather than a directory, so callers can
+ * treat "wrong kind of path" as an empty result instead of an exception.
+ */
+export async function listRepositoryDirectory(
+  repoFullName: string,
+  path: string,
+  ref?: string,
+): Promise<GitHubDirectoryEntry[]> {
+  const encodedPath = path ? encodePathForContentsApi(path) : "";
+  const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  const response = await fetch(
+    `${GITHUB_API}/repos/${repoFullName}/contents/${encodedPath}${query}`,
+    { headers: await getHeadersAsync() },
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(
+      `Failed to list directory ${path || "/"} in ${repoFullName}: ${response.status} ${text}`,
+    );
+  }
+  const data = await response.json();
+  if (!Array.isArray(data)) return [];
+  return data.map((entry: { path?: string; name?: string; type?: string; size?: number }) => ({
+    path: entry.path ?? "",
+    name: entry.name ?? "",
+    type: entry.type === "dir" ? "dir" : "file",
+    size: typeof entry.size === "number" ? entry.size : null,
+  }));
+}

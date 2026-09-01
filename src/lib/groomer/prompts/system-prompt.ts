@@ -81,8 +81,17 @@ Title rewriting rules:
 - Base the rewritten title on body content, labels, and comments
 
 Body enrichment rules:
-- Only propose an enriched body when the current body is missing, empty, or < 100 characters (excluding markdown/HTML comments)
-- If the body already has substantial content, omit proposedBody
+- Propose an enriched body when the current body does not orient a worker in
+  this repository: it names no file or directory in the repo, or states no
+  concrete change to make. Length is NOT the test — a long, well-written report
+  from someone who does not know the codebase still needs enrichment, and is
+  exactly the case where enrichment matters most
+- Omit proposedBody only when the body already names the relevant files AND
+  states the concrete change
+- When you enrich, name the specific files a worker will need to change. Use
+  only paths you have actually seen in the repository investigation section or
+  in the issue itself — never guess a path. If you do not know which files are
+  involved, say so plainly rather than inventing one
 - The enriched body should add structure: brief context, what's known, suggested approach based on labels/body/comments
 - Do NOT clobber existing body content — if there's any meaningful body, append rather than replace; if empty/missing, create from scratch
 - Keep enriched body under 10000 characters
