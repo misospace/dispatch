@@ -63,11 +63,12 @@
     "vitest": "^4.1.8"
   },
   "//": {
-    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory), sharp ^0.35.0 (libvips CVE-2026-33327/33328/35590/35591, #675 — already satisfied transitively by next@16.3.0's optional dep `sharp: ^0.35.3`, but the override survives any future `next` downgrade), deepmerge-ts ^8.0.0 (GHSA-ggr8-5vv4-36mx stack-exhaustion — pulled in by @prisma/config <=6.13.0-dev.1 and the transitive prisma <=7.10.0-integration-fix-prisma-publish-token.1, #761). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
+    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory), sharp ^0.35.0 (libvips CVE-2026-33327/33328/35590/35591, #675 — already satisfied transitively by next@16.3.0's optional dep `sharp: ^0.35.3`, but the override survives any future `next` downgrade), deepmerge-ts ^8.0.0 (GHSA-ggr8-5vv4-36mx stack-exhaustion — pulled in by @prisma/config <=6.13.0-dev.1 and the transitive prisma <=7.10.0-integration-fix-prisma-publish-token.1, #761), mysql2 ^3.22.0 (GHSA-3f6p-5ww8-9rcr plaintext-credential leak via mysql_clear_password auth-plugin downgrade — pulled in by the transitive prisma >=6.20.0-dev.1 / <=7.10.0, #897). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
   },
   "overrides": {
     "postcss": "^8.5.10",
     "sharp": "^0.35.0",
-    "deepmerge-ts": "^8.0.0"
+    "deepmerge-ts": "^8.0.0",
+    "mysql2": "^3.22.0"
   }
 }

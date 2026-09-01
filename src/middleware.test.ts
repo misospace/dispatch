@@ -505,6 +505,29 @@ describe("security headers", () => {
     expect(res.headers.get("content-security-policy")).toContain("script-src 'self' 'nonce-");
   });
 
+  it("serves static assets (favicon, theme-init, Next chunks) without auth in oidc mode", async () => {
+    // The OIDC login page renders its icon and theme from static assets the
+    // browser requests before the user is authenticated. Without an exemption
+    // the middleware redirects those to /login and the page shows a broken
+    // icon and no theme. Each must pass through with a 200 and no redirect.
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+    process.env.NEXTAUTH_SECRET = "secret";
+    mocks.getToken.mockResolvedValue(null);
+
+    for (const path of [
+      "/favicon.ico",
+      "/theme-init.js",
+      "/_next/static/chunks/main.js",
+      "/_next/image?url=%2Flogo.png",
+    ]) {
+      const res = await middleware(makeRequest(path));
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("location")).toBeNull();
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+  });
+
   it("does not allow inline scripts in the CSP except via a per-request nonce", async () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
 
