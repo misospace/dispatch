@@ -139,3 +139,31 @@ describe("fetchIssueComments", () => {
     await expect(fetchIssueComments("org/repo", 42)).rejects.toThrow("network error");
   });
 });
+
+describe("automation comment tagging", () => {
+  // The groomer writes grooming notes back to the issue, so on the next pass
+  // it read them as prior decisions and deferred again citing itself. Four P3
+  // chores were parked that way on reasons no maintainer ever wrote.
+  it("tags automation authors and leaves humans alone", async () => {
+    const text = await buildIssueContext({
+      number: 1,
+      title: "t",
+      body: "b",
+      labels: [],
+      currentLane: null,
+      comments: [
+        { author: "itsmiso-ai", body: "deferred to backlog", createdAt: "2026-08-19" },
+        { author: "its-saffron", body: "review note", createdAt: "2026-08-20" },
+        { author: "dependabot[bot]", body: "bump", createdAt: "2026-08-21" },
+        { author: "joryirving", body: "actually defer this", createdAt: "2026-08-22" },
+      ],
+    });
+
+    expect(text).toContain("itsmiso-ai [automation — not a human decision]");
+    expect(text).toContain("its-saffron [automation — not a human decision]");
+    expect(text).toContain("dependabot[bot] [automation — not a human decision]");
+    // A human's deferral must stay unqualified — it is the only kind that binds.
+    expect(text).toContain("joryirving (2026-08-22)");
+    expect(text).not.toContain("joryirving [automation");
+  });
+});
