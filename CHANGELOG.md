@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.51](https://github.com/misospace/dispatch/compare/v0.5.50...v0.5.51) (2026-09-01)
+
+
+### Features
+
+* **groomer:** drive repo exploration with tools instead of one-shot context ([#908](https://github.com/misospace/dispatch/issues/908)) ([10ed2b2](https://github.com/misospace/dispatch/commit/10ed2b2494f893306ba21ec92815fb2a45ea1373))
+
+
+### Bug Fixes
+
+* **middleware:** serve static assets without auth so the favicon loads on the OIDC login page ([#905](https://github.com/misospace/dispatch/issues/905)) ([349dbbf](https://github.com/misospace/dispatch/commit/349dbbff3c7de0dbc76963a6c2c9648d9964509e))
+
 ## [0.5.50](https://github.com/misospace/dispatch/compare/v0.5.49...v0.5.50) (2026-09-01)
 
 
