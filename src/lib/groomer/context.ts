@@ -18,6 +18,18 @@ export interface IssueContextInput {
   repositoryContext?: RepositoryContextResult;
 }
 
+/**
+ * Logins whose comments are this system talking to itself: the coder, the
+ * reviewer, and GitHub Actions. Their comments are evidence of what the
+ * automation did, never authority for what it should do next.
+ */
+const AUTOMATION_AUTHORS = new Set(["itsmiso-ai", "its-saffron", "its-miso", "github-actions[bot]"]);
+
+export function isAutomationAuthor(author: string): boolean {
+  const a = (author || "").toLowerCase();
+  return AUTOMATION_AUTHORS.has(a) || a.endsWith("[bot]");
+}
+
 export async function fetchIssueComments(
   repoFullName: string,
   issueNumber: number,
@@ -47,9 +59,16 @@ export async function buildIssueContext(input: IssueContextInput): Promise<strin
 
   let commentSection = "";
   if (input.comments.length > 0) {
-    const commentTexts = input.comments.map(
-      (c) => `- ${c.author} (${c.createdAt}): ${c.body}`,
-    );
+    // Mark automation comments. The groomer writes its own grooming notes back
+    // to the issue, so on the next pass it reads them as prior decisions and
+    // defers again, citing itself. Four P3 chores were parked that way with
+    // reasons like "deferred by maintainer" and "kept in backlog per audit
+    // decision" that no maintainer had written. Without the tag the model
+    // cannot tell its own past output from a human's instruction.
+    const commentTexts = input.comments.map((c) => {
+      const tag = isAutomationAuthor(c.author) ? " [automation — not a human decision]" : "";
+      return `- ${c.author}${tag} (${c.createdAt}): ${c.body}`;
+    });
     commentSection = `\n\nRecent comments:\n${commentTexts.join("\n")}`;
   }
 

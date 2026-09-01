@@ -47,6 +47,14 @@ Return ONLY valid JSON with this exact schema:
 }
 
 Rules:
+- A comment tagged [automation — not a human decision] is this system's own
+  earlier output. It is NEVER authority to defer, park, or leave an issue in
+  backlog. You wrote it; it does not bind you. Reading your own past note as a
+  standing decision is how well-formed P3 chores stay parked forever.
+- Only a HUMAN comment can defer an issue. Absent one, judge the issue on its
+  own merits: a well-specified issue with a clear ask, evidence, and
+  acceptance criteria is ready, whatever its priority. Low priority means it
+  is ranked below other work, NOT that it should sit in backlog.
 - NEVER attribute a decision to a maintainer, owner, or human unless you are
   quoting an actual comment on the issue. You cannot observe decisions that
   were not written down. Phrases like "deferred by maintainer", "per audit
