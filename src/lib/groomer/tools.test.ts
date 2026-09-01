@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildGroomerToolDefinitions,
   executeGroomerTool,
+  normalizeRepoPath,
   type GroomerToolDeps,
 } from "./tools";
 
@@ -145,5 +146,106 @@ describe("executeGroomerTool", () => {
       makeDeps(),
     );
     expect(read.ok).toBe(false);
+  });
+});
+
+describe("normalizeRepoPath", () => {
+  it("accepts an ordinary repo path", () => {
+    expect(normalizeRepoPath("src/lib/prisma.ts")).toEqual({ path: "src/lib/prisma.ts" });
+  });
+
+  it("strips redundant . segments and trailing slashes", () => {
+    expect(normalizeRepoPath("./src//lib/")).toEqual({ path: "src/lib" });
+  });
+
+  it("allows the empty path, which means the repository root", () => {
+    expect(normalizeRepoPath("")).toEqual({ path: "" });
+  });
+
+  it("rejects .. segments", () => {
+    expect(normalizeRepoPath("../package.json")).toEqual({
+      error: expect.stringContaining('contains ".."'),
+    });
+    expect(normalizeRepoPath("src/../../etc/passwd")).toEqual({
+      error: expect.stringContaining('contains ".."'),
+    });
+    expect(normalizeRepoPath("src/lib/prisma.ts/..")).toEqual({
+      error: expect.stringContaining('contains ".."'),
+    });
+  });
+
+  it("rejects absolute paths", () => {
+    expect(normalizeRepoPath("/etc/passwd")).toEqual({
+      error: expect.stringContaining("is absolute"),
+    });
+  });
+
+  it("rejects null bytes and control characters", () => {
+    expect(normalizeRepoPath(`src/lib/prisma.ts${String.fromCharCode(0)}.png`)).toEqual({
+      error: expect.stringContaining("control characters"),
+    });
+    expect(normalizeRepoPath(`src/lib${String.fromCharCode(10)}/etc/passwd`)).toEqual({
+      error: expect.stringContaining("control characters"),
+    });
+    expect(normalizeRepoPath(`src${String.fromCharCode(13)}lib`)).toEqual({
+      error: expect.stringContaining("control characters"),
+    });
+  });
+});
+
+describe("executeGroomerTool path handling", () => {
+  it("refuses a traversing read_file without calling GitHub", async () => {
+    const deps = makeDeps();
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "../package.json" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    expect(deps.readFile).not.toHaveBeenCalled();
+  });
+
+  it("refuses an absolute list_directory without calling GitHub", async () => {
+    const deps = makeDeps();
+    const result = await executeGroomerTool(
+      { name: "list_directory", arguments: { path: "/etc" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    expect(deps.listDir).not.toHaveBeenCalled();
+  });
+
+  it("refuses a null byte in a path without calling GitHub", async () => {
+    const deps = makeDeps();
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: `src/a.ts${String.fromCharCode(0)}` } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    expect(deps.readFile).not.toHaveBeenCalled();
+  });
+
+  it("passes the normalized path through to the fetcher", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") });
+    await executeGroomerTool(
+      { name: "read_file", arguments: { path: "./src/lib/prisma.ts" } },
+      options,
+      deps,
+    );
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts");
+  });
+
+  it("does not leave a replacement character before the truncation marker", async () => {
+    // "…" is three UTF-8 bytes; cutting at 4 lands mid-character.
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("ab…cd") });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "a.ts" } },
+      { ...options, maxFileBytes: 4 },
+      deps,
+    );
+    expect(result.content).not.toContain("�");
+    expect(result.content).toContain("(truncated)");
   });
 });

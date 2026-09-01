@@ -64,6 +64,15 @@ export async function searchRepositoryCode(
   }));
 }
 
+/**
+ * Upstream error bodies reach the model and the GroomingRun record. Collapse
+ * them to a single short line so an HTML error page cannot inject newlines or
+ * bulk into either.
+ */
+function summarizeErrorBody(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
 function encodePathForContentsApi(path: string): string {
   return path.split("/").map((seg) => encodeURIComponent(seg)).join("/");
 }
@@ -116,7 +125,7 @@ export async function listRepositoryDirectory(
   if (!response.ok) {
     const text = await response.text();
     throw new Error(
-      `Failed to list directory ${path || "/"} in ${repoFullName}: ${response.status} ${text}`,
+      `Failed to list directory ${path || "/"} in ${repoFullName}: ${response.status} ${summarizeErrorBody(text)}`,
     );
   }
   const data = await response.json();

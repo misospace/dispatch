@@ -14,6 +14,8 @@ export interface CallLlmOptions {
    * Optional so the grooming call still works with no exploration at all.
    */
   explorationFindings?: string;
+  /** Cap on the appended findings block. Defaults to MAX_FINDINGS_BYTES. */
+  maxFindingsBytes?: number;
 }
 
 const VALID_TYPE_LABELS = ["type/bug", "type/feature", "type/chore", "type/research", "type/security"];
@@ -103,10 +105,17 @@ export function buildGroomerResponseSchema(): Record<string, unknown> {
  * grammar constraint is what makes a small model's output reliable, and mixing
  * it with tool calling is exactly what the separate exploration pass avoids.
  */
+export const MAX_FINDINGS_BYTES = 4096;
+
 function buildUserContent(options: CallLlmOptions): string {
   const findings = options.explorationFindings?.trim();
   if (!findings) return options.prompt;
-  return `${options.prompt}\n\n${findings}`;
+  const limit = options.maxFindingsBytes ?? MAX_FINDINGS_BYTES;
+  const buf = Buffer.from(findings, "utf8");
+  if (buf.byteLength <= limit) return `${options.prompt}\n\n${findings}`;
+  const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+  const clipped = decoder.decode(buf.subarray(0, limit)).replace(/\uFFFD$/, "");
+  return `${options.prompt}\n\n${clipped}\n… (findings truncated)`;
 }
 
 function postChatCompletion(

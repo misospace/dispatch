@@ -171,3 +171,39 @@ describe("exploreRepository", () => {
     expect(result.toolCalls[0].ok).toBe(false);
   });
 });
+
+describe("exploreRepository bounds model-supplied findings", () => {
+  it("caps the file list, path length, ask and notes", async () => {
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [
+        toolCall("1", "submit_findings", {
+          files: [
+            ...Array.from({ length: 40 }, (_, i) => `src/f${i}.ts`),
+            "x".repeat(1000),
+          ],
+          ask: "a".repeat(9000),
+          notes: "n".repeat(9000),
+        }),
+      ],
+    });
+
+    const result = await exploreRepository(options, makeDeps({}, fetchImpl));
+
+    expect(result.files).toHaveLength(20);
+    expect(result.files.every((f) => f.length <= 301)).toBe(true);
+    expect(result.ask!.length).toBeLessThanOrEqual(2001);
+    expect(result.findings.length).toBeLessThan(12_000);
+  });
+
+  it("drops non-string entries from files", async () => {
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [
+        toolCall("1", "submit_findings", { files: ["src/a.ts", 42, null, "  "], ask: "do the thing" }),
+      ],
+    });
+    const result = await exploreRepository(options, makeDeps({}, fetchImpl));
+    expect(result.files).toEqual(["src/a.ts"]);
+  });
+});

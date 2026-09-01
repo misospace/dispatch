@@ -330,3 +330,35 @@ describe("callGroomerLLM exploration findings", () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe("callGroomerLLM findings cap", () => {
+  function okResponse2() {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify({ labelsToAdd: [], labelsToRemove: [], lane: { id: "local", confidence: "high", reason: "r" } }) } }],
+      }),
+      text: async () => "",
+    };
+  }
+
+  it("truncates findings past the byte cap so the final call stays bounded", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse2());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({
+      baseUrl: "https://llm.example.com/v1",
+      apiKey: "sk-test",
+      model: "local-pool",
+      prompt: "issue",
+      timeoutMs: 60_000,
+      explorationFindings: "z".repeat(50_000),
+      maxFindingsBytes: 1000,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    const content = body.messages.find((m: { role: string }) => m.role === "user").content;
+    expect(content).toContain("(findings truncated)");
+    expect(content.length).toBeLessThan(2000);
+    vi.unstubAllGlobals();
+  });
+});

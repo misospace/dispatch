@@ -146,7 +146,33 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
 function truncate(text: string, maxBytes: number): { text: string; truncated: boolean } {
   const buf = Buffer.from(text, "utf8");
   if (buf.byteLength <= maxBytes) return { text, truncated: false };
-  return { text: buf.subarray(0, maxBytes).toString("utf8"), truncated: true };
+  // Cut back to a character boundary. A raw byte slice can land mid-sequence
+  // and leave a replacement character just before the truncation marker.
+  const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+  const cut = decoder.decode(buf.subarray(0, maxBytes)).replace(/\uFFFD$/, "");
+  return { text: cut, truncated: true };
+}
+
+/**
+ * Paths come from the model, so they can be anything. These are read through
+ * GitHub's repo-scoped contents API rather than a filesystem, and the tools may
+ * already read any file in the repo, so a `..` segment crosses no privilege
+ * boundary — it just produces a 404. Rejecting these up front turns a wasted
+ * round trip into an immediate, readable error the model can act on.
+ */
+export function normalizeRepoPath(raw: string): { path: string } | { error: string } {
+  const path = raw.trim();
+  if (/[\u0000-\u001F\u007F]/.test(path)) {
+    return { error: "Path contains control characters. Use a plain path from the repository root." };
+  }
+  if (path.startsWith("/")) {
+    return { error: `Path "${path}" is absolute. Use a path relative to the repository root, e.g. src/lib/prisma.ts.` };
+  }
+  const segments = path.split("/").filter((seg) => seg !== "" && seg !== ".");
+  if (segments.includes("..")) {
+    return { error: `Path "${path}" contains "..". Use a direct path from the repository root.` };
+  }
+  return { path: segments.join("/") };
 }
 
 function asString(value: unknown): string {
@@ -198,7 +224,11 @@ export async function executeGroomerTool(
       }
 
       case "read_file": {
-        const path = asString(call.arguments.path).trim();
+        const raw = asString(call.arguments.path).trim();
+        if (!raw) return fail("read_file needs a non-empty path.");
+        const normalized = normalizeRepoPath(raw);
+        if ("error" in normalized) return fail(normalized.error);
+        const path = normalized.path;
         if (!path) return fail("read_file needs a non-empty path.");
         const text = await deps.readFile(options.repoFullName, path);
         if (!text) {
@@ -215,7 +245,9 @@ export async function executeGroomerTool(
       }
 
       case "list_directory": {
-        const path = asString(call.arguments.path).trim();
+        const normalized = normalizeRepoPath(asString(call.arguments.path));
+        if ("error" in normalized) return fail(normalized.error);
+        const path = normalized.path;
         const entries = await deps.listDir(options.repoFullName, path);
         if (entries.length === 0) {
           return {

@@ -93,6 +93,16 @@ function parseArguments(raw: unknown): Record<string, unknown> {
   }
 }
 
+const MAX_FILES = 20;
+const MAX_PATH_CHARS = 300;
+const MAX_TEXT_CHARS = 2000;
+
+/** Findings come back from the model, so they are bounded before they are
+ *  rendered into the grooming prompt or persisted. */
+function clampText(value: string, max = MAX_TEXT_CHARS): string {
+  return value.length <= max ? value : `${value.slice(0, max)}…`;
+}
+
 function renderFindings(files: string[], ask: string | null, notes: string, records: ExploreToolRecord[]): string {
   const lines: string[] = [];
   if (ask) lines.push(`What the issue is asking for, in repo terms: ${ask}`);
@@ -185,13 +195,14 @@ export async function exploreRepository(
         const args = parseArguments(toolCall?.function?.arguments);
 
         if (name === "submit_findings") {
-          const files = Array.isArray(args.files)
-            ? args.files.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
-            : [];
+          const files = (Array.isArray(args.files) ? args.files : [])
+            .filter((f): f is string => typeof f === "string" && f.trim().length > 0)
+            .slice(0, MAX_FILES)
+            .map((f) => clampText(f.trim(), MAX_PATH_CHARS));
           submitted = {
             files,
-            ask: typeof args.ask === "string" && args.ask.trim() ? args.ask.trim() : null,
-            notes: typeof args.notes === "string" ? args.notes.trim() : "",
+            ask: typeof args.ask === "string" && args.ask.trim() ? clampText(args.ask.trim()) : null,
+            notes: typeof args.notes === "string" ? clampText(args.notes.trim()) : "",
           };
           sources.push(...files);
           records.push({ name, arguments: args, ok: true, bytes: 0, preview: "" });
