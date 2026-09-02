@@ -1,3 +1,5 @@
+import { resolveExplorationBudget, type ExplorationBudget } from "./exploration-budget";
+
 export interface HostedGroomerConfig {
   enabled: boolean;
   dryRun: boolean;
@@ -16,6 +18,7 @@ export interface HostedGroomerConfig {
   maxToolCalls: number;
   maxSearchResults: number;
   maxDirEntries: number;
+  exploration: ExplorationBudget;
 }
 
 const parseBool = (value: string | undefined, defaultValue = false): boolean => {
@@ -56,6 +59,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
       maxToolCalls: 0,
       maxSearchResults: 0,
       maxDirEntries: 0,
+      exploration: { maxTotalBytes: 0, maxFileBytes: 0, timeoutMs: 0, source: "small" },
       maxContextFiles: 5,
       maxSearches: 3,
       maxFileBytes: 4096,
@@ -96,6 +100,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
     maxToolCalls: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_TOOL_CALLS, 12),
     maxSearchResults: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_SEARCH_RESULTS, 10),
     maxDirEntries: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_DIR_ENTRIES, 60),
+    exploration: resolveExplorationBudget(),
   };
 
   // timeoutMs: env override wins; otherwise scale with maxContextBytes.

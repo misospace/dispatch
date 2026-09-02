@@ -196,11 +196,11 @@ async function executeGroomerRun(
           model: config.model,
           repoFullName: candidate.repoFullName,
           prompt: context,
-          timeoutMs: config.timeoutMs,
+          timeoutMs: config.exploration.timeoutMs,
           maxToolCalls: config.maxToolCalls,
-          maxTotalBytes: config.maxContextBytes,
+          maxTotalBytes: config.exploration.maxTotalBytes,
           maxSearchResults: config.maxSearchResults,
-          maxFileBytes: config.maxFileBytes,
+          maxFileBytes: config.exploration.maxFileBytes,
           maxDirEntries: config.maxDirEntries,
         })
       : null;
@@ -218,6 +218,7 @@ async function executeGroomerRun(
           repositoryQueries: repositoryContext.queries,
           repositoryBytes: repositoryContext.bytes,
           exploration: {
+            budget: config.exploration,
             files: exploration.files,
             ask: exploration.ask,
             sources: exploration.sources,
