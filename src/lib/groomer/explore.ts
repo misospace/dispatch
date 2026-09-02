@@ -13,7 +13,9 @@ export interface ExploreOptions {
   /** The same issue context the final grooming call receives. */
   prompt: string;
   timeoutMs: number;
-  maxToolCalls: number;
+  /** Model round-trips the loop may make. One round can carry several tool
+   *  calls, so this is not a cap on calls — see maxToolCalls' doc comment. */
+  maxRounds: number;
   maxTotalBytes: number;
   maxSearchResults: number;
   maxFileBytes: number;
@@ -63,6 +65,9 @@ Work like this:
 - Use list_directory when you are unsure what exists, rather than guessing paths.
 
 Call submit_findings once you can name the files a worker would change and state what the issue is asking for in this repository's own terms. Be concrete: real paths you have actually seen, never a guess.`;
+
+/** Rounds remaining at which the model is told to wrap up. */
+export const ROUNDS_REMAINING_WARNING = 2;
 
 const EMPTY: Omit<ExploreResult, "warnings"> = {
   findings: "",
@@ -142,6 +147,7 @@ export async function exploreRepository(
   const sources: string[] = [];
   let bytes = 0;
 
+  let roundsExhausted = false;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs);
 
@@ -151,7 +157,24 @@ export async function exploreRepository(
   ];
 
   try {
-    for (let turn = 0; turn < options.maxToolCalls; turn++) {
+    for (let turn = 0; turn < options.maxRounds; turn++) {
+      roundsExhausted = turn === options.maxRounds - 1;
+      // Tell the model when it is running out of rounds. The byte-budget path
+      // already does this and the model reliably submits when it hears it; the
+      // round limit used to just end the loop, so a run that explored well but
+      // did not volunteer findings was discarded with nothing to show. Give it
+      // the same deadline pressure rather than a silent cut-off.
+      const roundsLeft = options.maxRounds - turn;
+      if (roundsLeft <= ROUNDS_REMAINING_WARNING && roundsLeft > 0 && records.length > 0) {
+        messages.push({
+          role: "user",
+          content:
+            `You have ${roundsLeft} round(s) left before this investigation ends. ` +
+            "Call submit_findings now with the files you have already opened, " +
+            "even if you have not finished exploring.",
+        });
+      }
+
       const response = await deps.fetchImpl(`${options.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -263,8 +286,8 @@ export async function exploreRepository(
       }
     }
 
-    if (records.length >= options.maxToolCalls) {
-      warnings.push("repository exploration hit its tool-call budget without submitting findings");
+    if (roundsExhausted) {
+      warnings.push("repository exploration used all its rounds without submitting findings");
     }
 
     return {

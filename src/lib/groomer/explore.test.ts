@@ -8,7 +8,7 @@ const options: ExploreOptions = {
   repoFullName: "org/repo",
   prompt: "Issue #899: DATABASE_URL with sslmode=no-verify does not turn TLS on",
   timeoutMs: 60_000,
-  maxToolCalls: 12,
+  maxRounds: 12,
   maxTotalBytes: 8192,
   maxSearchResults: 10,
   maxFileBytes: 4096,
@@ -125,7 +125,7 @@ describe("exploreRepository", () => {
     });
     const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("y".repeat(400)) }, fetchImpl);
 
-    const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxToolCalls: 4 }, deps);
+    const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxRounds: 4 }, deps);
 
     expect(result.warnings).toContain("repository exploration hit its byte budget");
     expect(deps.tools.readFile).toHaveBeenCalledTimes(1);
@@ -138,11 +138,11 @@ describe("exploreRepository", () => {
     });
     const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([{ path: "a.ts" }]) }, fetchImpl);
 
-    const result = await exploreRepository({ ...options, maxToolCalls: 3 }, deps);
+    const result = await exploreRepository({ ...options, maxRounds: 3 }, deps);
 
     expect(result.toolCalls).toHaveLength(3);
     expect(result.warnings).toContain(
-      "repository exploration hit its tool-call budget without submitting findings",
+      "repository exploration used all its rounds without submitting findings",
     );
   });
 
@@ -205,5 +205,67 @@ describe("exploreRepository bounds model-supplied findings", () => {
     });
     const result = await exploreRepository(options, makeDeps({}, fetchImpl));
     expect(result.files).toEqual(["src/a.ts"]);
+  });
+});
+
+describe("exploreRepository round-limit warning", () => {
+  it("tells the model to submit when it is nearly out of rounds", async () => {
+    const calls: string[][] = [];
+    const fetchImpl = vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string);
+      calls.push(body.messages.map((m: { role: string }) => m.role));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [
+            { message: { content: null, tool_calls: [toolCall("1", "search_code", { query: "x" })] } },
+          ],
+        }),
+        text: async () => "",
+      };
+    }) as unknown as typeof fetch;
+
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([{ path: "a.ts" }]) }, fetchImpl);
+    await exploreRepository({ ...options, maxRounds: 4 }, deps);
+
+    const sent = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+      JSON.parse((c[1] as RequestInit).body as string),
+    );
+    const nudges = sent.flatMap((b) =>
+      b.messages.filter(
+        (m: { role: string; content?: string }) =>
+          m.role === "user" && typeof m.content === "string" && m.content.includes("round(s) left"),
+      ),
+    );
+    expect(nudges.length).toBeGreaterThan(0);
+    expect(nudges[0].content).toContain("submit_findings");
+  });
+
+  it("does not nudge before the final rounds", async () => {
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "search_code", { query: "x" })],
+    });
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([{ path: "a.ts" }]) }, fetchImpl);
+    await exploreRepository({ ...options, maxRounds: 12 }, deps);
+
+    const first = JSON.parse(
+      ((fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit)
+        .body as string,
+    );
+    expect(
+      first.messages.some(
+        (m: { content?: string }) => typeof m.content === "string" && m.content.includes("round(s) left"),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not warn about rounds when the model stopped on its own", async () => {
+    const deps = makeDeps({}, fetchReturning({ content: "nothing to do", tool_calls: [] }));
+    const result = await exploreRepository({ ...options, maxRounds: 12 }, deps);
+    expect(result.warnings).not.toContain(
+      "repository exploration used all its rounds without submitting findings",
+    );
   });
 });
