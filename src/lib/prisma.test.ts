@@ -89,3 +89,79 @@ describe("prisma module lazy initialization", () => {
     expect(() => (mod.prisma as any).repository).not.toThrow(/DATABASE_URL/);
   });
 });
+
+describe("prisma DATABASE_URL sslmode handling", () => {
+  let adapterCtor: ReturnType<typeof vi.fn<(...args: unknown[]) => void>>;
+  let PrismaPgMock: any;
+
+  beforeEach(() => {
+    vi.resetModules();
+    adapterCtor = vi.fn((..._args: unknown[]) => undefined);
+    const PrismaPgCtor: any = vi.fn(function (this: any, ...args: any[]) {
+      adapterCtor(...args);
+      this.adapterName = "PrismaPg";
+      this.provider = "postgres";
+    });
+    PrismaPgMock = PrismaPgCtor;
+    vi.doMock("@prisma/adapter-pg", () => ({
+      PrismaPg: PrismaPgMock,
+    }));
+  });
+
+  afterEach(() => {
+    vi.doUnmock("@prisma/adapter-pg");
+  });
+
+  it("passes ssl: { rejectUnauthorized: false } when sslmode=no-verify is set", async () => {
+    process.env.DATABASE_URL =
+      "postgresql://dispatch:secret@ai-primary.ai.svc:5432/dispatch?sslmode=no-verify";
+    const mod = await import("./prisma");
+    // Force the cached client to be rebuilt with the new DATABASE_URL.
+    mod.__resetPrismaClientForTests();
+    // Touch the lazy proxy to force initClient().
+    void (mod.prisma as any).repository;
+    expect(adapterCtor).toHaveBeenCalledTimes(1);
+    const config = adapterCtor.mock.calls[0][0] as {
+      connectionString: string;
+      ssl: { rejectUnauthorized: boolean };
+    };
+    expect(config.ssl).toEqual({ rejectUnauthorized: false });
+    // The unknown sslmode must be stripped so pg-connection-string does
+    // not fall back to "prefer" and try a plaintext handshake.
+    expect(new URL(config.connectionString).searchParams.has("sslmode")).toBe(false);
+    expect(new URL(config.connectionString).toString()).toBe(
+      "postgresql://dispatch:secret@ai-primary.ai.svc:5432/dispatch",
+    );
+  });
+
+  it("leaves the URL untouched for standard sslmode values like require", async () => {
+    process.env.DATABASE_URL =
+      "postgresql://dispatch:secret@ai-primary.ai.svc:5432/dispatch?sslmode=require";
+    const mod = await import("./prisma");
+    mod.__resetPrismaClientForTests();
+    void (mod.prisma as any).repository;
+    expect(adapterCtor).toHaveBeenCalledTimes(1);
+    const arg = adapterCtor.mock.calls[0][0];
+    expect(arg).toBe(process.env.DATABASE_URL);
+  });
+
+  it("does not add explicit ssl config when sslmode is absent", async () => {
+    process.env.DATABASE_URL = "postgresql://dispatch:secret@ai-primary.ai.svc:5432/dispatch";
+    const mod = await import("./prisma");
+    mod.__resetPrismaClientForTests();
+    void (mod.prisma as any).repository;
+    expect(adapterCtor).toHaveBeenCalledTimes(1);
+    const arg = adapterCtor.mock.calls[0][0];
+    expect(arg).toBe(process.env.DATABASE_URL);
+  });
+
+  it("falls back to passing the raw URL when it is not a parseable URL", async () => {
+    process.env.DATABASE_URL = "not-a-valid-url";
+    const mod = await import("./prisma");
+    mod.__resetPrismaClientForTests();
+    void (mod.prisma as any).repository;
+    expect(adapterCtor).toHaveBeenCalledTimes(1);
+    const arg = adapterCtor.mock.calls[0][0];
+    expect(arg).toBe("not-a-valid-url");
+  });
+});
