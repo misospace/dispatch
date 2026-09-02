@@ -197,7 +197,7 @@ async function executeGroomerRun(
           repoFullName: candidate.repoFullName,
           prompt: context,
           timeoutMs: config.exploration.timeoutMs,
-          maxToolCalls: config.maxToolCalls,
+          maxRounds: config.maxRounds,
           maxTotalBytes: config.exploration.maxTotalBytes,
           maxSearchResults: config.maxSearchResults,
           maxFileBytes: config.exploration.maxFileBytes,

@@ -129,7 +129,7 @@ const mockConfig: HostedGroomerConfig = {
   commentCooldownHours: 24,
   groomerToken: null,
   toolLoopEnabled: false,
-  maxToolCalls: 12,
+  maxRounds: 12,
   maxSearchResults: 10,
   maxDirEntries: 60,
   exploration: { maxTotalBytes: 24576, maxFileBytes: 8192, timeoutMs: 150000, source: "medium" },

@@ -15,7 +15,7 @@ export interface HostedGroomerConfig {
   commentCooldownHours: number;
   groomerToken: string | null;
   toolLoopEnabled: boolean;
-  maxToolCalls: number;
+  maxRounds: number;
   maxSearchResults: number;
   maxDirEntries: number;
   exploration: ExplorationBudget;
@@ -56,7 +56,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
       maxContextBytes: 8192,
       repoContextEnabled: false,
       toolLoopEnabled: false,
-      maxToolCalls: 0,
+      maxRounds: 0,
       maxSearchResults: 0,
       maxDirEntries: 0,
       exploration: { maxTotalBytes: 0, maxFileBytes: 0, timeoutMs: 0, source: "small" },
@@ -97,7 +97,10 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
     commentCooldownHours: parseIntEnv(process.env.DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS, 24),
     groomerToken: process.env.DISPATCH_GROOMER_TOKEN?.trim() || null,
     toolLoopEnabled: parseBool(process.env.DISPATCH_GROOMER_TOOL_LOOP_ENABLED, true),
-    maxToolCalls: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_TOOL_CALLS, 12),
+    maxRounds: parseIntEnv(
+      process.env.DISPATCH_GROOMER_MAX_ROUNDS ?? process.env.DISPATCH_GROOMER_MAX_TOOL_CALLS,
+      12,
+    ),
     maxSearchResults: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_SEARCH_RESULTS, 10),
     maxDirEntries: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_DIR_ENTRIES, 60),
     exploration: resolveExplorationBudget(),
