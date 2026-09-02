@@ -13,6 +13,37 @@ function databaseUrl(): string | undefined {
   return process.env.DATABASE_URL ?? process.env.DISPATCH_DATABASE_URL;
 }
 
+/**
+ * Build a `PrismaPg` adapter from the connection URL.
+ *
+ * `pg-connection-string` (the parser used by `@prisma/adapter-pg` and
+ * `pg.Pool`) only recognises libpq's standard `sslmode` values:
+ * `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`.
+ * The README documents `sslmode=no-verify` (TLS on, certificate not
+ * verified) but `no-verify` is not one of those, so it falls through and
+ * `pg.Pool` ends up with no `ssl` config — the server then rejects the
+ * connection with `no pg_hba.conf entry ... no encryption`. Detect the
+ * documented alias, strip it from the URL, and hand PrismaPg an explicit
+ * `ssl: { rejectUnauthorized: false }` so node-postgres requires TLS
+ * without validating the certificate.
+ */
+function buildAdapter(url: string): PrismaPg {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return new PrismaPg(url);
+  }
+  if (parsed.searchParams.get("sslmode") !== "no-verify") {
+    return new PrismaPg(url);
+  }
+  parsed.searchParams.delete("sslmode");
+  return new PrismaPg({
+    connectionString: parsed.toString(),
+    ssl: { rejectUnauthorized: false },
+  });
+}
+
 function initClient(): PrismaClient {
   if (_client) return _client;
   if (globalForPrisma.prisma) {
@@ -27,7 +58,7 @@ function initClient(): PrismaClient {
     );
   }
 
-  const adapter = new PrismaPg(url);
+  const adapter = buildAdapter(url);
   const client = new PrismaClient({
     adapter,
     log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
