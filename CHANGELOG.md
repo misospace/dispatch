@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.52](https://github.com/misospace/dispatch/compare/v0.5.51...v0.5.52) (2026-09-02)
+
+
+### Features
+
+* **groomer:** give repository exploration its own budget ([#918](https://github.com/misospace/dispatch/issues/918)) ([fe138e8](https://github.com/misospace/dispatch/commit/fe138e85cf9b80a4d39fa2e4e4769da1b3b5ed10))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @testing-library/user-event (14.6.6 → 14.6.7) ([#911](https://github.com/misospace/dispatch/issues/911)) ([0145810](https://github.com/misospace/dispatch/commit/01458108757943ce5e4b85e51365f443ca031a16))
+* **prisma:** turn TLS on when DATABASE_URL uses sslmode=no-verify ([#910](https://github.com/misospace/dispatch/issues/910)) ([204f200](https://github.com/misospace/dispatch/commit/204f200173b08a42246b9e08b9d22f66a5277423)), closes [#899](https://github.com/misospace/dispatch/issues/899)
+
 ## [0.5.51](https://github.com/misospace/dispatch/compare/v0.5.50...v0.5.51) (2026-09-01)
 
 
