@@ -27,8 +27,39 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_MAX_SEARCHES` | `3` | Maximum GitHub code searches per grooming run. |
 | `DISPATCH_GROOMER_MAX_FILE_BYTES` | `4096` | Maximum bytes per fetched file snippet. |
 | `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | `24` | Suppresses repeated hosted-groomer comments on the same issue. A comment is skipped (and recorded on the run) when a prior run posted a comment within this window, unless `force` is true. |
+| `DISPATCH_GROOMER_TOOL_LOOP_ENABLED` | `true` | Lets the groomer drive its own repository exploration with tools (`search_code`, `read_file`, `list_directory`, `submit_findings`) instead of one pre-computed context block. |
+| `DISPATCH_GROOMER_MAX_TOOL_CALLS` | `12` | Tool calls the exploration loop may make per grooming run. |
+| `DISPATCH_GROOMER_CONTEXT_MODE` | `medium` | Exploration budget preset: `small`, `medium`, `large`. See below. |
+| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored — recommended for self-hosted models whose windows do not match what a named preset assumes. |
+| `DISPATCH_GROOMER_EXPLORE_MAX_BYTES` | from mode | Overrides the exploration byte budget. |
+| `DISPATCH_GROOMER_EXPLORE_MAX_FILE_BYTES` | from mode | Overrides bytes per file returned to the model. Never exceeds the total budget. |
+| `DISPATCH_GROOMER_EXPLORE_TIMEOUT_MS` | from mode | Overrides the wall-clock cap on the exploration loop. |
 | `DISPATCH_GROOMER_TOKEN` | unset | Optional bearer token for scheduled or admin groomer invocations. When set, `POST /api/groomer/run` accepts this token in addition to `DISPATCH_AGENT_TOKEN`. |
 | `DISPATCH_GROOMER_INTERVAL_MS` | 600000 | Interval for the in-process scheduler's `groomer` job. Dispatch still processes at most one issue per run. |
+
+## Exploration budget
+
+Repository exploration is a multi-turn tool loop, so it needs a budget of its
+own rather than the single-call one. Three ways to size it, most specific first:
+
+1. the individual `DISPATCH_GROOMER_EXPLORE_*` overrides,
+2. `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS`, which derives the budget from the
+   model's real context window and reserves the rest for the system prompt, the
+   issue context and the model's own output,
+3. `DISPATCH_GROOMER_CONTEXT_MODE`.
+
+| Mode | Total bytes | Per file | Timeout |
+| --- | --- | --- | --- |
+| `small` | 8 KB | 4 KB | 90s |
+| `medium` (default) | 24 KB | 8 KB | 150s |
+| `large` | 96 KB | 24 KB | 300s |
+
+The default suits a modest self-hosted model. If your model's window is much
+larger, prefer setting `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` over guessing a
+preset: a starved loop stops mid-investigation and reports fewer files, which
+shows up as `repository exploration hit its byte budget` in a run's
+`contextWarnings`. The resolved budget and which path produced it are recorded
+on every run under `contextSummary.exploration.budget`.
 
 ## Endpoint
 

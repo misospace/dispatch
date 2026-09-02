@@ -111,6 +111,8 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_GROOMER_MODEL` | Conditional | Model name sent to the chat completions API. Required when hosted grooming is enabled. |
 | `DISPATCH_GROOMER_TIMEOUT_MS` | No | LLM request timeout. Defaults to a scaled value of `60s + 5s/KB of maxContextBytes`, clamped to 60s–300s. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | No | Issue context budget sent to the model. Defaults to `8192`. |
+| `DISPATCH_GROOMER_CONTEXT_MODE` | No | Exploration budget preset: `small`, `medium` (default), `large`. |
+| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | No | The model's real context window in tokens. Derives the exploration budget from it and ignores the preset. Recommended for self-hosted models. |
 | `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |
 | `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | No | Enables bounded GitHub API repository context. Defaults to `false`. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_FILES` | No | Maximum files included in repository context. Defaults to `5`. |
