@@ -5,6 +5,7 @@ import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
+import { fetchPullRequestCommitMessages } from "@/lib/github";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
@@ -135,7 +136,21 @@ export async function POST(request: NextRequest) {
       prsScanned += botPrs.length;
 
       for (const pr of botPrs) {
-        const linkedIssue = extractLinkedIssue(pr);
+        // Fall back to the commit messages when the PR carries no reference.
+        // An unlinked PR never reaches follow-up, so a review requesting
+        // changes on it is never queued for a fix.
+        let linkedIssue = extractLinkedIssue(pr);
+        if (linkedIssue === null) {
+          try {
+            const commitMessages = await fetchPullRequestCommitMessages(
+              `${owner}/${repo}`,
+              pr.number,
+            );
+            linkedIssue = extractLinkedIssue({ ...pr, commitMessages });
+          } catch {
+            // Best effort: an unlinked PR is the status quo, not a failure.
+          }
+        }
 
         // Comments, reviews, and check runs are independent — fetch them in
         // parallel, best effort per source (a failed fetch yields no events).

@@ -53,6 +53,7 @@ export {
   fetchPullRequestMergeState,
   fetchPullRequestCheckFailures,
   fetchLinkedPrHealthInput,
+  fetchPullRequestCommitMessages,
 } from "./github-prs";
 
 export {

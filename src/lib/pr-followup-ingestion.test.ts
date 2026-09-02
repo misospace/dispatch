@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import {
+  extractLinkedIssue,
   classifyFeedback,
   parseAiReviewerFindings,
   isInformationalComment,
@@ -1071,5 +1072,68 @@ describe("comment ingestion requires actionable signal", () => {
     await processPrFollowupEvents(client, [commentEvent("lint error: unused import")]);
     expect(client.items.length).toBeGreaterThan(0);
     for (const item of client.items) expect(item.lane).toBe("NORMAL");
+  });
+});
+
+describe("extractLinkedIssue commit fallback", () => {
+  it("still prefers the body when it carries a reference", () => {
+    expect(
+      extractLinkedIssue({
+        title: "fix: thing",
+        body: "Fixes #42",
+        commitMessages: ["chore: x\n\nFixes #99"],
+      }),
+    ).toBe(42);
+  });
+
+  it("falls back to a commit message when title and body have none", () => {
+    expect(
+      extractLinkedIssue({
+        title: "fix(carry_forward): let a maintainer dismiss a finding",
+        body: "## Summary\n- does the thing\n",
+        commitMessages: ["fix(carry_forward): dismiss\n\nFixes #534\n"],
+      }),
+    ).toBe(534);
+  });
+
+  it("requires a closing keyword in a commit, ignoring a bare reference", () => {
+    expect(
+      extractLinkedIssue({
+        title: "t",
+        body: "b",
+        commitMessages: ["revert of #101, see discussion"],
+      }),
+    ).toBeNull();
+  });
+
+  it("accepts the closing-keyword variants", () => {
+    for (const [msg, want] of [
+      ["Fixes #1", 1],
+      ["fixed #2", 2],
+      ["Closes #3", 3],
+      ["closed #4", 4],
+      ["Resolves #5", 5],
+      ["resolve #6", 6],
+    ] as const) {
+      expect(extractLinkedIssue({ title: "t", body: "b", commitMessages: [msg] })).toBe(want);
+    }
+  });
+
+  it("takes the first commit that names an issue", () => {
+    expect(
+      extractLinkedIssue({
+        title: "t",
+        body: "b",
+        commitMessages: ["no reference here", "Fixes #77", "Fixes #88"],
+      }),
+    ).toBe(77);
+  });
+
+  it("tolerates absent, empty and null commit messages", () => {
+    expect(extractLinkedIssue({ title: "t", body: "b" })).toBeNull();
+    expect(extractLinkedIssue({ title: "t", body: "b", commitMessages: [] })).toBeNull();
+    expect(
+      extractLinkedIssue({ title: "t", body: "b", commitMessages: [null, undefined, ""] }),
+    ).toBeNull();
   });
 });

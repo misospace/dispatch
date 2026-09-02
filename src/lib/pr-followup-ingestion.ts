@@ -261,11 +261,34 @@ export function computeEvidenceKey(
 /**
  * Extract the linked issue number from a PR's title and body.
  * Matches the first "#NNN" reference (e.g. "#42", "Fixes #42", "Closes #42").
+ *
+ * `commitMessages` is a fallback for PRs whose title and body carry no
+ * reference at all. A PR opened by automation can lose the reference in its
+ * body while the commit that did the work still names the issue, and an
+ * unlinked PR drops out of follow-up entirely — no linked-issue health, no
+ * queued fix, so a CHANGES_REQUESTED review is never acted on.
+ *
+ * Commits are matched more strictly than the body: only a closing keyword
+ * counts. A bare "#123" in a commit message is as likely to be a reference to
+ * a prior PR as a declaration of what this one fixes, and a wrong link is
+ * worse than none.
  */
-export function extractLinkedIssue(pr: { title?: string | null; body?: string | null }): number | null {
+const CLOSING_KEYWORD = /\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b/i;
+
+export function extractLinkedIssue(pr: {
+  title?: string | null;
+  body?: string | null;
+  commitMessages?: readonly (string | null | undefined)[];
+}): number | null {
   const text = [pr.title, pr.body].filter(Boolean).join("\n");
   const match = text.match(/#(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
+  if (match) return parseInt(match[1], 10);
+
+  for (const message of pr.commitMessages ?? []) {
+    const closing = (message ?? "").match(CLOSING_KEYWORD);
+    if (closing) return parseInt(closing[1], 10);
+  }
+  return null;
 }
 
 // ─── Event Ingestion ────────────────────────────────────────────────────────

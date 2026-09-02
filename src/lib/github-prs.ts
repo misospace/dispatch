@@ -156,3 +156,18 @@ export async function fetchLinkedPrHealthInput(repoFullName: string, pr: GithubP
     checkFailures,
   };
 }
+
+/**
+ * Commit messages on a pull request, newest last. Used only as a fallback when
+ * a PR's title and body carry no issue reference — the commit that did the work
+ * often still names the issue.
+ */
+export async function fetchPullRequestCommitMessages(
+  repoFullName: string,
+  prNumber: number,
+): Promise<string[]> {
+  const commits = await fetchPaginated<{ commit?: { message?: string } }>(
+    `${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}/commits`,
+  );
+  return commits.map((c) => c.commit?.message ?? "").filter(Boolean);
+}
