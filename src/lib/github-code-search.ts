@@ -1,4 +1,4 @@
-import { GITHUB_API, getHeadersAsync, fetchPaginated } from "./github-auth";
+import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
 
 export interface GithubRepo {
   full_name: string;
@@ -9,7 +9,7 @@ export interface GithubRepo {
 }
 
 async function fetchRepoJson(repoFullName: string, errorPrefix: string): Promise<Record<string, unknown>> {
-  const response = await fetch(`${GITHUB_API}/repos/${repoFullName}`, {
+  const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}`, {
     headers: await getHeadersAsync(),
   });
   if (!response.ok) {
@@ -51,7 +51,7 @@ export async function searchRepositoryCode(
   const perPage = Math.min(Math.max(1, limit), 100);
   const searchQuery = `${query} repo:${repoFullName}`;
   const url = `${GITHUB_API}/search/code?q=${encodeURIComponent(searchQuery)}&per_page=${perPage}`;
-  const response = await fetch(url, { headers: await getHeadersAsync() });
+  const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Code search failed for ${repoFullName}: ${response.status} ${text}`);
@@ -84,7 +84,7 @@ export async function fetchRepositoryFileText(
 ): Promise<string> {
   const encodedPath = encodePathForContentsApi(path);
   const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/contents/${encodedPath}${query}`,
     { headers: await getHeadersAsync() },
   );
@@ -118,7 +118,7 @@ export async function listRepositoryDirectory(
 ): Promise<GitHubDirectoryEntry[]> {
   const encodedPath = path ? encodePathForContentsApi(path) : "";
   const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/contents/${encodedPath}${query}`,
     { headers: await getHeadersAsync() },
   );

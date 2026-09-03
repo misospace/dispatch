@@ -627,9 +627,11 @@ describe("issue mutations", () => {
   });
 
   it("removeIssueLabel still throws on non-404 errors", async () => {
-    fetchMock.mockResolvedValueOnce(httpError(500));
+    // 500 is transient: the shared retry wrapper retries twice before surfacing the error.
+    fetchMock.mockResolvedValue(httpError(500));
 
     await expect(removeIssueLabel("org/repo", 5, "x")).rejects.toThrow("GitHub API error: 500");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
 
