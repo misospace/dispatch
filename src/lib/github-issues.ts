@@ -43,7 +43,7 @@ export async function updateIssueLabels(
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "PUT",
     headers: await getHeadersAsync(),
     body: JSON.stringify({ labels }),
@@ -94,7 +94,7 @@ export async function addIssueComment(
   const [owner, repo] = repoFullName.split("/");
   const apiPath = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`;
 
-  const response = await fetch(apiPath, {
+  const response = await fetchWithRetry(apiPath, {
     method: "POST",
     headers: await getHeadersAsync(),
     body: JSON.stringify({ body }),
@@ -121,7 +121,7 @@ export async function updateIssueComment(
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/comments/${commentId}`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "PATCH",
     headers: await getHeadersAsync(),
     body: JSON.stringify({ body }),
@@ -141,7 +141,7 @@ export async function addIssueLabel(
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "POST",
     headers: await getHeadersAsync(),
     body: JSON.stringify({ labels: [label] }),
@@ -166,7 +166,7 @@ export async function updateIssueTitleAndBody(
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "PATCH",
     headers: await getHeadersAsync(),
     body: JSON.stringify(fields),
@@ -186,7 +186,7 @@ export async function removeIssueLabel(
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "DELETE",
     headers: await getHeadersAsync(),
   });
@@ -218,7 +218,7 @@ export async function closeIssue(
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "PATCH",
     headers: await getHeadersAsync(),
     body: JSON.stringify({ state: "closed" }),

@@ -112,7 +112,7 @@ export async function fetchPackages(repoFullName: string): Promise<GithubPackage
 }
 
 export async function rerunWorkflow(repoFullName: string, runId: number): Promise<void> {
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/actions/runs/${runId}/rerun`,
     { method: "POST", headers: await getHeadersAsync() }
   );
@@ -127,7 +127,7 @@ export async function triggerWorkflowDispatch(
   workflowId: number,
   ref: string
 ): Promise<void> {
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${GITHUB_API}/repos/${repoFullName}/actions/workflows/${workflowId}/dispatches`,
     {
       method: "POST",
