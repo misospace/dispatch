@@ -244,16 +244,10 @@ describe("POST /api/issues/unclaim — operator path", () => {
       const res = await basicAuthRequest();
       expect(res.status).toBe(200);
 
-      expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
-        "org/repo",
-        42,
-        expect.arrayContaining(["status/ready"]),
-      );
-      expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
-        "org/repo",
-        42,
-        expect.not.arrayContaining(["status/in-progress"]),
-      );
+      // Status transition uses targeted add/remove, not a full-set write.
+      expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+      expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
       expect(mocks.updateIssue).toHaveBeenCalledWith({
         where: { id: "issue-1" },
         data: expect.objectContaining({
@@ -308,9 +302,12 @@ describe("POST /api/issues/unclaim — status handling", () => {
     expect(body.labels).toEqual(["status/ready"]);
     expect(body.status).toBe("status/ready");
     expect(body.statusNote).toBeNull();
-    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
-      "status/ready",
-    ]);
+    // Targeted label writes: remove agent label, remove old status, add new status.
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
+    // Full-set write must never be used — it would revert labels changed on GitHub.
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({ labels: ["status/ready"] }),
@@ -332,9 +329,10 @@ describe("POST /api/issues/unclaim — status handling", () => {
     expect(body.labels).toEqual(["status/ready"]);
     expect(body.status).toBe("status/ready");
     expect(body.statusNote).toBeNull();
-    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
-      "status/ready",
-    ]);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/blocked");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({ labels: ["status/ready"] }),
@@ -356,9 +354,10 @@ describe("POST /api/issues/unclaim — status handling", () => {
     expect(body.labels).toEqual(["status/blocked"]);
     expect(body.status).toBe("status/blocked");
     expect(body.statusNote).toContain("blockedReason is set");
-    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
-      "status/blocked",
-    ]);
+    // No status transition — only the agent label is removed.
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({ labels: ["status/blocked"] }),
@@ -385,9 +384,10 @@ describe("POST /api/issues/unclaim — status handling", () => {
     expect(body.status).toBe("status/in-review");
     expect(body.statusNote).toContain("PR #7 is still open");
     expect(mocks.fetchPullRequestState).toHaveBeenCalledWith("org/repo", 7);
-    expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, [
-      "status/in-review",
-    ]);
+    // No status transition — only the agent label is removed.
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({ labels: ["status/in-review"] }),
@@ -474,7 +474,7 @@ describe("POST /api/issues/unclaim — guards", () => {
   });
 
   it("writes failure audit log when GitHub API fails", async () => {
-    mocks.updateIssueLabels.mockRejectedValueOnce(new Error("github 500"));
+    mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
 
     const res = await postRequest();
     expect(res.status).toBe(500);
@@ -500,11 +500,33 @@ describe("POST /api/issues/unclaim — guards", () => {
     const res = await postRequest();
     expect(res.status).toBe(200);
 
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({
         labels: ["priority/p1"],
       }),
     });
+  });
+
+  it("does not revert labels changed on GitHub since the last sync (stale cache)", async () => {
+    // Cache is behind GitHub: status/ready was already cleared on GitHub and
+    // a blocked/* label was added there. A full-set write from this stale row
+    // would restore status/ready and delete the blocked label.
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent", "status/ready"],
+    } as never);
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+
+    // Only the agent label is removed; no full-set write touches any other label.
+    expect(mocks.removeIssueLabel).toHaveBeenCalledTimes(1);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
   });
 });
