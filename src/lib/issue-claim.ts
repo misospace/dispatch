@@ -1,5 +1,5 @@
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
-import { removeIssueLabel, updateIssueLabels } from "@/lib/github";
+import { removeIssueLabel } from "@/lib/github";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { fetchPullRequestState } from "@/lib/github-prs";
 
@@ -151,9 +151,11 @@ export async function releaseIssueClaim(params: {
     }
   }
 
-  // Preserve the established full-label update for operator unclaims, then
-  // defensively DELETE the agent label in case the cache was stale.
-  await updateIssueLabels(repoFullName, issueNumber, updatedLabels);
+  // Only targeted label writes reach GitHub here: the agent label is removed
+  // directly and any status transition goes through transitionIssueStatus,
+  // which itself uses add/remove primitives. Never replace the whole label
+  // set — the cached row can be behind GitHub, and a full-set write would
+  // silently revert every label change made on GitHub since the last sync.
   await removeIssueLabel(repoFullName, issueNumber, agentLabel);
 
   await prisma.issue.update({
