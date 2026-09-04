@@ -73,12 +73,57 @@ export interface LessonFeedOptions {
   timeoutMs?: number;
 }
 
-function readConfig() {
-  return {
-    apiKey: process.env.OPENAI_API_KEY ?? "",
-    baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
-    model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-  };
+// One-shot guard so the legacy-fallback warning below fires at most once per
+// process (the lesson feed runs on every pr-fix/tombstone outcome).
+let legacyFallbackWarned = false;
+
+/**
+ * Resolve the LLM credentials + model for the lesson feed.
+ *
+ * Precedence (mirrors src/lib/groomer/config.ts so a deployment that only
+ * configures DISPATCH_LLM_* works for both the groomer and the lesson feed):
+ *   apiKey:  DISPATCH_LLM_API_KEY  > OPENAI_API_KEY (legacy fallback)
+ *   baseUrl: DISPATCH_LLM_BASE_URL > OPENAI_BASE_URL (legacy fallback)
+ *   model:   DISPATCH_LESSON_FEED_MODEL > DISPATCH_GROOMER_MODEL
+ *            > OPENAI_MODEL (legacy fallback) > "gpt-4o-mini"
+ *
+ * When a legacy OPENAI_* value is used, a one-time console.warn fires so the
+ * fallback path is observable (issue #913).
+ */
+export function readConfig() {
+  const dispatchApiKey = process.env.DISPATCH_LLM_API_KEY?.trim() || undefined;
+  const dispatchBaseUrl = process.env.DISPATCH_LLM_BASE_URL?.trim() || undefined;
+  const dispatchLessonFeedModel = process.env.DISPATCH_LESSON_FEED_MODEL?.trim() || undefined;
+  const dispatchGroomerModel = process.env.DISPATCH_GROOMER_MODEL?.trim() || undefined;
+  const openAiApiKey = process.env.OPENAI_API_KEY?.trim() || undefined;
+  const openAiBaseUrl = process.env.OPENAI_BASE_URL?.trim() || undefined;
+  const openAiModel = process.env.OPENAI_MODEL?.trim() || undefined;
+  const apiKey = dispatchApiKey || openAiApiKey || "";
+  const baseUrl = dispatchBaseUrl || openAiBaseUrl || "https://api.openai.com/v1";
+  const model = dispatchLessonFeedModel || dispatchGroomerModel || openAiModel || "gpt-4o-mini";
+
+  // Keep the legacy path observable without logging credentials or repeating the
+  // warning for every feed trigger. This also covers individual fallback values:
+  // for example, a DISPATCH key can still use the legacy model or base URL.
+  const usingLegacyApiKey = !dispatchApiKey && !!openAiApiKey;
+  const usingLegacyBaseUrl = !dispatchBaseUrl && !!openAiBaseUrl;
+  const usingLegacyModel = !dispatchLessonFeedModel && !dispatchGroomerModel && !!openAiModel;
+  const usingLegacyConfig = usingLegacyApiKey || usingLegacyBaseUrl || usingLegacyModel;
+  if (!legacyFallbackWarned && apiKey && usingLegacyConfig) {
+    legacyFallbackWarned = true;
+    const fallbackVars = [
+      usingLegacyApiKey ? "OPENAI_API_KEY" : undefined,
+      usingLegacyBaseUrl ? "OPENAI_BASE_URL" : undefined,
+      usingLegacyModel ? "OPENAI_MODEL" : undefined,
+    ].filter((name): name is string => !!name);
+    console.warn(
+      `[lesson-feed] using legacy ${fallbackVars.join(" / ")} env var(s); ` +
+        "set DISPATCH_LLM_API_KEY / DISPATCH_LLM_BASE_URL and " +
+        "DISPATCH_LESSON_FEED_MODEL (or DISPATCH_GROOMER_MODEL) instead",
+    );
+  }
+
+  return { apiKey, baseUrl, model };
 }
 
 /**

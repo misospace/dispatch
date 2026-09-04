@@ -160,6 +160,8 @@ These variables tune the OIDC callback, the operator-UI triage surface, the queu
 view, the inbound webhook (PR followup) handler, and the lesson feed. Most have
 safe defaults and can be omitted in small deployments.
 
+The lesson feed shares `DISPATCH_LLM_API_KEY` and `DISPATCH_LLM_BASE_URL` with the hosted groomer; `OPENAI_API_KEY` and `OPENAI_BASE_URL` are retained only as legacy fallbacks.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AUTH_URL` | No | Public base URL used to construct the OIDC callback (`/api/auth/callback/...`). Optional; falls back to `NEXTAUTH_URL`. Set this when Dispatch sits behind a reverse proxy that rewrites the public origin. |
@@ -173,9 +175,10 @@ safe defaults and can be omitted in small deployments.
 | `WEBHOOK_GATEWAY_MODE` | No | When set to `true`, disables the built-in signature check because an upstream API gateway has already verified the request. Must be the literal string `"true"` or `"false"` (parsed as a string, not a boolean). |
 | `PR_FOLLOWUP_BOT_IDENTITIES` | No | Comma-separated bot logins whose PR events are ingested (default `github-actions[bot]`). Example: `github-actions[bot],dependabot[bot]`. |
 | `PR_FOLLOWUP_BRANCH_OWNERS` | No | Comma-separated GitHub logins considered the canonical owner of a followup branch. Used to suppress "needs author" nudges. |
-| `OPENAI_API_KEY` | Conditional | OpenAI API key used by the lesson feed. Ignored when `DISPATCH_LLM_API_KEY` is set. |
-| `OPENAI_BASE_URL` | No | OpenAI-compatible base URL for the lesson feed. Ignored when `DISPATCH_LLM_BASE_URL` is set. |
-| `OPENAI_MODEL` | No | Default model for the lesson feed. The groomer uses `DISPATCH_GROOMER_MODEL` instead when set. |
+| `OPENAI_API_KEY` | Conditional | Legacy OpenAI API key fallback for the lesson feed. Ignored when `DISPATCH_LLM_API_KEY` is set. |
+| `OPENAI_BASE_URL` | No | Legacy OpenAI-compatible base URL fallback for the lesson feed. Ignored when `DISPATCH_LLM_BASE_URL` is set. |
+| `DISPATCH_LESSON_FEED_MODEL` | No | Model for the lesson feed. Takes precedence over `DISPATCH_GROOMER_MODEL` and `OPENAI_MODEL`. |
+| `OPENAI_MODEL` | No | Legacy model fallback for the lesson feed. Ignored when `DISPATCH_LESSON_FEED_MODEL` or `DISPATCH_GROOMER_MODEL` is set. |
 | `DISPATCH_AGENT_NAME` | No | Display name used by the agent when posting heartbeats. Defaults to the host's `HOSTNAME` env var. |
 | `DISPATCH_CLOSED_ISSUE_RETENTION_DAYS` | No | Days that a closed issue is kept before `/api/issues/prune-closed` is allowed to remove it. Defaults to `30`. |
 | `DISPATCH_DONE_RETENTION_DAYS` | No | Days that a done issue is kept before the issue list endpoint filters it out. Defaults to `7`. |
