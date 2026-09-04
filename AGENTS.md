@@ -61,6 +61,24 @@ Labels follow a `category/value` pattern:
 - **Priority**: `priority/p0` through `priority/p3`
 - **Type**: `type/bug`, `type/feature`, `type/chore`, `type/research`, `type/security`
 
+#### Label hygiene
+
+`.github/labels.yaml` is the source of truth for managed labels. The label-sync
+workflow (`.github/workflows/label-sync.yaml`) keeps the repo in sync with it.
+
+- **Umbrella labels are allowed; per-attempt / per-model variants are not.**
+  `blocked/infra` is the single managed label for infrastructure-blocked work.
+  Do NOT create `blocked/infra-attempt/<N>` or `blocked/infra-model/<name>`
+  labels: an external emitter (bridge / pr-followup path) used to write a fresh
+  one per failed GHA attempt, accumulating ~95 dead labels that polluted every
+  kanban label filter, repo add-label call, and audit view (#916).
+- The label-sync workflow prunes exactly the `blocked/infra-attempt/*` and
+  `blocked/infra-model/*` shapes (on push to main touching the label files and
+  on a weekly schedule) and keeps the `blocked/infra` umbrella.
+- If you need to distinguish infra failure modes, encode them in the issue
+  body / audit log, not in a new label. A single repo failure mode does not
+  need N unique identifiers.
+
 
 ### Issue Execution Lane Classification
 

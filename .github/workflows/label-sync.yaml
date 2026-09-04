@@ -12,7 +12,15 @@ on:
         default: false
   push:
     branches: ["main"]
-    paths: [".github/labels.yaml"]
+    paths:
+      - ".github/labels.yaml"
+      - ".github/workflows/label-sync.yaml"
+  # Recurring guard: an external emitter (bridge / pr-followup path) keeps
+  # creating fresh blocked/infra-attempt/<N> and blocked/infra-model/<name>
+  # labels that are never declared in labels.yaml. Prune them on a schedule so
+  # the kanban filter UI does not accumulate 100+ dead labels. See #916.
+  schedule:
+    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
@@ -24,6 +32,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      labels: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,3 +46,27 @@ jobs:
           config-file: .github/labels.yaml
           delete-other-labels: false
           dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+      # The sync action above only manages labels declared in .github/labels.yaml
+      # and (with delete-other-labels: false) never prunes unmanaged ones. An
+      # external emitter keeps creating fresh blocked/infra-attempt/<N> and
+      # blocked/infra-model/<name> labels, so prune exactly those shapes here.
+      # The blocked/infra umbrella is kept. See #916.
+      - name: Prune unmanaged blocked/infra-attempt/* and blocked/infra-model/* labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          labels="$(gh label list --limit 500 --json name \
+            | jq -r '.[].name' \
+            | grep -E '^blocked/infra-(attempt|model)/' || true)"
+          if [ -z "$labels" ]; then
+            echo "No unmanaged blocked/infra-attempt/* or blocked/infra-model/* labels to prune."
+            exit 0
+          fi
+          while IFS= read -r label; do
+            [ -n "$label" ] || continue
+            echo "Deleting unmanaged label: $label"
+            gh label delete "$label" --yes \
+              || echo "::warning::Could not delete $label (may be in use)"
+          done <<< "$labels"
