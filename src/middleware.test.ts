@@ -385,11 +385,35 @@ describe("security headers", () => {
     clearAll();
     resetAuthCaches();
     mocks.getToken.mockReset();
+    // applySecurityHeaders skips the CSP in development on purpose (see the
+    // comment there), so these assertions only hold outside it. Pin the value
+    // rather than inheriting whatever the runner happens to set: `npm run
+    // test` passes NODE_ENV=development, and this block passed only because
+    // vitest 4 overrode it to "test" inside the environment. vitest 5 does
+    // not, and every CSP assertion here silently read a null header.
+    vi.stubEnv("NODE_ENV", "production");
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     clearAll();
     resetAuthCaches();
+  });
+
+  it("does not set a CSP in development, but still sets the static headers", async () => {
+    // The dev exemption is deliberate: Next invokes the proxy several times per
+    // document request and the browser intersects the resulting CSP headers,
+    // which collapses script-src and breaks hydration. Asserting it here means
+    // the exemption cannot be removed, or silently inverted by a runner's
+    // NODE_ENV handling, without a test noticing.
+    vi.stubEnv("NODE_ENV", "development");
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+
+    const res = await middleware(makeRequest("/board"));
+
+    expect(res.headers.get("content-security-policy")).toBeNull();
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
   });
 
   it("injects security headers on disabled mode responses", async () => {
