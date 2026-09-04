@@ -201,6 +201,66 @@ describe("POST /api/issues/label", () => {
     expect(mockAddLabel).toHaveBeenCalledTimes(30);
   });
 
+  it("rejects adding a blocked/infra-attempt/N label (unmanaged drift, #916)", async () => {
+    const res = await POST(
+      makeRequest({ ...validBody, label: "blocked/infra-attempt/42", action: "add" }),
+    );
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("blocked/infra-attempt/42");
+    expect(data.error).toContain("blocked/infra");
+    expect(mockAddLabel).not.toHaveBeenCalled();
+    expect(mockRemoveLabel).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAuditCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects adding a blocked/infra-model/name label (unmanaged drift, #916)", async () => {
+    const res = await POST(
+      makeRequest({ ...validBody, label: "blocked/infra-model/llama-3", action: "add" }),
+    );
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("blocked/infra-model/llama-3");
+    expect(mockAddLabel).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("allows adding the blocked/infra umbrella label", async () => {
+    const res = await POST(
+      makeRequest({ ...validBody, label: "blocked/infra", action: "add" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.success).toBe(true);
+    expect(data.labels).toEqual(["bug", "blocked/infra"]);
+    expect(mockAddLabel).toHaveBeenCalledWith("misospace/dispatch", 42, "blocked/infra");
+  });
+
+  it("allows removing a blocked/infra-attempt/N label (cleanup of existing drift)", async () => {
+    mockFindUnique.mockResolvedValue({
+      ...validIssue,
+      labels: ["bug", "blocked/infra-attempt/7"],
+    } as never);
+    const res = await POST(
+      makeRequest({
+        ...validBody,
+        label: "blocked/infra-attempt/7",
+        action: "remove",
+      }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.success).toBe(true);
+    expect(data.labels).toEqual(["bug"]);
+    expect(mockRemoveLabel).toHaveBeenCalledWith(
+      "misospace/dispatch",
+      42,
+      "blocked/infra-attempt/7",
+    );
+    expect(mockAddLabel).not.toHaveBeenCalled();
+  });
+
   it("returns 400 when required fields are missing", async () => {
     const res = await POST(makeRequest({ issueId: "issue-1" }));
     expect(res.status).toBe(400);

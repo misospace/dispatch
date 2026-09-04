@@ -62,6 +62,19 @@ export async function POST(request: Request) {
     const op = action === "remove" ? "remove" : "add";
     const labelName = label.trim();
 
+    // Guard (#916): an external emitter used to auto-create a fresh
+    // blocked/infra-attempt/<N> / blocked/infra-model/<name> label per failed
+    // GHA attempt, accumulating ~95 dead labels. The GitHub API auto-creates
+    // missing labels on add, so reject that shape here before it can be
+    // created. The blocked/infra umbrella is allowed, and removal is always
+    // allowed so existing drift can still be cleaned up.
+    if (op === "add" && /^blocked\/infra-(attempt|model)\//.test(labelName)) {
+      return errorResponse(
+        `Label "${labelName}" is not allowed: per-attempt/per-model infra labels are unmanaged drift. Use the "blocked/infra" umbrella label instead.`,
+        400,
+      );
+    }
+
     const actorName = getAuthorizedActor(
       auth,
       request,

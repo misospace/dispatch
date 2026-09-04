@@ -73,4 +73,12 @@
 - name: agent/saffron-escalated
   color: "0052cc"
   description: Stable escalated-lane Saffron worker.
-# Repo-specific labels can be appended below. Unknown labels are not pruned.
+# Blocked / infra
+# The umbrella label is the only managed infra-blocked label. Per-attempt and
+# per-model variants (blocked/infra-attempt/N, blocked/infra-model/name) are
+# unmanaged drift emitted by an external loop and are pruned by the label-sync
+# workflow. Do NOT add them here. See AGENTS.md "Label hygiene".
+- name: blocked/infra
+  color: "e11d21"
+  description: Progress is blocked on infrastructure (umbrella; no per-attempt variants).
+# Repo-specific labels can be appended below.
