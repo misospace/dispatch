@@ -52,6 +52,7 @@ const DEFAULT_PR_FOLLOWUP_INTERVAL_MS = 15 * 60 * 1000; // 15m
 const DEFAULT_PRUNE_CLOSED_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 const DEFAULT_RECONCILE_INTERVAL_MS = 30 * 60 * 1000; // 30m
 const DEFAULT_STALE_WORK_INTERVAL_MS = 5 * 60 * 1000; // 5m
+const DEFAULT_CI_FAILURES_INTERVAL_MS = 30 * 60 * 1000; // 30m
 const DEFAULT_STARTUP_DELAY_MS = 5 * 1000;
 
 function intFromEnv(raw: string | undefined, fallback: number): number {
@@ -94,6 +95,15 @@ export function schedulerConfigFromEnv(env: Record<string, string | undefined>):
       path: "/api/pr-followup/sync",
       body: {},
       intervalMs: jobIntervalFromEnv(env.DISPATCH_PR_FOLLOWUP_INTERVAL_MS, DEFAULT_PR_FOLLOWUP_INTERVAL_MS),
+    },
+    {
+      name: "ci-failures",
+      path: "/api/ci-failures/sync",
+      body: {},
+      intervalMs: jobIntervalFromEnv(
+        env.DISPATCH_CI_FAILURES_INTERVAL_MS,
+        DEFAULT_CI_FAILURES_INTERVAL_MS,
+      ),
     },
     {
       name: "prune-closed",

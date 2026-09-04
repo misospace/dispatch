@@ -111,6 +111,8 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_GROOMER_MODEL` | Conditional | Model name sent to the chat completions API. Required when hosted grooming is enabled. |
 | `DISPATCH_GROOMER_TIMEOUT_MS` | No | LLM request timeout. Defaults to a scaled value of `60s + 5s/KB of maxContextBytes`, clamped to 60s–300s. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_BYTES` | No | Issue context budget sent to the model. Defaults to `8192`. |
+| `DISPATCH_CI_FAILURES_INTERVAL_MS` | No | Interval for the `ci-failures` scheduler job, which files an issue when a workflow fails twice in a row on a repo's default branch and closes it when the workflow goes green. Defaults to `1800000` (30m). |
+| `DISPATCH_CI_FAILURE_LABELS` | No | Comma-separated labels applied to those issues. Defaults to `type/bug,status/ready`. Set to an empty string to apply none. |
 | `DISPATCH_GROOMER_CONTEXT_MODE` | No | Exploration budget preset: `small`, `medium` (default), `large`. |
 | `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | No | The model's real context window in tokens. Derives the exploration budget from it and ignores the preset. Recommended for self-hosted models. |
 | `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |

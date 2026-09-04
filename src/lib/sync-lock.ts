@@ -74,7 +74,8 @@ export type SyncType =
   | "automation"
   | "pr-followup"
   | "reconcile"
-  | "stale-work";
+  | "stale-work"
+  | "ci-failures";
 
 /**
  * Lock key per sync type. One row per key in the same `sync_lock` table that
@@ -99,6 +100,7 @@ const LOCK_KEY_BY_TYPE: Record<SyncType, string> = {
   "pr-followup": "pr-followup",
   reconcile: "reconcile",
   "stale-work": "stale-work",
+  "ci-failures": "ci-failures",
 };
 
 /**

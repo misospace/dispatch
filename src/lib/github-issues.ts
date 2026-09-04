@@ -229,3 +229,28 @@ export async function closeIssue(
     throw new Error(`GitHub API error: ${response.status} ${text}`);
   }
 }
+
+/**
+ * Open a new issue. Used by the CI-failure ingester; every other issue in
+ * Dispatch arrives from GitHub rather than being created by it.
+ */
+export async function createIssue(
+  repoFullName: string,
+  input: { title: string; body: string; labels?: string[] },
+): Promise<{ number: number; html_url: string }> {
+  const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/issues`, {
+    method: "POST",
+    headers: { ...(await getHeadersAsync()), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: input.title,
+      body: input.body,
+      ...(input.labels?.length ? { labels: input.labels } : {}),
+    }),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to create issue in ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  return { number: data.number, html_url: data.html_url };
+}

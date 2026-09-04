@@ -45,14 +45,16 @@ describe("schedulerConfigFromEnv", () => {
     expect(schedulerConfigFromEnv({ PORT: "" }).baseUrl).toBe("http://127.0.0.1:3000");
   });
 
-  it("configures sync + groomer + pr-followup + prune-closed + reconcile + stale-work with defaults", () => {
+  it("configures sync + groomer + pr-followup + ci-failures + prune-closed + reconcile + stale-work with defaults", () => {
     const jobs = schedulerConfigFromEnv({}).jobs;
-    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "prune-closed", "reconcile", "stale-work"]);
+    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "ci-failures", "prune-closed", "reconcile", "stale-work"]);
     const byName = (n: string) => jobs.find((j) => j.name === n)!;
     expect(byName("groomer").path).toBe("/api/groomer/run");
     expect(byName("groomer").intervalMs).toBe(10 * 60 * 1000);
     expect(byName("pr-followup").path).toBe("/api/pr-followup/sync");
     expect(byName("pr-followup").intervalMs).toBe(15 * 60 * 1000);
+    expect(byName("ci-failures").path).toBe("/api/ci-failures/sync");
+    expect(byName("ci-failures").intervalMs).toBe(30 * 60 * 1000);
     expect(byName("prune-closed").path).toBe("/api/issues/prune-closed");
     expect(byName("prune-closed").intervalMs).toBe(24 * 60 * 60 * 1000);
     expect(byName("reconcile").path).toBe("/api/issues/reconcile");
