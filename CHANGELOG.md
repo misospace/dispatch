@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.54](https://github.com/misospace/dispatch/compare/v0.5.53...v0.5.54) (2026-09-06)
+
+
+### Features
+
+* **deps:** update dependency eslint (10.9.1 → 10.10.0) ([#946](https://github.com/misospace/dispatch/issues/946)) ([ee09a82](https://github.com/misospace/dispatch/commit/ee09a82d710dbd029039913498b9a33e04443858))
+* **lanes:** expose the lane topology and enforce role uniqueness ([#948](https://github.com/misospace/dispatch/issues/948)) ([6ab4acf](https://github.com/misospace/dispatch/commit/6ab4acf0e391804d10755cb940dccc9a5eb2eca8))
+
+
+### Bug Fixes
+
+* **groomer:** enforce exactly one status/* label after a groom ([#943](https://github.com/misospace/dispatch/issues/943)) ([4e4e358](https://github.com/misospace/dispatch/commit/4e4e35884f34d5a5d442bd5b6a15c768a9a4a7fa)), closes [#941](https://github.com/misospace/dispatch/issues/941)
+
 ## [0.5.53](https://github.com/misospace/dispatch/compare/v0.5.52...v0.5.53) (2026-09-06)
 
 
