@@ -41,23 +41,52 @@ Each lane is defined as a `LaneConfig` object:
 | `id` | `string` | Yes | Unique identifier (e.g., `"normal"`, `"local"`, `"frontier"`) |
 | `title` | `string` | Yes | Human-readable display name shown in the UI |
 | `claimable` | `boolean` | Yes | Whether worker agents may claim issues in this lane |
-| `role` | `"default"` \| `"escalation"` | No | Heuristic classification hint (see [Lane Roles](#lane-roles)) |
+| `role` | `"default"` \| `"escalation"` | No | The lane's function, used for classification and by external consumers (see [Lane Roles](#lane-roles)). Validated unique across claimable lanes |
 | `description` | `string` | No | Human-readable description of the lane's purpose |
 | `color` | `string` | No | Hex color for UI rendering (e.g., `"#4CAF50"`) |
 | `defaultAgent` | `string` | No | Default agent that handles this lane |
 
 ### Lane Roles
 
-Roles guide heuristic classification when the system needs to decide which lane an issue belongs to:
+Roles name what a lane is *for*, independently of what it is called. Lane ids stay
+free-form and descriptive — `local` and `frontier` say which hardware and which
+model — while the role is the stable thing other systems key off.
 
 - **`role: "default"`** — The standard claimable lane. Issues with no special signals route here. Exactly one claimable lane should have this role.
 - **`role: "escalation"`** — The lane for higher-judgment tasks. Issues with architecture, design, or cross-service signals route here. Optional; at most one claimable lane should have this role.
 - **No role** — Non-claimable lanes (like backlog) do not need a role.
 
+Both rules are **enforced**: a config in which two *claimable* lanes declare the
+same role is rejected at load with both ids named. A non-claimable lane carrying
+a stale role is inert and allowed, since only claimable lanes are resolution
+targets. Roles remain optional — a single-lane deployment needs neither.
+
 When `classifyLaneFromSignals()` runs:
 1. Backlog signals → routes to the non-claimable lane (if configured), otherwise falls back to the default claimable lane
 2. Escalation signals → routes to the lane with `role: "escalation"`, or falls back to the default claimable lane
 3. No signals → routes to the lane with `role: "default"`, or the first claimable lane
+
+### Reading the topology from outside (`GET /api/lanes`)
+
+External workers should resolve lanes **by role**, never by hardcoding this
+deployment's lane ids. `GET /api/lanes` returns the configured set:
+
+```json
+[
+  {"id": "local",    "title": "Local",    "claimable": true,  "role": "default"},
+  {"id": "frontier", "title": "Frontier", "claimable": true,  "role": "escalation"},
+  {"id": "backlog",  "title": "Backlog",  "claimable": false}
+]
+```
+
+It is a pure reflection of `DISPATCH_LANE_CONFIG_JSON` and contributes no lane
+names of its own: a deployment running the shipped default gets back `default`
+and `backlog`, one running five tiers gets five.
+
+This exists so a worker asking for "the escalation lane" does not have to be
+told a literal id. A setting like `ESCALATION_LANE=frontier` names a role but
+holds a deployment-specific value, so renaming a lane silently breaks the link
+and every adopter hand-syncs lane names across two systems.
 
 ---
 

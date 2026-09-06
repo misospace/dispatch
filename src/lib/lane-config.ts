@@ -343,6 +343,24 @@ function validateLaneConfigSet(config: LaneConfigSet): void {
     throw new Error("Lane config must contain at least one claimable lane");
   }
 
+  // At most one CLAIMABLE lane per role. Consumers resolve "the escalation
+  // lane" by role rather than by id (see /api/lanes), so two claimable lanes
+  // declaring the same role makes getEscalationLane's "find the first" depend
+  // on array order -- a silent, config-dependent answer. Roles stay optional:
+  // a single-lane deployment needs neither.
+  const byRole = new Map<string, string[]>();
+  for (const lane of config.lanes) {
+    if (!lane.claimable || !lane.role) continue;
+    byRole.set(lane.role, [...(byRole.get(lane.role) ?? []), lane.id]);
+  }
+  for (const [role, laneIds] of byRole) {
+    if (laneIds.length > 1) {
+      throw new Error(
+        `Role "${role}" is claimed by more than one claimable lane: ${laneIds.join(", ")}`,
+      );
+    }
+  }
+
   // Validate aliases point to configured lanes
   if (config.laneAliases) {
     for (const [from, to] of Object.entries(config.laneAliases)) {
