@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.5.53](https://github.com/misospace/dispatch/compare/v0.5.52...v0.5.53) (2026-09-06)
+
+
+### Features
+
+* **ci-failures:** file issues from repeated default-branch workflow failures ([#932](https://github.com/misospace/dispatch/issues/932)) ([2dd1387](https://github.com/misospace/dispatch/commit/2dd138794e32854ffe1d845960995adac1ee5ae3)), closes [#931](https://github.com/misospace/dispatch/issues/931)
+* **deps:** update dependency lucide-react (1.39.0 → 1.40.0) ([#928](https://github.com/misospace/dispatch/issues/928)) ([934d3c4](https://github.com/misospace/dispatch/commit/934d3c4cfce2aad142e503aa16a45d32f6e3cf7f))
+* **deps:** update dependency lucide-react (1.40.0 → 1.41.0) ([#938](https://github.com/misospace/dispatch/issues/938)) ([15cd8e2](https://github.com/misospace/dispatch/commit/15cd8e2b08f3bc6b873bbbd545be7824add30133))
+* **deps:** update vitest monorepo (4.1.11 → 5.0.0) ([#929](https://github.com/misospace/dispatch/issues/929)) ([936de51](https://github.com/misospace/dispatch/commit/936de5175edcca52cbf0b62db05c807d6f3292a5))
+* **groomer:** let the groomer assign the escalation lane on merit ([#922](https://github.com/misospace/dispatch/issues/922)) ([599eca6](https://github.com/misospace/dispatch/commit/599eca68c503164e3ca23d4319d9534f28241d32))
+* **pr-followup:** link a PR to its issue from commit messages when the body has none ([#923](https://github.com/misospace/dispatch/issues/923)) ([4b2a8dc](https://github.com/misospace/dispatch/commit/4b2a8dc0776af5d85b7af846e192ea8f4d0e8a66))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @eslint/compat (2.1.0 → 2.1.1) ([#930](https://github.com/misospace/dispatch/issues/930)) ([543150d](https://github.com/misospace/dispatch/commit/543150d39c65d8f0ed91e7b2223cd753e4c20e59))
+* **deps:** update dependency @types/react-dom (19.2.5 → 19.2.7) ([#927](https://github.com/misospace/dispatch/issues/927)) ([1beae56](https://github.com/misospace/dispatch/commit/1beae56d868c91dd736320c0586833c446c4d2b4))
+* **github:** retry transient 429/5xx in remaining GitHub API fetchers ([#926](https://github.com/misospace/dispatch/issues/926)) ([488f2bc](https://github.com/misospace/dispatch/commit/488f2bc837a306a9f03d9da14f791a9eb1fc9866)), closes [#917](https://github.com/misospace/dispatch/issues/917)
+* **groomer:** warn the model before its exploration rounds run out ([#919](https://github.com/misospace/dispatch/issues/919)) ([b5052b9](https://github.com/misospace/dispatch/commit/b5052b9bbc8267148b7f95671032f084cc7a4384))
+* **issue-claim:** stop unclaim from overwriting GitHub labels from the stale local cache ([#925](https://github.com/misospace/dispatch/issues/925)) ([4d83229](https://github.com/misospace/dispatch/commit/4d83229e5d46c3dbc112d0609e882b78f3d689d7)), closes [#921](https://github.com/misospace/dispatch/issues/921)
+* **labels:** prune unmanaged blocked/infra-attempt/* and blocked/infra-model/* drift ([#936](https://github.com/misospace/dispatch/issues/936)) ([97702a0](https://github.com/misospace/dispatch/commit/97702a0256c776d194a165dac7828c0c915e0b95)), closes [#916](https://github.com/misospace/dispatch/issues/916)
+* **lesson-feed:** use Dispatch LLM configuration with legacy fallbacks ([#937](https://github.com/misospace/dispatch/issues/937)) ([5caef62](https://github.com/misospace/dispatch/commit/5caef62d3c19bea9c1c424c632c7d09427604245)), closes [#913](https://github.com/misospace/dispatch/issues/913)
+* **pr-fix-queue:** refuse FIXED on no-progress and reopen stale tombstones ([#942](https://github.com/misospace/dispatch/issues/942)) ([e145d89](https://github.com/misospace/dispatch/commit/e145d8934f06b5d461634ca3c6e3b395fc9d6b95))
+* **types:** point at jest-dom's vitest matcher types ([#933](https://github.com/misospace/dispatch/issues/933)) ([248a4a8](https://github.com/misospace/dispatch/commit/248a4a8e1473522eebd4b076aee396e3720874f6))
+
+
+### Documentation
+
+* **env:** document DISPATCH_STALE_WORK_INTERVAL_MS ([#935](https://github.com/misospace/dispatch/issues/935)) ([a7a28be](https://github.com/misospace/dispatch/commit/a7a28be64e68050da4b7ab450847f4c672c56f39))
+
 ## [0.5.52](https://github.com/misospace/dispatch/compare/v0.5.51...v0.5.52) (2026-09-02)
 
 
