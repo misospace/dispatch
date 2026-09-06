@@ -141,6 +141,44 @@ describe("lane-config custom config", () => {
     );
   });
 
+  it("rejects two claimable lanes claiming the same role", () => {
+    // Consumers resolve "the escalation lane" by role, so a duplicate makes
+    // that lookup depend on array order rather than on config.
+    expect(() =>
+      setLaneConfig({
+        lanes: [
+          { id: "a", title: "A", claimable: true, role: "default" },
+          { id: "b", title: "B", claimable: true, role: "escalation" },
+          { id: "c", title: "C", claimable: true, role: "escalation" },
+        ],
+      }),
+    ).toThrow('Role "escalation" is claimed by more than one claimable lane: b, c');
+  });
+
+  it("allows a duplicate role when the extra lane is not claimable", () => {
+    // Only claimable lanes are resolution targets, so a parked lane carrying a
+    // stale role is inert rather than ambiguous.
+    expect(() =>
+      setLaneConfig({
+        lanes: [
+          { id: "a", title: "A", claimable: true, role: "escalation" },
+          { id: "shelf", title: "Shelf", claimable: false, role: "escalation" },
+        ],
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows lanes with no role at all", () => {
+    expect(() =>
+      setLaneConfig({
+        lanes: [
+          { id: "a", title: "A", claimable: true },
+          { id: "b", title: "B", claimable: true },
+        ],
+      }),
+    ).not.toThrow();
+  });
+
   it("rejects all non-claimable lanes", () => {
     expect(() =>
       setLaneConfig({
