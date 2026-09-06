@@ -12,6 +12,7 @@ import { exploreRepository } from "./explore";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { neutralizeMentions } from "./sanitize";
+import { isClaimableLane } from "@/lib/lane-config";
 
 export interface GroomerRunResult {
   candidateNumber: number;
@@ -287,7 +288,16 @@ async function executeGroomerRun(
       }
     }
 
-    const newLabels = applyLabelChanges(candidate.labels, output.labelsToAdd, output.labelsToRemove);
+    let newLabels = applyLabelChanges(candidate.labels, output.labelsToAdd, output.labelsToRemove);
+
+    // Post-condition invariant (dispatch#941): after a groom the issue must carry
+    // exactly one status/* label. A re-groom that removes the old status label but
+    // adds no new one (or adds several) leaves the issue invisible to the queue —
+    // strictly worse than either end state. The schema's ready-invariant only covers
+    // the readyForWork path; this catches every path, including a non-ready re-groom
+    // that dropped the status label. It needs the current labels, which only live
+    // here, so it is enforced on the final label set rather than the LLM output.
+    newLabels = ensureSingleStatusLabel(newLabels, isReadyForWork(output));
 
     // Compute title/body enrichment decisions
     const titleBodyMutations = computeTitleBodyMutations(candidate, output);
@@ -596,6 +606,44 @@ function computeTitleBodyMutations(
     ...(shouldRewrite ? { proposedTitle } : {}),
     ...(shouldEnrich ? { proposedBody } : {}),
   };
+}
+
+/**
+ * Mirror of the schema's readyForWork signal: a groomer can express readiness
+ * through actionability, its explicit next action, or a claimable lane.
+ */
+function isReadyForWork(output: GroomerOutput): boolean {
+  return (
+    output.actionability === "ready" ||
+    output.nextGroomingAction === "promote_to_ready" ||
+    isClaimableLane(output.lane.id)
+  );
+}
+
+/**
+ * Enforce the post-condition that a groomed issue carries exactly one status/*
+ * label (dispatch#941).
+ *
+ * - Zero status labels: the groom removed the old one and added none. Restore a
+ *   status so the issue stays visible — status/ready when the groom concluded the
+ *   issue is workable, otherwise status/backlog (visible, deprioritised).
+ * - More than one: keep the single most relevant status (ready wins, then the
+ *   first present) and drop the rest.
+ *
+ * Returns a new array; the input is not mutated.
+ */
+function ensureSingleStatusLabel(labels: string[], ready: boolean): string[] {
+  const statusLabels = labels.filter((l) => l.startsWith("status/"));
+  if (statusLabels.length === 1) return labels;
+
+  if (statusLabels.length === 0) {
+    const restored = ready ? "status/ready" : "status/backlog";
+    return [...labels, restored];
+  }
+
+  const keep =
+    statusLabels.includes("status/ready") ? "status/ready" : statusLabels[0];
+  return labels.filter((l) => !l.startsWith("status/") || l === keep);
 }
 
 function applyLabelChanges(
