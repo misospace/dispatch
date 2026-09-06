@@ -25,10 +25,17 @@ import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "
 
 /** Open-PR shape from the list endpoint, extending the shared client's type
  * with the fields this route consumes that the shared type omits. */
-interface GithubPR extends GithubPRBase {
+interface GithubPR extends Omit<GithubPRBase, "head"> {
   id: number;
   mergeable_state?: string;
   mergeable?: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
+  /**
+   * PR head ref + SHA from the list endpoint. `sha` is captured to populate
+   * PrFixQueueItem.headSha at enqueue time so a later FIXED transition can
+   * verify the workload actually pushed something (#940). Both fields are
+   * optional here so legacy fixtures still type-check.
+   */
+  head?: { ref?: string; sha?: string };
 }
 
 interface GithubComment {
@@ -161,7 +168,7 @@ export async function POST(request: NextRequest) {
         // carries a reviewer's anchored findings. Never fetched before, which is why
         // an APPROVED review's nits vanished entirely.
         const reviewCommentsUrl = `${githubApi}/repos/${owner}/${repo}/pulls/${pr.number}/comments?per_page=100`;
-        const checksUrl = `${githubApi}/repos/${owner}/${repo}/commits/${pr.head.ref}/check-runs?status=completed&per_page=100`;
+        const checksUrl = `${githubApi}/repos/${owner}/${repo}/commits/${pr.head?.ref ?? ""}/check-runs?status=completed&per_page=100`;
         const [comments, reviews, reviewComments, checkRuns, mergeState] = await Promise.all([
           fetchPaginated<GithubComment>(commentsUrl, 100).catch(() => [] as GithubComment[]),
           fetchPaginated<GithubReview>(reviewsUrl, 100).catch(() => [] as GithubReview[]),
@@ -190,6 +197,13 @@ export async function POST(request: NextRequest) {
               ? "MERGEABLE"
               : undefined;
 
+        // PR head SHA captured at sync time. Stored on PrFixQueueItem.headSha so a
+        // later FIXED transition can verify the workload actually pushed something
+        // (#940). GitHub's `pulls?state=open` returns `head.sha` on every entry;
+        // an empty/missing value here means we have nothing to compare against
+        // and the FIXED guard degrades to the legacy behaviour (accept).
+        const prHeadSha = pr.head?.sha ?? null;
+
         // Collect comment events
         for (const comment of comments) {
           // Ignore self-comments from the same bot identity
@@ -199,13 +213,14 @@ export async function POST(request: NextRequest) {
             eventType: "comment" as const,
             repoFullName,
             prNumber: pr.number,
-            branch: pr.head.ref ?? null,
+            branch: pr.head?.ref ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
             body: comment.body,
             id: String(comment.id),
             linkedIssue,
+            headSha: prHeadSha,
           });
         }
 
@@ -218,7 +233,7 @@ export async function POST(request: NextRequest) {
             eventType: "review_comment" as const,
             repoFullName,
             prNumber: pr.number,
-            branch: pr.head.ref ?? null,
+            branch: pr.head?.ref ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
@@ -229,6 +244,7 @@ export async function POST(request: NextRequest) {
             linkedIssue,
             prState: pr.state,
             prMergedAt: pr.merged_at,
+            headSha: prHeadSha,
           });
         }
 
@@ -239,7 +255,7 @@ export async function POST(request: NextRequest) {
               eventType: "review" as const,
               repoFullName,
               prNumber: pr.number,
-              branch: pr.head.ref ?? null,
+              branch: pr.head?.ref ?? null,
               url: pr.url,
               title: pr.title,
               author: pr.user.login,
@@ -249,6 +265,7 @@ export async function POST(request: NextRequest) {
               linkedIssue,
               prState: pr.state,
               prMergedAt: pr.merged_at,
+              headSha: prHeadSha,
             });
           } else {
             totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
@@ -269,7 +286,7 @@ export async function POST(request: NextRequest) {
               eventType: "check_run" as const,
               repoFullName,
               prNumber: pr.number,
-              branch: pr.head.ref ?? null,
+              branch: pr.head?.ref ?? null,
               url: checkRun.html_url,
               title: checkRun.name,
               author: pr.user.login,
@@ -278,6 +295,7 @@ export async function POST(request: NextRequest) {
               conclusion: checkRun.conclusion,
               checkName: checkRun.name,
               linkedIssue,
+              headSha: prHeadSha,
             });
           } else {
             totalSkipped++;
@@ -290,7 +308,7 @@ export async function POST(request: NextRequest) {
             eventType: "merge_state" as const,
             repoFullName,
             prNumber: pr.number,
-            branch: pr.head.ref ?? null,
+            branch: pr.head?.ref ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
@@ -299,6 +317,7 @@ export async function POST(request: NextRequest) {
             linkedIssue,
             prState: pr.state,
             prMergedAt: pr.merged_at,
+            headSha: prHeadSha,
           });
         }
 
@@ -307,12 +326,13 @@ export async function POST(request: NextRequest) {
           const conflictKey = await ingestMergeConflict(asPrFixQueueClient(prisma), {
             repoFullName,
             prNumber: pr.number,
-            branch: pr.head.ref ?? null,
+            branch: pr.head?.ref ?? null,
             url: pr.url,
             title: pr.title,
             author: pr.user.login,
             mergeable: pr.mergeable,
             linkedIssue,
+            headSha: prHeadSha,
           });
           if (conflictKey) {
             totalEnqueued++;

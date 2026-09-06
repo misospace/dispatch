@@ -75,6 +75,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         linkedIssue: extractLinkedIssue(pr),
         prState: pr.state,
         prMergedAt: pr.merged_at,
+        headSha: pr.head?.sha ?? null,
       });
       break;
     }
@@ -95,6 +96,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         body: comment.comment?.body ?? "",
         id: String(comment.comment?.id),
         linkedIssue: extractLinkedIssue(pr),
+        headSha: pr.head?.sha ?? null,
       });
       break;
     }
@@ -115,6 +117,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         body: issueComment.comment?.body ?? "",
         id: String(issueComment.comment?.id),
         linkedIssue: extractLinkedIssue(issue),
+        headSha: issue.head?.sha ?? null,
       });
       break;
     }
@@ -157,6 +160,11 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         conclusion: check.conclusion,
         checkName: check.name,
         linkedIssue: prLinkedIssue,
+        // GitHub does not include `head.sha` directly on the check_run payload;
+        // fall back to `head_branch` only. The PR detail fetcher in the sync
+        // route still has it; webhooks degrade to "no head sha recorded" and
+        // skip the FIXED head-SHA guard for that path.
+        headSha: null,
       });
       break;
     }
@@ -178,6 +186,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         linkedIssue: extractLinkedIssue(pr),
         prState: pr.state,
         prMergedAt: pr.merged_at,
+        headSha: pr.head?.sha ?? null,
       });
       break;
     }

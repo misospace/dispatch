@@ -163,6 +163,55 @@ describe("POST /api/pr-followup/sync", () => {
     vi.unstubAllGlobals();
   });
 
+  it("captures the PR head SHA from the list endpoint and threads it into events (#940)", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/KubeTix"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([{
+          id: 1, number: 467, url: "https://gh/pr/467", title: "fix", body: "Fixes #1",
+          state: "open", user: { login: "itsmiso-ai" },
+          // The list endpoint returns head.sha; the sync captures it so a
+          // later FIXED transition can verify the workload pushed a fix.
+          head: { ref: "fix/x", sha: "efc36e3ddeadbeef" },
+          base: { ref: "main" }, merged_at: null, draft: false, mergeable_state: "clean",
+        }]);
+      }
+      if (u.includes("/comments")) {
+        return jsonRes([{
+          id: 11, body: "Test failed: expected 200", user: { login: "reviewer" },
+          created_at: "2026-09-04T11:00:00Z", updated_at: "2026-09-04T11:00:00Z",
+        }]);
+      }
+      if (u.includes("/pulls/467/reviews")) {
+        return jsonRes([{
+          id: 22, body: "Use the right path", state: "CHANGES_REQUESTED",
+          user: { login: "reviewer" }, submitted_at: "2026-09-04T11:04:17Z",
+        }]);
+      }
+      if (u.includes("/pulls/467/comments")) return jsonRes([]);
+      if (u.includes("/check-runs")) return jsonRes({ check_runs: [] });
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const events = mocks.processPrFollowupEvents.mock.calls.at(-1)?.[1] ?? [];
+    // Every event for that PR carries the head SHA captured at sync time.
+    expect(events.length).toBeGreaterThan(0);
+    for (const event of events) {
+      expect(event.headSha).toBe("efc36e3ddeadbeef");
+    }
+
+    vi.unstubAllGlobals();
+  });
+
   it("detects a merge conflict via the per-PR detail fetch (list endpoint omits mergeability)", async () => {
     process.env.GITHUB_TOKEN = "gh_fake_token";
     mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);

@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, PrFixQueueClient } from "./pr-fix-queue";
 
-const { surfacingMocks, lessonFeedMocks } = vi.hoisted(() => ({
+const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
   surfacingMocks: {
     surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] }),
     surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] }),
@@ -13,6 +13,10 @@ const { surfacingMocks, lessonFeedMocks } = vi.hoisted(() => ({
   lessonFeedMocks: {
     extractLessonFromFixOutcome: vi.fn().mockResolvedValue({ kind: "no_lesson" as const }),
   },
+  githubPrsMocks: {
+    fetchPullRequestMergeState: vi.fn(async () => ({ mergeableState: null, mergeable: null })),
+    fetchPullRequestHeadSha: vi.fn(async (_repo: string, _pr: number): Promise<string | null> => null),
+  },
 }));
 
 vi.mock("./pr-fix-surfacing", () => ({
@@ -23,6 +27,11 @@ vi.mock("./pr-fix-surfacing", () => ({
 
 vi.mock("./lesson-feed", () => ({
   extractLessonFromFixOutcome: lessonFeedMocks.extractLessonFromFixOutcome,
+}));
+
+vi.mock("./github-prs", () => ({
+  fetchPullRequestMergeState: githubPrsMocks.fetchPullRequestMergeState,
+  fetchPullRequestHeadSha: githubPrsMocks.fetchPullRequestHeadSha,
 }));
 
 function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
@@ -556,6 +565,55 @@ describe("enqueuePrFixItem evidence dedupe", () => {
     const again = await enqueuePrFixItem(client, { ...base, evidenceKey: "review:o/r#2:r2" });
     expect(again.status).toBe("QUEUED");
   });
+
+  it("reopens a FIXED item when same evidence re-detected with head SHA unchanged (#940)", async () => {
+    // Worked example from the issue: misospace/miso-gallery#467. The sync
+    // re-detects the CHANGES_REQUESTED evidence every 15 minutes and writes
+    // a fresh `enqueue` history row against a FIXED tombstone whose PR head
+    // never moved. The item must reopen to QUEUED so the loop dispatches a
+    // fix again instead of stranding the PR.
+    const client = makeClient();
+    const input = {
+      repo: "misospace/miso-gallery", pr: 467, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "symlink guard",
+      evidenceKey: "review:misospace/miso-gallery#467:r1",
+      headSha: "efc36e3d",
+    };
+    await enqueuePrFixItem(client, input);
+    await markPrFixItem(client, { repo: "misospace/miso-gallery", pr: 467, status: "FIXED", note: "foreman succeeded" });
+
+    const before = client.history.length;
+    const reopened = await enqueuePrFixItem(client, input);
+
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.lane).toBe("NORMAL");
+    expect(reopened.headSha).toBe("efc36e3d");
+    // History records both the re-enqueue and a #940-tagged note explaining
+    // why we reopened despite the FIXED tombstone.
+    const last = client.history.at(-1);
+    expect(last).toMatchObject({ action: "enqueue", evidenceKey: input.evidenceKey });
+    expect(last.note ?? "").toContain("940");
+    expect(client.history.length).toBeGreaterThan(before);
+  });
+
+  it("does NOT reopen a FIXED item whose head SHA has moved (a real fix happened)", async () => {
+    // The companion case: the FIXED tombstone is real — the workload pushed a
+    // commit and the PR head moved. The sync re-detecting the same evidence
+    // is the standard pinchflat#25 loop and must NOT resurrect the item.
+    const client = makeClient();
+    const firstInput = {
+      repo: "o/r", pr: 3, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f", evidenceKey: "review:o/r#3:r1", headSha: "oldsha",
+    };
+    await enqueuePrFixItem(client, firstInput);
+    await markPrFixItem(client, { repo: "o/r", pr: 3, status: "FIXED" });
+
+    // Same evidence, but head SHA is now different — the workload pushed.
+    const reopened = await enqueuePrFixItem(client, { ...firstInput, headSha: "newsha" });
+
+    expect(reopened.status).toBe("FIXED");
+    expect(reopened.headSha).toBe("newsha");
+  });
 });
 
 describe("buildPrFixBlockedContext", () => {
@@ -659,16 +717,47 @@ describe("requeuePrFixItem surface cleanup", () => {
     expect(surfacingMocks.surfacePrFixRequeued).not.toHaveBeenCalled();
   });
 
-  it("preserves the wrong-status guard and skips cleanup for a non-BLOCKED item", async () => {
+  it("preserves the wrong-status guard and skips cleanup for a STALE item", async () => {
+    // FIXED items are now requeueable (#940); STALE remains terminal because
+    // the upstream PR is gone (merged/closed).
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 72, lane: "NORMAL", reason: "queued", feedback: "f", evidenceKey: "k1",
     });
-    await markPrFixItem(client, { repo: "org/repo", pr: 72, status: "FIXED" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 72, status: "STALE" });
     surfacingMocks.surfacePrFixRequeued.mockClear();
 
     await expect(requeuePrFixItem(client, { repo: "org/repo", pr: 72 }))
-      .rejects.toThrow("not BLOCKED");
+      .rejects.toThrow("not BLOCKED or FIXED");
     expect(surfacingMocks.surfacePrFixRequeued).not.toHaveBeenCalled();
+  });
+
+  it("requeues a FIXED item as a single-call recovery (#940)", async () => {
+    // Recovery used to require two calls: mark BLOCKED, then requeue. The
+    // BLOCKED step was a lie about the state and flipped the lane to
+    // NEEDS_HUMAN. A FIXED item whose PR head hasn't moved should reopen
+    // in one honest call.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 80, lane: "NORMAL", reason: "review nit", feedback: "f", evidenceKey: "k1",
+      headSha: "deadbeef",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 80, status: "FIXED", note: "foreman reported done" });
+    surfacingMocks.surfacePrFixRequeued.mockClear();
+
+    const item = await requeuePrFixItem(client, { repo: "org/repo", pr: 80, note: "no progress" });
+
+    expect(item?.status).toBe("QUEUED");
+    expect(item?.lane).toBe("NORMAL");
+    expect(surfacingMocks.surfacePrFixRequeued).toHaveBeenCalledTimes(1);
+    // History records both the source status and the #940 tag so an audit
+    // can tell this came from a no-progress FIXED tombstone.
+    const lastHistory = client.history.at(-1);
+    expect(lastHistory).toMatchObject({
+      action: "requeue",
+      status: "QUEUED",
+      lane: "NORMAL",
+    });
+    expect(lastHistory.note).toContain("FIXED");
+    expect(lastHistory.note).toContain("940");
   });
 
   it("cleanup failure does not fail the requeue", async () => {
@@ -681,5 +770,112 @@ describe("requeuePrFixItem surface cleanup", () => {
     const item = await requeuePrFixItem(client, { repo: "org/repo", pr: 73 });
 
     expect(item?.status).toBe("QUEUED");
+  });
+});
+
+describe("markPrFixItem head SHA guard (#940)", () => {
+  beforeEach(() => {
+    surfacingMocks.surfacePrFixBlocked.mockClear();
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    // Default to "head moved" so the rest of the test file is unaffected
+    // unless an individual test overrides this.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("newsha");
+  });
+
+  it("marks FIXED normally when the recorded headSha matches a different current head", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-gallery", pr: 467, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "efc36e3d",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("newsha");
+
+    const fixed = await markPrFixItem(client, {
+      repo: "misospace/miso-gallery", pr: 467, status: "FIXED", note: "pushed",
+    });
+
+    expect(fixed?.status).toBe("FIXED");
+    expect(githubPrsMocks.fetchPullRequestHeadSha).toHaveBeenCalledWith(
+      "misospace/miso-gallery", 467,
+    );
+  });
+
+  it("refuses FIXED and rolls back to QUEUED when the PR head SHA has not moved", async () => {
+    // Worked example from #940: workload reported success but pushed nothing.
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-gallery", pr: 467, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "efc36e3d",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("efc36e3d");
+
+    const result = await markPrFixItem(client, {
+      repo: "misospace/miso-gallery", pr: 467, status: "FIXED", note: "foreman reported done",
+    });
+
+    expect(result?.status).toBe("QUEUED");
+    expect(result?.lane).toBe("NORMAL");
+    // A refusal note is recorded in history for the audit log.
+    const last = client.history.at(-1);
+    expect(last).toMatchObject({ action: "mark", status: "QUEUED", lane: "NORMAL" });
+    expect(last.note ?? "").toContain("Refused FIXED");
+    expect(last.note ?? "").toContain("940");
+  });
+
+  it("accepts FIXED when the item has no recorded headSha (legacy rows)", async () => {
+    // Pre-#940 rows were enqueued without headSha. The guard cannot run;
+    // accept rather than strand the PR.
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
+    });
+    // No headSha was passed at enqueue.
+    expect(client.items[0].headSha).toBeUndefined();
+
+    const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "FIXED" });
+
+    expect(fixed?.status).toBe("FIXED");
+    // Guard should not have run — no comparison possible without a record.
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("accepts FIXED when the GitHub head SHA fetch fails (best-effort guard)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
+      headSha: "oldsha",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockRejectedValue(new Error("network timeout"));
+
+    const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "FIXED" });
+
+    expect(fixed?.status).toBe("FIXED");
+  });
+
+  it("accepts FIXED when GitHub returns null for head SHA", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
+      headSha: "oldsha",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+
+    const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "FIXED" });
+
+    expect(fixed?.status).toBe("FIXED");
+  });
+
+  it("does NOT run the head SHA guard for non-FIXED transitions", async () => {
+    // BLOCKED, QUEUED, and STALE must not pay the GitHub round-trip.
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
+      headSha: "oldsha",
+    });
+
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "BLOCKED" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "QUEUED" });
+
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
   });
 });

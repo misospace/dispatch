@@ -513,6 +513,7 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
     branch: event.branch,
     url: event.url,
     title: event.title,
+    headSha: event.headSha ?? null,
     author: event.author,
   });
 
@@ -725,6 +726,7 @@ export async function ingestMergeConflict(
     author: string | null;
     mergeable: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
     linkedIssue?: number | null;
+    headSha?: string | null;
   },
 ): Promise<string | null> {
   // Only CONFLICTING PRs trigger merge conflict items
@@ -750,6 +752,7 @@ export async function ingestMergeConflict(
     branch: opts.branch,
     url: opts.url,
     title: opts.title,
+    headSha: opts.headSha ?? null,
     author: opts.author,
   });
 
@@ -824,6 +827,13 @@ export interface PrFollowupEvent {
   /** review_comment only: the file and line the inline comment is anchored to. */
   path?: string | null;
   line?: number | null;
+  /**
+   * PR head SHA at enqueue time. Used by `enqueuePrFixItem` and `markPrFixItem`
+   * to detect "the workload reported done but the PR head never moved" — without
+   * it, a successful run that pushed nothing strands the PR with `CHANGES_REQUESTED`
+   * and the queue records `FIXED` (#940).
+   */
+  headSha?: string | null;
 }
 
 /**

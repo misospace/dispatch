@@ -120,6 +120,31 @@ export async function fetchPullRequestMergeState(
   return { mergeableState: null, mergeable: null };
 }
 
+/**
+ * Fetch the current PR head SHA from the per-PR detail endpoint.
+ *
+ * Used by the pr-fix-queue to compare the head at enqueue time against the
+ * head when a workload reports `done` (#940): if the SHA has not moved, the
+ * workload did not push a fix and the item must not transition to FIXED.
+ * Returns null when GitHub is unreachable, the response shape is unknown, or
+ * `head.sha` is absent (older fixtures, hard-deleted PRs).
+ */
+export async function fetchPullRequestHeadSha(
+  repoFullName: string,
+  prNumber: number,
+): Promise<string | null> {
+  const headers = await getHeadersAsync();
+  try {
+    const resp = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    if (resp.ok) {
+      const detail = (await resp.json()) as { head?: { sha?: string | null } };
+      return detail.head?.sha ?? null;
+    }
+  } catch {
+  }
+  return null;
+}
+
 export async function fetchPullRequestCheckFailures(repoFullName: string, ref: string): Promise<CheckFailure[]> {
   const FAILURE_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required"]);
   try {
