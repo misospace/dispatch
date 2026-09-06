@@ -898,4 +898,102 @@ Investigate session handling in auth module.`;
       expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
     });
   });
+
+  describe("exactly-one-status-label post-condition (dispatch#941)", () => {
+    // A parked issue: it carries a status label plus the needs-human park marker.
+    const parkedCandidate: GroomingCandidate = {
+      ...mockCandidate,
+      labels: ["status/backlog", "priority/p2", "needs-human"],
+    };
+
+    it("restores status/backlog when a non-ready re-groom drops the status label", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue(parkedCandidate);
+      // The LLM removes status/backlog but adds no status label and picks the
+      // non-claimable backlog lane — the exact pinchflat#81 shape that left the
+      // issue with zero status labels.
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: {
+          labelsToAdd: [],
+          labelsToRemove: ["status/backlog"],
+          lane: { id: "backlog", confidence: "medium", reason: "re-groomed, still parked" },
+          summary: "Re-groomed.",
+        },
+      });
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      expect(statusLabels).toEqual(["status/backlog"]);
+      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/backlog"]));
+    });
+
+    it("restores status/ready when a ready re-groom drops the status label", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue(parkedCandidate);
+      // Ready re-groom: removes the old status, adds no status label, but the
+      // lane is claimable so the issue is workable — it must land on status/ready.
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: {
+          labelsToAdd: [],
+          labelsToRemove: ["status/backlog"],
+          lane: { id: "local", confidence: "high", reason: "determinate fix" },
+          summary: "Marking ready for the local worker lane.",
+        },
+      });
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      expect(statusLabels).toEqual(["status/ready"]);
+      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/ready"]));
+    });
+
+    it("keeps a single status label when the groom adds none and the issue had one", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue(parkedCandidate);
+      // No status change at all: the existing status/backlog must survive.
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: {
+          labelsToAdd: [],
+          labelsToRemove: [],
+          lane: { id: "backlog", confidence: "medium", reason: "no change" },
+          summary: "No change.",
+        },
+      });
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      expect(statusLabels).toEqual(["status/backlog"]);
+      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/backlog"]));
+    });
+
+    it("collapses multiple status labels to one", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({
+        ...parkedCandidate,
+        labels: ["status/backlog", "status/ready", "priority/p2"],
+      });
+      // The LLM adds a second status label on top of an existing one.
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: {
+          labelsToAdd: ["status/ready"],
+          labelsToRemove: [],
+          lane: { id: "local", confidence: "high", reason: "ready" },
+          summary: "Ready.",
+        },
+      });
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      expect(statusLabels).toEqual(["status/ready"]);
+      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/ready"]));
+    });
+  });
 });
