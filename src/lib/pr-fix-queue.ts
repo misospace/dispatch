@@ -2,7 +2,7 @@ import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane
 import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
 import { extractLessonFromFixOutcome } from "./lesson-feed";
 import { prisma } from "@/lib/prisma";
-import { fetchPullRequestMergeState } from "./github-prs";
+import { fetchPullRequestMergeState, fetchPullRequestHeadSha } from "./github-prs";
 
 export type PrFixQueueClient = {
   prFixQueueItem: {
@@ -214,24 +214,48 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       // The enqueue is still recorded in history: knowing the sync re-observed
       // the evidence is useful, and it is the status flip that causes the churn.
       // New evidence flows through normally.
+      //
+      // One exception (#940): a `FIXED` item whose PR head hasn't moved since
+      // enqueue must be reopened, because the FIXED tombstone is untrusted —
+      // a workload reported success without pushing a fix. This is the safety
+      // net for the case where markPrFixItem's head-SHA guard ran with
+      // missing data or before this re-detection loop kicked in.
       const isKnownEvidence =
         !!input.evidenceKey && (existing.evidenceKeys ?? []).includes(input.evidenceKey);
+      const headShaUnchanged =
+        existing.status === "FIXED" &&
+        !!existing.headSha &&
+        typeof input.headSha === "string" &&
+        existing.headSha === input.headSha;
+      const reopenFixStale = isKnownEvidence && headShaUnchanged;
 
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
           lane,
           type,
-          status: isKnownEvidence ? existing.status : nextStatus,
+          // New evidence on a stale FIXED → reopen to QUEUED so the loop
+          // dispatches another fix attempt. Without the reopen we'd write
+          // another `enqueue` history row against a `FIXED` tombstone and
+          // strand the PR (the worked example in #940).
+          status: reopenFixStale ? nextStatus : isKnownEvidence ? existing.status : nextStatus,
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40),
           ...metadataPatch(input),
         },
       });
-      await tx.prFixHistory.create({
-        data: { itemId: updated.id, action: "enqueue", lane: updated.lane, reason: input.reason, evidenceKey: input.evidenceKey },
-      });
+      const historyData: Record<string, unknown> = {
+        itemId: updated.id,
+        action: "enqueue",
+        lane: updated.lane,
+        reason: input.reason,
+        evidenceKey: input.evidenceKey,
+      };
+      if (reopenFixStale) {
+        historyData.note = `Reopened: PR head SHA unchanged since FIXED (${existing.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
+      }
+      await tx.prFixHistory.create({ data: historyData });
       return updated;
     }
 
@@ -285,6 +309,64 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
   return items;
 }
 
+/**
+ * Verify that the PR head SHA at fix-time differs from the head SHA recorded
+ * at enqueue-time. Returns one of:
+ *
+ * - `"passed"` — current head differs from the recorded head (or both are
+ *   null on a freshly re-pushed fix). The fix is real.
+ * - `"no-record"` — the item has no recorded headSha (legacy rows enqueued
+ *   before #940, or a non-sync enqueue). Guard cannot run; we accept.
+ * - `"head-unchanged"` — recorded head equals current head. Workload
+ *   reported success but pushed nothing. Caller must refuse the FIXED.
+ * - `"head-unavailable"` — GitHub fetch failed or returned no headSha. Guard
+ *   could not run; we accept (better than stranding).
+ *
+ * The `enqueuePrFixItem` path keeps `headSha` up to date; the bridge's
+ * `tasks/report` path also runs through this function via `markPrFixItem`
+ * so the same guard fires regardless of who called the transition.
+ *
+ * Best-effort by design: it does not throw. The caller decides what to do
+ * with `"head-unchanged"` (roll back to QUEUED).
+ */
+export async function assertPrHeadMovedForFix(
+  client: PrFixQueueClient,
+  repo: string,
+  pr: number,
+  recordedHeadSha: string | null | undefined,
+  note: string | null,
+): Promise<"passed" | "no-record" | "head-unchanged" | "head-unavailable"> {
+  // Empty record → guard cannot run. This is the legacy path: rows enqueued
+  // before #940, plus any enqueue that did not pass headSha (e.g. a future
+  // fixture). Don't refuse on this — the FIXED tombstone stays meaningful.
+  if (!recordedHeadSha || typeof recordedHeadSha !== "string") {
+    return "no-record";
+  }
+
+  let currentHeadSha: string | null;
+  try {
+    currentHeadSha = await fetchPullRequestHeadSha(repo, pr);
+  } catch (error) {
+    // GitHub unreachable or returned an error. Accept the transition rather
+    // than refuse — the bridge reconcile pass will catch a stale FIXED on
+    // its next sweep. Log for ops.
+    console.warn(`[pr-fix-queue] head SHA check failed for ${repo}#${pr}:`, error instanceof Error ? error.message : error);
+    return "head-unavailable";
+  }
+
+  if (currentHeadSha === null) {
+    // GitHub returned 200 but no head.sha (unknown shape). Same as above.
+    return "head-unavailable";
+  }
+
+  if (currentHeadSha === recordedHeadSha) {
+    // PR head didn't move. Workload reported success without pushing anything.
+    return "head-unchanged";
+  }
+
+  return "passed";
+}
+
 export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixInput) {
   const nextStatus = normalizePrFixStatus(input.status) as PrFixStatus | null;
   if (!nextStatus) throw new Error("Invalid status");
@@ -315,6 +397,33 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
   if (item && previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
     const context = await buildPrFixBlockedContext(client, item);
     await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: input.note ?? null, context });
+  }
+  // Verify head SHA on the FIXED transition (#940): if a workload reports
+  // success but the PR head hasn't moved, the item must NOT be marked FIXED.
+  // We compare against the head SHA recorded at enqueue time. When the record
+  // is missing (legacy rows enqueued before headSha was populated) or the
+  // current head can't be fetched (GitHub unreachable), we accept the
+  // transition — losing the guard is better than stranding the PR forever.
+  if (item && previousStatus !== "FIXED" && item.status === "FIXED") {
+    const headShaGuard = await assertPrHeadMovedForFix(client, input.repo, input.pr, item.headSha, input.note ?? null);
+    if (headShaGuard === "head-unchanged") {
+      // Refuse the tombstone: roll the item back to QUEUED so the loop
+      // dispatches another fix attempt, and audit why we rejected.
+      const reverted = await client.prFixQueueItem.update({
+        where: { id: item.id },
+        data: { status: "QUEUED", lane: "NORMAL" },
+      });
+      await client.prFixHistory.create({
+        data: {
+          itemId: reverted.id,
+          action: "mark",
+          status: "QUEUED",
+          lane: "NORMAL",
+          note: `Refused FIXED: PR head SHA unchanged since enqueue (recorded=${item.headSha ?? "null"}). Workload reported success but pushed nothing (#940).`,
+        },
+      });
+      return reverted;
+    }
   }
   // Trigger the lesson feed (#754) only on a clean transition into FIXED
   // AND only when feedback burned ≥2 attempts — the same bar the issue calls
@@ -424,6 +533,11 @@ export function toAgentQueuePrFixItem(item: any) {
  * Return a BLOCKED pr-fix item to QUEUED with its attempt counter reset, so
  * the loop works it again without needing a hand-pushed commit to retrigger.
  *
+ * Accepts `FIXED` items too — the FIXED tombstone is untrusted when the PR
+ * head didn't move, and the previously-recommended `mark_pr_fix status=blocked
+ * → requeue_pr_fix` two-call recovery required lying about the state. A single
+ * honest requeue is preferable (#940).
+ *
  * Refuses if the upstream PR is already merged or closed — consistent with
  * `classify_pr_lifecycle` treating those as nothing-left-to-fix. The caller
  * passes `isPrMergedOrClosed` (computed upstream) so this stays a pure db op.
@@ -436,9 +550,13 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
   const item = await client.$transaction(async (tx) => {
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
     if (!existing) return null;
-    if (existing.status !== "BLOCKED") {
-      throw new Error(`Cannot requeue: item is ${existing.status}, not BLOCKED`);
+    // Requeue acts on both BLOCKED (the original case) and FIXED (recovery
+    // from a no-progress tombstone, #940). STALE is rejected because the
+    // upstream PR is gone.
+    if (existing.status !== "BLOCKED" && existing.status !== "FIXED") {
+      throw new Error(`Cannot requeue: item is ${existing.status}, not BLOCKED or FIXED`);
     }
+    const reopenedFrom = existing.status;
     const updated = await tx.prFixQueueItem.update({
       where: { id: existing.id },
       data: { status: "QUEUED", lane: "NORMAL" },
@@ -449,7 +567,9 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
         action: "requeue",
         status: "QUEUED",
         lane: "NORMAL",
-        note: input.note ?? "operator requeue",
+        note:
+          (input.note ? `${input.note} (reopened from ${reopenedFrom})` : `operator requeue from ${reopenedFrom}`) +
+          (reopenedFrom === "FIXED" ? " — #940 recovery" : ""),
       },
     });
     return updated;

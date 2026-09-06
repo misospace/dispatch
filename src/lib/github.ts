@@ -52,6 +52,7 @@ export {
   fetchPullRequestHealthSignals,
   fetchPullRequestState,
   fetchPullRequestMergeState,
+  fetchPullRequestHeadSha,
   fetchPullRequestCheckFailures,
   fetchLinkedPrHealthInput,
   fetchPullRequestCommitMessages,
