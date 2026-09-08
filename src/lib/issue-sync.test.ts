@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubIssue } from "@/types";
 
 const { mocks } = vi.hoisted(() => ({
@@ -27,8 +27,10 @@ import {
   reconcileClosedIssues,
   closedIssueStatusFix,
   fetchAllStateIssues,
+  defaultCurrentLane,
   SYNC_OVERLAP_BUFFER_MS,
 } from "./issue-sync";
+import { setLaneConfig, resetLaneConfig } from "@/lib/lane-config";
 
 function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
@@ -417,5 +419,41 @@ describe("fetchAllStateIssues", () => {
       includeClosed: true,
       since: new Date(anchor.getTime() - SYNC_OVERLAP_BUFFER_MS),
     });
+  });
+});
+
+describe("defaultCurrentLane (dispatch#964)", () => {
+  afterEach(() => resetLaneConfig());
+
+  it("returns the configured default claimable lane id", () => {
+    // A renamed multi-lane deployment: the default lane is `local`, and
+    // `normal` is only an alias. An ingested issue must start on `local`, the
+    // lane a worker actually polls — never the old hardcoded `normal`.
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+    expect(defaultCurrentLane()).toBe("local");
+  });
+
+  it("falls back to the built-in default lane when config is unset", () => {
+    resetLaneConfig();
+    // DEFAULT_LANE_CONFIG's claimable lane is `default` — agnostic, and still
+    // never the removed `normal`.
+    expect(defaultCurrentLane()).toBe("default");
+  });
+
+  it("prefers the first claimable lane when none is marked role=default", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "backlog", title: "Backlog", claimable: false },
+        { id: "work", title: "Work", claimable: true },
+      ],
+    });
+    expect(defaultCurrentLane()).toBe("work");
   });
 });

@@ -3,7 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
-import { refreshSingleIssue } from "@/lib/issue-sync";
+import { refreshSingleIssue, defaultCurrentLane } from "@/lib/issue-sync";
 import { authorizeRequest } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -80,6 +80,9 @@ export async function POST(request: NextRequest) {
       data: {
         repositoryId: targetRepo.id,
         ...issueData,
+        // Start on the configured default claimable lane, not the removed
+        // hardcoded "normal" default (dispatch#964).
+        currentLane: defaultCurrentLane(),
       },
     });
 

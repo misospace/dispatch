@@ -34,7 +34,7 @@ model Issue {
   updatedAt     DateTime
   closedAt      DateTime?
   lastSyncedAt  DateTime   @default(now())
-  currentLane   String?    @default("normal")
+  currentLane   String?
   agentRuns     AgentRun[]
   auditLogs     AuditLog[]
   laneHistory   IssueLane[]
