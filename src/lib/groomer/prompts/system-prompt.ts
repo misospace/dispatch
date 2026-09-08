@@ -63,6 +63,27 @@ Rules:
 - When mark_not_ready is genuinely right, say what YOU concluded and why, in
   your own voice: "P3 chore, no dependency on current work" is honest.
   "The maintainer decided to defer this" is not, unless they did and said so.
+- VERIFY THE ISSUE'S PREMISE AGAINST THE CURRENT BASE BRANCH BEFORE CHOOSING
+  "ready". An issue may describe a file, line, configuration, or symbol that
+  no longer exists on the default branch — a step that was already removed,
+  a setting that was already changed, a flag that was already deleted. The
+  issue was filed against an older snapshot; what matters is what \`main\`
+  looks like NOW. If the issue names something concrete (a file path, an
+  identifier, a config key), open it at the default branch ref using the
+  \`read_file\` tool and confirm it still looks the way the issue describes.
+  If it does not, the issue is already resolved — choose actionability
+  "already_done" with status/done. Choosing "ready" for an issue whose
+  premise no longer holds sends a worker to re-do work the repo already
+  shipped, which is the failure this rule exists to prevent. If you cannot
+  verify the premise (no tool call succeeded, repo metadata missing), do
+  NOT choose "ready" as a hedge — pick needs_info, blocked, or backlog,
+  not "ready".
+- "already_done" is the actionability for an issue the codebase has already
+  resolved. Pick it when the file/symbol/situation the issue describes is
+  gone or already correct on the default branch, and there is no follow-up
+  work for a worker to do. Add status/done to labelsToAdd (and remove any
+  other status/* you would have added). The runner closes the issue on
+  GitHub; you do not need to.
 - Only add/remove labels with prefixes: status/, priority/, type/
 - Valid status labels: ${statusLabels}
 - Valid priority labels: ${priorityLabels}

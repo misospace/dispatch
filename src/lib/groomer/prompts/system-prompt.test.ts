@@ -140,5 +140,27 @@ describe("buildGroomerSystemPrompt", () => {
       expect(prompt).not.toContain("Judgement, not size, is the test");
       expect(prompt).toContain('Most ready work belongs in "local"');
     });
+  
+    describe("dispatch#957", () => {
+      it("instructs the groomer to verify the issue's premise against the current base branch before choosing ready", () => {
+        const prompt = buildGroomerSystemPrompt(baseParams);
+        expect(prompt).toContain("VERIFY THE ISSUE'S PREMISE AGAINST THE CURRENT BASE BRANCH");
+        expect(prompt).toContain("default branch");
+        expect(prompt).toContain("read_file");
+      });
+  
+      it("describes what already_done means and how the model should signal it", () => {
+        const prompt = buildGroomerSystemPrompt(baseParams);
+        expect(prompt).toContain('"already_done"');
+        expect(prompt).toContain("status/done");
+        // The model does not need to call close — the runner handles it.
+        expect(prompt).toContain("closes the issue on");
+      });
+  
+      it("forbids hedging with ready when the premise cannot be verified", () => {
+        const prompt = buildGroomerSystemPrompt(baseParams);
+        expect(prompt).toContain('NOT choose "ready" as a hedge');
+      });
+    });
   });
 });

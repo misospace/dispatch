@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { addIssueComment, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
+import { addIssueComment, closeIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
@@ -46,6 +46,7 @@ export interface GroomerDeps {
   updateLabels: typeof updateIssueLabels;
   addComment: typeof addIssueComment;
   updateTitleAndBody: typeof updateIssueTitleAndBody;
+  closeIssue: typeof closeIssue;
   findActiveLeases: typeof findActiveLeasesForIssue;
   upsertLease: typeof upsertLease;
   releaseLease: typeof releaseLease;
@@ -66,6 +67,7 @@ const defaultDeps: GroomerDeps = {
   updateLabels: updateIssueLabels,
   addComment: addIssueComment,
   updateTitleAndBody: updateIssueTitleAndBody,
+  closeIssue,
   findActiveLeases: findActiveLeasesForIssue,
   upsertLease,
   releaseLease,
@@ -297,7 +299,7 @@ async function executeGroomerRun(
     // the readyForWork path; this catches every path, including a non-ready re-groom
     // that dropped the status label. It needs the current labels, which only live
     // here, so it is enforced on the final label set rather than the LLM output.
-    newLabels = ensureSingleStatusLabel(newLabels, isReadyForWork(output));
+    newLabels = ensureSingleStatusLabel(newLabels, isReadyForWork(output), isAlreadyDone(output));
 
     // Compute title/body enrichment decisions
     const titleBodyMutations = computeTitleBodyMutations(candidate, output);
@@ -310,6 +312,7 @@ async function executeGroomerRun(
       summary: output.summary ?? null,
       notReadyReason: notReadyReason ?? null,
       willComment: Boolean(output.githubComment?.trim()),
+      willCloseIssue: isAlreadyDone(output),
       titleRewritten: titleBodyMutations.shouldRewrite,
       originalTitle: titleBodyMutations.shouldRewrite ? candidate.title : undefined,
       proposedTitle: titleBodyMutations.proposedTitle,
@@ -421,6 +424,28 @@ async function executeGroomerRun(
       }
     }
 
+    // Close the issue on GitHub when the groomer concluded it is already
+    // resolved (dispatch#957). Without this step "already_done" was a dead
+    // enum value: the issue landed in the non-claimable backlog lane and
+    // stayed open forever. The label work above already coerced the local
+    // state to status/done; the close here makes GitHub agree so the local
+    // sync picks the issue up as closed on its next pass. Best-effort, like
+    // the comment path: a GitHub-side failure must not poison the run, but
+    // it should be surfaced on the GroomingRun so an operator can retry.
+    if (isAlreadyDone(output)) {
+      try {
+        await deps.closeIssue(candidate.repoFullName, candidate.number);
+        appliedMutations.issueClosed = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error closing issue";
+        console.error(
+          `[groomer] failed to close ${candidate.repoFullName}#${candidate.number} on already_done, continuing without it:`,
+          error,
+        );
+        appliedMutations.issueClosedError = message;
+      }
+    }
+
     // Update issue grooming fields
     const issueData: Record<string, unknown> = {
       groomedAt: new Date(),
@@ -432,6 +457,14 @@ async function executeGroomerRun(
     if (output.blockedReason) issueData.blockedReason = output.blockedReason;
     if (notReadyReason) issueData.notReadyReason = notReadyReason;
     if (output.nextGroomingAction) issueData.nextGroomingAction = output.nextGroomingAction;
+    // When the groomer closes the issue, mirror the closed state locally so
+    // the selector stops considering it (state: "open" is the implicit filter)
+    // and the next sync confirms what we just wrote. Best-effort on GitHub
+    // failure: appliedMutations.issueClosedError already captures that case.
+    if (appliedMutations.issueClosed === true) {
+      issueData.state = "closed";
+      issueData.closedAt = new Date();
+    }
 
     await deps.prisma.issue.update({
       where: { id: candidate.id },
@@ -621,18 +654,40 @@ function isReadyForWork(output: GroomerOutput): boolean {
 }
 
 /**
+ * The "done" signal: the groomer concluded the issue is already resolved
+ * (actionability === "already_done"). Previously this was a no-op — the issue
+ * landed on status/backlog, sat in the non-claimable backlog lane, and stayed
+ * open until something else closed it (dispatch#957). Treating it as a label
+ * category lets the rest of the pipeline (selector, status post-condition,
+ * close-on-GitHub) react to it without each consumer re-checking actionability.
+ */
+function isAlreadyDone(output: GroomerOutput): boolean {
+  return output.actionability === "already_done";
+}
+
+/**
  * Enforce the post-condition that a groomed issue carries exactly one status/*
- * label (dispatch#941).
+ * label (dispatch#941). Done wins: an "already_done" decision collapses every
+ * other status to status/done, so the close-on-GitHub step and the local
+ * selector (which excludes status/done) both see the same end state.
  *
- * - Zero status labels: the groom removed the old one and added none. Restore a
- *   status so the issue stays visible — status/ready when the groom concluded the
- *   issue is workable, otherwise status/backlog (visible, deprioritised).
- * - More than one: keep the single most relevant status (ready wins, then the
- *   first present) and drop the rest.
+ * - done=true: always end on status/done. Strips any other status the LLM
+ *   added (e.g. status/ready, status/backlog).
+ * - Zero status labels otherwise: the groom removed the old one and added
+ *   none. Restore a status so the issue stays visible — status/ready when
+ *   the groom concluded the issue is workable, otherwise status/backlog
+ *   (visible, deprioritised).
+ * - More than one (non-done): keep the single most relevant status (ready
+ *   wins, then the first present) and drop the rest.
  *
  * Returns a new array; the input is not mutated.
  */
-function ensureSingleStatusLabel(labels: string[], ready: boolean): string[] {
+function ensureSingleStatusLabel(labels: string[], ready: boolean, done: boolean): string[] {
+  if (done) {
+    const without = labels.filter((l) => !l.startsWith("status/"));
+    return [...without, "status/done"];
+  }
+
   const statusLabels = labels.filter((l) => l.startsWith("status/"));
   if (statusLabels.length === 1) return labels;
 

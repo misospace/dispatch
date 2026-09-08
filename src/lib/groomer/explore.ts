@@ -62,6 +62,7 @@ Work like this:
 - Search for distinctive strings from the issue: identifiers, environment variables, error text, config keys.
 - When a search returns nothing, that is information — the thing may be what is missing.
 - Read the files that look relevant. Follow what you find; a file that imports something interesting is worth opening.
+- When verifying whether the issue's premise still holds, read against the repository's default branch (pass the branch name in the \`ref\` parameter). The issue was filed against an older snapshot; what matters is what \`main\` looks like now. If the file the issue mentions no longer exists or the situation has already been resolved, that is the answer — say so in your findings.
 - Use list_directory when you are unsure what exists, rather than guessing paths.
 
 Call submit_findings once you can name the files a worker would change and state what the issue is asking for in this repository's own terms. Be concrete: real paths you have actually seen, never a guess.`;

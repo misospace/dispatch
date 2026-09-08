@@ -83,13 +83,23 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
         name: "read_file",
         description:
           "Read a file from this repository by its full path from the repo root, " +
-          "e.g. src/lib/prisma.ts. Long files are truncated.",
+          "e.g. src/lib/prisma.ts. Long files are truncated. Pass `ref` to read " +
+          "a specific branch or SHA; without it, the repository's default branch " +
+          "is used. Pass the default branch when verifying whether an issue's " +
+          "premise still holds against the current `main`.",
         parameters: {
           type: "object",
           additionalProperties: false,
           required: ["path"],
           properties: {
             path: { type: "string", description: "Path from the repository root" },
+            ref: {
+              type: "string",
+              description:
+                "Branch, tag, or commit SHA. Omit for the repository's default " +
+                "branch; supply explicitly when verifying that a file/symbol " +
+                "still exists on `main`.",
+            },
           },
         },
       },
@@ -107,6 +117,10 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
           required: ["path"],
           properties: {
             path: { type: "string", description: "Directory path from the repo root, or \"\" for root" },
+            ref: {
+              type: "string",
+              description: "Branch, tag, or commit SHA. Omit for the repository's default branch.",
+            },
           },
         },
       },
@@ -230,7 +244,8 @@ export async function executeGroomerTool(
         if ("error" in normalized) return fail(normalized.error);
         const path = normalized.path;
         if (!path) return fail("read_file needs a non-empty path.");
-        const text = await deps.readFile(options.repoFullName, path);
+        const ref = asString(call.arguments.ref).trim() || undefined;
+        const text = await deps.readFile(options.repoFullName, path, ref);
         if (!text) {
           return {
             ok: true,
@@ -248,7 +263,8 @@ export async function executeGroomerTool(
         const normalized = normalizeRepoPath(asString(call.arguments.path));
         if ("error" in normalized) return fail(normalized.error);
         const path = normalized.path;
-        const entries = await deps.listDir(options.repoFullName, path);
+        const ref = asString(call.arguments.ref).trim() || undefined;
+        const entries = await deps.listDir(options.repoFullName, path, ref);
         if (entries.length === 0) {
           return {
             ok: true,

@@ -24,6 +24,7 @@ const { mocks } = vi.hoisted(() => ({
     updateIssueLabels: vi.fn(),
     addIssueComment: vi.fn(),
     updateIssueTitleAndBody: vi.fn(),
+    closeIssue: vi.fn(),
     findActiveLeasesForIssue: vi.fn(),
     upsertLease: vi.fn(),
     releaseLease: vi.fn(),
@@ -69,6 +70,7 @@ vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
   addIssueComment: mocks.addIssueComment,
   updateIssueTitleAndBody: mocks.updateIssueTitleAndBody,
+  closeIssue: mocks.closeIssue,
   addIssueLabel: mocks.addIssueLabel,
   removeIssueLabel: mocks.removeIssueLabel,
 }));
@@ -150,6 +152,7 @@ describe("runHostedGroomer", () => {
     mocks.updateIssueLabels.mockResolvedValue(undefined);
     mocks.updateIssueTitleAndBody.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
+    mocks.closeIssue.mockResolvedValue(undefined);
     mocks.findActiveLeasesForIssue.mockResolvedValue([]);
     mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
     mocks.releaseLease.mockResolvedValue({ id: "lease-1" });
@@ -994,6 +997,116 @@ Investigate session handling in auth module.`;
       const statusLabels = written.filter((l) => l.startsWith("status/"));
       expect(statusLabels).toEqual(["status/ready"]);
       expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/ready"]));
+    });
+  });
+
+  describe("already_done has an effect (dispatch#957)", () => {
+    const alreadyDoneOutput: GroomerOutput = {
+      actionability: "already_done",
+      labelsToAdd: ["status/done"],
+      labelsToRemove: [],
+      lane: { id: "backlog", confidence: "high", reason: "the step is already gone on main" },
+      summary: "The Generate Token step no longer exists; closing as already resolved.",
+      githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
+    };
+
+    it("closes the GitHub issue, lands status/done, and mirrors closed state locally", async () => {
+      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: alreadyDoneOutput });
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(mocks.closeIssue).toHaveBeenCalledWith("org/repo", 42);
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      expect(statusLabels).toEqual(["status/done"]);
+      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/done"]));
+
+      // Local mirror of the closed state — selector's state: "open" filter
+      // must stop considering the issue on the next pass.
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "issue-42" },
+          data: expect.objectContaining({
+            state: "closed",
+            closedAt: expect.any(Date),
+            currentLane: "backlog",
+          }),
+        }),
+      );
+      expect(result!.appliedMutations?.issueClosed).toBe(true);
+    });
+
+    it("coerces conflicting status labels to status/done (issue#957 invariant)", async () => {
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: {
+          ...alreadyDoneOutput,
+          // Inconsistent LLM output: says already_done but added a non-done
+          // status. The invariant must reconcile so the close step and the
+          // selector see a single, correct status.
+          labelsToAdd: ["status/ready"],
+        },
+      });
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      expect(statusLabels).toEqual(["status/done"]);
+      expect(result!.plannedLabels).not.toEqual(expect.arrayContaining(["status/ready"]));
+      // Still closes the issue despite the inconsistent label set.
+      expect(mocks.closeIssue).toHaveBeenCalledWith("org/repo", 42);
+    });
+
+    it("records issueClosedError when the GitHub close call fails but does not fail the run", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.closeIssue.mockRejectedValue(new Error("GitHub API error: 502"));
+      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: alreadyDoneOutput });
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(result!.dryRun).toBe(false);
+      // The essential label mutation still applied even though close failed.
+      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+      expect(result!.appliedMutations?.issueClosedError).toMatch(/502/);
+      // Local state is NOT flipped closed when GitHub didn't actually close it,
+      // so the issue keeps the chance to be retried.
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ state: "closed" }),
+        }),
+      );
+      errSpy.mockRestore();
+    });
+
+    it("dry-run reports willCloseIssue in the mutation plan but does not call GitHub", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: alreadyDoneOutput });
+
+      const result = await runHostedGroomer();
+
+      expect(result!.dryRun).toBe(true);
+      expect(result!.mutationPlan?.willCloseIssue).toBe(true);
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("does not close when actionability is anything other than already_done", async () => {
+      mocks.validateGroomerOutput.mockReturnValue({
+        valid: true,
+        parsed: { ...mockOutput, actionability: "ready" },
+      });
+
+      await runHostedGroomer();
+
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ state: "closed" }) }),
+      );
     });
   });
 });

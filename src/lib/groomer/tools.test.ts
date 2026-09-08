@@ -234,7 +234,34 @@ describe("executeGroomerTool path handling", () => {
       options,
       deps,
     );
-    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts");
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", undefined);
+  });
+
+  it("passes the optional ref through to read_file so the groomer can verify against the base branch (dispatch#957)", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") });
+    await executeGroomerTool(
+      { name: "read_file", arguments: { path: "src/lib/prisma.ts", ref: "main" } },
+      options,
+      deps,
+    );
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", "main");
+  });
+
+  it("passes the optional ref through to list_directory", async () => {
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue([]) });
+    await executeGroomerTool(
+      { name: "list_directory", arguments: { path: "src", ref: "main" } },
+      options,
+      deps,
+    );
+    expect(deps.listDir).toHaveBeenCalledWith("org/repo", "src", "main");
+  });
+
+  it("exposes a ref parameter on the read_file tool definition so models can call it", () => {
+    const def = buildGroomerToolDefinitions().find(
+      (t) => (t.function as { name: string }).name === "read_file",
+    ) as { function: { parameters: { properties: Record<string, unknown> } } };
+    expect(def.function.parameters.properties).toHaveProperty("ref");
   });
 
   it("does not leave a replacement character before the truncation marker", async () => {
