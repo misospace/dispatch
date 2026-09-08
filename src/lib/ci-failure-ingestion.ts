@@ -260,6 +260,29 @@ export function decideAction(
   return { action: "file", signature, supersedes: closedForSignature?.number ?? null };
 }
 
+/**
+ * Is there already an open issue for this signature?
+ *
+ * Exported so the sync can re-ask the question against a FRESH listing
+ * immediately before it creates an issue. `decideAction` necessarily answers
+ * it from a listing taken earlier in the pass, and a listing that is stale for
+ * any reason costs a duplicate issue — which in a deployment wired to an
+ * autonomous loop costs a full coder run re-deriving a fix that is already
+ * queued (dispatch#961: llmkube-images#378 and #379 were filed 8.5h apart with
+ * identical signatures and byte-identical bodies, while the first stayed open).
+ *
+ * Deliberately narrower than `decideAction`: it answers only "would this be a
+ * duplicate", so it can be applied as a last-moment guard without re-deciding
+ * policy or re-deriving workflow state.
+ */
+export function hasOpenIssueForSignature(
+  filed: FiledIssue[],
+  signature: string,
+): number | null {
+  const open = filed.find((i) => i.state === "open" && i.signature === signature);
+  return open ? open.number : null;
+}
+
 export interface IssueDraft {
   title: string;
   body: string;

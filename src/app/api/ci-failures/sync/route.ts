@@ -20,6 +20,7 @@ import {
   decideAction,
   extractFailureMarker,
   extractFailureWorkflow,
+  hasOpenIssueForSignature,
   groupDefaultBranchRuns,
   type CiRun,
   type FiledIssue,
@@ -160,6 +161,38 @@ export async function POST(request: NextRequest) {
           }
 
           if (state.kind !== "repeated-failure") continue;
+
+          // Re-ask "is this already filed?" against a FRESH listing, because
+          // `filed` was taken before any of this pass's work and a duplicate
+          // is unrecoverable once created. dispatch#961 saw two byte-identical
+          // issues for one signature filed 8.5h apart while the first stayed
+          // open, which means the earlier listing was incomplete for a reason
+          // the code cannot see. This guard does not need to know why.
+          //
+          // Fail CLOSED: if the re-listing itself fails we skip filing. A
+          // missed filing is retried on the next pass 30 minutes later; a
+          // duplicate costs a coder run and has to be closed by hand.
+          let recheck: FiledIssue[] | null = null;
+          try {
+            recheck = await filedIssuesFor(repoFullName);
+          } catch (e) {
+            skipped.push({
+              repo: repoFullName,
+              workflow: history.workflowName,
+              reason: `could not re-verify before filing: ${String(e)}`,
+            });
+            continue;
+          }
+          const duplicateOf = hasOpenIssueForSignature(recheck, action.signature);
+          if (duplicateOf !== null) {
+            skipped.push({
+              repo: repoFullName,
+              workflow: history.workflowName,
+              reason: `already filed as #${duplicateOf} (caught on re-verify)`,
+            });
+            continue;
+          }
+
           const draft = buildIssueDraft({
             repoFullName,
             workflowName: history.workflowName,
@@ -177,7 +210,12 @@ export async function POST(request: NextRequest) {
           });
           // Keep the local view current so a second workflow in the same repo
           // with the same signature does not file a duplicate in this pass.
-          filed.push({ number: created.number, state: "open", signature: action.signature });
+          filed.push({
+            number: created.number,
+            state: "open",
+            signature: action.signature,
+            workflowName: history.workflowName,
+          });
           filedIssues.push({
             repo: repoFullName,
             number: created.number,

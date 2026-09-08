@@ -9,6 +9,7 @@ import {
   extractFailureMarker,
   extractFailureWorkflow,
   groupDefaultBranchRuns,
+  hasOpenIssueForSignature,
   type CiRun,
   type FiledIssue,
 } from "./ci-failure-ingestion";
@@ -470,5 +471,40 @@ describe("alternating red/green workflow (#953)", () => {
     expect(filed[1]).toMatchObject({ number: 2, state: "open", signature: "sig1" });
     expect(actions).toContain("close");
     expect(actions).toContain("file#1");
+  });
+});
+
+describe("hasOpenIssueForSignature", () => {
+  // The guard the sync applies against a fresh listing immediately before
+  // creating an issue (dispatch#961). Narrow on purpose: it answers only
+  // "would this be a duplicate".
+  it("finds an open issue with the same signature", () => {
+    const filed: FiledIssue[] = [{ number: 378, state: "open", signature: "sig1" }];
+    expect(hasOpenIssueForSignature(filed, "sig1")).toBe(378);
+  });
+
+  it("ignores a closed issue with the same signature", () => {
+    // A closed issue for this signature means the fix did not hold, which is a
+    // refile, not a duplicate — decideAction owns that call.
+    const filed: FiledIssue[] = [{ number: 378, state: "closed", signature: "sig1" }];
+    expect(hasOpenIssueForSignature(filed, "sig1")).toBeNull();
+  });
+
+  it("ignores an open issue with a different signature", () => {
+    const filed: FiledIssue[] = [{ number: 378, state: "open", signature: "other" }];
+    expect(hasOpenIssueForSignature(filed, "sig1")).toBeNull();
+  });
+
+  it("is null on an empty listing", () => {
+    expect(hasOpenIssueForSignature([], "sig1")).toBeNull();
+  });
+
+  it("does not care which workflow the open issue belongs to", () => {
+    // Signature already encodes repo + workflow + job + normalised excerpt, so
+    // an identical signature is the same failure whatever the marker says.
+    const filed: FiledIssue[] = [
+      { number: 378, state: "open", signature: "sig1", workflowName: "Vulnerability Scan" },
+    ];
+    expect(hasOpenIssueForSignature(filed, "sig1")).toBe(378);
   });
 });
