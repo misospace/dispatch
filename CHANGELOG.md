@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.57](https://github.com/misospace/dispatch/compare/v0.5.56...v0.5.57) (2026-09-08)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.42.0 → 1.43.0) ([#959](https://github.com/misospace/dispatch/issues/959)) ([304cb48](https://github.com/misospace/dispatch/commit/304cb481bb50e48ea898cecd4b009375520093bf))
+
+
+### Bug Fixes
+
+* **ci-failures:** re-verify before filing so a stale listing cannot duplicate ([#962](https://github.com/misospace/dispatch/issues/962)) ([39759a9](https://github.com/misospace/dispatch/commit/39759a977aedb215450ff8ce960457b8532cf4a8))
+* **groomer:** verify issue premise against base branch and act on already_done ([#958](https://github.com/misospace/dispatch/issues/958)) ([7ed19eb](https://github.com/misospace/dispatch/commit/7ed19eb4f060c236a3ce9ab7a38f6d32edad6f4a)), closes [#957](https://github.com/misospace/dispatch/issues/957)
+
 ## [0.5.56](https://github.com/misospace/dispatch/compare/v0.5.55...v0.5.56) (2026-09-07)
 
 
