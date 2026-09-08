@@ -31,6 +31,7 @@ vi.mock("@/lib/config", () => ({
 }));
 
 vi.mock("@/lib/issue-sync", () => ({
+  defaultCurrentLane: vi.fn().mockReturnValue("default"),
   refreshSingleIssue: vi.fn().mockResolvedValue({
     success: true,
     repo: { id: "repo-1", fullName: "org/repo" },

@@ -2,10 +2,21 @@ import { ACTIVE_STATUS_LABELS, GitHubIssue } from "@/types";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
+import { getDefaultClaimableLane } from "@/lib/lane-config";
 
 export interface SyncRepo {
   id: string;
   fullName: string;
+}
+
+/**
+ * The lane a newly-ingested issue should start on: the deployment's configured
+ * default claimable lane, or null when no claimable lane is configured. Used at
+ * every issue-create site so an ungroomed issue is grabbable on a real lane
+ * rather than the removed hardcoded "normal" column default (dispatch#964).
+ */
+export function defaultCurrentLane(): string | null {
+  return getDefaultClaimableLane()?.id ?? null;
 }
 
 export interface SyncedIssueData {
@@ -389,7 +400,16 @@ export function makePrismaIssueStore(): IssueStore {
       await prisma.issue.update({ where: { id }, data });
     },
     async createIssue(repositoryId: string, data: SyncedIssueData) {
-      await prisma.issue.create({ data: { ...data, repositoryId } });
+      // Stamp the configured default claimable lane so a freshly-ingested,
+      // not-yet-groomed issue lands on a lane a worker actually polls. Without
+      // this it fell through to the column default, which was a hardcoded
+      // "normal" — an alias, not a configured lane, in a renamed deployment —
+      // and the issue was invisible to the queue until grooming re-laned it
+      // (dispatch#964). Resolves per-deployment, so nothing lane-specific is
+      // baked in.
+      await prisma.issue.create({
+        data: { ...data, repositoryId, currentLane: defaultCurrentLane() },
+      });
     },
   };
 }
