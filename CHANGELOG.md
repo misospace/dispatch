@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.58](https://github.com/misospace/dispatch/compare/v0.5.57...v0.5.58) (2026-09-08)
+
+
+### Bug Fixes
+
+* **lanes:** start ingested issues on the configured default lane, not a hardcoded "normal" ([#965](https://github.com/misospace/dispatch/issues/965)) ([61dfeeb](https://github.com/misospace/dispatch/commit/61dfeeb4477d40d727fe829818ba36a94788c498))
+
 ## [0.5.57](https://github.com/misospace/dispatch/compare/v0.5.56...v0.5.57) (2026-09-08)
 
 
