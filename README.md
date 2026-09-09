@@ -179,6 +179,7 @@ The lesson feed shares `DISPATCH_LLM_API_KEY` and `DISPATCH_LLM_BASE_URL` with t
 | `OPENAI_BASE_URL` | No | Legacy OpenAI-compatible base URL fallback for the lesson feed. Ignored when `DISPATCH_LLM_BASE_URL` is set. |
 | `DISPATCH_LESSON_FEED_MODEL` | No | Model for the lesson feed. Takes precedence over `DISPATCH_GROOMER_MODEL` and `OPENAI_MODEL`. |
 | `OPENAI_MODEL` | No | Legacy model fallback for the lesson feed. Ignored when `DISPATCH_LESSON_FEED_MODEL` or `DISPATCH_GROOMER_MODEL` is set. |
+| `DISPATCH_LESSON_FEED_ENABLED` | No | Opt-in gate for the lesson feed (#970). When unset, or anything other than the literal string `"true"`, `extractLessonFromFixOutcome()` in `src/lib/lesson-feed.ts` returns `no_lesson` without making any LLM call. The pr-fix queue no longer fires the feed automatically — deployments that want their own downstream (dedupe via `lessonAlreadyCovered` + open an AGENTS.md PR) must enable this env var and wire the call themselves. |
 | `DISPATCH_AGENT_NAME` | No | Display name used by the agent when posting heartbeats. Defaults to the host's `HOSTNAME` env var. |
 | `DISPATCH_CLOSED_ISSUE_RETENTION_DAYS` | No | Days that a closed issue is kept before `/api/issues/prune-closed` is allowed to remove it. Defaults to `30`. |
 | `DISPATCH_DONE_RETENTION_DAYS` | No | Days that a done issue is kept before the issue list endpoint filters it out. Defaults to `7`. |

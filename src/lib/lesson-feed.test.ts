@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   extractLessonFromFixOutcome,
+  isLessonFeedEnabled,
   lessonAlreadyCovered,
   readConfig,
   type ExtractLessonInput,
@@ -78,11 +79,17 @@ const baseInput: ExtractLessonInput = {
 };
 
 describe("extractLessonFromFixOutcome", () => {
+  // The pre-#970 tests all force the feed on so they can exercise the model
+  // path without mutating process.env. Issue #970 made the feed opt-in via
+  // DISPATCH_LESSON_FEED_ENABLED; the enabled:true option bypasses that gate
+  // for tests.
+  const opts = { enabled: true } as const;
+
   it("returns no_lesson below the ≥2-attempt threshold without calling the model", async () => {
     const { fetcher, calls } = makeFetcher({ verdict: "no_lesson" });
     const out = await extractLessonFromFixOutcome(
       { ...baseInput, feedback: ["only one failure"] },
-      { fetcher, apiKey: "test" },
+      { fetcher, apiKey: "test", ...opts },
     );
     expect(out).toEqual({ kind: "no_lesson" } satisfies LessonOutcome);
     expect(calls).toHaveLength(0);
@@ -90,7 +97,7 @@ describe("extractLessonFromFixOutcome", () => {
 
   it("uses json_schema as the primary response_format (groomer pattern)", async () => {
     const { fetcher, calls } = makeFetcher({ verdict: "no_lesson" });
-    await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" });
+    await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts });
     expect(calls).toHaveLength(1);
     expect(calls[0].responseFormat?.type).toBe("json_schema");
   });
@@ -100,7 +107,7 @@ describe("extractLessonFromFixOutcome", () => {
       verdict: "lesson",
       text: "assert_eq is 2-arg; omitting the name is a parse error that drops the whole test file.",
     });
-    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" });
+    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts });
     expect(out.kind).toBe("lesson");
     if (out.kind === "lesson") {
       expect(out.text).toMatch(/assert_eq/);
@@ -109,17 +116,17 @@ describe("extractLessonFromFixOutcome", () => {
 
   it("treats verdict=no_lesson from the model as no_lesson (the common case)", async () => {
     const { fetcher } = makeFetcher({ verdict: "no_lesson" });
-    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" });
+    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts });
     expect(out).toEqual({ kind: "no_lesson" });
   });
 
   it("rejects empty or overlong lesson text (signal guard)", async () => {
     const first = makeFetcher({ verdict: "lesson", text: "" });
-    let out = await extractLessonFromFixOutcome(baseInput, { fetcher: first.fetcher, apiKey: "test" });
+    let out = await extractLessonFromFixOutcome(baseInput, { fetcher: first.fetcher, apiKey: "test", ...opts });
     expect(out).toEqual({ kind: "no_lesson" });
 
     const second = makeFetcher({ verdict: "lesson", text: "x".repeat(601) });
-    out = await extractLessonFromFixOutcome(baseInput, { fetcher: second.fetcher, apiKey: "test" });
+    out = await extractLessonFromFixOutcome(baseInput, { fetcher: second.fetcher, apiKey: "test", ...opts });
     expect(out).toEqual({ kind: "no_lesson" });
   });
 
@@ -139,20 +146,86 @@ describe("extractLessonFromFixOutcome", () => {
         { status: 200, headers: { "content-type": "application/json" } },
       );
     };
-    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" });
+    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts });
     expect(out.kind).toBe("lesson");
   });
 
   it("swallows non-2xx responses and returns no_lesson", async () => {
     const { fetcher } = makeFetcher({ verdict: "lesson" }, { status: 500 });
-    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" });
+    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts });
     expect(out).toEqual({ kind: "no_lesson" });
   });
 
   it("returns no_lesson when no API key is available", async () => {
     const { fetcher } = makeFetcher({ verdict: "lesson" });
-    const out = await extractLessonFromFixOutcome(baseInput, { fetcher }); // no apiKey
+    const out = await extractLessonFromFixOutcome(baseInput, { fetcher, ...opts }); // no apiKey
     expect(out).toEqual({ kind: "no_lesson" });
+  });
+});
+
+describe("extractLessonFromFixOutcome opt-in gate (issue #970)", () => {
+  it("returns no_lesson without calling the model when DISPATCH_LESSON_FEED_ENABLED is unset", async () => {
+    const { fetcher, calls } = makeFetcher({ verdict: "lesson", text: "should not be used" });
+    const out = await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: undefined },
+      async () => extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" }),
+    );
+    expect(out).toEqual({ kind: "no_lesson" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("returns no_lesson without calling the model when DISPATCH_LESSON_FEED_ENABLED is not the literal 'true'", async () => {
+    const { fetcher, calls } = makeFetcher({ verdict: "lesson", text: "should not be used" });
+    const out = await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "1" },
+      async () => extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" }),
+    );
+    expect(out).toEqual({ kind: "no_lesson" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("returns no_lesson when enabled option is explicitly false even with the env var set", async () => {
+    const { fetcher, calls } = makeFetcher({ verdict: "lesson", text: "should not be used" });
+    const out = await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "true" },
+      async () =>
+        extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", enabled: false }),
+    );
+    expect(out).toEqual({ kind: "no_lesson" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("makes the LLM call when DISPATCH_LESSON_FEED_ENABLED='true'", async () => {
+    const { fetcher, calls } = makeFetcher({ verdict: "no_lesson" });
+    const out = await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "true" },
+      async () => extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test" }),
+    );
+    expect(out).toEqual({ kind: "no_lesson" });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("isLessonFeedEnabled() reflects DISPATCH_LESSON_FEED_ENABLED exactly", async () => {
+    await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: undefined },
+      () => expect(isLessonFeedEnabled()).toBe(false),
+    );
+    await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "  true  " },
+      () => expect(isLessonFeedEnabled()).toBe(true), // trimmed before compare
+    );
+    await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "false" },
+      () => expect(isLessonFeedEnabled()).toBe(false),
+    );
+    await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "1" },
+      () => expect(isLessonFeedEnabled()).toBe(false), // only literal "true"
+    );
+    await withEnv(
+      { DISPATCH_LESSON_FEED_ENABLED: "true" },
+      () => expect(isLessonFeedEnabled()).toBe(true),
+    );
   });
 });
 
@@ -336,6 +409,10 @@ describe("readConfig (env precedence, issue #913)", () => {
 });
 
 describe("extractLessonFromFixOutcome (missing-key early return, issue #913)", () => {
+  // Force the feed on so the tests below reach the apiKey check — the gate
+  // is what #970 added; these tests are about the apiKey pre-#913 behavior.
+  const opts = { enabled: true } as const;
+
   it("returns no_lesson and makes no fetch call when no key is configured", async () => {
     const { fetcher, calls } = makeFetcher({ verdict: "lesson", text: "should not be used" });
     const out = await withEnv(
@@ -344,7 +421,7 @@ describe("extractLessonFromFixOutcome (missing-key early return, issue #913)", (
         OPENAI_API_KEY: undefined,
       },
       async () => {
-        return extractLessonFromFixOutcome(baseInput, { fetcher });
+        return extractLessonFromFixOutcome(baseInput, { fetcher, ...opts });
       },
     );
     expect(out).toEqual({ kind: "no_lesson" });
@@ -359,7 +436,7 @@ describe("extractLessonFromFixOutcome (missing-key early return, issue #913)", (
         OPENAI_API_KEY: undefined,
       },
       async () => {
-        return extractLessonFromFixOutcome(baseInput, { fetcher });
+        return extractLessonFromFixOutcome(baseInput, { fetcher, ...opts });
       },
     );
     expect(out).toEqual({ kind: "no_lesson" });
