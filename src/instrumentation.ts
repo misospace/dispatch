@@ -10,12 +10,22 @@
 export async function register() {
   // Lane config init moved to src/lib/lane-config.ts module-load side effect.
 
+  // Fail-fast OIDC config check. Runs once at startup, before the HTTP
+  // listener accepts traffic, so a misconfigured DISPATCH_AUTH_MODE=oidc
+  // (missing DISPATCH_OIDC_* vars) surfaces here with a clear error instead
+  // of as an opaque NextAuth error at first login. Node runtime only — the
+  // edge runtime has no process to fail and the check is redundant there.
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+  if (process.env.DISPATCH_AUTH_MODE === "oidc") {
+    const { validateOidcConfig } = await import("@/lib/auth");
+    validateOidcConfig();
+  }
+
   // In-app periodic scheduler (opt-in via DISPATCH_SCHEDULER_ENABLED). Node
   // runtime only — register() also runs in the edge runtime, which has no
   // timers/loopback. Dynamic import so the edge bundle never pulls it in. The
   // scheduler fires loopback HTTP POSTs (no shared module state with routes),
   // so the Turbopack chunk-graph isolation noted above does not affect it.
-  if (process.env.NEXT_RUNTIME !== "nodejs") return;
   const { schedulerConfigFromEnv, startScheduler } = await import("@/lib/scheduler");
   startScheduler(schedulerConfigFromEnv(process.env), {
     fetch,
