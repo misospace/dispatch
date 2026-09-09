@@ -143,6 +143,109 @@ function postChatCompletion(
   });
 }
 
+/**
+ * HTTP statuses that indicate a transient upstream failure worth retrying.
+ * A rolling litellm restart surfaces as a 502/503/504 from the Service while
+ * a pod is terminating; a 500 is a generic backend hiccup. 4xx (including the
+ * `400 response_format` class) is a real client error and must NOT be retried.
+ */
+const RETRYABLE_STATUS = new Set([500, 502, 503, 504]);
+
+/** Bounded retry cap: 3 total attempts (1 initial + 2 retries). */
+const MAX_ATTEMPTS = 3;
+
+/** Base delay for exponential backoff: 500ms, 1000ms between attempts. */
+const BASE_BACKOFF_MS = 500;
+
+/**
+ * True when a rejected fetch is a transient transport failure worth retrying.
+ *
+ * undici surfaces a dropped socket as `TypeError: fetch failed` with a
+ * `cause` carrying the underlying code (`UND_ERR_SOCKET`, `ECONNRESET`,
+ * `ECONNREFUSED`, `EPIPE`). A rolling litellm restart that terminates the pod
+ * mid-stream is exactly this shape. Timeouts (`AbortError`) and other errors
+ * are NOT transient — retrying them would just burn time.
+ */
+function isTransientFetchError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === "AbortError") return false;
+
+  const cause = (err as { cause?: unknown }).cause;
+  const causeCode =
+    cause instanceof Error ? ((cause as { code?: string }).code ?? "") : "";
+  const causeName = cause instanceof Error ? cause.name : "";
+  const causeMessage = cause instanceof Error ? cause.message : "";
+
+  const codes = [causeCode, causeName, err.message, causeMessage].join(" ");
+  return (
+    /UND_ERR_SOCKET|ECONNRESET|ECONNREFUSED|EPIPE/i.test(codes) ||
+    (err.name === "TypeError" && /fetch failed/i.test(err.message))
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * One logical attempt: prefer schema-constrained decoding, and if the backend
+ * rejects `json_schema` (400) fall back to plain JSON mode. The fallback is a
+ * deliberate downgrade, not a retry — a 400 from the fallback is a real error.
+ */
+async function attemptChatCompletion(
+  url: string,
+  options: CallLlmOptions,
+  signal: AbortSignal,
+): Promise<Response> {
+  let response = await postChatCompletion(
+    url,
+    options,
+    { type: "json_schema", json_schema: { name: "groomer_output", schema: buildGroomerResponseSchema() } },
+    signal,
+  );
+  if (response.status === 400) {
+    response = await postChatCompletion(url, options, { type: "json_object" }, signal);
+  }
+  return response;
+}
+
+/**
+ * Issue the chat-completion attempt with a bounded retry on transient
+ * failures only.
+ *
+ * Retries when the fetch rejects with a transient transport error (socket
+ * drop / connection reset) or resolves with a retryable 5xx, up to
+ * `MAX_ATTEMPTS` with short exponential backoff. Since litellm is a
+ * 3-replica Service, a retried request re-resolves to a healthy pod. A
+ * non-retryable 4xx (e.g. `400 response_format`) is returned immediately so
+ * the caller's existing error handling runs.
+ */
+async function callWithRetry(
+  url: string,
+  options: CallLlmOptions,
+  signal: AbortSignal,
+): Promise<Response> {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let response: Response;
+    try {
+      response = await attemptChatCompletion(url, options, signal);
+    } catch (err) {
+      // Transport-level failure (socket drop, connection reset, ...).
+      if (!isTransientFetchError(err) || attempt === MAX_ATTEMPTS) throw err;
+      await sleep(BASE_BACKOFF_MS * 2 ** (attempt - 1));
+      continue;
+    }
+    if (response.ok || !RETRYABLE_STATUS.has(response.status) || attempt === MAX_ATTEMPTS) {
+      return response;
+    }
+    // Retryable 5xx — release the body so the socket can be reused, then back off.
+    await response.body?.cancel().catch(() => {});
+    await sleep(BASE_BACKOFF_MS * 2 ** (attempt - 1));
+  }
+  // Unreachable: the loop always returns or throws.
+  throw new Error("callWithRetry: unreachable");
+}
+
 export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOutput> {
   const url = `${options.baseUrl}/chat/completions`;
 
@@ -153,15 +256,10 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOu
     // Prefer schema-constrained decoding. Fall back to plain JSON mode if the
     // backend rejects json_schema (400), so grooming never breaks on a serving
     // stack that doesn't support it; validateGroomerOutput repairs content either way.
-    let response = await postChatCompletion(
-      url,
-      options,
-      { type: "json_schema", json_schema: { name: "groomer_output", schema: buildGroomerResponseSchema() } },
-      controller.signal,
-    );
-    if (response.status === 400) {
-      response = await postChatCompletion(url, options, { type: "json_object" }, controller.signal);
-    }
+    // The call is wrapped in a bounded retry so a transient transport failure
+    // (socket drop / connection reset) or a retryable 5xx from a rolling
+    // litellm restart re-issues to a healthy replica instead of losing the run.
+    const response = await callWithRetry(url, options, controller.signal);
 
     if (!response.ok) {
       const text = await response.text();
