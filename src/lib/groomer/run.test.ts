@@ -33,6 +33,7 @@ const { mocks } = vi.hoisted(() => ({
     buildRepositoryContext: vi.fn(),
     exploreRepository: vi.fn(),
     acquireGroomerLock: vi.fn(),
+    heartbeatGroomerLock: vi.fn(),
     releaseGroomerLock: vi.fn(),
     prisma: {
       automationRepo: { findUnique: vi.fn() },
@@ -92,7 +93,9 @@ vi.mock("./repository-context", () => ({
 
 vi.mock("./groomer-lock", () => ({
   acquireGroomerLock: mocks.acquireGroomerLock,
+  heartbeatGroomerLock: mocks.heartbeatGroomerLock,
   releaseGroomerLock: mocks.releaseGroomerLock,
+  HEARTBEAT_MS: 30_000,
 }));
 
 import { runHostedGroomer } from "./run";
@@ -157,6 +160,7 @@ describe("runHostedGroomer", () => {
     mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
     mocks.releaseLease.mockResolvedValue({ id: "lease-1" });
     mocks.acquireGroomerLock.mockResolvedValue({ locked: true, token: "lock-token" });
+    mocks.heartbeatGroomerLock.mockResolvedValue(undefined);
     mocks.releaseGroomerLock.mockResolvedValue(undefined);
     mocks.prisma.automationRepo.findUnique.mockResolvedValue(mockAutomationRepo);
     mocks.prisma.groomingRun.create.mockResolvedValue(mockGroomingRun);
@@ -199,6 +203,45 @@ describe("runHostedGroomer", () => {
 
     expect(mocks.acquireGroomerLock).toHaveBeenCalledTimes(1);
     expect(mocks.releaseGroomerLock).toHaveBeenCalledWith("lock-token");
+  });
+
+  it("heartbeats the lock while a long run is in flight (dispatch#967)", async () => {
+    vi.useFakeTimers();
+    try {
+      // The LLM call hangs for 95s — three heartbeat intervals. Without the
+      // heartbeat the 90s TTL would reclaim the lock mid-run; with it, the
+      // lock stays fresh for the whole run.
+      let resolveLLM: (value: GroomerOutput) => void;
+      mocks.callGroomerLLM.mockReturnValue(
+        new Promise((resolve) => {
+          resolveLLM = resolve;
+        }),
+      );
+
+      const runPromise = runHostedGroomer();
+
+      await vi.advanceTimersByTimeAsync(95_000);
+      expect(mocks.heartbeatGroomerLock).toHaveBeenCalledTimes(3);
+      expect(mocks.heartbeatGroomerLock).toHaveBeenCalledWith("lock-token");
+      expect(mocks.releaseGroomerLock).not.toHaveBeenCalled();
+
+      resolveLLM!(mockOutput);
+      const result = await runPromise;
+
+      expect(result).not.toBeNull();
+      expect(mocks.releaseGroomerLock).toHaveBeenCalledWith("lock-token");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not heartbeat when the lock is not acquired", async () => {
+    mocks.acquireGroomerLock.mockResolvedValue({ locked: false });
+
+    const result = await runHostedGroomer();
+
+    expect(result).toBeNull();
+    expect(mocks.heartbeatGroomerLock).not.toHaveBeenCalled();
   });
 
   it("dry-run creates and completes groomingRun and result has groomingRunId", async () => {

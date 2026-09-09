@@ -7,6 +7,7 @@ vi.mock("@/lib/prisma", () => ({
       delete: vi.fn(),
       create: vi.fn(),
       deleteMany: vi.fn(),
+      updateMany: vi.fn(),
     },
     $transaction: vi.fn(),
   },
@@ -14,12 +15,13 @@ vi.mock("@/lib/prisma", () => ({
 
 import { prisma } from "@/lib/prisma";
 
-import { acquireGroomerLock, releaseGroomerLock } from "./groomer-lock";
+import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 
 const findUnique = prisma.syncLock.findUnique as ReturnType<typeof vi.fn>;
 const deleteRow = prisma.syncLock.delete as ReturnType<typeof vi.fn>;
 const create = prisma.syncLock.create as ReturnType<typeof vi.fn>;
 const deleteMany = prisma.syncLock.deleteMany as ReturnType<typeof vi.fn>;
+const updateMany = prisma.syncLock.updateMany as ReturnType<typeof vi.fn>;
 const transaction = prisma.$transaction as ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
@@ -54,7 +56,7 @@ describe("acquireGroomerLock", () => {
 
   describe("active existing lock", () => {
     it("returns { locked: false } when an unexpired lock is present", async () => {
-      const acquiredAt = new Date(Date.now() - 5 * 60 * 1000); // 5 min old
+      const acquiredAt = new Date(Date.now() - 20 * 1000); // 20s old (within the 90s TTL)
       findUnique.mockResolvedValueOnce({
         id: "groomer",
         syncRunId: "someone-else",
@@ -84,7 +86,9 @@ describe("acquireGroomerLock", () => {
 
   describe("stale existing lock", () => {
     it("clears a stale lock and acquires a fresh one", async () => {
-      const acquiredAt = new Date(Date.now() - 31 * 60 * 1000); // 31 min old
+      // 31 min old — far past the 90s TTL (a live holder heartbeats every 30s,
+      // so anything this old is orphaned, dispatch#967).
+      const acquiredAt = new Date(Date.now() - 31 * 60 * 1000);
       findUnique.mockResolvedValueOnce({
         id: "groomer",
         syncRunId: "old-token",
@@ -106,10 +110,11 @@ describe("acquireGroomerLock", () => {
       expect(deleteRow).toHaveBeenCalledWith({ where: { id: "groomer" } });
     });
 
-    it("treats a 30-minute-old lock as stale (boundary)", async () => {
-      // Exactly at MAX_AGE_MS (30 min). The implementation uses strict `<`
-      // for the still-valid check, so an age of exactly 30 min is reclaimed.
-      const acquiredAt = new Date(Date.now() - 30 * 60 * 1000);
+    it("treats a lock exactly at the TTL as stale (boundary)", async () => {
+      // Exactly at MAX_AGE_MS (3 * HEARTBEAT_MS = 90s). The implementation
+      // uses strict `<` for the still-valid check, so an age of exactly the
+      // TTL is reclaimed.
+      const acquiredAt = new Date(Date.now() - 3 * HEARTBEAT_MS);
       findUnique.mockResolvedValueOnce({
         id: "groomer",
         syncRunId: "boundary",
@@ -129,6 +134,22 @@ describe("acquireGroomerLock", () => {
 
       expect(result.locked).toBe(true);
       expect(deleteRow).toHaveBeenCalledWith({ where: { id: "groomer" } });
+    });
+
+    it("treats a 60-second-old lock as still held (a live holder heartbeats)", async () => {
+      // A live holder refreshes every 30s, so a 60s-old lock is within the
+      // 90s TTL and must not be reclaimed.
+      const acquiredAt = new Date(Date.now() - 60 * 1000);
+      findUnique.mockResolvedValueOnce({
+        id: "groomer",
+        syncRunId: "live-holder",
+        acquiredAt,
+      });
+
+      const result = await acquireGroomerLock();
+
+      expect(result).toEqual({ locked: false });
+      expect(transaction).not.toHaveBeenCalled();
     });
   });
 
@@ -213,6 +234,31 @@ describe("releaseGroomerLock", () => {
     await expect(releaseGroomerLock("not-our-token")).resolves.toBeUndefined();
     expect(deleteMany).toHaveBeenCalledWith({
       where: { id: "groomer", syncRunId: "not-our-token" },
+    });
+  });
+});
+
+describe("heartbeatGroomerLock", () => {
+  it("refreshes acquiredAt only for the row holding our token", async () => {
+    updateMany.mockResolvedValueOnce({ count: 1 });
+
+    await heartbeatGroomerLock("my-token");
+
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "groomer", syncRunId: "my-token" },
+      data: { acquiredAt: expect.any(Date) },
+    });
+  });
+
+  it("is a no-op (count = 0) when the lock was reclaimed by another run", async () => {
+    // Our token no longer matches the row — the lock was taken over. We must
+    // not refresh someone else's lock.
+    updateMany.mockResolvedValueOnce({ count: 0 });
+
+    await expect(heartbeatGroomerLock("stale-token")).resolves.toBeUndefined();
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: "groomer", syncRunId: "stale-token" },
+      data: { acquiredAt: expect.any(Date) },
     });
   });
 });
