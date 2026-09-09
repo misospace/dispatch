@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, closeIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
-import { acquireGroomerLock, releaseGroomerLock } from "./groomer-lock";
+import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
@@ -54,6 +54,7 @@ export interface GroomerDeps {
   buildRepositoryContext: typeof buildRepositoryContext;
   exploreRepository: typeof exploreRepository;
   acquireGroomerLock: typeof acquireGroomerLock;
+  heartbeatGroomerLock: typeof heartbeatGroomerLock;
   releaseGroomerLock: typeof releaseGroomerLock;
 }
 
@@ -75,6 +76,7 @@ const defaultDeps: GroomerDeps = {
   buildRepositoryContext,
   exploreRepository,
   acquireGroomerLock,
+  heartbeatGroomerLock,
   releaseGroomerLock,
 };
 
@@ -87,9 +89,22 @@ export async function runHostedGroomer(
   // (selection and lease acquisition are not atomic), double-grooming the issue.
   const lock = await deps.acquireGroomerLock();
   if (!lock.locked) return null;
+  // Heartbeat the lock for the duration of the run. The lock's TTL is a small
+  // multiple of the heartbeat interval (see groomer-lock.ts), so a live holder
+  // keeps its lock fresh while a holder SIGKILL'd mid-run (rollout, eviction,
+  // OOM) stops refreshing and its orphaned lock is reclaimable in ~90s
+  // instead of 30 minutes (dispatch#967). A failed heartbeat must never fail
+  // the run — the worst case is the old behaviour (stall until TTL).
+  const heartbeat = setInterval(() => {
+    deps.heartbeatGroomerLock(lock.token).catch(() => {
+      /* best-effort; a lost heartbeat just means an earlier reclaim */
+    });
+  }, HEARTBEAT_MS);
+  heartbeat.unref?.();
   try {
     return await executeGroomerRun(options, deps);
   } finally {
+    clearInterval(heartbeat);
     await deps.releaseGroomerLock(lock.token);
   }
 }
