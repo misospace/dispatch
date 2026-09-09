@@ -48,6 +48,38 @@ export function getAuthMode(): "basic" | "oidc" | "disabled" | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// OIDC config validation (fail-fast startup check)
+// ---------------------------------------------------------------------------
+
+/**
+ * Env vars required when DISPATCH_AUTH_MODE=oidc.
+ */
+export const OIDC_REQUIRED_ENV_VARS = [
+  "DISPATCH_OIDC_ISSUER",
+  "DISPATCH_OIDC_CLIENT_ID",
+  "DISPATCH_OIDC_CLIENT_SECRET",
+] as const;
+
+/**
+ * Validate that all required OIDC env vars are present.
+ *
+ * Intended to run once at startup (see src/instrumentation.ts register()) so
+ * a misconfiguration fails fast with a clear error instead of surfacing as an
+ * opaque NextAuth error at first login. Mirrors the GitHub App misconfiguration
+ * check in src/lib/github-auth.ts.
+ *
+ * @throws {Error} listing the missing keys when any required var is absent.
+ */
+export function validateOidcConfig(): void {
+  const missing = OIDC_REQUIRED_ENV_VARS.filter((key) => !process.env[key]?.trim());
+  if (missing.length > 0) {
+    throw new Error(
+      `OIDC authentication is misconfigured — missing required env vars: ${missing.join(", ")}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Basic Auth credential resolution
 // ---------------------------------------------------------------------------
 
