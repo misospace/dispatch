@@ -8,6 +8,7 @@ import {
   authenticateRequest,
   authorizeRequest,
   resetAuthCaches,
+  validateOidcConfig,
 } from "./auth";
 
 const { mocks } = vi.hoisted(() => ({
@@ -61,6 +62,51 @@ describe("getAuthMode", () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
     // Still returns cached value
     expect(getAuthMode()).toBe(first);
+  });
+});
+
+describe("validateOidcConfig", () => {
+  beforeEach(() => {
+    clearAll();
+    delete process.env.DISPATCH_OIDC_ISSUER;
+    delete process.env.DISPATCH_OIDC_CLIENT_ID;
+    delete process.env.DISPATCH_OIDC_CLIENT_SECRET;
+  });
+  afterEach(() => {
+    clearAll();
+    delete process.env.DISPATCH_OIDC_ISSUER;
+    delete process.env.DISPATCH_OIDC_CLIENT_ID;
+    delete process.env.DISPATCH_OIDC_CLIENT_SECRET;
+  });
+
+  it("does not throw when all three OIDC env vars are present", () => {
+    process.env.DISPATCH_OIDC_ISSUER = "https://auth.example.com";
+    process.env.DISPATCH_OIDC_CLIENT_ID = "client-id";
+    process.env.DISPATCH_OIDC_CLIENT_SECRET = "client-secret";
+    expect(() => validateOidcConfig()).not.toThrow();
+  });
+
+  it("throws listing the missing keys when all three are absent", () => {
+    expect(() => validateOidcConfig()).toThrow(
+      "OIDC authentication is misconfigured — missing required env vars: DISPATCH_OIDC_ISSUER, DISPATCH_OIDC_CLIENT_ID, DISPATCH_OIDC_CLIENT_SECRET",
+    );
+  });
+
+  it("throws listing only the missing keys when some are present", () => {
+    process.env.DISPATCH_OIDC_ISSUER = "https://auth.example.com";
+    process.env.DISPATCH_OIDC_CLIENT_ID = "client-id";
+    expect(() => validateOidcConfig()).toThrow(
+      "OIDC authentication is misconfigured — missing required env vars: DISPATCH_OIDC_CLIENT_SECRET",
+    );
+  });
+
+  it("treats whitespace-only values as missing", () => {
+    process.env.DISPATCH_OIDC_ISSUER = "https://auth.example.com";
+    process.env.DISPATCH_OIDC_CLIENT_ID = "   ";
+    process.env.DISPATCH_OIDC_CLIENT_SECRET = "client-secret";
+    expect(() => validateOidcConfig()).toThrow(
+      "OIDC authentication is misconfigured — missing required env vars: DISPATCH_OIDC_CLIENT_ID",
+    );
   });
 });
 
