@@ -153,6 +153,48 @@ describe("POST /api/agent-runs", () => {
     expect(mocks.agentRunCreate).toHaveBeenCalled();
   });
 
+  it("stores real GitHub URLs in touchedIssueUrls", async () => {
+    const res = await postRequest({
+      agentName: "saffron",
+      runType: "implement",
+      status: "completed",
+      startedAt: new Date().toISOString(),
+      touchedIssueUrls: ["https://github.com/org/repo/issues/42"],
+    });
+
+    expect(res.status).toBe(201);
+    const call = mocks.agentRunCreate.mock.calls[0][0].data;
+    expect(call.touchedIssueUrls).toEqual(["https://github.com/org/repo/issues/42"]);
+  });
+
+  it("rejects non-URL placeholders in touchedIssueUrls with 400", async () => {
+    const res = await postRequest({
+      agentName: "saffron",
+      runType: "heartbeat",
+      status: "ok",
+      startedAt: new Date().toISOString(),
+      touchedIssueUrls: ["repo:org/repo"],
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("touchedIssueUrls must be an array of http(s) URLs");
+    expect(mocks.agentRunCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-array touchedIssueUrls with 400", async () => {
+    const res = await postRequest({
+      agentName: "saffron",
+      runType: "implement",
+      status: "completed",
+      startedAt: new Date().toISOString(),
+      touchedIssueUrls: "https://github.com/org/repo/issues/42",
+    });
+
+    expect(res.status).toBe(400);
+    expect(mocks.agentRunCreate).not.toHaveBeenCalled();
+  });
+
   it("returns 500 on database error", async () => {
     mocks.agentRunCreate.mockRejectedValue(new Error("db connection lost"));
 

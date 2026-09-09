@@ -85,7 +85,7 @@ describe("runSyncBestEffort", () => {
     expect(result.reposProcessed).toBe(2);
   });
 
-  it("collects touchedIssueUrls for successful repos", async () => {
+  it("does not emit repo placeholders into touchedIssueUrls (URL-only contract)", async () => {
     mocks.getSyncRepos.mockResolvedValue([
       { id: "repo-1", fullName: "org/repo" },
       { id: "repo-2", fullName: "org/repo2" },
@@ -103,9 +103,10 @@ describe("runSyncBestEffort", () => {
 
     const result = await runSyncBestEffort();
 
-    expect(result.touchedIssueUrls).toContain("repo:org/repo");
-    expect(result.touchedIssueUrls).toContain("repo:org/repo2");
-    expect(result.touchedIssueUrls).toHaveLength(2);
+    // Sync rows are repo-scoped and have no per-issue URL data, so the
+    // result must not carry touchedIssueUrls at all — callers keep
+    // AgentRun.touchedIssueUrls URL-only (empty for sync runs).
+    expect(result).not.toHaveProperty("touchedIssueUrls");
   });
 
   it("collects warnings for repos with errors", async () => {
@@ -143,7 +144,7 @@ describe("runSyncBestEffort", () => {
       "No tracked repositories found — sync skipped",
     );
     expect(result.warnings).toHaveLength(0);
-    expect(result.touchedIssueUrls).toHaveLength(0);
+    expect(result).not.toHaveProperty("touchedIssueUrls");
   });
 
   it("handles mixed success and failure results", async () => {
@@ -171,9 +172,7 @@ describe("runSyncBestEffort", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("org/b");
     expect(result.errors).toHaveLength(1);
-    expect(result.touchedIssueUrls).toContain("repo:org/a");
-    expect(result.touchedIssueUrls).toContain("repo:org/c");
-    expect(result.touchedIssueUrls).not.toContain("repo:org/b");
+    expect(result).not.toHaveProperty("touchedIssueUrls");
   });
 
   it("catches unexpected errors from getSyncRepos", async () => {
@@ -271,7 +270,7 @@ describe("runSyncBestEffort", () => {
     expect(result.reposProcessed).toBe(0);
   });
 
-  it("touchedIssueUrls is empty when all repos fail", async () => {
+  it("does not emit touchedIssueUrls when all repos fail", async () => {
     mocks.getSyncRepos.mockResolvedValue([
       { id: "repo-1", fullName: "org/repo" },
     ]);
@@ -285,10 +284,10 @@ describe("runSyncBestEffort", () => {
 
     const result = await runSyncBestEffort();
 
-    expect(result.touchedIssueUrls).toHaveLength(0);
+    expect(result).not.toHaveProperty("touchedIssueUrls");
   });
 
-  it("preserves warnings and errors alongside touchedIssueUrls on partial failure", async () => {
+  it("preserves warnings and errors on partial failure", async () => {
     mocks.getSyncRepos.mockResolvedValue([
       { id: "r1", fullName: "org/a" },
       { id: "r2", fullName: "org/b" },
@@ -306,7 +305,7 @@ describe("runSyncBestEffort", () => {
 
     const result = await runSyncBestEffort();
 
-    expect(result.touchedIssueUrls).toContain("repo:org/a");
+    expect(result).not.toHaveProperty("touchedIssueUrls");
     expect(result.warnings).toContain("Sync warning for org/b: auth failed");
     expect(result.errors).toContain(
       "Sync completed with one or more repo failures",

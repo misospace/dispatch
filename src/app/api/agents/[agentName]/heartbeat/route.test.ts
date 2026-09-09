@@ -58,7 +58,6 @@ vi.mock("@/lib/heartbeat", async (importOriginal) => {
       reposProcessed: 1,
       warnings: [],
       errors: [],
-      touchedIssueUrls: ["repo:org/repo"],
     }),
     runReconcileBestEffort: vi.fn().mockResolvedValue({
       issuesReconciled: 2,
@@ -136,7 +135,6 @@ describe("POST /api/agents/[agentName]/heartbeat — success", () => {
       reposProcessed: 1,
       warnings: [],
       errors: [],
-      touchedIssueUrls: ["repo:org/repo"],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 2,
@@ -177,7 +175,10 @@ describe("POST /api/agents/[agentName]/heartbeat — success", () => {
     expect(call.summary).toContain("Heartbeat completed");
   });
 
-  it("includes touchedIssueUrls in the response and AgentRun", async () => {
+  it("keeps touchedIssueUrls URL-only: empty for heartbeat/sync runs", async () => {
+    // Sync rows are repo-scoped and carry no per-issue URL data, so the
+    // heartbeat must never push "repo:owner/name" placeholders into the
+    // URL-only AgentRun.touchedIssueUrls column.
     await POST(makeRequest("my-agent"), {
       params: Promise.resolve({ agentName: "my-agent" }),
     });
@@ -185,7 +186,9 @@ describe("POST /api/agents/[agentName]/heartbeat — success", () => {
       params: Promise.resolve({ agentName: "my-agent" }),
     });
     const body = await res.json();
-    expect(body.touchedIssueUrls).toContain("repo:org/repo");
+    expect(body.touchedIssueUrls).toEqual([]);
+    const call = mockAgentRun.create.mock.calls[1][0].data;
+    expect(call.touchedIssueUrls).toEqual([]);
   });
 
   it("does not make model/judgment grooming decisions", async () => {
@@ -214,7 +217,6 @@ describe("POST /api/agents/[agentName]/heartbeat — warning aggregation", () =>
       reposProcessed: 2,
       warnings: ["Sync warning for org/repo: rate limited"],
       errors: [],
-      touchedIssueUrls: ["repo:org/repo"],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,
@@ -240,7 +242,6 @@ describe("POST /api/agents/[agentName]/heartbeat — warning aggregation", () =>
       reposProcessed: 1,
       warnings: ["sync warning"],
       errors: [],
-      touchedIssueUrls: [],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,
@@ -266,7 +267,6 @@ describe("POST /api/agents/[agentName]/heartbeat — warning aggregation", () =>
       reposProcessed: 1,
       warnings: ["warning"],
       errors: [],
-      touchedIssueUrls: [],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,
@@ -297,7 +297,6 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
       reposProcessed: 0,
       warnings: [],
       errors: ["sync: No tracked repositories found"],
-      touchedIssueUrls: [],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,
@@ -322,7 +321,6 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
       reposProcessed: 1,
       warnings: [],
       errors: [],
-      touchedIssueUrls: ["repo:org/repo"],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,
@@ -347,7 +345,6 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
       reposProcessed: 0,
       warnings: [],
       errors: ["sync error"],
-      touchedIssueUrls: [],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,
@@ -372,7 +369,6 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
       reposProcessed: 0,
       warnings: [],
       errors: ["error"],
-      touchedIssueUrls: [],
     });
     vi.mocked(heartbeatModule.runReconcileBestEffort).mockResolvedValue({
       issuesReconciled: 0,

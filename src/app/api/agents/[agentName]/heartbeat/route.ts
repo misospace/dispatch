@@ -25,6 +25,10 @@ export type AgentHeartbeatResponse = {
   summary: string;
   warnings: string[];
   errors: string[];
+  /**
+   * Always empty for heartbeat runs: the sync phase is repo-scoped and has no
+   * per-issue URL data, so `AgentRun.touchedIssueUrls` stays URL-only.
+   */
   touchedIssueUrls: string[];
 };
 
@@ -42,7 +46,6 @@ export async function POST(
   const startedAt = new Date();
   const warnings: string[] = [];
   const errors: string[] = [];
-  const touchedIssueUrlsSet = new Set<string>();
 
   // --- Sync phase (best-effort) ---
   try {
@@ -50,13 +53,6 @@ export async function POST(
 
     for (const w of syncResult.warnings) warnings.push(`sync: ${w}`);
     for (const e of syncResult.errors) errors.push(`sync: ${e}`);
-
-    // Collect touched issue URLs from synced repos
-    if (syncResult.touchedIssueUrls.length > 0) {
-      for (const url of syncResult.touchedIssueUrls) {
-        touchedIssueUrlsSet.add(url);
-      }
-    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown sync error";
     errors.push(`sync: ${message}`);
@@ -74,7 +70,6 @@ export async function POST(
   }
 
   const finishedAt = new Date();
-  const touchedIssueUrls = Array.from(touchedIssueUrlsSet);
 
   // Determine overall status
   let status: "ok" | "warning" | "error" = "ok";
@@ -103,7 +98,8 @@ export async function POST(
         startedAt,
         finishedAt,
         summary,
-        touchedIssueUrls,
+        // Sync runs have no per-issue URL data; keep the column URL-only.
+        touchedIssueUrls: [],
       },
     });
   } catch (error) {
@@ -119,6 +115,6 @@ export async function POST(
     summary,
     warnings,
     errors,
-    touchedIssueUrls,
+    touchedIssueUrls: [],
   });
 }

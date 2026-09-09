@@ -25,7 +25,6 @@ export interface SyncStepResult {
   reposProcessed: number;
   warnings: string[];
   errors: string[];
-  touchedIssueUrls: string[];
 }
 
 /**
@@ -40,7 +39,6 @@ export async function runSyncBestEffort(
 ): Promise<SyncStepResult> {
   const warnings: string[] = [];
   const errors: string[] = [];
-  const touchedIssueUrls: string[] = [];
   let syncedCount = 0;
   let reposProcessed = 0;
 
@@ -49,7 +47,7 @@ export async function runSyncBestEffort(
 
     if (repos.length === 0) {
       errors.push("No tracked repositories found — sync skipped");
-      return { synced: 0, reposProcessed: 0, warnings, errors, touchedIssueUrls };
+      return { synced: 0, reposProcessed: 0, warnings, errors };
     }
 
     const excludedLabels = opts?.excludedLabels ?? parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS);
@@ -62,10 +60,6 @@ export async function runSyncBestEffort(
     for (const r of result.results) {
       if (r.error) {
         warnings.push(`Sync warning for ${r.repo}: ${r.error}`);
-      } else {
-        // Collect touched issue URLs from successful repos
-        // We don't have per-issue URLs here, so we note the repo was synced
-        touchedIssueUrls.push(`repo:${r.repo}`);
       }
     }
 
@@ -77,7 +71,7 @@ export async function runSyncBestEffort(
     errors.push(`Sync failed: ${message}`);
   }
 
-  return { synced: syncedCount, reposProcessed, warnings, errors, touchedIssueUrls };
+  return { synced: syncedCount, reposProcessed, warnings, errors };
 }
 
 // ---------------------------------------------------------------------------
