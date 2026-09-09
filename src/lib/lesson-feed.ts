@@ -1,14 +1,19 @@
 /**
- * Feed repo-specific lessons learned from pr-fix/tombstone outcomes back into
- * AGENTS.md. Closes the loop that today only preserves burned-attempt lessons
+ * Library for extracting repo-specific lessons learned from pr-fix/tombstone
+ * outcomes. Closes the loop that today only preserves burned-attempt lessons
  * when a human hand-writes them (e.g. windowstead#321's `assert_eq` arity trap,
  * pinchflat's sqlean/app path gotchas).
  *
- * Trigger: a PrFixQueueItem reaching FIXED after ≥2 feedback entries (a proxy
- * for "≥2 attempts" — feedback is appended per re-enqueue in enqueuePrFixItem),
- * or a workload ending BLOCKED/tombstoned. The model returns either
- * `no_lesson` (the common case — same bar as the groomer's binary ready/backlog)
- * or a 1-3 sentence, checkable gotcha. Dedupe + PR-opening live downstream.
+ * The model is asked to return either `no_lesson` (the common case — same bar
+ * as the groomer's binary ready/backlog) or a 1-3 sentence, checkable gotcha.
+ * Dedupe (`lessonAlreadyCovered`) lives here so a downstream PR-opener can
+ * reuse it.
+ *
+ * **Opt-in only (issue #970).** `extractLessonFromFixOutcome` returns
+ * `no_lesson` without making any LLM call unless `DISPATCH_LESSON_FEED_ENABLED`
+ * is set to the literal string `"true"`. The pr-fix queue no longer fires the
+ * feed automatically; deployments that want their own downstream must enable
+ * the env var and wire `extractLessonFromFixOutcome` themselves.
  *
  * The LLM call mirrors src/lib/groomer/llm.ts: a raw fetch against an
  * OpenAI-compatible /chat/completions endpoint with `response_format:
@@ -71,11 +76,38 @@ export interface LessonFeedOptions {
   fetcher?: typeof fetch;
   /** Per-call timeout in ms; the model call is short so default is generous. */
   timeoutMs?: number;
+  /**
+   * Override the DISPATCH_LESSON_FEED_ENABLED opt-in gate. Defaults to the env
+   * var. Used by tests to bypass the env var without mutating process state.
+   *
+   * When false, extractLessonFromFixOutcome returns `no_lesson` immediately
+   * without making any LLM call — issue #970. The lesson feed ships off by
+   * default: deployments that wire their own downstream (dedupe + AGENTS.md
+   * PR-opener) must set DISPATCH_LESSON_FEED_ENABLED=true to opt in.
+   */
+  enabled?: boolean;
 }
 
 // One-shot guard so the legacy-fallback warning below fires at most once per
 // process (the lesson feed runs on every pr-fix/tombstone outcome).
 let legacyFallbackWarned = false;
+
+/**
+ * Whether the lesson feed is enabled for this process. Reads
+ * `DISPATCH_LESSON_FEED_ENABLED` — the literal string `"true"` enables it,
+ * anything else (unset, empty, `"false"`, `"1"`, …) leaves it off.
+ *
+ * Issue #970: the lesson feed was triggering on every FIXED pr-fix transition
+ * with ≥2 feedback entries but the only consumer of the result was a
+ * `console.info` line — every qualifying transition burned an LLM call whose
+ * output was discarded. The trigger was removed from `markPrFixItem`; this
+ * gate now sits at the top of `extractLessonFromFixOutcome` so deployments
+ * that wire their own downstream can opt in via the env var without the
+ * trigger path firing unconditionally.
+ */
+export function isLessonFeedEnabled(): boolean {
+  return process.env.DISPATCH_LESSON_FEED_ENABLED?.trim() === "true";
+}
 
 /**
  * Resolve the LLM credentials + model for the lesson feed.
@@ -137,6 +169,13 @@ export async function extractLessonFromFixOutcome(
   input: ExtractLessonInput,
   options: LessonFeedOptions = {},
 ): Promise<LessonOutcome> {
+  // Opt-in gate (issue #970). The feed is off by default; deployments that
+  // wire their own downstream (dedupe + AGENTS.md PR-opener) must set
+  // DISPATCH_LESSON_FEED_ENABLED=true. Returning `no_lesson` here keeps the
+  // function signature stable so future wiring can call it without changes.
+  const enabled = options.enabled ?? isLessonFeedEnabled();
+  if (!enabled) return { kind: "no_lesson" };
+
   const attempts = input.feedback.length;
   if (attempts < 2) return { kind: "no_lesson" };
 

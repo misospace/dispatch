@@ -28,14 +28,13 @@ vi.mock("./github-prs", () => ({
   fetchPullRequestMergeState: (...args: unknown[]) => fetchPullRequestMergeStateMock(...args),
 }));
 
-// Mock pr-fix-surfacing & lesson-feed so side-effects don't reach real subs.
+// Mock pr-fix-surfacing so side-effects don't reach real subs. The lesson
+// feed used to be mocked here too, but #970 removed the pr-fix-queue -> lesson
+// feed wiring — there is no longer anything to mock from this surface.
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn(async () => null),
   surfacePrFixRequeued: vi.fn(async () => null),
   extractUrlsFromText: vi.fn(() => []),
-}));
-vi.mock("./lesson-feed", () => ({
-  extractLessonFromFixOutcome: vi.fn(async () => null),
 }));
 
 // Mock the queue table that markPrFixItem writes to.
