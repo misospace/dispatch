@@ -207,6 +207,145 @@ describe("callGroomerLLM", () => {
   });
 });
 
+describe("callGroomerLLM transient retry", () => {
+  const baseOptions = {
+    baseUrl: "https://llm.example.com",
+    apiKey: "sk-test",
+    model: "gpt-4o-mini",
+    prompt: "test",
+    timeoutMs: 10000,
+  };
+
+  function okResponse() {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify({ labelsToAdd: [], labelsToRemove: [], lane: { id: "local", confidence: "high", reason: "r" } }) } }],
+      }),
+      text: async () => "",
+    };
+  }
+
+  function socketDropError() {
+    const cause = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+    return Object.assign(new TypeError("fetch failed"), { cause });
+  }
+
+  function connResetError() {
+    const cause = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+    return Object.assign(new TypeError("fetch failed"), { cause });
+  }
+
+  function serverError(status: number) {
+    return { ok: false, status, text: async () => `HTTP ${status}` };
+  }
+
+  it("retries a transient socket drop and succeeds on a later attempt", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(socketDropError())
+      .mockResolvedValueOnce(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    await vi.advanceTimersByTimeAsync(5000);
+    const result = await promise;
+
+    expect(result.lane.id).toBe("local");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("retries an ECONNRESET transport failure and succeeds", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(connResetError())
+      .mockResolvedValueOnce(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    await vi.advanceTimersByTimeAsync(5000);
+    await promise;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("retries a retryable 5xx and succeeds on a later attempt", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(serverError(503))
+      .mockResolvedValueOnce(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    await vi.advanceTimersByTimeAsync(5000);
+    const result = await promise;
+
+    expect(result.lane.id).toBe("local");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("does not retry a non-retryable 4xx and fails immediately", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(serverError(400));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    promise.catch(() => {}); // avoid an unhandled rejection while timers advance
+    // 5000ms is well past the 500ms first-retry backoff, so if a 400 were
+    // (wrongly) retried we'd see a third fetch by now.
+    await vi.advanceTimersByTimeAsync(5000);
+    await expect(promise).rejects.toThrow(/400/);
+
+    // A 400 is a real client error — no retry. The only two fetches are the
+    // initial json_schema call and the deliberate json_object fallback (which
+    // is a downgrade, not a retry); a retry would push this past 2.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("exhausts the retry cap and still fails when every attempt drops", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockRejectedValue(socketDropError());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    promise.catch(() => {}); // avoid an unhandled rejection while timers advance
+    await vi.advanceTimersByTimeAsync(60000);
+    await expect(promise).rejects.toThrow(/fetch failed/);
+
+    // Bounded: 3 total attempts (1 initial + 2 retries), then it gives up.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("does not retry a non-transient fetch error", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockRejectedValue(new Error("network error"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const promise = callGroomerLLM(baseOptions);
+    promise.catch(() => {}); // avoid an unhandled rejection while timers advance
+    await vi.advanceTimersByTimeAsync(10000);
+    await expect(promise).rejects.toThrow(/network error/);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+});
+
 describe("buildGroomerResponseSchema", () => {
   it("requires lane/labels, forbids extra props, and constrains lane.id to configured lanes", () => {
     const schema = buildGroomerResponseSchema() as any;
