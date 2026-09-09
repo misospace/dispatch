@@ -345,6 +345,13 @@ The following endpoints remain available for internal use and backward compatibi
 * `POST /api/agent-runs` — legacy run ingestion (superseded by `tasks/report`)
 * `GET /api/issues` — raw issue listing (superseded by `next-task`)
 * `GET /api/agents/{name}/queue` — legacy queue endpoint (superseded by `next-task`)
+* `POST /api/agents/{name}/heartbeat` — internal sync/reconcile pass; returns
+  `touchedIssueUrls: []` because the sync phase is repo-scoped and carries no
+  per-issue URL data. `AgentRun.touchedIssueUrls` is URL-only across all
+  producers (groomer, task reports, heartbeat); non-`http(s)` entries are
+  rejected by `POST /api/agent-runs`. External agent clients should treat the
+  heartbeat response's `touchedIssueUrls` as always empty — do not rely on
+  the field to surface per-issue URLs from sync passes.
 
 ### Detailed Worker Contract
 

@@ -81,6 +81,12 @@ Content-Type: application/json
 **Required fields:** `agentName`, `runType`, `status`, `startedAt`
 **Optional fields:** `finishedAt`, `summary`, `errorMessage`, `touchedIssueUrls`, `issueId`
 
+> **Contract:** `touchedIssueUrls` must be an array of real `http(s)://` URLs (issue
+> or PR links). Non-URL entries (e.g. `repo:owner/name` placeholders) are rejected
+> with HTTP 400. Sync/heartbeat runs store `[]` because they are repo-scoped and
+> carry no per-issue URL data. The `AgentRun.touchedIssueUrls` column is URL-only
+> across all producers (groomer, task reports, heartbeat).
+
 **Response:** `201 Created` with the created run object.
 
 ### 2. Sync Issue State (Best-Effort)
@@ -268,6 +274,7 @@ All Dispatch interactions are best-effort from the agent's perspective:
 | `/api/issues/move` | POST | Bearer token | Move an issue on the board |
 | `/api/agent-runs` | GET | None | List recent agent runs |
 | `/api/agent-runs` | POST | Bearer token | Submit a new agent run record |
+| `/api/agents/{name}/heartbeat` | POST | Bearer token | Internal sync/reconcile pass. Returns `touchedIssueUrls: []` because the sync phase is repo-scoped and carries no per-issue URL data. |
 | `/api/automation/repos` | GET | None | List tracked repositories |
 | `/api/audit` | GET | None | Query audit log entries |
 
@@ -291,6 +298,7 @@ Backlog → Ready → In Progress → In Review → Done
 - Done is reserved exclusively for closed/terminal issues
 
 ## History
+- **2026-09-09** — Documented the URL-only `AgentRun.touchedIssueUrls` contract and the heartbeat endpoint's always-empty `touchedIssueUrls` response shape (Issue #971).
 - **2026-05-21** — Added resumable work section with next-action contract reference (Issue #167).
 
 

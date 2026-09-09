@@ -9,6 +9,11 @@ import { enforceRateLimit } from "@/lib/rate-limit";
 // the loosest of the API limits and only backstops runaway loops.
 const RATE_LIMIT = { limit: 120, windowMs: 60_000 };
 
+// AgentRun.touchedIssueUrls is a URL-only column (groomer and task reports
+// write real GitHub issue/PR URLs). Reject non-URL entries at the boundary
+// so mixed-format placeholders can never land in the column.
+const TOUCHED_ISSUE_URL_PATTERN = /^https?:\/\//;
+
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
     return errorResponse("Unauthorized", 401);
@@ -53,6 +58,13 @@ export async function POST(request: Request) {
 
     if (!agentName || !runType || !status || !startedAt) {
       return errorResponse("Missing required fields", 400);
+    }
+
+    // Validate touchedIssueUrls shape: URL-only entries
+    if (touchedIssueUrls !== undefined && touchedIssueUrls !== null) {
+      if (!Array.isArray(touchedIssueUrls) || !touchedIssueUrls.every((u) => typeof u === "string" && TOUCHED_ISSUE_URL_PATTERN.test(u))) {
+        return errorResponse("touchedIssueUrls must be an array of http(s) URLs", 400);
+      }
     }
 
     // Validate escalated-lane outcome if provided

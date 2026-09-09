@@ -152,6 +152,15 @@ model AgentRun {
   summary          String?
   errorMessage     String?
   notes            String?   @db.Text
+  // URL-only: entries must be real http(s) issue/PR URLs (e.g.
+  // https://github.com/owner/repo/issues/N). Enforced at the API write
+  // boundaries (POST /api/agent-runs, heartbeat route); sync runs store [].
+  //
+  // There is no DB-level CHECK constraint — only API validation guards writes,
+  // so any historical rows containing "repo:owner/name" placeholders written
+  // before validation was added remain valid in the column until pruned by
+  // a follow-up cleanup. Renderers that treat non-https entries as broken
+  // links should be aware of this when deciding how to handle them.
   touchedIssueUrls String[]
   createdAt        DateTime  @default(now())
   issueId          String?
