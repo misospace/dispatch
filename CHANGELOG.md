@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.59](https://github.com/misospace/dispatch/compare/v0.5.58...v0.5.59) (2026-09-09)
+
+
+### Features
+
+* **deps:** update dependency zod (4.5.4 → 4.6.0) ([#982](https://github.com/misospace/dispatch/issues/982)) ([07af5df](https://github.com/misospace/dispatch/commit/07af5df3ef83b3c3f01a4812df32a7437a80b220))
+* **deps:** update react monorepo (19.2.18 → 19.3.0) ([#980](https://github.com/misospace/dispatch/issues/980)) ([b86bafe](https://github.com/misospace/dispatch/commit/b86bafe8bf62bb782b1a1d61d6277b4ac0be9409))
+
+
+### Bug Fixes
+
+* **agent-runs:** keep touchedIssueUrls URL-only ([#973](https://github.com/misospace/dispatch/issues/973)) ([5293195](https://github.com/misospace/dispatch/commit/52931956e9f5f9f3178bc9f0b9ab67d7b884d62e)), closes [#971](https://github.com/misospace/dispatch/issues/971)
+* **auth:** fail fast at startup when OIDC env vars are missing ([#975](https://github.com/misospace/dispatch/issues/975)) ([ab46bbf](https://github.com/misospace/dispatch/commit/ab46bbf20e4e60f240ffac4dddd623aeab7fc1d3)), closes [#972](https://github.com/misospace/dispatch/issues/972)
+* **ci-failures:** normalize UUIDs and temp paths in the failure signature ([#978](https://github.com/misospace/dispatch/issues/978)) ([df38ab0](https://github.com/misospace/dispatch/commit/df38ab00dc22727049e37d1a56f3114e87360c77))
+* **deps:** update dependency @types/node (24.13.3 → 24.13.4) ([#981](https://github.com/misospace/dispatch/issues/981)) ([84973c5](https://github.com/misospace/dispatch/commit/84973c5002853a516d07b47f9db59f3a4bf3a966))
+* **groomer:** heartbeat the run lock so a mid-groom rollout stalls grooming ~90s, not 30 min ([#968](https://github.com/misospace/dispatch/issues/968)) ([866032b](https://github.com/misospace/dispatch/commit/866032b61fbe4f132029cad807d078bf58beeabd)), closes [#967](https://github.com/misospace/dispatch/issues/967)
+* **groomer:** retry transient litellm connection drops ([#979](https://github.com/misospace/dispatch/issues/979)) ([75f20c4](https://github.com/misospace/dispatch/commit/75f20c419b64baabee7d8a7df93f37d7473e0ec9)), closes [#976](https://github.com/misospace/dispatch/issues/976)
+* **lesson-feed:** stop firing an LLM call on every FIXED pr-fix transition ([#974](https://github.com/misospace/dispatch/issues/974)) ([7af794d](https://github.com/misospace/dispatch/commit/7af794dccd312d03908fc0a224c44c446e4b0139)), closes [#970](https://github.com/misospace/dispatch/issues/970)
+
 ## [0.5.58](https://github.com/misospace/dispatch/compare/v0.5.57...v0.5.58) (2026-09-08)
 
 
