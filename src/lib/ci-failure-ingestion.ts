@@ -90,6 +90,21 @@ export interface FailureSignatureInput {
  */
 export function computeFailureSignature(input: FailureSignatureInput): string {
   const normalised = (input.logExcerpt || "")
+    // Ephemeral CI paths come first, before <hex> can partially rewrite them.
+    // A UUID's middle groups are 4 hex chars — below the <hex> threshold — so a
+    // GitHub Actions temp id leaves `<hex>-ccb3-450b-8c9a-<hex>`, and an mktemp
+    // basename (`/tmp/tmp.wVcSzQXwsN`, `/tmp/grype-download-bgjrFs`) matches no
+    // rule at all. Both are random per run, so the same recurring failure hashes
+    // to a fresh signature every time and no dedup can catch it — one grype scan
+    // was filed as three separate issues (#977).
+    .replace(
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,
+      "<uuid>",
+    )
+    // The random basename directly under a temp root is per-run noise; keep the
+    // stable prefix and any stable trailing segment so distinct failures still
+    // differ.
+    .replace(/(\/tmp\/|\/_temp\/|\/work\/_temp\/)[^\s/]+/g, "$1<tmp>")
     .replace(/\b[0-9a-f]{7,64}\b/gi, "<hex>")
     .replace(/\b\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?\b/g, "<ts>")
     .replace(/\b\d+(\.\d+)?(ms|s|m|h)\b/gi, "<dur>")

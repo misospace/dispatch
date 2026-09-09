@@ -71,6 +71,47 @@ describe("computeFailureSignature", () => {
       computeFailureSignature(base),
     );
   });
+
+  it("ignores per-run UUIDs so a recurring failure keeps one signature (#977)", () => {
+    // A GitHub Actions temp id: the <hex> rule catches the 8/12-char groups but
+    // not the 4-char middle groups, so without a UUID rule these differ every run.
+    const a = computeFailureSignature({
+      ...base,
+      logExcerpt: "run _temp/50c3e0f1-ccb3-450b-8c9a-1881217bbe76 failed",
+    });
+    const b = computeFailureSignature({
+      ...base,
+      logExcerpt: "run _temp/eace82d5-188d-40ff-b14c-e4f47a4da97e failed",
+    });
+    expect(a).toBe(b);
+  });
+
+  it("ignores per-run mktemp basenames under a temp root (#977)", () => {
+    // grype installs into a fresh mktemp dir every run; only the basename varies.
+    const a = computeFailureSignature({
+      ...base,
+      logExcerpt: "Downloaded to /tmp/grype-download-bgjrFs/grype via /tmp/tmp.wVcSzQXwsN",
+    });
+    const b = computeFailureSignature({
+      ...base,
+      logExcerpt: "Downloaded to /tmp/grype-download-tRNd9b/grype via /tmp/tmp.L04KwwRRIg",
+    });
+    expect(a).toBe(b);
+  });
+
+  it("still distinguishes failures that differ beyond ephemeral paths (#977)", () => {
+    // The temp-path normalisation must not collapse two different failures: a
+    // stable trailing segment and the surrounding message still separate them.
+    const a = computeFailureSignature({
+      ...base,
+      logExcerpt: "CVE-2026-1 in openssl at /tmp/scan-XXXX/report",
+    });
+    const b = computeFailureSignature({
+      ...base,
+      logExcerpt: "CVE-2026-2 in zlib at /tmp/scan-XXXX/report",
+    });
+    expect(a).not.toBe(b);
+  });
 });
 
 describe("failure marker", () => {
