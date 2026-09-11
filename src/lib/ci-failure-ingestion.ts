@@ -312,6 +312,115 @@ export interface IssueDraft {
   body: string;
 }
 
+/** One row of a grype/trivy findings table, parsed out of a job log. */
+export interface ScanFinding {
+  package: string;
+  installed: string;
+  fixedIn: string;
+  severity: string;
+  /** The file/binary path the finding sits on, when the scanner reports one. */
+  location?: string;
+}
+
+/** Header names (lower-cased) → ScanFinding field, for grype and trivy tables. */
+const SCAN_COLUMN_ALIASES: Record<string, keyof ScanFinding> = {
+  name: "package",
+  package: "package",
+  version: "installed",
+  installed: "installed",
+  "fix version": "fixedIn",
+  "fixed version": "fixedIn",
+  "fixed in": "fixedIn",
+  severity: "severity",
+  location: "location",
+  target: "location",
+  file: "location",
+  path: "location",
+};
+
+/** Split a space-aligned table row into cells (columns are separated by 2+ spaces). */
+function splitScanRow(line: string): string[] {
+  return line.trim().split(/\s{2,}/).map((c) => c.trim());
+}
+
+/** A GHA wrapper prefixes each scanner line with a bracketed tag ("[grype] ",
+ *  "[trivy] "); strip it so the first column is the real column name. */
+function stripLinePrefix(line: string): string {
+  return line.replace(/^\s*\[[a-z]+\]\s*/i, "");
+}
+
+/** A table separator row: every cell is dashes/box-drawing only. */
+function isSeparatorRow(cells: string[]): boolean {
+  return cells.every((c) => /^[\-─=+|: ]*$/.test(c));
+}
+
+/**
+ * Parse a grype/trivy findings table out of a job log.
+ *
+ * Finds the header row (a row carrying a package/name column and a version
+ * column), maps each column to a field by its header name, and returns one
+ * finding per data row. Returns [] when the log has no such table, so a
+ * non-scan log yields nothing.
+ */
+export function parseScanFindings(log: string): ScanFinding[] {
+  const lines = (log || "").split("\n");
+  let headerIdx = -1;
+  let fields: (keyof ScanFinding | null)[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const cells = splitScanRow(stripLinePrefix(lines[i])).map((c) => c.toLowerCase());
+    if (
+      cells.some((c) => c === "name" || c === "package") &&
+      cells.some((c) => c === "version" || c === "installed")
+    ) {
+      headerIdx = i;
+      fields = cells.map((c) => SCAN_COLUMN_ALIASES[c] ?? null);
+      break;
+    }
+  }
+  if (headerIdx === -1) return [];
+
+  const findings: ScanFinding[] = [];
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = stripLinePrefix(lines[i]);
+    if (!line.trim()) break; // a blank line ends the table
+    const cells = splitScanRow(line);
+    if (cells.length < 2) break; // not a table row
+    if (isSeparatorRow(cells)) continue; // the ─── row under the header
+    const finding: ScanFinding = {
+      package: "",
+      installed: "",
+      fixedIn: "",
+      severity: "",
+    };
+    for (let j = 0; j < fields.length && j < cells.length; j++) {
+      const field = fields[j];
+      if (field) finding[field] = cells[j];
+    }
+    // A bare number in the package column is a summary line ("3 vulnerabilities
+    // found"), not a finding.
+    if (finding.package && !/^\d+$/.test(finding.package)) findings.push(finding);
+  }
+  return findings;
+}
+
+/**
+ * Is this failure a scan/vulnerability gate?
+ *
+ * A workflow or job named for scanning/vulnerabilities is one, and so is any
+ * failure whose log carries a grype/trivy findings table — the table is itself
+ * evidence of a scan gate, whatever the workflow is called.
+ */
+export function isScanFailure(
+  workflowName: string,
+  jobName: string,
+  logExcerpt: string,
+): boolean {
+  if (/scan|vuln|trivy|grype|vulnerab|security/i.test(`${workflowName} ${jobName}`)) {
+    return true;
+  }
+  return parseScanFindings(logExcerpt).length > 0;
+}
+
 /** Render the issue an actionable failure produces. */
 export function buildIssueDraft(opts: {
   repoFullName: string;
@@ -325,7 +434,13 @@ export function buildIssueDraft(opts: {
 }): IssueDraft {
   const { workflowName, jobName, latest, previous, logExcerpt, supersedes } = opts;
   const excerpt = (logExcerpt || "").trim().slice(0, 4000) || "(no log excerpt available)";
-  const lines = [
+  // A scan/vuln failure gets its findings parsed out of the log and rendered
+  // above the raw excerpt, so the solver sees the fixable findings and where
+  // they live instead of reverse-engineering a wall of log (#994).
+  const findings = isScanFailure(workflowName, jobName, logExcerpt)
+    ? parseScanFindings(logExcerpt)
+    : [];
+  const lines: string[] = [
     `\`${workflowName}\` has failed twice in a row on the default branch, for the same reason.`,
     "",
     `- Latest: [${latest.html_url}](${latest.html_url}) (\`${latest.head_sha.slice(0, 8)}\`)`,
@@ -333,11 +448,30 @@ export function buildIssueDraft(opts: {
     `- Failing job: \`${jobName}\``,
     "",
     "A single red run is not filed — this one repeated, so it is a condition rather than a transient.",
+  ];
+  if (findings.length > 0) {
+    // Cap the rendered rows: a scan can report hundreds of findings and the
+    // issue body has a hard size limit; the raw excerpt below still carries
+    // the rest.
+    const shown = findings.slice(0, 50);
+    lines.push(
+      "",
+      `**Scan findings (${findings.length}${findings.length > shown.length ? `, showing first ${shown.length}` : ""}):**`,
+      "",
+      "| Package | Installed | Fixed-in | Severity | Location |",
+      "| --- | --- | --- | --- | --- |",
+      ...shown.map(
+        (f) =>
+          `| ${f.package} | ${f.installed} | ${f.fixedIn || "—"} | ${f.severity} | ${f.location ?? "—"} |`,
+      ),
+    );
+  }
+  lines.push(
     "",
     "```",
     excerpt,
     "```",
-  ];
+  );
   if (supersedes !== null) {
     lines.push(
       "",

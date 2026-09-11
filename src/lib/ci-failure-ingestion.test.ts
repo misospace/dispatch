@@ -10,6 +10,8 @@ import {
   extractFailureWorkflow,
   groupDefaultBranchRuns,
   hasOpenIssueForSignature,
+  isScanFailure,
+  parseScanFindings,
   type CiRun,
   type FiledIssue,
 } from "./ci-failure-ingestion";
@@ -446,6 +448,146 @@ describe("buildIssueDraft", () => {
   it("caps a huge excerpt", () => {
     const d = buildIssueDraft({ ...opts, logExcerpt: "x".repeat(50_000) });
     expect(d.body.length).toBeLessThan(6_000);
+  });
+});
+
+describe("parseScanFindings", () => {
+  // A real grype table as it appears in a job log (grype table output,
+  // --fail-on high gate): the header row, a separator row, and data rows.
+  const grypeLog = [
+    "  [command]/usr/bin/grype image ghcr.io/o/elixir-gate:latest --fail-on high",
+    "  [grype] ",
+    "  [grype] NAME            VERSION              FIX VERSION  VULNERABILITY  SEVERITY  LOCATION",
+    "  [grype] ───────────────  ───────────────────  ───────────  ─────────────  ────────  ────────",
+    "  [grype] pebble          0.10.0               0.10.1       CVE-2026-1234  High      /usr/bin/pebble",
+    "  [grype] node            20.11.0              20.12.0      CVE-2026-5678  High      /usr/lib/node_modules/npm/node_modules/semver",
+    "  [grype] openssl         3.0.13-1~deb12u1     3.0.14-1~deb12u2  CVE-2026-9012  High  /usr/lib/x86_64-linux-gnu/libssl.so.3",
+    "  [grype] ",
+    "  [grype] 3 vulnerabilities found",
+    "  [grype] ",
+    "  [command]exit code: 1",
+    "  Error: Process completed with exit code 1.",
+  ].join("\n");
+
+  it("parses a real grype table into structured findings", () => {
+    const findings = parseScanFindings(grypeLog);
+    expect(findings).toHaveLength(3);
+    expect(findings[0]).toEqual({
+      package: "pebble",
+      installed: "0.10.0",
+      fixedIn: "0.10.1",
+      severity: "High",
+      location: "/usr/bin/pebble",
+    });
+    expect(findings[1].location).toBe(
+      "/usr/lib/node_modules/npm/node_modules/semver",
+    );
+    expect(findings[2]).toMatchObject({
+      package: "openssl",
+      fixedIn: "3.0.14-1~deb12u2",
+      severity: "High",
+    });
+  });
+
+  it("returns [] for a log with no findings table", () => {
+    expect(parseScanFindings("error: invalid bake override key *.provenance=false")).toEqual([]);
+    expect(parseScanFindings("")).toEqual([]);
+  });
+
+  it("handles a trivy-style table with a Target column", () => {
+    const trivyLog = [
+      "NAME          VERSION     FIXED VERSION  VULNERABILITY  SEVERITY  TARGET",
+      "────────────  ─────────  ─────────────  ─────────────  ────────  ──────",
+      "golang.org/x/net  v0.17.0  v0.23.0      CVE-2024-45338  High      /usr/local/bin/pebble",
+    ].join("\n");
+    const findings = parseScanFindings(trivyLog);
+    expect(findings).toEqual([
+      {
+        package: "golang.org/x/net",
+        installed: "v0.17.0",
+        fixedIn: "v0.23.0",
+        severity: "High",
+        location: "/usr/local/bin/pebble",
+      },
+    ]);
+  });
+});
+
+describe("isScanFailure", () => {
+  it("is true for a scan-named workflow or job", () => {
+    expect(isScanFailure("Vulnerability Scan", "Scan", "")).toBe(true);
+    expect(isScanFailure("Release", "trivy image scan", "")).toBe(true);
+  });
+
+  it("is true when the log carries a findings table even if unnamed", () => {
+    const log =
+      "NAME  VERSION  FIX VERSION  SEVERITY\npebble  0.10.0  0.10.1  High";
+    expect(isScanFailure("Release", "Build", log)).toBe(true);
+  });
+
+  it("is false for a non-scan failure", () => {
+    expect(isScanFailure("Release", "Build", "error: invalid bake override key")).toBe(false);
+  });
+});
+
+describe("buildIssueDraft scan enrichment (#994)", () => {
+  const scanOpts = {
+    repoFullName: "o/r",
+    workflowName: "Vulnerability Scan",
+    jobName: "Scan (elixir-gate)",
+    signature: "sig1",
+    latest: run({ id: 3, html_url: "https://example.test/3" }),
+    previous: run({ id: 2, html_url: "https://example.test/2" }),
+    logExcerpt: [
+      "NAME            VERSION              FIX VERSION  VULNERABILITY  SEVERITY  LOCATION",
+      "──────────────  ───────────────────  ───────────  ─────────────  ────────  ────────",
+      "pebble          0.10.0               0.10.1       CVE-2026-1234  High      /usr/bin/pebble",
+      "node            20.11.0              20.12.0      CVE-2026-5678  High      /usr/lib/node_modules/npm/node_modules/semver",
+      "",
+      "3 vulnerabilities found",
+      "Error: Process completed with exit code 1.",
+    ].join("\n"),
+    supersedes: null,
+  };
+
+  it("renders a findings table above the raw excerpt", () => {
+    const d = buildIssueDraft(scanOpts);
+    expect(d.body).toContain("**Scan findings (2):**");
+    expect(d.body).toContain(
+      "| pebble | 0.10.0 | 0.10.1 | High | /usr/bin/pebble |",
+    );
+    expect(d.body).toContain(
+      "| node | 20.11.0 | 20.12.0 | High | /usr/lib/node_modules/npm/node_modules/semver |",
+    );
+    // The findings table comes before the raw excerpt.
+    expect(d.body.indexOf("**Scan findings")).toBeLessThan(d.body.indexOf("```"));
+    // The raw excerpt is still embedded.
+    expect(d.body).toContain("3 vulnerabilities found");
+    expect(extractFailureMarker(d.body)).toBe("sig1");
+  });
+
+  it("leaves a non-scan failure unchanged (raw excerpt only)", () => {
+    const d = buildIssueDraft({
+      ...scanOpts,
+      workflowName: "Release",
+      jobName: "Build",
+      logExcerpt: "error: invalid bake override key *.provenance=false",
+    });
+    expect(d.body).not.toContain("Scan findings");
+    expect(d.body).toContain("error: invalid bake override key");
+  });
+
+  it("caps the rendered findings when a scan reports many", () => {
+    const rows = Array.from({ length: 80 }, (_, i) =>
+      `pkg${i}  1.0.${i}  1.0.${i + 1}  High  /bin/pkg${i}`,
+    ).join("\n");
+    const d = buildIssueDraft({
+      ...scanOpts,
+      logExcerpt: `NAME  VERSION  FIX VERSION  SEVERITY  LOCATION\n${rows}`,
+    });
+    expect(d.body).toContain("**Scan findings (80, showing first 50):**");
+    expect(d.body).toContain("| pkg49 |");
+    expect(d.body).not.toContain("| pkg50 |");
   });
 });
 
