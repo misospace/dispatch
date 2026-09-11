@@ -54,16 +54,38 @@ describe("computeFailureSignature", () => {
     expect(a).toBe(b);
   });
 
-  it("separates different jobs, workflows and repos", () => {
-    expect(computeFailureSignature({ ...base, jobName: "Test" })).not.toBe(
-      computeFailureSignature(base),
-    );
+  it("separates different workflows and repos", () => {
     expect(computeFailureSignature({ ...base, workflowName: "Nightly" })).not.toBe(
       computeFailureSignature(base),
     );
     expect(computeFailureSignature({ ...base, repoFullName: "o/other" })).not.toBe(
       computeFailureSignature(base),
     );
+  });
+
+  it("merges different jobs of the same workflow with the same error (#986)", () => {
+    // One root cause surfaces as several jobs — a per-arch matrix leg, a scan
+    // step and a build step — and each leg used to hash to its own signature,
+    // so one break filed N issues that never merged. The job name is no
+    // longer part of the key; the normalised error text still separates
+    // genuinely different failures.
+    const scan = computeFailureSignature({
+      ...base,
+      jobName: "Vulnerability Scan (elixir-gate)",
+      logExcerpt: "error: invalid bake override key *.provenance=false",
+    });
+    const buildAmd = computeFailureSignature({
+      ...base,
+      jobName: "Build llmkube-coder / Build (linux/amd64)",
+      logExcerpt: "error: invalid bake override key *.provenance=false",
+    });
+    const buildArm = computeFailureSignature({
+      ...base,
+      jobName: "Build elixir-gate / Build (linux/arm64)",
+      logExcerpt: "error: invalid bake override key *.provenance=false",
+    });
+    expect(scan).toBe(buildAmd);
+    expect(buildAmd).toBe(buildArm);
   });
 
   it("separates genuinely different errors", () => {
@@ -541,7 +563,7 @@ describe("hasOpenIssueForSignature", () => {
   });
 
   it("does not care which workflow the open issue belongs to", () => {
-    // Signature already encodes repo + workflow + job + normalised excerpt, so
+    // Signature already encodes repo + workflow + normalised excerpt, so
     // an identical signature is the same failure whatever the marker says.
     const filed: FiledIssue[] = [
       { number: 378, state: "open", signature: "sig1", workflowName: "Vulnerability Scan" },
