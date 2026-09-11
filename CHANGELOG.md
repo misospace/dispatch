@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.60](https://github.com/misospace/dispatch/compare/v0.5.59...v0.5.60) (2026-09-11)
+
+
+### Features
+
+* **ci-failures:** enrich scan-failure issue bodies with parsed grype/trivy findings ([#995](https://github.com/misospace/dispatch/issues/995)) ([84c74fd](https://github.com/misospace/dispatch/commit/84c74fd1862078509d3ec85d83856784543be3cf)), closes [#994](https://github.com/misospace/dispatch/issues/994)
+* **deps:** update dependency lucide-react (1.43.0 → 1.44.0) ([#985](https://github.com/misospace/dispatch/issues/985)) ([ea28470](https://github.com/misospace/dispatch/commit/ea284705994e7ff65d4019b79eccf3ee2161fdb2))
+* **deps:** update dependency lucide-react (1.44.0 → 1.45.0) ([#990](https://github.com/misospace/dispatch/issues/990)) ([519f53d](https://github.com/misospace/dispatch/commit/519f53dd6e1c76e83428398f8cb475d40f32d251))
+
+
+### Bug Fixes
+
+* **ci-failures:** stop hashing the job name into the failure signature ([#989](https://github.com/misospace/dispatch/issues/989)) ([448078b](https://github.com/misospace/dispatch/commit/448078b480590bc2971c70aa1a582834ec27838e)), closes [#986](https://github.com/misospace/dispatch/issues/986)
+* **deps:** update dependency zod (4.6.0 → 4.6.1) ([#983](https://github.com/misospace/dispatch/issues/983)) ([26bfe78](https://github.com/misospace/dispatch/commit/26bfe78b24af2fc798dde235dd4f79d4cb5b4e7c))
+* **deps:** update dependency zod (4.6.1 → 4.6.2) ([#987](https://github.com/misospace/dispatch/issues/987)) ([a865373](https://github.com/misospace/dispatch/commit/a865373cdadd073a6dbef60aa6337129be80c562))
+* **deps:** update nextjs monorepo (16.3.4 → 16.3.5) ([#993](https://github.com/misospace/dispatch/issues/993)) ([85bb0cf](https://github.com/misospace/dispatch/commit/85bb0cf89378183ba4da01bd8a2bda9cded91539))
+* **issue-sync:** always full-fetch open issues so old untouched ones are not stranded ([#992](https://github.com/misospace/dispatch/issues/992)) ([1e6ef1d](https://github.com/misospace/dispatch/commit/1e6ef1dc88b2d6c2f91d19355b5eac6aed16529b)), closes [#991](https://github.com/misospace/dispatch/issues/991)
+
 ## [0.5.59](https://github.com/misospace/dispatch/compare/v0.5.58...v0.5.59) (2026-09-09)
 
 
