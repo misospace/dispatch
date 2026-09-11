@@ -372,15 +372,32 @@ async function getRepoSyncAnchor(repositoryId: string): Promise<Date | null> {
 
 /**
  * Fetch wrapper for the shared sync path (manual sync route, scheduled sync
- * route, heartbeat). Narrows to `since = anchor - SYNC_OVERLAP_BUFFER_MS` when
- * the repo has a trustworthy prior anchor (i.e. already has cached issues);
- * otherwise does the full fetch as before. See getRepoSyncAnchor for why
- * "has cached issues" is the validity guard.
+ * route, heartbeat).
+ *
+ * Open issues are always fetched in full (no `since`): they are a bounded,
+ * cheap set and are all the queue cares about. Fetching them incrementally
+ * stranded any open issue that was missed by the repo's initial fetch and
+ * never `updated_at`-touched since — invisible to the queue forever
+ * (dispatch#991). The closed-issue tail stays incremental on
+ * `since = anchor - SYNC_OVERLAP_BUFFER_MS` when the repo has a trustworthy
+ * prior anchor (i.e. already has cached issues); otherwise it is fetched in
+ * full as before. See getRepoSyncAnchor for why "has cached issues" is the
+ * validity guard.
  */
 export const fetchAllStateIssues = async (repo: SyncRepo): Promise<GitHubIssue[]> => {
   const anchor = await getRepoSyncAnchor(repo.id);
   const since = anchor ? new Date(anchor.getTime() - SYNC_OVERLAP_BUFFER_MS) : undefined;
-  return fetchIssues(repo.fullName, { includeClosed: true, since });
+  const [openIssues, closedIssues] = await Promise.all([
+    fetchIssues(repo.fullName, { state: "open" }),
+    fetchIssues(repo.fullName, { state: "closed", since }),
+  ]);
+  // Dedupe by number in case GitHub ever returns the same issue twice; the
+  // open copy wins (it is the fresher, queue-relevant state).
+  const byNumber = new Map<number, GitHubIssue>();
+  for (const issue of [...closedIssues, ...openIssues]) {
+    byNumber.set(issue.number, issue);
+  }
+  return [...byNumber.values()];
 };
 
 /**

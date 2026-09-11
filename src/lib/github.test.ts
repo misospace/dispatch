@@ -439,6 +439,16 @@ describe("fetchIssues", () => {
     expect(fetchMock.mock.calls[1][0]).toContain("state=all");
   });
 
+  it("honors an explicit state option (open/closed) over includeClosed", async () => {
+    fetchMock.mockResolvedValue(makeResponse([]));
+
+    await fetchIssues("org/repo", { state: "closed" });
+    expect(fetchMock.mock.calls[0][0]).toContain("state=closed");
+
+    await fetchIssues("org/repo", { state: "open", includeClosed: true });
+    expect(fetchMock.mock.calls[1][0]).toContain("state=open");
+  });
+
   it("omits since by default and includes it as ISO-8601 when provided", async () => {
     fetchMock.mockResolvedValue(makeResponse([]));
 
