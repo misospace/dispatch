@@ -410,7 +410,10 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
     const { POST } = await import("./route");
     const github = await import("@/lib/github");
     await POST(makeRequest());
-    expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), { includeClosed: true });
+    // Open issues are always full-fetched (dispatch#991); the closed tail is
+    // fetched separately so closedIssueStatusFix still runs (#521).
+    expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), { state: "open" });
+    expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ state: "closed" }));
   });
 
   it("does not sync automation by default", async () => {

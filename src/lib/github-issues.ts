@@ -3,10 +3,12 @@ import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./g
 
 export async function fetchIssues(
   repoFullName: string,
-  options?: { includeClosed?: boolean; since?: Date },
+  options?: { includeClosed?: boolean; state?: "open" | "closed" | "all"; since?: Date },
 ): Promise<GitHubIssue[]> {
   const [owner, repo] = repoFullName.split("/");
-  const state = options?.includeClosed ? "all" : "open";
+  // `state` wins when given (lets callers fetch only the closed tail);
+  // otherwise the legacy includeClosed flag maps to all/open.
+  const state = options?.state ?? (options?.includeClosed ? "all" : "open");
   let url = `${GITHUB_API}/repos/${owner}/${repo}/issues?state=${state}&per_page=100`;
   if (options?.since) {
     url += `&since=${options.since.toISOString()}`;

@@ -406,19 +406,48 @@ describe("fetchAllStateIssues", () => {
       where: { repositoryId: "repo-1" },
       _max: { lastSyncedAt: true },
     });
-    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { includeClosed: true, since: undefined });
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { state: "open" });
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { state: "closed", since: undefined });
   });
 
-  it("narrows with since = anchor - SYNC_OVERLAP_BUFFER_MS when the repo has cached issues", async () => {
+  it("always full-fetches open issues (no since) even when the repo has cached issues", async () => {
+    const anchor = new Date("2026-07-01T00:00:00.000Z");
+    mocks.issueAggregate.mockResolvedValue({ _max: { lastSyncedAt: anchor } });
+
+    await fetchAllStateIssues({ id: "repo-1", fullName: "org/repo" });
+
+    // dispatch#991: an open issue missed by the initial fetch and never
+    // updated_at-touched must not be stranded — open issues are fetched in
+    // full every sync, never narrowed by `since`.
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { state: "open" });
+  });
+
+  it("narrows the closed-issue tail with since = anchor - SYNC_OVERLAP_BUFFER_MS when the repo has cached issues", async () => {
     const anchor = new Date("2026-07-01T00:00:00.000Z");
     mocks.issueAggregate.mockResolvedValue({ _max: { lastSyncedAt: anchor } });
 
     await fetchAllStateIssues({ id: "repo-1", fullName: "org/repo" });
 
     expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", {
-      includeClosed: true,
+      state: "closed",
       since: new Date(anchor.getTime() - SYNC_OVERLAP_BUFFER_MS),
     });
+  });
+
+  it("merges open and closed results, deduping by issue number", async () => {
+    mocks.issueAggregate.mockResolvedValue({ _max: { lastSyncedAt: null } });
+    mocks.fetchIssues.mockImplementation(async (_repo: string, options?: { state?: string }) => {
+      if (options?.state === "open") {
+        return [githubIssue(1), githubIssue(2)];
+      }
+      return [githubIssue(2, { state: "closed", closed_at: "2026-01-03T00:00:00.000Z" }), githubIssue(3, { state: "closed", closed_at: "2026-01-03T00:00:00.000Z" })];
+    });
+
+    const result = await fetchAllStateIssues({ id: "repo-1", fullName: "org/repo" });
+
+    expect(result.map((i) => i.number).sort((a, b) => a - b)).toEqual([1, 2, 3]);
+    // The open copy of #2 wins over the closed one.
+    expect(result.find((i) => i.number === 2)?.state).toBe("open");
   });
 });
 
