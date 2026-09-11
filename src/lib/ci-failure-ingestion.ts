@@ -87,6 +87,15 @@ export interface FailureSignatureInput {
  * timestamps, hex digests, durations — does not make every occurrence look
  * like a new failure. Without that, consecutive failures never match and
  * nothing is ever filed.
+ *
+ * The job name is deliberately NOT part of the key. One root cause surfaces
+ * as several jobs in the same workflow — a per-arch matrix leg, a scan step
+ * and a build step, one job per app — and hashing the job name gives each leg
+ * its own signature, so one break files N issues that never merge (#986: one
+ * invalid bake override key produced five open issues). The normalised error
+ * text still separates genuinely different failures, and the recovery-close
+ * path is signature-agnostic within a workflow, so a coarser key only shrinks
+ * the fan-out.
  */
 export function computeFailureSignature(input: FailureSignatureInput): string {
   const normalised = (input.logExcerpt || "")
@@ -113,7 +122,7 @@ export function computeFailureSignature(input: FailureSignatureInput): string {
     .trim()
     .slice(0, 2000);
   return createHash("sha256")
-    .update(`${input.repoFullName}\n${input.workflowName}\n${input.jobName}\n${normalised}`)
+    .update(`${input.repoFullName}\n${input.workflowName}\n${normalised}`)
     .digest("hex")
     .slice(0, 16);
 }
@@ -317,7 +326,7 @@ export function buildIssueDraft(opts: {
   const { workflowName, jobName, latest, previous, logExcerpt, supersedes } = opts;
   const excerpt = (logExcerpt || "").trim().slice(0, 4000) || "(no log excerpt available)";
   const lines = [
-    `\`${workflowName}\` has failed twice in a row on the default branch, in the same job and for the same reason.`,
+    `\`${workflowName}\` has failed twice in a row on the default branch, for the same reason.`,
     "",
     `- Latest: [${latest.html_url}](${latest.html_url}) (\`${latest.head_sha.slice(0, 8)}\`)`,
     `- Previous: [${previous.html_url}](${previous.html_url}) (\`${previous.head_sha.slice(0, 8)}\`)`,
