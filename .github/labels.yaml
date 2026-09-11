@@ -41,6 +41,9 @@
 - name: dependencies
   color: "0366d6"
   description: Dependency update or maintenance.
+- name: type/security
+  color: "d73a4a"
+  description: Security finding (e.g. CVE/scan release blocker). Routed to the escalation lane; fixed by the loop, not a human.
 - name: audit
   color: "bfdadc"
   description: Audit, review, or investigation work.

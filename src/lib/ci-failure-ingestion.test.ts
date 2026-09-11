@@ -3,13 +3,18 @@ import {
   buildCloseComment,
   buildFailureMarker,
   buildIssueDraft,
+  buildScanInstructions,
   classifyWorkflow,
   computeFailureSignature,
   decideAction,
+  extractFailureKind,
   extractFailureMarker,
   extractFailureWorkflow,
   groupDefaultBranchRuns,
   hasOpenIssueForSignature,
+  isScanFailure,
+  parseScanFindings,
+  renderFindingsTable,
   type CiRun,
   type FiledIssue,
 } from "./ci-failure-ingestion";
@@ -123,6 +128,129 @@ describe("failure marker", () => {
     expect(extractFailureMarker("just an issue")).toBeNull();
     expect(extractFailureMarker(null)).toBeNull();
     expect(extractFailureMarker(undefined)).toBeNull();
+  });
+
+  it("round-trips the scan kind (#988)", () => {
+    const marker = buildFailureMarker("abc123", "Vulnerability Scan", "scan");
+    expect(extractFailureMarker(marker)).toBe("abc123");
+    expect(extractFailureWorkflow(marker)).toBe("Vulnerability Scan");
+    expect(extractFailureKind(marker)).toBe("scan");
+  });
+
+  it("reads a marker without a kind as null (pre-#988 issues)", () => {
+    expect(extractFailureKind(buildFailureMarker("abc123", "Release"))).toBeNull();
+    expect(extractFailureKind("<!-- dispatch-ci-failure:abc123 -->")).toBeNull();
+    expect(extractFailureKind("just an issue")).toBeNull();
+  });
+});
+
+describe("isScanFailure (#988)", () => {
+  it("detects a scan gate by workflow name", () => {
+    expect(isScanFailure("Vulnerability Scan", "scan", "")).toBe(true);
+  });
+
+  it("detects a scan gate by job name", () => {
+    expect(isScanFailure("Release", "grype", "")).toBe(true);
+    expect(isScanFailure("Release", "trivy-scan", "")).toBe(true);
+  });
+
+  it("detects CVE findings in the log even for an unrecognised workflow", () => {
+    expect(isScanFailure("Build", "test", "FAIL: CVE-2026-1234 in openssl")).toBe(true);
+  });
+
+  it("does not treat a plain build failure as a scan", () => {
+    expect(isScanFailure("Build", "test", "error: openssl 3.5.5 is vulnerable")).toBe(false);
+  });
+});
+
+describe("parseScanFindings (#988)", () => {
+  it("parses grype table rows", () => {
+    const log = [
+      "NAME         VERSION             TYPE  VULNERABILITY  FIX VERSION  STATUS",
+      "openssl      3.5.5-1ubuntu3.3    deb   CVE-2026-1234  3.5.5-1ubuntu3.4  fix available",
+      "zlib1g       1:1.3.1-1           deb   CVE-2026-5678  1:1.3.1-1ubuntu1  fix available",
+    ].join("\n");
+    const findings = parseScanFindings(log);
+    expect(findings).toEqual([
+      {
+        cve: "CVE-2026-1234",
+        package: "openssl",
+        installed: "3.5.5-1ubuntu3.3",
+        fixedIn: "3.5.5-1ubuntu3.4",
+        location: null,
+      },
+      {
+        cve: "CVE-2026-5678",
+        package: "zlib1g",
+        installed: "1:1.3.1-1",
+        fixedIn: "1:1.3.1-1ubuntu1",
+        location: null,
+      },
+    ]);
+  });
+
+  it("parses prose findings with fixed-in and location", () => {
+    const log =
+      "CVE-2026-1234 in openssl 3.5.5-1ubuntu3.3 (fixed in 3.5.5-1ubuntu3.4) at /usr/bin/pebble";
+    const findings = parseScanFindings(log);
+    expect(findings).toEqual([
+      {
+        cve: "CVE-2026-1234",
+        package: "openssl",
+        installed: "3.5.5-1ubuntu3.3",
+        fixedIn: "3.5.5-1ubuntu3.4",
+        location: "/usr/bin/pebble",
+      },
+    ]);
+  });
+
+  it("parses the 'is vulnerable to' prose shape", () => {
+    const findings = parseScanFindings("openssl 3.5.5-1ubuntu3.3 is vulnerable to CVE-2026-1234");
+    expect(findings).toEqual([
+      {
+        cve: "CVE-2026-1234",
+        package: "openssl",
+        installed: "3.5.5-1ubuntu3.3",
+        fixedIn: null,
+        location: null,
+      },
+    ]);
+  });
+
+  it("returns an empty list for a log with no recognisable findings", () => {
+    expect(parseScanFindings("error: build failed")).toEqual([]);
+    expect(parseScanFindings("")).toEqual([]);
+  });
+
+  it("deduplicates a finding that appears in both table and prose form", () => {
+    const log = [
+      "openssl 3.5.5-1ubuntu3.3 deb CVE-2026-1234 3.5.5-1ubuntu3.4 fix available",
+      "CVE-2026-1234 in openssl 3.5.5-1ubuntu3.3 (fixed in 3.5.5-1ubuntu3.4)",
+    ].join("\n");
+    expect(parseScanFindings(log)).toHaveLength(1);
+  });
+});
+
+describe("renderFindingsTable (#988)", () => {
+  it("renders a markdown table", () => {
+    const table = renderFindingsTable([
+      { cve: "CVE-2026-1234", package: "openssl", installed: "3.5.5", fixedIn: "3.5.6", location: null },
+    ]);
+    expect(table).toContain("| CVE | Package | Installed | Fixed in | Location |");
+    expect(table).toContain("| CVE-2026-1234 | openssl | 3.5.5 | 3.5.6 | — |");
+  });
+
+  it("is null for no findings", () => {
+    expect(renderFindingsTable([])).toBeNull();
+  });
+});
+
+describe("buildScanInstructions (#988)", () => {
+  it("requires building the image and running the scanner locally", () => {
+    const s = buildScanInstructions();
+    expect(s).toContain("Build the target image");
+    expect(s).toContain("grype or trivy");
+    expect(s).toContain("Only push a change you have verified clears the gate");
   });
 });
 
@@ -424,6 +552,40 @@ describe("buildIssueDraft", () => {
   it("caps a huge excerpt", () => {
     const d = buildIssueDraft({ ...opts, logExcerpt: "x".repeat(50_000) });
     expect(d.body.length).toBeLessThan(6_000);
+  });
+
+  it("carries parsed findings and the scan instructions for a scan blocker (#988)", () => {
+    const d = buildIssueDraft({
+      ...opts,
+      kind: "scan",
+      findings: [
+        {
+          cve: "CVE-2026-1234",
+          package: "openssl",
+          installed: "3.5.5-1ubuntu3.3",
+          fixedIn: "3.5.5-1ubuntu3.4",
+          location: "/usr/bin/pebble",
+        },
+      ],
+    });
+    expect(d.body).toContain("Parsed findings:");
+    expect(d.body).toContain("| CVE-2026-1234 | openssl | 3.5.5-1ubuntu3.3 | 3.5.5-1ubuntu3.4 | /usr/bin/pebble |");
+    expect(d.body).toContain("Build the target image");
+    expect(d.body).toContain("Only push a change you have verified clears the gate");
+    expect(extractFailureKind(d.body)).toBe("scan");
+  });
+
+  it("omits the findings table when the log carried no recognisable findings", () => {
+    const d = buildIssueDraft({ ...opts, kind: "scan", findings: [] });
+    expect(d.body).not.toContain("Parsed findings:");
+    expect(d.body).toContain("Build the target image");
+    expect(extractFailureKind(d.body)).toBe("scan");
+  });
+
+  it("does not carry scan instructions for a non-scan failure", () => {
+    const d = buildIssueDraft(opts);
+    expect(d.body).not.toContain("Build the target image");
+    expect(extractFailureKind(d.body)).toBeNull();
   });
 });
 

@@ -90,6 +90,14 @@ Rules:
 - Valid type labels: ${typeLabels}
 - Never remove agent/* labels
 - Lane must be one of the configured lane ids
+${escalationLaneId ? `- CVE/scan release blockers (CI scan-gate failures: the body carries a
+  \`dispatch-ci-failure\` marker with kind \`scan\`, or the issue is a
+  vulnerability-scan failure with parsed findings) are ready work for the
+  escalation lane, not for a human. Route them to "${escalationLaneId}" with
+  actionability "ready" — the issue body already carries the reproduce-and-
+  verify instructions (build the image, run the scanner locally, iterate).
+  NEVER route them to needs-human or backlog: the whole point of ingesting
+  these failures is that the loop fixes them without a human in the loop.` : ""}
 - When actionability is "ready", lane.id MUST be a claimable worker lane (${claimableIds})${backlogLaneId ? `, NEVER "${backlogLaneId}"` : ""}. Claimable lanes:
 ${laneGuide}
   Choose the lane the work actually needs, using the descriptions above. Most ready work belongs in "${defaultLaneId}", because most issues are determinate: the change to make is already clear from the issue and its code, and a worker only has to carry it out. Bug fixes, small-to-medium features, config/YAML/docs changes and single-module refactors are normally determinate. Size is not the test — a determinate change spanning several files is still determinate, so do NOT escalate merely because an issue touches many files or looks large.${escalationLaneId ? ` Choose "${escalationLaneId}" when the work requires deciding between alternatives rather than carrying out a decision already made: a design or architecture change, a fix whose correct approach is genuinely arguable from the issue, or work that must hold several modules in mind at once to be done safely. Judgement, not size, is the test. Assign it directly when the issue calls for it — do not route work through "${defaultLaneId}" first to see whether it copes.` : ""}${backlogLaneId ? `\n- The "${backlogLaneId}" lane is non-claimable — use it only when actionability is not "ready" (needs_info/blocked/backlog/already_done). Priority (P2/P3/low) does NOT mean backlog: a low-priority but ready issue still goes to a claimable lane.` : ""}

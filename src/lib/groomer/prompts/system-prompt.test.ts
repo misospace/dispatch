@@ -114,6 +114,18 @@ describe("buildGroomerSystemPrompt", () => {
     expect(prompt).toContain('Most ready work belongs in "local"');
   });
 
+  it("routes CVE/scan blockers to the escalation lane, never needs-human (#988)", () => {
+    const prompt = buildGroomerSystemPrompt(baseParams);
+    expect(prompt).toContain("CVE/scan release blockers");
+    expect(prompt).toContain('Route them to "cloud"');
+    expect(prompt).toContain("NEVER route them to needs-human or backlog");
+  });
+
+  it("omits the scan-blocker rule when no escalation lane is configured", () => {
+    const prompt = buildGroomerSystemPrompt({ ...baseParams, escalationLaneId: "" });
+    expect(prompt).not.toContain("CVE/scan release blockers");
+  });
+
   describe("lane selection", () => {
     it("lets the groomer assign the escalation lane directly", () => {
       const prompt = buildGroomerSystemPrompt(baseParams);

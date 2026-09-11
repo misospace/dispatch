@@ -28,9 +28,11 @@ import {
   closedIssueStatusFix,
   fetchAllStateIssues,
   defaultCurrentLane,
+  ingestLaneFor,
   SYNC_OVERLAP_BUFFER_MS,
 } from "./issue-sync";
 import { setLaneConfig, resetLaneConfig } from "@/lib/lane-config";
+import { buildFailureMarker } from "./ci-failure-ingestion";
 
 function githubIssue(number: number, overrides?: Partial<GitHubIssue>): GitHubIssue {
   return {
@@ -455,5 +457,43 @@ describe("defaultCurrentLane (dispatch#964)", () => {
       ],
     });
     expect(defaultCurrentLane()).toBe("work");
+  });
+});
+
+describe("ingestLaneFor (dispatch#988)", () => {
+  afterEach(() => resetLaneConfig());
+
+  const multiLane = () =>
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+
+  it("routes a scan-blocker issue to the escalation lane", () => {
+    multiLane();
+    const body = `CI: Vulnerability Scan failing\n\n${buildFailureMarker("abc123", "Vulnerability Scan", "scan")}`;
+    expect(ingestLaneFor(body)).toBe("frontier");
+  });
+
+  it("routes a non-scan CI failure to the default lane", () => {
+    multiLane();
+    const body = `CI: Release failing\n\n${buildFailureMarker("abc123", "Release")}`;
+    expect(ingestLaneFor(body)).toBe("local");
+  });
+
+  it("routes a plain issue to the default lane", () => {
+    multiLane();
+    expect(ingestLaneFor("Fix the login bug")).toBe("local");
+    expect(ingestLaneFor(null)).toBe("local");
+  });
+
+  it("falls back to the default lane when no escalation lane is configured", () => {
+    resetLaneConfig();
+    const body = buildFailureMarker("abc123", "Vulnerability Scan", "scan");
+    expect(ingestLaneFor(body)).toBe("default");
   });
 });

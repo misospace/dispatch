@@ -22,7 +22,10 @@ import {
   extractFailureWorkflow,
   hasOpenIssueForSignature,
   groupDefaultBranchRuns,
+  isScanFailure,
+  parseScanFindings,
   type CiRun,
+  type FailureKind,
   type FiledIssue,
 } from "@/lib/ci-failure-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -42,14 +45,23 @@ import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "
  */
 
 /** Labels applied to a filed issue. Configurable so this carries no
- *  assumption about any one deployment's taxonomy. */
-function issueLabels(): string[] {
+ *  assumption about any one deployment's taxonomy. Scan blockers additionally
+ *  carry type/security: they are security findings, and the label is what
+ *  downstream tooling (and the groomer) keys on to keep them on the
+ *  escalation lane (#988). */
+function issueLabels(kind?: FailureKind): string[] {
   const raw = process.env.DISPATCH_CI_FAILURE_LABELS;
-  if (raw === undefined) return ["type/bug", "status/ready"];
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const base =
+    raw === undefined
+      ? ["type/bug", "status/ready"]
+      : raw
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+  if (kind === "scan" && !base.includes("type/security")) {
+    return [...base, "type/security"];
+  }
+  return base;
 }
 
 async function filedIssuesFor(repoFullName: string): Promise<FiledIssue[]> {
@@ -193,6 +205,20 @@ export async function POST(request: NextRequest) {
             continue;
           }
 
+          // CVE/scan blockers are a different kind of failure: the fix is
+          // only verifiable by rebuilding the image and re-running the
+          // scanner, so the issue carries parsed findings and the
+          // reproduce-and-verify instructions, and the type/security label
+          // keeps it on the escalation lane through grooming (#988).
+          const kind: FailureKind | undefined = isScanFailure(
+            history.workflowName,
+            jobName,
+            logExcerpt,
+          )
+            ? "scan"
+            : undefined;
+          const findings = kind === "scan" ? parseScanFindings(logExcerpt) : [];
+
           const draft = buildIssueDraft({
             repoFullName,
             workflowName: history.workflowName,
@@ -202,11 +228,13 @@ export async function POST(request: NextRequest) {
             previous: state.previous,
             logExcerpt,
             supersedes: action.supersedes,
+            kind,
+            findings,
           });
           const created = await createIssue(repoFullName, {
             title: draft.title,
             body: draft.body,
-            labels: issueLabels(),
+            labels: issueLabels(kind),
           });
           // Keep the local view current so a second workflow in the same repo
           // with the same signature does not file a duplicate in this pass.

@@ -46,7 +46,15 @@ import { createHash } from "crypto";
  * The workflow is base64url-encoded so a name containing `-->`, a colon or a
  * newline cannot break out of the comment or the field split. */
 const MARKER_PREFIX = "dispatch-ci-failure";
-const MARKER_RE = /<!--\s*dispatch-ci-failure:([a-z0-9]+)(?::([A-Za-z0-9_-]*))?\s*-->/i;
+const MARKER_RE = /<!--\s*dispatch-ci-failure:(?<sig>[a-z0-9]+)(?::(?<workflow>[A-Za-z0-9_-]*))?(?::(?<kind>[a-z]+))?\s*-->/i;
+
+/**
+ * The kind of failure an auto-filed issue describes. `scan` marks a
+ * CVE/scan release blocker: it is routed to the escalation lane at ingest
+ * and carries parsed findings, so the solver starts from real inputs
+ * (package → installed → fixed-in → location) instead of the raw log (#988).
+ */
+export type FailureKind = "scan";
 
 function encodeWorkflow(workflowName: string): string {
   return Buffer.from(workflowName, "utf8").toString("base64url");
@@ -118,21 +126,228 @@ export function computeFailureSignature(input: FailureSignatureInput): string {
     .slice(0, 16);
 }
 
-export function buildFailureMarker(signature: string, workflowName?: string): string {
-  const suffix = workflowName ? `:${encodeWorkflow(workflowName)}` : "";
+export function buildFailureMarker(
+  signature: string,
+  workflowName?: string,
+  kind?: FailureKind,
+): string {
+  const suffix = workflowName
+    ? `:${encodeWorkflow(workflowName)}${kind ? `:${kind}` : ""}`
+    : kind
+      ? `:${kind}`
+      : "";
   return `<!-- ${MARKER_PREFIX}:${signature}${suffix} -->`;
 }
 
 export function extractFailureMarker(body: string | null | undefined): string | null {
   const m = MARKER_RE.exec(body || "");
-  return m ? m[1].toLowerCase() : null;
+  return m ? m.groups!.sig.toLowerCase() : null;
 }
 
 /** The workflow an auto-filed issue belongs to, or null for a pre-#956 issue
  *  whose marker carries only a signature. */
 export function extractFailureWorkflow(body: string | null | undefined): string | null {
   const m = MARKER_RE.exec(body || "");
-  return m ? decodeWorkflow(m[2]) : null;
+  return m ? decodeWorkflow(m.groups!.workflow) : null;
+}
+
+/** The failure kind an auto-filed issue carries, or null for a marker that
+ *  predates the kind field. */
+export function extractFailureKind(body: string | null | undefined): FailureKind | null {
+  const m = MARKER_RE.exec(body || "");
+  return m && m.groups!.kind === "scan" ? "scan" : null;
+}
+
+// ─── CVE/scan blocker classification (#988) ─────────────────────────────────
+
+/**
+ * Is this a CVE/scan release blocker?
+ *
+ * A scan gate failing is a different kind of failure from a build or test
+ * failure: the fix is usually a dependency bump or dropping a vulnerable
+ * binary, and it can only be *verified* by rebuilding the image and running
+ * the same scanner. The issue text alone is not enough — a coder that
+ * guesses burns a full run and lets CI reject it, then re-dispatches
+ * (misospace/llmkube-images #407 ran ~98 min and re-dispatched indefinitely).
+ *
+ * Detection: a workflow or job whose name says it is a scan gate, or a log
+ * that actually contains CVE findings. A CVE id in a failing job's log is
+ * strong evidence the gate is a scan gate — the whole point is that these
+ * are auto-routed, so erring toward "scan" (a stronger model, same loop) is
+ * cheaper than missing one.
+ */
+export function isScanFailure(workflowName: string, jobName: string, logExcerpt: string): boolean {
+  const name = `${workflowName} ${jobName}`.toLowerCase();
+  if (/(vulnerab|security|grype|trivy|snyk|scan)/.test(name)) return true;
+  return /CVE-\d{4}-\d{4,}/i.test(logExcerpt || "");
+}
+
+/**
+ * Parsed findings from a scan log: package → installed → fixed-in →
+ * file/binary location.
+ *
+ * This is the enrichment the solver needs to start from real inputs instead
+ * of the raw job log (#988). The parsers are best-effort: a line that does
+ * not match a known scanner shape is skipped, and a log with no recognisable
+ * findings yields an empty list (the raw excerpt still goes in the body).
+ */
+export interface ScanFinding {
+  /** CVE id, e.g. "CVE-2026-1234". */
+  cve: string;
+  /** Package name, e.g. "openssl". */
+  package: string;
+  /** Installed version, when the log carries one. */
+  installed: string | null;
+  /** Fixed-in version, when the log carries one. */
+  fixedIn: string | null;
+  /** File or binary location, when the log carries one. */
+  location: string | null;
+}
+
+// The optional leading `N:` is a Debian epoch (`1:1.3.1-1`); without it a
+// versioned package with an epoch is dropped from the findings.
+const VERSION_RE = /(?:\d+:)?\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.+-]+)?/;
+
+/**
+ * Parse grype-style table rows:
+ * `NAME  VERSION  TYPE  VULNERABILITY  FIX VERSION  STATUS`
+ * e.g. `openssl  3.5.5-1ubuntu3.3  deb  CVE-2026-1234  3.5.5-1ubuntu3.4  ...`
+ */
+function parseGrypeTableRows(log: string): ScanFinding[] {
+  const findings: ScanFinding[] = [];
+  for (const line of log.split("\n")) {
+    const cells = line.trim().split(/\s+/);
+    const cveIdx = cells.findIndex((c) => /^CVE-\d{4}-\d{4,}$/i.test(c));
+    if (cveIdx < 1) continue;
+    // The installed version is the nearest version-like cell BEFORE the CVE
+    // (grype's layout is NAME VERSION TYPE VULNERABILITY FIX VERSION, so the
+    // column positions are not fixed); the package is the cell before it.
+    let vIdx = -1;
+    for (let i = cveIdx - 1; i >= 0; i--) {
+      if (VERSION_RE.test(cells[i])) {
+        vIdx = i;
+        break;
+      }
+    }
+    if (vIdx < 1) continue;
+    const pkg = cells[vIdx - 1];
+    if (!pkg || VERSION_RE.test(pkg)) continue;
+    let fixedIn: string | null = null;
+    for (let i = cveIdx + 1; i < cells.length; i++) {
+      if (VERSION_RE.test(cells[i])) {
+        fixedIn = cells[i];
+        break;
+      }
+    }
+    findings.push({ cve: cells[cveIdx], package: pkg, installed: cells[vIdx], fixedIn, location: null });
+  }
+  return findings;
+}
+
+/**
+ * Parse prose findings:
+ * `CVE-2026-1234 in openssl 3.5.5-1ubuntu3.3 (fixed in 3.5.5-1ubuntu3.4) at /usr/bin/pebble`
+ * and the looser `openssl 3.5.5-1ubuntu3.3 is vulnerable to CVE-2026-1234`.
+ */
+function parseProseFindings(log: string): ScanFinding[] {
+  const findings: ScanFinding[] = [];
+  const seen = new Set<string>();
+  const push = (f: ScanFinding) => {
+    const key = `${f.cve}|${f.package}|${f.installed ?? ""}|${f.fixedIn ?? ""}|${f.location ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    findings.push(f);
+  };
+
+  // "CVE-... in <pkg> <version> (fixed in <version>) at <path>"
+  const inRe = /CVE-\d{4}-\d{4,}\s+in\s+([A-Za-z0-9._@/-]+)\s+(\S+)(?:\s+\(fixed in\s+([^)]+)\))?(?:\s+at\s+(\S+))?/gi;
+  for (const m of log.matchAll(inRe)) {
+    push({
+      cve: m[0].slice(0, m[0].indexOf(" in ")),
+      package: m[1],
+      installed: m[2],
+      fixedIn: m[3] ?? null,
+      location: m[4] ?? null,
+    });
+  }
+
+  // "<pkg> <version> is vulnerable to CVE-..."
+  const vulnRe = /([A-Za-z0-9._@/-]+)\s+(\S+)\s+is vulnerable(?:\s+to)?\s+(CVE-\d{4}-\d{4,})/gi;
+  for (const m of log.matchAll(vulnRe)) {
+    push({ cve: m[3], package: m[1], installed: m[2], fixedIn: null, location: null });
+  }
+
+  // "fixed in <version>" / "fixed-in: <version>" attached to the most recent CVE
+  const fixedRe = /CVE-\d{4}-\d{4,}[^.\n]*?fixed[- ]in[:\s]+(\S+)/gi;
+  for (const m of log.matchAll(fixedRe)) {
+    const cve = m[0].match(/CVE-\d{4}-\d{4,}/i)![0];
+    const f = findings.find((x) => x.cve === cve && !x.fixedIn);
+    if (f) f.fixedIn = m[1];
+  }
+
+  // "at <path>" / "location: <path>" attached to the most recent CVE
+  const locRe = /CVE-\d{4}-\d{4,}[^.\n]*?(?:at|location[:\s]+)(\/\S+)/gi;
+  for (const m of log.matchAll(locRe)) {
+    const cve = m[0].match(/CVE-\d{4}-\d{4,}/i)![0];
+    const f = findings.find((x) => x.cve === cve && !x.location);
+    if (f) f.location = m[1];
+  }
+
+  return findings;
+}
+
+/**
+ * Extract findings from a scan log. Table rows first (grype's default
+ * output), then prose; duplicates are dropped.
+ */
+export function parseScanFindings(logExcerpt: string): ScanFinding[] {
+  const log = logExcerpt || "";
+  const findings = [...parseGrypeTableRows(log), ...parseProseFindings(log)];
+  const seen = new Set<string>();
+  return findings.filter((f) => {
+    const key = `${f.cve}|${f.package}|${f.installed ?? ""}|${f.fixedIn ?? ""}|${f.location ?? ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/**
+ * Render the parsed findings as a markdown table for the issue body.
+ * Returns null when there are no findings — the raw log excerpt is then the
+ * only evidence, and the body should not promise a table that is empty.
+ */
+export function renderFindingsTable(findings: ScanFinding[]): string | null {
+  if (findings.length === 0) return null;
+  const rows = findings.map((f) =>
+    [f.cve, f.package, f.installed ?? "—", f.fixedIn ?? "—", f.location ?? "—"].join(" | "),
+  );
+  return [
+    "| CVE | Package | Installed | Fixed in | Location |",
+    "| --- | --- | --- | --- | --- |",
+    ...rows.map((r) => `| ${r} |`),
+  ].join("\n");
+}
+
+/**
+ * The instructions a scan-blocker issue carries for the solver.
+ *
+ * This is the feedback contract (#988): the lane must build the target image
+ * and run the same scanner locally, iterate, and only push a change it has
+ * verified clears the gate. Without that loop the fix is guess-and-let-CI-
+ * reject, which is exactly the failure mode this issue exists to end.
+ */
+export function buildScanInstructions(): string {
+  return [
+    "This is a CVE/scan release blocker. The fix is only verifiable by reproducing the scan locally:",
+    "",
+    "1. Build the target image from the default branch.",
+    "2. Run the same scanner the gate uses (grype or trivy) against the built image.",
+    "3. Iterate on the fix — bump the pinned dependency, or drop the vulnerable package/binary from the image — until the scan clears.",
+    "4. Only push a change you have verified clears the gate. Do not push a guess and let CI reject it.",
+    "",
+    "Note: bumping a top-level dependency does not always patch its vendored or bundled dependencies (e.g. `npm@latest` does not patch npm's bundled `node_modules`). If a bump does not clear the finding, find where the vulnerable code actually ships and remove or replace it.",
+  ].join("\n");
 }
 
 /** Runs for one workflow on the default branch, newest first. */
@@ -313,8 +528,13 @@ export function buildIssueDraft(opts: {
   previous: CiRun;
   logExcerpt: string;
   supersedes: number | null;
+  /** Failure kind; `scan` issues carry parsed findings and the local
+   *  reproduce-and-verify instructions (#988). */
+  kind?: FailureKind;
+  /** Parsed scan findings, when the log carried recognisable ones. */
+  findings?: ScanFinding[];
 }): IssueDraft {
-  const { workflowName, jobName, latest, previous, logExcerpt, supersedes } = opts;
+  const { workflowName, jobName, latest, previous, logExcerpt, supersedes, kind, findings } = opts;
   const excerpt = (logExcerpt || "").trim().slice(0, 4000) || "(no log excerpt available)";
   const lines = [
     `\`${workflowName}\` has failed twice in a row on the default branch, in the same job and for the same reason.`,
@@ -324,18 +544,27 @@ export function buildIssueDraft(opts: {
     `- Failing job: \`${jobName}\``,
     "",
     "A single red run is not filed — this one repeated, so it is a condition rather than a transient.",
+  ];
+  if (kind === "scan") {
+    const table = renderFindingsTable(findings ?? []);
+    if (table) {
+      lines.push("", "Parsed findings:", "", table);
+    }
+    lines.push("", buildScanInstructions());
+  }
+  lines.push(
     "",
     "```",
     excerpt,
     "```",
-  ];
+  );
   if (supersedes !== null) {
     lines.push(
       "",
       `This failure was filed before as #${supersedes} and closed. It has returned, so the earlier fix did not hold.`,
     );
   }
-  lines.push("", buildFailureMarker(opts.signature, opts.workflowName));
+  lines.push("", buildFailureMarker(opts.signature, opts.workflowName, kind));
   return {
     title: `CI: ${workflowName} failing on the default branch (${jobName})`,
     body: lines.join("\n"),
