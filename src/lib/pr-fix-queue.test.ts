@@ -600,6 +600,74 @@ describe("enqueuePrFixItem evidence dedupe", () => {
     expect(reopened.status).toBe("FIXED");
     expect(reopened.headSha).toBe("newsha");
   });
+
+  it("keeps a reaped (STALE) item terminal when NEW evidence arrives (#1000)", async () => {
+    // Worked example from #1000: a merged PR whose CI check fails after the
+    // merge, or whose bot post-merges a comment. The webhook path has no reap
+    // and filters no terminal PRs for comments / check runs, and the pull
+    // sync re-reads the same evidence every sweep — a late event used to move
+    // the reaped record back to QUEUED so the bridge re-dispatched a coder fix
+    // for a PR that no longer exists. STALE is terminal: new evidence is
+    // recorded (feedback/evidenceKeys/history) but never resurrects the item.
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "o/r", pr: 4, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "Failing check: ci", feedback: "first", evidenceKey: "check:o/r#4:1",
+    });
+    await markPrFixItem(client, { repo: "o/r", pr: 4, status: "STALE", note: "Upstream PR state=merged at reconcile time" });
+    expect(client.items[0].status).toBe("STALE");
+
+    const before = client.history.length;
+    const revived = await enqueuePrFixItem(client, {
+      repo: "o/r", pr: 4, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "Failing check: ci", feedback: "second", evidenceKey: "check:o/r#4:2",
+    });
+
+    expect(revived.status).toBe("STALE");
+    // The late evidence is still recorded for audit, but the reap is not undone.
+    expect(revived.evidenceKeys).toEqual(["check:o/r#4:1", "check:o/r#4:2"]);
+    expect(revived.feedback).toEqual(["first", "second"]);
+    expect(client.history.at(-1)).toMatchObject({ action: "enqueue", evidenceKey: "check:o/r#4:2" });
+    expect(client.history.length).toBeGreaterThan(before);
+  });
+
+  it("keeps a reaped (STALE) item terminal on repeat of known evidence (#1000)", async () => {
+    // The sync re-reads a persistent check run (or comment) every sweep; the
+    // pre-fix dedupe branch left known evidence's status unchanged, but the
+    // new-evidence branch flipped STALE back to QUEUED. Neither may: a reaped
+    // item stays reaped under any evidence, known or new.
+    const client = makeClient();
+    const input = {
+      repo: "o/r", pr: 5, lane: "NEEDS_HUMAN", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "changes please",
+      evidenceKey: "review:o/r#5:r1",
+    };
+    await enqueuePrFixItem(client, input);
+    await markPrFixItem(client, { repo: "o/r", pr: 5, status: "STALE", note: "Upstream PR state=merged at reconcile time" });
+    expect(client.items[0].status).toBe("STALE");
+
+    const again = await enqueuePrFixItem(client, input);
+    expect(again.status).toBe("STALE");
+  });
+
+  it("does not surface a blocked handoff when a reaped item is re-enqueued (#1000)", async () => {
+    // A reaped item can no longer flip to QUEUED/BLOCKED, so a late event must
+    // not also post a "blocked" handoff (label + comment) for a merged PR.
+    const client = makeClient();
+    const input = {
+      repo: "o/r", pr: 6, lane: "NEEDS_HUMAN", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "changes please",
+      evidenceKey: "review:o/r#6:r1",
+    };
+    await enqueuePrFixItem(client, input);
+    await markPrFixItem(client, { repo: "o/r", pr: 6, status: "STALE" });
+    surfacingMocks.surfacePrFixBlocked.mockClear();
+
+    const again = await enqueuePrFixItem(client, input);
+
+    expect(again.status).toBe("STALE");
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
 });
 
 describe("buildPrFixBlockedContext", () => {

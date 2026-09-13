@@ -227,17 +227,33 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         typeof input.headSha === "string" &&
         existing.headSha === input.headSha;
       const reopenFixStale = isKnownEvidence && headShaUnchanged;
+      // A STALE item is terminal: its PR was reaped (merged or closed) and there
+      // is nothing left to fix. New or repeat evidence must NOT move it back to
+      // QUEUED. The pull sync re-reads every open PR each sweep, and the webhook
+      // path has no reap and filters no terminal PRs for comments / check runs,
+      // so a late event on a merged PR resurrected the reaped record and the
+      // bridge re-dispatched a coder fix for a PR that no longer exists
+      // (dispatch#1000). Keep the reap sticky; the enqueue is still recorded in
+      // history for audit.
+      const staleTerminal = existing.status === "STALE";
 
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
           lane,
           type,
+          // STALE is terminal — keep it, never requeue (#1000).
           // New evidence on a stale FIXED → reopen to QUEUED so the loop
           // dispatches another fix attempt. Without the reopen we'd write
           // another `enqueue` history row against a `FIXED` tombstone and
           // strand the PR (the worked example in #940).
-          status: reopenFixStale ? nextStatus : isKnownEvidence ? existing.status : nextStatus,
+          status: staleTerminal
+            ? existing.status
+            : reopenFixStale
+              ? nextStatus
+              : isKnownEvidence
+                ? existing.status
+                : nextStatus,
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40),
