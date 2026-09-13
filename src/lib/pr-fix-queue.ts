@@ -194,6 +194,17 @@ function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number
   return patch;
 }
 
+/**
+ * Bound on automatic fix attempts before a REVIEW_FEEDBACK/CI item is handed to
+ * a human instead of re-queued. Distinct evidence keys count attempts (each
+ * coder push draws a fresh automated review → a new key). Overridable via
+ * PR_FIX_MAX_ATTEMPTS; defaults to 5.
+ */
+export function maxPrFixAttempts(): number {
+  const n = Number(process.env.PR_FIX_MAX_ATTEMPTS);
+  return Number.isInteger(n) && n > 0 ? n : 5;
+}
+
 export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueuePrFixInput) {
   const lane = normalizePrFixLane(input.lane);
   const type = normalizePrFixType(input.type);
@@ -228,19 +239,49 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         existing.headSha === input.headSha;
       const reopenFixStale = isKnownEvidence && headShaUnchanged;
 
+      // Terminal states are sticky. Once an item is STALE (its PR merged or
+      // closed) or IGNORED, re-observed evidence must NOT resurrect it to
+      // QUEUED — the only way back is an explicit requeue, which refuses
+      // merged/closed PRs. Without this the per-sync reap that stales a merged
+      // PR is immediately undone by the next fresh review/check event, looping
+      // a coder forever on a PR that no longer exists (#1000; observed on
+      // pr-reviewer-action #593/#595).
+      const isTerminalStatus = existing.status === "STALE" || existing.status === "IGNORED";
+
+      // Bound the fix loop. Each coder push draws a fresh automated review with
+      // a new evidenceKey, so distinct keys count fix attempts. Past the cap,
+      // stop re-queuing and hand the PR to a human — otherwise a human
+      // CHANGES_REQUESTED that N automated fixes never satisfy loops forever
+      // (#1001).
+      const nextEvidenceKeys = uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40);
+      const capExceeded = !isKnownEvidence && nextEvidenceKeys.length > maxPrFixAttempts();
+
+      let resolvedStatus: PrFixStatus;
+      let resolvedLane: PrFixLane = lane;
+      let statusNote: string | null = null;
+      if (isTerminalStatus) {
+        resolvedStatus = existing.status; // sticky — never resurrect a gone PR
+      } else if (reopenFixStale) {
+        resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
+      } else if (isKnownEvidence) {
+        resolvedStatus = existing.status; // #25 anti-churn: repeat evidence never flips status
+      } else if (capExceeded) {
+        resolvedStatus = "BLOCKED";
+        resolvedLane = "NEEDS_HUMAN";
+        statusNote = `Bounded at ${nextEvidenceKeys.length} attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1001).`;
+      } else {
+        resolvedStatus = nextStatus;
+      }
+
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
-          lane,
+          lane: resolvedLane,
           type,
-          // New evidence on a stale FIXED → reopen to QUEUED so the loop
-          // dispatches another fix attempt. Without the reopen we'd write
-          // another `enqueue` history row against a `FIXED` tombstone and
-          // strand the PR (the worked example in #940).
-          status: reopenFixStale ? nextStatus : isKnownEvidence ? existing.status : nextStatus,
+          status: resolvedStatus,
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
-          evidenceKeys: uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40),
+          evidenceKeys: nextEvidenceKeys,
           ...metadataPatch(input),
         },
       });
@@ -253,6 +294,8 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       };
       if (reopenFixStale) {
         historyData.note = `Reopened: PR head SHA unchanged since FIXED (${existing.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
+      } else if (statusNote) {
+        historyData.note = statusNote;
       }
       await tx.prFixHistory.create({ data: historyData });
       return updated;
