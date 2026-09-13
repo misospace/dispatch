@@ -184,6 +184,44 @@ describe("PR review-fix queue", () => {
     expect(await listQueuedPrFixItems(client, { lane: "NORMAL" })).toEqual([]);
     expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED", note: "pushed fix + validation" });
   });
+
+  it("does not resurrect a STALE item on new evidence (#1000)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "review", feedback: "f1", evidenceKey: "review:1" });
+    // PR merges → the per-sync reap stales it.
+    await reconcileStalePrFixItems(
+      client,
+      new Map([["org/repo", new Set([7])]]),
+      new Map([["org/repo", new Map<number, "merged" | "closed">([[7, "merged"]])]]),
+    );
+    expect(client.items[0].status).toBe("STALE");
+
+    // A fresh automated review lands after the merge (a new evidence key).
+    // Before #1000 this flipped the item back to QUEUED and the coder looped
+    // forever on a merged PR. It must stay STALE.
+    const after = await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "review", feedback: "f2", evidenceKey: "review:2" });
+    expect(after.status).toBe("STALE");
+    expect(await listQueuedPrFixItems(client, { includeBlocked: true })).toEqual([]);
+  });
+
+  it("blocks a REVIEW_FEEDBACK item after PR_FIX_MAX_ATTEMPTS distinct attempts (#1001)", async () => {
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "3";
+    try {
+      for (let i = 1; i <= 3; i++) {
+        const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: `f${i}`, evidenceKey: `review:${i}` });
+        expect(item.status).toBe("QUEUED");
+      }
+      // The 4th distinct attempt exceeds the cap → hand to a human instead of
+      // re-queuing (the human-review-forever case).
+      const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: "f4", evidenceKey: "review:4" });
+      expect(blocked.status).toBe("BLOCKED");
+      expect(blocked.lane).toBe("NEEDS_HUMAN");
+      expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
 });
 
 describe("reconcileStalePrFixItems", () => {
@@ -641,21 +679,31 @@ describe("buildPrFixBlockedContext", () => {
   });
 
   it("uses uncapped history for totalAttempts", async () => {
-    const client = makeClient();
-    for (let i = 0; i < 13; i += 1) {
-      await enqueuePrFixItem(client, {
-        repo: "org/repo",
-        pr: 8,
-        lane: "NORMAL",
-        reason: `failure ${i}`,
-        feedback: `attempt ${i}`,
-        evidenceKey: `k${i}`,
-      });
-    }
+    // Raise the attempt cap out of the way — this test exercises history-based
+    // attempt counting, not the #1001 bound (which would otherwise re-lane the
+    // later attempts to NEEDS_HUMAN).
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "100";
+    try {
+      const client = makeClient();
+      for (let i = 0; i < 13; i += 1) {
+        await enqueuePrFixItem(client, {
+          repo: "org/repo",
+          pr: 8,
+          lane: "NORMAL",
+          reason: `failure ${i}`,
+          feedback: `attempt ${i}`,
+          evidenceKey: `k${i}`,
+        });
+      }
 
-    const context = await buildPrFixBlockedContext(client, client.items.find((item) => item.pr === 8));
-    expect(context.totalAttempts).toBe(13);
-    expect(context.attemptsByLane).toEqual({ NORMAL: 13 });
+      const context = await buildPrFixBlockedContext(client, client.items.find((item) => item.pr === 8));
+      expect(context.totalAttempts).toBe(13);
+      expect(context.attemptsByLane).toEqual({ NORMAL: 13 });
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
   });
 
   it("returns no per-lane/signature data when absent (backwards compatible)", async () => {

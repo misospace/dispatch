@@ -365,7 +365,7 @@ export async function POST(request: NextRequest) {
     for (const repoFullName of repoFullNames) {
       if (rateLimited) break;
       try {
-        const closedPrs = await fetchClosedPullRequests(repoFullName, 30);
+        const closedPrs = await fetchClosedPullRequests(repoFullName, 100);
         if (closedPrs.length > 0) {
           mergedOrClosedPrsByRepo.set(repoFullName, new Set(closedPrs.map((pr) => pr.number)));
           const statesMap = new Map<number, "merged" | "closed">();
