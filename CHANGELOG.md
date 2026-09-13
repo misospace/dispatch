@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.61](https://github.com/misospace/dispatch/compare/v0.5.60...v0.5.61) (2026-09-13)
+
+
+### Features
+
+* **deps:** update dependency tailwind-merge (3.6.0 → 3.7.0) ([#997](https://github.com/misospace/dispatch/issues/997)) ([9f67de0](https://github.com/misospace/dispatch/commit/9f67de0bb49750b86c8cebe7736ff37630372184))
+
+
+### Bug Fixes
+
+* **deps:** update dependency zod (4.6.2 → 4.6.4) ([#998](https://github.com/misospace/dispatch/issues/998)) ([0bed6b5](https://github.com/misospace/dispatch/commit/0bed6b58c1d76b814ad34523aa894da943ebfee4))
+* **pr-fix:** stop the merged-PR and human-review fix loops ([#1003](https://github.com/misospace/dispatch/issues/1003)) ([a2a412f](https://github.com/misospace/dispatch/commit/a2a412fea6195f4078b944f76a732e11f11ffbdf))
+
 ## [0.5.60](https://github.com/misospace/dispatch/compare/v0.5.59...v0.5.60) (2026-09-11)
 
 
