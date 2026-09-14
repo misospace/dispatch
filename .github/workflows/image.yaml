@@ -99,6 +99,14 @@ jobs:
           docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" --version
           docker run --rm --env DATABASE_URL=postgresql://localhost:5432/dispatch --entrypoint ./node_modules/.bin/prisma "$IMAGE" validate
 
+      # Trivy is the release gate, so this action is pinned to a commit SHA on
+      # purpose: a floating tag (e.g. if upstream retagged it with a compromise)
+      # must not reach a release build. Renovate's github-tags datasource cannot
+      # resolve a bare SHA pin and only produced a "no-result" lookup failure on
+      # the dashboard, so the action is excluded from Renovate in renovate.json
+      # (matchPackageNames: aquasecurity/trivy-action, enabled: false) and is
+      # bumped manually, with the version comment, after reviewing an upstream
+      # release.
       - name: Run Trivy vulnerability scanner
         if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
