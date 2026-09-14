@@ -58,5 +58,5 @@ The following previously accepted risks have been retired:
 
 | Advisory | Status | Action |
 |---|---|---|
-| Trivy action pinned to SHA | ✅ Resolved | `aquasecurity/trivy-action@ed142fd` (v0.36.0) |
+| Trivy action pinned to SHA | ✅ Resolved | `aquasecurity/trivy-action@ed142fd` (v0.36.0). The SHA pin is intentional: trivy is the release gate, so a floating tag must not reach a release build. Renovate's `github-tags` datasource cannot resolve a bare SHA pin (it only produced a `no-result` lookup failure on the dashboard), so the action is excluded from Renovate in `renovate.json` (`matchPackageNames: ["aquasecurity/trivy-action"]`, `enabled: false`) and is bumped manually, with the version comment, after reviewing an upstream release. |
 | `.npmrc` invalid omit config | ✅ Resolved | Fixed `omit=` → `omit=dev` |

@@ -7,6 +7,10 @@
     {
       "matchPackageNames": ["typescript"],
       "allowedVersions": "<7.0.0"
+    },
+    {
+      "matchPackageNames": ["aquasecurity/trivy-action"],
+      "enabled": false
     }
   ]
 }
