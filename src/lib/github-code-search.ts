@@ -48,20 +48,29 @@ export async function searchRepositoryCode(
   query: string,
   limit: number,
 ): Promise<GitHubCodeSearchResult[]> {
-  const perPage = Math.min(Math.max(1, limit), 100);
   const searchQuery = `${query} repo:${repoFullName}`;
-  const url = `${GITHUB_API}/search/code?q=${encodeURIComponent(searchQuery)}&per_page=${perPage}`;
-  const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Code search failed for ${repoFullName}: ${response.status} ${text}`);
+  const url = `${GITHUB_API}/search/code?q=${encodeURIComponent(searchQuery)}`;
+  try {
+    // Follow the `Link: rel="next"` header across pages (up to `limit` results)
+    // so a search with more matches than fit on one page is not silently
+    // truncated at the first page. Each page is fetched through fetchWithRetry,
+    // so transient 429/5xx responses are retried here as well.
+    const items = await fetchPaginated<{ path?: string; html_url?: string }>(
+      url,
+      limit,
+      (data) => (data as { items?: { path?: string; html_url?: string }[] }).items ?? [],
+    );
+    return items.map((item) => ({
+      path: item.path ?? "",
+      url: item.html_url ?? "",
+    }));
+  } catch (err) {
+    // Preserve the caller-facing "Code search failed for <repo>:" prefix the
+    // groomer's tool layer keys off, while still surfacing the upstream status
+    // and body carried in fetchPaginated's error.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Code search failed for ${repoFullName}: ${message}`);
   }
-  const data = await response.json();
-  const items = (data.items ?? []).slice(0, limit);
-  return items.map((item: { path?: string; html_url?: string }) => ({
-    path: item.path ?? "",
-    url: item.html_url ?? "",
-  }));
 }
 
 /**

@@ -201,6 +201,7 @@ describe("searchRepositoryCode", () => {
   it("returns search results with path and url", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
+      headers: new Headers(),
       json: () => Promise.resolve({
         items: [
           { path: "src/a.ts", html_url: "https://github.com/org/repo/blob/main/src/a.ts" },
@@ -220,6 +221,7 @@ describe("searchRepositoryCode", () => {
   it("encodes the full search query string correctly", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
+      headers: new Headers(),
       json: () => Promise.resolve({ items: [] }),
     } as Response);
 
@@ -250,6 +252,7 @@ describe("searchRepositoryCode", () => {
   it("returns empty array when no items", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
+      headers: new Headers(),
       json: () => Promise.resolve({ items: [] }),
     } as Response);
 
