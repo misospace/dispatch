@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.62](https://github.com/misospace/dispatch/compare/v0.5.61...v0.5.62) (2026-09-15)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.45.0 → 1.46.0) ([#1011](https://github.com/misospace/dispatch/issues/1011)) ([e3a554f](https://github.com/misospace/dispatch/commit/e3a554f051fa5280b0eb74b8c352b0fec825f60e))
+
+
+### Bug Fixes
+
+* **deps:** update dependency zod (4.6.4 → 4.6.5) ([#1007](https://github.com/misospace/dispatch/issues/1007)) ([6b7ef11](https://github.com/misospace/dispatch/commit/6b7ef11bdb3b71acddfaddd70eddfd77e855dce6))
+* **deps:** update vitest monorepo (5.0.0 → 5.0.1) ([#1016](https://github.com/misospace/dispatch/issues/1016)) ([dc9893a](https://github.com/misospace/dispatch/commit/dc9893a881e9162c0d980d94e27f2a303b31e805))
+* **github:** paginate code-search results and add a co-located client test ([#1012](https://github.com/misospace/dispatch/issues/1012)) ([41381f6](https://github.com/misospace/dispatch/commit/41381f6c02c0a11d421510ba449eaaf6e762d514)), closes [#1006](https://github.com/misospace/dispatch/issues/1006)
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#1010](https://github.com/misospace/dispatch/issues/1010)) ([ef57a6a](https://github.com/misospace/dispatch/commit/ef57a6ae02c146a796b4351acc7612f37f580293))
+* **renovate:** exclude SHA-pinned trivy-action to stop no-result lookup ([#1009](https://github.com/misospace/dispatch/issues/1009)) ([89f3d29](https://github.com/misospace/dispatch/commit/89f3d292041b5c43e25bb9a5cae8e764faf03971))
+
 ## [0.5.61](https://github.com/misospace/dispatch/compare/v0.5.60...v0.5.61) (2026-09-13)
 
 
