@@ -27,10 +27,16 @@ export interface ExplorationBudget {
   source: "env" | "derived" | ContextMode;
 }
 
+const LARGE_EXPLORATION_BYTES = 98_304;
+
 const MODES: Record<ContextMode, Omit<ExplorationBudget, "source">> = {
   small: { maxTotalBytes: 8_192, maxFileBytes: 4_096, timeoutMs: 90_000 },
   medium: { maxTotalBytes: 24_576, maxFileBytes: 8_192, timeoutMs: 150_000 },
-  large: { maxTotalBytes: 98_304, maxFileBytes: 24_576, timeoutMs: 300_000 },
+  large: {
+    maxTotalBytes: LARGE_EXPLORATION_BYTES,
+    maxFileBytes: 24_576,
+    timeoutMs: 300_000,
+  },
 };
 
 export const DEFAULT_CONTEXT_MODE: ContextMode = "medium";
@@ -41,6 +47,8 @@ const BYTES_PER_TOKEN = 3.5;
 /** Share of the window exploration may occupy. The rest is the system prompt,
  *  the issue context, the findings block and the model's own output. */
 const WINDOW_SHARE = 0.35;
+/** A tool loop does not benefit from consuming an entire large model window. */
+export const MAX_DERIVED_EXPLORATION_BYTES = LARGE_EXPLORATION_BYTES;
 
 function parseMode(raw: string | undefined): ContextMode | null {
   const v = (raw ?? "").trim().toLowerCase();
@@ -59,7 +67,10 @@ function parseIntEnv(raw: string | undefined, min = 1): number | null {
  */
 export function deriveFromContextTokens(tokens: number): Omit<ExplorationBudget, "source"> {
   const usable = Math.floor(tokens * WINDOW_SHARE * BYTES_PER_TOKEN);
-  const maxTotalBytes = Math.max(4_096, usable);
+  const maxTotalBytes = Math.min(
+    MAX_DERIVED_EXPLORATION_BYTES,
+    Math.max(4_096, usable),
+  );
   return {
     maxTotalBytes,
     // A quarter of the budget, so no single file can consume the whole thing

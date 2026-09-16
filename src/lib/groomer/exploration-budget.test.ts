@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CONTEXT_MODE,
+  MAX_DERIVED_EXPLORATION_BYTES,
   deriveFromContextTokens,
   resolveExplorationBudget,
 } from "./exploration-budget";
@@ -49,9 +50,8 @@ describe("resolveExplorationBudget", () => {
       DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS: "131072",
     });
     expect(b.source).toBe("derived");
-    // Well above what "small" would have allowed, and a fraction of the window.
-    expect(b.maxTotalBytes).toBeGreaterThan(100_000);
-    expect(b.maxTotalBytes).toBeLessThan(131_072 * 3.5);
+    // The derived source ignores the named mode and reaches the grooming cap.
+    expect(b.maxTotalBytes).toBe(MAX_DERIVED_EXPLORATION_BYTES);
   });
 
   it("derives a small budget for a small window", () => {
@@ -59,6 +59,16 @@ describe("resolveExplorationBudget", () => {
     expect(b.source).toBe("derived");
     expect(b.maxTotalBytes).toBeLessThan(24_576);
     expect(b.maxTotalBytes).toBeGreaterThanOrEqual(4_096);
+  });
+
+  it("lets an explicit byte override win over a derived budget", () => {
+    const b = resolveExplorationBudget({
+      DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS: "262144",
+      DISPATCH_GROOMER_EXPLORE_MAX_BYTES: "40960",
+    });
+    expect(b.source).toBe("env");
+    expect(b.maxTotalBytes).toBe(40_960);
+    expect(b.maxTotalBytes).toBeLessThan(MAX_DERIVED_EXPLORATION_BYTES);
   });
 
   it("never lets a single file exceed the whole budget", () => {
@@ -102,8 +112,11 @@ describe("deriveFromContextTokens", () => {
     expect(deriveFromContextTokens(1_024).maxTotalBytes).toBeGreaterThanOrEqual(4_096);
   });
 
-  it("caps the timeout at five minutes however large the window", () => {
-    expect(deriveFromContextTokens(1_000_000).timeoutMs).toBe(300_000);
+  it("caps a large model window at the grooming exploration limit", () => {
+    const d = deriveFromContextTokens(262_144);
+    expect(d.maxTotalBytes).toBe(MAX_DERIVED_EXPLORATION_BYTES);
+    expect(d.maxFileBytes).toBe(MAX_DERIVED_EXPLORATION_BYTES / 4);
+    expect(d.timeoutMs).toBe(300_000);
   });
 
   it("keeps per-file at a quarter of the budget", () => {

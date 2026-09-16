@@ -30,7 +30,7 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_TOOL_LOOP_ENABLED` | `true` | Lets the groomer drive its own repository exploration with tools (`search_code`, `read_file`, `list_directory`, `submit_findings`) instead of one pre-computed context block. |
 | `DISPATCH_GROOMER_MAX_ROUNDS` | `12` | Model round-trips the exploration loop may make. One round can carry several tool calls, so this is not a cap on calls. `DISPATCH_GROOMER_MAX_TOOL_CALLS` is accepted as a deprecated alias. |
 | `DISPATCH_GROOMER_CONTEXT_MODE` | `medium` | Exploration budget preset: `small`, `medium`, `large`. See below. |
-| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored — recommended for self-hosted models whose windows do not match what a named preset assumes. |
+| `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored, up to the 96 KB `large` preset cap. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_BYTES` | from mode | Overrides the exploration byte budget. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_FILE_BYTES` | from mode | Overrides bytes per file returned to the model. Never exceeds the total budget. |
 | `DISPATCH_GROOMER_EXPLORE_TIMEOUT_MS` | from mode | Overrides the wall-clock cap on the exploration loop. |
@@ -59,10 +59,12 @@ that explores well but never volunteers findings is not discarded empty. The
 byte budget carries the same nudge when it runs out.
 
 The default suits a modest self-hosted model. If your model's window is much
-larger, prefer setting `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` over guessing a
-preset: a starved loop stops mid-investigation and reports fewer files, which
-shows up as `repository exploration hit its byte budget` in a run's
-`contextWarnings`. The resolved budget and which path produced it are recorded
+larger, setting `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` avoids undersizing the
+loop, but derived budgets stop at the 96 KB `large` preset cap: a tool loop does
+not need to consume the model's full context window. A starved loop stops
+mid-investigation and reports fewer files, which shows up as
+`repository exploration hit its byte budget` in a run's `contextWarnings`. The
+resolved budget and which path produced it are recorded
 on every run under `contextSummary.exploration.budget`.
 
 ## Endpoint
