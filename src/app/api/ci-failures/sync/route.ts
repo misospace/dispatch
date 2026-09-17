@@ -15,6 +15,7 @@ import {
 import {
   buildCloseComment,
   buildIssueDraft,
+  ciFailureIssueLabels,
   classifyWorkflow,
   computeFailureSignature,
   decideAction,
@@ -206,7 +207,7 @@ export async function POST(request: NextRequest) {
           const created = await createIssue(repoFullName, {
             title: draft.title,
             body: draft.body,
-            labels: issueLabels(),
+            labels: ciFailureIssueLabels(history.workflowName, jobName, logExcerpt, issueLabels()),
           });
           // Keep the local view current so a second workflow in the same repo
           // with the same signature does not file a duplicate in this pass.
