@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.62](https://github.com/misospace/dispatch/compare/v0.5.61...v0.5.62) (2026-09-17)
+
+
+### Features
+
+* **ci-failures:** route scan/CVE failures to escalation lane ([#1025](https://github.com/misospace/dispatch/issues/1025)) ([7a7ef31](https://github.com/misospace/dispatch/commit/7a7ef3193bb77e13af7e6b236902c324b6e70c63)), closes [#988](https://github.com/misospace/dispatch/issues/988)
+* **deps:** update dependency jsdom (30.0.1 → 30.1.0) ([#1024](https://github.com/misospace/dispatch/issues/1024)) ([3595fa8](https://github.com/misospace/dispatch/commit/3595fa8c3d160d6026a5654048c40f158b1ef199))
+* **deps:** update dependency lucide-react (1.45.0 → 1.46.0) ([#1011](https://github.com/misospace/dispatch/issues/1011)) ([e3a554f](https://github.com/misospace/dispatch/commit/e3a554f051fa5280b0eb74b8c352b0fec825f60e))
+* **deps:** update dependency lucide-react (1.46.0 → 1.47.0) ([#1029](https://github.com/misospace/dispatch/issues/1029)) ([edbd4f7](https://github.com/misospace/dispatch/commit/edbd4f762c8f4c1a49ffaca4169ac2c2f2376a7f))
+* **helm:** update chart common (5.1.0 → 5.2.0) ([#1021](https://github.com/misospace/dispatch/issues/1021)) ([7d4de92](https://github.com/misospace/dispatch/commit/7d4de9269d9ee1957ad75fca02349de1372083d6))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @types/node (24.13.4 → 24.13.5) ([#1019](https://github.com/misospace/dispatch/issues/1019)) ([6b1a5c0](https://github.com/misospace/dispatch/commit/6b1a5c027c94478ace4b1feb20c6a0e66ac16504))
+* **deps:** update dependency zod (4.6.4 → 4.6.5) ([#1007](https://github.com/misospace/dispatch/issues/1007)) ([6b7ef11](https://github.com/misospace/dispatch/commit/6b7ef11bdb3b71acddfaddd70eddfd77e855dce6))
+* **deps:** update vitest monorepo (5.0.0 → 5.0.1) ([#1016](https://github.com/misospace/dispatch/issues/1016)) ([dc9893a](https://github.com/misospace/dispatch/commit/dc9893a881e9162c0d980d94e27f2a303b31e805))
+* **github:** paginate code-search results and add a co-located client test ([#1012](https://github.com/misospace/dispatch/issues/1012)) ([41381f6](https://github.com/misospace/dispatch/commit/41381f6c02c0a11d421510ba449eaaf6e762d514)), closes [#1006](https://github.com/misospace/dispatch/issues/1006)
+* **groomer:** cap derived exploration budget ([#1023](https://github.com/misospace/dispatch/issues/1023)) ([33b8851](https://github.com/misospace/dispatch/commit/33b88519b4ff338dbb934a026600919b6271aa4f))
+* **pr-followup:** route recurring scan failures ([#1028](https://github.com/misospace/dispatch/issues/1028)) ([6b7ff0d](https://github.com/misospace/dispatch/commit/6b7ff0d8d90345c79de781d6d5c3b19b2fd50400))
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#1010](https://github.com/misospace/dispatch/issues/1010)) ([ef57a6a](https://github.com/misospace/dispatch/commit/ef57a6ae02c146a796b4351acc7612f37f580293))
+* **renovate:** exclude SHA-pinned trivy-action to stop no-result lookup ([#1009](https://github.com/misospace/dispatch/issues/1009)) ([89f3d29](https://github.com/misospace/dispatch/commit/89f3d292041b5c43e25bb9a5cae8e764faf03971))
+* update native loop settings ([#1027](https://github.com/misospace/dispatch/issues/1027)) ([12a4efc](https://github.com/misospace/dispatch/commit/12a4efc1bac638fc3fdd385b8b13d511400988d9))
+
 ## [0.5.61](https://github.com/misospace/dispatch/compare/v0.5.60...v0.5.61) (2026-09-13)
 
 
