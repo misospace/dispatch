@@ -421,6 +421,23 @@ export function isScanFailure(
   return parseScanFindings(logExcerpt).length > 0;
 }
 
+/**
+ * Escalation label appended to a filed issue when the failure is a scan/vuln
+ * class. Carrying `needs-escalation` routes the issue to the escalation/frontier
+ * lane at ingest (see issue-sync) and to the classification heuristic, so a
+ * security-class failure is picked up by a higher-judgment worker rather than a
+ * default-lane coder. Base labels are preserved so this stays config-driven.
+ */
+export function ciFailureIssueLabels(
+  workflowName: string,
+  jobName: string,
+  logExcerpt: string,
+  baseLabels: string[],
+): string[] {
+  if (!isScanFailure(workflowName, jobName, logExcerpt)) return baseLabels;
+  return baseLabels.includes("needs-escalation") ? baseLabels : [...baseLabels, "needs-escalation"];
+}
+
 /** Render the issue an actionable failure produces. */
 export function buildIssueDraft(opts: {
   repoFullName: string;

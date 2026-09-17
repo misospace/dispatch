@@ -1,8 +1,9 @@
 import { ACTIVE_STATUS_LABELS, GitHubIssue } from "@/types";
 import { isIssueExcludedByLabels } from "@/lib/issue-filters";
+import { isEscalationLabel } from "@/lib/issue-lane";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
-import { getDefaultClaimableLane } from "@/lib/lane-config";
+import { getDefaultClaimableLane, getEscalationLane } from "@/lib/lane-config";
 
 export interface SyncRepo {
   id: string;
@@ -17,6 +18,23 @@ export interface SyncRepo {
  */
 export function defaultCurrentLane(): string | null {
   return getDefaultClaimableLane()?.id ?? null;
+}
+
+/**
+ * The lane a freshly-ingested issue should start on based on its labels.
+ *
+ * An issue carrying an explicit escalation label (`needs-escalation` /
+ * `needs-gpt`) is routed to the escalation/frontier lane at ingest rather than
+ * the default claimable lane, so a scan/CVE-class CI failure (which carries the
+ * label when filed) is picked up by a higher-judgment worker immediately. Falls
+ * back to the configured default lane. Mirrors the classification heuristic so
+ * ingest and reclassification agree (#988).
+ */
+export function currentLaneForLabels(labels: string[]): string | null {
+  if (isEscalationLabel(labels)) {
+    return getEscalationLane()?.id ?? defaultCurrentLane();
+  }
+  return defaultCurrentLane();
 }
 
 export interface SyncedIssueData {
@@ -423,9 +441,10 @@ export function makePrismaIssueStore(): IssueStore {
       // "normal" — an alias, not a configured lane, in a renamed deployment —
       // and the issue was invisible to the queue until grooming re-laned it
       // (dispatch#964). Resolves per-deployment, so nothing lane-specific is
-      // baked in.
+      // baked in. Escalation-labeled issues (e.g. scan/CVE CI failures) are
+      // routed straight to the escalation/frontier lane (#988).
       await prisma.issue.create({
-        data: { ...data, repositoryId, currentLane: defaultCurrentLane() },
+        data: { ...data, repositoryId, currentLane: currentLaneForLabels(data.labels) },
       });
     },
   };

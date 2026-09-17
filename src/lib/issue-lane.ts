@@ -133,6 +133,16 @@ const BACKLOG_SIGNALS = [
 const ESCALATION_LABELS = ["needs-escalation", "needs-gpt"];
 
 /**
+ * Whether an issue's labels carry an explicit escalation signal. Shared by the
+ * heuristic classifier and the issue-ingest lane stamping so both agree on what
+ * routes an issue to the escalation/frontier lane.
+ */
+export function isEscalationLabel(labels: string[]): boolean {
+  const lowered = labels.map((l) => l.toLowerCase());
+  return ESCALATION_LABELS.some((s) => lowered.includes(s));
+}
+
+/**
  * Evaluate heuristic signals for an issue. Returns structured signals that can
  * be mapped to a configured lane via classifyLaneFromSignals.
  */
@@ -152,7 +162,7 @@ export function evaluateLaneSignals(
   }
 
   // Explicit escalation labels take precedence over text heuristics
-  if (ESCALATION_LABELS.some((s) => labelSet.has(s))) {
+  if (isEscalationLabel(labels)) {
     return { isBacklog: false, isEscalation: true, reason: "Escalation label detected" };
   }
 
@@ -181,7 +191,7 @@ export function classifyLaneByHeuristics(
   let confidence: "high" | "medium" | "low" = "medium";
   if (signals.isBacklog) {
     confidence = "high";
-  } else if (signals.isEscalation && ESCALATION_LABELS.some((l) => labels.map((x) => x.toLowerCase()).includes(l))) {
+  } else if (signals.isEscalation && isEscalationLabel(labels)) {
     confidence = "high";
   }
 

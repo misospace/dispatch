@@ -3,6 +3,7 @@ import {
   buildCloseComment,
   buildFailureMarker,
   buildIssueDraft,
+  ciFailureIssueLabels,
   classifyWorkflow,
   computeFailureSignature,
   decideAction,
@@ -527,6 +528,40 @@ describe("isScanFailure", () => {
 
   it("is false for a non-scan failure", () => {
     expect(isScanFailure("Release", "Build", "error: invalid bake override key")).toBe(false);
+  });
+});
+
+describe("ciFailureIssueLabels (dispatch#988)", () => {
+  it("appends needs-escalation for a scan/vuln failure", () => {
+    const labels = ciFailureIssueLabels("Vulnerability Scan", "Scan", "", [
+      "bug",
+      "priority/p1",
+    ]);
+    expect(labels).toEqual(["bug", "priority/p1", "needs-escalation"]);
+  });
+
+  it("routes a log-carried findings table even when unnamed to escalation", () => {
+    const log =
+      "NAME  VERSION  FIX VERSION  SEVERITY\npebble  0.10.0  0.10.1  High";
+    expect(ciFailureIssueLabels("Release", "Build", log, ["bug"])).toEqual([
+      "bug",
+      "needs-escalation",
+    ]);
+  });
+
+  it("preserves base labels unchanged for a non-scan failure", () => {
+    const base = ["bug", "priority/p1"];
+    const labels = ciFailureIssueLabels("Release", "Build", "invalid bake override key", base);
+    expect(labels).toBe(base);
+    expect(labels).toEqual(["bug", "priority/p1"]);
+  });
+
+  it("does not duplicate needs-escalation when already present", () => {
+    const labels = ciFailureIssueLabels("Vulnerability Scan", "Scan", "", [
+      "bug",
+      "needs-escalation",
+    ]);
+    expect(labels).toEqual(["bug", "needs-escalation"]);
   });
 });
 

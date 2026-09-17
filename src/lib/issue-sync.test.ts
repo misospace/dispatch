@@ -28,6 +28,7 @@ import {
   closedIssueStatusFix,
   fetchAllStateIssues,
   defaultCurrentLane,
+  currentLaneForLabels,
   SYNC_OVERLAP_BUFFER_MS,
 } from "./issue-sync";
 import { setLaneConfig, resetLaneConfig } from "@/lib/lane-config";
@@ -484,5 +485,47 @@ describe("defaultCurrentLane (dispatch#964)", () => {
       ],
     });
     expect(defaultCurrentLane()).toBe("work");
+  });
+});
+
+describe("currentLaneForLabels (dispatch#988)", () => {
+  afterEach(() => resetLaneConfig());
+
+  it("routes an escalation-labeled issue to the escalation lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+    // A scan/CVE CI failure filed with the escalation label must land on the
+    // frontier lane at ingest, not the default lane a standard coder polls.
+    expect(currentLaneForLabels(["bug", "needs-escalation"])).toBe("frontier");
+    // The legacy alias is honored too, and matching is case-insensitive.
+    expect(currentLaneForLabels(["needs-gpt"])).toBe("frontier");
+    expect(currentLaneForLabels(["Needs-Escalation"])).toBe("frontier");
+  });
+
+  it("routes a plain issue to the default claimable lane", () => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+    expect(currentLaneForLabels(["bug", "priority/p1"])).toBe("local");
+    expect(currentLaneForLabels([])).toBe("local");
+  });
+
+  it("falls back to the default lane when an escalation label has no escalation lane", () => {
+    setLaneConfig({
+      lanes: [{ id: "work", title: "Work", claimable: true }],
+    });
+    // No lane carries role=escalation, so an escalation-labeled issue must not
+    // vanish — it falls back to the default claimable lane.
+    expect(currentLaneForLabels(["needs-escalation"])).toBe("work");
   });
 });
