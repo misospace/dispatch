@@ -4,6 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { fetchPullRequestMergeState, fetchPullRequestHeadSha } from "./github-prs";
 
 export type PrFixQueueClient = {
+  issue: {
+    findFirst: (args: any) => Promise<any>;
+  };
   prFixQueueItem: {
     findUnique: (args: any) => Promise<any>;
     findMany: (args?: any) => Promise<any[]>;

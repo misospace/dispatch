@@ -10,6 +10,8 @@
 
 import { EnqueuePrFixInput, enqueuePrFixItem, PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
+import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
+import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -295,7 +297,7 @@ export function extractLinkedIssue(pr: {
 
 /** Lane + work-item fields derived from an event by its descriptor. */
 interface IngestWorkItem {
-  lane: "NORMAL" | "NEEDS_HUMAN";
+  lane: "NORMAL" | "ESCALATED" | "NEEDS_HUMAN";
   type: string;
   reason: string;
   feedback: string;
@@ -498,7 +500,41 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(event.repoFullName)) return null;
 
-  const { lane, type, reason, feedback } = descriptor.workItem(event);
+  let { lane, type, reason, feedback } = descriptor.workItem(event);
+  if (event.eventType === "check_run" && event.linkedIssue !== null && event.linkedIssue !== undefined) {
+    const checkName = event.checkName ?? "unknown";
+    const excerpt = event.body?.trim() ?? "";
+    try {
+      const issue = await client.issue.findFirst({
+        where: {
+          repository: { fullName: event.repoFullName },
+          number: event.linkedIssue,
+        },
+        select: { body: true, currentLane: true },
+      });
+      const signature = extractFailureMarker(issue?.body);
+      const escalationLane = getEscalationLane();
+      const hasExplicitEscalationLane = getConfiguredLanes().some(
+        (lane) => lane.claimable && lane.role === "escalation" && lane.id === escalationLane?.id,
+      );
+      if (
+        signature &&
+        isScanFailure(checkName, checkName, excerpt) &&
+        hasExplicitEscalationLane &&
+        issue?.currentLane === escalationLane?.id
+      ) {
+        const workflow = extractFailureWorkflow(issue.body) ?? checkName;
+        lane = "ESCALATED";
+        feedback = `Recurrence of scan failure filed as #${event.linkedIssue} (workflow ${workflow}, signature ${signature}).\n${feedback}`;
+      }
+    } catch (error) {
+      console.warn("[pr-followup-ingestion] linked issue lookup failed", {
+        repo: event.repoFullName,
+        issue: event.linkedIssue,
+        errorType: error instanceof Error ? error.name : typeof error,
+      });
+    }
+  }
   const evidenceKey = computeEvidenceKey(event.eventType, descriptor.sourceId(event), event.repoFullName, event.prNumber);
 
   await enqueuePrFixItem(client, {
