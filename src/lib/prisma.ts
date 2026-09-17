@@ -133,6 +133,7 @@ export function __resetPrismaClientForTests(): void {
 // than `as any`) so the transaction's return type T is still checked.
 export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
   return {
+    issue: client.issue,
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
     $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>

@@ -1,4 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { buildFailureMarker } from "./ci-failure-ingestion";
+import { resetLaneConfig, setLaneConfig } from "./lane-config";
 import {
   extractLinkedIssue,
   classifyFeedback,
@@ -18,12 +20,15 @@ import {
 
 // ─── Mock client ────────────────────────────────────────────────────────────
 
-function makeClient() {
+function makeClient(issue?: { body: string | null; currentLane: string | null } | null) {
   const items: any[] = [];
   let seq = 0;
   return {
     items,
-    $transaction: async (fn: any) => fn({ prFixQueueItem: { findUnique: async () => null, create: async ({ data }: any) => { const item = { id: `item-${++seq}`, queuedAt: new Date(), updatedAt: new Date(), ...data }; items.push(item); return item; }, update: async () => items[0] ?? {} }, prFixHistory: { create: async () => ({}) } }),
+    issue: {
+      findFirst: async () => issue,
+    },
+    $transaction: async (fn: any) => fn({ issue: { findFirst: async () => issue }, prFixQueueItem: { findUnique: async () => null, create: async ({ data }: any) => { const item = { id: `item-${++seq}`, queuedAt: new Date(), updatedAt: new Date(), ...data }; items.push(item); return item; }, update: async () => items[0] ?? {} }, prFixHistory: { create: async () => ({}) } }),
     prFixQueueItem: {
       findUnique: async () => null,
       create: async ({ data }: any) => {
@@ -446,6 +451,191 @@ describe("ingestReviewEvent", () => {
 });
 
 describe("ingestCheckRunEvent", () => {
+  it("escalates a recurring scan failure linked to an escalated issue", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+    });
+    const client = makeClient({
+      body: buildFailureMarker("abc123", "Vulnerability Scan"),
+      currentLane: "frontier",
+    });
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "Vulnerability Scan",
+      conclusion: "failure",
+      checkRunId: "cr-scan",
+      checkDetails: "found CVE-2026-1234",
+      linkedIssue: 123,
+    });
+
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].lane).toBe("ESCALATED");
+    expect(client.items[0].type).toBe("CI_FAILURE");
+    expect(client.items[0].issue).toBe(123);
+    expect(client.items[0].feedback[0]).toBe(
+      'Recurrence of scan failure filed as #123 (workflow Vulnerability Scan, signature abc123).\nCI check "Vulnerability Scan" failed (failure) on this PR.\n\nError from the job log:\nfound CVE-2026-1234\n\nFull log: https://github.com/misospace/dispatch/actions/runs/123\n\nFix the root cause the log shows.',
+    );
+  });
+
+  it("keeps a marked issue on a non-escalation lane in NORMAL", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+    });
+    const client = makeClient({ body: buildFailureMarker("abc123", "Vulnerability Scan"), currentLane: "normal" });
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "Vulnerability Scan",
+      conclusion: "failure",
+      checkRunId: "cr-non-escalated",
+      checkDetails: "found CVE-2026-1234",
+      linkedIssue: 123,
+    });
+
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].feedback[0]).not.toContain("Recurrence of scan failure");
+  });
+
+  it("keeps a marked scan issue in NORMAL without an explicit escalation role", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    setLaneConfig({
+      lanes: [{ id: "normal", title: "Normal", claimable: true, role: "default" }],
+    });
+    const client = makeClient({ body: buildFailureMarker("abc123", "Vulnerability Scan"), currentLane: "normal" });
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "Vulnerability Scan",
+      conclusion: "failure",
+      checkRunId: "cr-no-escalation-role",
+      checkDetails: "found CVE-2026-1234",
+      linkedIssue: 123,
+    });
+
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].feedback[0]).not.toContain("Recurrence of scan failure");
+  });
+
+  it("falls back to the check name for a legacy marker without workflow", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+    });
+    const client = makeClient({ body: buildFailureMarker("abc123"), currentLane: "frontier" });
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "Vulnerability Scan",
+      conclusion: "failure",
+      checkRunId: "cr-legacy-marker",
+      checkDetails: "found CVE-2026-1234",
+      linkedIssue: 123,
+    });
+
+    expect(client.items[0].feedback[0]).toContain("workflow Vulnerability Scan");
+  });
+
+  it("keeps a marked issue's non-scan check in NORMAL", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+    });
+    const client = makeClient({ body: buildFailureMarker("abc123", "Vulnerability Scan"), currentLane: "frontier" });
+
+    await ingestCheckRunEvent(client, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "lint",
+      conclusion: "failure",
+      checkRunId: "cr-lint",
+      checkDetails: "eslint error: unused import",
+      linkedIssue: 123,
+    });
+
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].feedback[0]).not.toContain("Recurrence of scan failure");
+  });
+
+  it("keeps a scan check in NORMAL without a linked issue or marker", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    setLaneConfig({
+      lanes: [
+        { id: "normal", title: "Normal", claimable: true, role: "default" },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+      ],
+    });
+    const noIssueClient = makeClient();
+    await ingestCheckRunEvent(noIssueClient, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "Vulnerability Scan",
+      conclusion: "failure",
+      checkRunId: "cr-no-issue",
+      linkedIssue: null,
+    });
+
+    const unmarkedClient = makeClient({ body: "ordinary issue", currentLane: "frontier" });
+    await ingestCheckRunEvent(unmarkedClient, {
+      repoFullName: "misospace/dispatch",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/misospace/dispatch/actions/runs/123",
+      title: "Fix test issue",
+      author: "itsmiso-ai",
+      checkName: "Vulnerability Scan",
+      conclusion: "failure",
+      checkRunId: "cr-unmarked",
+      linkedIssue: 123,
+    });
+
+    expect(noIssueClient.items[0].lane).toBe("NORMAL");
+    expect(unmarkedClient.items[0].lane).toBe("NORMAL");
+    expect(unmarkedClient.items[0].feedback[0]).not.toContain("Recurrence of scan failure");
+  });
+
   it("enqueues failing checks with NORMAL lane", async () => {
     process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
     const client = makeClient();
@@ -585,6 +775,7 @@ describe("ingestCheckRunEvent", () => {
 
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+    resetLaneConfig();
   });
 });
 
