@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.63](https://github.com/misospace/dispatch/compare/v0.5.62...v0.5.63) (2026-09-18)
+
+
+### Bug Fixes
+
+* **helm:** update chart common (5.2.0 → 5.2.1) ([#1030](https://github.com/misospace/dispatch/issues/1030)) ([073bc93](https://github.com/misospace/dispatch/commit/073bc931bf6ebdf032ce04fbd02c4867fdc5c304))
+
 ## [0.5.62](https://github.com/misospace/dispatch/compare/v0.5.61...v0.5.62) (2026-09-17)
 
 
