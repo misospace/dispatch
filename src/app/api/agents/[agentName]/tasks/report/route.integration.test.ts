@@ -17,9 +17,18 @@ process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
+// Surfacing to GitHub is out of scope for these DB-semantics tests; no-op it
+// so the queue state machine can be driven without network.
+vi.mock("@/lib/pr-fix-surfacing", () => ({
+  surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: false, commentPosted: false, errors: [] }),
+  surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: false, commentUpdated: false, errors: [] }),
+  extractUrlsFromText: vi.fn(() => []),
+}));
+
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { enqueuePrFixItem, markPrFixItem, requeuePrFixItem } from "@/lib/pr-fix-queue";
 
 const url = process.env.DATABASE_URL;
 const enabled = process.env.RUN_DB_INTEGRATION === "1" && Boolean(url);
@@ -62,6 +71,7 @@ suite("tasks/report idempotency against a real PostgreSQL", () => {
     resetAuthCaches();
     await prisma.agentReportDedupe.deleteMany({ where: { agentName: AGENT } });
     await prisma.agentRun.deleteMany({ where: { agentName: AGENT } });
+    await prisma.prFixQueueItem.deleteMany({ where: { repo: "integration/generation" } });
   });
 
   it("two concurrent same-key reports create exactly one logical report", async () => {
@@ -144,5 +154,47 @@ suite("tasks/report idempotency against a real PostgreSQL", () => {
     const retry = await postRequest(keyedReport);
     expect(retry.status).toBe(409);
     expect((await retry.json()).error).toContain("no recorded result");
+  });
+
+  it("PrFixQueueItem.generation backfills to 1 and bumps on a real requeue", async () => {
+    // Pin the migration's backfill semantics at the DDL level: the column is
+    // NOT NULL DEFAULT 1, which is exactly how ALTER TABLE ADD COLUMN values
+    // every pre-existing row (validated manually on a scratch cluster by
+    // inserting a row pre-migration and applying the migration afterwards).
+    const columns = await prisma.$queryRaw<
+      Array<{ column_default: string | null; is_nullable: string }>
+    >`SELECT column_default, is_nullable FROM information_schema.columns
+      WHERE table_name = 'PrFixQueueItem' AND column_name = 'generation'`;
+    expect(columns).toHaveLength(1);
+    expect(columns[0].column_default).toBe("1");
+    expect(columns[0].is_nullable).toBe("NO");
+
+    // A row written without referencing the column lands at 1 — same default
+    // the backfill applies.
+    await prisma.$executeRaw`INSERT INTO "PrFixQueueItem" ("id", "repo", "pr", "reason", "status", "updatedAt")
+      VALUES ('integration-gen-row', 'integration/generation', 1, 'raw row', 'QUEUED', now())`;
+    const rawRow = await prisma.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo: "integration/generation", pr: 1 } },
+    });
+    expect(rawRow?.generation).toBe(1);
+
+    // The production lifecycle bumps via Prisma's atomic increment against
+    // the real database: enqueue → BLOCKED → requeue ⇒ generation 2.
+    const client = prisma as any;
+    const enqueued = await enqueuePrFixItem(client, {
+      repo: "integration/generation",
+      pr: 2,
+      lane: "NORMAL",
+      reason: "review changes requested",
+      feedback: "please update tests",
+      evidenceKey: "review:1",
+    });
+    expect(enqueued.generation).toBe(1);
+
+    await markPrFixItem(client, { repo: "integration/generation", pr: 2, status: "BLOCKED", note: "stuck" });
+    const requeued = await requeuePrFixItem(client, { repo: "integration/generation", pr: 2, note: "try again" });
+
+    expect(requeued?.status).toBe("QUEUED");
+    expect(requeued?.generation).toBe(2);
   });
 });

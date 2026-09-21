@@ -707,14 +707,17 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
   it("rejects a non-string or empty idempotencyKey without side effects", async () => {
     const badType = await postRequest({ taskType: "implement", outcome: "pr_opened", idempotencyKey: 42 });
     expect(badType.status).toBe(400);
+    expect((await badType.json()).error).toBe("idempotencyKey must be a non-empty string");
     const empty = await postRequest({ taskType: "implement", outcome: "pr_opened", idempotencyKey: "  " });
     expect(empty.status).toBe(400);
+    expect((await empty.json()).error).toBe("idempotencyKey must be a non-empty string");
     const tooLong = await postRequest({
       taskType: "implement",
       outcome: "pr_opened",
       idempotencyKey: "k".repeat(201),
     });
     expect(tooLong.status).toBe(400);
+    expect((await tooLong.json()).error).toBe("idempotencyKey must be at most 200 characters");
 
     expect(mockAgentRun.create).not.toHaveBeenCalled();
     expect(mockDedupe.create).not.toHaveBeenCalled();
