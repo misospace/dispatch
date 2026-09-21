@@ -589,9 +589,7 @@ export function toAgentQueuePrFixItem(item: any) {
     evidenceKeys: item.evidenceKeys ?? [],
     headSha: item.headSha,
     author: item.author,
-    // NOT NULL DEFAULT 1 in the DB; the fallback only covers in-memory
-    // fixtures predating the column.
-    generation: item.generation ?? 1,
+    generation: item.generation,
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,

@@ -17,6 +17,11 @@ CREATE TABLE "AgentReportDedupe" (
     CONSTRAINT "AgentReportDedupe_pkey" PRIMARY KEY ("id")
 );
 
+-- ForeignKey: an AgentRun deletion must not strand an orphan audit trail;
+-- SetNull keeps the claim (key + payload hash) recognizable while dropping
+-- the dangling run reference.
+ALTER TABLE "AgentReportDedupe" ADD CONSTRAINT "AgentReportDedupe_agentRunId_fkey" FOREIGN KEY ("agentRunId") REFERENCES "AgentRun"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
 -- CreateIndex
 CREATE UNIQUE INDEX "AgentReportDedupe_agentName_idempotencyKey_key" ON "AgentReportDedupe"("agentName", "idempotencyKey");
 CREATE INDEX "AgentReportDedupe_agentName_idx" ON "AgentReportDedupe"("agentName");

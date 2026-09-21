@@ -155,7 +155,9 @@ Each queue item carries a Dispatch-owned `generation` (integer, starts at `1`). 
 - `prFixItem.id` — stable for the persistent `PrFixQueueItem` row.
 - `prFixItem.generation` — changes only when Dispatch creates a fresh dispatchable attempt: an explicit requeue from `BLOCKED` or `FIXED`, genuinely new evidence reopening a resolved item, recovery from a no-progress `FIXED` tombstone (#940), or the refused-`FIXED` head-SHA rollback. Repeated reads, repeated sync of known evidence, and updates that stay within the same active attempt never change it.
 
-Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. Follow-up tasks driven by linked-PR health (not backed by a `PrFixQueueItem`) omit `prFixItem`.
+Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. `generation` is an integer; the SHA-256 hex derivation from this change's first revision was superseded before ever shipping, so no released contract exposed a string form. Follow-up tasks driven by linked-PR health (not backed by a `PrFixQueueItem`) omit `prFixItem`.
+
+For downstream consumers that also report results through `POST /api/agents/{agentName}/tasks/report`: reports accept an optional opaque `idempotencyKey` that makes retries safe — see "Idempotent reporting" in AGENTS.md.
 
 ## Status lifecycle
 

@@ -709,10 +709,79 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     expect(badType.status).toBe(400);
     const empty = await postRequest({ taskType: "implement", outcome: "pr_opened", idempotencyKey: "  " });
     expect(empty.status).toBe(400);
+    const tooLong = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      idempotencyKey: "k".repeat(201),
+    });
+    expect(tooLong.status).toBe(400);
 
     expect(mockAgentRun.create).not.toHaveBeenCalled();
     expect(mockDedupe.create).not.toHaveBeenCalled();
     expect(prFixResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("trims surrounding whitespace from an idempotencyKey before claiming", async () => {
+    const res = await postRequest({
+      ...keyedBody,
+      idempotencyKey: "  worker-run-1:report  ",
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockDedupe.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ idempotencyKey: "worker-run-1:report" }),
+    });
+  });
+
+  it("a retry with the untrimmed form of the same key is recognized as a duplicate", async () => {
+    await postRequest({ ...keyedBody, idempotencyKey: "  worker-run-1:report  " });
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    const retry = await postRequest({ ...keyedBody, idempotencyKey: "worker-run-1:report" });
+
+    expect(retry.status).toBe(200);
+    expect((await retry.json()).duplicate).toBe(true);
+  });
+
+  it("payload key order does not change identity: a reordered retry is a duplicate, not a conflict", async () => {
+    await postRequest(keyedBody);
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    // Same logical report, different JSON key order in the request body.
+    const reordered = {
+      idempotencyKey: "worker-run-1:report",
+      summary: "pushed the fix",
+      pullRequestNumber: 12,
+      repoFullName: "org/repo",
+      outcome: "pr_updated",
+      taskType: "followup-pr",
+    };
+    const retry = await postRequest(reordered);
+
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    expect(body.agentRunId).toBe("run-1");
   });
 
   it("first report with a key claims the key, creates one AgentRun, and runs PR-fix resolution", async () => {
@@ -816,31 +885,28 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
   it("concurrent same-key submissions create exactly one logical report", async () => {
     // The winner claims the key; the loser hits the unique constraint and
     // reads back the winner's committed claim.
+    let winnerData: any;
     mockDedupe.create
-      .mockImplementationOnce(async ({ data }: any) => ({
-        id: "claim-1",
-        agentName: data.agentName,
-        idempotencyKey: data.idempotencyKey,
-        payloadHash: data.payloadHash,
-        agentRunId: null,
-        prFixResolution: null,
-      }))
+      .mockImplementationOnce(async ({ data }: any) => {
+        winnerData = data;
+        return {
+          id: "claim-1",
+          agentName: data.agentName,
+          idempotencyKey: data.idempotencyKey,
+          payloadHash: data.payloadHash,
+          agentRunId: null,
+          prFixResolution: null,
+        };
+      })
       .mockImplementationOnce(() => Promise.reject(p2002()));
-    mockDedupe.findUnique.mockImplementationOnce(async () => {
-      // The winner's create is chronologically first, so its payloadHash is
-      // already recorded when the loser reaches this read.
-      const winnerData = mockDedupe.create.mock.calls.find(
-        (c: any) => c[0].data.idempotencyKey === "worker-run-1:report",
-      )![0].data;
-      return {
-        id: "claim-1",
-        agentName: "test-agent",
-        idempotencyKey: "worker-run-1:report",
-        payloadHash: winnerData.payloadHash,
-        agentRunId: "run-1",
-        prFixResolution: null,
-      };
-    });
+    mockDedupe.findUnique.mockImplementationOnce(async () => ({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash: winnerData.payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    }));
 
     const [winner, loser] = await Promise.all([
       postRequest(keyedBody),
@@ -855,6 +921,30 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     expect(loserBody.duplicate).toBe(true);
     expect(loserBody.agentRunId).toBe("run-1");
     expect(winnerBody.agentRunId).toBe("run-1");
+  });
+
+  it("a claim without a recorded agentRunId is rejected as a conflict, never re-run", async () => {
+    // Defensive guard: while the claim and the AgentRun commit together this
+    // is unreachable, a future refactor that decouples them must fail loudly
+    // instead of silently re-running the report.
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    // The create call is recorded (with the route-computed hash) before
+    // findUnique runs, so read the hash back at invocation time.
+    mockDedupe.findUnique.mockImplementationOnce(async () => ({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash: mockDedupe.create.mock.calls[0]?.[0]?.data?.payloadHash,
+      agentRunId: null,
+      prFixResolution: null,
+    }));
+
+    const res = await postRequest(keyedBody);
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("no recorded result");
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+    expect(prFixResolveMock).not.toHaveBeenCalled();
   });
 
   it("same key with a different payload is rejected as a conflict", async () => {
@@ -908,5 +998,38 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     const claimedAgents = mockDedupe.create.mock.calls.map((c: any) => c[0].data.agentName);
     expect(claimedAgents).toEqual(["agent-one", "agent-two"]);
     expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("a failed resolution-store update fails the first response; the retry still dedupes to the skip marker", async () => {
+    // The claim + AgentRun transaction commits (first update), then the
+    // resolution persistence fails: the report itself is durable, so this
+    // response fails and the worker retries into the duplicate branch.
+    mockDedupe.update
+      .mockResolvedValueOnce({}) // in-transaction agentRunId stamp
+      .mockRejectedValueOnce(new Error("db hiccup"));
+
+    await expect(postRequest(keyedBody)).rejects.toThrow("db hiccup");
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash: mockDedupe.create.mock.calls[0][0].data.payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    const retry = await postRequest(keyedBody);
+
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    expect(body.agentRunId).toBe("run-1");
+    expect(body.prFixResolution.action).toBe("skipped");
+    // No second AgentRun and no repeated resolution despite the failed store.
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
   });
 });

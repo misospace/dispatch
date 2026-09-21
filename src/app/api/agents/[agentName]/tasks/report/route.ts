@@ -149,9 +149,20 @@ export async function POST(
 
   // Optional worker-chosen opaque key. Present → the report becomes
   // idempotently retryable; absent → current at-least-once behavior (#1044).
-  const idempotencyKey = raw.idempotencyKey;
-  if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || idempotencyKey.trim().length === 0)) {
+  // Trimmed and capped so the unique index cannot be abused with unbounded
+  // key material; otherwise fully opaque to Dispatch.
+  const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
+  const rawIdempotencyKey = raw.idempotencyKey;
+  if (rawIdempotencyKey !== undefined && typeof rawIdempotencyKey !== "string") {
     return errorResponse("idempotencyKey must be a non-empty string", 400);
+  }
+  const idempotencyKey =
+    typeof rawIdempotencyKey === "string" ? rawIdempotencyKey.trim() : undefined;
+  if (idempotencyKey !== undefined && idempotencyKey.length === 0) {
+    return errorResponse("idempotencyKey must be a non-empty string", 400);
+  }
+  if (idempotencyKey !== undefined && idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    return errorResponse(`idempotencyKey must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`, 400);
   }
 
   const report: TaskReportBody = {
@@ -257,16 +268,17 @@ export async function POST(
       summary: report.summary,
     });
     if (typeof idempotencyKey === "string") {
-      // Best-effort persistence so retries replay the original logical result.
-      // A failure only degrades future retries to the skip marker above.
-      await prisma.agentReportDedupe
-        .update({
-          where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
-          data: { prFixResolution: prFixResolution as unknown as Prisma.InputJsonValue },
-        })
-        .catch((error) => {
-          console.warn(`[tasks/report] failed to store prFixResolution for an idempotent report of ${agentName}:`, error);
-        });
+      // Persist the resolution before responding so a retry replays the real
+      // result rather than the skip marker. This runs after the claim/run
+      // transaction and is awaited: a failure surfaces as a 5xx on THIS
+      // response, and the worker's retry then takes the duplicate branch
+      // (same agentRunId, skip marker) — side effects are never re-run either
+      // way. It cannot move inside the claim transaction because the
+      // resolver makes GitHub round-trips and itself opens transactions.
+      await prisma.agentReportDedupe.update({
+        where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
+        data: { prFixResolution: prFixResolution as unknown as Prisma.InputJsonValue },
+      });
     }
   }
 

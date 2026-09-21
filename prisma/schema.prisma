@@ -173,6 +173,7 @@ model AgentRun {
   // Escalated lane outcome tracking
   outcome          EscalatedOutcome?
   groomingRuns     GroomingRun[]
+  reportDedupes    AgentReportDedupe[]
 
   @@index([agentName])
   @@index([runType])
@@ -203,6 +204,7 @@ model AgentReportDedupe {
   idempotencyKey  String
   payloadHash     String
   agentRunId      String?
+  agentRun        AgentRun? @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
   prFixResolution Json?
   createdAt       DateTime @default(now())
 
