@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
@@ -529,6 +530,18 @@ export async function reconcileStalePrFixItems(
   }
 
   return { checked, markedStale, errored };
+}
+
+export function prFixGeneration(item: {
+  evidenceKeys?: string[] | null;
+  headSha?: string | null;
+  queuedAt?: Date | string | null;
+}): string {
+  const evidenceKeys = Array.isArray(item.evidenceKeys) ? item.evidenceKeys : [];
+  const queuedAt = item.queuedAt instanceof Date ? item.queuedAt.toISOString() : item.queuedAt ?? null;
+  return createHash("sha256")
+    .update(JSON.stringify({ evidenceKeys, headSha: item.headSha ?? null, queuedAt }))
+    .digest("hex");
 }
 
 export function toAgentQueuePrFixItem(item: any) {

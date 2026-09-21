@@ -175,6 +175,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.repoFullName).toBe("org/repo");
     expect(body.pullRequest.number).toBe(12);
     expect(body.pullRequest.url).toBe("https://github.com/org/repo/pull/12");
+    expect(body.prFixItem).toEqual({
+      id: "prfix-1",
+      generation: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     expect(Array.isArray(body.reasons)).toBe(true);
   });
 
@@ -437,6 +441,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.shouldRun).toBe(true);
+    expect(body.prFixItem).toBeUndefined();
   });
 
   it("linked PR follow-up beats normal implement work", async () => {

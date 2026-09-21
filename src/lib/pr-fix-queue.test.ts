@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, PrFixQueueClient } from "./pr-fix-queue";
+import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, prFixGeneration, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, PrFixQueueClient } from "./pr-fix-queue";
 
 const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
   surfacingMocks: {
@@ -152,6 +152,33 @@ describe("PR review-fix queue", () => {
     expect(updated.evidenceKeys).toEqual(["review:1", "check:2"]);
     expect(client.items[0].feedback).toEqual(["first comment", "failing test"]);
     expect(client.history).toHaveLength(3);
+  });
+
+  it("changes generation when new evidence is enqueued", async () => {
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 10,
+      lane: "NORMAL",
+      reason: "review requested",
+      feedback: "first comment",
+      evidenceKey: "review:1",
+      headSha: "sha-1",
+    });
+    const firstGeneration = prFixGeneration(item);
+    expect(prFixGeneration(item)).toBe(firstGeneration);
+
+    const updated = await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 10,
+      lane: "NORMAL",
+      reason: "checks failed",
+      feedback: "failing test",
+      evidenceKey: "check:2",
+      headSha: "sha-1",
+    });
+
+    expect(prFixGeneration(updated)).not.toBe(firstGeneration);
+    expect(prFixGeneration(updated)).toBe(prFixGeneration(updated));
   });
 
   it("orders queued items before issue work by queuedAt, repo, then PR", async () => {

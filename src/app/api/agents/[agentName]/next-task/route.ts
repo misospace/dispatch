@@ -10,6 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
+import { prFixGeneration } from "@/lib/pr-fix-queue";
 import { selectGroomingCandidate } from "@/lib/groomer/selector";
 
 export async function GET(
@@ -79,6 +80,10 @@ export async function GET(
         issue: first.issue
           ? { repoFullName: first.repo, number: first.issue }
           : undefined,
+        prFixItem: {
+          id: first.id,
+          generation: prFixGeneration(first),
+        },
         reasons,
       });
       return NextResponse.json(task);

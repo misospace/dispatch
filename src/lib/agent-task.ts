@@ -19,6 +19,11 @@ export interface PullRequestRef {
   url?: string;
 }
 
+export interface PrFixItemIdentity {
+  id: string;
+  generation: string;
+}
+
 export interface IdleTask {
   type: "idle";
   shouldRun: false;
@@ -43,6 +48,7 @@ export interface FollowupPrTask {
   lane?: string;
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
+  prFixItem?: PrFixItemIdentity;
   reasons: string[];
   instructions: string;
   stopAfter: string;
@@ -133,6 +139,7 @@ export interface FollowupPrTaskInput {
   lane?: string;
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
+  prFixItem?: PrFixItemIdentity;
   reasons: string[];
   instructions?: string;
   stopAfter?: string;
@@ -147,6 +154,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
     lane: input.lane,
     issue: input.issue,
     pullRequest: input.pullRequest,
+    prFixItem: input.prFixItem,
     reasons: input.reasons,
     instructions: input.instructions ?? FOLLOWUP_PR_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? FOLLOWUP_PR_STOP_AFTER,

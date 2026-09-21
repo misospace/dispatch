@@ -148,6 +148,19 @@ describe("createFollowupPrTask", () => {
     expect(task.reasons).toContain("CI failure");
   });
 
+  it("includes optional PR-fix identity when provided", () => {
+    const task = createFollowupPrTask({
+      ...baseInput,
+      prFixItem: { id: "cuid-1", generation: "generation-1" },
+    });
+    expect(task.prFixItem).toEqual({ id: "cuid-1", generation: "generation-1" });
+  });
+
+  it("omits PR-fix identity when not provided", () => {
+    const task = createFollowupPrTask(baseInput);
+    expect(task.prFixItem).toBeUndefined();
+  });
+
   it("preserves optional issue when provided", () => {
     const task = createFollowupPrTask({
       ...baseInput,
