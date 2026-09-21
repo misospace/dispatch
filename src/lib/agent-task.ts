@@ -19,6 +19,18 @@ export interface PullRequestRef {
   url?: string;
 }
 
+/**
+ * Dispatch-owned identity of the PR-fix queue item backing a followup-pr
+ * task (#1044). `id` is stable for the persistent PrFixQueueItem; `generation`
+ * starts at 1 and changes only when Dispatch creates a fresh dispatchable
+ * attempt. Consumers treat the pair as opaque work identity and must not
+ * derive queue policy from the number.
+ */
+export interface PrFixItemIdentity {
+  id: string;
+  generation: number;
+}
+
 export interface IdleTask {
   type: "idle";
   shouldRun: false;
@@ -43,6 +55,7 @@ export interface FollowupPrTask {
   lane?: string;
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
+  prFixItem?: PrFixItemIdentity;
   reasons: string[];
   instructions: string;
   stopAfter: string;
@@ -133,6 +146,7 @@ export interface FollowupPrTaskInput {
   lane?: string;
   issue?: OptionalIssueRef;
   pullRequest: PullRequestRef;
+  prFixItem?: PrFixItemIdentity;
   reasons: string[];
   instructions?: string;
   stopAfter?: string;
@@ -147,6 +161,7 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
     lane: input.lane,
     issue: input.issue,
     pullRequest: input.pullRequest,
+    prFixItem: input.prFixItem,
     reasons: input.reasons,
     instructions: input.instructions ?? FOLLOWUP_PR_INSTRUCTIONS,
     stopAfter: input.stopAfter ?? FOLLOWUP_PR_STOP_AFTER,

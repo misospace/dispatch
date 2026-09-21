@@ -109,6 +109,10 @@ model PrFixQueueItem {
   feedback     String[]       @default([])
   evidenceKeys String[]       @default([])
   status       PrFixStatus    @default(QUEUED)
+  // Dispatch-owned work generation (#1044): 1 on creation, bumped when a
+  // non-QUEUED item becomes dispatchable again as a fresh attempt. Workers
+  // consume (id, generation) as an opaque work identity via next-task.
+  generation   Int            @default(1)
   queuedAt     DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
   url          String?
@@ -169,6 +173,7 @@ model AgentRun {
   // Escalated lane outcome tracking
   outcome          EscalatedOutcome?
   groomingRuns     GroomingRun[]
+  reportDedupes    AgentReportDedupe[]
 
   @@index([agentName])
   @@index([runType])
@@ -183,6 +188,28 @@ enum EscalatedOutcome {
   DESIGN_COMMENT_POSTED
   DECOMPOSED_SKIPPED
   STUCK
+}
+
+// Durable idempotency claims for tasks/report (#1044): a worker that crashes
+// between Dispatch committing a report and recording the result locally will
+// retry the same report. The (agentName, idempotencyKey) unique constraint
+// makes the claim atomic against concurrent duplicates; payloadHash rejects
+// key reuse with a different report (409); agentRunId and prFixResolution
+// replay the original logical result to retries without re-running side
+// effects. The key is opaque worker-chosen state — no producer-specific
+// semantics.
+model AgentReportDedupe {
+  id              String   @id @default(cuid())
+  agentName       String
+  idempotencyKey  String
+  payloadHash     String
+  agentRunId      String?
+  agentRun        AgentRun? @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  prFixResolution Json?
+  createdAt       DateTime @default(now())
+
+  @@unique([agentName, idempotencyKey])
+  @@index([agentName])
 }
 
 model AuditLog {

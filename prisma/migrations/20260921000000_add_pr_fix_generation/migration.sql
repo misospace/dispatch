@@ -1,0 +1,12 @@
+-- AlterTable: Dispatch-owned work generation for PR-fix queue items (#1044).
+-- 1 on creation; bumped when a non-QUEUED item becomes dispatchable again as a
+-- fresh attempt (requeue, new evidence reopening a resolved item, #940 recovery,
+-- refused-FIXED rollback). Workers consume (id, generation) as opaque work
+-- identity via next-task's followup-pr.prFixItem.
+--
+-- The DEFAULT 1 backfill for existing rows is the intended initial state, not
+-- data loss: no generation concept existed before this migration (the SHA-256
+-- derivation in this PR's first revision never shipped), so no prior bump
+-- history exists to preserve. Every row starts at 1 and future fresh attempts
+-- bump from there.
+ALTER TABLE "PrFixQueueItem" ADD COLUMN "generation" INTEGER NOT NULL DEFAULT 1;

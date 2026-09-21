@@ -25,8 +25,67 @@ vi.mock("@/lib/lease", () => ({
   findLeasedIssueIds: mocks.findLeasedIssueIds,
 }));
 
+// The production queue-mutation functions (enqueue/mark/requeue) surface
+// outcomes to GitHub; no-op them so route-level lifecycle tests can drive the
+// real state machine without network.
+vi.mock("@/lib/pr-fix-surfacing", () => ({
+  surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: false, commentPosted: false, errors: [] }),
+  surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: false, commentUpdated: false, errors: [] }),
+  extractUrlsFromText: vi.fn(() => []),
+}));
+
 import { GET } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { enqueuePrFixItem, markPrFixItem, requeuePrFixItem } from "@/lib/pr-fix-queue";
+
+/**
+ * Minimal in-memory PrFixQueueClient backing the production queue-mutation
+ * functions: findUnique by (repo, pr), update by id (with Prisma `increment`
+ * support), findMany by status/lane, and history append.
+ */
+function makeQueueStore() {
+  const items: any[] = [];
+  let seq = 0;
+  const client: any = {
+    items,
+    $transaction: async (fn: any) => fn(client),
+    prFixQueueItem: {
+      findUnique: async ({ where }: any) =>
+        items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null,
+      create: async ({ data }: any) => {
+        const item = { id: `prfix-${++seq}`, generation: 1, queuedAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-01T00:00:00Z"), ...data };
+        items.push(item);
+        return item;
+      },
+      update: async ({ where, data }: any) => {
+        const idx = items.findIndex((i) => i.id === where.id);
+        const patch: Record<string, any> = { ...data };
+        for (const key of Object.keys(patch)) {
+          const value = patch[key];
+          if (value && typeof value === "object" && typeof value.increment === "number") {
+            patch[key] = (items[idx][key] ?? 0) + value.increment;
+          }
+        }
+        items[idx] = { ...items[idx], ...patch, updatedAt: new Date("2026-01-02T00:00:00Z") };
+        return items[idx];
+      },
+      findMany: async ({ where }: any) => {
+        let result = items.slice();
+        if (where?.status) {
+          result = Array.isArray(where.status.in)
+            ? result.filter((i) => where.status.in.includes(i.status))
+            : result.filter((i) => i.status === where.status);
+        }
+        if (where?.lane) result = result.filter((i) => i.lane === where.lane);
+        return result;
+      },
+    },
+    prFixHistory: {
+      create: async ({ data }: any) => ({ ...data }),
+    },
+  };
+  return client;
+}
 
 function request(url: string, agentName = "example-agent", includeAuth = true) {
   return authedRequest(`http://localhost${url}`, { includeAuth });
@@ -145,6 +204,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         feedback: ["please update tests"],
         evidenceKeys: ["review:1"],
         author: "itsmiso-ai",
+        generation: 1,
         queuedAt: new Date("2026-01-01T00:00:00Z"),
         updatedAt: new Date("2026-01-01T00:00:00Z"),
       },
@@ -175,7 +235,93 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.repoFullName).toBe("org/repo");
     expect(body.pullRequest.number).toBe(12);
     expect(body.pullRequest.url).toBe("https://github.com/org/repo/pull/12");
+    expect(body.prFixItem).toEqual({
+      id: "prfix-1",
+      generation: 1,
+    });
     expect(Array.isArray(body.reasons)).toBe(true);
+  });
+
+  it("serves distinct (id, generation) identities across a requeue of the same PR", async () => {
+    // The route is a read over the persisted queue row; a requeue bumps the
+    // row's generation without changing its id. First attempt:
+    const item = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 12,
+      issue: null,
+      branch: "fix/something",
+      url: "https://github.com/org/repo/pull/12",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "review changes requested",
+      feedback: ["please update tests"],
+      evidenceKeys: ["review:1"],
+      author: "bot",
+      generation: 1,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+    };
+    mocks.prFixFindMany.mockResolvedValue([item]);
+
+    const first = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const firstBody = await first.json();
+    expect(firstBody.prFixItem).toEqual({ id: "prfix-1", generation: 1 });
+
+    // Same queue row after an explicit requeue — same id, bumped generation.
+    item.generation = 2;
+    const second = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const secondBody = await second.json();
+    expect(secondBody.type).toBe("followup-pr");
+    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(secondBody.prFixItem.id).toBe(firstBody.prFixItem.id);
+  });
+
+  it("serves the bumped generation through the production requeue path", async () => {
+    // Drive the real queue state machine (enqueue → BLOCKED → requeue) against
+    // an in-memory store, and verify next-task surfaces the persisted identity.
+    const client = makeQueueStore();
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any) =>
+      client.prFixQueueItem.findMany({ where }),
+    );
+
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 12,
+      lane: "NORMAL",
+      reason: "review changes requested",
+      feedback: "please update tests",
+      evidenceKey: "review:1",
+    });
+
+    const first = await GET(
+      request("/api/agents/example-agent/next-task"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const firstBody = await first.json();
+    expect(firstBody.type).toBe("followup-pr");
+    expect(firstBody.prFixItem.generation).toBe(1);
+    const itemId = firstBody.prFixItem.id;
+
+    await markPrFixItem(client, { repo: "org/repo", pr: 12, status: "BLOCKED", note: "stuck" });
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 12, note: "try again" });
+    expect(requeued?.status).toBe("QUEUED");
+    expect(requeued?.generation).toBe(2);
+
+    const second = await GET(
+      request("/api/agents/example-agent/next-task"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const secondBody = await second.json();
+    expect(secondBody.type).toBe("followup-pr");
+    expect(secondBody.prFixItem).toEqual({ id: itemId, generation: 2 });
   });
 
   it("includes linked issue context when PR-fix has an issue number", async () => {
@@ -437,6 +583,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.shouldRun).toBe(true);
+    expect(body.prFixItem).toBeUndefined();
   });
 
   it("linked PR follow-up beats normal implement work", async () => {

@@ -47,6 +47,7 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
       create: async ({ data }: any) => {
         const item = {
           id: `item-${++seq}`,
+          generation: 1, // mirrors the column's @default(1)
           queuedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           updatedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           ...data,
@@ -56,7 +57,15 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
       },
       update: async ({ where, data }: any) => {
         const idx = items.findIndex((i) => i.id === where.id);
-        items[idx] = { ...items[idx], ...data, updatedAt: new Date(Date.UTC(2026, 0, 1, 1, ++seq)) };
+        // Interpret Prisma atomic operations ({ increment }) like the real client.
+        const patch: Record<string, any> = { ...data };
+        for (const key of Object.keys(patch)) {
+          const value = patch[key];
+          if (value && typeof value === "object" && typeof value.increment === "number") {
+            patch[key] = (items[idx][key] ?? 0) + value.increment;
+          }
+        }
+        items[idx] = { ...items[idx], ...patch, updatedAt: new Date(Date.UTC(2026, 0, 1, 1, ++seq)) };
         return items[idx];
       },
       findMany: async ({ where, orderBy }: any) => {
@@ -221,6 +230,150 @@ describe("PR review-fix queue", () => {
       if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
       else process.env.PR_FIX_MAX_ATTEMPTS = prev;
     }
+  });
+});
+
+describe("work generation identity (#1044)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixRequeued.mockReset();
+    surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+  });
+
+  it("starts at generation 1 and stays stable across repeated reads of the same pending work", async () => {
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 10, lane: "NORMAL", reason: "review requested",
+      feedback: "first comment", evidenceKey: "review:1", headSha: "sha-1",
+    });
+    expect(item.generation).toBe(1);
+
+    // Re-observing the same known evidence while already QUEUED is the same
+    // pending unit of work — the identity must not move.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 10, lane: "NORMAL", reason: "review requested",
+      feedback: "first comment", evidenceKey: "review:1", headSha: "sha-1",
+    });
+
+    // Additional NEW evidence on already-QUEUED work enriches the same
+    // attempt; it does not create a parallel dispatchable unit.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 10, lane: "NORMAL", reason: "checks failed",
+      feedback: "failing test", evidenceKey: "check:2", headSha: "sha-1",
+    });
+
+    for (let i = 0; i < 3; i += 1) {
+      const queued = await listQueuedPrFixItems(client, { lane: "NORMAL" });
+      expect(queued[0].generation).toBe(1);
+    }
+    expect(toAgentQueuePrFixItem(client.items[0]).generation).toBe(1);
+  });
+
+  it("bumps generation on explicit requeue from BLOCKED, and again from FIXED", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 11, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 11, status: "BLOCKED", note: "stuck" });
+    expect(client.items[0].status).toBe("BLOCKED");
+    expect(client.items[0].generation).toBe(1); // BLOCKED is not fresh work
+
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 11, note: "try again" });
+    expect(requeued?.status).toBe("QUEUED");
+    expect(requeued?.generation).toBe(2);
+
+    await markPrFixItem(client, { repo: "org/repo", pr: 11, status: "FIXED", note: "done" });
+    const requeuedAgain = await requeuePrFixItem(client, { repo: "org/repo", pr: 11 });
+    expect(requeuedAgain?.status).toBe("QUEUED");
+    expect(requeuedAgain?.generation).toBe(3);
+  });
+
+  it("bumps generation when genuinely new evidence reopens a FIXED item", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 12, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 12, status: "FIXED" });
+    expect(client.items[0].generation).toBe(1);
+
+    const reopened = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 12, lane: "NORMAL", reason: "new review round", feedback: "f2", evidenceKey: "review:2",
+    });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+  });
+
+  it("keeps generation when known evidence is re-observed on a FIXED item whose head moved", async () => {
+    // A real fix landed — the FIXED tombstone is trusted and the #25
+    // anti-churn rule keeps the item resolved. No fresh work exists to
+    // identify, so the generation stays put.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 13, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "oldsha",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 13, status: "FIXED" });
+
+    const again = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 13, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "newsha",
+    });
+    expect(again.status).toBe("FIXED");
+    expect(again.generation).toBe(1);
+  });
+
+  it("bumps generation on #940 recovery from a no-progress FIXED tombstone", async () => {
+    const input = {
+      repo: "misospace/miso-gallery", pr: 467, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "symlink guard",
+      evidenceKey: "review:misospace/miso-gallery#467:r1", headSha: "efc36e3d",
+    };
+    await enqueuePrFixItem(client, input);
+    await markPrFixItem(client, { repo: "misospace/miso-gallery", pr: 467, status: "FIXED", note: "foreman succeeded" });
+    expect(client.items[0].generation).toBe(1);
+
+    // Same evidence, head SHA unchanged — the tombstone is untrusted and the
+    // item reopens as a fresh dispatchable attempt.
+    const reopened = await enqueuePrFixItem(client, input);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+  });
+
+  it("bumps generation when a BLOCKED item is marked back to QUEUED via markPrFixItem", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 14, lane: "NEEDS_HUMAN", reason: "r", feedback: "f", evidenceKey: "k1",
+    });
+    expect(client.items[0].status).toBe("BLOCKED");
+
+    const requeued = await markPrFixItem(client, { repo: "org/repo", pr: 14, status: "QUEUED", note: "operator unblock" });
+    expect(requeued?.status).toBe("QUEUED");
+    expect(requeued?.generation).toBe(2);
+  });
+
+  it("does not bump generation when marking an already-QUEUED item QUEUED", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 15, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
+    });
+    const again = await markPrFixItem(client, { repo: "org/repo", pr: 15, status: "QUEUED" });
+    expect(again?.status).toBe("QUEUED");
+    expect(again?.generation).toBe(1);
+  });
+
+  it("bumps generation when the head-SHA guard refuses FIXED and returns work to QUEUED", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 16, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1", headSha: "oldsha",
+    });
+    expect(client.items[0].generation).toBe(1);
+    // One-shot override so the "head never moved" answer cannot leak into
+    // later describes that rely on the shared default mock.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValueOnce("oldsha");
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 16, status: "FIXED", note: "reported done" });
+
+    expect(result?.status).toBe("QUEUED");
+    // The refused-FIXED rollback is a fresh worker attempt; an identity a
+    // worker already consumed for generation 1 must not be silently reused.
+    expect(result?.generation).toBe(2);
   });
 });
 

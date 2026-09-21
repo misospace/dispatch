@@ -142,6 +142,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
         title: "Fix issue 67",
         lane: "NORMAL",
         status: "QUEUED",
+        generation: 1,
         reason: "review changes requested",
         feedback: ["please update tests"],
         evidenceKeys: ["review:1"],
@@ -170,6 +171,8 @@ describe("GET /api/agents/[agentName]/queue", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0]).toMatchObject({ type: "pr-review-fix", repo: "org/repo", pr: 12 });
+    // The persisted work-generation identity surfaces on the queue response too.
+    expect(body[0].generation).toBe(1);
     expect(body[1]).toMatchObject({ number: 99, title: "Regular issue" });
     expect(mocks.prFixFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ status: "QUEUED", lane: "NORMAL" }) }));
   });
@@ -233,6 +236,7 @@ describe("GET /api/agents/[agentName]/queue", () => {
         title: "Fix PR",
         lane: "NORMAL",
         status: "QUEUED",
+        generation: 1,
         reason: "review requested",
         feedback: [],
         evidenceKeys: [],

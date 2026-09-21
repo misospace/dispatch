@@ -119,10 +119,10 @@ jobs:
       # surrounding transaction, and that abort is what broke #843 (P2039,
       # #850). Two fixes to this lock shipped green against mocks and failed in
       # the cluster, so this job is the guard rather than a nicety.
-      - name: Sync-lock concurrency against a real PostgreSQL
+      - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts"
 
   coverage:
     name: Coverage

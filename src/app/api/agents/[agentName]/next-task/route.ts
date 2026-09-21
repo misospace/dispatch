@@ -79,6 +79,10 @@ export async function GET(
         issue: first.issue
           ? { repoFullName: first.repo, number: first.issue }
           : undefined,
+        prFixItem: {
+          id: first.id,
+          generation: first.generation,
+        },
         reasons,
       });
       return NextResponse.json(task);
