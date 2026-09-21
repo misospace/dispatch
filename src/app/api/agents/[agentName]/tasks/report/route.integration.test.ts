@@ -156,6 +156,26 @@ suite("tasks/report idempotency against a real PostgreSQL", () => {
     expect((await retry.json()).error).toContain("no recorded result");
   });
 
+  it("the idempotency DDL is pinned: unique (agentName, idempotencyKey) index and SetNull FK", async () => {
+    const indexes = await prisma.$queryRaw<
+      Array<{ indexdef: string }>
+    >`SELECT indexdef FROM pg_indexes WHERE tablename = 'AgentReportDedupe'`;
+    const defs = indexes.map((r) => r.indexdef);
+    expect(
+      defs.some((d) => /UNIQUE INDEX.*ON "AgentReportDedupe"\("agentName", "idempotencyKey"\)/.test(d)),
+    ).toBe(true);
+
+    const fks = await prisma.$queryRaw<
+      Array<{ confdeltype: string; confrelid_regclass: string }>
+    >`SELECT confdeltype, confrelid::regclass::text AS "confrelid_regclass"
+      FROM pg_constraint
+      WHERE conrelid = '"AgentReportDedupe"'::regclass AND contype = 'f'`;
+    expect(fks).toHaveLength(1);
+    expect(fks[0].confrelid_regclass).toBe("AgentRun");
+    // 'a' is PG's code for SET NULL.
+    expect(fks[0].confdeltype).toBe("a");
+  });
+
   it("PrFixQueueItem.generation backfills to 1 and bumps on a real requeue", async () => {
     // Pin the migration's backfill semantics at the DDL level: the column is
     // NOT NULL DEFAULT 1, which is exactly how ALTER TABLE ADD COLUMN values
