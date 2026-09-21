@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.63](https://github.com/misospace/dispatch/compare/v0.5.62...v0.5.63) (2026-09-21)
+
+
+### Features
+
+* **deps:** update dependency eslint (10.10.0 → 10.11.0) ([#1035](https://github.com/misospace/dispatch/issues/1035)) ([197c87a](https://github.com/misospace/dispatch/commit/197c87af5b5d26e921484df25e5e63cc9a282469))
+* **queue:** expose PR-fix work generations ([#1044](https://github.com/misospace/dispatch/issues/1044)) ([c16f04f](https://github.com/misospace/dispatch/commit/c16f04f28547b73fc894f4d480afec7a6888ddfa))
+
+
+### Bug Fixes
+
+* **claims:** gate claim/assign/status decisions on live GitHub labels ([#1037](https://github.com/misospace/dispatch/issues/1037)) ([#1042](https://github.com/misospace/dispatch/issues/1042)) ([bacac7b](https://github.com/misospace/dispatch/commit/bacac7b023df539aaecdc3e7559b3c06049f64b9))
+* **deps:** update dependency @types/node (24.13.5 → 24.13.6) ([#1036](https://github.com/misospace/dispatch/issues/1036)) ([cb7bd79](https://github.com/misospace/dispatch/commit/cb7bd793d62afd76b820fc8fb1ab96413e03d543))
+* **deps:** update dependency tsx (4.23.13 → 4.23.15) ([#1039](https://github.com/misospace/dispatch/issues/1039)) ([6555743](https://github.com/misospace/dispatch/commit/6555743d591b7334873961b28a0cff79c02995d5))
+* **helm:** update chart common (5.2.0 → 5.2.1) ([#1030](https://github.com/misospace/dispatch/issues/1030)) ([073bc93](https://github.com/misospace/dispatch/commit/073bc931bf6ebdf032ce04fbd02c4867fdc5c304))
+
 ## [0.5.62](https://github.com/misospace/dispatch/compare/v0.5.61...v0.5.62) (2026-09-17)
 
 
