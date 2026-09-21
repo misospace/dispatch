@@ -1000,8 +1000,7 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
   });
 
-  it("a failed resolution-store update returns a structured 500; the retry still dedupes to the skip marker", async () => {
-    // The claim + AgentRun transaction commits (first update), then the
+  it("a failed resolution-store update returns a structured 500; the retry still dedupes to the skip marker", async () => {    // The claim + AgentRun transaction commits (first update), then the
     // resolution persistence fails: the report itself is durable, so this
     // response fails with a structured 5xx and the worker retries into the
     // duplicate branch.
@@ -1035,5 +1034,31 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     // No second AgentRun and no repeated resolution despite the failed store.
     expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
     expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("an AgentRun write failure on the no-key path returns a structured 500", async () => {
+    mockAgentRun.create.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("Failed to report task");
+  });
+
+  it("a resolver failure on the keyed path returns a structured 500 and records the claim", async () => {
+    // The claim + AgentRun transaction commits, then the resolver throws:
+    // the report is durable; the response must still be a structured 5xx.
+    prFixResolveMock.mockRejectedValueOnce(new Error("github unreachable"));
+
+    const res = await postRequest(keyedBody);
+
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("Failed to report task");
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+    // The committed claim still identifies the report for the worker's retry.
+    expect(mockDedupe.update).toHaveBeenCalledWith({
+      where: { id: "claim-1" },
+      data: { agentRunId: "run-1" },
+    });
   });
 });
