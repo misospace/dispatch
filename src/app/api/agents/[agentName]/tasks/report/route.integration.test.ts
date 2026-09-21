@@ -161,19 +161,24 @@ suite("tasks/report idempotency against a real PostgreSQL", () => {
       Array<{ indexdef: string }>
     >`SELECT indexdef FROM pg_indexes WHERE tablename = 'AgentReportDedupe'`;
     const defs = indexes.map((r) => r.indexdef);
+    // indexdef is schema-qualified, e.g. CREATE UNIQUE INDEX "…_key" ON
+    // public."AgentReportDedupe" USING btree ("agentName", "idempotencyKey").
     expect(
-      defs.some((d) => /UNIQUE INDEX.*ON "AgentReportDedupe"\("agentName", "idempotencyKey"\)/.test(d)),
+      defs.some((d) =>
+        /CREATE UNIQUE INDEX .* ON (public\.)?"AgentReportDedupe" USING btree \("agentName", "idempotencyKey"\)/.test(d),
+      ),
     ).toBe(true);
 
     const fks = await prisma.$queryRaw<
       Array<{ confdeltype: string; confrelid_regclass: string }>
-    >`SELECT confdeltype, confrelid::regclass::text AS "confrelid_regclass"
+    >`SELECT confdeltype::text AS "confdeltype", confrelid::regclass::text AS "confrelid_regclass"
       FROM pg_constraint
       WHERE conrelid = '"AgentReportDedupe"'::regclass AND contype = 'f'`;
     expect(fks).toHaveLength(1);
-    expect(fks[0].confrelid_regclass).toBe("AgentRun");
-    // 'a' is PG's code for SET NULL.
-    expect(fks[0].confdeltype).toBe("a");
+    // regclass::text preserves the quotes on mixed-case identifiers.
+    expect(fks[0].confrelid_regclass).toBe('"AgentRun"');
+    // pg_constraint codes: n = SET NULL, a = NO ACTION.
+    expect(fks[0].confdeltype).toBe("n");
   });
 
   it("PrFixQueueItem.generation backfills to 1 and bumps on a real requeue", async () => {
