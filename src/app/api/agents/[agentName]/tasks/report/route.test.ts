@@ -5,8 +5,8 @@ process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
-const { mocks, mockAgentRun } = vi.hoisted(() => ({
-  mockAgentRun: {
+const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, prismaMock } = vi.hoisted(() => {
+  const mockAgentRun = {
     create: vi.fn().mockResolvedValue({
       id: "run-1",
       agentName: "test-agent",
@@ -18,21 +18,26 @@ const { mocks, mockAgentRun } = vi.hoisted(() => ({
       errorMessage: null,
       touchedIssueUrls: [],
     }),
-  },
-  mocks: {
-    repoFindUnique: vi.fn().mockResolvedValue(null),
-    issueFindUnique: vi.fn().mockResolvedValue(null),
-  },
-}));
-
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
+  };
+  const mockDedupe = {
+    create: vi.fn().mockResolvedValue({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "key-1",
+      payloadHash: "hash-1",
+      agentRunId: null,
+      prFixResolution: null,
+    }),
+    findUnique: vi.fn().mockResolvedValue(null),
+    update: vi.fn().mockResolvedValue({}),
+  };
+  const prismaMock: any = {
     agentRun: mockAgentRun,
     repository: {
-      findUnique: mocks.repoFindUnique,
+      findUnique: vi.fn().mockResolvedValue(null),
     },
     issue: {
-      findUnique: mocks.issueFindUnique,
+      findUnique: vi.fn().mockResolvedValue(null),
     },
     // `tasks/report` resolves a queued pr-fix item when the agent reports
     // back on PR coordinates. Tests that send `repoFullName` +
@@ -41,11 +46,50 @@ vi.mock("@/lib/prisma", () => ({
     prFixQueueItem: {
       findUnique: vi.fn(async () => null),
     },
+    agentReportDedupe: mockDedupe,
+    $transaction: (fn: any) => fn(prismaMock),
+  };
+  return {
+    mockAgentRun,
+    mockDedupe,
+    prFixResolveMock: vi.fn().mockResolvedValue({
+      matched: false,
+      action: "none",
+      itemId: null,
+      reason: "no matching pr-fix queue item",
+    }),
+    mocks: {
+      repoFindUnique: prismaMock.repository.findUnique,
+      issueFindUnique: prismaMock.issue.findUnique,
+    },
+    prismaMock,
+  };
+});
+
+vi.mock("@/lib/prisma", () => ({ prisma: prismaMock }));
+
+// Real Prisma error shape so the `instanceof` check in the route triggers.
+vi.mock("@prisma/client", () => ({
+  Prisma: {
+    PrismaClientKnownRequestError: class PrismaClientKnownRequestError extends Error {
+      code: string;
+      clientVersion: string;
+      constructor(message: string, opts: { code: string; clientVersion?: string }) {
+        super(message);
+        this.code = opts.code;
+        this.clientVersion = opts.clientVersion ?? "test";
+      }
+    },
   },
+}));
+
+vi.mock("@/lib/pr-fix-queue", () => ({
+  resolvePrFixFromAgentReport: prFixResolveMock,
 }));
 
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { Prisma } from "@prisma/client";
 
 function postRequest(body: unknown, agentName = "test-agent", includeAuth = true) {
   return POST(
@@ -619,5 +663,250 @@ describe("POST /api/agents/[agentName]/tasks/report — AgentRun persistence", (
 
     const call = mockAgentRun.create.mock.calls[0][0].data;
     expect(call.touchedIssueUrls).toEqual([]);
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  const keyedBody = {
+    taskType: "followup-pr",
+    outcome: "pr_updated",
+    repoFullName: "org/repo",
+    pullRequestNumber: 12,
+    summary: "pushed the fix",
+    idempotencyKey: "worker-run-1:report",
+  };
+
+  function p2002(): Error {
+    return new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+      code: "P2002",
+      clientVersion: "test",
+    });
+  }
+
+  it("reports without idempotencyKey keep at-least-once behavior", async () => {
+    const body = { taskType: "implement", outcome: "pr_opened" };
+
+    const first = await postRequest(body);
+    const second = await postRequest(body);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    // No key → no claim, and repeated reports create repeated AgentRuns.
+    expect(mockDedupe.create).not.toHaveBeenCalled();
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
+    expect((await first.json()).duplicate).toBeUndefined();
+    expect((await second.json()).duplicate).toBeUndefined();
+  });
+
+  it("rejects a non-string or empty idempotencyKey without side effects", async () => {
+    const badType = await postRequest({ taskType: "implement", outcome: "pr_opened", idempotencyKey: 42 });
+    expect(badType.status).toBe(400);
+    const empty = await postRequest({ taskType: "implement", outcome: "pr_opened", idempotencyKey: "  " });
+    expect(empty.status).toBe(400);
+
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+    expect(mockDedupe.create).not.toHaveBeenCalled();
+    expect(prFixResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("first report with a key claims the key, creates one AgentRun, and runs PR-fix resolution", async () => {
+    const res = await postRequest(keyedBody);
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.duplicate).toBeUndefined();
+
+    expect(mockDedupe.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        agentName: "test-agent",
+        idempotencyKey: "worker-run-1:report",
+        payloadHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+    });
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+    // The claim is stamped with the AgentRun id inside the same transaction.
+    expect(mockDedupe.update).toHaveBeenCalledWith({
+      where: { id: "claim-1" },
+      data: { agentRunId: "run-1" },
+    });
+  });
+
+  it("identical retry returns success with the original agentRunId and stored resolution", async () => {
+    const first = await postRequest(keyedBody);
+    expect(first.status).toBe(200);
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+    // Simulate the retry hitting the committed claim from the first report.
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: { matched: true, action: "fixed", itemId: 7, reason: "pr merge state verified" },
+    });
+
+    const retry = await postRequest(keyedBody);
+
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.ok).toBe(true);
+    expect(body.duplicate).toBe(true);
+    expect(body.agentRunId).toBe("run-1");
+    expect(body.prFixResolution).toEqual({
+      matched: true,
+      action: "fixed",
+      itemId: 7,
+      reason: "pr merge state verified",
+    });
+  });
+
+  it("a retry creates no second AgentRun", async () => {
+    await postRequest(keyedBody);
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    await postRequest(keyedBody);
+
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("a retry does not repeat PR-fix resolution side effects", async () => {
+    await postRequest(keyedBody);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    const retry = await postRequest(keyedBody);
+    expect(retry.status).toBe(200);
+
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+    const body = await retry.json();
+    // No stored resolution → explicit skip marker, never a re-run.
+    expect(body.prFixResolution.action).toBe("skipped");
+    expect(body.prFixResolution.reason).toContain("not re-run");
+  });
+
+  it("concurrent same-key submissions create exactly one logical report", async () => {
+    // The winner claims the key; the loser hits the unique constraint and
+    // reads back the winner's committed claim.
+    mockDedupe.create
+      .mockImplementationOnce(async ({ data }: any) => ({
+        id: "claim-1",
+        agentName: data.agentName,
+        idempotencyKey: data.idempotencyKey,
+        payloadHash: data.payloadHash,
+        agentRunId: null,
+        prFixResolution: null,
+      }))
+      .mockImplementationOnce(() => Promise.reject(p2002()));
+    mockDedupe.findUnique.mockImplementationOnce(async () => {
+      // The winner's create is chronologically first, so its payloadHash is
+      // already recorded when the loser reaches this read.
+      const winnerData = mockDedupe.create.mock.calls.find(
+        (c: any) => c[0].data.idempotencyKey === "worker-run-1:report",
+      )![0].data;
+      return {
+        id: "claim-1",
+        agentName: "test-agent",
+        idempotencyKey: "worker-run-1:report",
+        payloadHash: winnerData.payloadHash,
+        agentRunId: "run-1",
+        prFixResolution: null,
+      };
+    });
+
+    const [winner, loser] = await Promise.all([
+      postRequest(keyedBody),
+      postRequest(keyedBody),
+    ]);
+
+    expect(winner.status).toBe(200);
+    expect(loser.status).toBe(200);
+    const winnerBody = await winner.json();
+    const loserBody = await loser.json();
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+    expect(loserBody.duplicate).toBe(true);
+    expect(loserBody.agentRunId).toBe("run-1");
+    expect(winnerBody.agentRunId).toBe("run-1");
+  });
+
+  it("same key with a different payload is rejected as a conflict", async () => {
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "worker-run-1:report",
+      payloadHash: "hash-of-a-different-payload",
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    const res = await postRequest(keyedBody);
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("different report payload");
+    // No second AgentRun and no side effects for a conflicting payload.
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+    expect(prFixResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("different keys produce independent reports", async () => {
+    mockAgentRun.create
+      .mockResolvedValueOnce({ id: "run-1" })
+      .mockResolvedValueOnce({ id: "run-2" });
+
+    const first = await postRequest({ ...keyedBody, idempotencyKey: "key-a" });
+    const second = await postRequest({ ...keyedBody, idempotencyKey: "key-b" });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(mockDedupe.create).toHaveBeenCalledTimes(2);
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
+    expect((await first.json()).agentRunId).toBe("run-1");
+    expect((await second.json()).agentRunId).toBe("run-2");
+  });
+
+  it("different agents may use the same opaque key without colliding", async () => {
+    mockAgentRun.create
+      .mockResolvedValueOnce({ id: "run-1" })
+      .mockResolvedValueOnce({ id: "run-2" });
+
+    const first = await postRequest({ ...keyedBody, idempotencyKey: "shared-key" }, "agent-one");
+    const second = await postRequest({ ...keyedBody, idempotencyKey: "shared-key" }, "agent-two");
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(mockDedupe.create).toHaveBeenCalledTimes(2);
+    const claimedAgents = mockDedupe.create.mock.calls.map((c: any) => c[0].data.agentName);
+    expect(claimedAgents).toEqual(["agent-one", "agent-two"]);
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
   });
 });

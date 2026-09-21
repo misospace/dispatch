@@ -189,6 +189,27 @@ enum EscalatedOutcome {
   STUCK
 }
 
+// Durable idempotency claims for tasks/report (#1044): a worker that crashes
+// between Dispatch committing a report and recording the result locally will
+// retry the same report. The (agentName, idempotencyKey) unique constraint
+// makes the claim atomic against concurrent duplicates; payloadHash rejects
+// key reuse with a different report (409); agentRunId and prFixResolution
+// replay the original logical result to retries without re-running side
+// effects. The key is opaque worker-chosen state — no producer-specific
+// semantics.
+model AgentReportDedupe {
+  id              String   @id @default(cuid())
+  agentName       String
+  idempotencyKey  String
+  payloadHash     String
+  agentRunId      String?
+  prFixResolution Json?
+  createdAt       DateTime @default(now())
+
+  @@unique([agentName, idempotencyKey])
+  @@index([agentName])
+}
+
 model AuditLog {
   id           String   @id @default(cuid())
   actor        String

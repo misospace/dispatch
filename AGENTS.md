@@ -310,6 +310,10 @@ The `tasks/report` endpoint accepts these outcomes:
 | `failed` | The task failed unexpectedly |
 | `no_changes_needed` | No action was required |
 
+#### Idempotent reporting (optional)
+
+`tasks/report` accepts an optional `idempotencyKey` (opaque non-empty string). When present, `(agentName, idempotencyKey)` uniquely identifies the logical report: a retried request with the same key and the same payload returns the original `agentRunId` (with `duplicate: true`) without creating another `AgentRun` or re-running PR-fix resolution. Reusing the same key with a different payload is rejected with `409`. Reports that omit the key keep the current at-least-once behavior. Workers that may crash between reporting and recording the result locally should derive the key from a durable per-run identity (for example `"<work-item-id>:<lifecycle-event>"`); Dispatch treats the value as fully opaque.
+
 ### Worker Boundaries
 
 Workers must respect these constraints:
