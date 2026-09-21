@@ -53,6 +53,10 @@ rejected with a 503 response unless `WEBHOOK_GATEWAY_MODE` is explicitly set to
 `"true"` (indicating the endpoint is behind an API gateway that handles its own
 authentication and signature verification).
 
+A related endpoint, `POST /api/issues/webhook`, ingests GitHub `issues`
+`labeled`/`unlabeled` events directly into the issue label cache using the same
+signature-verification model (see the `WEBHOOK_SECRET` row in the README).
+
 ## Feedback classification
 
 Incoming feedback is classified as **actionable** or **needs_human**:

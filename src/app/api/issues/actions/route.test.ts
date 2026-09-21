@@ -8,6 +8,7 @@ const { mocks } = vi.hoisted(() => ({
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     updateIssueLabels: vi.fn().mockResolvedValue(undefined),
+    getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
   },
 }));
 
@@ -30,12 +31,20 @@ vi.mock("@/lib/github", () => ({
   addIssueLabel: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
+
 // Import the route after mocks are set up
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
+import { resetRateLimits } from "@/lib/rate-limit";
 import { POST } from "./route";
+
+// Reset process-global per-actor rate-limit windows per test (see claim suite).
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function makePayload(overrides = {}) {
   return {
@@ -216,6 +225,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
   });
 
   it("assigns agent and preserves existing labels", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "type/feature"]);
     const res = await postRequest(makePayload());
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -256,6 +266,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
       state: "open",
       labels: ["status/backlog", "agent/old-worker"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "agent/old-worker"]);
 
     const res = await postRequest(makePayload());
     expect(res.status).toBe(200);
@@ -277,6 +288,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
       state: "open",
       labels: ["status/backlog", "agent/dup", "agent/dup2"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "agent/dup", "agent/dup2"]);
 
     const res = await postRequest(makePayload());
     expect(res.status).toBe(200);
@@ -292,6 +304,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
       state: "open",
       labels: ["owner/alice", "status/in-progress"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/alice", "status/in-progress"]);
 
     const res = await postRequest(makePayload());
     expect(res.status).toBe(200);
@@ -313,6 +326,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
       state: "open",
       labels: ["status/backlog", "agent/other-agent"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "agent/other-agent"]);
 
     const res = await postRequest(makePayload({ force_claim: true }));
     expect(res.status).toBe(200);
@@ -335,6 +349,7 @@ describe("POST /api/issues/actions — assign_agent", () => {
       state: "open",
       labels: ["priority/p1", "type/bug", "agent/old"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["priority/p1", "type/bug", "agent/old"]);
 
     const res = await postRequest(makePayload());
     expect(res.status).toBe(200);
@@ -360,6 +375,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
   });
 
   it("assigns owner and preserves existing labels", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-progress", "type/bug"]);
     const res = await postRequest(
       makePayload({ action: "assign_owner" as const, value: "owner/alice" })
     );
@@ -383,6 +399,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
       state: "open",
       labels: ["status/in-progress", "owner/bob"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-progress", "owner/bob"]);
 
     const res = await postRequest(
       makePayload({ action: "assign_owner" as const, value: "owner/alice" })
@@ -406,6 +423,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
       state: "open",
       labels: ["status/backlog"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
     let res = await postRequest(makePayload());
     expect(res.status).toBe(200);
 
@@ -415,6 +433,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
       state: "open",
       labels: ["status/backlog", "agent/worker"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "agent/worker"]);
     res = await postRequest(
       makePayload({ action: "assign_owner" as const, value: "owner/alice" })
     );
@@ -431,6 +450,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
       state: "open",
       labels: ["status/in-review", "priority/p1"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-review", "priority/p1"]);
 
     const res = await postRequest(makePayload());
     expect(res.status).toBe(200);
@@ -446,6 +466,7 @@ describe("POST /api/issues/actions — assign_owner", () => {
       state: "open",
       labels: ["agent/worker", "status/in-progress"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/worker", "status/in-progress"]);
 
     const res = await postRequest(
       makePayload({ action: "assign_owner" as const, value: "owner/alice" })
@@ -517,5 +538,56 @@ describe("POST /api/issues/actions — error handling", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("network timeout");
+  });
+});
+
+describe("POST /api/issues/actions — #1037 live label gate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findIssue.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog"],
+    });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+  });
+
+  it("returns 503 and performs no writes when live GitHub labels cannot be verified", async () => {
+    mocks.getLiveIssueLabels.mockRejectedValueOnce(new Error("github 500"));
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toBe("Could not verify live GitHub labels: github 500");
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "assign_agent",
+        success: false,
+        errorMessage: "Could not verify live GitHub labels: github 500",
+      }),
+    });
+  });
+
+  it("assigns based on live labels, not the cached labels", async () => {
+    // Stale cache shows a ghost agent; live GitHub labels do not
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog", "agent/ghost"],
+    });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["status/backlog", "agent/worker"]
+    );
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ beforeLabels: ["status/backlog"] }),
+    });
   });
 });

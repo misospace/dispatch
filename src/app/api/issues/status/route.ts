@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS, StatusLabel, isStatusLabel } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -60,9 +61,42 @@ export async function POST(request: Request) {
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
       const effectiveNumber = issue.number;
 
+      // #1037: the transition must be computed against the labels GitHub
+      // currently has, not the Prisma cache — a label change made directly
+      // on GitHub is invisible in the cache until the next sync. Fail closed
+      // if GitHub is unreachable: no label writes, no cache update.
+      let liveLabels: string[];
+      try {
+        liveLabels = await getLiveIssueLabels(effectiveRepo, effectiveNumber);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+
+        // Failed audit entry, consistent with the failure-audit style below
+        try {
+          await prisma.auditLog.create({
+            data: {
+              actor: actorName,
+              action: "set_status",
+              repoFullName: effectiveRepo,
+              issueNumber: effectiveNumber,
+              issueId: issueId as string,
+              beforeLabels: issue.labels,
+              afterLabels: [],
+              success: false,
+              errorMessage: `Could not verify live GitHub labels: ${errorMessage}`,
+            },
+          });
+        } catch {
+          // Audit log failure should not mask the real error
+        }
+
+        return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
+      }
+
       // Remove ALL existing status labels before adding the new one, via the
       // shared status-swap helper (also used by claim/groom/move/unclaim).
-      const labelsToSet = await transitionIssueStatus(effectiveRepo, effectiveNumber, issue.labels, targetLabel);
+      // Base is the live GitHub label set (authoritative — #1037).
+      const labelsToSet = await transitionIssueStatus(effectiveRepo, effectiveNumber, liveLabels, targetLabel);
 
       // Update local cache
       await prisma.issue.update({
@@ -84,7 +118,7 @@ export async function POST(request: Request) {
           repoFullName: effectiveRepo,
           issueNumber: effectiveNumber,
           issueId: issueId as string,
-          beforeLabels: issue.labels,
+          beforeLabels: liveLabels,
           afterLabels: labelsToSet,
           success: true,
         },

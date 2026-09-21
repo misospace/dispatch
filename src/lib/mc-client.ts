@@ -375,6 +375,20 @@ export async function claimWork(
   let resolved: ResolveIssueResult;
   let refreshSucceeded = false;
 
+  // #1037: refresh the cache up front, best-effort, before resolving — the
+  // server-side claim gate re-reads live GitHub labels before deciding, and a
+  // fresh refresh keeps the cached issue/labels as close to GitHub as
+  // possible. Refresh failures are swallowed on purpose: the server-side
+  // gate is the enforcement layer, and a refresh hiccup must not block a
+  // claim that would otherwise succeed.
+  if (refreshEnabled) {
+    try {
+      await refreshIssue(repoFullName, issueNumber);
+    } catch {
+      // best-effort: proceed to resolve
+    }
+  }
+
   try {
     resolved = await resolveIssue(repoFullName, issueNumber);
   } catch (error) {

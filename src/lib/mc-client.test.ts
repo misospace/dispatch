@@ -405,10 +405,13 @@ describe("claimWork", () => {
 
   it("resolves, claims, and sets status in sequence", async () => {
     const { claimWork } = await import("./mc-client");
-    // claimWork calls resolveIssue 3 times (once directly + once inside claimIssue + once inside setIssueStatus)
-    // plus one POST to /api/issues/claim and one POST to /api/issues/status = 5 fetch calls total
+    // claimWork refreshes best-effort (#1037) then calls resolveIssue 3 times
+    // (once directly + once inside claimIssue + once inside setIssueStatus)
+    // plus one POST to /api/issues/claim and one POST to /api/issues/status
+    // = 6 fetch calls total
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (claimWork)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (claimIssue -> resolveIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // POST /api/issues/claim
@@ -430,13 +433,14 @@ describe("claimWork", () => {
     expect(result.taskContract).toContain("[Task Contract]");
     expect(result.taskContract).toContain("#42");
     expect(result.taskContract).toContain("org/repo");
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
   });
 
   it("uses custom status when provided", async () => {
     const { claimWork } = await import("./mc-client");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (inside claimIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // claim
@@ -448,7 +452,7 @@ describe("claimWork", () => {
     const result = await claimWork("org/repo", 42, "test-agent", { status: "in-review" });
 
     expect(result.status).toBe("in-review");
-    const call = vi.mocked(fetch).mock.calls[4] as [string, RequestInit];
+    const call = vi.mocked(fetch).mock.calls[5] as [string, RequestInit];
     const body = JSON.parse(call[1].body as string);
     expect(body.status).toBe("in-review");
   });
@@ -457,6 +461,7 @@ describe("claimWork", () => {
     const { claimWork } = await import("./mc-client");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (inside claimIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // claim
@@ -465,7 +470,7 @@ describe("claimWork", () => {
 
     await claimWork("org/repo", 42, "test-agent", { force: true });
 
-    const call = vi.mocked(fetch).mock.calls[2] as [string, RequestInit];
+    const call = vi.mocked(fetch).mock.calls[3] as [string, RequestInit];
     const body = JSON.parse(call[1].body as string);
     expect(body.force).toBe(true);
   });
@@ -473,9 +478,10 @@ describe("claimWork", () => {
   it("includes lane in task contract", async () => {
     const { claimWork } = await import("./mc-client");
     const escalatedIssue = { ...mockIssue, currentLane: "frontier" };
-    // claimWork calls resolveIssue 3 times + POST claim + POST status = 5 fetch calls
+    // claimWork refreshes (best-effort) + calls resolveIssue 3 times + POST claim + POST status = 6 fetch calls
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([escalatedIssue]))  // resolve
       .mockResolvedValueOnce(jsonResponse([escalatedIssue])); // resolve (inside claimIssue)
     fetchSpy.mockResolvedValueOnce(jsonResponse({ success: true, labels: [] })); // claim
@@ -490,6 +496,7 @@ describe("claimWork", () => {
     const { claimWork } = await import("./mc-client");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (inside claimIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // claim
@@ -504,6 +511,7 @@ describe("claimWork", () => {
     const { claimWork } = await import("./mc-client");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(jsonResponse([mockIssue]))
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))
@@ -531,6 +539,7 @@ describe("claimWork", () => {
     process.env.DISPATCH_AGENT_NAME = "env-agent";
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (best-effort)
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve
       .mockResolvedValueOnce(jsonResponse([mockIssue]))  // resolve (inside claimIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))         // claim
@@ -542,7 +551,7 @@ describe("claimWork", () => {
     expect(result.resolvedAgentName).toBe("env-agent");
     expect(result.taskContract).toContain("Agent: env-agent");
     // Verify the claim request used the env agent name
-    const call = vi.mocked(fetch).mock.calls[2] as [string, RequestInit];
+    const call = vi.mocked(fetch).mock.calls[3] as [string, RequestInit];
     const body = JSON.parse(call[1].body as string);
     expect(body.agentName).toBe("env-agent");
   });
@@ -561,9 +570,13 @@ describe("claimWork with refreshBeforeClaim", () => {
     const { claimWork } = await import("./mc-client");
     const fetchMock = vi.spyOn(globalThis, "fetch");
 
-    // First call fails (issue not in cache)
+    // Best-effort pre-claim refresh (#1037)
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
+    );
+    // First resolve fails (issue not in cache)
     fetchMock.mockResolvedValueOnce(jsonResponse([]));
-    // Refresh succeeds
+    // Second-chance refresh succeeds
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
     );
@@ -586,16 +599,20 @@ describe("claimWork with refreshBeforeClaim", () => {
 
   it("does not refresh when refreshBeforeClaim is false", async () => {
     const { claimWork } = await import("./mc-client");
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse([]));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse([]));
 
     await expect(claimWork("org/repo", 42, "test-agent", { refreshBeforeClaim: false })).rejects.toThrow(/not found/);
+
+    // No pre-claim refresh: the only call is the resolve itself
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("throws clear error when refresh also fails", async () => {
     const { claimWork } = await import("./mc-client");
     vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(errorResponse("Issue not found on GitHub", 404)) // best-effort pre-claim refresh fails (swallowed)
       .mockResolvedValueOnce(jsonResponse([])) // resolve fails
-      .mockResolvedValueOnce(errorResponse("Issue not found on GitHub", 404)); // refresh fails
+      .mockResolvedValueOnce(errorResponse("Issue not found on GitHub", 404)); // second-chance refresh fails
 
     await expect(claimWork("org/repo", 42, "test-agent")).rejects.toThrow(/not found in.*after refresh/);
   });
@@ -604,10 +621,13 @@ describe("claimWork with refreshBeforeClaim", () => {
     const { claimWork } = await import("./mc-client");
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock
-      .mockResolvedValueOnce(jsonResponse([])) // resolve fails
       .mockResolvedValueOnce(
         jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
-      ); // refresh succeeds
+      ); // best-effort pre-claim refresh
+    fetchMock.mockResolvedValueOnce(jsonResponse([])); // resolve fails
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "created", error: null }),
+    ); // second-chance refresh succeeds
     fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve after refresh
     fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve inside claimIssue
     fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, labels: [] })); // claim
@@ -616,6 +636,41 @@ describe("claimWork with refreshBeforeClaim", () => {
 
     const result = await claimWork("org/repo", 42, "test-agent");
     expect(result.taskContract).toContain("was refreshed from GitHub");
+  });
+
+  it("refreshes the issue before resolving, even when the issue is already cached", async () => {
+    const { claimWork } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (first call)
+      .mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve (inside claimIssue)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, labels: [] })); // claim
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve (inside setIssueStatus)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] })); // set status
+
+    const result = await claimWork("org/repo", 42, "test-agent");
+
+    expect(fetchMock.mock.calls[0][0]).toContain("/api/issues/refresh");
+    expect(fetchMock.mock.calls[1][0]).toContain("/api/issues?repo=org%2Frepo");
+    expect(result.issueId).toBe("issue-cuid-1");
+    // No cache-miss note: the issue was in the cache
+    expect(result.taskContract).not.toContain("was not in cache");
+  });
+
+  it("still attempts to claim when the pre-claim refresh fails", async () => {
+    const { claimWork } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock
+      .mockResolvedValueOnce(errorResponse("GitHub unavailable", 500)) // refresh fails — swallowed
+      .mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve (inside claimIssue)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, labels: [] })); // claim
+    fetchMock.mockResolvedValueOnce(jsonResponse([mockIssue])); // resolve (inside setIssueStatus)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, status: "", labels: [] })); // set status
+
+    const result = await claimWork("org/repo", 42, "test-agent");
+    expect(result.issueId).toBe("issue-cuid-1");
   });
 });
 

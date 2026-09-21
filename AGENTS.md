@@ -168,7 +168,7 @@ src/
       audit/                # audit log read
       automation/           # sync, runs, workflows, events, repos
       health/               # health check
-      issues/               # listing, move, claim, unclaim, unassign, status, groom, lane, actions, reconcile, refresh, prune-closed, untriaged
+      issues/               # listing, move, claim, unclaim, unassign, status, groom, lane, actions, reconcile, refresh, prune-closed, untriaged, webhook
       pr-fix-queue/         # enqueue, queued, mark
       pr-followup/          # sync, webhook
       repos/                # repository config

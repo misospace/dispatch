@@ -8,6 +8,7 @@ const { mocks } = vi.hoisted(() => ({
     leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
     leaseCreate: vi.fn(), leaseUpdate: vi.fn(), leaseDelete: vi.fn(), leaseFindFirst: vi.fn(),
+    getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
     agentWorkFindMany: vi.fn().mockResolvedValue([]),
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
     transaction: vi.fn((arg: any) => {
@@ -45,7 +46,17 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/github", () => ({ addIssueLabel: mocks.addIssueLabel, removeIssueLabel: mocks.removeIssueLabel }));
 
+vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
+
+import { resetRateLimits } from "@/lib/rate-limit";
 import { POST } from "./route";
+
+// Per-actor rate-limit windows are process-global; reset them per test so the
+// shared TEST_AGENT_TOKEN buckets cannot bleed across describes (same pattern
+// as move/webhook suites).
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function makePayload(o = {}) { return { issueId: "issue-1", repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent", ...o }; }
 function makeRequest(overrides = {}, extraHeaders = {}) {
@@ -141,6 +152,7 @@ describe("POST /api/issues/claim — business logic", () => {
 
   it("refuses done issues", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/done"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/done"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(400);
     expect((await res.json()).error).toBe("Cannot claim a done issue");
@@ -166,12 +178,14 @@ describe("POST /api/issues/claim — business logic", () => {
       state: "open",
       labels: ["agent/test-agent", "agent/other-agent"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/test-agent", "agent/other-agent"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
   });
 
   it("returns 409 when already assigned to another agent without force", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
     expect((await res.json()).error).toContain("already assigned to other-agent");
@@ -179,6 +193,7 @@ describe("POST /api/issues/claim — business logic", () => {
 
   it("force claims by removing old agent label when force=true", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -187,9 +202,25 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
   });
 
+  it("force claims by removing ALL conflicting agent labels when live labels carry more than one", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "agent/third-agent"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "agent/third-agent"]);
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/other-agent");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/third-agent");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    // Cache and GitHub agree: no stale agent label survives in the cache
+    expect(body.labels).not.toContain("agent/other-agent");
+    expect(body.labels).not.toContain("agent/third-agent");
+  });
+
   it("logs error when force claim label removal fails but continues", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockReturnValue();
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
@@ -214,6 +245,7 @@ describe("POST /api/issues/claim — business logic", () => {
 
   it("replaces an existing status label with in-progress", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-review"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
@@ -223,6 +255,7 @@ describe("POST /api/issues/claim — business logic", () => {
 
   it("removes ALL existing status labels when an issue carries more than one (approved fix)", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review", "status/backlog"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-review", "status/backlog"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-review");
@@ -262,6 +295,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
 
   it("preserves owner labels when claiming an issue with owner/*", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/alice"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -273,6 +307,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
 
   it("allows claim when only owner label exists (no agent conflict)", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/bob", "priority/p1"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/bob", "priority/p1"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -283,6 +318,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
 
   it("handles both agent and owner conflicts — refuses without force", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "owner/alice"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "owner/alice"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
     expect((await res.json()).error).toContain("already assigned to other-agent");
@@ -290,6 +326,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
 
   it("force claims when both agent and owner labels exist", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "owner/alice", "priority/p2"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "owner/alice", "priority/p2"]);
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -315,6 +352,7 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
 
   it("includes conflict details in audit log when agent conflict exists and force is used", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     await POST(makeRequest({ force: true }));
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -327,6 +365,7 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
 
   it("includes owner conflict details in audit log when owner labels exist", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/alice"]);
     await POST(makeRequest());
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -347,5 +386,75 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
         notes: undefined,
       }),
     });
+  });
+});
+
+describe("POST /api/issues/claim — #1037 live label gate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+  });
+
+  it("refuses 409 when only the live GitHub labels show another agent (cache is clean)", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "agent/other-agent"]);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("already assigned to other-agent");
+  });
+
+  it("force-claims when only the live GitHub labels show another agent, removing that label", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "agent/other-agent"]);
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/other-agent");
+  });
+
+  it("returns 503 and performs no writes when live GitHub labels cannot be verified", async () => {
+    mocks.getLiveIssueLabels.mockRejectedValueOnce(new Error("github 500"));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe("Could not verify live GitHub labels: github 500");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: false,
+        errorMessage: "Could not verify live GitHub labels: github 500",
+      }),
+    });
+  });
+
+  it("builds the resulting label set from live labels, not the stale cache", async () => {
+    // Cache still has status/in-review; GitHub no longer does and carries status/backlog
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "priority/p0"]);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toContain("status/in-progress");
+    expect(body.labels).toContain("priority/p0");
+    expect(body.labels).not.toContain("status/in-review");
+    // GitHub ops act on the live base: only the live status label is removed
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/backlog");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalledWith("org/repo", 42, "status/in-review");
+  });
+
+  it("refuses a done issue when only live labels carry status/done (cache does not)", async () => {
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "status/done"]);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot claim a done issue");
   });
 });

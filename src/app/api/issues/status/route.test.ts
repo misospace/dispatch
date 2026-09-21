@@ -8,6 +8,7 @@ const { mocks } = vi.hoisted(() => ({
     createAuditLog: vi.fn(),
     removeIssueLabel: vi.fn(),
     addIssueLabel: vi.fn(),
+    getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
   },
 }));
 
@@ -25,7 +26,15 @@ vi.mock("@/lib/github", () => ({
   addIssueLabel: mocks.addIssueLabel,
 }));
 
+vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
+
+import { resetRateLimits } from "@/lib/rate-limit";
 import { POST } from "./route";
+
+// Reset process-global per-actor rate-limit windows per test (see claim suite).
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function makePayload(o = {}) {
   return { issueId: "issue-1", repoFullName: "org/repo", issueNumber: 42, status: "in-progress", ...o };
@@ -141,6 +150,7 @@ describe("POST /api/issues/status — business logic", () => {
 
   it("replaces existing status label", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/backlog"], number: 42, repository: { fullName: "org/repo" } });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -151,6 +161,7 @@ describe("POST /api/issues/status — business logic", () => {
 
   it("does not call github when status is already set to the same value", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-progress"], number: 42, repository: { fullName: "org/repo" } });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-progress"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
@@ -220,6 +231,7 @@ describe("POST /api/issues/status — business logic", () => {
 
   it("fails when removing old status label fails — does not add new label or update Prisma", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/backlog"], number: 42, repository: { fullName: "org/repo" } });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
     mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
     const consoleSpy = vi.spyOn(console, "error").mockReturnValue();
     const res = await POST(makeRequest());
@@ -241,6 +253,7 @@ describe("POST /api/issues/status — business logic", () => {
 
   it("preserves non-status labels when replacing", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["priority/p0", "status/backlog", "type/bug"], number: 42, repository: { fullName: "org/repo" } });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["priority/p0", "status/backlog", "type/bug"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -258,6 +271,7 @@ describe("POST /api/issues/status — business logic", () => {
 
   it("transitions an issue to status/blocked and persists a trimmed reason", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"], number: 42, repository: { fullName: "org/repo" } });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready"]);
     const res = await POST(makeRequest({ status: "blocked", blockedReason: "  Waiting on API team  " }));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -279,6 +293,7 @@ describe("POST /api/issues/status — business logic", () => {
       number: 42,
       repository: { fullName: "org/repo" },
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/blocked"]);
     const res = await POST(makeRequest({ status: "ready" }));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -288,6 +303,37 @@ describe("POST /api/issues/status — business logic", () => {
     expect(mocks.updateIssue).toHaveBeenCalledWith({
       where: { id: "issue-1" },
       data: expect.objectContaining({ blockedReason: null }),
+    });
+  });
+
+  it("returns 503 and performs no writes when live GitHub labels cannot be verified", async () => {
+    mocks.getLiveIssueLabels.mockRejectedValueOnce(new Error("github 500"));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe("Could not verify live GitHub labels: github 500");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "set_status",
+        success: false,
+        errorMessage: "Could not verify live GitHub labels: github 500",
+      }),
+    });
+  });
+
+  it("transitions from live labels, not the cached labels", async () => {
+    // Cache says status/backlog; GitHub has status/in-review
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/backlog"], number: 42, repository: { fullName: "org/repo" } });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-review"]);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-review");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalledWith("org/repo", 42, "status/backlog");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ beforeLabels: ["status/in-review"] }),
     });
   });
 });
