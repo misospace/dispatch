@@ -75,6 +75,9 @@ suite("tasks/report idempotency against a real PostgreSQL", () => {
     const bodies = [(await first.json()), (await second.json())];
     const duplicates = bodies.filter((b) => b.duplicate === true);
     expect(duplicates).toHaveLength(1);
+    // Exactly one of the two carries duplicate:true — the other is a plain
+    // first-time response with no duplicate field at all.
+    expect(bodies.filter((b) => b.duplicate === undefined)).toHaveLength(1);
     expect(new Set(bodies.map((b) => b.agentRunId)).size).toBe(1);
 
     // Exactly one AgentRun and one claim row; the claim carries the result.
@@ -133,9 +136,13 @@ suite("tasks/report idempotency against a real PostgreSQL", () => {
     });
     expect(claims).toHaveLength(1);
     expect(claims[0].agentRunId).toBeNull();
+    // The claim stays fully recognizable without the run: key and payload
+    // hash are intact.
+    expect(claims[0].payloadHash).toMatch(/^[0-9a-f]{64}$/);
     // A retry after the run's deletion surfaces the defensive conflict, not a
     // silent re-run.
     const retry = await postRequest(keyedReport);
     expect(retry.status).toBe(409);
+    expect((await retry.json()).error).toContain("no recorded result");
   });
 });

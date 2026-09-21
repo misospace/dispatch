@@ -1000,15 +1000,19 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
   });
 
-  it("a failed resolution-store update fails the first response; the retry still dedupes to the skip marker", async () => {
+  it("a failed resolution-store update returns a structured 500; the retry still dedupes to the skip marker", async () => {
     // The claim + AgentRun transaction commits (first update), then the
     // resolution persistence fails: the report itself is durable, so this
-    // response fails and the worker retries into the duplicate branch.
+    // response fails with a structured 5xx and the worker retries into the
+    // duplicate branch.
     mockDedupe.update
       .mockResolvedValueOnce({}) // in-transaction agentRunId stamp
       .mockRejectedValueOnce(new Error("db hiccup"));
 
-    await expect(postRequest(keyedBody)).rejects.toThrow("db hiccup");
+    const first = await postRequest(keyedBody);
+
+    expect(first.status).toBe(500);
+    expect((await first.json()).error).toBe("Failed to report task");
     expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
 
     mockDedupe.create.mockRejectedValueOnce(p2002());

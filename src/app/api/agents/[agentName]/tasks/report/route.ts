@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
-import { errorResponse } from "@/lib/api-errors";
+import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest } from "@/lib/auth";
 import { resolvePrFixFromAgentReport, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
@@ -176,118 +176,126 @@ export async function POST(
     error: raw.error as string | undefined,
   };
 
-  // Resolve issueId from repoFullName + issueNumber
-  const issueId = await resolveIssueId(report.repoFullName, report.issueNumber);
+  try {
+    // Resolve issueId from repoFullName + issueNumber
+    const issueId = await resolveIssueId(report.repoFullName, report.issueNumber);
 
-  // Build touched URLs
-  const touchedIssueUrls = buildTouchedUrls(report);
+    // Build touched URLs
+    const touchedIssueUrls = buildTouchedUrls(report);
 
-  // Persist AgentRun
-  const now = new Date();
-  const runData = {
-    agentName,
-    runType: report.taskType,
-    status: deriveStatus(report.outcome),
-    startedAt: now,
-    finishedAt: now,
-    summary: report.summary,
-    errorMessage: report.error,
-    touchedIssueUrls,
-    issueId,
-  };
-
-  let run: { id: string };
-  let duplicate = false;
-  let storedResolution: ResolvePrFixFromAgentReportResult | undefined;
-
-  if (typeof idempotencyKey === "string") {
-    // Idempotent reporting (#1044): claim the key and create the AgentRun in
-    // ONE transaction, so a committed claim always carries its result. A
-    // concurrent or retried report with the same (agentName, idempotencyKey)
-    // loses the unique-index race (P2002) and replays the stored result
-    // instead of re-running the report or its side effects.
-    const payloadHash = reportPayloadHash(report);
-    try {
-      run = await prisma.$transaction(async (tx) => {
-        const claim = await tx.agentReportDedupe.create({
-          data: { agentName, idempotencyKey, payloadHash },
-        });
-        const created = await tx.agentRun.create({ data: runData });
-        await tx.agentReportDedupe.update({
-          where: { id: claim.id },
-          data: { agentRunId: created.id },
-        });
-        return created;
-      });
-    } catch (error) {
-      if (!isUniqueViolation(error)) throw error;
-      const existing = await prisma.agentReportDedupe.findUnique({
-        where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
-      });
-      if (!existing) throw error;
-      if (existing.payloadHash !== payloadHash) {
-        return errorResponse(
-          `idempotencyKey was already used with a different report payload for agent ${agentName}`,
-          409,
-        );
-      }
-      if (!existing.agentRunId) {
-        // Unreachable while the claim and the AgentRun commit together; guard
-        // against a half-written claim from any future refactor.
-        return errorResponse("idempotencyKey is claimed but has no recorded result", 409);
-      }
-      duplicate = true;
-      run = { id: existing.agentRunId };
-      storedResolution =
-        (existing.prFixResolution as ResolvePrFixFromAgentReportResult | null) ?? undefined;
-    }
-  } else {
-    run = await prisma.agentRun.create({ data: runData });
-  }
-
-  let prFixResolution: ResolvePrFixFromAgentReportResult;
-  if (duplicate) {
-    // Never re-run side effects for an already-processed key. Replay the
-    // stored resolution when available; otherwise report an explicit skip.
-    prFixResolution = storedResolution ?? {
-      matched: true,
-      action: "skipped",
-      itemId: null,
-      reason: "duplicate report (idempotency key already processed); PR-fix resolution not re-run",
-    };
-  } else {
-    // If the report corresponds to a queued pr-fix item, resolve it. Without
-    // this, non-bridge agents (anything driven through MCP tools or the generic
-    // harness loop) leave the item QUEUED and it is re-served ahead of issue
-    // work on every poll. See issue #868.
-    prFixResolution = await resolvePrFixFromAgentReport({
-      repoFullName: report.repoFullName,
-      pullRequestNumber: report.pullRequestNumber,
-      pullRequestUrl: report.pullRequestUrl,
-      outcome: report.outcome,
+    // Persist AgentRun
+    const now = new Date();
+    const runData = {
+      agentName,
+      runType: report.taskType,
+      status: deriveStatus(report.outcome),
+      startedAt: now,
+      finishedAt: now,
       summary: report.summary,
-    });
-    if (typeof idempotencyKey === "string") {
-      // Persist the resolution before responding so a retry replays the real
-      // result rather than the skip marker. This runs after the claim/run
-      // transaction and is awaited: a failure surfaces as a 5xx on THIS
-      // response, and the worker's retry then takes the duplicate branch
-      // (same agentRunId, skip marker) — side effects are never re-run either
-      // way. It cannot move inside the claim transaction because the
-      // resolver makes GitHub round-trips and itself opens transactions.
-      await prisma.agentReportDedupe.update({
-        where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
-        data: { prFixResolution: prFixResolution as unknown as Prisma.InputJsonValue },
-      });
-    }
-  }
+      errorMessage: report.error,
+      touchedIssueUrls,
+      issueId,
+    };
 
-  return NextResponse.json({
-    ok: true,
-    agentName,
-    report,
-    agentRunId: run.id,
-    prFixResolution,
-    ...(duplicate ? { duplicate: true } : {}),
-  });
+    let run: { id: string };
+    let duplicate = false;
+    let storedResolution: ResolvePrFixFromAgentReportResult | undefined;
+
+    if (typeof idempotencyKey === "string") {
+      // Idempotent reporting (#1044): claim the key and create the AgentRun in
+      // ONE transaction, so a committed claim always carries its result. A
+      // concurrent or retried report with the same (agentName, idempotencyKey)
+      // loses the unique-index race (P2002) and replays the stored result
+      // instead of re-running the report or its side effects.
+      const payloadHash = reportPayloadHash(report);
+      try {
+        run = await prisma.$transaction(async (tx) => {
+          const claim = await tx.agentReportDedupe.create({
+            data: { agentName, idempotencyKey, payloadHash },
+          });
+          const created = await tx.agentRun.create({ data: runData });
+          await tx.agentReportDedupe.update({
+            where: { id: claim.id },
+            data: { agentRunId: created.id },
+          });
+          return created;
+        });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        const existing = await prisma.agentReportDedupe.findUnique({
+          where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
+        });
+        if (!existing) throw error;
+        if (existing.payloadHash !== payloadHash) {
+          return errorResponse(
+            `idempotencyKey was already used with a different report payload for agent ${agentName}`,
+            409,
+          );
+        }
+        if (!existing.agentRunId) {
+          // Unreachable while the claim and the AgentRun commit together; guard
+          // against a half-written claim from any future refactor.
+          return errorResponse("idempotencyKey is claimed but has no recorded result", 409);
+        }
+        duplicate = true;
+        run = { id: existing.agentRunId };
+        storedResolution =
+          (existing.prFixResolution as ResolvePrFixFromAgentReportResult | null) ?? undefined;
+      }
+    } else {
+      run = await prisma.agentRun.create({ data: runData });
+    }
+
+    let prFixResolution: ResolvePrFixFromAgentReportResult;
+    if (duplicate) {
+      // Never re-run side effects for an already-processed key. Replay the
+      // stored resolution when available; otherwise report an explicit skip.
+      prFixResolution = storedResolution ?? {
+        matched: true,
+        action: "skipped",
+        itemId: null,
+        reason: "duplicate report (idempotency key already processed); PR-fix resolution not re-run",
+      };
+    } else {
+      // If the report corresponds to a queued pr-fix item, resolve it. Without
+      // this, non-bridge agents (anything driven through MCP tools or the generic
+      // harness loop) leave the item QUEUED and it is re-served ahead of issue
+      // work on every poll. See issue #868.
+      prFixResolution = await resolvePrFixFromAgentReport({
+        repoFullName: report.repoFullName,
+        pullRequestNumber: report.pullRequestNumber,
+        pullRequestUrl: report.pullRequestUrl,
+        outcome: report.outcome,
+        summary: report.summary,
+      });
+      if (typeof idempotencyKey === "string") {
+        // Persist the resolution before responding so a retry replays the real
+        // result rather than the skip marker. This runs after the claim/run
+        // transaction and is awaited: a failure surfaces as a 5xx on THIS
+        // response, and the worker's retry then takes the duplicate branch
+        // (same agentRunId, skip marker) — side effects are never re-run either
+        // way. It cannot move inside the claim transaction because the
+        // resolver makes GitHub round-trips and itself opens transactions.
+        await prisma.agentReportDedupe.update({
+          where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
+          data: { prFixResolution: prFixResolution as unknown as Prisma.InputJsonValue },
+        });
+      }
+    }
+
+    return NextResponse.json({
+      ok: true,
+      agentName,
+      report,
+      agentRunId: run.id,
+      prFixResolution,
+      ...(duplicate ? { duplicate: true } : {}),
+    });
+  } catch (error) {
+    // An unexpected failure after validation (DB write, idempotency claim,
+    // resolution persistence) must surface as a structured 5xx, not an
+    // unhandled rejection — a worker retrying after a 5xx relies on the
+    // idempotency key to land in the duplicate branch.
+    return handleApiError("report task", error);
+  }
 }
