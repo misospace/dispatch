@@ -1000,7 +1000,8 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     expect(mockAgentRun.create).toHaveBeenCalledTimes(2);
   });
 
-  it("a failed resolution-store update returns a structured 500; the retry still dedupes to the skip marker", async () => {    // The claim + AgentRun transaction commits (first update), then the
+  it("a failed resolution-store update returns a structured 500; the retry still dedupes to the skip marker", async () => {
+    // The claim + AgentRun transaction commits (first update), then the
     // resolution persistence fails: the report itself is durable, so this
     // response fails with a structured 5xx and the worker retries into the
     // duplicate branch.
