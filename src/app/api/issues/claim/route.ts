@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
+import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX } from "@/types";
 import { authorizeRequest } from "@/lib/auth";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
@@ -51,14 +52,46 @@ export async function POST(request: Request) {
       return errorResponse("Issue not found in local cache", 404);
     }
 
-    // Refuse closed issues
+    // Refuse closed issues (cached state is fine for this check)
     if (issue.state === "closed") {
       return errorResponse("Cannot claim a closed issue", 400);
     }
 
-    // Refuse done issues
-    const currentStatus = issue.labels.find((l) => l.startsWith("status/"));
-    if (currentStatus === "status/done") {
+    // #1037: the claim decision must be made against the labels GitHub
+    // currently has, not the Prisma cache — a claim made directly on GitHub
+    // is invisible in the cache until the next sync. Fail closed if GitHub
+    // is unreachable: no label writes, no cache update, no lease.
+    let liveLabels: string[];
+    try {
+      liveLabels = await getLiveIssueLabels(repoFullName as string, issueNumber as number);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+
+      // Failed audit entry, consistent with the failure-audit style below
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor: agentName as string,
+            action: "claim_issue",
+            repoFullName: repoFullName as string,
+            issueNumber: issueNumber as number,
+            issueId: issueId as string,
+            beforeLabels: issue.labels,
+            afterLabels: [],
+            success: false,
+            errorMessage: `Could not verify live GitHub labels: ${errorMessage}`,
+          },
+        });
+      } catch {
+        // Audit log failure should not mask the real error
+      }
+
+      return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
+    }
+
+    // Refuse done issues (live labels are the authoritative base — #1037).
+    // Any live status/done makes the issue done, even alongside other status labels.
+    if (liveLabels.includes("status/done")) {
       return errorResponse("Cannot claim a done issue", 400);
     }
 
@@ -82,29 +115,36 @@ export async function POST(request: Request) {
       console.warn(`Released ${staleWorkCount} stale AgentWork record(s) for issue #${issueNumber}`);
     }
 
-    // Analyze assignment conflicts using the shared conflict resolution module.
+    // Analyze assignment conflicts using the shared conflict resolution module,
+    // against the live GitHub labels (authoritative base — #1037).
     // Passing this agent's own label makes a re-claim idempotent: an issue still
     // carrying agent/<this agent> is ours to take, not a conflict to 409 on.
-    const analysis = analyzeAssignmentConflict(issue.labels, `${AGENT_PREFIX}${agentName}`);
+    const analysis = analyzeAssignmentConflict(liveLabels, `${AGENT_PREFIX}${agentName}`);
 
     // Check for agent conflict — if another agent is assigned, require force-claim
     if (analysis.hasAgentConflict) {
       if (force === true) {
-        // Force claim: remove the old agent label first
-        try {
-          await removeIssueLabel(repoFullName as string, issueNumber as number, analysis.existingAgents[0]);
-        } catch (e) {
-          console.error(`Failed to remove stale agent label ${analysis.existingAgents[0]} during force claim:`, e);
-          // Non-fatal: continue with force claim even if label removal fails
+        // Force claim: remove ALL stale agent labels first.
+        // buildNewLabels below drops every conflicting agent label from the
+        // cache, so GitHub must lose all of them too — leaving extras behind
+        // is the same GitHub/cache divergence class #1037 fights.
+        for (const staleAgentLabel of analysis.existingAgents) {
+          try {
+            await removeIssueLabel(repoFullName as string, issueNumber as number, staleAgentLabel);
+          } catch (e) {
+            console.error(`Failed to remove stale agent label ${staleAgentLabel} during force claim:`, e);
+            // Non-fatal: continue with force claim even if label removal fails
+          }
         }
       } else {
         return errorResponse(`Issue is already assigned to ${analysis.existingAgents[0].replace("agent/", "")}. Use force=true to override.`, 409);
       }
     }
 
-    // Build updated labels using the shared conflict resolution module
+    // Build updated labels using the shared conflict resolution module,
+    // from the live GitHub labels (authoritative base — #1037)
     const agentLabel = `agent/${agentName}`;
-    const labelsWithAgent = buildNewLabels(issue.labels, "assign_agent", agentLabel);
+    const labelsWithAgent = buildNewLabels(liveLabels, "assign_agent", agentLabel);
     const updatedLabels = [...labelsWithAgent.filter((l) => !l.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
@@ -114,7 +154,8 @@ export async function POST(request: Request) {
       // Remove ALL existing status labels (not just the first) before adding
       // status/in-progress — keeps GitHub and the Prisma cache from
       // diverging when an issue carries more than one status label.
-      await transitionIssueStatus(repoFullName as string, issueNumber as number, issue.labels, IN_PROGRESS_STATUS);
+      // Base is the live GitHub label set (authoritative — #1037).
+      await transitionIssueStatus(repoFullName as string, issueNumber as number, liveLabels, IN_PROGRESS_STATUS);
 
       // Update local cache
       await prisma.issue.update({
@@ -153,7 +194,7 @@ export async function POST(request: Request) {
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
           issueId: issueId as string,
-          beforeLabels: issue.labels,
+          beforeLabels: liveLabels,
           afterLabels: updatedLabels,
           success: true,
           notes: auditNotesParts.length > 0 ? auditNotesParts.join(" | ") : undefined,
@@ -172,7 +213,7 @@ export async function POST(request: Request) {
           repoFullName: repoFullName as string,
           issueNumber: issueNumber as number,
           issueId: issueId as string,
-          beforeLabels: issue.labels,
+          beforeLabels: liveLabels,
           afterLabels: [],
           success: false,
           errorMessage,

@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
-import { createHmac, timingSafeEqual } from "node:crypto";
 import { authorizeRequest } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { getSignatureVerificationMode, verifyWebhookSignature } from "@/lib/webhook-signature";
 
 /**
  * GitHub Webhook Handler for PR Follow-up Events
@@ -24,33 +24,6 @@ import { enforceRateLimit } from "@/lib/rate-limit";
  * which indicates the endpoint is behind a gateway that performs its own
  * authentication and signature verification.
  */
-
-/**
- * Determine signature verification mode.
- *
- * - "verify": WEBHOOK_SECRET is set — verify HMAC-SHA256 signature
- * - "skip": WEBHOOK_GATEWAY_MODE is "true" — skip verification (behind API gateway)
- * - "reject": neither configured — fail-closed, reject all requests
- */
-function getSignatureVerificationMode(): "verify" | "skip" | "reject" {
-  const secret = process.env.WEBHOOK_SECRET;
-  if (secret) return "verify";
-  if (process.env.WEBHOOK_GATEWAY_MODE === "true") return "skip";
-  // Fail-closed: reject requests when neither WEBHOOK_SECRET nor WEBHOOK_GATEWAY_MODE is configured
-  return "reject";
-}
-
-function verifyWebhookSignature(secret: string, payload: Buffer, signature: string): boolean {
-  if (!signature.startsWith("sha256=")) return false;
-  const expected = signature.slice(7);
-  const hmac = createHmac("sha256", secret);
-  hmac.update(payload);
-  const computed = hmac.digest("hex");
-
-  // Constant-time comparison; timingSafeEqual requires equal-length buffers
-  if (computed.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(computed), Buffer.from(expected));
-}
 
 function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): PrFollowupEvent[] {
   const events: PrFollowupEvent[] = [];

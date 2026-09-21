@@ -157,8 +157,8 @@ Note that `require` differs from libpq here. In libpq it means encrypt without v
 ### Auth, Triage, Queue, and Webhooks
 
 These variables tune the OIDC callback, the operator-UI triage surface, the queue
-view, the inbound webhook (PR followup) handler, and the lesson feed. Most have
-safe defaults and can be omitted in small deployments.
+view, the inbound webhook handlers (PR followup, issue labels), and the lesson feed.
+Most have safe defaults and can be omitted in small deployments.
 
 The lesson feed shares `DISPATCH_LLM_API_KEY` and `DISPATCH_LLM_BASE_URL` with the hosted groomer; `OPENAI_API_KEY` and `OPENAI_BASE_URL` are retained only as legacy fallbacks.
 
@@ -171,7 +171,7 @@ The lesson feed shares `DISPATCH_LLM_API_KEY` and `DISPATCH_LLM_BASE_URL` with t
 | `DISPATCH_QUEUE_AGING_DAYS_PER_TIER` | No | Comma-separated numbers (days) defining the aging buckets per queue tier. The first entry applies to the highest-priority tier, the second to the next, and so on. Issues older than the matching bucket are highlighted in the queue UI. |
 | `DISPATCH_QUEUE_AGING_MAX_TIERS` | No | Maximum number of aging buckets the queue UI will render, regardless of how many entries `DISPATCH_QUEUE_AGING_DAYS_PER_TIER` contains. |
 | `DISPATCH_SYNC_LOCK_MAX_AGE_MS` | No | Maximum age (ms) before a stale sync lock is considered abandoned and may be reclaimed by a new sync run. Defaults to `1_800_000` (30 minutes). |
-| `WEBHOOK_SECRET` | Conditional | HMAC-SHA256 shared secret used to verify inbound webhook payloads. Required for `POST /api/pr-followup/webhook` when `WEBHOOK_GATEWAY_MODE` is not `true`. See `docs/pr-review-fix-queue.md` for the event contract. Use a long random string (>= 32 bytes recommended). |
+| `WEBHOOK_SECRET` | Conditional | HMAC-SHA256 shared secret used to verify inbound webhook payloads. Required for `POST /api/pr-followup/webhook` and `POST /api/issues/webhook` when `WEBHOOK_GATEWAY_MODE` is not `true`. See `docs/pr-review-fix-queue.md` for the pr-followup event contract. Use a long random string (>= 32 bytes recommended). |
 | `WEBHOOK_GATEWAY_MODE` | No | When set to `true`, disables the built-in signature check because an upstream API gateway has already verified the request. Must be the literal string `"true"` or `"false"` (parsed as a string, not a boolean). |
 | `PR_FOLLOWUP_BOT_IDENTITIES` | No | Comma-separated bot logins whose PR events are ingested (default `github-actions[bot]`). Example: `github-actions[bot],dependabot[bot]`. |
 | `PR_FOLLOWUP_BRANCH_OWNERS` | No | Comma-separated GitHub logins considered the canonical owner of a followup branch. Used to suppress "needs author" nudges. |

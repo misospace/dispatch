@@ -377,9 +377,10 @@ describe("claimWorkHandler", () => {
       repository: { fullName: "org/repo" },
     };
 
-    // claimWork calls resolveIssue 3 times + POST claim + POST status = 5 fetch calls
+    // claimWork: pre-claim refresh + resolveIssue 3 times + POST claim + POST status = 6 fetch calls
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (pre-claim, #1037)
       .mockResolvedValueOnce(jsonResponse([issue])) // resolve (claimWork)
       .mockResolvedValueOnce(jsonResponse([issue])) // resolve (claimIssue -> resolveIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))       // POST claim
@@ -405,6 +406,7 @@ describe("claimWorkHandler", () => {
   it("uses custom status when provided", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (pre-claim, #1037)
       .mockResolvedValueOnce(
         jsonResponse([
           {
@@ -482,6 +484,7 @@ describe("claimWorkHandler", () => {
   it("passes force flag through", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (pre-claim, #1037)
       .mockResolvedValueOnce(
         jsonResponse([
           {
@@ -550,7 +553,7 @@ describe("claimWorkHandler", () => {
 
     await claimWorkHandler(makeArgs({ repoFullName: "org/repo", issueNumber: 42, agentName: "test-agent", force: true }));
 
-    const call = (vi.mocked(fetch).mock.calls[2] as [string, RequestInit])[1];
+    const call = (vi.mocked(fetch).mock.calls[3] as [string, RequestInit])[1];
     const body = JSON.parse(call.body as string) as Record<string, unknown>;
     expect(body.force).toBe(true);
   });
@@ -684,6 +687,7 @@ describe("claimWorkHandler", () => {
 
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ success: true, repo: "org/repo", issueNumber: 42, action: "updated", error: null })) // refresh (pre-claim, #1037)
       .mockResolvedValueOnce(jsonResponse([issue])) // resolve (claimWork)
       .mockResolvedValueOnce(jsonResponse([issue])) // resolve (claimIssue -> resolveIssue)
       .mockResolvedValueOnce(jsonResponse({ success: true, labels: [] }))       // POST claim
@@ -698,8 +702,8 @@ describe("claimWorkHandler", () => {
     const parsed = JSON.parse(result.content[0].text as string);
     expect(parsed.resolvedAgentName).toBe("env-agent");
     expect(parsed.taskContract).toContain("Agent: env-agent");
-    // Verify the claim request used env-agent
-    const call = vi.mocked(fetch).mock.calls[2] as [string, RequestInit];
+    // Verify the claim request used env-agent (call 3: refresh, resolve, resolve, POST claim)
+    const call = vi.mocked(fetch).mock.calls[3] as [string, RequestInit];
     const body = JSON.parse(call[1].body as string);
     expect(body.agentName).toBe("env-agent");
     delete process.env.DISPATCH_AGENT_NAME;

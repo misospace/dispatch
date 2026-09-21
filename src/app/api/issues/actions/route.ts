@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
+import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 
@@ -73,7 +74,39 @@ export async function POST(request: Request) {
         return errorResponse(`Cannot assign to closed issue (state: ${issue.state})`, 400);
       }
 
-      const currentLabels = issue.labels;
+      // #1037: the assignment decision must be made against the labels
+      // GitHub currently has, not the Prisma cache — an assignment made
+      // directly on GitHub is invisible in the cache until the next sync.
+      // Fail closed if GitHub is unreachable: no label writes, no cache update.
+      let liveLabels: string[];
+      try {
+        liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+
+        // Failed audit entry, consistent with the failure-audit style below
+        try {
+          await prisma.auditLog.create({
+            data: {
+              actor: auditActor,
+              action: payload.action,
+              repoFullName,
+              issueNumber,
+              issueId,
+              beforeLabels: issue.labels,
+              afterLabels: [],
+              success: false,
+              errorMessage: `Could not verify live GitHub labels: ${errorMessage}`,
+            },
+          });
+        } catch {
+          // Audit log failure should not mask the real error
+        }
+
+        return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
+      }
+
+      const currentLabels = liveLabels;
 
       // Analyze conflicts using the shared conflict resolution module
       const analysis = analyzeAssignmentConflict(currentLabels);
