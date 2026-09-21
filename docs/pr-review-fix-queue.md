@@ -14,6 +14,7 @@ Each item is deduped by `(repo, pr)` and stores:
 - `status`: `QUEUED`, `FIXED`, `BLOCKED`, `STALE`, or `IGNORED`
 - `reason`, `feedback[]`, `evidenceKeys[]`
 - `headSha` and `author` metadata
+- `generation` — Dispatch-owned work generation (see below)
 - `queuedAt`, `updatedAt`, and history entries
 
 ## Ingestion paths
@@ -138,6 +139,23 @@ Workers consuming from the agent queue should:
    - Push to the same branch, comment on the PR
    - Mark fixed via `POST /api/pr-fix-queue/mark` with `status: "fixed"`
 3. If no PR-fix items remain, consume from ranked issue work
+
+## Work generation identity
+
+Each queue item carries a Dispatch-owned `generation` (integer, starts at `1`). `GET /api/agents/{agentName}/next-task` surfaces it on `followup-pr` tasks that are backed by a queue item:
+
+```json
+{
+  "type": "followup-pr",
+  "pullRequest": { "repoFullName": "org/repo", "number": 42 },
+  "prFixItem": { "id": "cktz...", "generation": 2 }
+}
+```
+
+- `prFixItem.id` — stable for the persistent `PrFixQueueItem` row.
+- `prFixItem.generation` — changes only when Dispatch creates a fresh dispatchable attempt: an explicit requeue from `BLOCKED` or `FIXED`, genuinely new evidence reopening a resolved item, recovery from a no-progress `FIXED` tombstone (#940), or the refused-`FIXED` head-SHA rollback. Repeated reads, repeated sync of known evidence, and updates that stay within the same active attempt never change it.
+
+Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. Follow-up tasks driven by linked-PR health (not backed by a `PrFixQueueItem`) omit `prFixItem`.
 
 ## Status lifecycle
 

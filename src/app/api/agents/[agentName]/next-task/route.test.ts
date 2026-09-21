@@ -145,6 +145,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         feedback: ["please update tests"],
         evidenceKeys: ["review:1"],
         author: "itsmiso-ai",
+        generation: 1,
         queuedAt: new Date("2026-01-01T00:00:00Z"),
         updatedAt: new Date("2026-01-01T00:00:00Z"),
       },
@@ -177,9 +178,51 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.url).toBe("https://github.com/org/repo/pull/12");
     expect(body.prFixItem).toEqual({
       id: "prfix-1",
-      generation: expect.stringMatching(/^[0-9a-f]{64}$/),
+      generation: 1,
     });
     expect(Array.isArray(body.reasons)).toBe(true);
+  });
+
+  it("serves distinct (id, generation) identities across a requeue of the same PR", async () => {
+    // The route is a read over the persisted queue row; a requeue bumps the
+    // row's generation without changing its id. First attempt:
+    const item = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 12,
+      issue: null,
+      branch: "fix/something",
+      url: "https://github.com/org/repo/pull/12",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "review changes requested",
+      feedback: ["please update tests"],
+      evidenceKeys: ["review:1"],
+      author: "bot",
+      generation: 1,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+    };
+    mocks.prFixFindMany.mockResolvedValue([item]);
+
+    const first = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const firstBody = await first.json();
+    expect(firstBody.prFixItem).toEqual({ id: "prfix-1", generation: 1 });
+
+    // Same queue row after an explicit requeue — same id, bumped generation.
+    item.generation = 2;
+    const second = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const secondBody = await second.json();
+    expect(secondBody.type).toBe("followup-pr");
+    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(secondBody.prFixItem.id).toBe(firstBody.prFixItem.id);
   });
 
   it("includes linked issue context when PR-fix has an issue number", async () => {

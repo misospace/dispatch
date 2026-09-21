@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
@@ -277,6 +276,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         resolvedStatus = nextStatus;
       }
 
+      // A transition from a non-QUEUED status back to QUEUED is a fresh
+      // dispatchable attempt — new work a worker should run — so the item's
+      // work-generation identity must change (#1044). Staying QUEUED (e.g.
+      // additional evidence on already-pending work) is the same attempt and
+      // must keep the identity stable.
+      const isFreshAttempt = resolvedStatus === "QUEUED" && existing.status !== "QUEUED";
+
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
@@ -286,6 +292,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: nextEvidenceKeys,
+          ...(isFreshAttempt ? freshAttemptGeneration() : {}),
           ...metadataPatch(input),
         },
       });
@@ -432,6 +439,12 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
       data.lane = "NEEDS_HUMAN";
     } else if (nextStatus === "QUEUED") {
       data.lane = "NORMAL";
+      // Marking a non-QUEUED item back to QUEUED creates a fresh dispatchable
+      // attempt (same semantics as requeuePrFixItem) — bump the generation
+      // alongside the status flip so the work identity changes (#1044).
+      if (existing.status !== "QUEUED") {
+        Object.assign(data, freshAttemptGeneration());
+      }
     }
     const updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data });
     await tx.prFixHistory.create({
@@ -454,19 +467,24 @@ export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixIn
     const headShaGuard = await assertPrHeadMovedForFix(client, input.repo, input.pr, item.headSha, input.note ?? null);
     if (headShaGuard === "head-unchanged") {
       // Refuse the tombstone: roll the item back to QUEUED so the loop
-      // dispatches another fix attempt, and audit why we rejected.
-      const reverted = await client.prFixQueueItem.update({
-        where: { id: item.id },
-        data: { status: "QUEUED", lane: "NORMAL" },
-      });
-      await client.prFixHistory.create({
-        data: {
-          itemId: reverted.id,
-          action: "mark",
-          status: "QUEUED",
-          lane: "NORMAL",
-          note: `Refused FIXED: PR head SHA unchanged since enqueue (recorded=${item.headSha ?? "null"}). Workload reported success but pushed nothing (#940).`,
-        },
+      // dispatches another fix attempt, and audit why we rejected. This is a
+      // fresh dispatchable attempt — bump the generation in the same update so
+      // the identity a worker already consumed is not silently reused (#1044).
+      const reverted = await client.$transaction(async (tx) => {
+        const updated = await tx.prFixQueueItem.update({
+          where: { id: item.id },
+          data: { status: "QUEUED", lane: "NORMAL", ...freshAttemptGeneration() },
+        });
+        await tx.prFixHistory.create({
+          data: {
+            itemId: updated.id,
+            action: "mark",
+            status: "QUEUED",
+            lane: "NORMAL",
+            note: `Refused FIXED: PR head SHA unchanged since enqueue (recorded=${item.headSha ?? "null"}). Workload reported success but pushed nothing (#940).`,
+          },
+        });
+        return updated;
       });
       return reverted;
     }
@@ -532,16 +550,24 @@ export async function reconcileStalePrFixItems(
   return { checked, markedStale, errored };
 }
 
-export function prFixGeneration(item: {
-  evidenceKeys?: string[] | null;
-  headSha?: string | null;
-  queuedAt?: Date | string | null;
-}): string {
-  const evidenceKeys = Array.isArray(item.evidenceKeys) ? item.evidenceKeys : [];
-  const queuedAt = item.queuedAt instanceof Date ? item.queuedAt.toISOString() : item.queuedAt ?? null;
-  return createHash("sha256")
-    .update(JSON.stringify({ evidenceKeys, headSha: item.headSha ?? null, queuedAt }))
-    .digest("hex");
+/**
+ * Patch that bumps a PrFixQueueItem's `generation` — Dispatch-owned work
+ * identity (#1044), exposed to workers via next-task as
+ * `followup-pr.prFixItem.generation`. Merge it into the same Prisma update
+ * that flips the item back to QUEUED so the bump is atomic with the state
+ * transition: Prisma computes `increment` server-side, so concurrent
+ * transitions cannot lose a bump the way a read-then-write `generation + 1`
+ * would.
+ *
+ * When to bump: only when a non-QUEUED item becomes dispatchable again as a
+ * NEW attempt — requeue from BLOCKED/FIXED, genuinely new evidence reopening a
+ * resolved item, the #940 no-progress FIXED recovery, and markPrFixItem's
+ * refused-FIXED rollback. Never bump for ordinary reads, repeated sync of
+ * known evidence, or updates that stay within the same active attempt —
+ * repeated reads of one pending unit of work must return the same identity.
+ */
+export function freshAttemptGeneration(): { generation: { increment: number } } {
+  return { generation: { increment: 1 } };
 }
 
 export function toAgentQueuePrFixItem(item: any) {
@@ -563,6 +589,9 @@ export function toAgentQueuePrFixItem(item: any) {
     evidenceKeys: item.evidenceKeys ?? [],
     headSha: item.headSha,
     author: item.author,
+    // NOT NULL DEFAULT 1 in the DB; the fallback only covers in-memory
+    // fixtures predating the column.
+    generation: item.generation ?? 1,
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,
@@ -599,7 +628,10 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
     const reopenedFrom = existing.status;
     const updated = await tx.prFixQueueItem.update({
       where: { id: existing.id },
-      data: { status: "QUEUED", lane: "NORMAL" },
+      // Requeue hands the PR back to the worker loop as a fresh attempt —
+      // bump the generation in the same update so consumers see a new work
+      // identity rather than one they may already have deduplicated (#1044).
+      data: { status: "QUEUED", lane: "NORMAL", ...freshAttemptGeneration() },
     });
     await tx.prFixHistory.create({
       data: {

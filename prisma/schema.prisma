@@ -109,6 +109,10 @@ model PrFixQueueItem {
   feedback     String[]       @default([])
   evidenceKeys String[]       @default([])
   status       PrFixStatus    @default(QUEUED)
+  // Dispatch-owned work generation (#1044): 1 on creation, bumped when a
+  // non-QUEUED item becomes dispatchable again as a fresh attempt. Workers
+  // consume (id, generation) as an opaque work identity via next-task.
+  generation   Int            @default(1)
   queuedAt     DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
   url          String?

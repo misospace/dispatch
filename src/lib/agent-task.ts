@@ -19,9 +19,16 @@ export interface PullRequestRef {
   url?: string;
 }
 
+/**
+ * Dispatch-owned identity of the PR-fix queue item backing a followup-pr
+ * task (#1044). `id` is stable for the persistent PrFixQueueItem; `generation`
+ * starts at 1 and changes only when Dispatch creates a fresh dispatchable
+ * attempt. Consumers treat the pair as opaque work identity and must not
+ * derive queue policy from the number.
+ */
 export interface PrFixItemIdentity {
   id: string;
-  generation: string;
+  generation: number;
 }
 
 export interface IdleTask {

@@ -151,9 +151,11 @@ describe("createFollowupPrTask", () => {
   it("includes optional PR-fix identity when provided", () => {
     const task = createFollowupPrTask({
       ...baseInput,
-      prFixItem: { id: "cuid-1", generation: "generation-1" },
+      prFixItem: { id: "cuid-1", generation: 3 },
     });
-    expect(task.prFixItem).toEqual({ id: "cuid-1", generation: "generation-1" });
+    // Verify each field is individually forwarded from input to output.
+    expect(task.prFixItem?.id).toBe("cuid-1");
+    expect(task.prFixItem?.generation).toBe(3);
   });
 
   it("omits PR-fix identity when not provided", () => {
