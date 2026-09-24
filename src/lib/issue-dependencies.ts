@@ -54,6 +54,38 @@ function isSeparator(ch: string): boolean {
 }
 
 /**
+ * Clause boundary chars — the prefix preceding a trigger is clipped at the most
+ * recent one, so a negation in one clause never suppresses a trigger in another.
+ */
+function isClauseBoundary(ch: string): boolean {
+  return (
+    ch === "." ||
+    ch === "!" ||
+    ch === "?" ||
+    ch === "," ||
+    ch === ";" ||
+    ch === ":" ||
+    ch === "\n"
+  );
+}
+
+/** Substring from the most recent clause boundary up to (exclusive) `index`. */
+function clausePrefix(text: string, index: number): string {
+  for (let i = index - 1; i >= 0; i--) {
+    if (isClauseBoundary(text[i])) return text.slice(i + 1, index);
+  }
+  return text.slice(0, index);
+}
+
+/**
+ * Negation tokens that, when present in the same clause *before* a trigger, mean
+ * the phrase disclaims a dependency rather than declaring one ("no dependencies
+ * on #5", "does not depend on #5", "don't depend on #5"). Matching the `'t` of a
+ * contraction plus whole-word negations catches don't/doesn't/won't/isn't etc.
+ */
+const NEGATION_PATTERN = /\b(?:no|not|never|without|neither|nor|cannot)\b|'t\b/;
+
+/**
  * Extract dependency refs from an issue body.
  *
  * A trigger phrase (see TRIGGER_PATTERN) starts a ref list; refs are
@@ -61,6 +93,15 @@ function isSeparator(ch: string): boolean {
  * commas, "and", "&", "+", "/", or whitespace. Refs with number <= 0 are
  * ignored and duplicates (by dependencyKey, using each ref's own repo) are
  * dropped. Never throws; null/undefined bodies yield [].
+ *
+ * Scope decisions (deliberate):
+ * - Negated phrases are not blockers: if the clause preceding a trigger (up to
+ *   the nearest clause boundary) contains a negation, that trigger is skipped,
+ *   so "does not depend on #5" or "no dependencies on #5" register nothing.
+ * - GitHub native `blocked_by` / sub-issue links are not fetched by sync today
+ *   (the Issue schema has no such field), so only body-text refs are operative.
+ *   The resolver accepts refs from any source, so native links can be fed into
+ *   the same gate later without changing this contract.
  */
 export function parseIssueDependencies(body: string | null | undefined): DependencyRef[] {
   if (body == null) return [];
@@ -77,6 +118,8 @@ export function parseIssueDependencies(body: string | null | undefined): Depende
   };
 
   for (const trigger of text.matchAll(TRIGGER_PATTERN)) {
+    // Skip a trigger whose clause disclaims the dependency (negation guard).
+    if (NEGATION_PATTERN.test(clausePrefix(text, trigger.index))) continue;
     let pos = trigger.index + trigger[0].length;
     while (pos < text.length) {
       while (pos < text.length && isSeparator(text[pos])) pos++;
@@ -106,6 +149,15 @@ export function parseIssueDependencies(body: string | null | undefined): Depende
  * `openIssueKeys`. A ref pointing at the depending issue itself is dropped
  * when `self` is provided, so an issue never blocks on itself.
  * Order of the input is preserved.
+ *
+ * Scope decisions (deliberate):
+ * - Direct blockers only, non-transitive: openness is the blocker's raw GitHub
+ *   state, not its queue eligibility. If A depends on B and B is itself gated,
+ *   A becomes eligible as soon as B is open, even while B is withheld — this
+ *   matches the issue's "direct blockers" acceptance criteria.
+ * - A blocker in an untracked / disabled repo is absent from the open set and
+ *   therefore does not gate (preserve-visibility, consistent with the queue's
+ *   unknown-lane policy).
  */
 export function resolveOpenBlockers(
   deps: DependencyRef[],
@@ -138,9 +190,14 @@ export function formatDependencyBlockReason(
 ): string {
   if (blockers.length === 0) return "";
   const defaultKey = normalizeRepoKey(defaultRepo);
-  const parts = blockers.map((b) => {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const b of blockers) {
     const repoKey = normalizeRepoKey(b.repo);
-    return repoKey && repoKey !== defaultKey ? `${b.repo}#${b.number}` : `#${b.number}`;
-  });
+    const rendered = repoKey && repoKey !== defaultKey ? `${b.repo}#${b.number}` : `#${b.number}`;
+    if (seen.has(rendered)) continue;
+    seen.add(rendered);
+    parts.push(rendered);
+  }
   return `Blocked by open ${parts.join(", ")}`;
 }

@@ -258,4 +258,39 @@ describe("formatDependencyBlockReason", () => {
       ),
     ).toBe("Blocked by open #5, other/repo#9");
   });
+
+  it("dedupes identical rendered refs", () => {
+    expect(
+      formatDependencyBlockReason(
+        [
+          { repo: null, number: 5 },
+          { repo: "test/repo", number: 5 },
+        ],
+        "test/repo",
+      ),
+    ).toBe("Blocked by open #5");
+  });
+});
+
+describe("parseIssueDependencies negation guard", () => {
+  it("ignores negated dependency phrasings", () => {
+    expect(parseIssueDependencies("no dependencies on #5")).toEqual([]);
+    expect(parseIssueDependencies("Do not depend on #5")).toEqual([]);
+    expect(parseIssueDependencies("This must not depend on #5")).toEqual([]);
+    expect(parseIssueDependencies("does not depend on #5")).toEqual([]);
+    expect(parseIssueDependencies("don't depend on #5")).toEqual([]);
+    expect(parseIssueDependencies("without requiring #3")).toEqual([]);
+  });
+
+  it("still parses a positive trigger when the negation is in a later clause", () => {
+    expect(parseIssueDependencies("This feature depends on #5, which does not mean anything")).toEqual([
+      { repo: null, number: 5 },
+    ]);
+  });
+
+  it("does not let a negation in one clause suppress a trigger in another", () => {
+    expect(parseIssueDependencies("It should not log. It depends on #7.")).toEqual([
+      { repo: null, number: 7 },
+    ]);
+  });
 });
