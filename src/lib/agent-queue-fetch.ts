@@ -3,7 +3,7 @@ import { buildAgentQueue } from "@/lib/agent-queue";
 import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue";
 import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
-import { resolveRequestLane, getLaneIds } from "@/lib/lane-config";
+import { resolveRequestLane, getLaneIds, prFixLaneForRequest } from "@/lib/lane-config";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -64,6 +64,18 @@ export async function fetchAgentQueueData(
     repository: { enabled: true },
   };
 
+  // Resolve and validate the request lane through the configured-lane helpers
+  // BEFORE filtering PR-fix work. The PR-fix queue uses its own internal enum,
+  // so we derive the PR-fix lane from the already-resolved configured lane's
+  // role rather than feeding the raw request lane to `normalizePrFixLane`
+  // (which would coerce unknown/custom lane ids to `NEEDS_HUMAN` and silently
+  // hide queued PR-fix work — #1046).
+  const resolvedLane = resolveRequestLane(lane?.toLowerCase());
+  const availableLanes = getLaneIds();
+  // If a lane was provided but resolution returned null, it's invalid.
+  const laneValid = !(lane && resolvedLane === null);
+  const prFixLane = prFixLaneForRequest(resolvedLane);
+
   // The open-issue list, active leases, and queued PR fix items are
   // independent — fetch them in parallel.
   const [issues, leasedIssueIds, prFixItemsRaw] = await Promise.all([
@@ -91,16 +103,9 @@ export async function fetchAgentQueueData(
     }),
     // Find issues that have active leases from OTHER agents — exclude them
     findLeasedIssueIds(agentName),
-    // List queued PR fix items (uses raw lane for pr-fix queue normalization)
-    listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane }),
+    // List queued PR fix items using the role-derived PR-fix lane (#1046)
+    listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: prFixLane }),
   ]);
-
-  // Resolve lane through alias map (returns null for unknown lanes)
-  const resolvedLane = resolveRequestLane(lane?.toLowerCase());
-  const availableLanes = getLaneIds();
-
-  // Validate: if a lane was provided but resolution returned null, it's invalid
-  const laneValid = !(lane && resolvedLane === null);
 
   // Filter out leased issue IDs before building the queue
   const leasedIssueIdSet = new Set(leasedIssueIds);

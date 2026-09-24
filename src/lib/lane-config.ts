@@ -244,6 +244,26 @@ export function resolveRequestLane(lane: string | null | undefined): string | nu
   return null;
 }
 
+/**
+ * Map an already-resolved request-time configured lane to the PR-fix queue's
+ * internal lane vocabulary.
+ *
+ * The PR-fix queue uses a separate enum (`NORMAL` / `ESCALATED` / `NEEDS_HUMAN`)
+ * and must NOT be fed a raw request lane: doing so lets `normalizePrFixLane`
+ * silently coerce unknown/custom lane ids to `NEEDS_HUMAN` and hide work
+ * (#1046). Callers must first resolve/validate the request lane through
+ * {@link resolveRequestLane}; this helper then derives the PR-fix lane from the
+ * resolved lane's role (escalation → `ESCALATED`, otherwise `NORMAL`).
+ *
+ * Returns `undefined` when no lane was resolved (no filter requested).
+ */
+export function prFixLaneForRequest(
+  resolvedLane: string | null | undefined,
+): "NORMAL" | "ESCALATED" | undefined {
+  if (!resolvedLane) return undefined;
+  return getLaneById(resolvedLane)?.role === "escalation" ? "ESCALATED" : "NORMAL";
+}
+
 // ─── Classification Helpers ──────────────────────────────────────────────────
 
 /**

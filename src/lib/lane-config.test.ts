@@ -17,6 +17,7 @@ import {
   isKnownOrAliasedLane,
   getUnconfiguredLaneInfo,
   laneMatchesConfigured,
+  prFixLaneForRequest,
   resolveRequestLane,
   setLaneConfig,
 } from "./lane-config";
@@ -393,6 +394,44 @@ describe("lane-config classification helpers", () => {
         expect(["alpha", "beta", "gamma"]).toContain(lane);
       }
     });
+  });
+});
+
+describe("lane-config prFixLaneForRequest", () => {
+  beforeEach(() => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "cloud", title: "Cloud", claimable: true },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+  });
+  afterEach(() => resetLaneConfig());
+
+  it("maps an escalation-role lane to ESCALATED", () => {
+    expect(prFixLaneForRequest("frontier")).toBe("ESCALATED");
+  });
+
+  it("maps the default-role lane to NORMAL", () => {
+    expect(prFixLaneForRequest("local")).toBe("NORMAL");
+  });
+
+  it("maps a no-role claimable lane to NORMAL", () => {
+    expect(prFixLaneForRequest("cloud")).toBe("NORMAL");
+  });
+
+  it("maps a non-claimable (backlog) lane to NORMAL", () => {
+    // The PR-fix queue has no backlog concept; a resolved lane that is not the
+    // escalation lane always resolves to NORMAL (#1046).
+    expect(prFixLaneForRequest("backlog")).toBe("NORMAL");
+  });
+
+  it("returns undefined when no lane was resolved", () => {
+    expect(prFixLaneForRequest(null)).toBeUndefined();
+    expect(prFixLaneForRequest(undefined)).toBeUndefined();
   });
 });
 

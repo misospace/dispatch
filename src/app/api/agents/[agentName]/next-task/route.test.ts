@@ -1500,6 +1500,126 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     });
   });
 
+  // ─── PR-fix lane filter tests ──────────────────────────────────────────
+
+  describe("PR-fix lane filter (#1046)", () => {
+    function prFixStore(items: any[]) {
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any) => {
+        let result = items.slice();
+        if (where?.status) {
+          result = Array.isArray(where.status.in)
+            ? result.filter((i) => where.status.in.includes(i.status))
+            : result.filter((i) => i.status === where.status);
+        }
+        if (where?.lane) result = result.filter((i) => i.lane === where.lane);
+        return result;
+      });
+    }
+    function prFixItem(id: string, lane: string, extra: Record<string, unknown> = {}) {
+      return {
+        id, repo: "org/repo", pr: 12, issue: null, branch: "fix/x",
+        url: "https://github.com/org/repo/pull/12", title: "Fix", lane,
+        status: "QUEUED", reason: "review changes requested", feedback: [],
+        evidenceKeys: ["review:1"], author: "bot", generation: 1,
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+        ...extra,
+      };
+    }
+
+    it("serves NORMAL PR-fix work for a normal configured lane", async () => {
+      prFixStore([prFixItem("prfix-1", "NORMAL")]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=local"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.pullRequest.number).toBe(12);
+      expect(mocks.prFixFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ lane: "NORMAL" }),
+        }),
+      );
+    });
+
+    it("does not coerce a normal lane to NEEDS_HUMAN", async () => {
+      prFixStore([prFixItem("prfix-nh", "NEEDS_HUMAN")]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=local"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(mocks.prFixFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ lane: "NORMAL" }),
+        }),
+      );
+    });
+
+    it("resolves an alias lane to NORMAL PR-fix work", async () => {
+      prFixStore([prFixItem("prfix-1", "NORMAL")]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=normal"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.type).toBe("followup-pr");
+    });
+
+    it("routes escalation lane to ESCALATED PR-fix work", async () => {
+      prFixStore([prFixItem("prfix-e", "ESCALATED")]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=frontier"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.type).toBe("followup-pr");
+    });
+
+    it("escalation lane does not pick up NORMAL PR-fix work", async () => {
+      prFixStore([prFixItem("prfix-1", "NORMAL")]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=frontier"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      const body = await res.json();
+      expect(body.type).toBe("idle");
+      expect(mocks.prFixFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ lane: "ESCALATED" }),
+        }),
+      );
+    });
+
+    it("returns 400 for an unknown lane", async () => {
+      prFixStore([prFixItem("prfix-1", "NORMAL")]);
+
+      const res = await GET(
+        request("/api/agents/example-agent/next-task?lane=definitely-not-a-lane"),
+        { params: Promise.resolve({ agentName: "example-agent" }) },
+      );
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain("Invalid lane");
+    });
+  });
+
   // ─── Auth tests ──────────────────────────────────────────────────
 
   describe("auth", () => {
