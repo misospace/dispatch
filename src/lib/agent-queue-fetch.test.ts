@@ -9,6 +9,7 @@ const { mocks } = vi.hoisted(() => ({
     findLeasedIssueIds: vi.fn(),
     resolveRequestLane: vi.fn(),
     getLaneIds: vi.fn(() => ["local", "cloud", "frontier", "backlog"]),
+    prFixLaneForRequest: vi.fn((l: string | null | undefined) => (!l ? undefined : l === "frontier" ? "ESCALATED" : l === "local" ? "NORMAL" : null)),
     parseExcludedLabels: vi.fn(() => []),
   },
 }));
@@ -24,7 +25,7 @@ vi.mock("@/lib/pr-fix-queue", () => ({
 }));
 vi.mock("@/lib/lease", () => ({ findLeasedIssueIds: mocks.findLeasedIssueIds }));
 vi.mock("@/lib/config", () => ({ parseExcludedLabels: mocks.parseExcludedLabels }));
-vi.mock("@/lib/lane-config", () => ({ resolveRequestLane: mocks.resolveRequestLane, getLaneIds: mocks.getLaneIds }));
+vi.mock("@/lib/lane-config", () => ({ resolveRequestLane: mocks.resolveRequestLane, getLaneIds: mocks.getLaneIds, prFixLaneForRequest: mocks.prFixLaneForRequest }));
 
 import { fetchAgentQueueData } from "./agent-queue-fetch";
 
@@ -51,11 +52,14 @@ describe("fetchAgentQueueData", () => {
     const r = await fetchAgentQueueData(params({ lane: "bogus" }));
     expect(r.laneValid).toBe(false);
     expect(r.resolvedLane).toBeNull();
+    expect(mocks.listQueuedPrFixItems).not.toHaveBeenCalled();
+    expect(mocks.findMany).not.toHaveBeenCalled();
   });
 
-  it("treats an absent lane as valid", async () => {
+  it("treats an absent lane as valid and leaves PR-fix work unfiltered", async () => {
     const r = await fetchAgentQueueData(params());
     expect(r.laneValid).toBe(true);
+    expect(mocks.listQueuedPrFixItems).toHaveBeenCalledWith(expect.anything(), { lane: undefined });
   });
 
   it("treats a resolvable lane as valid and passes it to the ranker", async () => {
@@ -100,5 +104,24 @@ describe("fetchAgentQueueData", () => {
     expect(r.rankedQueue).toEqual([{ issueId: "x" }]);
     expect(r.prFixItems).toEqual([{ id: "pf1" }]);
     expect(r.availableLanes).toEqual(["local", "cloud", "frontier", "backlog"]);
+  });
+
+  it("derives the PR-fix lane from the resolved request lane (#1046)", async () => {
+    // Normal configured lane → NORMAL PR-fix filter
+    mocks.resolveRequestLane.mockReturnValue("local");
+    await fetchAgentQueueData(params({ lane: "normal" }));
+    expect(mocks.listQueuedPrFixItems).toHaveBeenLastCalledWith(expect.anything(), { lane: "NORMAL" });
+
+    // Escalation lane → ESCALATED PR-fix filter
+    mocks.resolveRequestLane.mockReturnValue("frontier");
+    await fetchAgentQueueData(params({ lane: "escalated" }));
+    expect(mocks.listQueuedPrFixItems).toHaveBeenLastCalledWith(expect.anything(), { lane: "ESCALATED" });
+
+    mocks.listQueuedPrFixItems.mockClear();
+    mocks.resolveRequestLane.mockReturnValue("backlog");
+    expect((await fetchAgentQueueData(params({ lane: "backlog" }))).prFixItems).toEqual([]);
+    mocks.resolveRequestLane.mockReturnValue("cloud");
+    expect((await fetchAgentQueueData(params({ lane: "cloud" }))).prFixItems).toEqual([]);
+    expect(mocks.listQueuedPrFixItems).not.toHaveBeenCalled();
   });
 });
