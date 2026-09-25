@@ -2,6 +2,7 @@ import { fetchIssueComments as fetchGitHubIssueComments } from "@/lib/github";
 import type { RepositoryContextResult } from "./repository-context";
 
 export interface IssueComment {
+  id?: number | null;
   author: string;
   body: string;
   createdAt: string;
@@ -37,6 +38,7 @@ export async function fetchIssueComments(
 ): Promise<IssueComment[]> {
   const comments = await fetchGitHubIssueComments(repoFullName, issueNumber, maxComments);
   return comments.slice(0, maxComments).map((comment) => ({
+    id: comment.id ?? null,
     author: comment.user?.login ?? "unknown",
     body: comment.body ?? "",
     createdAt: comment.created_at ?? "",

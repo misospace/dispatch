@@ -20,6 +20,9 @@ export interface ExploreOptions {
   maxSearchResults: number;
   maxFileBytes: number;
   maxDirEntries: number;
+  /** The snapshot SHA all file/directory reads in this exploration are pinned
+   *  to; forwarded to the tool layer. */
+  pinnedRef?: string;
 }
 
 export interface ExploreToolRecord {
@@ -258,6 +261,7 @@ export async function exploreRepository(
             maxSearchResults: options.maxSearchResults,
             maxFileBytes: Math.min(options.maxFileBytes, remaining),
             maxDirEntries: options.maxDirEntries,
+            pinnedRef: options.pinnedRef,
           },
           deps.tools,
         );
