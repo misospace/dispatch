@@ -1589,6 +1589,24 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(body.type).toBe("followup-pr");
     });
 
+    it("backlog and custom no-role lanes do not pick up PR-fix work", async () => {
+      for (const lane of ["backlog", "cloud"]) {
+        vi.clearAllMocks();
+        prFixStore([prFixItem("prfix-n", "NORMAL"), prFixItem("prfix-e", "ESCALATED")]);
+        mocks.issueFindMany.mockResolvedValue([]);
+        mocks.findLeasedIssueIds.mockResolvedValue([]);
+
+        const res = await GET(
+          request(`/api/agents/example-agent/next-task?lane=${lane}`),
+          { params: Promise.resolve({ agentName: "example-agent" }) },
+        );
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).type).toBe("idle");
+        expect(mocks.prFixFindMany).not.toHaveBeenCalled();
+      }
+    });
+
     it("escalation lane does not pick up NORMAL PR-fix work", async () => {
       prFixStore([prFixItem("prfix-1", "NORMAL")]);
 
@@ -1597,6 +1615,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         { params: Promise.resolve({ agentName: "example-agent" }) },
       );
 
+      expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.type).toBe("idle");
       expect(mocks.prFixFindMany).toHaveBeenCalledWith(
@@ -1617,6 +1636,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(res.status).toBe(400);
       const body = await res.json();
       expect(body.error).toContain("Invalid lane");
+      expect(mocks.prFixFindMany).not.toHaveBeenCalled();
     });
   });
 

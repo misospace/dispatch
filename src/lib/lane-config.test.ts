@@ -419,14 +419,12 @@ describe("lane-config prFixLaneForRequest", () => {
     expect(prFixLaneForRequest("local")).toBe("NORMAL");
   });
 
-  it("maps a no-role claimable lane to NORMAL", () => {
-    expect(prFixLaneForRequest("cloud")).toBe("NORMAL");
+  it("skips PR-fix work for a claimable lane without a PR-fix role", () => {
+    expect(prFixLaneForRequest("cloud")).toBeNull();
   });
 
-  it("maps a non-claimable (backlog) lane to NORMAL", () => {
-    // The PR-fix queue has no backlog concept; a resolved lane that is not the
-    // escalation lane always resolves to NORMAL (#1046).
-    expect(prFixLaneForRequest("backlog")).toBe("NORMAL");
+  it("skips PR-fix work for a non-claimable lane", () => {
+    expect(prFixLaneForRequest("backlog")).toBeNull();
   });
 
   it("returns undefined when no lane was resolved", () => {

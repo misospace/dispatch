@@ -72,8 +72,10 @@ export async function fetchAgentQueueData(
   // hide queued PR-fix work — #1046).
   const resolvedLane = resolveRequestLane(lane?.toLowerCase());
   const availableLanes = getLaneIds();
-  // If a lane was provided but resolution returned null, it's invalid.
-  const laneValid = !(lane && resolvedLane === null);
+  // An invalid request must not run the unfiltered PR-fix lookup (or any queue fetch).
+  if (lane && resolvedLane === null) {
+    return { resolvedLane, laneValid: false, rankedQueue: [], prFixItems: [], availableLanes };
+  }
   const prFixLane = prFixLaneForRequest(resolvedLane);
 
   // The open-issue list, active leases, and queued PR fix items are
@@ -103,8 +105,10 @@ export async function fetchAgentQueueData(
     }),
     // Find issues that have active leases from OTHER agents — exclude them
     findLeasedIssueIds(agentName),
-    // List queued PR fix items using the role-derived PR-fix lane (#1046)
-    listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: prFixLane }),
+    // null is a configured lane with no PR-fix equivalent; undefined is unfiltered.
+    prFixLane === null
+      ? Promise.resolve([])
+      : listQueuedPrFixItems(asPrFixQueueClient(prisma), { lane: prFixLane }),
   ]);
 
   // Filter out leased issue IDs before building the queue
@@ -140,7 +144,7 @@ export async function fetchAgentQueueData(
 
   return {
     resolvedLane,
-    laneValid,
+    laneValid: true,
     rankedQueue,
     prFixItems: prFixItemsRaw.map(toAgentQueuePrFixItem),
     availableLanes,

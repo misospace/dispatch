@@ -253,15 +253,20 @@ export function resolveRequestLane(lane: string | null | undefined): string | nu
  * silently coerce unknown/custom lane ids to `NEEDS_HUMAN` and hide work
  * (#1046). Callers must first resolve/validate the request lane through
  * {@link resolveRequestLane}; this helper then derives the PR-fix lane from the
- * resolved lane's role (escalation → `ESCALATED`, otherwise `NORMAL`).
+ * resolved lane's role. Lanes without a PR-fix equivalent must not consume
+ * PR-fix work, even if they are claimable.
  *
- * Returns `undefined` when no lane was resolved (no filter requested).
+ * `undefined` means no filter was requested; `null` means skip PR-fix work.
  */
 export function prFixLaneForRequest(
   resolvedLane: string | null | undefined,
-): "NORMAL" | "ESCALATED" | undefined {
+): "NORMAL" | "ESCALATED" | null | undefined {
   if (!resolvedLane) return undefined;
-  return getLaneById(resolvedLane)?.role === "escalation" ? "ESCALATED" : "NORMAL";
+  const configured = getLaneById(resolvedLane);
+  if (!configured?.claimable) return null;
+  if (configured.role === "default") return "NORMAL";
+  if (configured.role === "escalation") return "ESCALATED";
+  return null;
 }
 
 // ─── Classification Helpers ──────────────────────────────────────────────────

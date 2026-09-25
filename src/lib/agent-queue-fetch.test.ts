@@ -9,7 +9,7 @@ const { mocks } = vi.hoisted(() => ({
     findLeasedIssueIds: vi.fn(),
     resolveRequestLane: vi.fn(),
     getLaneIds: vi.fn(() => ["local", "cloud", "frontier", "backlog"]),
-    prFixLaneForRequest: vi.fn((l: string | null | undefined) => (!l ? undefined : l === "frontier" ? "ESCALATED" : "NORMAL")),
+    prFixLaneForRequest: vi.fn((l: string | null | undefined) => (!l ? undefined : l === "frontier" ? "ESCALATED" : l === "local" ? "NORMAL" : null)),
     parseExcludedLabels: vi.fn(() => []),
   },
 }));
@@ -52,11 +52,14 @@ describe("fetchAgentQueueData", () => {
     const r = await fetchAgentQueueData(params({ lane: "bogus" }));
     expect(r.laneValid).toBe(false);
     expect(r.resolvedLane).toBeNull();
+    expect(mocks.listQueuedPrFixItems).not.toHaveBeenCalled();
+    expect(mocks.findMany).not.toHaveBeenCalled();
   });
 
-  it("treats an absent lane as valid", async () => {
+  it("treats an absent lane as valid and leaves PR-fix work unfiltered", async () => {
     const r = await fetchAgentQueueData(params());
     expect(r.laneValid).toBe(true);
+    expect(mocks.listQueuedPrFixItems).toHaveBeenCalledWith(expect.anything(), { lane: undefined });
   });
 
   it("treats a resolvable lane as valid and passes it to the ranker", async () => {
@@ -114,9 +117,11 @@ describe("fetchAgentQueueData", () => {
     await fetchAgentQueueData(params({ lane: "escalated" }));
     expect(mocks.listQueuedPrFixItems).toHaveBeenLastCalledWith(expect.anything(), { lane: "ESCALATED" });
 
-    // Unknown/invalid lane (resolves to null) → NO lane filter (never NEEDS_HUMAN)
-    mocks.resolveRequestLane.mockReturnValue(null);
-    await fetchAgentQueueData(params({ lane: "definitely-not-a-lane" }));
-    expect(mocks.listQueuedPrFixItems).toHaveBeenLastCalledWith(expect.anything(), { lane: undefined });
+    mocks.listQueuedPrFixItems.mockClear();
+    mocks.resolveRequestLane.mockReturnValue("backlog");
+    expect((await fetchAgentQueueData(params({ lane: "backlog" }))).prFixItems).toEqual([]);
+    mocks.resolveRequestLane.mockReturnValue("cloud");
+    expect((await fetchAgentQueueData(params({ lane: "cloud" }))).prFixItems).toEqual([]);
+    expect(mocks.listQueuedPrFixItems).not.toHaveBeenCalled();
   });
 });
