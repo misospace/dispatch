@@ -403,6 +403,16 @@ describe("callGroomerLLM response_format", () => {
     expect(JSON.parse(fetchMock.mock.calls[1][1].body).response_format.type).toBe("json_object");
     expect(result.lane.confidence).toBe("high");
   });
+
+  it("omits response_format entirely when responseFormat is false", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: okContent() } }] }) });
+    global.fetch = fetchMock as any;
+    const result = await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000, responseFormat: false });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty("response_format");
+    expect(result.lane.confidence).toBe("high");
+  });
 });
 
 describe("callGroomerLLM exploration findings", () => {

@@ -116,6 +116,7 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_GROOMER_CONTEXT_MODE` | No | Exploration budget preset: `small`, `medium` (default), `large`. |
 | `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | No | The model's real context window in tokens. Derives the exploration budget from it and ignores the preset. Recommended for self-hosted models. |
 | `DISPATCH_GROOMER_DRY_RUN` | No | Defaults to `true`; when true, returns a mutation plan without GitHub or DB writes. |
+| `DISPATCH_LLM_RESPONSE_FORMAT` | No | Defaults to `true`: the groomer and lesson feed send `response_format` (`json_schema`, falling back to `json_object`). Set `false` for backends that implement neither; the prompts still demand JSON and the output is still validated. |
 | `DISPATCH_GROOMER_REPO_CONTEXT_ENABLED` | No | Enables bounded GitHub API repository context. Defaults to `false`. |
 | `DISPATCH_GROOMER_MAX_CONTEXT_FILES` | No | Maximum files included in repository context. Defaults to `5`. |
 | `DISPATCH_GROOMER_MAX_SEARCHES` | No | Maximum GitHub code searches per grooming run. Defaults to `3`. |

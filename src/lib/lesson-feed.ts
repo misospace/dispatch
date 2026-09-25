@@ -110,6 +110,16 @@ export function isLessonFeedEnabled(): boolean {
 }
 
 /**
+ * Whether to send `response_format`. Shares DISPATCH_LLM_RESPONSE_FORMAT with
+ * the groomer (same backend); defaults to true.
+ */
+export function isResponseFormatEnabled(): boolean {
+  const value = process.env.DISPATCH_LLM_RESPONSE_FORMAT?.trim();
+  if (value === undefined) return true;
+  return value.toLowerCase() === "true" || value === "1";
+}
+
+/**
  * Resolve the LLM credentials + model for the lesson feed.
  *
  * Precedence (mirrors src/lib/groomer/config.ts so a deployment that only
@@ -201,17 +211,22 @@ export async function extractLessonFromFixOutcome(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    let response = await postChatCompletion(fetcher, url, apiKey, model, userPayload, {
-      type: "json_schema",
-      json_schema: { name: "lesson_outcome", schema: LESSON_SCHEMA as any, strict: true },
-    }, controller.signal);
-
-    // Some endpoints reject json_schema with a 400; fall back to json_object so
-    // the feed still works (mirrors lib/groomer/llm.ts).
-    if (response.status === 400) {
+    let response: Response;
+    if (!isResponseFormatEnabled()) {
+      response = await postChatCompletion(fetcher, url, apiKey, model, userPayload, undefined, controller.signal);
+    } else {
       response = await postChatCompletion(fetcher, url, apiKey, model, userPayload, {
-        type: "json_object",
+        type: "json_schema",
+        json_schema: { name: "lesson_outcome", schema: LESSON_SCHEMA as any, strict: true },
       }, controller.signal);
+
+      // Some endpoints reject json_schema with a 400; fall back to json_object so
+      // the feed still works (mirrors lib/groomer/llm.ts).
+      if (response.status === 400) {
+        response = await postChatCompletion(fetcher, url, apiKey, model, userPayload, {
+          type: "json_object",
+        }, controller.signal);
+      }
     }
 
     if (!response.ok) return { kind: "no_lesson" };
