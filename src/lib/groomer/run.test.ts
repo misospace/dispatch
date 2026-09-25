@@ -125,6 +125,7 @@ const mockConfig: HostedGroomerConfig = {
   llmBaseUrl: "https://llm.example.com",
   apiKey: "sk-test",
   model: "gpt-4o-mini",
+  responseFormat: true,
   timeoutMs: 60000,
   maxContextBytes: 8192,
   repoContextEnabled: false,

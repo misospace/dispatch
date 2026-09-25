@@ -6,6 +6,7 @@ export interface HostedGroomerConfig {
   llmBaseUrl: string | null;
   apiKey: string | null;
   model: string;
+  responseFormat: boolean;
   timeoutMs: number;
   maxContextBytes: number;
   repoContextEnabled: boolean;
@@ -51,6 +52,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
       dryRun: true,
       llmBaseUrl: null,
       apiKey: null,
+      responseFormat: true,
       model: "gpt-4o-mini",
       timeoutMs: 60000,
       maxContextBytes: 8192,
@@ -88,6 +90,7 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
     llmBaseUrl: baseUrl,
     apiKey,
     model,
+    responseFormat: parseBool(process.env.DISPATCH_LLM_RESPONSE_FORMAT, true),
     timeoutMs: 0, // computed below after maxContextBytes is resolved
     maxContextBytes: process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES ? parseInt(process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES, 10) : 8192,
     repoContextEnabled: parseBool(process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED, false),

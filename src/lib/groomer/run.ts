@@ -252,6 +252,7 @@ async function executeGroomerRun(
       baseUrl: config.llmBaseUrl!,
       apiKey: config.apiKey!,
       model: config.model,
+      responseFormat: config.responseFormat,
       prompt: context,
       timeoutMs: config.timeoutMs,
       explorationFindings: exploration?.findings,
