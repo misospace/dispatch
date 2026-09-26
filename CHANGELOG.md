@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.65](https://github.com/misospace/dispatch/compare/v0.5.64...v0.5.65) (2026-09-26)
+
+
+### Features
+
+* **groomer:** capture revision-pinned evidence snapshot before analysis ([#1073](https://github.com/misospace/dispatch/issues/1073)) ([f6e966f](https://github.com/misospace/dispatch/commit/f6e966fa931b091b0398b471349e6bc06747fc0b))
+
+
+### Bug Fixes
+
+* **deps:** update vitest monorepo (5.0.1 → 5.0.2) ([#1071](https://github.com/misospace/dispatch/issues/1071)) ([f68bfc1](https://github.com/misospace/dispatch/commit/f68bfc12a8b36585dbc63091da1d373a42090203))
+* **lanes:** derive classifyLaneFromSignals fallback instead of hardcoded "normal" ([#1080](https://github.com/misospace/dispatch/issues/1080)) ([d5db2f9](https://github.com/misospace/dispatch/commit/d5db2f99bed82a4d44412ada4449cc8909bf699c)), closes [#1049](https://github.com/misospace/dispatch/issues/1049)
+* **queue:** derive PR-fix lane from resolved request lane ([#1046](https://github.com/misospace/dispatch/issues/1046)) ([#1058](https://github.com/misospace/dispatch/issues/1058)) ([3725b27](https://github.com/misospace/dispatch/commit/3725b27327037a64d1e83dd69f3ff0e8c479f852))
+
 ## [0.5.64](https://github.com/misospace/dispatch/compare/v0.5.63...v0.5.64) (2026-09-25)
 
 
