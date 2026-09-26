@@ -75,6 +75,21 @@ describe("lane-config defaults", () => {
     lanes[0].id = "mutated";
     expect(getConfiguredLanes()[0].id).toBe("default");
   });
+
+  it("never returns an id outside the default lane set", () => {
+    const combos = [
+      { signals: { isBacklog: false, isEscalation: false }, expected: "default" },
+      { signals: { isBacklog: false, isEscalation: true }, expected: "default" },
+      { signals: { isBacklog: true, isEscalation: false }, expected: "backlog" },
+      { signals: { isBacklog: true, isEscalation: true }, expected: "backlog" },
+    ] as const;
+
+    for (const { signals, expected } of combos) {
+      const result = classifyLaneFromSignals(signals);
+      expect(["default", "backlog"]).toContain(result);
+      expect(result).toBe(expected);
+    }
+  });
 });
 
 describe("lane-config custom config", () => {
