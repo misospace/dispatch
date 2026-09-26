@@ -102,7 +102,6 @@ vi.mock("./evidence-snapshot", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./evidence-snapshot")>();
   return { ...actual, collectGroomingEvidenceSnapshot: mocks.collectGroomingEvidenceSnapshot };
 });
-
 vi.mock("./groomer-lock", () => ({
   acquireGroomerLock: mocks.acquireGroomerLock,
   heartbeatGroomerLock: mocks.heartbeatGroomerLock,
@@ -186,6 +185,8 @@ const mockExploration: ExploreResult = {
   toolCalls: [],
   bytes: 0,
   warnings: [],
+  relatedWorkQueries: [],
+  relatedWorkRefs: [],
 };
 
 describe("runHostedGroomer", () => {
@@ -316,6 +317,39 @@ describe("runHostedGroomer", () => {
     expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
     expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
     expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+  });
+
+  it("persists related-work queries and refs in the explored context summary", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+    mocks.exploreRepository.mockResolvedValue({
+      findings: "",
+      files: [],
+      ask: null,
+      sources: ["pr:org/repo#7"],
+      toolCalls: [],
+      bytes: 0,
+      warnings: [],
+      relatedWorkQueries: ["sslmode"],
+      relatedWorkRefs: ["pr:#7"],
+    });
+
+    const result = await runHostedGroomer();
+
+    expect(result).not.toBeNull();
+    expect(mocks.exploreRepository).toHaveBeenCalledTimes(1);
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "gr-1" },
+        data: expect.objectContaining({
+          stage: "explored",
+          contextSummary: expect.objectContaining({
+            commentCount: 0,
+            relatedWorkQueries: ["sslmode"],
+            relatedWorkRefs: ["pr:#7"],
+          }),
+        }),
+      }),
+    );
   });
 
   it("repository context warnings are persisted and returned", async () => {

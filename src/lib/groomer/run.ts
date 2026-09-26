@@ -298,6 +298,8 @@ async function executeGroomerRun(
           repositorySources: repositoryContext.sources,
           repositoryQueries: repositoryContext.queries,
           repositoryBytes: repositoryContext.bytes,
+          relatedWorkQueries: exploration.relatedWorkQueries,
+          relatedWorkRefs: exploration.relatedWorkRefs,
           evidence: summarizeEvidenceForPersistence(evidence),
           exploration: {
             budget: config.exploration,
