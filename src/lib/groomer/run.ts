@@ -9,6 +9,12 @@ import { validateGroomerOutput, type GroomerOutput } from "./schema";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
 import { exploreRepository } from "./explore";
+import {
+  addEvidenceSources,
+  collectGroomingEvidenceSnapshot,
+  summarizeEvidenceForPersistence,
+  type GroomingEvidenceSnapshot,
+} from "./evidence-snapshot";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { neutralizeMentions } from "./sanitize";
@@ -53,6 +59,7 @@ export interface GroomerDeps {
   prisma: typeof prisma;
   buildRepositoryContext: typeof buildRepositoryContext;
   exploreRepository: typeof exploreRepository;
+  collectEvidence: typeof collectGroomingEvidenceSnapshot;
   acquireGroomerLock: typeof acquireGroomerLock;
   heartbeatGroomerLock: typeof heartbeatGroomerLock;
   releaseGroomerLock: typeof releaseGroomerLock;
@@ -75,6 +82,7 @@ const defaultDeps: GroomerDeps = {
   prisma,
   buildRepositoryContext,
   exploreRepository,
+  collectEvidence: collectGroomingEvidenceSnapshot,
   acquireGroomerLock,
   heartbeatGroomerLock,
   releaseGroomerLock,
@@ -166,9 +174,57 @@ async function executeGroomerRun(
       comments = [];
     }
 
+    // Capture the evidence snapshot BEFORE model analysis: the pinned
+    // default-branch head SHA plus the live issue/comment state that every
+    // repository read in this run is pinned to. Never fatal — the collector
+    // is contractually non-throwing, but a broken injected dep must not fail
+    // the groom; it degrades to an unpinned shell and the run continues.
+    let evidence: GroomingEvidenceSnapshot;
+    try {
+      evidence = await deps.collectEvidence({
+        repoFullName: candidate.repoFullName,
+        issueNumber: candidate.number,
+        comments,
+      });
+    } catch (err) {
+      // Defensive: a broken injected dep must not fail the groom. Fall back
+      // to an unpinned shell (headSha/pinnedRef null, no sources) — the shell
+      // means we lost the live capture.
+      console.warn(
+        `[groomer] evidence snapshot collection failed for ${candidate.repoFullName}#${candidate.number}; continuing unpinned:`,
+        err,
+      );
+      evidence = {
+        capturedAt: new Date().toISOString(),
+        repoFullName: candidate.repoFullName,
+        defaultBranch: null,
+        headSha: null,
+        pinnedRef: null,
+        issue: {
+          number: candidate.number,
+          title: "",
+          body: null,
+          labels: [],
+          state: "unknown",
+          updatedAt: "",
+          url: "",
+        },
+        issueFingerprint: "",
+        comments: [],
+        evidenceDigest: "",
+        warnings: ["evidence: snapshot collection failed"],
+        sources: [],
+      };
+    }
+
     // Build repository context
     const repositoryContext = await deps.buildRepositoryContext(
-      { repoFullName: candidate.repoFullName, issueTitle: candidate.title, issueBody: candidate.body },
+      {
+        repoFullName: candidate.repoFullName,
+        issueTitle: candidate.title,
+        issueBody: candidate.body,
+        ref: evidence.pinnedRef ?? undefined,
+      },
       {
         enabled: config.repoContextEnabled,
         maxSearches: config.maxSearches,
@@ -178,8 +234,11 @@ async function executeGroomerRun(
       },
     );
 
-    // Persist stage context_built with warnings and summary
+    // Persist stage context_built with warnings and summary. Repository
+    // evidence sources are folded into the snapshot before it is persisted so
+    // the summary's sources reflect what this run actually read.
     const contextWarnings = repositoryContext.warnings;
+    evidence = addEvidenceSources(evidence, repositoryContext.sources);
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
       stage: "context_built",
       contextWarnings,
@@ -188,6 +247,7 @@ async function executeGroomerRun(
         repositorySources: repositoryContext.sources,
         repositoryQueries: repositoryContext.queries,
         repositoryBytes: repositoryContext.bytes,
+        evidence: summarizeEvidenceForPersistence(evidence),
       },
     });
 
@@ -220,13 +280,16 @@ async function executeGroomerRun(
           maxSearchResults: config.maxSearchResults,
           maxFileBytes: config.exploration.maxFileBytes,
           maxDirEntries: config.maxDirEntries,
+          pinnedRef: evidence.headSha ?? undefined,
         })
       : null;
 
     if (exploration) {
-      // Persisted so a bad grooming run can be read back afterwards. Before
-      // this, the only evidence of what the groomer saw was whatever comment
-      // it happened to leave on the issue.
+      // Fold exploration sources into the snapshot, then persist so a bad
+      // grooming run can be read back afterwards. Before this, the only
+      // evidence of what the groomer saw was whatever comment it happened to
+      // leave on the issue.
+      evidence = addEvidenceSources(evidence, exploration.sources);
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         stage: "explored",
         contextWarnings: [...contextWarnings, ...exploration.warnings],
@@ -237,6 +300,7 @@ async function executeGroomerRun(
           repositoryBytes: repositoryContext.bytes,
           relatedWorkQueries: exploration.relatedWorkQueries,
           relatedWorkRefs: exploration.relatedWorkRefs,
+          evidence: summarizeEvidenceForPersistence(evidence),
           exploration: {
             budget: config.exploration,
             files: exploration.files,

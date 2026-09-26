@@ -138,6 +138,29 @@ describe("fetchIssueComments", () => {
 
     await expect(fetchIssueComments("org/repo", 42)).rejects.toThrow("network error");
   });
+
+  it("carries the comment id through to the mapped IssueComment (evidence provenance)", async () => {
+    mocks.fetchGitHubIssueComments.mockResolvedValue([
+      {
+        id: 555,
+        user: { login: "alice" },
+        body: "First comment",
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        user: { login: "bob" },
+        body: "Second comment",
+        created_at: "2026-01-02T00:00:00Z",
+      },
+    ]);
+
+    const result = await fetchIssueComments("org/repo", 42);
+
+    expect(result).toEqual([
+      { id: 555, author: "alice", body: "First comment", createdAt: "2026-01-01T00:00:00Z" },
+      { id: null, author: "bob", body: "Second comment", createdAt: "2026-01-02T00:00:00Z" },
+    ]);
+  });
 });
 
 describe("automation comment tagging", () => {

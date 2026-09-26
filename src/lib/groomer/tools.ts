@@ -358,6 +358,12 @@ export interface ExecuteToolOptions {
   maxSearchResults: number;
   maxFileBytes: number;
   maxDirEntries: number;
+  /**
+   * When set, every read_file / list_directory read is forced to this ref
+   * (the snapshot SHA captured at the start of the grooming run) and any
+   * model-supplied `ref` is ignored.
+   */
+  pinnedRef?: string;
 }
 
 /**
@@ -404,7 +410,7 @@ export async function executeGroomerTool(
         if ("error" in normalized) return fail(normalized.error);
         const path = normalized.path;
         if (!path) return fail("read_file needs a non-empty path.");
-        const ref = asString(call.arguments.ref).trim() || undefined;
+        const ref = options.pinnedRef ?? (asString(call.arguments.ref).trim() || undefined);
         const text = await deps.readFile(options.repoFullName, path, ref);
         if (!text) {
           return {
@@ -423,7 +429,7 @@ export async function executeGroomerTool(
         const normalized = normalizeRepoPath(asString(call.arguments.path));
         if ("error" in normalized) return fail(normalized.error);
         const path = normalized.path;
-        const ref = asString(call.arguments.ref).trim() || undefined;
+        const ref = options.pinnedRef ?? (asString(call.arguments.ref).trim() || undefined);
         const entries = await deps.listDir(options.repoFullName, path, ref);
         if (entries.length === 0) {
           return {

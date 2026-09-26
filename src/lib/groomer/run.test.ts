@@ -2,6 +2,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { GroomingCandidate } from "./selector";
 import type { GroomerOutput } from "./schema";
 import type { HostedGroomerConfig } from "./config";
+import type { ExploreResult } from "./explore";
+import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 
 const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -32,6 +34,7 @@ const { mocks } = vi.hoisted(() => ({
     removeIssueLabel: vi.fn(),
     buildRepositoryContext: vi.fn(),
     exploreRepository: vi.fn(),
+    collectGroomingEvidenceSnapshot: vi.fn(),
     acquireGroomerLock: vi.fn(),
     heartbeatGroomerLock: vi.fn(),
     releaseGroomerLock: vi.fn(),
@@ -95,6 +98,10 @@ vi.mock("./explore", () => ({
   exploreRepository: mocks.exploreRepository,
 }));
 
+vi.mock("./evidence-snapshot", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./evidence-snapshot")>();
+  return { ...actual, collectGroomingEvidenceSnapshot: mocks.collectGroomingEvidenceSnapshot };
+});
 vi.mock("./groomer-lock", () => ({
   acquireGroomerLock: mocks.acquireGroomerLock,
   heartbeatGroomerLock: mocks.heartbeatGroomerLock,
@@ -148,6 +155,40 @@ const mockConfig: HostedGroomerConfig = {
 const mockAutomationRepo = { id: "repo-1", fullName: "org/repo", enabled: true };
 const mockGroomingRun = { id: "gr-1", stage: "selected" };
 
+const mockEvidence: GroomingEvidenceSnapshot = {
+  capturedAt: "2026-09-25T00:00:00.000Z",
+  repoFullName: "org/repo",
+  defaultBranch: "main",
+  headSha: "abc123",
+  pinnedRef: "abc123",
+  issue: {
+    number: 42,
+    title: "Fix login bug",
+    body: "Login fails after password reset.",
+    labels: ["priority/p0"],
+    state: "open",
+    updatedAt: "2026-09-24T00:00:00.000Z",
+    url: "https://github.com/org/repo/issues/42",
+  },
+  issueFingerprint: "fp",
+  comments: [],
+  evidenceDigest: "digest",
+  warnings: [],
+  sources: [],
+};
+
+const mockExploration: ExploreResult = {
+  findings: "",
+  files: [],
+  ask: null,
+  sources: ["src/x.ts"],
+  toolCalls: [],
+  bytes: 0,
+  warnings: [],
+  relatedWorkQueries: [],
+  relatedWorkRefs: [],
+};
+
 describe("runHostedGroomer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -182,6 +223,7 @@ describe("runHostedGroomer", () => {
       bytes: 0,
       queries: [],
     });
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue(mockEvidence);
   });
 
   it("returns null when no grooming candidate available", async () => {
@@ -332,6 +374,85 @@ describe("runHostedGroomer", () => {
         }),
       }),
     );
+  });
+
+  describe("evidence snapshot (dispatch#1060)", () => {
+    it("captures an evidence snapshot before analysis", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(mocks.collectGroomingEvidenceSnapshot).toHaveBeenCalledWith({
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        comments: [],
+      });
+      const contextBuiltCall = mocks.prisma.groomingRun.update.mock.calls.find(
+        (call) => call[0]?.data?.stage === "context_built",
+      );
+      expect(contextBuiltCall).toBeDefined();
+      expect(contextBuiltCall![0].data).toMatchObject({
+        stage: "context_built",
+        contextSummary: expect.objectContaining({
+          evidence: expect.objectContaining({
+            headSha: "abc123",
+            pinnedRef: "abc123",
+          }),
+        }),
+      });
+    });
+
+    it("pins repository exploration and file reads to the captured SHA", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({
+        ...mockConfig,
+        dryRun: true,
+        toolLoopEnabled: true,
+      });
+      mocks.exploreRepository.mockResolvedValue(mockExploration);
+
+      const result = await runHostedGroomer();
+
+      expect(result).not.toBeNull();
+      expect(mocks.exploreRepository).toHaveBeenCalledWith(
+        expect.objectContaining({ pinnedRef: "abc123" }),
+      );
+      expect(mocks.buildRepositoryContext).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repoFullName: "org/repo",
+          ref: "abc123",
+        }),
+        expect.any(Object),
+      );
+    });
+
+    it("evidence capture failure does not fail the run", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValue(new Error("boom"));
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const result = await runHostedGroomer();
+
+        expect(result).not.toBeNull();
+        expect(result!.dryRun).toBe(true);
+        // The defensive shell is persisted: no pinned ref, capture failure
+        // recorded inside the evidence summary (never in contextWarnings).
+        const contextBuiltCall = mocks.prisma.groomingRun.update.mock.calls.find(
+          (call) => call[0]?.data?.stage === "context_built",
+        );
+        expect(contextBuiltCall![0].data).toMatchObject({
+          contextSummary: expect.objectContaining({
+            evidence: expect.objectContaining({
+              headSha: null,
+              pinnedRef: null,
+              warnings: ["evidence: snapshot collection failed"],
+            }),
+          }),
+        });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   it("write mode calls label update when labels change", async () => {
