@@ -4,6 +4,7 @@ import { listQueuedPrFixItems, toAgentQueuePrFixItem } from "@/lib/pr-fix-queue"
 import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
 import { resolveRequestLane, getLaneIds, prFixLaneForRequest } from "@/lib/lane-config";
+import { dependencyKey } from "@/lib/issue-dependencies";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -89,6 +90,7 @@ export async function fetchAgentQueueData(
         number: true,
         createdAt: true,
         title: true,
+        body: true,
         url: true,
         labels: true,
         currentLane: true,
@@ -115,6 +117,9 @@ export async function fetchAgentQueueData(
   const leasedIssueIdSet = new Set(leasedIssueIds);
   const filteredIssues = issues.filter((issue) => !leasedIssueIdSet.has(issue.id));
 
+  // Open-issue key set for dependency gating (issues are already filtered to state: "open")
+  const openIssueKeys = new Set(issues.map((i) => dependencyKey(i.repository.fullName, i.number)));
+
   // Build ranked issue queue
   const rankedQueue = buildAgentQueue(
     filteredIssues.map((issue) => ({
@@ -139,6 +144,7 @@ export async function fetchAgentQueueData(
       includeClaimed,
       includeRenovate,
       excludedLabels: parseExcludedLabels(process.env.DISPATCH_EXCLUDED_LABELS),
+      openIssueKeys,
     },
   );
 

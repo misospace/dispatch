@@ -52,6 +52,8 @@ export interface Issue {
   groomingSummary?: string | null;
   notReadyReason?: string | null;
   blockedReason?: string | null;
+  /** Reason string derived from open `depends on #N` blockers gating this issue. */
+  dependencyBlockReason?: string | null;
   needsInfoReason?: string | null;
   nextGroomingAction?: string | null;
 
