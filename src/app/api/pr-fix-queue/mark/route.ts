@@ -29,8 +29,26 @@ export async function POST(request: Request) {
     const input = parseMarkPrFixInput(body);
     if ("error" in input) return errorResponse(input.error, 400);
 
-    const item = await markPrFixItem(asPrFixQueueClient(prisma), input);
-    if (!item) return errorResponse("PR fix queue item not found", 404);
+    // #1074: bearer (agent/bridge) marks must settle a specific attempt, so
+    // the generation token is required. Operator paths (oidc session, basic,
+    // disabled) keep the optional behavior for compatibility.
+    if (auth.type === "bearer" && input.expectedGeneration === undefined) {
+      return errorResponse("generation is required for agent/bridge marks (#1074)", 400);
+    }
+
+    const result = await markPrFixItem(asPrFixQueueClient(prisma), input);
+    if (!result.mutated) {
+      if (result.reason === "generation-mismatch") {
+        // The item moved to a newer attempt between the caller's read and
+        // this write. Conflict, not an error: no mutation happened.
+        return errorResponse(
+          `PR fix queue item generation mismatch: expected generation ${input.expectedGeneration} did not match the item's current generation`,
+          409,
+        );
+      }
+      return errorResponse("PR fix queue item not found", 404);
+    }
+    const item = result.item;
 
     await prisma.auditLog.create({
       data: {

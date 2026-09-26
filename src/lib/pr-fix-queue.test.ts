@@ -1,5 +1,10 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, PrFixQueueClient } from "./pr-fix-queue";
+import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+
+function mutatedItem(result: MarkPrFixResult): any {
+  if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
+  return result.item;
+}
 
 const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
   surfacingMocks: {
@@ -14,7 +19,7 @@ const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
     extractLessonFromFixOutcome: vi.fn().mockResolvedValue({ kind: "no_lesson" as const }),
   },
   githubPrsMocks: {
-    fetchPullRequestMergeState: vi.fn(async () => ({ mergeableState: null, mergeable: null })),
+    fetchPullRequestMergeState: vi.fn(async (_repo: string, _pr: number): Promise<{ mergeableState: string | null; mergeable: boolean | null }> => ({ mergeableState: null, mergeable: null })),
     fetchPullRequestHeadSha: vi.fn(async (_repo: string, _pr: number): Promise<string | null> => null),
   },
 }));
@@ -43,7 +48,13 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
     history,
     $transaction: async (fn: any) => fn(client),
     prFixQueueItem: {
-      findUnique: async ({ where }: any) => items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null,
+      findUnique: async ({ where }: any) => {
+        // Support both lookup shapes: composite repo_pr and primary id.
+        if (where.id !== undefined) {
+          return items.find((i) => i.id === where.id) ?? null;
+        }
+        return items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null;
+      },
       create: async ({ data }: any) => {
         const item = {
           id: `item-${++seq}`,
@@ -67,6 +78,27 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
         }
         items[idx] = { ...items[idx], ...patch, updatedAt: new Date(Date.UTC(2026, 0, 1, 1, ++seq)) };
         return items[idx];
+      },
+      updateMany: async ({ where, data }: any) => {
+        // Generation-conditional (and/or id-scoped) bulk write — mirrors the
+        // real client's commit-time revalidation semantics for #1074.
+        const matches = items.filter(
+          (i) =>
+            (where.id === undefined || i.id === where.id) &&
+            (where.generation === undefined || i.generation === where.generation),
+        );
+        for (const match of matches) {
+          const idx = items.findIndex((i) => i.id === match.id);
+          const patch: Record<string, any> = { ...data };
+          for (const key of Object.keys(patch)) {
+            const value = patch[key];
+            if (value && typeof value === "object" && typeof value.increment === "number") {
+              patch[key] = (match[key] ?? 0) + value.increment;
+            }
+          }
+          items[idx] = { ...match, ...patch, updatedAt: new Date(Date.UTC(2026, 0, 1, 1, ++seq)) };
+        }
+        return { count: matches.length };
       },
       findMany: async ({ where, orderBy }: any) => {
         let result = items.slice();
@@ -189,7 +221,8 @@ describe("PR review-fix queue", () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 5, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "e" });
     const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed", note: "pushed fix + validation" });
 
-    expect(fixed?.status).toBe("FIXED");
+    expect(fixed.mutated).toBe(true);
+    expect(mutatedItem(fixed)?.status).toBe("FIXED");
     expect(await listQueuedPrFixItems(client, { lane: "NORMAL" })).toEqual([]);
     expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED", note: "pushed fix + validation" });
   });
@@ -346,8 +379,9 @@ describe("work generation identity (#1044)", () => {
     expect(client.items[0].status).toBe("BLOCKED");
 
     const requeued = await markPrFixItem(client, { repo: "org/repo", pr: 14, status: "QUEUED", note: "operator unblock" });
-    expect(requeued?.status).toBe("QUEUED");
-    expect(requeued?.generation).toBe(2);
+    expect(requeued.mutated).toBe(true);
+    expect(mutatedItem(requeued)?.status).toBe("QUEUED");
+    expect(mutatedItem(requeued)?.generation).toBe(2);
   });
 
   it("does not bump generation when marking an already-QUEUED item QUEUED", async () => {
@@ -355,8 +389,9 @@ describe("work generation identity (#1044)", () => {
       repo: "org/repo", pr: 15, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1",
     });
     const again = await markPrFixItem(client, { repo: "org/repo", pr: 15, status: "QUEUED" });
-    expect(again?.status).toBe("QUEUED");
-    expect(again?.generation).toBe(1);
+    expect(again.mutated).toBe(true);
+    expect(mutatedItem(again)?.status).toBe("QUEUED");
+    expect(mutatedItem(again)?.generation).toBe(1);
   });
 
   it("bumps generation when the head-SHA guard refuses FIXED and returns work to QUEUED", async () => {
@@ -370,10 +405,11 @@ describe("work generation identity (#1044)", () => {
 
     const result = await markPrFixItem(client, { repo: "org/repo", pr: 16, status: "FIXED", note: "reported done" });
 
-    expect(result?.status).toBe("QUEUED");
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("QUEUED");
     // The refused-FIXED rollback is a fresh worker attempt; an identity a
     // worker already consumed for generation 1 must not be silently reused.
-    expect(result?.generation).toBe(2);
+    expect(mutatedItem(result)?.generation).toBe(2);
   });
 });
 
@@ -981,7 +1017,8 @@ describe("markPrFixItem head SHA guard (#940)", () => {
       repo: "misospace/miso-gallery", pr: 467, status: "FIXED", note: "pushed",
     });
 
-    expect(fixed?.status).toBe("FIXED");
+    expect(fixed.mutated).toBe(true);
+    expect(mutatedItem(fixed)?.status).toBe("FIXED");
     expect(githubPrsMocks.fetchPullRequestHeadSha).toHaveBeenCalledWith(
       "misospace/miso-gallery", 467,
     );
@@ -1000,8 +1037,9 @@ describe("markPrFixItem head SHA guard (#940)", () => {
       repo: "misospace/miso-gallery", pr: 467, status: "FIXED", note: "foreman reported done",
     });
 
-    expect(result?.status).toBe("QUEUED");
-    expect(result?.lane).toBe("NORMAL");
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("QUEUED");
+    expect(mutatedItem(result)?.lane).toBe("NORMAL");
     // A refusal note is recorded in history for the audit log.
     const last = client.history.at(-1);
     expect(last).toMatchObject({ action: "mark", status: "QUEUED", lane: "NORMAL" });
@@ -1021,7 +1059,8 @@ describe("markPrFixItem head SHA guard (#940)", () => {
 
     const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "FIXED" });
 
-    expect(fixed?.status).toBe("FIXED");
+    expect(fixed.mutated).toBe(true);
+    expect(mutatedItem(fixed)?.status).toBe("FIXED");
     // Guard should not have run — no comparison possible without a record.
     expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
   });
@@ -1036,7 +1075,8 @@ describe("markPrFixItem head SHA guard (#940)", () => {
 
     const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "FIXED" });
 
-    expect(fixed?.status).toBe("FIXED");
+    expect(fixed.mutated).toBe(true);
+    expect(mutatedItem(fixed)?.status).toBe("FIXED");
   });
 
   it("accepts FIXED when GitHub returns null for head SHA", async () => {
@@ -1049,7 +1089,8 @@ describe("markPrFixItem head SHA guard (#940)", () => {
 
     const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "FIXED" });
 
-    expect(fixed?.status).toBe("FIXED");
+    expect(fixed.mutated).toBe(true);
+    expect(mutatedItem(fixed)?.status).toBe("FIXED");
   });
 
   it("does NOT run the head SHA guard for non-FIXED transitions", async () => {
@@ -1064,5 +1105,362 @@ describe("markPrFixItem head SHA guard (#940)", () => {
     await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "QUEUED" });
 
     expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+});
+
+describe("attempt baseline + generation-conditional writes (#1074)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    // Default to "head moved" so the guard passes unless a test overrides.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
+  });
+
+  it("captures attemptHeadSha from headSha on a fresh enqueue", async () => {
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 92, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "abc123",
+    });
+    expect(item.attemptHeadSha).toBe("abc123");
+    expect(item.headSha).toBe("abc123");
+  });
+
+  it("re-baselines attemptHeadSha when new evidence reopens a resolved item", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 93, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "oldsha",
+    });
+    expect(client.items[0].attemptHeadSha).toBe("oldsha");
+    // Resolve the item (head moved, so the guard passes).
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("newsha");
+    await markPrFixItem(client, { repo: "org/repo", pr: 93, status: "FIXED" });
+
+    // New evidence reopens it as a fresh attempt with a new head baseline.
+    const reopened = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 93, lane: "NORMAL", reason: "new round", feedback: "f2",
+      evidenceKey: "k2", headSha: "newer",
+    });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.attemptHeadSha).toBe("newer");
+  });
+
+  it("exposes attemptHeadSha on the agent-queue item", async () => {
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 94, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "base42",
+    });
+    const queued = toAgentQueuePrFixItem(item);
+    expect(queued.attemptHeadSha).toBe("base42");
+    expect(queued.headSha).toBe("base42");
+  });
+
+  it("refuses a generation-conditional FIXED via updateMany when the head is unchanged", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 90, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "base",
+    });
+    expect(client.items[0].generation).toBe(1);
+    // Head has not moved since the attempt baseline.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("base");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 90, status: "FIXED", note: "reported done",
+      expectedGeneration: 1,
+    });
+
+    // The refusal re-queues as a fresh attempt (generation bumped); the
+    // conditional write matched the row, so the result is mutated.
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("QUEUED");
+    expect(mutatedItem(result)?.generation).toBe(2);
+  });
+
+  it("skips a generation-conditional mark when the generation no longer matches", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 91, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1",
+    });
+    // Simulate a concurrent re-issue: the row is now at generation 2.
+    client.items[0].generation = 2;
+
+    // The worker's report carries the stale generation-1 token.
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 91, status: "BLOCKED", note: "stale report",
+      expectedGeneration: 1,
+    });
+
+    // No mutation: the conditional write matches nothing.
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(2);
+  });
+
+  it("returns not-found for a mark of an unknown item without mutating", async () => {
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 999, status: "FIXED",
+    });
+    expect(result).toEqual({ mutated: false, reason: "not-found" });
+    expect(client.items).toHaveLength(0);
+  });
+});
+
+// The issue's Done-when areas that the existing suite did not cover:
+// in-flight enrichment, no-progress re-baselining, late/duplicate reports,
+// commit-time races, and the pre-#1074 baseline fallback.
+describe("settlement races and baseline fallback (#1074)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
+    githubPrsMocks.fetchPullRequestMergeState.mockReset();
+    githubPrsMocks.fetchPullRequestMergeState.mockResolvedValue({ mergeableState: null, mergeable: null });
+  });
+
+  it("keeps the attempt baseline stable when new evidence enriches an in-flight item, and settles without erasing the new feedback", async () => {
+    // The worker picks the attempt up: QUEUED at generation 1, the
+    // per-attempt baseline is the head the sync observed at dispatch.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 95, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "k1", headSha: "H1",
+    });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(1);
+    expect(client.items[0].attemptHeadSha).toBe("H1");
+
+    // A fresh review lands while the worker is mid-work: new evidence, new
+    // head. The item is already QUEUED, so this enriches the SAME attempt —
+    // no generation bump, and the immutable baseline must stay H1.
+    const enriched = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 95, lane: "NORMAL", reason: "r2", feedback: "f2",
+      evidenceKey: "k2", headSha: "H2",
+    });
+    expect(enriched.status).toBe("QUEUED");
+    expect(enriched.generation).toBe(1);
+    expect(enriched.headSha).toBe("H2");
+    expect(enriched.attemptHeadSha).toBe("H1"); // baseline unchanged
+
+    // The in-flight report settles against the ORIGINAL token. The head
+    // moved H1 → H2, so the guard compares against the attempt baseline
+    // (H1) and passes.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 95, status: "FIXED", note: "pushed fix",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("FIXED");
+    // Settlement must not erase the newer feedback recorded mid-flight.
+    expect(client.items[0].feedback).toEqual(["f1", "f2"]);
+    expect(client.items[0].evidenceKeys).toEqual(["k1", "k2"]);
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED" });
+  });
+
+  it("reopens a no-progress FIXED item with a new generation and a fresh attempt baseline", async () => {
+    const input = {
+      repo: "org/repo", pr: 96, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "H1",
+    };
+    await enqueuePrFixItem(client, input);
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H-moved");
+    await markPrFixItem(client, { repo: "org/repo", pr: 96, status: "FIXED" });
+    expect(client.items[0].generation).toBe(1);
+
+    // Same evidence, head never moved → untrusted tombstone: the item
+    // reopens as a fresh dispatchable attempt with a re-baselined head.
+    const reopened = await enqueuePrFixItem(client, input);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.attemptHeadSha).toBe("H1");
+  });
+
+  it("skips a late report carrying a superseded attempt token without any writes", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 97, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "H1",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H-moved");
+    await markPrFixItem(client, { repo: "org/repo", pr: 97, status: "FIXED" });
+    // No-progress re-issue: the row is now at generation 2.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 97, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "H1",
+    });
+    expect(client.items[0].generation).toBe(2);
+
+    // The superseded worker's report finally lands, still carrying
+    // generation 1.
+    githubPrsMocks.fetchPullRequestHeadSha.mockClear();
+    githubPrsMocks.fetchPullRequestMergeState.mockClear();
+    const historyBefore = client.history.length;
+    const lateReport = await resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient,
+      repoFullName: "org/repo",
+      pullRequestNumber: 97,
+      outcome: "pr_updated",
+      attempt: { itemId: client.items[0].id, generation: 1 },
+    });
+
+    expect(lateReport.matched).toBe(true);
+    expect(lateReport.action).toBe("skipped");
+    expect(lateReport.reason).toContain("stale attempt generation");
+    // Zero writes: no item mutation, no history row, no GitHub round-trips.
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(2);
+    expect(client.history.length).toBe(historyBefore);
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+    expect(githubPrsMocks.fetchPullRequestMergeState).not.toHaveBeenCalled();
+  });
+
+  it("skips settlement when a concurrent re-issue lands between the read and the conditional write", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 98, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "H1",
+    });
+
+    // Simulate the race: the resolver's read sees generation 1, but a
+    // concurrent re-issue bumps the row just before the conditional
+    // commit-time write, so the generation-qualified updateMany matches
+    // nothing.
+    const originalUpdateMany = client.prFixQueueItem.updateMany;
+    let raced = false;
+    client.prFixQueueItem.updateMany = async ({ where, data }: any) => {
+      if (!raced && where.generation === 1) {
+        raced = true;
+        const idx = client.items.findIndex((i) => i.id === where.id);
+        client.items[idx] = { ...client.items[idx], generation: 2 };
+      }
+      return originalUpdateMany({ where, data });
+    };
+
+    githubPrsMocks.fetchPullRequestMergeState.mockResolvedValueOnce({ mergeable: true, mergeableState: "CLEAN" });
+    const historyBefore = client.history.length;
+    const result = await resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient,
+      repoFullName: "org/repo",
+      pullRequestNumber: 98,
+      outcome: "pr_updated",
+      attempt: { itemId: client.items[0].id, generation: 1 },
+    });
+
+    expect(raced).toBe(true);
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toContain("generation-mismatch");
+    // The conditional write matched nothing: no status flip, no history row.
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(2);
+    expect(client.history.length).toBe(historyBefore);
+    // Nothing runs after the skip: the merge check and the head check are
+    // the only GitHub calls.
+    expect(githubPrsMocks.fetchPullRequestMergeState).toHaveBeenCalledTimes(1);
+    expect(githubPrsMocks.fetchPullRequestHeadSha).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the mutable headSha as the baseline for legacy rows: unchanged head → refused", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 99, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "H1",
+    });
+    // Pre-#1074 row: no per-attempt baseline column.
+    client.items[0].attemptHeadSha = null;
+
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 99, status: "FIXED" });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("QUEUED");
+    expect(mutatedItem(result)?.generation).toBe(2);
+    expect(client.history.at(-1).note ?? "").toContain("Refused FIXED");
+    expect(client.history.at(-1).note ?? "").toContain("recorded=H1");
+  });
+
+  it("settles a legacy row via the headSha fallback when the head moved", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 99, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "H1",
+    });
+    client.items[0].attemptHeadSha = null;
+
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 99, status: "FIXED", note: "pushed the fix",
+    });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("FIXED");
+    expect(client.history.at(-1).note ?? "").toContain("pushed");
+  });
+
+  it("accepts FIXED when the row has no baseline at all (no-record)", async () => {
+    // Legacy row: neither headSha nor attemptHeadSha recorded.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 100, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1",
+    });
+    expect(client.items[0].attemptHeadSha).toBeNull();
+    expect(client.items[0].headSha).toBeUndefined();
+
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 100, status: "FIXED" });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("FIXED");
+    // With no record to compare against, the guard must not even hit GitHub.
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+});
+
+describe("parseMarkPrFixInput generation (#1074)", () => {
+  it("passes a valid integer generation through as expectedGeneration", () => {
+    const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", generation: 3 });
+    if ("error" in input) throw new Error(input.error);
+    expect(input).toEqual({ repo: "org/repo", pr: 1, status: "FIXED", note: null, expectedGeneration: 3, attemptHeadSha: null });
+  });
+
+  it("passes attemptHeadSha through when provided", () => {
+    const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "QUEUED", generation: 2, attemptHeadSha: "abc1234" });
+    if ("error" in input) throw new Error(input.error);
+    expect(input.expectedGeneration).toBe(2);
+    expect(input.attemptHeadSha).toBe("abc1234");
+  });
+
+  it("trims and accepts a valid attemptHeadSha", () => {
+    const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", attemptHeadSha: "  abc123def456  " });
+    if ("error" in input) throw new Error(input.error);
+    expect(input.attemptHeadSha).toBe("abc123def456");
+  });
+
+  it("rejects an attemptHeadSha that is not a git SHA", () => {
+    expect(parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", attemptHeadSha: "not-a-sha" })).toEqual({ error: "Invalid attemptHeadSha" });
+  });
+
+  it("rejects a too-short attemptHeadSha", () => {
+    expect(parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", attemptHeadSha: "abc12" })).toEqual({ error: "Invalid attemptHeadSha" });
+  });
+
+  it("rejects a non-string attemptHeadSha", () => {
+    expect(parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", attemptHeadSha: 1234567 })).toEqual({ error: "Invalid attemptHeadSha" });
+  });
+
+  it("rejects a non-integer generation", () => {
+    expect(parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", generation: 1.5 })).toEqual({ error: "generation must be an integer >= 1" });
+  });
+
+  it("rejects a generation below 1", () => {
+    expect(parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED", generation: 0 })).toEqual({ error: "generation must be an integer >= 1" });
+  });
+
+  it("leaves expectedGeneration undefined when generation is absent", () => {
+    const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED" });
+    if ("error" in input) throw new Error(input.error);
+    expect(input.expectedGeneration).toBeUndefined();
   });
 });

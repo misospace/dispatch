@@ -118,6 +118,10 @@ model PrFixQueueItem {
   url          String?
   title        String?
   headSha      String?
+  // Immutable head baseline for the current attempt/generation (#1074),
+  // captured when the attempt becomes dispatchable. The FIXED guard compares
+  // the PR head against this baseline, not the mutable enqueue-time headSha.
+  attemptHeadSha String?
   author       String?
   history      PrFixHistory[]
 
