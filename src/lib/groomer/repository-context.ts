@@ -10,6 +10,9 @@ export interface RepositoryContextInput {
   repoFullName: string;
   issueTitle: string;
   issueBody: string | null;
+  /** The snapshot-pinned revision to read files at; when set it overrides
+   *  the moving default branch for file reads. */
+  ref?: string;
 }
 
 export interface RepositoryContextConfig {
@@ -125,6 +128,9 @@ export async function buildRepositoryContext(
     lines.push("Repository context:");
     lines.push(`- repo: ${metadata.fullName}`);
     lines.push(`- default branch: ${metadata.defaultBranch}`);
+    if (input.ref) {
+      lines.push(`- pinned revision: ${input.ref}`);
+    }
     if (metadata.description) {
       lines.push(`- description: ${metadata.description}`);
     }
@@ -165,7 +171,7 @@ export async function buildRepositoryContext(
 
       let content: string = "";
       try {
-        content = await deps.fetchFile(input.repoFullName, result.path, metadata?.defaultBranch);
+        content = await deps.fetchFile(input.repoFullName, result.path, input.ref ?? metadata?.defaultBranch);
       } catch (err) {
         warnings.push(`Failed to fetch ${result.path}: ${err instanceof Error ? err.message : String(err)}`);
         continue;

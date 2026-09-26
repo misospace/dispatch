@@ -276,3 +276,66 @@ describe("executeGroomerTool path handling", () => {
     expect(result.content).toContain("(truncated)");
   });
 });
+
+describe("executeGroomerTool pinned ref", () => {
+  it("forces read_file to the pinned ref, ignoring a conflicting model-supplied ref", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") });
+    const result = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "src/lib/prisma.ts", ref: "main" } },
+      { ...options, pinnedRef: "deadbeef" },
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", "deadbeef");
+  });
+
+  it("forces read_file to the pinned ref when the model supplies none", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") });
+    await executeGroomerTool(
+      { name: "read_file", arguments: { path: "src/lib/prisma.ts" } },
+      { ...options, pinnedRef: "deadbeef" },
+      deps,
+    );
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", "deadbeef");
+  });
+
+  it("keeps the model's ref when no pinned ref is set", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") });
+    await executeGroomerTool(
+      { name: "read_file", arguments: { path: "src/lib/prisma.ts", ref: "topic" } },
+      options,
+      deps,
+    );
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", "topic");
+  });
+
+  it("passes no ref when neither a pinned ref nor a model ref is set", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") });
+    await executeGroomerTool(
+      { name: "read_file", arguments: { path: "src/lib/prisma.ts" } },
+      options,
+      deps,
+    );
+    expect(deps.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", undefined);
+  });
+
+  it("forces list_directory to the pinned ref, ignoring a conflicting model-supplied ref", async () => {
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue([]) });
+    await executeGroomerTool(
+      { name: "list_directory", arguments: { path: "src", ref: "refs/heads/other" } },
+      { ...options, pinnedRef: "deadbeef" },
+      deps,
+    );
+    expect(deps.listDir).toHaveBeenCalledWith("org/repo", "src", "deadbeef");
+  });
+
+  it("forces list_directory to the pinned ref when the model supplies none", async () => {
+    const deps = makeDeps({ listDir: vi.fn().mockResolvedValue([]) });
+    await executeGroomerTool(
+      { name: "list_directory", arguments: { path: "src" } },
+      { ...options, pinnedRef: "deadbeef" },
+      deps,
+    );
+    expect(deps.listDir).toHaveBeenCalledWith("org/repo", "src", "deadbeef");
+  });
+});

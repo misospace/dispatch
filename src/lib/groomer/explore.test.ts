@@ -269,3 +269,22 @@ describe("exploreRepository round-limit warning", () => {
     );
   });
 });
+
+describe("exploreRepository pinned ref", () => {
+  it("pins file reads to the snapshot SHA, ignoring a conflicting model-supplied ref", async () => {
+    const fetchImpl = fetchReturning(
+      {
+        content: null,
+        tool_calls: [
+          toolCall("1", "read_file", { path: "src/lib/prisma.ts", ref: "refs/heads/other" }),
+        ],
+      },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("code") }, fetchImpl);
+
+    await exploreRepository({ ...options, pinnedRef: "deadbeef" }, deps);
+
+    expect(deps.tools.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", "deadbeef");
+  });
+});

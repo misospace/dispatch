@@ -270,6 +270,49 @@ describe("buildRepositoryContext", () => {
     });
   });
 
+  describe("pinned ref (evidence snapshot)", () => {
+    it("reads files at the pinned ref and renders it in the metadata block", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockResolvedValue([
+        { path: "src/auth.ts", url: "https://github.com/org/repo/blob/main/src/auth.ts" },
+      ]);
+      deps.fetchFile.mockResolvedValue("export const auth = true;");
+
+      const result = await buildRepositoryContext(
+        { ...defaultInput, ref: "abc123" },
+        defaultConfig,
+        deps,
+      );
+
+      // File reads are pinned to the snapshot SHA, not the moving default branch.
+      expect(deps.fetchFile).toHaveBeenCalledWith("org/repo", "src/auth.ts", "abc123");
+      expect(result.text).toContain("- default branch: main");
+      expect(result.text).toContain("- pinned revision: abc123");
+    });
+
+    it("reads files at the default branch and renders no pinned line when no ref is provided", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockResolvedValue([
+        { path: "src/auth.ts", url: "https://github.com/org/repo/blob/main/src/auth.ts" },
+      ]);
+      deps.fetchFile.mockResolvedValue("export const auth = true;");
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(deps.fetchFile).toHaveBeenCalledWith("org/repo", "src/auth.ts", "main");
+      expect(result.text).toContain("- default branch: main");
+      expect(result.text).not.toContain("pinned revision");
+    });
+  });
+
   describe("soft failures", () => {
     it("records warning on fetchRepo failure and continues without metadata", async () => {
       deps.fetchRepo.mockRejectedValue(new Error("repo not found"));
