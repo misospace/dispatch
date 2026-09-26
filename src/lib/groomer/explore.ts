@@ -42,6 +42,10 @@ export interface ExploreResult {
   toolCalls: ExploreToolRecord[];
   bytes: number;
   warnings: string[];
+  /** search_related_work queries the model ran. */
+  relatedWorkQueries: string[];
+  /** issue/PR/commit refs the model looked up: issue:#n, pr:#n, commit:<sha>. */
+  relatedWorkRefs: string[];
 }
 
 export interface ExploreDeps {
@@ -65,6 +69,12 @@ Work like this:
 - When verifying whether the issue's premise still holds, read against the repository's default branch (pass the branch name in the \`ref\` parameter). The issue was filed against an older snapshot; what matters is what \`main\` looks like now. If the file the issue mentions no longer exists or the situation has already been resolved, that is the answer — say so in your findings.
 - Use list_directory when you are unsure what exists, rather than guessing paths.
 
+Related-work evidence (the repository's GitHub history) is read-only and bounded:
+- If the issue names specific issues, PRs, or commits, read them first with read_related_issue, read_related_pr, or read_related_commit.
+- Use search_related_work only as a fallback when the issue names no refs.
+- The state returned by read_related_issue / read_related_pr (open, closed, merged) is structured, authoritative evidence about that work — do not infer status from comment prose.
+- Bot comments (CI, dependency bots) and Dispatch's own grooming comments are not independent evidence.
+
 Call submit_findings once you can name the files a worker would change and state what the issue is asking for in this repository's own terms. Be concrete: real paths you have actually seen, never a guess.`;
 
 /** Rounds remaining at which the model is told to wrap up. */
@@ -77,6 +87,8 @@ const EMPTY: Omit<ExploreResult, "warnings"> = {
   sources: [],
   toolCalls: [],
   bytes: 0,
+  relatedWorkQueries: [],
+  relatedWorkRefs: [],
 };
 
 interface ChatMessage {
@@ -146,6 +158,8 @@ export async function exploreRepository(
   const warnings: string[] = [];
   const records: ExploreToolRecord[] = [];
   const sources: string[] = [];
+  const relatedWorkQueries: string[] = [];
+  const relatedWorkRefs: string[] = [];
   let bytes = 0;
 
   let roundsExhausted = false;
@@ -264,6 +278,36 @@ export async function exploreRepository(
 
         bytes += result.bytes;
         sources.push(...result.sources);
+        if (result.warnings?.length) warnings.push(...result.warnings);
+        if (name === "search_related_work") {
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          if (result.ok) {
+            if (query) relatedWorkQueries.push(query);
+            try {
+              const parsed = JSON.parse(result.content);
+              if (Array.isArray(parsed)) {
+                for (const hit of parsed) {
+                  if (
+                    hit &&
+                    typeof hit === "object" &&
+                    typeof (hit as { evidenceKey?: unknown }).evidenceKey === "string"
+                  ) {
+                    relatedWorkRefs.push((hit as { evidenceKey: string }).evidenceKey);
+                  }
+                }
+              }
+            } catch {
+              // Non-JSON content: no hits to record.
+            }
+          }
+        } else if (name === "read_related_issue" && typeof args.number === "number") {
+          if (result.ok) relatedWorkRefs.push(`issue:#${args.number}`);
+        } else if (name === "read_related_pr" && typeof args.number === "number") {
+          if (result.ok) relatedWorkRefs.push(`pr:#${args.number}`);
+        } else if (name === "read_related_commit") {
+          const ref = typeof args.ref === "string" ? args.ref.trim() : "";
+          if (result.ok && ref) relatedWorkRefs.push(`commit:${ref}`);
+        }
         records.push({
           name,
           arguments: args,
@@ -283,6 +327,8 @@ export async function exploreRepository(
           toolCalls: records,
           bytes,
           warnings,
+          relatedWorkQueries: [...new Set(relatedWorkQueries)],
+          relatedWorkRefs: [...new Set(relatedWorkRefs)],
         };
       }
     }
@@ -298,6 +344,8 @@ export async function exploreRepository(
       toolCalls: records,
       bytes,
       warnings,
+      relatedWorkQueries: [...new Set(relatedWorkQueries)],
+      relatedWorkRefs: [...new Set(relatedWorkRefs)],
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -313,6 +361,8 @@ export async function exploreRepository(
       toolCalls: records,
       bytes,
       warnings,
+      relatedWorkQueries: [...new Set(relatedWorkQueries)],
+      relatedWorkRefs: [...new Set(relatedWorkRefs)],
     };
   } finally {
     clearTimeout(timeoutId);

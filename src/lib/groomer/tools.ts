@@ -6,6 +6,13 @@ import {
   listRepositoryDirectory as defaultListDir,
   searchRepositoryCode as defaultSearchCode,
 } from "@/lib/github-code-search";
+import {
+  fetchRelatedCommit,
+  fetchRelatedIssue,
+  fetchRelatedPullRequest,
+  searchRelatedWork,
+  RelatedWorkNotFoundError,
+} from "@/lib/github-related-work";
 
 /**
  * Read-only repository tools the groomer drives itself.
@@ -13,14 +20,20 @@ import {
  * Grooming used to receive one pre-computed briefing assembled from three
  * keyword searches picked by word order, which meant it could never open a
  * file it had not been handed. These tools let it look, then look again based
- * on what it found. Nothing here writes: the groomer reads the repository and
- * reports, and every mutation still goes through the existing run pipeline.
+ * on what it found. The related-work tools extend the same bounded, read-only
+ * exploration to GitHub history: the issues, PRs, and commits the issue names.
+ * Nothing here writes: the groomer reads the repository and reports, and every
+ * mutation still goes through the existing run pipeline.
  */
 
 export const GROOMER_TOOL_NAMES = [
   "search_code",
   "read_file",
   "list_directory",
+  "search_related_work",
+  "read_related_issue",
+  "read_related_pr",
+  "read_related_commit",
   "submit_findings",
 ] as const;
 
@@ -39,6 +52,8 @@ export interface GroomerToolResult {
   bytes: number;
   /** Repo paths this call surfaced, for the run's source list. */
   sources: string[];
+  /** Warnings to surface on the exploration result, e.g. a failed lookup. */
+  warnings?: string[];
 }
 
 export interface GroomerToolDeps {
@@ -49,12 +64,20 @@ export interface GroomerToolDeps {
     path: string,
     ref?: string,
   ) => Promise<{ path: string; type: "file" | "dir"; size: number | null }[]>;
+  fetchRelatedIssue: typeof fetchRelatedIssue;
+  fetchRelatedPullRequest: typeof fetchRelatedPullRequest;
+  fetchRelatedCommit: typeof fetchRelatedCommit;
+  searchRelatedWork: typeof searchRelatedWork;
 }
 
 export const defaultGroomerToolDeps: GroomerToolDeps = {
   searchCode: defaultSearchCode,
   readFile: defaultFetchFile,
   listDir: defaultListDir,
+  fetchRelatedIssue,
+  fetchRelatedPullRequest,
+  fetchRelatedCommit,
+  searchRelatedWork,
 };
 
 /** OpenAI-style tool definitions sent with each exploration turn. */
@@ -128,6 +151,90 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
     {
       type: "function",
       function: {
+        name: "search_related_work",
+        description:
+          "Search this repository's GitHub issues and pull requests for related work. " +
+          "Read-only evidence about the project's history, bounded server-side. Use this " +
+          "only as a fallback, after reading any issue, PR, or commit the issue itself names. " +
+          "Each result's open/closed/merged state is authoritative.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["query"],
+          properties: {
+            query: { type: "string", description: "Search term, e.g. an identifier or error message" },
+            type: {
+              type: "string",
+              enum: ["issue", "pr", "all"],
+              description: "Kind of work to search. Defaults to all.",
+            },
+            state: {
+              type: "string",
+              enum: ["open", "closed", "all"],
+              description: "State filter. Defaults to all.",
+            },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_related_issue",
+        description:
+          "Read a GitHub issue in this repository by number. Read-only evidence about the " +
+          "project's history: title, body, labels, recent comments, and its state. The " +
+          "open/closed state is structured, authoritative evidence — do not infer status from prose. " +
+          "GitHub's issue endpoint also serves pull-request numbers, so use read_related_pr " +
+          "for a PR's authoritative merged state.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["number"],
+          properties: {
+            number: { type: "integer", description: "Issue number in this repository" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_related_pr",
+        description:
+          "Read a pull request in this repository by number. Read-only evidence about the " +
+          "project's history: title, body, and its state. The open/closed/merged state is " +
+          "structured, authoritative evidence — do not infer status from prose.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["number"],
+          properties: {
+            number: { type: "integer", description: "Pull request number in this repository" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_related_commit",
+        description:
+          "Read a commit in this repository by SHA. Read-only evidence about the " +
+          "repository's history: message, author, and date.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["ref"],
+          properties: {
+            ref: { type: "string", description: "Commit SHA (full or short)" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "submit_findings",
         description:
           "Call this when you have seen enough. Report the files a worker will need " +
@@ -191,6 +298,59 @@ export function normalizeRepoPath(raw: string): { path: string } | { error: stri
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+  const s = asString(value).trim();
+  return /^\d+$/.test(s) ? parseInt(s, 10) : null;
+}
+
+/**
+ * Shared shape for the read_related_* tools: one bounded fetch, the result
+ * rendered as compact JSON, and conservative degradation on failure. A 404 is
+ * an answer, not an error; anything else is a warning plus an empty result,
+ * so a flaky lookup never ends the grooming run.
+ */
+async function runRelatedWorkLookup(
+  kind: string,
+  invoke: () => Promise<unknown>,
+): Promise<GroomerToolResult> {
+  try {
+    const evidence = await invoke();
+    const content = JSON.stringify(evidence);
+    const key =
+      evidence &&
+      typeof evidence === "object" &&
+      typeof (evidence as { evidenceKey?: unknown }).evidenceKey === "string"
+        ? (evidence as { evidenceKey: string }).evidenceKey
+        : "";
+    return {
+      ok: true,
+      content,
+      bytes: Buffer.byteLength(content, "utf8"),
+      sources: key ? [key] : [],
+    };
+  } catch (err) {
+    if (err instanceof RelatedWorkNotFoundError) {
+      const content = JSON.stringify({ found: false, kind: err.kind, ref: err.ref });
+      return {
+        ok: true,
+        content,
+        bytes: Buffer.byteLength(content, "utf8"),
+        sources: [],
+        warnings: [`related-work: not found ${err.kind} ${err.ref}`],
+      };
+    }
+    const content = JSON.stringify({ error: true });
+    return {
+      ok: false,
+      content,
+      bytes: Buffer.byteLength(content, "utf8"),
+      sources: [],
+      warnings: [`related-work: ${kind} lookup failed`],
+    };
+  }
 }
 
 export interface ExecuteToolOptions {
@@ -278,6 +438,67 @@ export async function executeGroomerTool(
         const more = entries.length > shown.length ? `\n… ${entries.length - shown.length} more` : "";
         const content = `${path || "/"}:\n${lines.join("\n")}${more}`;
         return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources: [] };
+      }
+
+      case "search_related_work": {
+        const query = asString(call.arguments.query).trim();
+        if (!query) return fail("search_related_work needs a non-empty query.");
+        const typeRaw = asString(call.arguments.type).trim();
+        const stateRaw = asString(call.arguments.state).trim();
+        const type: "issue" | "pr" | "all" =
+          typeRaw === "issue" || typeRaw === "pr" || typeRaw === "all" ? typeRaw : "all";
+        const state: "open" | "closed" | "all" =
+          stateRaw === "open" || stateRaw === "closed" || stateRaw === "all" ? stateRaw : "all";
+        let hits;
+        try {
+          hits = await deps.searchRelatedWork(options.repoFullName, query, {
+            type,
+            state,
+            maxResults: options.maxSearchResults,
+          });
+        } catch (err) {
+          // Upstream error bodies (fetchPaginated) can be a full HTML page.
+          // Summarize before it reaches the model message or the persisted preview.
+          const message = err instanceof Error ? err.message : String(err);
+          const summarized =
+            message.length > 200 ? `${message.slice(0, 200)}…` : message;
+          return fail(`search_related_work failed: ${summarized}`);
+        }
+        if (hits.length === 0) {
+          return {
+            ok: true,
+            content: `No related work found for "${query}".`,
+            bytes: 0,
+            sources: [],
+          };
+        }
+        const content = JSON.stringify(hits);
+        const sources = hits.map((h) => h.evidenceKey).filter(Boolean);
+        return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources };
+      }
+
+      case "read_related_issue": {
+        const number = asNumber(call.arguments.number);
+        if (!number) return fail("read_related_issue needs a positive integer issue number.");
+        return runRelatedWorkLookup("issue", () =>
+          deps.fetchRelatedIssue(options.repoFullName, number),
+        );
+      }
+
+      case "read_related_pr": {
+        const number = asNumber(call.arguments.number);
+        if (!number) return fail("read_related_pr needs a positive integer pull request number.");
+        return runRelatedWorkLookup("pr", () =>
+          deps.fetchRelatedPullRequest(options.repoFullName, number),
+        );
+      }
+
+      case "read_related_commit": {
+        const ref = asString(call.arguments.ref).trim();
+        if (!ref) return fail("read_related_commit needs a non-empty commit SHA.");
+        return runRelatedWorkLookup("commit", () =>
+          deps.fetchRelatedCommit(options.repoFullName, ref),
+        );
       }
 
       default:

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { RelatedWorkNotFoundError } from "@/lib/github-related-work";
 import { exploreRepository, type ExploreDeps, type ExploreOptions } from "./explore";
 
 const options: ExploreOptions = {
@@ -40,6 +41,10 @@ function makeDeps(overrides: Partial<ExploreDeps["tools"]> = {}, fetchImpl?: typ
       searchCode: vi.fn().mockResolvedValue([]),
       readFile: vi.fn().mockResolvedValue(""),
       listDir: vi.fn().mockResolvedValue([]),
+      fetchRelatedIssue: vi.fn().mockResolvedValue({}),
+      fetchRelatedPullRequest: vi.fn().mockResolvedValue({}),
+      fetchRelatedCommit: vi.fn().mockResolvedValue({}),
+      searchRelatedWork: vi.fn().mockResolvedValue([]),
       ...overrides,
     },
     fetchImpl: fetchImpl ?? fetchReturning({ content: "done", tool_calls: [] }),
@@ -129,6 +134,103 @@ describe("exploreRepository", () => {
 
     expect(result.warnings).toContain("repository exploration hit its byte budget");
     expect(deps.tools.readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("records related-work queries and refs from the related-work tools", async () => {
+    const fetchImpl = fetchReturning(
+      {
+        content: null,
+        tool_calls: [
+          toolCall("1", "read_related_pr", { number: 12 }),
+          toolCall("2", "read_related_commit", { ref: "abc123" }),
+        ],
+      },
+      {
+        content: null,
+        tool_calls: [toolCall("3", "search_related_work", { query: "sslmode" })],
+      },
+      {
+        content: null,
+        tool_calls: [
+          toolCall("4", "submit_findings", {
+            files: ["src/lib/prisma.ts"],
+            ask: "Map libpq sslmode onto the pg driver's ssl option.",
+          }),
+        ],
+      },
+    );
+    const deps = makeDeps(
+      {
+        fetchRelatedPullRequest: vi
+          .fn()
+          .mockResolvedValue({ number: 12, state: "merged", evidenceKey: "pr:org/repo#12" }),
+        fetchRelatedCommit: vi
+          .fn()
+          .mockResolvedValue({ sha: "abc123", message: "Fix ssl", evidenceKey: "commit:abc123" }),
+        searchRelatedWork: vi
+          .fn()
+          .mockResolvedValue([{ evidenceKey: "issue:org/repo#101", title: "Original report" }]),
+      },
+      fetchImpl,
+    );
+
+    const result = await exploreRepository(options, deps);
+
+    expect(result.relatedWorkQueries).toEqual(["sslmode"]);
+    expect(result.relatedWorkRefs).toEqual([
+      "pr:#12",
+      "commit:abc123",
+      "issue:org/repo#101",
+    ]);
+    expect(result.sources).toEqual([
+      "pr:org/repo#12",
+      "commit:abc123",
+      "issue:org/repo#101",
+      "src/lib/prisma.ts",
+    ]);
+  });
+
+  it("counts related-work bytes against the exploration byte budget", async () => {
+    const big = { evidenceKey: "issue:org/repo#1", body: "x".repeat(300) };
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "search_related_work", { query: "loop" })],
+    });
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue([big]) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxTotalBytes: 100, maxRounds: 4 }, deps);
+
+    expect(result.warnings).toContain("repository exploration hit its byte budget");
+    expect(deps.tools.searchRelatedWork).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts a related-work round against the round budget", async () => {
+    const fetchImpl = fetchReturning({
+      content: null,
+      tool_calls: [toolCall("1", "search_related_work", { query: "loop" })],
+    });
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue([]) }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, maxRounds: 3 }, deps);
+
+    expect(result.toolCalls).toHaveLength(3);
+    expect(result.warnings).toContain(
+      "repository exploration used all its rounds without submitting findings",
+    );
+  });
+
+  it("surfaces a related-work not-found warning on the exploration result", async () => {
+    const notFound = new RelatedWorkNotFoundError("issue", "org/repo#99");
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_related_issue", { number: 99 })] },
+      { content: "done", tool_calls: [] },
+    );
+    const deps = makeDeps({ fetchRelatedIssue: vi.fn().mockRejectedValue(notFound) }, fetchImpl);
+
+    const result = await exploreRepository(options, deps);
+
+    expect(result.warnings).toContain("related-work: not found issue org/repo#99");
+    expect(result.relatedWorkRefs).toEqual(["issue:#99"]);
   });
 
   it("stops at the tool-call budget and says so", async () => {
