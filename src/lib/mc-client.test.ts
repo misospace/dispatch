@@ -853,6 +853,18 @@ describe("queue, issues, pr-fix, groomer clients", () => {
     expect(url).toContain("include_blocked=true");
   });
 
+  it("markPrFix forwards the settled generation", async () => {
+    const { markPrFix } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ status: "BLOCKED" }));
+    await markPrFix({ repo: "org/repo", pr: 7, status: "blocked", generation: 3 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/pr-fix-queue/mark"),
+      expect.objectContaining({
+        body: JSON.stringify({ repo: "org/repo", pr: 7, status: "blocked", generation: 3 }),
+      }),
+    );
+  });
+
   it("markPrFix POSTs the mark body", async () => {
     const { markPrFix } = await import("./mc-client");
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ status: "FIXED" }));
