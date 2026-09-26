@@ -6,6 +6,7 @@ import {
   fetchRelatedIssue,
   fetchRelatedPullRequest,
   searchRelatedWork,
+  type RelatedWorkIssue,
 } from "./github-related-work";
 
 // GITHUB_TOKEN is read by getHeadersAsync (github-auth) on every request; the
@@ -78,7 +79,7 @@ describe("github-related-work", () => {
           ]),
         );
 
-      const issue = await fetchRelatedIssue("org/repo", 10, { maxComments: 2 });
+      const issue = (await fetchRelatedIssue("org/repo", 10, { maxComments: 2 })) as RelatedWorkIssue;
 
       expect(issue.kind).toBe("issue");
       expect(issue.state).toBe("closed");
@@ -124,7 +125,7 @@ describe("github-related-work", () => {
           ]),
         );
 
-      const issue = await fetchRelatedIssue("org/repo", 11);
+      const issue = (await fetchRelatedIssue("org/repo", 11)) as RelatedWorkIssue;
 
       expect(issue.comments[0].isBot).toBe(true);
       expect(issue.comments[0].authorType).toBe("NONE");
@@ -155,11 +156,13 @@ describe("github-related-work", () => {
           ]),
         );
 
-      const issue = await fetchRelatedIssue("org/repo", 12, { maxBodyBytes: 20 });
+      const issue = (await fetchRelatedIssue("org/repo", 12, { maxBodyBytes: 20 })) as RelatedWorkIssue;
 
-      expect(issue.bodyExcerpt).toBe(`${"x".repeat(20)}…`);
-      expect(issue.bodyExcerpt.length).toBe(21);
-      expect(issue.comments[0].bodyExcerpt).toBe(`${"y".repeat(20)}…`);
+      // Byte-correct cap: a 100-byte ASCII body at 20 bytes leaves a 17-byte
+      // prefix (20 - 3-byte ellipsis) plus the ellipsis = 20 bytes / 18 chars.
+      expect(issue.bodyExcerpt).toBe(`${"x".repeat(17)}…`);
+      expect(issue.bodyExcerpt.length).toBe(18);
+      expect(issue.comments[0].bodyExcerpt).toBe(`${"y".repeat(17)}…`);
     });
 
     it("caps the comment list to maxComments", async () => {
@@ -187,7 +190,7 @@ describe("github-related-work", () => {
           ),
         );
 
-      const issue = await fetchRelatedIssue("org/repo", 13, { maxComments: 3 });
+      const issue = (await fetchRelatedIssue("org/repo", 13, { maxComments: 3 })) as RelatedWorkIssue;
 
       expect(issue.comments).toHaveLength(3);
     });
@@ -200,6 +203,71 @@ describe("github-related-work", () => {
       expect(err).toBeInstanceOf(RelatedWorkNotFoundError);
       expect(err.kind).toBe("issue");
       expect(err.ref).toBe("org/repo#999");
+    });
+
+    it("delegates to the PR fetch when the /issues response has a pull_request marker", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(
+          mockResponse({
+            number: 30,
+            title: "A PR via the issues endpoint",
+            body: "pr body",
+            state: "closed",
+            html_url: "https://github.com/org/repo/pull/30",
+            updated_at: "2026-02-02T00:00:00Z",
+            pull_request: { url: "https://api.github.com/repos/org/repo/pulls/30" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          mockResponse({
+            number: 30,
+            title: "A PR via the issues endpoint",
+            body: "pr body",
+            state: "closed",
+            html_url: "https://github.com/org/repo/pull/30",
+            updated_at: "2026-02-02T00:00:00Z",
+            merged: true,
+            merged_at: "2026-02-02T00:00:00Z",
+            merge_commit_sha: "abc123",
+            base: { ref: "main" },
+            head: { ref: "feature", sha: "def456" },
+          }),
+        );
+
+      const result = await fetchRelatedIssue("org/repo", 30);
+
+      // The /issues response is recognized as a PR and delegated to /pulls.
+      expect(result.kind).toBe("pull_request");
+      expect(result.state).toBe("merged");
+      expect(result.merged).toBe(true);
+      // The delegation hit the authoritative pulls endpoint.
+      const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+      expect(urls.some((u) => u.includes("/pulls/30"))).toBe(true);
+    });
+
+    it("caps a multi-byte body to maxBodyBytes without splitting a character", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(
+          mockResponse({
+            number: 31,
+            title: "t",
+            // 10 x U+1F600 = 40 UTF-8 bytes.
+            body: "😀".repeat(10),
+            state: "open",
+            html_url: "https://github.com/org/repo/issues/31",
+            labels: [],
+            updated_at: null,
+          }),
+        )
+        .mockResolvedValueOnce(mockResponse([]));
+
+      const issue = (await fetchRelatedIssue("org/repo", 31, { maxBodyBytes: 20 })) as RelatedWorkIssue;
+
+      // The 17-byte budget (20 - 3) cuts mid-sequence at the 5th emoji; the
+      // partial char is dropped, so the excerpt stays whole and within budget.
+      expect(Buffer.byteLength(issue.bodyExcerpt, "utf8")).toBeLessThanOrEqual(20);
+      expect(issue.bodyExcerpt).not.toContain("�");
+      expect(issue.bodyExcerpt.endsWith("…")).toBe(true);
     });
   });
 

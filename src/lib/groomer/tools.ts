@@ -456,13 +456,13 @@ export async function executeGroomerTool(
             state,
             maxResults: options.maxSearchResults,
           });
-        } catch (err) {
-          // Upstream error bodies (fetchPaginated) can be a full HTML page.
-          // Summarize before it reaches the model message or the persisted preview.
-          const message = err instanceof Error ? err.message : String(err);
-          const summarized =
-            message.length > 200 ? `${message.slice(0, 200)}…` : message;
-          return fail(`search_related_work failed: ${summarized}`);
+        } catch {
+          // Upstream error bodies (fetchPaginated) can be a full HTML page and may
+          // contain non-repo text; never surface them to the model or the persisted
+          // preview. Degrade to a generic, bounded hint instead.
+          return fail(
+            "search_related_work failed: upstream search is unavailable right now. Try a narrower repo-scoped query or an explicit #issue/PR reference.",
+          );
         }
         if (hits.length === 0) {
           return {

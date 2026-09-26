@@ -95,6 +95,7 @@ interface RawIssue {
   html_url: string;
   labels?: Array<{ name: string }> | null;
   updated_at: string | null;
+  pull_request?: unknown;
 }
 
 interface RawComment {
@@ -142,8 +143,15 @@ interface RawSearchItem {
 function capBody(body: string | null | undefined, maxBytes: number): string {
   if (!body) return "";
   const trimmed = body.trim();
-  if (trimmed.length <= maxBytes) return trimmed;
-  return `${trimmed.slice(0, maxBytes)}…`;
+  const bytes = Buffer.from(trimmed, "utf8");
+  if (bytes.byteLength <= maxBytes) return trimmed;
+  // Reserve room for the 3-byte ellipsis so the total stays within maxBytes,
+  // and cut back to a character boundary so a multi-byte sequence is never
+  // split (a raw byte slice would leave a U+FFFD right before the marker).
+  const budget = Math.max(0, maxBytes - 3);
+  const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+  const prefix = decoder.decode(bytes.subarray(0, budget)).replace(/\uFFFD$/, "");
+  return `${prefix}…`;
 }
 
 // Scope-broadening qualifiers a caller's free-text query must not carry in:
@@ -182,7 +190,7 @@ export async function fetchRelatedIssue(
   repoFullName: string,
   issueNumber: number,
   limits?: RelatedWorkLimits,
-): Promise<RelatedWorkIssue> {
+): Promise<RelatedWorkIssue | RelatedWorkPullRequest> {
   const [owner, repo] = repoFullName.split("/");
   const maxComments = limits?.maxComments ?? DEFAULT_MAX_COMMENTS;
   const maxBodyBytes = limits?.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
@@ -193,6 +201,13 @@ export async function fetchRelatedIssue(
     "issue",
     ref,
   )) as RawIssue;
+
+  // /issues/{n} also returns pull requests (with a `pull_request` sub-object).
+  // Delegate to the authoritative PR fetch so state/merged are correct rather
+  // than misclassifying a PR as a plain open/closed issue.
+  if (data.pull_request && typeof data.pull_request === "object") {
+    return fetchRelatedPullRequest(repoFullName, issueNumber, limits);
+  }
 
   const perPage = Math.max(1, Math.min(maxComments, 100));
   const commentsResp = await fetchWithRetry(

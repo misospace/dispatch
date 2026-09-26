@@ -350,7 +350,13 @@ describe("executeGroomerTool related-work", () => {
 
   it("degrades a thrown search error without throwing", async () => {
     const deps = makeDeps({
-      searchRelatedWork: vi.fn().mockRejectedValue(new Error("rate limited")),
+      searchRelatedWork: vi
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            "GitHub API error: 502 SENTINEL_UPSTREAM_BODY_HTML <html>...</html>",
+          ),
+        ),
     });
     const result = await executeGroomerTool(
       { name: "search_related_work", arguments: { query: "sslmode" } },
@@ -359,6 +365,8 @@ describe("executeGroomerTool related-work", () => {
     );
     expect(result.ok).toBe(false);
     expect(result.content).toContain("search_related_work failed");
+    expect(result.content.includes("SENTINEL_UPSTREAM_BODY_HTML")).toBe(false);
+    expect(result.content.includes("SENTINEL")).toBe(false);
   });
 });
 
