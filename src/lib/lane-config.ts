@@ -35,11 +35,13 @@ export interface LaneConfig {
 export interface LaneConfigSet {
   lanes: LaneConfig[];
   /**
-   * Migration aliases: map old lane IDs to currently configured lane IDs.
+   * Migration aliases: map legacy lane IDs to currently configured lane IDs.
    *
    * Used for read-time compatibility when deploying a custom lane set to an
-   * existing install that has issues stored under the default lane names
-   * (normal, escalated, backlog). Aliases are purely a read-time resolution
+   * existing install that has issues stored under legacy lane names (normal,
+   * escalated, backlog) from before lanes were configurable. These legacy names
+   * are not configured or default lanes — they only ever appear as alias source
+   * keys, resolved at read time. Aliases are purely a read-time resolution
    * mechanism — they do not rewrite issue data.
    *
    * Example:
@@ -244,6 +246,31 @@ export function resolveRequestLane(lane: string | null | undefined): string | nu
   return null;
 }
 
+/**
+ * Map an already-resolved request-time configured lane to the PR-fix queue's
+ * internal lane vocabulary.
+ *
+ * The PR-fix queue uses a separate enum (`NORMAL` / `ESCALATED` / `NEEDS_HUMAN`)
+ * and must NOT be fed a raw request lane: doing so lets `normalizePrFixLane`
+ * silently coerce unknown/custom lane ids to `NEEDS_HUMAN` and hide work
+ * (#1046). Callers must first resolve/validate the request lane through
+ * {@link resolveRequestLane}; this helper then derives the PR-fix lane from the
+ * resolved lane's role. Lanes without a PR-fix equivalent must not consume
+ * PR-fix work, even if they are claimable.
+ *
+ * `undefined` means no filter was requested; `null` means skip PR-fix work.
+ */
+export function prFixLaneForRequest(
+  resolvedLane: string | null | undefined,
+): "NORMAL" | "ESCALATED" | null | undefined {
+  if (!resolvedLane) return undefined;
+  const configured = getLaneById(resolvedLane);
+  if (!configured?.claimable) return null;
+  if (configured.role === "default") return "NORMAL";
+  if (configured.role === "escalation") return "ESCALATED";
+  return null;
+}
+
 // ─── Classification Helpers ──────────────────────────────────────────────────
 
 /**
@@ -302,9 +329,12 @@ export function classifyLaneFromSignals(signals: LaneSignals): string {
   const defaultLane = getDefaultClaimableLane();
   if (defaultLane) return defaultLane.id;
 
-  // Should never happen (config validation requires at least one claimable lane),
-  // but provide a safe fallback.
-  return "normal";
+  // Should never happen: config validation requires at least one claimable lane
+  // and the branches above return a configured id whenever any claimable or
+  // backlog lane exists. Fail loudly instead of returning an unknown literal id.
+  throw new Error(
+    "classifyLaneFromSignals: no claimable or backlog lane is configured",
+  );
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────

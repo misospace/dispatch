@@ -17,6 +17,7 @@ import {
   isKnownOrAliasedLane,
   getUnconfiguredLaneInfo,
   laneMatchesConfigured,
+  prFixLaneForRequest,
   resolveRequestLane,
   setLaneConfig,
 } from "./lane-config";
@@ -73,6 +74,21 @@ describe("lane-config defaults", () => {
     const lanes = getConfiguredLanes();
     lanes[0].id = "mutated";
     expect(getConfiguredLanes()[0].id).toBe("default");
+  });
+
+  it("never returns an id outside the default lane set", () => {
+    const combos = [
+      { signals: { isBacklog: false, isEscalation: false }, expected: "default" },
+      { signals: { isBacklog: false, isEscalation: true }, expected: "default" },
+      { signals: { isBacklog: true, isEscalation: false }, expected: "backlog" },
+      { signals: { isBacklog: true, isEscalation: true }, expected: "backlog" },
+    ] as const;
+
+    for (const { signals, expected } of combos) {
+      const result = classifyLaneFromSignals(signals);
+      expect(["default", "backlog"]).toContain(result);
+      expect(result).toBe(expected);
+    }
   });
 });
 
@@ -393,6 +409,42 @@ describe("lane-config classification helpers", () => {
         expect(["alpha", "beta", "gamma"]).toContain(lane);
       }
     });
+  });
+});
+
+describe("lane-config prFixLaneForRequest", () => {
+  beforeEach(() => {
+    setLaneConfig({
+      lanes: [
+        { id: "local", title: "Local", claimable: true, role: "default" },
+        { id: "cloud", title: "Cloud", claimable: true },
+        { id: "frontier", title: "Frontier", claimable: true, role: "escalation" },
+        { id: "backlog", title: "Backlog", claimable: false },
+      ],
+      laneAliases: { normal: "local", escalated: "frontier" },
+    });
+  });
+  afterEach(() => resetLaneConfig());
+
+  it("maps an escalation-role lane to ESCALATED", () => {
+    expect(prFixLaneForRequest("frontier")).toBe("ESCALATED");
+  });
+
+  it("maps the default-role lane to NORMAL", () => {
+    expect(prFixLaneForRequest("local")).toBe("NORMAL");
+  });
+
+  it("skips PR-fix work for a claimable lane without a PR-fix role", () => {
+    expect(prFixLaneForRequest("cloud")).toBeNull();
+  });
+
+  it("skips PR-fix work for a non-claimable lane", () => {
+    expect(prFixLaneForRequest("backlog")).toBeNull();
+  });
+
+  it("returns undefined when no lane was resolved", () => {
+    expect(prFixLaneForRequest(null)).toBeUndefined();
+    expect(prFixLaneForRequest(undefined)).toBeUndefined();
   });
 });
 

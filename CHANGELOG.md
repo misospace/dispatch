@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.64](https://github.com/misospace/dispatch/compare/v0.5.63...v0.5.64) (2026-09-25)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.47.0 → 1.48.0) ([#1056](https://github.com/misospace/dispatch/issues/1056)) ([1d9844e](https://github.com/misospace/dispatch/commit/1d9844ea1440dd93649a397b22850587cd833a18))
+* **groomer:** DISPATCH_LLM_RESPONSE_FORMAT toggle ([#1070](https://github.com/misospace/dispatch/issues/1070)) ([05c3814](https://github.com/misospace/dispatch/commit/05c38142e5f737a2155027c3f8780b4bf5d270a4))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @modelcontextprotocol/sdk (1.30.0 → 1.30.1) ([#1054](https://github.com/misospace/dispatch/issues/1054)) ([a6b3ea5](https://github.com/misospace/dispatch/commit/a6b3ea5bfa05404499da2df0cf026c78558008c2))
+* **deps:** update dependency jsdom (30.1.0 → 30.1.1) ([#1047](https://github.com/misospace/dispatch/issues/1047)) ([48e5d62](https://github.com/misospace/dispatch/commit/48e5d62392eaf73cd26b10f73a81cdee8863db75))
+* **deps:** update nextjs monorepo (16.3.5 → 16.3.6) ([#1053](https://github.com/misospace/dispatch/issues/1053)) ([fb23bd2](https://github.com/misospace/dispatch/commit/fb23bd206d1a57707cae652c302dbd62ed3c2581))
+
 ## [0.5.63](https://github.com/misospace/dispatch/compare/v0.5.62...v0.5.63) (2026-09-21)
 
 

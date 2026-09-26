@@ -10,6 +10,12 @@ export interface CallLlmOptions {
   prompt: string;
   timeoutMs: number;
   /**
+   * Send `response_format` (json_schema, falling back to json_object). Set
+   * false for backends that implement neither; the system prompt still
+   * demands JSON and `validateGroomerOutput` still checks it. Defaults to true.
+   */
+  responseFormat?: boolean;
+  /**
    * Findings from the repository exploration loop, appended to the prompt.
    * Optional so the grooming call still works with no exploration at all.
    */
@@ -197,6 +203,9 @@ async function attemptChatCompletion(
   options: CallLlmOptions,
   signal: AbortSignal,
 ): Promise<Response> {
+  if (options.responseFormat === false) {
+    return postChatCompletion(url, options, undefined, signal);
+  }
   let response = await postChatCompletion(
     url,
     options,

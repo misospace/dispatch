@@ -150,6 +150,26 @@ describe("extractLessonFromFixOutcome", () => {
     expect(out.kind).toBe("lesson");
   });
 
+  it("omits response_format when DISPATCH_LLM_RESPONSE_FORMAT=false", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      const payload = { verdict: "lesson", text: "no response_format sent" } as PlannedResponse;
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: JSON.stringify(payload) } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const out = await withEnv({ DISPATCH_LLM_RESPONSE_FORMAT: "false" }, () =>
+      extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts }),
+    ) as { kind: string };
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).not.toHaveProperty("response_format");
+    expect(out.kind).toBe("lesson");
+  });
+
   it("swallows non-2xx responses and returns no_lesson", async () => {
     const { fetcher } = makeFetcher({ verdict: "lesson" }, { status: 500 });
     const out = await extractLessonFromFixOutcome(baseInput, { fetcher, apiKey: "test", ...opts });

@@ -12,6 +12,7 @@ describe("groomer config", () => {
     delete process.env.DISPATCH_GROOMER_TIMEOUT_MS;
     delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_BYTES;
     delete process.env.DISPATCH_GROOMER_DRY_RUN;
+    delete process.env.DISPATCH_LLM_RESPONSE_FORMAT;
     delete process.env.DISPATCH_GROOMER_REPO_CONTEXT_ENABLED;
     delete process.env.DISPATCH_GROOMER_MAX_CONTEXT_FILES;
     delete process.env.DISPATCH_GROOMER_MAX_SEARCHES;
@@ -60,6 +61,23 @@ describe("groomer config", () => {
     process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "";
     const config = getHostedGroomerConfig();
     expect(config.enabled).toBe(false);
+  });
+
+  it("sends response_format by default", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    expect(getHostedGroomerConfig().responseFormat).toBe(true);
+  });
+
+  it("reads responseFormat=false when explicitly set", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    process.env.DISPATCH_LLM_RESPONSE_FORMAT = "false";
+    expect(getHostedGroomerConfig().responseFormat).toBe(false);
   });
 
   it("reads dryRun=false when explicitly set", () => {
