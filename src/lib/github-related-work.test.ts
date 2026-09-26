@@ -269,6 +269,29 @@ describe("github-related-work", () => {
       expect(issue.bodyExcerpt).not.toContain("�");
       expect(issue.bodyExcerpt.endsWith("…")).toBe(true);
     });
+
+    it("returns an empty excerpt when maxBodyBytes cannot fit the 3-byte ellipsis", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(
+          mockResponse({
+            number: 32,
+            title: "t",
+            body: "a long enough body to be truncated",
+            state: "open",
+            html_url: "https://github.com/org/repo/issues/32",
+            labels: [],
+            updated_at: null,
+          }),
+        )
+        .mockResolvedValueOnce(mockResponse([]));
+
+      const issue = (await fetchRelatedIssue("org/repo", 32, { maxBodyBytes: 2 })) as RelatedWorkIssue;
+
+      // 2 bytes cannot fit the 3-byte ellipsis marker, so the excerpt is
+      // empty and the total stays within maxBytes.
+      expect(issue.bodyExcerpt).toBe("");
+      expect(Buffer.byteLength(issue.bodyExcerpt, "utf8")).toBeLessThanOrEqual(2);
+    });
   });
 
   describe("fetchRelatedPullRequest", () => {

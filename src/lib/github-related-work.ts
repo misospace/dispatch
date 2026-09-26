@@ -145,6 +145,9 @@ function capBody(body: string | null | undefined, maxBytes: number): string {
   const trimmed = body.trim();
   const bytes = Buffer.from(trimmed, "utf8");
   if (bytes.byteLength <= maxBytes) return trimmed;
+  // A budget below the 3-byte ellipsis width cannot fit the marker, so return
+  // empty rather than an over-budget 3-byte ellipsis.
+  if (maxBytes < 3) return "";
   // Reserve room for the 3-byte ellipsis so the total stays within maxBytes,
   // and cut back to a character boundary so a multi-byte sequence is never
   // split (a raw byte slice would leave a U+FFFD right before the marker).

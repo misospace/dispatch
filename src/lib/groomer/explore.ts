@@ -304,13 +304,11 @@ export async function exploreRepository(
               // Non-JSON content: no hits to record.
             }
           }
-        } else if (name === "read_related_issue" && typeof args.number === "number") {
-          if (result.ok) relatedWorkRefs.push(`issue:#${args.number}`);
-        } else if (name === "read_related_pr" && typeof args.number === "number") {
-          if (result.ok) relatedWorkRefs.push(`pr:#${args.number}`);
-        } else if (name === "read_related_commit") {
-          const ref = typeof args.ref === "string" ? args.ref.trim() : "";
-          if (result.ok && ref) relatedWorkRefs.push(`commit:${ref}`);
+        } else if (
+          (name === "read_related_issue" || name === "read_related_pr" || name === "read_related_commit") &&
+          result.ok
+        ) {
+          for (const s of result.sources) relatedWorkRefs.push(s);
         }
         records.push({
           name,

@@ -163,13 +163,13 @@ describe("exploreRepository", () => {
       {
         fetchRelatedPullRequest: vi
           .fn()
-          .mockResolvedValue({ number: 12, state: "merged", evidenceKey: "pr:org/repo#12" }),
+          .mockResolvedValue({ number: 12, state: "merged", evidenceKey: "github:pr:org/repo#12" }),
         fetchRelatedCommit: vi
           .fn()
-          .mockResolvedValue({ sha: "abc123", message: "Fix ssl", evidenceKey: "commit:abc123" }),
+          .mockResolvedValue({ sha: "abc123", message: "Fix ssl", evidenceKey: "github:commit:org/repo@abc123" }),
         searchRelatedWork: vi
           .fn()
-          .mockResolvedValue([{ evidenceKey: "issue:org/repo#101", title: "Original report" }]),
+          .mockResolvedValue([{ evidenceKey: "github:issue:org/repo#101", title: "Original report" }]),
       },
       fetchImpl,
     );
@@ -177,15 +177,18 @@ describe("exploreRepository", () => {
     const result = await exploreRepository(options, deps);
 
     expect(result.relatedWorkQueries).toEqual(["sslmode"]);
+    // Successful reads record the tool result's evidence keys (from
+    // result.sources), so a PR number read via read_related_pr is a
+    // pull_request ref, not an issue ref.
     expect(result.relatedWorkRefs).toEqual([
-      "pr:#12",
-      "commit:abc123",
-      "issue:org/repo#101",
+      "github:pr:org/repo#12",
+      "github:commit:org/repo@abc123",
+      "github:issue:org/repo#101",
     ]);
     expect(result.sources).toEqual([
-      "pr:org/repo#12",
-      "commit:abc123",
-      "issue:org/repo#101",
+      "github:pr:org/repo#12",
+      "github:commit:org/repo@abc123",
+      "github:issue:org/repo#101",
       "src/lib/prisma.ts",
     ]);
   });
@@ -230,7 +233,9 @@ describe("exploreRepository", () => {
     const result = await exploreRepository(options, deps);
 
     expect(result.warnings).toContain("related-work: not found issue org/repo#99");
-    expect(result.relatedWorkRefs).toEqual(["issue:#99"]);
+    // A not-found lookup returns ok:true with {found:false} content and empty
+    // sources, so it records no ref.
+    expect(result.relatedWorkRefs).toEqual([]);
   });
 
   it("stops at the tool-call budget and says so", async () => {
