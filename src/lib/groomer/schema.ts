@@ -7,6 +7,12 @@ import { isClaimableLane, getDefaultClaimableLane } from "@/lib/lane-config";
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
+/**
+ * The legacy, loose groomer output. The model now emits a GroomingPlan
+ * (./plan.ts); this shape survives as the compatibility view the run path and
+ * existing run/history consumers read (toGroomerOutput), and as the shape of
+ * GroomingRun.validatedOutput rows recorded before the plan contract.
+ */
 export interface GroomerOutput {
   actionability?: "ready" | "needs_info" | "blocked" | "backlog" | "already_done";
   confidence?: "high" | "medium" | "low";
@@ -138,6 +144,11 @@ const OPTIONAL_STRING_FIELDS: (keyof Pick<GroomerOutput, "summary" | "githubComm
 
 // ─── Main Validator ───────────────────────────────────────────────────────────
 
+/**
+ * @deprecated The hosted groomer validates a GroomingPlan with
+ * validateGroomingPlan (./plan.ts). Retained for the legacy shape during the
+ * plan rollout; the run path no longer calls it.
+ */
 export function validateGroomerOutput(data: unknown): ValidationResult {
   const errors: string[] = [];
   const resolutions: ResolutionEvent[] = [];

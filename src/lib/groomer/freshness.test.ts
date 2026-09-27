@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildGroomingFreshnessBaseline,
   computeGroomingIssueFingerprint,
+  deriveEvidenceReliance,
   deriveEvidenceScope,
   deriveGroomingFreshness,
   dependencyKeysForIssue,
@@ -33,8 +34,9 @@ const evidence: GroomingEvidenceSnapshot = {
   evidenceDigest: "digest-1",
   warnings: [],
   sources: [
-    { path: "src/a.ts", provenance: "repository", ref: "sha-1" },
-    { path: "src/a.ts", provenance: "repository", ref: "sha-1" },
+    { path: "src/a.ts", provenance: "repository", via: "read", ref: "sha-1" },
+    { path: "src/a.ts", provenance: "repository", via: "read", ref: "sha-1" },
+    { path: "src/hit.ts", provenance: "repository", via: "surfaced", ref: null },
     {
       key: "github:pr:org/repo#12",
       provenance: "github_pull_request",
@@ -141,6 +143,61 @@ describe("dependency and related-work baselines", () => {
   });
 });
 
+describe("deriveEvidenceReliance", () => {
+  it("without citations, relies on read paths only (surfaced hits never bound a result)", () => {
+    const reliance = deriveEvidenceReliance(evidence.sources, undefined);
+    expect(reliance.repositoryPaths).toEqual(["src/a.ts"]);
+    expect(reliance.reliesOnSurfacedPath).toBe(false);
+    expect(reliance.basis).toEqual({ repository: "heuristic", relatedWork: "heuristic" });
+  });
+
+  it("a surfaced-only run has no read path, so it is global", () => {
+    const sources = [{ path: "src/hit.ts", provenance: "repository" as const, via: "surfaced" as const, ref: null }];
+    const reliance = deriveEvidenceReliance(sources, undefined);
+    expect(reliance.repositoryPaths).toEqual([]);
+    expect(
+      deriveEvidenceScope({ repositoryPaths: reliance.repositoryPaths, negativeSearch: false, repositoryConsulted: true }),
+    ).toBe("global");
+  });
+
+  it("prefers the plan's citations over the heuristic", () => {
+    const sources = [
+      ...evidence.sources,
+      { path: "src/b.ts", provenance: "repository" as const, via: "read" as const, ref: "sha-1" },
+    ];
+    const reliance = deriveEvidenceReliance(sources, [
+      { id: "issue", subject: "issue", state: null },
+      { id: "repo:src/b.ts", subject: "repository", state: null },
+      { id: "github:issue:org/repo#13", subject: "related_work", state: "closed" },
+    ]);
+    // Only the cited read path, not every read path.
+    expect(reliance.repositoryPaths).toEqual(["src/b.ts"]);
+    expect(reliance.reliesOnSurfacedPath).toBe(false);
+    // The cited search hit replaces the heuristic's directly-read PR.
+    expect(reliance.relatedWork).toEqual([
+      { key: "github:issue:org/repo#13", kind: "issue", repo: "org/repo", number: 13, state: "closed" },
+    ]);
+    expect(reliance.basis).toEqual({ repository: "citations", relatedWork: "citations" });
+  });
+
+  it("a cited surfaced-only path makes the result global", () => {
+    const reliance = deriveEvidenceReliance(evidence.sources, [
+      { id: "repo:src/a.ts", subject: "repository", state: null },
+      { id: "repo:src/hit.ts", subject: "repository", state: null },
+    ]);
+    expect(reliance.repositoryPaths).toEqual(["src/a.ts"]);
+    expect(reliance.reliesOnSurfacedPath).toBe(true);
+    expect(
+      deriveEvidenceScope({
+        repositoryPaths: reliance.repositoryPaths,
+        negativeSearch: false,
+        repositoryConsulted: true,
+        reliesOnSurfacedPath: true,
+      }),
+    ).toBe("global");
+  });
+});
+
 describe("buildGroomingFreshnessBaseline", () => {
   it("records the pinned revision, evidence and expected post-apply state", async () => {
     const baseline = await buildGroomingFreshnessBaseline(input());
@@ -191,6 +248,14 @@ describe("buildGroomingFreshnessBaseline", () => {
         labels: ["priority/p1", "status/ready"],
       }),
     );
+  });
+
+  it("uses plan citations when given", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({ citations: [{ id: "repo:src/hit.ts", subject: "repository", state: null }] }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedEvidencePaths).toEqual([]);
   });
 
   it("marks a negative code search as global evidence", async () => {

@@ -106,13 +106,21 @@ export function hasNegativeSearchResult(toolCalls: ExplorationToolCallLike[]): b
   return toolCalls.some((call) => call.name === "search_code" && call.ok && call.bytes === 0);
 }
 
+/**
+ * - `none`: no repository evidence at all.
+ * - `global`: a negative search, a relied-on path that was only surfaced
+ *   (a search hit or a path the model named, never read at the pinned SHA),
+ *   or repository access with no read path to bound it.
+ * - `paths`: everything relied on is a bounded set of read paths.
+ */
 export function deriveEvidenceScope(input: {
   repositoryPaths: string[];
   negativeSearch: boolean;
   repositoryConsulted: boolean;
+  reliesOnSurfacedPath?: boolean;
 }): GroomingEvidenceScope {
-  if (!input.repositoryConsulted && input.repositoryPaths.length === 0) return "none";
-  if (input.negativeSearch || input.repositoryPaths.length === 0) return "global";
+  if (!input.repositoryConsulted && input.repositoryPaths.length === 0 && !input.reliesOnSurfacedPath) return "none";
+  if (input.negativeSearch || input.reliesOnSurfacedPath || input.repositoryPaths.length === 0) return "global";
   return "paths";
 }
 
@@ -167,28 +175,120 @@ export interface RelatedWorkBaselineEntry {
 
 const RELATED_KEY_PATTERN = /^github:(issue|pr):([^#\s]+\/[^#\s]+)#(\d+)$/;
 
+function relatedWorkEntry(key: string, state: string | null): RelatedWorkBaselineEntry | null {
+  if (state !== "open" && state !== "closed" && state !== "merged") return null;
+  const match = RELATED_KEY_PATTERN.exec(key);
+  if (!match) return null;
+  return {
+    key,
+    kind: match[1] === "pr" ? "pull_request" : "issue",
+    repo: match[2],
+    number: Number(match[3]),
+    state,
+  };
+}
+
 /**
- * The related work a result relied on: issues/PRs the run read directly and
- * whose state it observed. Search hits are excluded (the search index lags,
- * and a hit is incidental rather than cited), as are commits (no state).
+ * Heuristic related-work reliance, for a plan that cites none: issues/PRs the
+ * run read directly and whose state it observed. Search hits are excluded
+ * (the search index lags, and a hit is incidental), as are commits (no state).
  */
 export function relatedWorkBaseline(sources: EvidenceSource[]): RelatedWorkBaselineEntry[] {
   const entries: RelatedWorkBaselineEntry[] = [];
   for (const source of sources) {
     if (source.provenance === "repository") continue;
-    if (source.via !== "read" || source.state === null) continue;
-    const match = RELATED_KEY_PATTERN.exec(source.key);
-    if (!match) continue;
-    entries.push({
-      key: source.key,
-      kind: match[1] === "pr" ? "pull_request" : "issue",
-      repo: match[2],
-      number: Number(match[3]),
-      state: source.state,
-    });
+    if (source.via !== "read") continue;
+    const entry = relatedWorkEntry(source.key, source.state);
+    if (!entry) continue;
+    entries.push(entry);
     if (entries.length >= MAX_BASELINE_RELATED_WORK) break;
   }
   return entries;
+}
+
+/**
+ * A plan citation (#1062's GroomingPlanCitation), structurally: the evidence
+ * id the plan cited, its subject, and the related-work state it saw.
+ */
+export interface FreshnessCitation {
+  id: string;
+  subject: string;
+  state: string | null;
+}
+
+const REPOSITORY_CITATION_PREFIX = "repo:";
+
+export interface EvidenceReliance {
+  /** Read repository paths the result relies on. */
+  repositoryPaths: string[];
+  /** A relied-on repository path was never read (search hit / model claim). */
+  reliesOnSurfacedPath: boolean;
+  relatedWork: RelatedWorkBaselineEntry[];
+  /** Per subject: whether the plan's citations decided it, or the heuristic did. */
+  basis: { repository: "citations" | "heuristic"; relatedWork: "citations" | "heuristic" };
+}
+
+/**
+ * What the result relied on. A plan's citations win for each subject they
+ * cover; a subject the plan cites nothing for falls back to the heuristic
+ * (every read path, every directly read issue/PR), which over-approximates
+ * reliance and so only costs extra re-grooms. Surfaced-only paths never
+ * bound a result: cited, they make it global; uncited, they are ignored
+ * (a surfaced-only run with no read path is global via the empty path set).
+ */
+export function deriveEvidenceReliance(
+  sources: EvidenceSource[],
+  citations: FreshnessCitation[] | undefined,
+): EvidenceReliance {
+  const readPaths: string[] = [];
+  const surfaced = new Set<string>();
+  for (const source of sources) {
+    if (source.provenance !== "repository") continue;
+    if (source.via === "read") {
+      if (!readPaths.includes(source.path)) readPaths.push(source.path);
+    } else {
+      surfaced.add(source.path);
+    }
+  }
+  const readSet = new Set(readPaths);
+
+  const cited = citations ?? [];
+  const citedRepo = cited
+    .filter((c) => c.subject === "repository" && c.id.startsWith(REPOSITORY_CITATION_PREFIX))
+    .map((c) => c.id.slice(REPOSITORY_CITATION_PREFIX.length));
+  const citedRelated = cited.filter((c) => c.subject === "related_work");
+
+  let repositoryPaths: string[];
+  let reliesOnSurfacedPath = false;
+  let repositoryBasis: EvidenceReliance["basis"]["repository"] = "heuristic";
+  if (citedRepo.length > 0) {
+    repositoryBasis = "citations";
+    repositoryPaths = [...new Set(citedRepo.filter((path) => readSet.has(path)))];
+    reliesOnSurfacedPath = citedRepo.some((path) => !readSet.has(path));
+  } else {
+    repositoryPaths = readPaths;
+  }
+
+  let relatedWork: RelatedWorkBaselineEntry[];
+  let relatedBasis: EvidenceReliance["basis"]["relatedWork"] = "heuristic";
+  if (citedRelated.length > 0) {
+    relatedBasis = "citations";
+    relatedWork = [];
+    for (const citation of citedRelated) {
+      const entry = relatedWorkEntry(citation.id, citation.state);
+      if (entry && !relatedWork.some((existing) => existing.key === entry.key)) relatedWork.push(entry);
+      if (relatedWork.length >= MAX_BASELINE_RELATED_WORK) break;
+    }
+  } else {
+    relatedWork = relatedWorkBaseline(sources);
+  }
+
+  return {
+    repositoryPaths: repositoryPaths.slice(0, MAX_BASELINE_PATHS),
+    reliesOnSurfacedPath,
+    relatedWork,
+    basis: { repository: repositoryBasis, relatedWork: relatedBasis },
+  };
 }
 
 /** Tolerant reader for the persisted JSON column. */
@@ -263,6 +363,8 @@ export interface GroomingFreshnessInput {
   repositoryQueries: string[];
   explorationRan: boolean;
   explorationToolCalls: ExplorationToolCallLike[];
+  /** The validated plan's citations (#1062), when there is a plan. */
+  citations?: FreshnessCitation[];
   /** Returns the subset of dependency keys whose issue is currently open. */
   resolveOpenKeys: (keys: string[]) => Promise<Set<string>>;
 }
@@ -279,17 +381,12 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
   const body = input.appliedBody ?? (liveCaptured ? evidence.issue.body : input.candidate.body);
   const state = input.closed ? "closed" : liveCaptured ? evidence.issue.state : "open";
 
-  const repositoryPaths: string[] = [];
-  for (const source of evidence.sources) {
-    if (source.provenance !== "repository") continue;
-    if (repositoryPaths.includes(source.path)) continue;
-    repositoryPaths.push(source.path);
-    if (repositoryPaths.length >= MAX_BASELINE_PATHS) break;
-  }
+  const reliance = deriveEvidenceReliance(evidence.sources, input.citations);
   const scope = deriveEvidenceScope({
-    repositoryPaths,
+    repositoryPaths: reliance.repositoryPaths,
     negativeSearch: hasNegativeSearchResult(input.explorationToolCalls),
     repositoryConsulted: input.explorationRan || input.repositoryQueries.length > 0,
+    reliesOnSurfacedPath: reliance.reliesOnSurfacedPath,
   });
 
   const dependencyKeys = dependencyKeysForIssue(body, input.repoFullName, input.issueNumber);
@@ -304,10 +401,10 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     groomedEvidenceDigest: evidence.evidenceDigest || null,
     groomedEvidenceCapturedAt: input.evidenceWindowStart,
     groomedEvidenceScope: scope,
-    groomedEvidencePaths: repositoryPaths,
+    groomedEvidencePaths: reliance.repositoryPaths,
     groomedDependencyKeys: dependencyKeys,
     groomedOpenBlockerKeys: dependencyKeys.filter((key) => openKeys.has(key)).sort(),
-    groomedRelatedWork: relatedWorkBaseline(evidence.sources),
+    groomedRelatedWork: reliance.relatedWork,
     groomingVerifiedSha: evidence.headSha,
     groomingStaleAt: null,
     groomingStaleReasons: [],

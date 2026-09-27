@@ -26,7 +26,13 @@ export interface EvidenceComment {
 export interface RepositoryEvidenceSource {
   path: string;
   provenance: "repository";
-  ref: string | null; // the pinned head SHA this run read at
+  /**
+   * "read": the file was fetched at `ref`. "surfaced": the path only came
+   * from a code-search hit (the default-branch index, not the pinned SHA) or
+   * from the model's own findings, so it is never pinned (`ref: null`).
+   */
+  via: "read" | "surfaced";
+  ref: string | null; // the pinned head SHA this run read at; null when surfaced or unpinned
 }
 
 /**
@@ -157,28 +163,45 @@ export function computeEvidenceDigest(parts: {
   return sha256Hex(JSON.stringify(canonical));
 }
 
-/**
- * Append repository paths read during exploration as provenanced evidence.
- * Returns a NEW snapshot (input is not mutated), dedupes by path (first
- * wins), and bounds the list so a runaway exploration cannot bloat it.
- * Each source is stamped with the run's pinned head SHA.
- */
 function sourceIdentity(source: EvidenceSource): string {
   return source.provenance === "repository" ? `path:${source.path}` : `key:${source.key}`;
 }
 
+/**
+ * Append repository paths as provenanced evidence. Returns a NEW snapshot
+ * (input is not mutated), dedupes by path, and bounds the list so a runaway
+ * exploration cannot bloat it.
+ *
+ * `via: "read"` paths were fetched at the pinned ref and are stamped with the
+ * run's head SHA. `via: "surfaced"` paths (code-search hits, paths the model
+ * named) were not read at that SHA, so they carry `ref: null`. A read
+ * supersedes an earlier surfaced entry for the same path; otherwise the
+ * first entry wins.
+ */
 export function addEvidenceSources(
   snapshot: GroomingEvidenceSnapshot,
   paths: string[],
+  via: RepositoryEvidenceSource["via"] = "read",
 ): GroomingEvidenceSnapshot {
-  const seen = new Set(snapshot.sources.map((source) => sourceIdentity(source)));
   const sources: EvidenceSource[] = [...snapshot.sources];
+  const indexByIdentity = new Map(sources.map((source, index) => [sourceIdentity(source), index]));
   for (const path of paths) {
-    if (sources.length >= MAX_EVIDENCE_SOURCES) break;
     const identity = `path:${path}`;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    sources.push({ path, provenance: "repository", ref: snapshot.headSha });
+    const entry: RepositoryEvidenceSource = {
+      path,
+      provenance: "repository",
+      via,
+      ref: via === "read" ? snapshot.headSha : null,
+    };
+    const existing = indexByIdentity.get(identity);
+    if (existing !== undefined) {
+      const current = sources[existing] as RepositoryEvidenceSource;
+      if (current.via === "surfaced" && via === "read") sources[existing] = entry;
+      continue;
+    }
+    if (sources.length >= MAX_EVIDENCE_SOURCES) break;
+    indexByIdentity.set(identity, sources.length);
+    sources.push(entry);
   }
   return { ...snapshot, sources };
 }
@@ -254,7 +277,7 @@ export function summarizeEvidenceForPersistence(snapshot: GroomingEvidenceSnapsh
     sourceCount: snapshot.sources.length,
     sources: snapshot.sources.slice(0, MAX_PERSISTED_SOURCES).map((source) =>
       source.provenance === "repository"
-        ? { path: source.path, provenance: source.provenance, ref: source.ref }
+        ? { path: source.path, provenance: source.provenance, via: source.via, ref: source.ref }
         : {
             key: source.key,
             provenance: source.provenance,

@@ -129,7 +129,7 @@ describe("runGroomingFreshnessPass", () => {
       headSha: "sha-1",
       defaultBranch: "main",
       evidenceDigest: "d",
-      sources: [{ path: "src/a.ts", provenance: "repository", ref: "sha-1" }],
+      sources: [{ path: "src/a.ts", provenance: "repository", via: "read", ref: "sha-1" }],
       issue: { number: 1, title: "Short", body: "Old body", labels: [], state: "open", updatedAt: "", url: "" },
     } as unknown as GroomingEvidenceSnapshot;
     const baseline = await buildGroomingFreshnessBaseline({

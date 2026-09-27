@@ -194,6 +194,26 @@ describe("exploreRepository", () => {
     expect(result.sources).toEqual(["src/lib/prisma.ts"]);
   });
 
+  it("separates files actually read from search hits and submitted paths (dispatch#1062)", async () => {
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "search_code", { query: "PrismaPg" })] },
+      { content: null, tool_calls: [toolCall("2", "read_file", { path: "src/lib/prisma.ts" })] },
+      { content: null, tool_calls: [toolCall("3", "submit_findings", { files: ["src/lib/db.ts"], ask: "a" })] },
+    );
+    const deps = makeDeps(
+      {
+        searchCode: vi.fn().mockResolvedValue([{ path: "src/lib/prisma.ts" }, { path: "src/lib/other.ts" }]),
+        readFile: vi.fn().mockResolvedValue("const adapter = new PrismaPg(url);"),
+      },
+      fetchImpl,
+    );
+
+    const result = await exploreRepository(options, deps);
+
+    expect(result.sources).toEqual(["src/lib/prisma.ts", "src/lib/other.ts", "src/lib/db.ts"]);
+    expect(result.readSources).toEqual(["src/lib/prisma.ts"]);
+  });
+
   it("counts related-work bytes against the exploration byte budget", async () => {
     const big = { evidenceKey: "issue:org/repo#1", body: "x".repeat(300) };
     const fetchImpl = fetchReturning({
