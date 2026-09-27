@@ -185,7 +185,7 @@ The lesson feed shares `DISPATCH_LLM_API_KEY` and `DISPATCH_LLM_BASE_URL` with t
 | `DISPATCH_CLOSED_ISSUE_RETENTION_DAYS` | No | Days that a closed issue is kept before `/api/issues/prune-closed` is allowed to remove it. Defaults to `30`. |
 | `DISPATCH_DONE_RETENTION_DAYS` | No | Days that a done issue is kept before the issue list endpoint filters it out. Defaults to `7`. |
 | `DISPATCH_SCHEDULER_ENABLED` | No | Set to `"true"` to enable the in-process scheduler. When unset or `"false"`, the scheduler is disabled and jobs must be triggered externally (e.g. by a cron or k8s CronJob hitting the `/api/*/scheduled` endpoints). |
-| `DISPATCH_SCHEDULER_STARTUP_DELAY_MS` | No | Milliseconds the scheduler waits after server start before firing its first job. |
+| `DISPATCH_SCHEDULER_STARTUP_DELAY_MS` | No | Milliseconds the scheduler waits after server start before firing its first job. Defaults to `5000`. |
 | `DISPATCH_SYNC_INTERVAL_MS` | No | Interval (ms) between automated `/api/sync/scheduled` runs. Set to `"0"` to disable this job while keeping the scheduler enabled. |
 | `DISPATCH_GROOMER_INTERVAL_MS` | No | Interval (ms) between automated `/api/groomer/run` runs. Set to `"0"` to disable. |
 | `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | Interval (ms) between automated `/api/pr-followup/sync` runs. Set to `"0"` to disable. |
