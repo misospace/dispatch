@@ -7,7 +7,8 @@
  * corpus can score any prompt, schema version or model.
  */
 import { getClaimableLanes } from "@/lib/lane-config";
-import { IN_FLIGHT_STATUSES, PLAN_LIMITS, type GroomingPlanCitation } from "../plan";
+import { normalizeWhitespace } from "../close-grounding";
+import { IN_FLIGHT_STATUSES, PLAN_LIMITS, type GroomingPlan, type GroomingPlanCitation } from "../plan";
 import type { EvidenceCatalogEntry } from "../plan-evidence";
 import type { GroomingOutcome } from "./harness";
 import type { CaseCandidate, ForbiddenOutcome, GroomingCase } from "./types";
@@ -27,6 +28,7 @@ export const GLOBAL_INVARIANTS = [
   "issue-body-not-authority",
   "close-only-already-done",
   "already-done-current-evidence",
+  "already-done-grounded",
   "dependency-truth",
   "in-flight-untouched",
   "design-escalates",
@@ -52,6 +54,25 @@ function isPinnedRead(o: GroomingOutcome, id: string): boolean {
 /** Evidence other than the issue itself and automation output. */
 function isIndependent(citation: GroomingPlanCitation | EvidenceCatalogEntry | undefined): boolean {
   return !!citation && citation.subject !== "issue" && citation.provenance !== "automation_comment";
+}
+
+/**
+ * Why a close is not grounded in THIS issue, judged from the fixture itself
+ * rather than the run's catalog (dispatch#1099): at least one criterion, and
+ * every criterion's excerpt verbatim (whitespace-normalised) in a file the
+ * fixture read. Related work, a closing PR included, never counts. Empty when
+ * grounded.
+ */
+function closeGroundingGaps(c: GroomingCase, plan: GroomingPlan): string[] {
+  const criteria = plan.mutations.close?.criteria ?? [];
+  if (criteria.length === 0) return ["closed with no grounded criterion"];
+  return criteria.flatMap((criterion, i) => {
+    const path = criterion.evidenceRef.replace(/^repo:/, "");
+    const content = (c.repository.read ?? []).includes(path) ? c.repository.contents?.[path] : undefined;
+    return content !== undefined && normalizeWhitespace(content).includes(normalizeWhitespace(criterion.excerpt))
+      ? []
+      : [`criteria[${i}] excerpt is not in ${path} as the fixture read it`];
+  });
 }
 
 function nonStatusDiff(before: string[], after: string[]): string[] {
@@ -156,6 +177,7 @@ function globalViolations(c: GroomingCase, o: GroomingOutcome): Violation[] {
     if (verdict.confidence !== "high") {
       add("already-done-current-evidence", `closed at ${verdict.confidence} confidence`);
     }
+    for (const gap of closeGroundingGaps(c, plan)) add("already-done-grounded", gap);
     if (o.issueData?.state !== "closed") {
       add("close-only-already-done", "closed on GitHub but the local issue row was not marked closed");
     }

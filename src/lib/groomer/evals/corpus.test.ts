@@ -127,6 +127,17 @@ describe("grooming corpus", () => {
       expect(ids(c, outcome).filter((id) => id === "automation-never-authority")).toHaveLength(3);
     });
 
+    it("already-done-grounded fails when a close rests on a sibling's evidence (dispatch#1099)", async () => {
+      const c = byId("already-done-grounded");
+      const outcome = await runCandidate(c, accepted(c, "every criterion quoted from the expected files at head closes it"));
+      expect(ids(c, outcome)).toEqual([]);
+      const close = outcome.plan!.mutations.close!;
+      outcome.plan!.mutations.close = { ...close, evidenceRefs: [...close.evidenceRefs, "github:pr:acme/storefront#316"], criteria: [] };
+      expect(ids(c, outcome)).toEqual(["already-done-grounded"]);
+      outcome.plan!.mutations.close = { ...close, criteria: [{ ...close.criteria![0], excerpt: "dry-run is supported" }] };
+      expect(ids(c, outcome)).toEqual(["already-done-grounded"]);
+    });
+
     it("exactly-one-status fails when a groom leaves two statuses", async () => {
       const c = byId("exactly-one-status");
       const outcome = await runCandidate(c, accepted(c, "re-grooms to backlog"));

@@ -104,7 +104,7 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
 }
 ```
 
-`generation` is **required for bearer (agent/bridge) marks** — a bearer request without it is rejected with `400` (`generation is required for agent/bridge marks (#1074)`) — and optional for operator paths (OIDC session, basic auth, disabled mode), which keep the unconditional behavior for compatibility. When supplied, the write is generation-conditional: if the item's current generation no longer matches, the request is rejected with `409` and nothing is mutated (the caller's read predates a re-issued attempt). A `FIXED` mark additionally re-reads the item's per-attempt `attemptHeadSha` baseline before writing; if the PR head has not moved since the attempt was recorded, the item is refused `FIXED` (back to `QUEUED`) — and the refusal never transiently stores `FIXED`. A mark for an unknown item returns `404`.
+`generation` is **required for bearer (agent/bridge) marks** — a bearer request without it is rejected with `400` (`generation is required for agent/bridge marks (#1074)`) — and optional for operator paths (OIDC session, basic auth, disabled mode), which keep the unconditional behavior for compatibility. When supplied, the write is generation-conditional: if the item's current generation no longer matches, the request is rejected with `409` and nothing is mutated (the caller's read predates a re-issued attempt). A `FIXED` mark additionally re-reads the item's per-attempt `attemptHeadSha` baseline before writing; if the PR head has not moved since the attempt was recorded, the item is refused `FIXED` (back to `QUEUED`, or `BLOCKED` once the attempt cap is spent) — and the refusal never transiently stores `FIXED`. Every fresh attempt (enqueue reopen, requeue, mark back to `QUEUED`, refusal) records its baseline from the newest head Dispatch has observed, so a sync that sees the worker's push before its report cannot turn a real fix into a refusal. A mark for an unknown item returns `404`.
 
 ## Assignment queue behavior
 
@@ -179,3 +179,7 @@ QUEUED → IGNORED (deliberately skipped)
 ```
 
 `NEEDS_HUMAN` lane items start with `BLOCKED` status and require explicit marking to change state.
+
+### Attempt cap
+
+`PR_FIX_MAX_ATTEMPTS` (default 5) bounds dispatched fix attempts per item, tracked as `fixAttempts`. An item starts at attempt 1; each return to `QUEUED` (new evidence after a fix, the #940 no-progress reopen, a mark back to `QUEUED`, a refused no-push `FIXED`) is another attempt. Once the count reaches the cap, the next return goes to `BLOCKED` in the `NEEDS_HUMAN` lane instead. Evidence that lands while the item is already `QUEUED`, such as the other inline comments of the same review, is the same attempt and never counts. `POST /api/pr-fix-queue/requeue` resets the count to 1.

@@ -153,6 +153,11 @@ export async function runCandidate(
     ask: null,
     sources: [...read, ...surfaced],
     readSources: [...read],
+    readContents: read.flatMap((path) =>
+      c.repository.contents?.[path] !== undefined
+        ? [{ path, ref: c.repository.headSha, content: c.repository.contents[path] }]
+        : [],
+    ),
     toolCalls: [],
     bytes: 0,
     warnings: [],

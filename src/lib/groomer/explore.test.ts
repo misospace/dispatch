@@ -45,6 +45,7 @@ function makeDeps(overrides: Partial<ExploreDeps["tools"]> = {}, fetchImpl?: typ
       fetchRelatedPullRequest: vi.fn().mockResolvedValue({}),
       fetchRelatedCommit: vi.fn().mockResolvedValue({}),
       searchRelatedWork: vi.fn().mockResolvedValue([]),
+      fetchPullRequestClosingIssues: vi.fn().mockResolvedValue({ issues: [], truncated: false }),
       ...overrides,
     },
     fetchImpl: fetchImpl ?? fetchReturning({ content: "done", tool_calls: [] }),
@@ -212,6 +213,8 @@ describe("exploreRepository", () => {
 
     expect(result.sources).toEqual(["src/lib/prisma.ts", "src/lib/other.ts", "src/lib/db.ts"]);
     expect(result.readSources).toEqual(["src/lib/prisma.ts"]);
+    // What the read showed the model, for close-excerpt checks (dispatch#1099).
+    expect(result.readContents).toEqual([{ path: "src/lib/prisma.ts", ref: null, content: "const adapter = new PrismaPg(url);" }]);
   });
 
   it("counts related-work bytes against the exploration byte budget", async () => {
@@ -415,5 +418,18 @@ describe("exploreRepository pinned ref", () => {
     await exploreRepository({ ...options, pinnedRef: "deadbeef" }, deps);
 
     expect(deps.tools.readFile).toHaveBeenCalledWith("org/repo", "src/lib/prisma.ts", "deadbeef");
+  });
+
+  it("records each read's content at the pinned ref, even when the model never submits", async () => {
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "read_file", { path: "src/a.ts" }), toolCall("2", "read_file", { path: "missing.ts" })] },
+      { content: "done", tool_calls: [] },
+    );
+    const readFile = vi.fn().mockImplementation(async (_repo: string, path: string) => (path === "src/a.ts" ? "export const a = 1;" : ""));
+    const deps = makeDeps({ readFile }, fetchImpl);
+
+    const result = await exploreRepository({ ...options, pinnedRef: "deadbeef" }, deps);
+
+    expect(result.readContents).toEqual([{ path: "src/a.ts", ref: "deadbeef", content: "export const a = 1;" }]);
   });
 });

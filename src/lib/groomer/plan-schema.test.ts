@@ -74,10 +74,20 @@ describe("buildGroomingPlanResponseSchema", () => {
     expect(schema.properties.relatedWork.items.properties.ref.enum).toEqual(["github:pr:org/repo#2"]);
   });
 
+  it("bounds already_done close criteria and constrains their evidence to repository ids (dispatch#1099)", () => {
+    const close = schema.properties.mutations.properties.close.anyOf[1];
+    const criteria = close.properties.criteria;
+    expect(close.required).toContain("criteria");
+    expect(criteria.maxItems).toBe(12);
+    expect(criteria.items.properties.evidenceRef.enum).toEqual(["repo:src/a.ts"]);
+    expect(criteria.items.properties.excerpt).toMatchObject({ type: "string", minLength: 24, maxLength: 300 });
+  });
+
   it("forces arrays empty when the catalog has no ids of the needed kind", () => {
     const bare = buildGroomingPlanResponseSchema(buildEvidenceCatalog({ ...snapshot, sources: [] })) as Node;
     expect(bare.properties.relatedWork.maxItems).toBe(0);
     expect(bare.properties.implementationBrief.anyOf[1].properties.relevantPaths.maxItems).toBe(0);
+    expect(bare.properties.mutations.properties.close.anyOf[1].properties.criteria.maxItems).toBe(0);
   });
 
   it("falls back to bounded strings without a catalog", () => {

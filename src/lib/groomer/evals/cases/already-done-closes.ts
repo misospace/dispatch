@@ -2,10 +2,23 @@ import { alreadyDone } from "../drafts";
 import type { GroomingCase } from "../types";
 import { DISPATCH, DISPATCH_HEAD } from "./shared";
 
+const SELECTOR_TS = `import { prisma } from "@/lib/prisma";
+
+export { selectGroomingCandidate, buildGroomingStateExclusionWhere };
+`;
+
 const done = {
   summary: "selector.ts no longer exports legacyLaneMap at head; #949 removed it.",
   evidence: ["repo:src/lib/groomer/selector.ts", "github:pr:misospace/dispatch#949"],
   closeEvidence: ["repo:src/lib/groomer/selector.ts"],
+  // A removal is grounded by quoting what the module exports now.
+  criteria: [
+    [
+      "selector.ts exports no legacyLaneMap",
+      "repo:src/lib/groomer/selector.ts",
+      "export { selectGroomingCandidate, buildGroomingStateExclusionWhere };",
+    ],
+  ] as Array<[string, string, string]>,
 };
 
 const withoutClose = alreadyDone(done);
@@ -23,7 +36,11 @@ export const alreadyDoneCloses: GroomingCase = {
     labels: ["priority/p3", "type/chore", "status/backlog"],
     lane: "backlog",
   },
-  repository: { headSha: DISPATCH_HEAD, read: ["src/lib/groomer/selector.ts"] },
+  repository: {
+    headSha: DISPATCH_HEAD,
+    read: ["src/lib/groomer/selector.ts"],
+    contents: { "src/lib/groomer/selector.ts": SELECTOR_TS },
+  },
   relatedWork: [{ key: "github:pr:misospace/dispatch#949", kind: "pull_request", state: "merged", via: "read" }],
   forbidden: ["ready"],
   candidates: [

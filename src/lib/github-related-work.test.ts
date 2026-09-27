@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   RelatedWorkNotFoundError,
+  fetchPullRequestClosingIssues,
   fetchRelatedCommit,
   fetchRelatedIssue,
   fetchRelatedPullRequest,
@@ -291,6 +292,46 @@ describe("github-related-work", () => {
       // empty and the total stays within maxBytes.
       expect(issue.bodyExcerpt).toBe("");
       expect(Buffer.byteLength(issue.bodyExcerpt, "utf8")).toBeLessThanOrEqual(2);
+    });
+  });
+
+  describe("fetchPullRequestClosingIssues (dispatch#1099)", () => {
+    it("asks GraphQL for the PR's closing references, bounded, and returns owner/repo#N keys", async () => {
+      fetchSpy.mockResolvedValueOnce(
+        mockResponse({
+          data: {
+            repository: {
+              pullRequest: {
+                closingIssuesReferences: {
+                  totalCount: 3,
+                  nodes: [
+                    { number: 587, repository: { nameWithOwner: "org/repo" } },
+                    { number: 9, repository: { nameWithOwner: "other/repo" } },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      );
+
+      const result = await fetchPullRequestClosingIssues("org/repo", 590, { maxResults: 2 });
+
+      expect(result).toEqual({ issues: ["org/repo#587", "other/repo#9"], truncated: true });
+      const [url, init] = fetchSpy.mock.calls[0]!;
+      expect(String(url)).toBe("https://api.github.com/graphql");
+      expect(init?.method).toBe("POST");
+      const body = JSON.parse(String(init?.body));
+      expect(body.variables).toEqual({ owner: "org", repo: "repo", number: 590, first: 2 });
+      expect(body.query).toContain("closingIssuesReferences(first: $first)");
+      expect(body.query).not.toMatch(/mutation/);
+    });
+
+    it("throws on an HTTP error or a GraphQL error payload, so the caller can treat the references as unknown", async () => {
+      fetchSpy.mockResolvedValueOnce(mockResponse("nope", { status: 401 }));
+      await expect(fetchPullRequestClosingIssues("org/repo", 1)).rejects.toThrow(/401/);
+      fetchSpy.mockResolvedValueOnce(mockResponse({ data: { repository: { pullRequest: null } }, errors: [{ message: "Could not resolve" }] }));
+      await expect(fetchPullRequestClosingIssues("org/repo", 1)).rejects.toThrow(/Could not resolve/);
     });
   });
 

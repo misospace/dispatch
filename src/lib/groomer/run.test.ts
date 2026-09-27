@@ -214,6 +214,12 @@ const mockConfig: HostedGroomerConfig = {
   exploration: { maxTotalBytes: 24576, maxFileBytes: 8192, timeoutMs: 150000, source: "medium" },
 };
 
+const LOGIN_TS = "export function redirectAfterLogin(session: Session) {\n  return session.returnTo ?? \"/\";\n}\n";
+/** An already_done close's criterion, grounded in login.ts as read at the pin (dispatch#1099). */
+const GROUNDED_CRITERIA = [
+  { criterion: "login redirects to the saved return URL", evidenceRef: "repo:src/auth/login.ts", excerpt: 'return session.returnTo ?? "/";' },
+];
+
 const mockAutomationRepo = { id: "repo-1", fullName: "org/repo", enabled: true };
 const mockGroomingRun = { id: "gr-1", stage: "selected" };
 
@@ -245,6 +251,7 @@ const mockExploration: ExploreResult = {
   ask: null,
   sources: ["src/x.ts"],
   readSources: [],
+  readContents: [],
   toolCalls: [],
   bytes: 0,
   warnings: [],
@@ -285,6 +292,9 @@ describe("runHostedGroomer", () => {
       warnings: [],
       bytes: 0,
       queries: [],
+      // What the run read at the pinned head: the content close excerpts are
+      // checked against (dispatch#1099).
+      files: [{ path: "src/auth/login.ts", ref: "abc123", content: LOGIN_TS }],
     });
     // The live issue defaults to the candidate this run selected, so the
     // snapshot and the apply-time re-capture agree unless a test says not.
@@ -1413,7 +1423,7 @@ Investigate session handling in auth module.`;
         mocks.selectGroomingCandidate.mockResolvedValue(inReview);
         mocks.callGroomerLLM.mockResolvedValue(
           notReadyDraft("already_done", {
-            mutations: { close: { reason: "already_done", rationale: "gone", evidenceRefs: ["repo:src/auth/login.ts"] } },
+            mutations: { close: { reason: "already_done", rationale: "gone", evidenceRefs: ["repo:src/auth/login.ts"], criteria: GROUNDED_CRITERIA } },
           }),
         );
 
@@ -1472,7 +1482,7 @@ Investigate session handling in auth module.`;
       },
       mutations: {
         githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
-        close: { reason: "already_done", rationale: "login.ts no longer has the step", evidenceRefs: ["repo:src/auth/login.ts"] },
+        close: { reason: "already_done", rationale: "login.ts no longer has the step", evidenceRefs: ["repo:src/auth/login.ts"], criteria: GROUNDED_CRITERIA },
       },
     });
 
@@ -1960,7 +1970,7 @@ Investigate session handling in auth module.`;
           verdict: { lane: { id: "backlog", confidence: "high", reason: "gone" } },
           mutations: {
             githubComment: "Closing: already fixed on main.",
-            close: { reason: "already_done", rationale: "login.ts keeps returnTo", evidenceRefs: ["repo:src/auth/login.ts"] },
+            close: { reason: "already_done", rationale: "login.ts keeps returnTo", evidenceRefs: ["repo:src/auth/login.ts"], criteria: GROUNDED_CRITERIA },
           },
         }),
       );
@@ -2038,7 +2048,7 @@ Investigate session handling in auth module.`;
       const close = (evidenceRefs: string[], confidence: "high" | "medium" = "high") =>
         notReadyDraft("already_done", {
           verdict: { confidence, lane: { id: "backlog", confidence: "high", reason: "gone" } },
-          mutations: { githubComment: "Closing.", close: { reason: "already_done", rationale: "fixed", evidenceRefs } },
+          mutations: { githubComment: "Closing.", close: { reason: "already_done", rationale: "fixed", evidenceRefs, criteria: GROUNDED_CRITERIA } },
         });
 
       it("rejects a medium-confidence already_done: nothing is closed or written", async () => {

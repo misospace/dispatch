@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { setLaneConfig } from "@/lib/lane-config";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog, type EvidenceCatalog } from "./plan-evidence";
+import { collectPinnedReadContent } from "./close-grounding";
 import {
   GROOMING_PLAN_SCHEMA_VERSION,
   PLAN_LIMITS,
@@ -63,6 +64,17 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
 
 const catalog = (overrides: Partial<GroomingEvidenceSnapshot> = {}): EvidenceCatalog =>
   buildEvidenceCatalog(snapshot(overrides));
+
+const LOGIN_TS = "export function redirectAfterLogin(session: Session) {\n  return session.returnTo ?? \"/\";\n}\n";
+const GROUNDED = [
+  { criterion: "login redirects to the saved return URL", evidenceRef: "repo:src/auth/login.ts", excerpt: 'return session.returnTo ?? "/";' },
+];
+
+/** A catalog carrying login.ts as read at the pinned head, for close grounding (dispatch#1099). */
+const groundedCatalog = (overrides: Partial<GroomingEvidenceSnapshot> = {}): EvidenceCatalog => {
+  const snap = snapshot(overrides);
+  return buildEvidenceCatalog(snap, collectPinnedReadContent(snap.headSha, [{ path: "src/auth/login.ts", ref: snap.headSha, content: LOGIN_TS }]));
+};
 
 function readyDraft(): GroomingPlanDraft {
   return {
@@ -535,10 +547,68 @@ describe("GroomingPlan validation failures", () => {
 
     it("accepts already_done backed by pinned repository evidence, with related work as corroboration", () => {
       for (const refs of [["repo:src/auth/login.ts"], ["repo:src/auth/login.ts", "github:pr:org/repo#12", "comment:101"]]) {
-        const plan = validPlan(done({ mutations: { close: { reason: "already_done", rationale: "fixed by #12", evidenceRefs: refs } } }));
+        const plan = validPlan(
+          done({ mutations: { close: { reason: "already_done", rationale: "fixed by #12", evidenceRefs: refs, criteria: GROUNDED } } }),
+          groundedCatalog(),
+        );
         expect(plan.mutations.status).toBe("status/done");
         expect(plan.readiness.ready).toBe(false);
+        expect(plan.mutations.close?.criteria).toEqual(GROUNDED);
+        expect(plan.citations.map((c) => c.id)).toContain("repo:src/auth/login.ts");
       }
+    });
+
+    describe("grounding in this issue's acceptance (dispatch#1099)", () => {
+      const close = (criteria: typeof GROUNDED, evidenceRefs = ["repo:src/auth/login.ts"]) =>
+        done({ mutations: { close: { reason: "already_done", rationale: "r", evidenceRefs, criteria } } });
+
+      it("rejects a close that grounds no criterion, even on pinned repository evidence", () => {
+        expectInvalid(close([]), "already_done must ground every acceptance criterion", groundedCatalog());
+      });
+
+      it("rejects an excerpt that is not verbatim in the file as read", () => {
+        expectInvalid(
+          close([{ ...GROUNDED[0], excerpt: "redirect keeps the returnTo URL" }]),
+          "mutations.close.criteria[0].excerpt: not found verbatim in src/auth/login.ts",
+          groundedCatalog(),
+        );
+      });
+
+      it("accepts an excerpt re-wrapped across lines: whitespace is normalised, nothing else", () => {
+        validPlan(close([{ ...GROUNDED[0], excerpt: "redirectAfterLogin(session: Session) {\n    return session.returnTo" }]), groundedCatalog());
+        expectInvalid(close([{ ...GROUNDED[0], excerpt: 'RETURN session.returnTo ?? "/";' }]), "not found verbatim", groundedCatalog());
+      });
+
+      it("rejects criteria cited on a path whose content was not captured at the pinned head", () => {
+        expectInvalid(close(GROUNDED), "is not available to check the excerpt against", catalog());
+        expectInvalid(
+          close([{ ...GROUNDED[0], evidenceRef: "repo:src/auth/session.ts" }]),
+          "the content of src/auth/session.ts as read at the pinned head is not available",
+          groundedCatalog(),
+        );
+      });
+
+      it("rejects a criterion evidenced by a non-repository citation", () => {
+        expectInvalid(close([{ ...GROUNDED[0], evidenceRef: "github:pr:org/repo#12" }]), 'must be a repository evidence reference', groundedCatalog());
+      });
+
+      it("requires every acceptance criterion the issue lists", () => {
+        const body = "## Acceptance criteria\n\n- [ ] Login redirects to the saved return URL.\n- [ ] A reset-then-login test covers it.";
+        const cat = groundedCatalog({ issue: { ...snapshot().issue, body } });
+        const errors = expectInvalid(close(GROUNDED), 'not grounded: "A reset-then-login test covers it."', cat);
+        expect(errors.join("\n")).not.toContain("Login redirects to the saved return URL");
+      });
+
+      it("requires one grounded citation among the issue's expected files", () => {
+        const body = "## Expected files\n\n`src/auth/session.ts`\n`src/auth/login.test.ts`";
+        expectInvalid(
+          close(GROUNDED),
+          "the issue names expected files (src/auth/session.ts, src/auth/login.test.ts); at least one grounded citation must be one of them",
+          groundedCatalog({ issue: { ...snapshot().issue, body } }),
+        );
+        const named = "## Expected files\n\n`src/auth/login.ts`";
+        validPlan(close(GROUNDED), groundedCatalog({ issue: { ...snapshot().issue, body: named } }));
+      });
     });
 
     it("refuses to close on the issue itself or automation comments", () => {

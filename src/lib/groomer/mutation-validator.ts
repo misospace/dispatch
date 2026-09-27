@@ -24,6 +24,7 @@ import {
 } from "./freshness";
 import { evaluateReadiness, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
+import { evaluateCloseGrounding } from "./close-grounding";
 
 // ─── Preconditions ────────────────────────────────────────────────────────────
 
@@ -358,7 +359,11 @@ function isPinnedRepositoryCitation(catalog: EvidenceCatalog, id: string): boole
  * - at least one close citation that is repository content read at the
  *   pinned head SHA (direct current-revision evidence), not only a PR,
  *   commit or comment;
- * - no material uncertainty of any kind.
+ * - no material uncertainty of any kind;
+ * - grounding for THIS issue (dispatch#1099): every acceptance criterion
+ *   backed by a verbatim excerpt of a file read at the pinned head (with one
+ *   of the issue's expected files among them, when it names any), or a cited
+ *   merged PR whose closing reference is this issue.
  * The apply preconditions separately guarantee that the head has not moved
  * under that evidence and the issue is still open.
  */
@@ -378,6 +383,7 @@ export function evaluateClosePolicy(plan: GroomingPlan, catalog: EvidenceCatalog
   plan.verdict.uncertainties.forEach((u, i) => {
     if (u.material) reasons.push(`material uncertainty remains (verdict.uncertainties[${i}]): ${u.question}`);
   });
+  reasons.push(...evaluateCloseGrounding({ evidenceRefs: close.evidenceRefs, criteria: close.criteria ?? [] }, catalog).errors);
   if (plan.evidence.evidenceDigest !== catalog.binding.evidenceDigest) {
     reasons.push("the plan is bound to a different evidence snapshot");
   }
