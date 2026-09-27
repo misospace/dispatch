@@ -166,6 +166,7 @@ const PRE_ADMISSION_SELECT_KEYS = [
   "createdAt",
   "title",
   "body",
+  "nativeBlockedBy",
   "url",
   "labels",
   "currentLane",

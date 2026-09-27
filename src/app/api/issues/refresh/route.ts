@@ -36,7 +36,11 @@ export async function POST(request: NextRequest) {
       return errorResponse(`Repo ${repoFullName} is not tracked. Track it first via /api/repos or the UI.`, 404);
     }
 
-    const refreshResult = await refreshSingleIssue(repoFullName, issueNumber, fetchIssueFromGitHub);
+    const refreshResult = await refreshSingleIssue(
+      repoFullName,
+      issueNumber,
+      (repo, num) => fetchIssueFromGitHub(repo, num, { includeNativeBlockedBy: true }),
+    );
 
     if (!refreshResult.success) {
       return NextResponse.json(
@@ -57,6 +61,7 @@ export async function POST(request: NextRequest) {
         data: {
           title: issueData.title,
           body: issueData.body,
+          nativeBlockedBy: issueData.nativeBlockedBy,
           url: issueData.url,
           labels: issueData.labels,
           assignees: issueData.assignees,

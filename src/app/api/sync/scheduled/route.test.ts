@@ -412,7 +412,7 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
     await POST(makeRequest());
     // Open issues are always full-fetched (dispatch#991); the closed tail is
     // fetched separately so closedIssueStatusFix still runs (#521).
-    expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), { state: "open" });
+    expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), { state: "open", includeNativeBlockers: true });
     expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ state: "closed" }));
   });
 

@@ -392,13 +392,16 @@ describe("POST /api/issues/groom — promote_to_ready", () => {
       updated_at: "2026-08-15T04:00:00Z",
       closed_at: null,
       state: "open",
+      nativeBlockedBy: ["misospace/dispatch#41"],
     });
     const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
     expect(res.status).toBe(200);
-    expect(mocks.fetchIssue).toHaveBeenCalledWith("misospace/dispatch", 42);
+    expect(mocks.fetchIssue).toHaveBeenCalledWith("misospace/dispatch", 42, { includeNativeBlockedBy: true });
     // The refresh writes the freshly-fetched labels back to the cached row.
     const refreshCall = mocks.updateIssue.mock.calls.at(-1)![0];
     expect(refreshCall.data!.labels).toEqual(["status/ready", "priority/p2"]);
+    // ...and the freshly-fetched native blocked_by keys.
+    expect(refreshCall.data!.nativeBlockedBy).toEqual(["misospace/dispatch#41"]);
   });
 });
 

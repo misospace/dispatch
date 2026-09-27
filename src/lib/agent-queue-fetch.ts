@@ -122,6 +122,7 @@ export async function fetchAgentQueueData(
         createdAt: true,
         title: true,
         body: true,
+        nativeBlockedBy: true,
         url: true,
         labels: true,
         currentLane: true,

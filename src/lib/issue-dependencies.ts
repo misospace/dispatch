@@ -98,10 +98,10 @@ const NEGATION_PATTERN = /\b(?:no|not|never|without|neither|nor|cannot)\b|'t\b/;
  * - Negated phrases are not blockers: if the clause preceding a trigger (up to
  *   the nearest clause boundary) contains a negation, that trigger is skipped,
  *   so "does not depend on #5" or "no dependencies on #5" register nothing.
- * - GitHub native `blocked_by` / sub-issue links are not fetched by sync today
- *   (the Issue schema has no such field), so only body-text refs are operative.
- *   The resolver accepts refs from any source, so native links can be fed into
- *   the same gate later without changing this contract.
+ * - GitHub native `blocked_by` links ARE ingested by sync into
+ *   `Issue.nativeBlockedBy` and fed through `parseNativeBlockedBy` +
+ *   `mergeDependencyRefs` into the same gate (#1086). This function itself
+ *   still only parses body text.
  */
 export function parseIssueDependencies(body: string | null | undefined): DependencyRef[] {
   if (body == null) return [];
@@ -201,4 +201,60 @@ export function formatDependencyBlockReason(
     parts.push(rendered);
   }
   return `Blocked by open ${parts.join(", ")}`;
+}
+
+/**
+ * Parse stored native `blocked_by` keys (`owner/repo#N`, or bare `#N`) into
+ * DependencyRef[]. A ref whose repo equals `defaultRepo` (normalized) collapses
+ * to `repo: null`, matching parseIssueDependencies' same-repo convention so
+ * native and body refs for the same blocker dedupe to one dependencyKey and
+ * render identically. Cross-repo refs keep their repo. Never throws; null/
+ * undefined/empty input yields []. Invalid keys (no `#`, non-positive or
+ * non-integer number) are skipped; duplicates (by dependencyKey) are dropped.
+ */
+export function parseNativeBlockedBy(
+  keys: string[] | null | undefined,
+  defaultRepo?: string | null,
+): DependencyRef[] {
+  if (keys == null) return [];
+  const refs: DependencyRef[] = [];
+  const seen = new Set<string>();
+  for (const raw of keys) {
+    if (typeof raw !== "string") continue;
+    const key = raw.trim();
+    const hashIndex = key.lastIndexOf("#");
+    if (hashIndex < 0) continue;
+    const repoPart = key.slice(0, hashIndex).trim();
+    const number = Number(key.slice(hashIndex + 1));
+    if (!Number.isInteger(number) || number <= 0) continue;
+    const repoKey = normalizeRepoKey(repoPart);
+    const repo = repoKey && repoKey !== normalizeRepoKey(defaultRepo) ? repoPart : null;
+    const dedupeKey = dependencyKey(repo, number);
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    refs.push({ repo, number });
+  }
+  return refs;
+}
+
+/**
+ * Merge dependency-ref sources (e.g. native `blocked_by` refs and body-parsed
+ * refs) into one list, deduped by dependencyKey. Order: earlier lists win, and
+ * within the merged list the first occurrence of each key is kept. Null/
+ * undefined lists are treated as empty.
+ */
+export function mergeDependencyRefs(
+  ...lists: Array<DependencyRef[] | null | undefined>
+): DependencyRef[] {
+  const refs: DependencyRef[] = [];
+  const seen = new Set<string>();
+  for (const list of lists) {
+    for (const ref of list ?? []) {
+      const key = dependencyKey(ref.repo, ref.number);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push(ref);
+    }
+  }
+  return refs;
 }

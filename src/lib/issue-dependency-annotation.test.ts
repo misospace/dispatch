@@ -111,3 +111,55 @@ describe("withDependencyBlockReasons", () => {
     expect(annotated[1]).toMatchObject({ ...input[1], dependencyBlockReason: "Blocked by open #20" });
   });
 });
+
+describe("withDependencyBlockReasons native blocked_by (issue #1086)", () => {
+  const nativeIssue = (
+    repo: string,
+    number: number,
+    body: string | null,
+    nativeBlockedBy: string[],
+    state = "open",
+  ) => ({ id: `${repo}#${number}`, number, state, body, nativeBlockedBy, repository: { fullName: repo } });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findManyIssues.mockResolvedValue([]);
+  });
+
+  it("reports a same-repo native blocker", async () => {
+    mocks.findManyIssues.mockResolvedValue([openRow("foo/repo", 20)]);
+
+    const [annotated] = await withDependencyBlockReasons([
+      nativeIssue("foo/repo", 10, null, ["foo/repo#20"]),
+    ]);
+
+    expect(annotated.dependencyBlockReason).toBe("Blocked by open #20");
+  });
+
+  it("reports a cross-repo native blocker under the same universe rule", async () => {
+    mocks.findManyIssues.mockResolvedValue([openRow("bar/repo", 20)]);
+
+    const [annotated] = await withDependencyBlockReasons([
+      nativeIssue("foo/repo", 10, null, ["bar/repo#20"]),
+    ]);
+
+    expect(annotated.dependencyBlockReason).toBe("Blocked by open bar/repo#20");
+  });
+
+  it("returns null once the native blocker is closed", async () => {
+    const [annotated] = await withDependencyBlockReasons([
+      nativeIssue("foo/repo", 10, null, ["foo/repo#20"]),
+    ]);
+
+    expect(annotated.dependencyBlockReason).toBeNull();
+  });
+
+  it("skips the lookup when no issue declares a dependency", async () => {
+    const annotated = await withDependencyBlockReasons([
+      nativeIssue("foo/repo", 10, null, []),
+    ]);
+
+    expect(annotated.map((i) => i.dependencyBlockReason)).toEqual([null]);
+    expect(mocks.findManyIssues).not.toHaveBeenCalled();
+  });
+});

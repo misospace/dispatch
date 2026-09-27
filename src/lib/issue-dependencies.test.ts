@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   dependencyKey,
   formatDependencyBlockReason,
+  mergeDependencyRefs,
   normalizeRepoKey,
   parseIssueDependencies,
+  parseNativeBlockedBy,
   resolveOpenBlockers,
 } from "./issue-dependencies";
 
@@ -292,5 +294,99 @@ describe("parseIssueDependencies negation guard", () => {
     expect(parseIssueDependencies("It should not log. It depends on #7.")).toEqual([
       { repo: null, number: 7 },
     ]);
+  });
+});
+
+describe("parseNativeBlockedBy", () => {
+  it("keeps a cross-repo key with its repo", () => {
+    expect(parseNativeBlockedBy(["bar/repo#20"], "foo/repo")).toEqual([
+      { repo: "bar/repo", number: 20 },
+    ]);
+  });
+
+  it("collapses a same-repo key to repo: null", () => {
+    expect(parseNativeBlockedBy(["foo/repo#20"], "foo/repo")).toEqual([
+      { repo: null, number: 20 },
+    ]);
+  });
+
+  it("treats a bare #N key as same-repo", () => {
+    expect(parseNativeBlockedBy(["#20"], "foo/repo")).toEqual([{ repo: null, number: 20 }]);
+    expect(parseNativeBlockedBy(["#20"])).toEqual([{ repo: null, number: 20 }]);
+  });
+
+  it("matches the same-repo collapse case-insensitively", () => {
+    expect(parseNativeBlockedBy(["Foo/Repo#20"], "foo/repo")).toEqual([
+      { repo: null, number: 20 },
+    ]);
+  });
+
+  it("skips invalid keys", () => {
+    expect(parseNativeBlockedBy(["garbage", "foo/repo#0", "foo/repo#abc", ""])).toEqual([]);
+  });
+
+  it("dedupes duplicates by dependencyKey", () => {
+    expect(parseNativeBlockedBy(["foo/repo#20", "foo/repo#20", "#20"], "foo/repo")).toEqual([
+      { repo: null, number: 20 },
+    ]);
+    expect(parseNativeBlockedBy(["bar/repo#20", "bar/repo#20"], "foo/repo")).toEqual([
+      { repo: "bar/repo", number: 20 },
+    ]);
+  });
+
+  it("returns [] for null, undefined, and empty input", () => {
+    expect(parseNativeBlockedBy(null)).toEqual([]);
+    expect(parseNativeBlockedBy(undefined)).toEqual([]);
+    expect(parseNativeBlockedBy([])).toEqual([]);
+  });
+
+  it("uses the last # so odd repo parts do not break parsing", () => {
+    expect(parseNativeBlockedBy(["weird#name/repo#30"], "other/repo")).toEqual([
+      { repo: "weird#name/repo", number: 30 },
+    ]);
+  });
+});
+
+describe("mergeDependencyRefs", () => {
+  it("dedupes identical native and body refs by dependencyKey", () => {
+    expect(
+      mergeDependencyRefs(
+        [{ repo: null, number: 5 }],
+        [{ repo: null, number: 5 }],
+      ),
+    ).toEqual([{ repo: null, number: 5 }]);
+  });
+
+  it("keeps distinct cross-repo refs, first occurrence wins", () => {
+    expect(
+      mergeDependencyRefs(
+        [{ repo: "bar/repo", number: 20 }, { repo: null, number: 5 }],
+        [{ repo: "BAR/repo", number: 20 }, { repo: null, number: 6 }],
+      ),
+    ).toEqual([
+      { repo: "bar/repo", number: 20 },
+      { repo: null, number: 5 },
+      { repo: null, number: 6 },
+    ]);
+  });
+
+  it("treats null and undefined lists as empty", () => {
+    expect(mergeDependencyRefs(null, undefined, [{ repo: null, number: 5 }])).toEqual([
+      { repo: null, number: 5 },
+    ]);
+    expect(mergeDependencyRefs()).toEqual([]);
+  });
+
+  it("merges parsed native keys and body refs into one deduped list", () => {
+    const merged = mergeDependencyRefs(
+      parseNativeBlockedBy(["test/repo#5"], "test/repo"),
+      parseIssueDependencies("depends on #5"),
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toEqual({ repo: null, number: 5 });
+    // Resolved against the depending issue's repo (as the gate does):
+    expect(dependencyKey(merged[0].repo ?? "test/repo", merged[0].number)).toBe(
+      dependencyKey("test/repo", 5),
+    );
   });
 });
