@@ -307,6 +307,55 @@ describe("item URL is identity, write-once (#1098)", () => {
     expect(client.items[0].evidenceKeys).toEqual(["rev-1", "cr-1"]);
   });
 
+  it("repairs a stored CI job URL on the next enqueue that carries the PR URL (#1118)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 9, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f1", evidenceKey: "cr-1",
+    });
+    // A row poisoned by the pre-#1098 ingestion.
+    client.items[0].url = "https://github.com/o/repo/actions/runs/9/job/1";
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 9, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f2", evidenceKey: "rev-1",
+      url: "https://api.github.com/repos/o/repo/pulls/9",
+    });
+
+    expect(after.url).toBe("https://api.github.com/repos/o/repo/pulls/9");
+  });
+
+  it("leaves a legitimate stored URL alone even when a different one arrives", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 10, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f1", evidenceKey: "rev-1",
+      url: "https://github.com/o/repo/pull/10",
+    });
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 10, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f2", evidenceKey: "rev-2",
+      url: "https://api.github.com/repos/o/repo/pulls/10",
+    });
+
+    expect(after.url).toBe("https://github.com/o/repo/pull/10");
+  });
+
+  it("never stores a CI job URL as the item URL, on create or on backfill (#1118)", async () => {
+    const created = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 11, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f1", evidenceKey: "cr-1",
+      url: "https://github.com/o/repo/actions/runs/9/job/1",
+    });
+    expect(created.url).toBeUndefined();
+
+    const reenqueued = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 11, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f2", evidenceKey: "cr-2",
+      url: "https://github.com/o/repo/actions/runs/10/job/2",
+    });
+    expect(reenqueued.url).toBeUndefined();
+  });
+
   it("backfills the URL only when the item has none", async () => {
     await enqueuePrFixItem(client, {
       repo: "o/repo", pr: 8, lane: "NORMAL", type: "REVIEW_FEEDBACK",

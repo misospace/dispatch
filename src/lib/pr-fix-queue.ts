@@ -207,6 +207,21 @@ function extractUrlsFromTextSafe(text: string): string[] {
   }
 }
 
+/**
+ * A GitHub Actions run/job URL: what the pre-#1098 ingestion stored as an
+ * item URL for CI failures. Never valid item identity (#1118).
+ */
+const ACTIONS_RUN_URL = /^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\//;
+
+function isActionsRunUrl(url: string | null | undefined): boolean {
+  return typeof url === "string" && ACTIONS_RUN_URL.test(url);
+}
+
+/** The item URL an enqueue may write: never a CI job URL (#1098, #1118). */
+function itemUrlFromInput(input: EnqueuePrFixInput): string | undefined {
+  return input.url && !isActionsRunUrl(input.url) ? input.url : undefined;
+}
+
 // `url` is not part of this patch (#1098): the item URL is identity (the PR
 // URL) — set at first enqueue, backfilled only while empty. A CI-failure
 // re-enqueue's job URL must not flip it; job links belong in feedback/
@@ -330,8 +345,12 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           evidenceKeys: nextEvidenceKeys,
           // #1098: the item URL is identity — write-once. Backfill it only
           // while empty; never overwrite an existing URL with a
-          // re-enqueue's value (e.g. a CI job URL).
-          ...(!existing.url && input.url ? { url: input.url } : {}),
+          // re-enqueue's value (e.g. a CI job URL). A stored CI job URL left
+          // by the pre-#1098 ingestion counts as empty, so it heals on the
+          // next enqueue instead of being frozen by the guard (#1118).
+          ...((!existing.url || isActionsRunUrl(existing.url)) && itemUrlFromInput(input)
+            ? { url: itemUrlFromInput(input) }
+            : {}),
           // A fresh attempt gets a fresh per-attempt head baseline (#1074):
           // the head the sync observed in THIS enqueue, else the last one
           // observed (#1104). metadataPatch below keeps refreshing the mutable
@@ -374,7 +393,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         evidenceKeys: [input.evidenceKey],
         // #1098: the item URL is identity (the PR URL) — set it at first
         // enqueue, explicitly, so it is never left to the update patch.
-        ...(input.url ? { url: input.url } : {}),
+        ...(itemUrlFromInput(input) ? { url: itemUrlFromInput(input) } : {}),
         // A brand-new item is a fresh attempt: capture the head the sync
         // observed now as its immutable per-attempt baseline (#1074).
         attemptHeadSha: input.headSha ?? null,
