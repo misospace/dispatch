@@ -228,7 +228,7 @@ const mockEvidence: GroomingEvidenceSnapshot = {
   comments: [],
   evidenceDigest: "digest",
   warnings: [],
-  sources: [{ path: "src/auth/login.ts", provenance: "repository", ref: "abc123" }],
+  sources: [{ path: "src/auth/login.ts", provenance: "repository", via: "read", ref: "abc123" }],
 };
 
 const mockExploration: ExploreResult = {
@@ -236,6 +236,7 @@ const mockExploration: ExploreResult = {
   files: [],
   ask: null,
   sources: ["src/x.ts"],
+  readSources: [],
   toolCalls: [],
   bytes: 0,
   warnings: [],
@@ -421,6 +422,7 @@ describe("runHostedGroomer", () => {
     mocks.exploreRepository.mockResolvedValue({
       ...mockExploration,
       sources: ["src/lib/prisma.ts"],
+      readSources: ["src/lib/prisma.ts"],
       relatedWorkRefs: ["github:pr:org/repo#7"],
       relatedWork: [
         {
@@ -441,8 +443,8 @@ describe("runHostedGroomer", () => {
     );
     expect(exploredCall).toBeDefined();
     expect(exploredCall![0].data.contextSummary.evidence.sources).toEqual([
-      { path: "src/auth/login.ts", provenance: "repository", ref: "abc123" },
-      { path: "src/lib/prisma.ts", provenance: "repository", ref: "abc123" },
+      { path: "src/auth/login.ts", provenance: "repository", via: "read", ref: "abc123" },
+      { path: "src/lib/prisma.ts", provenance: "repository", via: "read", ref: "abc123" },
       {
         key: "github:pr:org/repo#7",
         provenance: "github_pull_request",
@@ -453,6 +455,30 @@ describe("runHostedGroomer", () => {
         ref: null,
       },
     ]);
+  });
+
+  it("records code-search hits as surfaced, unpinned evidence that cannot back a ready plan (dispatch#1062)", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({ ...mockEvidence, sources: [] });
+    // login.ts only came back from search_code; session.ts was read.
+    mocks.exploreRepository.mockResolvedValue({
+      ...mockExploration,
+      sources: ["src/auth/login.ts", "src/auth/session.ts"],
+      readSources: ["src/auth/session.ts"],
+    });
+
+    await expect(runHostedGroomer()).rejects.toThrow(
+      /readiness: verdict\.evidenceRefs must cite at least one repository source read at the pinned head SHA/,
+    );
+
+    const exploredCall = mocks.prisma.groomingRun.update.mock.calls.find(
+      (call) => call[0]?.data?.stage === "explored",
+    );
+    expect(exploredCall![0].data.contextSummary.evidence.sources).toEqual([
+      { path: "src/auth/session.ts", provenance: "repository", via: "read", ref: "abc123" },
+      { path: "src/auth/login.ts", provenance: "repository", via: "surfaced", ref: null },
+    ]);
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
   });
 
   it("repository context warnings are persisted and returned", async () => {

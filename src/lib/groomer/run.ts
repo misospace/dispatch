@@ -294,7 +294,10 @@ async function executeGroomerRun(
       // evidence of what the groomer saw was whatever comment it happened to
       // leave on the issue. Related-work refs are GitHub state, not repository
       // content, so they enter as their own unpinned provenance.
-      evidence = addEvidenceSources(evidence, exploration.sources);
+      // Only read_file results were read at the pinned SHA; search hits and
+      // submitted findings enter as surfaced (unpinned) repository evidence.
+      evidence = addEvidenceSources(evidence, exploration.readSources ?? []);
+      evidence = addEvidenceSources(evidence, exploration.sources, "surfaced");
       evidence = addRelatedWorkEvidence(evidence, exploration.relatedWork);
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         stage: "explored",

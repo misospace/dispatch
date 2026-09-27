@@ -119,7 +119,7 @@ Each run builds an evidence catalog from its revision-pinned snapshot and append
 
 - `issue`: the groomed issue as captured;
 - `comment:<id>`: a comment, marked human or automation;
-- `repo:<path>`: a repository path read or surfaced this run, pinned to the snapshot head SHA when one was captured;
+- `repo:<path>`: a repository path from this run. It is pinned only when the file was actually read at the snapshot head SHA (repository context fetches and `read_file`). Code-search hits come from the default-branch index and paths the model names in its findings were never read, so both are recorded as `via: "surfaced"` with `ref: null` and never satisfy a pinned-evidence rule;
 - `github:<kind>:<ref>`: related GitHub issue/PR/commit state.
 
 An id outside the catalog fails validation. Automation-authored comments may be cited as context but never satisfy an evidence requirement.

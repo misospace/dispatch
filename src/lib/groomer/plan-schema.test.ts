@@ -17,7 +17,7 @@ const snapshot: GroomingEvidenceSnapshot = {
   evidenceDigest: "d",
   warnings: [],
   sources: [
-    { path: "src/a.ts", provenance: "repository", ref: "abc123" },
+    { path: "src/a.ts", provenance: "repository", via: "read", ref: "abc123" },
     { key: "github:pr:org/repo#2", provenance: "github_pull_request", state: "merged", url: null, via: "read", observedAt: "", ref: null },
   ],
 };

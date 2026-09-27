@@ -36,8 +36,8 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
     evidenceDigest: "digest-1",
     warnings: [],
     sources: [
-      { path: "src/auth/login.ts", provenance: "repository", ref: "abc123def4567890" },
-      { path: "src/auth/session.ts", provenance: "repository", ref: "abc123def4567890" },
+      { path: "src/auth/login.ts", provenance: "repository", via: "read", ref: "abc123def4567890" },
+      { path: "src/auth/session.ts", provenance: "repository", via: "read", ref: "abc123def4567890" },
       {
         key: "github:pr:org/repo#12",
         provenance: "github_pull_request",
@@ -257,6 +257,15 @@ describe("GroomingPlan readiness invariant", () => {
     const errors = expectInvalid(readyDraft(), "not pinned to a default-branch head SHA", catalog({ headSha: null, pinnedRef: null }));
     // Repository reads without a pin are not current evidence either.
     expect(errors.some((e) => e.includes("verdict.evidenceRefs"))).toBe(true);
+  });
+
+  it("does not accept a code-search hit as pinned repository evidence", () => {
+    const hitOnly = catalog({
+      sources: [{ path: "src/auth/login.ts", provenance: "repository", via: "surfaced", ref: null }],
+    });
+    const cited = draft({ implementationBrief: { relevantPaths: [{ ref: "repo:src/auth/login.ts", change: "modify" }] } });
+    const errors = expectInvalid(cited, "readiness: verdict.evidenceRefs must cite at least one repository source read at the pinned head SHA", hitOnly);
+    expect(errors.some((e) => e.includes("verifiedCurrentBehavior.evidenceRefs must cite repository evidence"))).toBe(true);
   });
 
   it("rejects ready when the snapshot was never captured", () => {

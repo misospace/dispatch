@@ -15,7 +15,7 @@ const catalog = buildEvidenceCatalog({
   comments: [],
   evidenceDigest: "d",
   warnings: [],
-  sources: [{ path: "src/lib/prisma.ts", provenance: "repository", ref: "abc123" }],
+  sources: [{ path: "src/lib/prisma.ts", provenance: "repository", via: "read", ref: "abc123" }],
 });
 
 describe("callGroomerLLM", () => {

@@ -17,8 +17,8 @@ const base: GroomingEvidenceSnapshot = {
   evidenceDigest: "digest",
   warnings: [],
   sources: [
-    { path: "src/a.ts", provenance: "repository", ref: "abc123def4567890" },
-    { path: "src/a.ts", provenance: "repository", ref: "abc123def4567890" },
+    { path: "src/a.ts", provenance: "repository", via: "read", ref: "abc123def4567890" },
+    { path: "src/a.ts", provenance: "repository", via: "read", ref: "abc123def4567890" },
     { key: "github:issue:org/repo#7", provenance: "github_issue", state: "open", url: null, via: "search", observedAt: "", ref: null },
   ],
 };
@@ -41,9 +41,19 @@ describe("buildEvidenceCatalog", () => {
       ...base,
       headSha: null,
       pinnedRef: null,
-      sources: [{ path: "src/a.ts", provenance: "repository", ref: null }],
+      sources: [{ path: "src/a.ts", provenance: "repository", via: "read", ref: null }],
     });
     expect(catalog.entries.find((e) => e.id === "repo:src/a.ts")?.pinned).toBe(false);
+  });
+
+  it("never pins a surfaced search hit, even with a head SHA", () => {
+    const catalog = buildEvidenceCatalog({
+      ...base,
+      sources: [{ path: "src/hit.ts", provenance: "repository", via: "surfaced", ref: "abc123def4567890" }],
+    });
+    const entry = catalog.entries.find((e) => e.id === "repo:src/hit.ts");
+    expect(entry?.pinned).toBe(false);
+    expect(entry?.label).toContain("not read");
   });
 
   it("filters ids by subject", () => {

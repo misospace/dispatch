@@ -104,7 +104,9 @@ export function buildEvidenceCatalog(snapshot: GroomingEvidenceSnapshot): Eviden
 
   for (const source of snapshot.sources) {
     if (source.provenance === "repository") {
-      const pinned = source.ref !== null && source.ref === snapshot.headSha;
+      // Only a read at the snapshot SHA is pinned. A search hit comes from the
+      // default-branch index and a surfaced path was never read at all.
+      const pinned = source.via === "read" && source.ref !== null && source.ref === snapshot.headSha;
       push({
         id: repositoryEvidenceId(source.path),
         subject: "repository",
@@ -112,7 +114,11 @@ export function buildEvidenceCatalog(snapshot: GroomingEvidenceSnapshot): Eviden
         authoritative: true,
         pinned,
         state: null,
-        label: clip(`repository path${pinned ? ` at ${source.ref!.slice(0, 12)}` : " (unpinned read)"}`),
+        label: clip(
+          source.via === "surfaced"
+            ? "repository path surfaced by search or findings, not read (unpinned)"
+            : `repository path${pinned ? ` at ${source.ref!.slice(0, 12)}` : " (unpinned read)"}`,
+        ),
       });
     } else {
       push({
