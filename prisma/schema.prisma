@@ -50,6 +50,11 @@ model Issue {
   decomposedNote String? @db.Text
   followUpUrls  String[] @default([])
 
+  // Native GitHub blocked_by dependencies (#1086): canonical `owner/repo#N`
+  // keys for issues that natively block this one. Ingested by sync; merged
+  // with body-parsed deps by the queue gate and board annotation.
+  nativeBlockedBy String[] @default([])
+
   // Backlog grooming state
   groomedAt        DateTime?
   groomedBy        String?  @db.Text

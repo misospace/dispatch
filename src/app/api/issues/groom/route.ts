@@ -201,7 +201,11 @@ export async function POST(request: Request) {
         // Best-effort: a refresh failure must not fail the groom, since the
         // label change itself already succeeded.
         try {
-          const refreshResult = await refreshSingleIssue(effectiveRepo, effectiveNumber, fetchIssueFromGitHub);
+          const refreshResult = await refreshSingleIssue(
+            effectiveRepo,
+            effectiveNumber,
+            (repo, num) => fetchIssueFromGitHub(repo, num, { includeNativeBlockedBy: true }),
+          );
           if (refreshResult.success && refreshResult.issueData) {
             const issueData = refreshResult.issueData;
             await prisma.issue.update({
@@ -209,6 +213,7 @@ export async function POST(request: Request) {
               data: {
                 title: issueData.title,
                 body: issueData.body,
+                nativeBlockedBy: issueData.nativeBlockedBy,
                 url: issueData.url,
                 labels: issueData.labels,
                 assignees: issueData.assignees,

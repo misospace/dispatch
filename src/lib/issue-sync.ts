@@ -50,6 +50,12 @@ export interface SyncedIssueData {
   closedAt: Date | null;
   lastSyncedAt: Date;
   state: string;
+  /**
+   * Native GitHub blocked_by keys (canonical `owner/repo#N`). `[]` means
+   * authoritatively none; `undefined` means unknown (not enriched, or the
+   * dependency fetch failed) so the store update leaves the column unchanged.
+   */
+  nativeBlockedBy?: string[];
 }
 
 export interface IssueStore {
@@ -110,6 +116,7 @@ export function githubIssueToSyncedIssueData(ghIssue: GitHubIssue, lastSyncedAt 
     closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : null,
     lastSyncedAt,
     state: ghIssue.state,
+    nativeBlockedBy: ghIssue.nativeBlockedBy,
   };
 }
 
@@ -406,7 +413,7 @@ export const fetchAllStateIssues = async (repo: SyncRepo): Promise<GitHubIssue[]
   const anchor = await getRepoSyncAnchor(repo.id);
   const since = anchor ? new Date(anchor.getTime() - SYNC_OVERLAP_BUFFER_MS) : undefined;
   const [openIssues, closedIssues] = await Promise.all([
-    fetchIssues(repo.fullName, { state: "open" }),
+    fetchIssues(repo.fullName, { state: "open", includeNativeBlockers: true }),
     fetchIssues(repo.fullName, { state: "closed", since }),
   ]);
   // Dedupe by number in case GitHub ever returns the same issue twice; the

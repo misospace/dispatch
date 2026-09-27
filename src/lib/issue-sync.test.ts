@@ -271,6 +271,51 @@ describe("syncIssuesForRepos", () => {
   });
 });
 
+describe("syncIssuesForRepos native blocked_by persistence", () => {
+  let store: IssueStore;
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("writes native keys on create", async () => {
+    const createMock = vi.fn().mockResolvedValue(undefined);
+    store = {
+      findIssue: vi.fn().mockResolvedValue(null),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
+      createIssue: createMock,
+    };
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(1, { nativeBlockedBy: ["org/repo#5", "other/repo#9"] })],
+      store,
+    );
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(createMock.mock.calls[0][1].nativeBlockedBy).toEqual(["org/repo#5", "other/repo#9"]);
+  });
+
+  it("does not clear stored keys when the field is absent/unknown", async () => {
+    const updateMock = vi.fn().mockResolvedValue(undefined);
+    store = {
+      findIssue: vi.fn().mockResolvedValue({ id: "existing-2", labels: [] }),
+      updateIssue: updateMock,
+      createIssue: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(2)],
+      store,
+    );
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    // undefined → Prisma omits the field, so stored keys are preserved.
+    expect(updateMock.mock.calls[0][1].nativeBlockedBy).toBeUndefined();
+  });
+});
+
 describe("reconcileClosedIssues", () => {
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -407,7 +452,10 @@ describe("fetchAllStateIssues", () => {
       where: { repositoryId: "repo-1" },
       _max: { lastSyncedAt: true },
     });
-    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { state: "open" });
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", {
+      state: "open",
+      includeNativeBlockers: true,
+    });
     expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { state: "closed", since: undefined });
   });
 
@@ -420,7 +468,10 @@ describe("fetchAllStateIssues", () => {
     // dispatch#991: an open issue missed by the initial fetch and never
     // updated_at-touched must not be stranded — open issues are fetched in
     // full every sync, never narrowed by `since`.
-    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", { state: "open" });
+    expect(mocks.fetchIssues).toHaveBeenCalledWith("org/repo", {
+      state: "open",
+      includeNativeBlockers: true,
+    });
   });
 
   it("narrows the closed-issue tail with since = anchor - SYNC_OVERLAP_BUFFER_MS when the repo has cached issues", async () => {

@@ -3,6 +3,8 @@ import {
   dependencyKey,
   formatDependencyBlockReason,
   parseIssueDependencies,
+  parseNativeBlockedBy,
+  mergeDependencyRefs,
   resolveOpenBlockers,
 } from "@/lib/issue-dependencies";
 
@@ -10,6 +12,7 @@ interface AnnotatableIssue {
   number: number;
   state: string;
   body?: string | null;
+  nativeBlockedBy?: string[] | null;
   repository: { fullName: string };
 }
 
@@ -50,9 +53,18 @@ export async function findOpenIssueKeys(numbers: number[], client: typeof prisma
 export async function withDependencyBlockReasons<T extends AnnotatableIssue>(
   issues: T[],
 ): Promise<Array<T & { dependencyBlockReason: string | null }>> {
-  const refsByIssue = issues.map((issue) =>
-    issue.state === "open" ? parseIssueDependencies(issue.body) : [],
-  );
+  const refsByIssue = issues.map((issue) => {
+    if (issue.state !== "open") return [];
+    const bodyRefs = parseIssueDependencies(issue.body);
+    const nativeKeys = issue.nativeBlockedBy;
+    if (!nativeKeys || nativeKeys.length === 0) return bodyRefs;
+    // `repository` is only needed to resolve native refs; keep it unaccessed for
+    // issues with no native keys, matching the prior lazy contract.
+    return mergeDependencyRefs(
+      parseNativeBlockedBy(nativeKeys, issue.repository.fullName),
+      bodyRefs,
+    );
+  });
 
   const referencedNumbers = new Set<number>();
   for (const refs of refsByIssue) {

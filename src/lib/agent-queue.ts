@@ -10,6 +10,8 @@ import { isIssueExcludedByLabels, isRenovateIssue } from "@/lib/issue-filters";
 import { isBacklogLane, resolveLaneId, laneMatchesConfigured } from "@/lib/lane-config";
 import {
   parseIssueDependencies,
+  parseNativeBlockedBy,
+  mergeDependencyRefs,
   resolveOpenBlockers,
   formatDependencyBlockReason,
 } from "@/lib/issue-dependencies";
@@ -211,6 +213,21 @@ function isClaimableStatus(labels: string[]): boolean {
 }
 
 /**
+ * All dependency refs for one issue: GitHub-native `blocked_by` links merged
+ * with body-parsed refs, deduped by dependencyKey (native first).
+ */
+function issueDependencyRefs(issue: {
+  body?: string | null;
+  nativeBlockedBy?: string[] | null;
+  repoFullName?: string;
+}) {
+  return mergeDependencyRefs(
+    parseNativeBlockedBy(issue.nativeBlockedBy, issue.repoFullName),
+    parseIssueDependencies(issue.body),
+  );
+}
+
+/**
  * Build the agent queue: filter, rank, and return issues for a given agent.
  * Optionally filters by execution lane. By default excludes backlog lane items.
  * Optionally excludes decomposed audit parents.
@@ -227,8 +244,9 @@ function isClaimableStatus(labels: string[]): boolean {
  * Pass claimableOnly=false to include all actionable issues including backlog.
  * Excludes issues with labels matching DISPATCH_EXCLUDED_LABELS by default.
  * Dependency gating: pass openIssueKeys (a Set of dependencyKey strings for
- * currently-open issues) to exclude claimable issues whose body declares an
- * open blocker (e.g. "depends on #5"). Only applied when claimableOnly is
+ * currently-open issues) to exclude claimable issues that declare an open
+ * blocker in its body or via a native GitHub `blocked_by` link (e.g.
+ * "depends on #5"). Only applied when claimableOnly is
  * true; when omitted the queue behaves as before. Every result item carries
  * blockedBy (open blocker numbers) and dependencyBlockReason ("" when none).
  */
@@ -243,6 +261,7 @@ export function buildAgentQueue(
     issueId?: string;
     repoFullName?: string;
     body?: string | null;
+    nativeBlockedBy?: string[] | null;
     linkedPrHealth?: QueueLinkedPrHealth | null;
     createdAt?: Date | string | null;
   }>,
@@ -306,12 +325,13 @@ export function buildAgentQueue(
   }
 
   // Dependency gating: a claimable issue that declares an open blocker in its
-  // body (e.g. "depends on #5") is withheld until the blocker closes. Only
-  // active when openIssueKeys is provided and the claimable filter is on.
+  // body or via a native `blocked_by` link (e.g. "depends on #5") is withheld
+  // until the blocker closes. Only active when openIssueKeys is provided and
+  // the claimable filter is on.
   if (openIssueKeys !== undefined && claimableOnly) {
     actionable = actionable.filter((issue) => {
       const blockers = resolveOpenBlockers(
-        parseIssueDependencies(issue.body),
+        issueDependencyRefs(issue),
         openIssueKeys,
         issue.repoFullName,
         { repo: issue.repoFullName, number: issue.number },
@@ -358,7 +378,7 @@ export function buildAgentQueue(
     const status = getStatusFromLabels(item.labels);
     const openBlockers = openIssueKeys
       ? resolveOpenBlockers(
-          parseIssueDependencies(item.body),
+          issueDependencyRefs(item),
           openIssueKeys,
           item.repoFullName,
           { repo: item.repoFullName, number: item.number },

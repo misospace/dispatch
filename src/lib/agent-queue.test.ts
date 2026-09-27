@@ -3,7 +3,7 @@ import { buildAgentQueue, isRenovateIssue, issueAgeDays } from "./agent-queue";
 import { setLaneConfig, resetLaneConfig } from "./lane-config";
 import { dependencyKey } from "./issue-dependencies";
 
-const makeIssue = (overrides: Partial<{ number: number; title: string; url: string; labels: string[]; lane?: string; body?: string | null; repoFullName?: string }> = {}) => ({
+const makeIssue = (overrides: Partial<{ number: number; title: string; url: string; labels: string[]; lane?: string; body?: string | null; repoFullName?: string; nativeBlockedBy?: string[] }> = {}) => ({
   number: overrides.number ?? 1,
   title: overrides.title ?? "Test issue",
   url: overrides.url ?? "https://github.com/test/repo/issues/1",
@@ -11,6 +11,7 @@ const makeIssue = (overrides: Partial<{ number: number; title: string; url: stri
   lane: overrides.lane,
   body: overrides.body,
   repoFullName: overrides.repoFullName,
+  nativeBlockedBy: overrides.nativeBlockedBy,
 });
 
 describe("isRenovateIssue", () => {
@@ -1107,6 +1108,80 @@ describe("buildAgentQueue dependency gating (issue #1038)", () => {
     });
     expect(result).toHaveLength(1);
     expect(result[0].claimable).toBe(true);
+  });
+});
+
+describe("buildAgentQueue native blocked_by gating (issue #1086)", () => {
+  const nativeBlockedIssue = (overrides: {
+    number?: number;
+    nativeBlockedBy?: string[];
+    body?: string | null;
+    repoFullName?: string;
+  } = {}) =>
+    makeIssue({
+      number: overrides.number ?? 1,
+      labels: ["status/ready", "priority/p1"],
+      body: overrides.body ?? null,
+      repoFullName: overrides.repoFullName ?? "test/repo",
+      nativeBlockedBy: overrides.nativeBlockedBy,
+    });
+
+  it("withholds a ready issue with only a native blocker from the claimable queue", () => {
+    const issues = [nativeBlockedIssue({ nativeBlockedBy: ["test/repo#5"] })];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 5)]),
+    });
+    expect(result).toHaveLength(0);
+  });
+
+  it("surfaces blockedBy and dependencyBlockReason with claimableOnly=false", () => {
+    const issues = [nativeBlockedIssue({ nativeBlockedBy: ["test/repo#5"] })];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 5)]),
+      claimableOnly: false,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].blockedBy).toEqual([5]);
+    expect(result[0].dependencyBlockReason).toBe("Blocked by open #5");
+    expect(result[0].claimable).toBe(false);
+  });
+
+  it("becomes claimable once the native blocker closes", () => {
+    const issues = [nativeBlockedIssue({ nativeBlockedBy: ["test/repo#5"] })];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set<string>(),
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].claimable).toBe(true);
+    expect(result[0].dependencyBlockReason).toBe("");
+  });
+
+  it("dedupes native and body refs for the same blocker", () => {
+    const issues = [
+      nativeBlockedIssue({ nativeBlockedBy: ["test/repo#5"], body: "depends on #5" }),
+    ];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 5)]),
+      claimableOnly: false,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].blockedBy).toEqual([5]);
+  });
+
+  it("gates on a native cross-repo blocker", () => {
+    const issues = [
+      nativeBlockedIssue({ nativeBlockedBy: ["other/repo#9"], repoFullName: "test/repo" }),
+    ];
+    const gated = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("other/repo", 9)]),
+    });
+    expect(gated).toHaveLength(0);
+
+    const ranked = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("other/repo", 9)]),
+      claimableOnly: false,
+    });
+    expect(ranked[0].dependencyBlockReason).toContain("other/repo#9");
   });
 });
 

@@ -1,9 +1,32 @@
 import { GitHubIssue } from "@/types";
 import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
+import { dependencyKey } from "./issue-dependencies";
+
+interface BlockedByItem {
+  number?: number;
+  repository_url?: string;
+  html_url?: string;
+  pull_request?: { url?: string };
+}
+
+function repoFromBlockedByItem(item: BlockedByItem): string | null {
+  // Prefer html_url — always slug form: https://github.com/{owner}/{repo}/issues/{n}.
+  const html = /github\.com\/([^/]+\/[^/]+)\/issues\/\d+/i.exec(item.html_url ?? "");
+  if (html) return html[1];
+  // Fallback: slug-form repository_url. Many payloads use the id form
+  // (https://api.github.com/repositories/{id}) which has no slug here (#1086).
+  const repo = /\/repos\/([^/]+\/[^/]+)/.exec(item.repository_url ?? "");
+  return repo ? repo[1] : null;
+}
 
 export async function fetchIssues(
   repoFullName: string,
-  options?: { includeClosed?: boolean; state?: "open" | "closed" | "all"; since?: Date },
+  options?: {
+    includeClosed?: boolean;
+    state?: "open" | "closed" | "all";
+    since?: Date;
+    includeNativeBlockers?: boolean;
+  },
 ): Promise<GitHubIssue[]> {
   const [owner, repo] = repoFullName.split("/");
   // `state` wins when given (lets callers fetch only the closed tail);
@@ -15,10 +38,30 @@ export async function fetchIssues(
   }
 
   const all = await fetchPaginated<GitHubIssue>(url);
-  return all.filter((issue: GitHubIssue) => !issue.pull_request);
+  const issues = all.filter((issue: GitHubIssue) => !issue.pull_request);
+  return options?.includeNativeBlockers ? enrichNativeBlockers(repoFullName, issues) : issues;
 }
 
-export async function fetchIssue(repoFullName: string, issueNumber: number): Promise<GitHubIssue> {
+async function enrichNativeBlockers(repoFullName: string, issues: GitHubIssue[]): Promise<GitHubIssue[]> {
+  const out: GitHubIssue[] = [];
+  for (const issue of issues) {
+    const blocked = issue.issue_dependencies_summary?.blocked_by ?? 0;
+    if (blocked <= 0) {
+      out.push({ ...issue, nativeBlockedBy: [] });
+      continue;
+    }
+    const fetched = await fetchIssueNativeBlockers(repoFullName, issue.number);
+    // null (fetch failed) → leave nativeBlockedBy unset so sync preserves last-known keys (#1086).
+    out.push(fetched === null ? issue : { ...issue, nativeBlockedBy: fetched });
+  }
+  return out;
+}
+
+export async function fetchIssue(
+  repoFullName: string,
+  issueNumber: number,
+  options?: { includeNativeBlockedBy?: boolean },
+): Promise<GitHubIssue> {
   const [owner, repo] = repoFullName.split("/");
   const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}`;
   const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
@@ -34,7 +77,57 @@ export async function fetchIssue(repoFullName: string, issueNumber: number): Pro
     throw new Error(`#${issueNumber} is a pull request, not an issue`);
   }
 
+  if (options?.includeNativeBlockedBy) {
+    const fetched = await fetchIssueNativeBlockers(repoFullName, issueNumber);
+    return fetched === null ? data : { ...data, nativeBlockedBy: fetched };
+  }
   return data;
+}
+
+/**
+ * Fetch native `blocked_by` links for one issue as canonical `owner/repo#N`
+ * keys (repo lowercased via dependencyKey). Returns `string[] | null`: null =
+ * fetch failed (caller must preserve last-known keys); [] = authoritatively
+ * known-none. Best-effort, never throws; pull-request blockers (GitHub allows
+ * PR dependencies) are skipped, and items whose repo cannot be derived are
+ * skipped rather than mis-attributed to the caller's repo. Results are
+ * deduped.
+ */
+export async function fetchIssueNativeBlockers(
+  repoFullName: string,
+  issueNumber: number,
+): Promise<string[] | null> {
+  const [owner, repo] = repoFullName.split("/");
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocked_by`;
+  try {
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (!response.ok) {
+      console.warn(`[dispatch] native blocked_by fetch failed for ${repoFullName}#${issueNumber}: HTTP ${response.status}`);
+      return null;
+    }
+    const data = await response.json();
+    if (!Array.isArray(data)) {
+      console.warn(`[dispatch] native blocked_by unexpected payload for ${repoFullName}#${issueNumber}`);
+      return null;
+    }
+    const keys = new Set<string>();
+    for (const item of data as BlockedByItem[]) {
+      if (!item || typeof item.number !== "number" || item.number <= 0 || item.pull_request) continue;
+      const depRepo = repoFromBlockedByItem(item);
+      if (!depRepo) {
+        console.warn(`[dispatch] native blocked_by item with unparseable repo for ${repoFullName}#${issueNumber}`);
+        continue;
+      }
+      keys.add(dependencyKey(depRepo, item.number));
+    }
+    return Array.from(keys);
+  } catch (error) {
+    console.warn(
+      `[dispatch] native blocked_by fetch errored for ${repoFullName}#${issueNumber}:`,
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
+  }
 }
 
 export async function updateIssueLabels(
