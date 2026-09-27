@@ -99,9 +99,12 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
   "repo": "org/repo",
   "pr": 42,
   "status": "fixed",
-  "note": "Pushed fix and validation passed"
+  "note": "Pushed fix and validation passed",
+  "generation": 2
 }
 ```
+
+`generation` is **required for bearer (agent/bridge) marks** — a bearer request without it is rejected with `400` (`generation is required for agent/bridge marks (#1074)`) — and optional for operator paths (OIDC session, basic auth, disabled mode), which keep the unconditional behavior for compatibility. When supplied, the write is generation-conditional: if the item's current generation no longer matches, the request is rejected with `409` and nothing is mutated (the caller's read predates a re-issued attempt). A `FIXED` mark additionally re-reads the item's per-attempt `attemptHeadSha` baseline before writing; if the PR head has not moved since the attempt was recorded, the item is refused `FIXED` (back to `QUEUED`) — and the refusal never transiently stores `FIXED`. A mark for an unknown item returns `404`.
 
 ## Assignment queue behavior
 
@@ -158,6 +161,13 @@ Each queue item carries a Dispatch-owned `generation` (integer, starts at `1`). 
 Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. `generation` is an integer; the SHA-256 hex derivation from this change's first revision was superseded before ever shipping, so no released contract exposed a string form. Follow-up tasks driven by linked-PR health (not backed by a `PrFixQueueItem`) omit `prFixItem`.
 
 For downstream consumers that also report results through `POST /api/agents/{agentName}/tasks/report`: reports accept an optional opaque `idempotencyKey` that makes retries safe — a retry with the same key and payload returns the original `agentRunId` (with `duplicate: true`) and never re-runs PR-fix resolution; the stored resolution is replayed when it has been persisted, and otherwise the response carries an explicit `action: "skipped"` resolution. The same key with a different payload is rejected with `409`, as is a claim whose referenced run was deleted; an unexpected persistence failure returns a structured `500` whose retry lands in the duplicate branch. Full contract: "Idempotent reporting" in AGENTS.md.
+
+**Attempt-token settlement.** `tasks/report` accepts the attempt token as `prFixItem: { id, generation }` — the same pair `next-task` issued on the `followup-pr` task the worker was dispatched. The token is the settlement authority for the PR-fix queue:
+
+- **Token present** → the report settles exactly that item + generation. A missing item, a report repo/PR that doesn't match the token's item, a stale generation (the attempt was re-issued after dispatch: new evidence, requeue, refused-`FIXED` rollback), or an already-settled status all produce an `action: "skipped"` resolution with no mutation. Every status write in settlement is generation-conditional, so a concurrent re-issue between the check and the write still lands as a no-op (commit-time revalidation).
+- **Token absent** (legacy report) → the queue is **never** mutated: the report matches the item (so the response stays informative) but takes no action and makes no GitHub calls. A worker that was never issued an attempt can no longer settle an item.
+
+The token is part of the report's canonical payload, so it participates in `idempotencyKey` replay semantics: a retry with the same key and a different `prFixItem` is a `409`, exactly like any other payload change.
 
 ## Status lifecycle
 

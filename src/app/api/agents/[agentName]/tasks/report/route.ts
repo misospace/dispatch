@@ -29,6 +29,10 @@ export interface TaskReportBody {
   pullRequestUrl?: string;
   summary?: string;
   error?: string;
+  // The (id, generation) attempt token next-task issued on this followup-pr
+  // task, echoed back by the worker (#1074). Required for PR-fix queue
+  // settlement; part of the report's payload identity (idempotency hash).
+  prFixItem?: { id: string; generation: number } | null;
 }
 
 function deriveStatus(outcome: ValidOutcome): string {
@@ -147,6 +151,21 @@ export async function POST(
     }
   }
 
+  // Optional attempt token for PR-fix queue settlement (#1074). The worker
+  // echoes the prFixItem { id, generation } that next-task issued.
+  if (raw.prFixItem !== undefined && raw.prFixItem !== null) {
+    if (typeof raw.prFixItem !== "object" || Array.isArray(raw.prFixItem)) {
+      return errorResponse("prFixItem must be an object", 400);
+    }
+    const prFixItem = raw.prFixItem as Record<string, unknown>;
+    if (typeof prFixItem.id !== "string" || prFixItem.id.trim().length === 0) {
+      return errorResponse("prFixItem.id must be a non-empty string", 400);
+    }
+    if (typeof prFixItem.generation !== "number" || !Number.isInteger(prFixItem.generation) || prFixItem.generation < 1) {
+      return errorResponse("prFixItem.generation must be an integer >= 1", 400);
+    }
+  }
+
   // Optional worker-chosen opaque key. Present → the report becomes
   // idempotently retryable; absent → current at-least-once behavior (#1044).
   // Trimmed and capped so the unique index cannot be abused with unbounded
@@ -165,6 +184,14 @@ export async function POST(
     return errorResponse(`idempotencyKey must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`, 400);
   }
 
+  const prFixItem =
+    raw.prFixItem && typeof raw.prFixItem === "object" && !Array.isArray(raw.prFixItem)
+      ? {
+          id: (raw.prFixItem as { id: string }).id.trim(),
+          generation: (raw.prFixItem as { generation: number }).generation,
+        }
+      : undefined;
+
   const report: TaskReportBody = {
     taskType: taskType as ValidTaskType,
     outcome: outcome as ValidOutcome,
@@ -174,6 +201,7 @@ export async function POST(
     pullRequestUrl: raw.pullRequestUrl as string | undefined,
     summary: raw.summary as string | undefined,
     error: raw.error as string | undefined,
+    prFixItem,
   };
 
   try {
@@ -267,6 +295,9 @@ export async function POST(
         pullRequestUrl: report.pullRequestUrl,
         outcome: report.outcome,
         summary: report.summary,
+        // #1074: settlement is authorized by the attempt token the worker was
+        // issued; a report without one never mutates the queue.
+        attempt: prFixItem ? { itemId: prFixItem.id, generation: prFixItem.generation } : null,
       });
       if (typeof idempotencyKey === "string") {
         // Persist the resolution before responding so a retry replays the real

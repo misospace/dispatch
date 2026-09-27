@@ -1,15 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMockWithSafeEqual());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     prFixQueueClient: vi.fn(),
     parseMarkPrFixInput: vi.fn(),
-    markPrFixItem: vi.fn().mockResolvedValue({ id: "fix-1" }),
+    markPrFixItem: vi.fn().mockResolvedValue({ mutated: true, item: { id: "fix-1" } }),
     auditLogCreate: vi.fn().mockResolvedValue({ id: "log-1" }),
   },
 }));
@@ -40,7 +40,7 @@ describe("POST /api/pr-fix-queue/mark", () => {
     vi.clearAllMocks();
     mocks.prFixQueueClient.mockReturnValue({});
     mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "DONE" });
-    mocks.markPrFixItem.mockResolvedValue({ id: "fix-1", status: "DONE" });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "DONE" } });
     mocks.auditLogCreate.mockResolvedValue({ id: "log-1" });
   });
 
@@ -93,20 +93,78 @@ describe("POST /api/pr-fix-queue/mark", () => {
     expect(body.error).toBe("repo is required");
   });
 
-  it("marks item and creates audit log on success", async () => {
-    mocks.markPrFixItem.mockResolvedValue({ id: "fix-1", status: "DONE" });
-
+  it("returns 400 for a bearer mark without a generation (#1074)", async () => {
     const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE" });
 
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("generation is required for agent/bridge marks (#1074)");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+  });
+
+  it("marks item and creates audit log on success (bearer with generation)", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "org/repo", pr: 42, status: "DONE", expectedGeneration: 2,
+    });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "DONE" } });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE", generation: 2 });
+
     expect(res.status).toBe(200);
-    expect(mocks.markPrFixItem).toHaveBeenCalled();
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ expectedGeneration: 2 }),
+    );
     expect(mocks.auditLogCreate).toHaveBeenCalled();
   });
 
-  it("returns 404 when item not found", async () => {
-    mocks.markPrFixItem.mockResolvedValue(null);
+  it("allows an operator mark without a generation (disabled mode)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+    resetAuthCaches();
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "DONE" } });
 
-    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE" });
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE" }, false);
+
+    expect(res.status).toBe(200);
+    // No expectedGeneration on the input: the operator mark is unconditional.
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo", pr: 42, status: "DONE",
+    });
+  });
+
+  it("allows an operator mark without a generation (basic mode)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "op";
+    process.env.DISPATCH_AUTH_PASSWORD = "op-pass";
+    resetAuthCaches();
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "DONE" } });
+
+    const res = await POST(
+      new Request("http://localhost/api/pr-fix-queue/mark", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from("op:op-pass").toString("base64")}`,
+        },
+        body: JSON.stringify({ repo: "org/repo", pr: 42, status: "DONE" }),
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    // No expectedGeneration on the input: the operator mark is unconditional.
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), {
+      repo: "org/repo", pr: 42, status: "DONE",
+    });
+  });
+
+  it("returns 404 when item not found", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "org/repo", pr: 42, status: "DONE", expectedGeneration: 2,
+    });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: false, reason: "not-found" });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE", generation: 2 });
 
     expect(res.status).toBe(404);
     const body = await res.json();
@@ -114,9 +172,12 @@ describe("POST /api/pr-fix-queue/mark", () => {
   });
 
   it("returns 500 on database error", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "org/repo", pr: 42, status: "DONE", expectedGeneration: 2,
+    });
     mocks.markPrFixItem.mockRejectedValue(new Error("db connection lost"));
 
-    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE" });
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE", generation: 2 });
 
     expect(res.status).toBe(500);
     const body = await res.json();
@@ -127,6 +188,24 @@ describe("POST /api/pr-fix-queue/mark", () => {
     await postRequest({ repo: "org/repo", pr: 42, status: "DONE" }, false);
 
     expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+  });
+
+  // The item moved to a newer attempt between the caller's read and this
+  // write: the generation-conditional write matched nothing.
+  it("returns 409 when the expected generation no longer matches the item", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "org/repo", pr: 42, status: "DONE", expectedGeneration: 2,
+    });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: false, reason: "generation-mismatch" });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "DONE", generation: 2 });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("generation mismatch");
+    expect(body.error).toContain("2");
+    // A skipped mark is not audited as a mutation.
     expect(mocks.auditLogCreate).not.toHaveBeenCalled();
   });
 });
