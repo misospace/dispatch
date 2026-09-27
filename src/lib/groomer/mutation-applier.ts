@@ -404,8 +404,12 @@ export interface ApplicationStore {
     issueNumber: number;
   }): Promise<{ existing: ApplicationRecord | null }>;
   save(applicationKey: string, data: { status: string; steps: ApplySteps }): Promise<void>;
-  /** Record that an unfinished claim is being resumed by another attempt. */
-  resume(applicationKey: string): Promise<void>;
+  /**
+   * Take over an unfinished claim, atomically: succeeds only if the record is
+   * still as `seen` (same updatedAt), so of two attempts resuming the same
+   * abandoned claim exactly one proceeds.
+   */
+  resume(applicationKey: string, seen: ApplicationRecord): Promise<boolean>;
   /** Whether a hosted-groomer comment was recorded on this issue since `since`. */
   hasRecentComment(issueId: string, since: Date): Promise<boolean>;
 }
@@ -503,7 +507,9 @@ export async function applyGroomingMutations(
     if (existing.status === "in_progress" && Number.isFinite(updatedAt) && now().getTime() - updatedAt < ACTIVE_CLAIM_MS) {
       return { outcome: "busy", steps: prior, ...nothing };
     }
-    await store.resume(applicationKey);
+    if (!(await store.resume(applicationKey, existing))) {
+      return { outcome: "busy", steps: prior, ...nothing };
+    }
   }
 
   if (existing?.status === "applied") {
@@ -679,6 +685,7 @@ interface GroomingApplicationDelegateLike {
   findUnique(args: { where: { applicationKey: string } }): Promise<ApplicationRecord | null>;
   create(args: { data: Record<string, unknown> }): Promise<unknown>;
   update(args: { where: { applicationKey: string }; data: Record<string, unknown> }): Promise<unknown>;
+  updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>;
 }
 
 export interface ApplicationStoreClient {
@@ -724,12 +731,22 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
     async save(applicationKey, data) {
       await delegate.update({ where: { applicationKey }, data: { status: data.status, steps: data.steps } });
     },
-    async resume(applicationKey) {
-      await delegate.update({ where: { applicationKey }, data: { attempts: { increment: 1 } } });
+    async resume(applicationKey, seen) {
+      // Compare-and-swap on the record as read. Bumping attempts also bumps
+      // updatedAt, so a second resumer holding the same read matches nothing.
+      // Every run that works on the application records its key on its own
+      // GroomingRun, so attribution is by applicationKey, not a pointer here.
+      const where: Record<string, unknown> = { applicationKey, status: seen.status };
+      if (seen.updatedAt) where.updatedAt = new Date(seen.updatedAt);
+      const { count } = await delegate.updateMany({ where, data: { attempts: { increment: 1 } } });
+      return count > 0;
     },
     async hasRecentComment(issueId, since) {
+      // A run's comment lands between its createdAt and its last update, so
+      // updatedAt is the conservative bound: a run still inside the window
+      // may have posted inside it.
       const recent = await client.groomingRun.findFirst({
-        where: { issueId, commentUrl: { not: null }, createdAt: { gte: since } },
+        where: { issueId, commentUrl: { not: null }, updatedAt: { gte: since } },
       });
       return recent !== null && recent !== undefined;
     },

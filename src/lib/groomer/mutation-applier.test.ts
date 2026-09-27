@@ -284,8 +284,12 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Ma
       row.steps = JSON.parse(JSON.stringify(data.steps));
     },
     hasRecentComment: async () => false,
-    resume: async (key) => {
-      rows.get(key)!.attempts += 1;
+    resume: async (key, seen) => {
+      const row = rows.get(key)!;
+      if (row.updatedAt !== seen.updatedAt || row.status !== seen.status) return false;
+      row.attempts += 1;
+      row.updatedAt = new Date();
+      return true;
     },
   };
 }
@@ -489,6 +493,25 @@ describe("applyGroomingMutations", () => {
     expect(store.rows.get(KEY)!.attempts).toBe(1);
   });
 
+  it("stays busy when another attempt resumed the abandoned claim first", async () => {
+    const store = memoryStore({
+      applicationKey: KEY,
+      groomingRunId: "run-0",
+      status: "in_progress",
+      steps: {},
+      attempts: 1,
+      updatedAt: new Date(Date.now() - 11 * 60 * 1000),
+    });
+    const stale = { ...store.rows.get(KEY)! };
+    store.claim = async () => ({ existing: stale });
+    // The first resumer wins the compare-and-swap and moves updatedAt on.
+    expect(await store.resume(KEY, stale)).toBe(true);
+    const { github, calls } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, store);
+    expect(result.outcome).toBe("busy");
+    expect(calls).toEqual([]);
+  });
+
   it("resumes an abandoned unfinished claim once it has aged out", async () => {
     const store = memoryStore({
       applicationKey: KEY,
@@ -539,6 +562,7 @@ describe("makePrismaApplicationStore", () => {
           return data;
         }),
         update: vi.fn(async () => ({})),
+        updateMany: vi.fn(async () => ({ count: 1 })),
       },
       groomingRun: { findFirst: vi.fn(async () => null) },
     };
@@ -556,8 +580,20 @@ describe("makePrismaApplicationStore", () => {
     expect(second.existing).toMatchObject({ applicationKey: KEY, groomingRunId: "r1" });
     // A repeat claim only reads; resuming it is what counts an attempt.
     expect(c.groomingApplication.update).not.toHaveBeenCalled();
-    await store.resume(KEY);
-    expect(c.groomingApplication.update).toHaveBeenCalledWith({ where: { applicationKey: KEY }, data: { attempts: { increment: 1 } } });
+    const seen = { ...second.existing!, updatedAt: new Date("2026-09-26T00:00:00Z") };
+    expect(await store.resume(KEY, seen)).toBe(true);
+    expect(c.groomingApplication.updateMany).toHaveBeenCalledWith({
+      where: { applicationKey: KEY, status: seen.status, updatedAt: new Date("2026-09-26T00:00:00Z") },
+      data: { attempts: { increment: 1 } },
+    });
+  });
+
+  it("lets only one of two resumers take over an abandoned claim", async () => {
+    const c = client();
+    c.groomingApplication.updateMany.mockResolvedValueOnce({ count: 0 });
+    const store = makePrismaApplicationStore(c);
+    const seen = { applicationKey: KEY, groomingRunId: "r0", status: "in_progress", steps: {}, attempts: 1, updatedAt: new Date(0) };
+    expect(await store.resume(KEY, seen)).toBe(false);
   });
 
   it("looks for a recorded hosted-groomer comment on this issue inside the window", async () => {
@@ -566,7 +602,7 @@ describe("makePrismaApplicationStore", () => {
     const store = makePrismaApplicationStore(c);
     expect(await store.hasRecentComment("issue-42", since)).toBe(false);
     expect(c.groomingRun.findFirst).toHaveBeenCalledWith({
-      where: { issueId: "issue-42", commentUrl: { not: null }, createdAt: { gte: since } },
+      where: { issueId: "issue-42", commentUrl: { not: null }, updatedAt: { gte: since } },
     });
     c.groomingRun.findFirst.mockResolvedValueOnce({ id: "gr-0" } as never);
     expect(await store.hasRecentComment("issue-42", since)).toBe(true);

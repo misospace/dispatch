@@ -193,8 +193,14 @@ export async function runCandidate(
       },
       update: async ({ where, data }: { where: { applicationKey: string }; data: Record<string, unknown> }) => {
         const row = applications.get(where.applicationKey)!;
-        Object.assign(row, "attempts" in data ? { attempts: Number(row.attempts) + 1 } : structuredClone(data));
+        Object.assign(row, structuredClone(data));
         return row;
+      },
+      updateMany: async ({ where }: { where: { applicationKey: string; status?: string } }) => {
+        const row = applications.get(where.applicationKey);
+        if (!row || (where.status !== undefined && row.status !== where.status)) return { count: 0 };
+        row.attempts = Number(row.attempts) + 1;
+        return { count: 1 };
       },
     },
   };

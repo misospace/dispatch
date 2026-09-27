@@ -42,7 +42,7 @@ const { mocks } = vi.hoisted(() => ({
     prisma: {
       automationRepo: { findUnique: vi.fn() },
       groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
-      groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
+      groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
@@ -308,6 +308,14 @@ describe("runHostedGroomer", () => {
       mocks.applications.set(data.applicationKey, row);
       return row;
     });
+    mocks.prisma.groomingApplication.updateMany.mockImplementation(
+      async ({ where, data }: { where: { applicationKey: string; status: string }; data: Record<string, any> }) => {
+        const row = mocks.applications.get(where.applicationKey);
+        if (!row || row.status !== where.status) return { count: 0 };
+        if (data.attempts?.increment) row.attempts += data.attempts.increment;
+        return { count: 1 };
+      },
+    );
     mocks.prisma.groomingApplication.update.mockImplementation(
       async ({ where, data }: { where: { applicationKey: string }; data: Record<string, any> }) => {
         const row = mocks.applications.get(where.applicationKey)!;
