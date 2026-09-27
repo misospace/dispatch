@@ -96,7 +96,8 @@ export const PLAN_LIMITS = {
   comment: 4000,
   /** already_done criterion evidence (dispatch#1099). */
   closeCriteria: 12,
-  excerptMin: 8,
+  /** Before whitespace normalisation; the grounding check applies MIN_EXCERPT_CHARS after it. */
+  excerptMin: 24,
   excerpt: 300,
 } as const;
 

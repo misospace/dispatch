@@ -80,7 +80,7 @@ describe("buildGroomingPlanResponseSchema", () => {
     expect(close.required).toContain("criteria");
     expect(criteria.maxItems).toBe(12);
     expect(criteria.items.properties.evidenceRef.enum).toEqual(["repo:src/a.ts"]);
-    expect(criteria.items.properties.excerpt).toMatchObject({ type: "string", minLength: 8, maxLength: 300 });
+    expect(criteria.items.properties.excerpt).toMatchObject({ type: "string", minLength: 24, maxLength: 300 });
   });
 
   it("forces arrays empty when the catalog has no ids of the needed kind", () => {

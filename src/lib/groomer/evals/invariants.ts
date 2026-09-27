@@ -58,28 +58,14 @@ function isIndependent(citation: GroomingPlanCitation | EvidenceCatalogEntry | u
 
 /**
  * Why a close is not grounded in THIS issue, judged from the fixture itself
- * rather than the run's catalog (dispatch#1099): a cited merged PR into the
- * default branch that closes this issue, or at least one criterion and every
- * criterion's excerpt verbatim (whitespace-normalised) in a file the fixture
- * read. Empty when grounded.
+ * rather than the run's catalog (dispatch#1099): at least one criterion, and
+ * every criterion's excerpt verbatim (whitespace-normalised) in a file the
+ * fixture read. Related work, a closing PR included, never counts. Empty when
+ * grounded.
  */
 function closeGroundingGaps(c: GroomingCase, plan: GroomingPlan): string[] {
-  const close = plan.mutations.close;
-  const issueKey = `${c.repoFullName}#${c.issue.number}`.toLowerCase();
-  const branch = c.repository.defaultBranch ?? "main";
-  const closingPr = (close?.evidenceRefs ?? []).some((id) =>
-    (c.relatedWork ?? []).some(
-      (w) =>
-        w.key === id &&
-        w.kind === "pull_request" &&
-        w.state === "merged" &&
-        w.baseRef === branch &&
-        (w.closes ?? []).some((k) => k.toLowerCase() === issueKey),
-    ),
-  );
-  if (closingPr) return [];
-  const criteria = close?.criteria ?? [];
-  if (criteria.length === 0) return ["closed with no grounded criterion and no merged PR closing this issue"];
+  const criteria = plan.mutations.close?.criteria ?? [];
+  if (criteria.length === 0) return ["closed with no grounded criterion"];
   return criteria.flatMap((criterion, i) => {
     const path = criterion.evidenceRef.replace(/^repo:/, "");
     const content = (c.repository.read ?? []).includes(path) ? c.repository.contents?.[path] : undefined;

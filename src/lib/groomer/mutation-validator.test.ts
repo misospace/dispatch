@@ -378,7 +378,7 @@ describe("evaluateClosePolicy", () => {
         ...plan.mutations,
         close: {
           ...plan.mutations.close!,
-          criteria: [{ criterion: "login keeps returnTo", evidenceRef: "repo:src/auth/login.ts", excerpt: "returns session.returnTo" }],
+          criteria: [{ criterion: "login keeps returnTo", evidenceRef: "repo:src/auth/login.ts", excerpt: "returns session.returnTo or the root" }],
         },
       },
     };

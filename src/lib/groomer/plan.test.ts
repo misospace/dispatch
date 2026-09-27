@@ -576,7 +576,7 @@ describe("GroomingPlan validation failures", () => {
 
       it("accepts an excerpt re-wrapped across lines: whitespace is normalised, nothing else", () => {
         validPlan(close([{ ...GROUNDED[0], excerpt: "redirectAfterLogin(session: Session) {\n    return session.returnTo" }]), groundedCatalog());
-        expectInvalid(close([{ ...GROUNDED[0], excerpt: "RETURN session.returnTo" }]), "not found verbatim", groundedCatalog());
+        expectInvalid(close([{ ...GROUNDED[0], excerpt: 'RETURN session.returnTo ?? "/";' }]), "not found verbatim", groundedCatalog());
       });
 
       it("rejects criteria cited on a path whose content was not captured at the pinned head", () => {

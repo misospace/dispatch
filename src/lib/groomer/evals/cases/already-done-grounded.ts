@@ -55,7 +55,7 @@ const done = {
 export const alreadyDoneGrounded: GroomingCase = {
   id: "already-done-grounded",
   scenario:
-    "already_done closes only on this issue's own acceptance: every criterion quoted from its files at head, or a merged PR that closes this issue.",
+    "already_done closes only on this issue's own acceptance, every criterion quoted from its files at head; a merged PR that closes this issue only corroborates.",
   regressionOf: "dispatch#1099",
   repoFullName: STOREFRONT,
   issue: {
@@ -88,19 +88,34 @@ export const alreadyDoneGrounded: GroomingCase = {
       expect: { accepted: true, status: "status/done", ready: false, closes: true },
     },
     {
-      name: "a merged PR whose closing reference is this issue closes it",
-      output: alreadyDone({ ...done, closeEvidence: ["repo:src/cli/sync.ts", CLOSING_PR] }),
+      name: "grounded criteria with the merged PR that closes this issue as corroboration closes it",
+      output: alreadyDone({ ...done, closeEvidence: ["repo:src/cli/sync.ts", "repo:src/cli/sync.test.ts", CLOSING_PR], criteria: GROUNDED }),
       expect: { accepted: true, status: "status/done", ready: false, closes: true },
+    },
+    {
+      // An open issue with a merged closing PR usually means a human reopened it.
+      name: "a merged PR whose closing reference is this issue does not close it alone",
+      output: alreadyDone({ ...done, closeEvidence: ["repo:src/cli/sync.ts", CLOSING_PR] }),
+      expect: { accepted: false, rejectedFor: "a merged PR that closes this issue, only corroborates" },
     },
     {
       name: "a merged PR closing a sibling issue does not",
       output: alreadyDone({ ...done, closeEvidence: ["repo:src/cli/sync.ts", SIBLING_PR] }),
-      expect: { accepted: false, rejectedFor: `${SIBLING_PR} closes acme/storefront#311, not acme/storefront#310` },
+      expect: { accepted: false, rejectedFor: "already_done must ground every acceptance criterion" },
     },
     {
       name: "a PR closing this issue but merged into a release branch does not",
       output: alreadyDone({ ...done, closeEvidence: ["repo:src/cli/sync.ts", RELEASE_BRANCH_PR] }),
-      expect: { accepted: false, rejectedFor: "was merged into release/1.x, not the default branch" },
+      expect: { accepted: false, rejectedFor: "already_done must ground every acceptance criterion" },
+    },
+    {
+      name: "a generic excerpt, verbatim in the file, does not ground a criterion",
+      output: alreadyDone({
+        ...done,
+        closeEvidence: ["repo:src/cli/sync.ts"],
+        criteria: [GROUNDED[0], GROUNDED[1], ["A test covers dry-run mode.", "repo:src/cli/sync.test.ts", "}); }); }); });"]],
+      }),
+      expect: { accepted: false, rejectedFor: "mutations.close.criteria[2].excerpt: is 15 characters" },
     },
     {
       name: "an excerpt that is not in the file rejects the close",

@@ -134,20 +134,21 @@ Rules:
   alone. Status becomes status/done and the runner closes the issue on
   GitHub; you do not need to.
 - An already_done close must prove THIS issue's own acceptance, not a
-  sibling's, parent's or dependent's. Either:
-  (a) fill mutations.close.criteria with one entry per acceptance criterion
-      of this issue (copy each criterion's text as the issue states it), each
-      citing a "repo:" file you read at the pinned head and an "excerpt":
-      a short passage copied VERBATIM from that file (at least 8 characters;
-      re-wrapping lines is fine, paraphrase is not). Dispatch checks every
-      excerpt against the file as it was fetched. When the issue names
-      expected files, at least one criterion must cite one of them; or
-  (b) cite a merged pull request whose GitHub closing references (the
-      closingIssues read_related_pr returns) include this exact issue.
-  CHANGELOG or release-note entries, excerpts that mention other issues, and
-  PRs that close other issues never ground a close. Never argue that work
-  "must" be done because something downstream shipped: if you cannot quote
-  this issue's own acceptance from its own files, it is not already_done.
+  sibling's, parent's or dependent's. Fill mutations.close.criteria with one
+  entry per acceptance criterion of this issue (copy each criterion's text as
+  the issue states it), each citing a "repo:" file you read at the pinned
+  head and an "excerpt": a passage copied VERBATIM from that file that shows
+  the criterion holds (at least 24 characters, and more than keywords and
+  punctuation; re-wrapping lines is fine, paraphrase is not). Dispatch checks
+  every excerpt against the file as it was fetched. When the issue names
+  expected files, at least one criterion must cite one of them.
+  Related work only corroborates. Even a merged pull request whose closing
+  references include this issue does not close it alone: an issue still open
+  after such a PR merged was usually reopened. CHANGELOG or release-note
+  entries, excerpts that mention other issues, and PRs for other issues never
+  ground a close. Never argue that work "must" be done because something
+  downstream shipped: if you cannot quote this issue's own acceptance from
+  its own files, it is not already_done.
 - "duplicate" and "superseded" closes are recommendations only: they are
   recorded, never applied. Cite the matching relatedWork entry.
 - Only add/remove labels with prefixes: priority/, type/

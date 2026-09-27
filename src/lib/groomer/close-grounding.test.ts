@@ -8,6 +8,7 @@ import {
   normalizeWhitespace,
   parseAcceptanceCriteria,
   parseExpectedFiles,
+  trivialExcerptReason,
 } from "./close-grounding";
 import { buildEvidenceCatalog } from "./plan-evidence";
 
@@ -211,34 +212,40 @@ describe("evaluateCloseGrounding", () => {
   });
 
   it("rejects an excerpt that refers to another issue, but not one naming this issue", () => {
-    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("printPlan(plan); // see #42")] }, catalog()).errors).toEqual([]);
-    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("return; // unlike #41")] }, catalog()).errors[0]).toBe(
+    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("{ printPlan(plan); // see #42")] }, catalog()).errors).toEqual([]);
+    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("see #42 return; // unlike #41")] }, catalog()).errors[0]).toBe(
       "mutations.close.criteria[0].excerpt: refers to #41; evidence about other issues can corroborate but cannot ground this issue's criteria",
     );
   });
 
-  it("treats a merged PR into the default branch that closes this issue as sufficient on its own", () => {
-    expect(evaluateCloseGrounding({ evidenceRefs: ["github:pr:org/repo#50"], criteria: [] }, catalog())).toEqual({
-      errors: [],
-      closingPullRequest: "github:pr:org/repo#50",
-    });
+  it("records a merged PR into the default branch that closes this issue, but never lets it satisfy the close alone", () => {
+    const alone = evaluateCloseGrounding({ evidenceRefs: ["github:pr:org/repo#50"], criteria: [] }, catalog());
+    expect(alone.closingPullRequest).toBe("github:pr:org/repo#50");
+    expect(alone.errors).toEqual([
+      "mutations.close.criteria: already_done must ground every acceptance criterion of this issue in a file read at the pinned head, with a verbatim excerpt; related work, including a merged PR that closes this issue, only corroborates",
+    ]);
+    const grounded = evaluateCloseGrounding(
+      { evidenceRefs: ["github:pr:org/repo#50"], criteria: [criterion("if (opts.dryRun) { printPlan(plan);")] },
+      catalog(),
+    );
+    expect(grounded).toEqual({ errors: [], closingPullRequest: "github:pr:org/repo#50" });
   });
 
-  it("never treats an unmerged PR, a search hit, or a PR merged elsewhere as closing proof", () => {
-    const errors = (refs: string[], overrides: Partial<GroomingEvidenceSnapshot> = {}) =>
-      evaluateCloseGrounding({ evidenceRefs: refs, criteria: [] }, catalog(overrides)).errors.join("\n");
-    expect(errors(["github:pr:org/repo#51"])).toContain("github:pr:org/repo#51 is open, not merged");
-    expect(errors(["github:pr:org/repo#52"])).toContain("github:pr:org/repo#52 has no known closing references");
-    expect(errors(["github:pr:org/repo#50"], { defaultBranch: "trunk" })).toContain("was merged into main, not the default branch");
+  it("does not record an unmerged PR, a search hit, or a PR merged elsewhere as a closing PR", () => {
+    const closingPr = (refs: string[], overrides: Partial<GroomingEvidenceSnapshot> = {}) =>
+      evaluateCloseGrounding({ evidenceRefs: refs, criteria: [] }, catalog(overrides)).closingPullRequest;
+    expect(closingPr(["github:pr:org/repo#51"])).toBeNull();
+    expect(closingPr(["github:pr:org/repo#52"])).toBeNull();
+    expect(closingPr(["github:pr:org/repo#50"], { defaultBranch: "trunk" })).toBeNull();
   });
 
-  it("still rejects a fabricated excerpt when a closing PR is cited", () => {
+  it("rejects a fabricated excerpt beside a closing PR", () => {
     const result = evaluateCloseGrounding(
-      { evidenceRefs: ["github:pr:org/repo#50"], criteria: [criterion("opts.dryRun === true")] },
+      { evidenceRefs: ["github:pr:org/repo#50"], criteria: [criterion("opts.dryRun === true && printPlan(plan)")] },
       catalog(),
     );
     expect(result.closingPullRequest).toBe("github:pr:org/repo#50");
-    expect(result.errors).toEqual([expect.stringContaining("not found verbatim in src/sync.ts")]);
+    expect(result.errors[0]).toContain("not found verbatim in src/sync.ts");
   });
 
   it("rejects reads that are not pinned and content that was not captured", () => {
@@ -246,15 +253,48 @@ describe("evaluateCloseGrounding", () => {
       snapshot({ sources: [{ path: "src/sync.ts", provenance: "repository", via: "surfaced", ref: null }] }),
       collectPinnedReadContent(HEAD, [{ path: "src/sync.ts", ref: HEAD, content: SYNC }]),
     );
-    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("printPlan(plan);")] }, unpinned).errors[0]).toBe(
+    const excerpt = "if (opts.dryRun) { printPlan(plan);";
+    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion(excerpt)] }, unpinned).errors[0]).toBe(
       "mutations.close.criteria[0].evidenceRef: src/sync.ts was not read at the pinned head SHA",
     );
     const otherHead = buildEvidenceCatalog(snapshot(), collectPinnedReadContent("f00", [{ path: "src/sync.ts", ref: "f00", content: SYNC }]));
-    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion("printPlan(plan);")] }, otherHead).errors[0]).toBe(
+    expect(evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion(excerpt)] }, otherHead).errors[0]).toBe(
       "mutations.close.criteria[0].evidenceRef: the content of src/sync.ts as read at the pinned head is not available to check the excerpt against",
     );
   });
 
+  it("rejects a generic excerpt even when it is verbatim in the file", () => {
+    const content = "import {\n  foo,\n} from './foo';\nreturn nil\n} } } ) ) ; ; ; ] ] ] 1 2 3 4 5\nif err != nil { return nil, err }\nexport default function handler() {}";
+    const cat = buildEvidenceCatalog(snapshot(), collectPinnedReadContent(HEAD, [{ path: "src/sync.ts", ref: HEAD, content }]));
+    const reason = (excerpt: string) => evaluateCloseGrounding({ evidenceRefs: [], criteria: [criterion(excerpt)] }, cat).errors[0] ?? "";
+    expect(reason("import {")).toContain("is 8 characters after collapsing whitespace; quote at least 24");
+    expect(reason("return nil")).toContain("quote at least 24");
+    expect(reason("} } } ) ) ; ; ; ] ] ] 1 2 3 4 5")).toContain("is only punctuation, brackets, numbers or common keywords");
+    expect(reason("if err != nil { return nil, err }")).toContain("is only punctuation, brackets, numbers or common keywords");
+    expect(reason("export default function handler() {}")).toBe("");
+  });
+});
+
+describe("trivialExcerptReason", () => {
+  it("counts length after collapsing whitespace", () => {
+    expect(trivialExcerptReason("   abc\n\n\n\n\n        def                ")).toContain("is 7 characters");
+    expect(trivialExcerptReason("const retries = MAX_SYNC_RETRIES;")).toBeNull();
+  });
+
+  it("rejects excerpts made only of keywords, literals, punctuation and numbers, whatever their length", () => {
+    for (const excerpt of ["} else { return null; } } } }", "import { } from export default const", "return true; return false; 1234567"]) {
+      expect(trivialExcerptReason(excerpt), excerpt).toContain("common keywords");
+    }
+  });
+
+  it("accepts anything carrying one identifier or word that is not a common keyword", () => {
+    for (const excerpt of ['if (opts.dryRun) { return; } else {', 'return { ok: false, reason: "expired" };', "## 1.8.0 - sync gains a flag"]) {
+      expect(trivialExcerptReason(excerpt), excerpt).toBeNull();
+    }
+  });
+});
+
+describe("catalog grounding context", () => {
   it("carries the issue's expected files and criteria on the catalog, and the PR's closing references on its entry", () => {
     const cat = catalog();
     expect(cat.grounding).toMatchObject({ issueKey: "org/repo#42", expectedFiles: ["src/sync.ts"], acceptanceCriteria: [] });

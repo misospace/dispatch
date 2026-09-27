@@ -7,18 +7,19 @@
  * for a sibling issue and a module that sibling added. Nothing checked that
  * the evidence established THIS issue's acceptance.
  *
- * An already_done close must now show one of:
- * - every acceptance criterion of the issue grounded in a repository file read
- *   at the pinned head, with a short excerpt that occurs verbatim in that
- *   file's content as fetched (whitespace-normalised exact substring), and, if
- *   the issue names expected files, at least one grounded citation among them;
- * - or a merged pull request, merged into the default branch, whose GitHub
- *   closing reference is this exact issue.
+ * An already_done close must now ground every acceptance criterion of the
+ * issue in a repository file read at the pinned head, with an excerpt that
+ * occurs verbatim in that file's content as fetched (whitespace-normalised
+ * exact substring) and is specific enough to mean something, and, if the
+ * issue names expected files, at least one grounded citation among them.
  *
- * Evidence about other issues (sibling, parent or dependent PRs, changelog
- * entries, excerpts that cite another issue) can corroborate but never
- * satisfies the close. The same checks run in plan validation and again at
- * apply time.
+ * A merged pull request into the default branch whose GitHub closing
+ * reference is this exact issue is recorded as corroboration but never
+ * satisfies the close alone: such a PR closes the issue on merge, so finding
+ * the issue still open usually means someone reopened it. Evidence about
+ * other issues (sibling, parent or dependent PRs, changelog entries, excerpts
+ * that cite another issue) likewise corroborates at most. The same checks
+ * run in plan validation and again at apply time.
  */
 
 import type { CloseCriterionEvidence } from "./plan";
@@ -298,40 +299,66 @@ export interface CloseGroundingResult {
   closingPullRequest: string | null;
 }
 
-/** A cited merged PR into the default branch whose GitHub closing reference is this issue. */
-function closingPullRequestOf(
-  refs: string[],
-  catalog: EvidenceCatalog,
-  byId: Map<string, EvidenceCatalogEntry>,
-): { found: string | null; others: string[] } {
+/**
+ * A cited merged PR into the default branch whose GitHub closing reference is
+ * this issue. Corroboration only: it is reported, never a substitute for
+ * grounded criteria.
+ */
+function closingPullRequestOf(refs: string[], catalog: EvidenceCatalog, byId: Map<string, EvidenceCatalogEntry>): string | null {
   const key = catalog.grounding.issueKey.toLowerCase();
-  const others: string[] = [];
+  const branch = catalog.binding.defaultBranch;
   for (const id of refs) {
     const entry = byId.get(id);
     if (!entry || entry.subject !== "related_work" || entry.provenance !== "github_pull_request") continue;
     const closes = (entry.closes ?? []).map((k) => k.toLowerCase());
-    const intoDefault = !!catalog.binding.defaultBranch && entry.baseRef === catalog.binding.defaultBranch;
-    if (entry.state === "merged" && intoDefault && closes.includes(key)) return { found: id, others };
-    const why =
-      entry.state !== "merged"
-        ? `is ${entry.state ?? "of unknown state"}, not merged`
-        : entry.closes === undefined
-          ? "has no known closing references"
-          : !closes.includes(key)
-            ? closes.length > 0
-              ? `closes ${entry.closes.join(", ")}, not ${catalog.grounding.issueKey}`
-              : `has no closing reference to ${catalog.grounding.issueKey}`
-            : `was merged into ${entry.baseRef ?? "an unknown branch"}, not the default branch`;
-    others.push(`${id} ${why}`);
+    if (entry.state === "merged" && !!branch && entry.baseRef === branch && closes.includes(key)) return id;
   }
-  return { found: null, others };
+  return null;
+}
+
+/** Shortest excerpt, after whitespace normalisation, that may ground a criterion. */
+export const MIN_EXCERPT_CHARS = 24;
+
+/**
+ * Words that carry no meaning of their own in an excerpt: language keywords
+ * and literals common across the languages the groomer reads. An excerpt made
+ * only of these, punctuation, brackets and numbers could match nearly any
+ * file, so it grounds nothing. Deliberately short: any identifier, string or
+ * name that is not listed here makes the excerpt specific enough.
+ */
+const TRIVIAL_WORDS = new Set(
+  (
+    "import from export default return returns nil null none undefined true false const let var val function func fn " +
+    "def class struct interface type enum impl trait pub mod use package module require if else elif then fi for foreach " +
+    "while do done end in of is not and or async await yield new this self super public private protected static final " +
+    "void int string bool boolean try catch except finally throw throws raise pass break continue case switch match " +
+    "when with as go defer select lambda echo local set get err error ok"
+  ).split(" "),
+);
+
+/**
+ * Why an excerpt is too generic to ground anything, or null when it is
+ * specific enough. Relevance is still the model's judgement; this only makes
+ * trivial matches impossible.
+ */
+export function trivialExcerptReason(excerpt: string): string | null {
+  const normalized = normalizeWhitespace(excerpt);
+  if (normalized.length < MIN_EXCERPT_CHARS) {
+    return `is ${normalized.length} characters after collapsing whitespace; quote at least ${MIN_EXCERPT_CHARS} so the match is specific`;
+  }
+  const words = normalized.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+  if (words.every((word) => TRIVIAL_WORDS.has(word.toLowerCase()))) {
+    return "is only punctuation, brackets, numbers or common keywords; quote something specific to this change";
+  }
+  return null;
 }
 
 /**
  * Check an already_done close's grounding against the run's catalog and
  * pinned content. Deterministic: the same close and catalog give the same
- * errors in the same order. Every provided criterion is checked, even when a
- * closing PR makes them unnecessary, so a fabricated excerpt still rejects.
+ * errors in the same order. A cited closing PR is reported in
+ * `closingPullRequest` but satisfies nothing: every criterion must be
+ * grounded either way.
  */
 export function evaluateCloseGrounding(
   close: { evidenceRefs: string[]; criteria: CloseCriterionEvidence[] },
@@ -368,6 +395,11 @@ export function evaluateCloseGrounding(
       );
       return;
     }
+    const trivial = trivialExcerptReason(c.excerpt);
+    if (trivial) {
+      errors.push(`${at}.excerpt: ${trivial}`);
+      return;
+    }
     const excerpt = normalizeWhitespace(c.excerpt);
     if (!text.includes(excerpt)) {
       errors.push(
@@ -385,14 +417,12 @@ export function evaluateCloseGrounding(
     grounded.push({ index: i, path });
   });
 
-  const closing = closingPullRequestOf(close.evidenceRefs, catalog, byId);
-  if (closing.found) return { errors, closingPullRequest: closing.found };
-
-  const hint = closing.others.length > 0 ? ` (${closing.others.join("; ")})` : "";
-  const complete = "already_done must ground every acceptance criterion of this issue in a file read at the pinned head, with a verbatim excerpt, or cite a merged pull request whose closing reference is this issue";
+  const closingPullRequest = closingPullRequestOf(close.evidenceRefs, catalog, byId);
+  const complete =
+    "already_done must ground every acceptance criterion of this issue in a file read at the pinned head, with a verbatim excerpt; related work, including a merged PR that closes this issue, only corroborates";
   if (close.criteria.length === 0) {
-    errors.push(`mutations.close.criteria: ${complete}${hint}`);
-    return { errors, closingPullRequest: null };
+    errors.push(`mutations.close.criteria: ${complete}`);
+    return { errors, closingPullRequest };
   }
 
   if (grounding.acceptanceCriteria.length > 0) {
@@ -400,7 +430,7 @@ export function evaluateCloseGrounding(
     const missing = grounding.acceptanceCriteria.filter((criterion) => !covered.has(normalizeCriterion(criterion)));
     if (missing.length > 0) {
       const shown = missing.slice(0, 5).map((m) => `"${m}"`).join(", ") + (missing.length > 5 ? `, +${missing.length - 5} more` : "");
-      errors.push(`mutations.close.criteria: ${complete}; not grounded: ${shown}${hint}`);
+      errors.push(`mutations.close.criteria: ${complete}; not grounded: ${shown}`);
     }
   }
 
@@ -410,5 +440,5 @@ export function evaluateCloseGrounding(
     );
   }
 
-  return { errors, closingPullRequest: null };
+  return { errors, closingPullRequest };
 }

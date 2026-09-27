@@ -144,10 +144,7 @@ export const siblingShippedNotThisIssue: GroomingCase = {
     {
       name: "already_done citing the sibling's merged PR as the closing proof",
       output: alreadyDone({ ...inferred, closeEvidence: ["repo:pr_reviewer/platform.py", SIBLING_PR] }),
-      expect: {
-        accepted: false,
-        rejectedFor: `${SIBLING_PR} closes misospace/pr-reviewer-action#587, not misospace/pr-reviewer-action#583`,
-      },
+      expect: { accepted: false, rejectedFor: "already_done must ground every acceptance criterion" },
     },
     {
       name: "already_done quoting Tangled support that platform.py does not contain",

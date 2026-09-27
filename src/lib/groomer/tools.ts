@@ -358,10 +358,10 @@ function toRelatedWorkObservation(
 const MAX_CLOSING_ISSUES = 10;
 
 /**
- * Add GitHub's closing references to a merged PR read (dispatch#1099): the
- * one fact that lets a merged PR prove an issue done is that it closes THAT
- * issue. Only merged PRs need it, so an open or closed PR costs no extra
- * call. A failed lookup leaves the references unknown (never "none") and
+ * Add GitHub's closing references to a merged PR read (dispatch#1099), so
+ * the plan and its history show whether the PR closes THIS issue or another
+ * one. It corroborates an already_done close; it never satisfies one. Only
+ * merged PRs need it, so an open or closed PR costs no extra call. A failed lookup leaves the references unknown (never "none") and
  * warns; the PR read itself still succeeds.
  */
 async function withClosingIssues(
