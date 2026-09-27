@@ -137,6 +137,14 @@ describe("github-code-search: searchRepositoryCode (the groomer repo-exploration
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("fails an incomplete search with no items instead of reporting no matches", async () => {
+    fetchSpy.mockResolvedValueOnce(mockResponse({ total_count: 0, incomplete_results: true, items: [] }));
+
+    await expect(searchRepositoryCode("org/repo", "prisma", 5)).rejects.toThrow(
+      /^Code search failed for org\/repo: search timed out with incomplete results and no matches$/,
+    );
+  });
+
   // (c) HTTP 429 retried with backoff.
   it("retries a 429 rate-limit response with backoff and succeeds on the next attempt", async () => {
     fetchSpy

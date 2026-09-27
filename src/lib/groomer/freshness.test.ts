@@ -260,12 +260,11 @@ describe("buildGroomingFreshnessBaseline", () => {
     expect(baseline.groomedEvidencePaths).toEqual([]);
   });
 
-  it("records bounded, deduplicated empty-search queries only for global evidence", async () => {
+  it("records trimmed, deduplicated empty-search queries only for global evidence", async () => {
     const calls = [
       { name: "search_code", ok: true, bytes: 0, arguments: { query: "  missing symbol  " } },
       { name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } },
-      { name: "search_code", ok: true, bytes: 0, arguments: { query: "x".repeat(250) } },
-      { name: "search_code", ok: true, bytes: 0, arguments: { query: "  " } },
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "x".repeat(200) } },
       { name: "search_code", ok: false, bytes: 0, arguments: { query: "failed" } },
     ];
     const global = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: calls }));
@@ -328,15 +327,28 @@ describe("buildGroomingFreshnessBaseline", () => {
     ).toEqual([{ name: "search_code", arguments: { query: "q" }, ok: true, bytes: 0 }]);
   });
 
-  it("bounds saved empty-search queries to ten, below the pass search budget", async () => {
-    const toolCalls = Array.from({ length: 25 }, (_, index) => ({
-      name: "search_code",
-      ok: true,
-      bytes: 0,
-      arguments: { query: `missing ${index}` },
-    }));
-    const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: toolCalls }));
-    expect(baseline.groomedSearchCodeQueries).toHaveLength(10);
+  const emptySearches = (queries: unknown[]) =>
+    queries.map((query) => ({ name: "search_code", ok: true, bytes: 0, arguments: { query } }));
+
+  it("saves up to ten empty-search queries, below the pass search budget", async () => {
+    const queries = Array.from({ length: 10 }, (_, index) => `missing ${index}`);
+    const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(queries) }));
+    expect(baseline.groomedSearchCodeQueries).toEqual(queries);
+  });
+
+  it("saves none when the empty searches exceed the cap, so a subset is never rechecked", async () => {
+    const queries = Array.from({ length: 11 }, (_, index) => `missing ${index}`);
+    const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(queries) }));
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when an empty search can't be saved whole", async () => {
+    const tooLong = await buildGroomingFreshnessBaseline(
+      input({ explorationToolCalls: emptySearches(["short", "x".repeat(201)]) }),
+    );
+    expect(tooLong.groomedSearchCodeQueries).toEqual([]);
+    const unreadable = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(["short", 42]) }));
+    expect(unreadable.groomedSearchCodeQueries).toEqual([]);
   });
 });
 

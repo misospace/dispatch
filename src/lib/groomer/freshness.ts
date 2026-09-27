@@ -120,12 +120,17 @@ function emptySearchCodeQueries(toolCalls: ExplorationToolCallLike[]): string[] 
   const queries: string[] = [];
   for (const call of toolCalls) {
     if (call.name !== "search_code" || !call.ok || call.bytes !== 0) continue;
+    // Every empty search is part of the negative evidence. One that can't be
+    // saved whole (unreadable, too long, or past the cap) would leave the
+    // recheck verifying the result on a subset, so save none and keep the
+    // conservative stale-on-commit behaviour instead.
     const raw = call.arguments?.query;
-    if (typeof raw !== "string") continue;
-    const query = raw.trim().slice(0, MAX_BASELINE_SEARCH_CODE_QUERY_CHARS);
-    if (!query || queries.includes(query)) continue;
+    if (typeof raw !== "string") return [];
+    const query = raw.trim();
+    if (!query) return [];
+    if (queries.includes(query)) continue;
+    if (query.length > MAX_BASELINE_SEARCH_CODE_QUERY_CHARS || queries.length >= MAX_BASELINE_SEARCH_CODE_QUERIES) return [];
     queries.push(query);
-    if (queries.length >= MAX_BASELINE_SEARCH_CODE_QUERIES) break;
   }
   return queries;
 }

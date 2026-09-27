@@ -57,11 +57,19 @@ export async function searchRepositoryCode(
     // so a search with more matches than fit on one page is not silently
     // truncated at the first page. Each page is fetched through fetchWithRetry,
     // so transient 429/5xx responses are retried here as well.
-    const items = await fetchPaginated<{ path?: string; html_url?: string }>(
-      url,
-      limit,
-      (data) => (data as { items?: { path?: string; html_url?: string }[] }).items ?? [],
-    );
+    let incomplete = false;
+    const items = await fetchPaginated<{ path?: string; html_url?: string }>(url, limit, (data) => {
+      const page = data as { items?: { path?: string; html_url?: string }[]; incomplete_results?: boolean };
+      if (page.incomplete_results === true) incomplete = true;
+      return page.items ?? [];
+    });
+    // Code search can time out and still answer 200 with incomplete_results
+    // and no items. That is not "no matches": the groomer treats an empty
+    // result as proof of absence and the freshness recheck advances on it
+    // (#1091), so surface it as a failure instead.
+    if (incomplete && items.length === 0) {
+      throw new Error("search timed out with incomplete results and no matches");
+    }
     return items.map((item) => ({
       path: item.path ?? "",
       url: item.html_url ?? "",
