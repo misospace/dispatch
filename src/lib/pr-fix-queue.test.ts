@@ -256,7 +256,8 @@ describe("PR review-fix queue", () => {
         const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: `f${i}`, evidenceKey: `review:${i}` });
         expect(item.status).toBe("QUEUED");
         expect(item.fixAttempts).toBe(i);
-        await markPrFixItem(client, { repo: "org/repo", pr: 9, status: "fixed" });
+        const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 9, status: "fixed" });
+        expect(mutatedItem(fixed)?.status).toBe("FIXED");
       }
       // The 4th attempt exceeds the cap → hand to a human instead of
       // re-queuing (the human-review-forever case).
@@ -1540,6 +1541,38 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     expect(client.history.at(-1).note).toContain("Bounded at 2 fix attempts");
     expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
   });
+
+  it("counts a mark back to QUEUED as an attempt without resetting the budget", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "blocked" });
+
+    const queued = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "queued" }));
+    expect(queued.status).toBe("QUEUED");
+    expect(queued.fixAttempts).toBe(2);
+
+    // The budget is spent, so the next return goes to a human.
+    await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "fixed" });
+    const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+    expect(blocked.status).toBe("BLOCKED");
+    expect(blocked.lane).toBe("NEEDS_HUMAN");
+  });
+
+  it("caps the #940 no-progress tombstone reopen like any other return to QUEUED", async () => {
+    const input = { repo: "org/repo", pr: 5, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" };
+    await enqueuePrFixItem(client, input);
+    await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed" });
+
+    // Same evidence, head unchanged: the FIXED tombstone reopens (attempt 2).
+    const reopened = await enqueuePrFixItem(client, input);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.fixAttempts).toBe(2);
+
+    // Past the cap the reopen hands the PR to a human instead.
+    await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed" });
+    const capped = await enqueuePrFixItem(client, input);
+    expect(capped.status).toBe("BLOCKED");
+    expect(capped.lane).toBe("NEEDS_HUMAN");
+  });
 });
 
 describe("fresh attempts always get a head baseline (#1104)", () => {
@@ -1602,5 +1635,18 @@ describe("fresh attempts always get a head baseline (#1104)", () => {
     const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2" });
     expect(reopened.status).toBe("QUEUED");
     expect(reopened.attemptHeadSha).toBe("H1");
+  });
+
+  it("leaves the baseline null only when no head was ever observed, and FIXED then settles as no-record", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 8, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 8, status: "blocked" });
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 8 });
+    expect(requeued.attemptHeadSha).toBeNull();
+
+    // Nothing to compare against, and no mutable headSha for a sync to
+    // overwrite, so the guard cannot misfire: it accepts without GitHub.
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 8, status: "FIXED", expectedGeneration: requeued.generation });
+    expect(mutatedItem(result).status).toBe("FIXED");
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
   });
 });
