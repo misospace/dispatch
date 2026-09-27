@@ -11,7 +11,12 @@ const { mocks } = vi.hoisted(() => ({
     repoFindUnique: vi.fn(),
     issueFindUnique: vi.fn(),
     issueUpdate: vi.fn(),
+    invalidateGroomingForComment: vi.fn(),
   },
+}));
+
+vi.mock("@/lib/groomer/freshness-invalidation", () => ({
+  invalidateGroomingForComment: mocks.invalidateGroomingForComment,
 }));
 
 vi.mock("@/lib/prisma", () => ({
@@ -314,5 +319,47 @@ describe("POST /api/issues/webhook", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("Webhook processing failed");
+  });
+
+  describe("issue_comment (grooming freshness, #1064)", () => {
+    function commentEvent(overrides: Record<string, any> = {}) {
+      return {
+        action: "created",
+        repository: { full_name: "org/repo" },
+        issue: { number: 42 },
+        comment: { user: { login: "joryirving" }, created_at: "2026-09-25T03:00:00Z" },
+        ...overrides,
+      };
+    }
+    const headers = { Authorization: `Bearer ${mockToken}`, "x-github-event": "issue_comment" };
+
+    it("hands a new issue comment to the freshness invalidator", async () => {
+      mocks.invalidateGroomingForComment.mockResolvedValue(true);
+      const res = await postRequest(commentEvent(), headers);
+      expect(res.status).toBe(200);
+      expect((await res.json()).groomingStale).toBe(true);
+      expect(mocks.invalidateGroomingForComment).toHaveBeenCalledWith({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        author: "joryirving",
+        createdAt: "2026-09-25T03:00:00Z",
+      });
+      expect(mocks.issueUpdate).not.toHaveBeenCalled();
+    });
+
+    it("ignores edits, PR comments and untracked issues", async () => {
+      await postRequest(commentEvent({ action: "edited" }), headers);
+      await postRequest(commentEvent({ issue: { number: 42, pull_request: {} } }), headers);
+      mocks.issueFindUnique.mockResolvedValueOnce(null);
+      const res = await postRequest(commentEvent(), headers);
+      expect((await res.json()).message).toContain("not cached");
+      expect(mocks.invalidateGroomingForComment).not.toHaveBeenCalled();
+    });
+
+    it("rejects a comment payload without an author", async () => {
+      const res = await postRequest(commentEvent({ comment: { created_at: "2026-09-25T03:00:00Z" } }), headers);
+      expect(res.status).toBe(400);
+    });
   });
 });

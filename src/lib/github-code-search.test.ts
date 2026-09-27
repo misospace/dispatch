@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
+  compareCommits,
+  COMPARE_MAX_FILES,
   fetchRepo,
   fetchRepositoryFileText,
   fetchRepositoryMetadata,
@@ -283,5 +285,49 @@ describe("github-code-search: repository metadata and contents fetchers", () => 
     await expect(listRepositoryDirectory("org/repo", "nope")).rejects.toThrow(
       "Failed to list directory nope in org/repo: 404",
     );
+  });
+});
+
+describe("github-code-search: compareCommits (grooming freshness, #1064)", () => {
+  let fetchSpy: Mock<typeof globalThis.fetch>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  it("returns changed paths, including the old side of a rename, in one request", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      mockResponse({
+        status: "ahead",
+        files: [{ filename: "src/new.ts", previous_filename: "src/old.ts" }, { filename: "docs/a.md" }],
+      }),
+    );
+    const result = await compareCommits("org/repo", "base1", "head1");
+    expect(result).toEqual({ ok: true, status: "ahead", files: ["src/new.ts", "src/old.ts", "docs/a.md"], truncated: false });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(fetchSpy.mock.calls[0][0])).toContain("/repos/org/repo/compare/base1...head1?per_page=1");
+  });
+
+  it("flags a file list at GitHub's cap as truncated", async () => {
+    const files = Array.from({ length: COMPARE_MAX_FILES }, (_, i) => ({ filename: `f${i}` }));
+    fetchSpy.mockResolvedValueOnce(mockResponse({ status: "ahead", files }));
+    const result = await compareCommits("org/repo", "a", "b");
+    expect(result.ok && result.truncated).toBe(true);
+  });
+
+  it("reports an unknown base as a definitive failure without throwing", async () => {
+    fetchSpy.mockResolvedValueOnce(mockResponse("No commit found", { status: 404 }));
+    const result = await compareCommits("org/repo", "gone", "b");
+    expect(result).toMatchObject({ ok: false, httpStatus: 404, definitive: true });
+  });
+
+  it("reports a network failure as transient", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("socket hang up"));
+    const result = await compareCommits("org/repo", "a", "b");
+    expect(result).toMatchObject({ ok: false, httpStatus: null, definitive: false });
   });
 });

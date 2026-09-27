@@ -40,7 +40,7 @@ const { mocks } = vi.hoisted(() => ({
     prisma: {
       automationRepo: { findUnique: vi.fn() },
       groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
-      issue: { update: vi.fn() },
+      issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
       auditLog: { create: vi.fn() },
@@ -105,6 +105,7 @@ vi.mock("./groomer-lock", () => ({
 }));
 
 import { runHostedGroomer } from "./run";
+import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
   id: "issue-42",
@@ -846,6 +847,7 @@ describe("runHostedGroomer", () => {
     expect(mocks.selectGroomingCandidate).toHaveBeenCalledWith({
       repoFullName: "org/repo",
       issueNumber: 42,
+      freshnessBackfill: true,
     });
   });
 
@@ -1358,7 +1360,7 @@ Investigate session handling in auth module.`;
 
         const result = await runHostedGroomer({ repoFullName: "org/repo", issueNumber: 42 });
 
-        expect(mocks.selectGroomingCandidate).toHaveBeenCalledWith({ repoFullName: "org/repo", issueNumber: 42 });
+        expect(mocks.selectGroomingCandidate).toHaveBeenCalledWith({ repoFullName: "org/repo", issueNumber: 42, freshnessBackfill: true });
         expectNoGitHubMutation();
         expect(result!.plannedLabels).toEqual(["status/in-review", "priority/p1"]);
         expect(result!.mutationPlan).toMatchObject({ skippedReason: "in_flight_status", inFlightStatus: "status/in-review", willCloseIssue: false });
@@ -1502,6 +1504,107 @@ Investigate session handling in auth module.`;
       expect(mocks.closeIssue).not.toHaveBeenCalled();
       expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ state: "closed" }) }),
+      );
+    });
+  });
+
+  describe("grooming freshness (#1064)", () => {
+    function issueUpdateData(): Record<string, unknown> {
+      const call = mocks.prisma.issue.update.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      return call![0].data;
+    }
+
+    it("records the evidence baseline of an applied groom, and clears staleness", async () => {
+      await runHostedGroomer();
+      const data = issueUpdateData();
+      expect(data).toMatchObject({
+        groomedRunId: "gr-1",
+        groomedHeadSha: "abc123",
+        groomedDefaultBranch: "main",
+        groomedEvidenceDigest: "digest",
+        groomedEvidenceScope: "paths",
+        groomedEvidencePaths: ["src/auth/login.ts"],
+        groomingVerifiedSha: "abc123",
+        groomingStaleAt: null,
+        groomingStaleReasons: [],
+      });
+      expect(data.groomedEvidenceCapturedAt).toBeInstanceOf(Date);
+      // Expected post-apply state: live title/body plus the labels just written.
+      expect(data.groomedIssueFingerprint).toBe(
+        computeGroomingIssueFingerprint({
+          title: mockEvidence.issue.title,
+          body: mockEvidence.issue.body,
+          state: "open",
+          labels: ["priority/p0", "status/ready"],
+        }),
+      );
+    });
+
+    it("relies on the plan's cited read paths, not every path the run read", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue({ ...mockExploration, sources: ["src/x.ts"], readSources: ["src/x.ts"] });
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({ groomedEvidenceScope: "paths", groomedEvidencePaths: ["src/auth/login.ts"] });
+    });
+
+    it("treats a result citing a surfaced-only path as global evidence", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue({ ...mockExploration, sources: ["src/x.ts"], readSources: [] });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { evidenceRefs: ["repo:src/x.ts"] } }));
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({ groomedEvidenceScope: "global", groomedEvidencePaths: [] });
+    });
+
+    it("does not record a baseline for a skipped in-flight run, leaving the prior one untouched", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-progress", "priority/p0"] });
+      await runHostedGroomer();
+      expect(mocks.prisma.issue.update).toHaveBeenCalledTimes(1);
+      const data = issueUpdateData();
+      expect(Object.keys(data).sort()).toEqual(["groomedAt", "groomedBy"]);
+    });
+
+    it("records the open-blocker state of declared dependencies", async () => {
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: { ...mockEvidence.issue, body: "Depends on #5 and #6." },
+      });
+      mocks.prisma.issue.findMany.mockResolvedValue([{ number: 5, repository: { fullName: "org/repo" } }]);
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({
+        groomedDependencyKeys: ["org/repo#5", "org/repo#6"],
+        groomedOpenBlockerKeys: ["org/repo#5"],
+      });
+    });
+
+    it("falls back to unknown freshness when the baseline cannot be built, without failing the run", async () => {
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: { ...mockEvidence.issue, body: "Depends on #5." },
+      });
+      mocks.prisma.issue.findMany.mockRejectedValue(new Error("db down"));
+      const result = await runHostedGroomer();
+      expect(result).not.toBeNull();
+      expect(issueUpdateData()).toMatchObject({ groomedIssueFingerprint: null, groomingStaleAt: null });
+    });
+
+    it("does not record freshness for a dry run", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      await runHostedGroomer();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("records why a stale candidate was re-groomed on the GroomingRun", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({
+        ...mockCandidate,
+        selectionReason: "stale",
+        staleReasons: ["human_comment"],
+      });
+      await runHostedGroomer();
+      expect(mocks.prisma.groomingRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ candidateSource: "stale", staleReasons: ["human_comment"] }),
+        }),
       );
     });
   });

@@ -21,6 +21,7 @@ import {
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { neutralizeMentions } from "./sanitize";
+import { freshnessBaselineIssueData } from "./freshness-invalidation";
 
 export interface GroomerRunResult {
   candidateNumber: number;
@@ -132,6 +133,7 @@ async function executeGroomerRun(
   const candidate = await deps.selectCandidate({
     repoFullName: options.repoFullName,
     issueNumber: options.issueNumber,
+    freshnessBackfill: true,
   });
   if (!candidate) return null;
 
@@ -157,6 +159,8 @@ async function executeGroomerRun(
     provider: config.llmBaseUrl ? new URL(config.llmBaseUrl).host : null,
     timeoutMs: config.timeoutMs ?? null,
     maxContextBytes: config.maxContextBytes ?? null,
+    candidateSource: candidateSourceOf(candidate),
+    staleReasons: candidate.staleReasons,
   });
 
   const activeLeases = await deps.findActiveLeases(candidate.id);
@@ -169,6 +173,9 @@ async function executeGroomerRun(
     checkpoint: "issue_claimed",
     ttlMs: GROOMER_LEASE_TTL_MS,
   });
+
+  // Freshness (#1064): a human comment after this instant is new evidence.
+  const evidenceWindowStart = new Date();
 
   try {
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
@@ -646,6 +653,29 @@ async function executeGroomerRun(
       issueData.closedAt = new Date();
     }
 
+    // Freshness baseline (#1064): the evidence this applied result was
+    // validated against, including the post-apply state Dispatch just wrote,
+    // so the groomer's own writes never read back as an external change.
+    Object.assign(
+      issueData,
+      await freshnessBaselineIssueData(deps.prisma, {
+        groomingRunId: groomingRun.id,
+        repoFullName: candidate.repoFullName,
+        issueNumber: candidate.number,
+        evidence,
+        candidate,
+        appliedTitle: titleBodyFields.title as string | undefined,
+        appliedBody: titleBodyFields.body as string | undefined,
+        labelsAfter: newLabels,
+        closed: appliedMutations.issueClosed === true,
+        evidenceWindowStart,
+        repositoryQueries: repositoryContext.queries,
+        explorationRan: exploration !== null,
+        explorationToolCalls: exploration?.toolCalls ?? [],
+        citations: plan.citations,
+      }),
+    );
+
     await deps.prisma.issue.update({
       where: { id: candidate.id },
       data: issueData,
@@ -752,6 +782,17 @@ async function executeGroomerRun(
     throw error;
   } finally {
     await deps.releaseLease(lease.id);
+  }
+}
+
+function candidateSourceOf(candidate: { selectionReason?: string }): string {
+  switch (candidate.selectionReason) {
+    case "targeted":
+    case "stale":
+    case "freshness_unknown":
+      return candidate.selectionReason;
+    default:
+      return "selector";
   }
 }
 

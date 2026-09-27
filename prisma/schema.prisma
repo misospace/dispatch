@@ -58,6 +58,27 @@ model Issue {
   needsInfoReason  String?  @db.Text
   nextGroomingAction String? @db.Text
 
+  // Grooming freshness (#1064): the evidence identity the latest applied
+  // grooming result was validated against, and whether it has gone stale.
+  // groomedIssueFingerprint NULL means freshness is unknown (never groomed
+  // since freshness was introduced, or the baseline could not be recorded).
+  groomedRunId              String?
+  groomedHeadSha            String?
+  groomedDefaultBranch      String?
+  groomedIssueFingerprint   String?
+  groomedCommentCount       Int?
+  groomedEvidenceDigest     String?
+  groomedEvidenceCapturedAt DateTime?
+  groomedEvidenceScope      String?
+  groomedEvidencePaths      String[]  @default([])
+  groomedDependencyKeys     String[]  @default([])
+  groomedOpenBlockerKeys    String[]  @default([])
+  groomedRelatedWork        Json?
+  groomingVerifiedSha       String?
+  groomingStaleAt           DateTime?
+  groomingStaleReasons      String[]  @default([])
+  groomingStaleDetail       String?   @db.Text
+
   // Linked PR health (persisted by reconcile, refreshable on demand)
   linkedPrNumber          Int?
   linkedPrUrl             String?
@@ -73,6 +94,7 @@ model Issue {
   @@index([state])
   @@index([labels])
   @@index([linkedPrNeedsFollowup])
+  @@index([groomingStaleAt])
 }
 
 enum PrFixLane {
@@ -458,6 +480,7 @@ model GroomingRun {
   status            String
   dryRun            Boolean
   candidateSource   String         @default("selector")
+  staleReasons      String[]       @default([])
   stage             String         @default("selected")
 
   model             String?

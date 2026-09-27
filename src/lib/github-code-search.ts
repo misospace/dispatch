@@ -146,3 +146,73 @@ export async function listRepositoryDirectory(
     size: typeof entry.size === "number" ? entry.size : null,
   }));
 }
+
+/** GitHub caps a compare's file list at this many entries. */
+export const COMPARE_MAX_FILES = 300;
+
+export type CommitComparison =
+  | {
+      ok: true;
+      /** ahead | identical | behind | diverged, as GitHub reports it. */
+      status: string;
+      /** Changed paths, including the old path of a rename. */
+      files: string[];
+      /** True when GitHub's file cap was reached, so `files` may be incomplete. */
+      truncated: boolean;
+    }
+  | {
+      ok: false;
+      /** HTTP status, or null for a network/parse failure. */
+      httpStatus: number | null;
+      /** True when retrying cannot help (unknown SHA, unrelated histories). */
+      definitive: boolean;
+      message: string;
+    };
+
+/**
+ * Compare two commits and return the paths changed between them. One request:
+ * the file list is only on the first page, so commits are paged at 1 to keep
+ * the payload small. Never throws.
+ */
+export async function compareCommits(
+  repoFullName: string,
+  base: string,
+  head: string,
+): Promise<CommitComparison> {
+  const url = `${GITHUB_API}/repos/${repoFullName}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}?per_page=1`;
+  try {
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (!response.ok) {
+      const text = await response.text();
+      return {
+        ok: false,
+        httpStatus: response.status,
+        definitive: response.status === 404 || response.status === 422,
+        message: `compare ${base}...${head} failed: ${response.status} ${text.slice(0, 200)}`,
+      };
+    }
+    const data = (await response.json()) as {
+      status?: string;
+      files?: Array<{ filename?: string; previous_filename?: string }>;
+    };
+    const rawFiles = Array.isArray(data.files) ? data.files : [];
+    const files = new Set<string>();
+    for (const file of rawFiles) {
+      if (typeof file.filename === "string" && file.filename) files.add(file.filename);
+      if (typeof file.previous_filename === "string" && file.previous_filename) files.add(file.previous_filename);
+    }
+    return {
+      ok: true,
+      status: typeof data.status === "string" ? data.status : "unknown",
+      files: [...files],
+      truncated: rawFiles.length >= COMPARE_MAX_FILES,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      httpStatus: null,
+      definitive: false,
+      message: `compare ${base}...${head} failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}

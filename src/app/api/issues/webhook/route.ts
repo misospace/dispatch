@@ -4,6 +4,7 @@ import { authorizeRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getSignatureVerificationMode, verifyWebhookSignature } from "@/lib/webhook-signature";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { invalidateGroomingForComment } from "@/lib/groomer/freshness-invalidation";
 
 /**
  * GitHub Webhook Handler for Issue Label Events
@@ -15,6 +16,11 @@ import { enforceRateLimit } from "@/lib/rate-limit";
  * Signature verification: validates X-Hub-Signature-256 using HMAC-SHA256
  * with the WEBHOOK_SECRET environment variable (same fail-closed model as
  * the pr-followup webhook).
+ *
+ * Also receives `issue_comment` events with action `created`: a new human
+ * comment marks the issue's grooming result stale (#1064) so the groomer
+ * revisits it without waiting for the next sync's comment check. Automation
+ * comments are ignored.
  *
  * Only the Prisma cache is updated. GitHub is the source of truth and the
  * event already came from GitHub, so no outbound GitHub calls are made.
@@ -85,6 +91,10 @@ export async function POST(request: Request) {
 
     if (!jsonPayload || typeof jsonPayload !== "object") {
       return errorResponse("Invalid payload", 400);
+    }
+
+    if (githubEvent === "issue_comment") {
+      return handleIssueComment(jsonPayload as Record<string, any>);
     }
 
     if (githubEvent !== "issues") {
@@ -164,4 +174,45 @@ export async function POST(request: Request) {
     console.error("Issues webhook handler failed:", error);
     return errorResponse("Webhook processing failed", 500);
   }
+}
+
+async function handleIssueComment(body: Record<string, any>) {
+  if (body.action !== "created") {
+    return NextResponse.json({ message: `Unhandled issue_comment action: ${body.action ?? "unknown"}` });
+  }
+  if (body.issue?.pull_request) {
+    return NextResponse.json({ message: "Pull request comment, ignored" });
+  }
+  const repoFullName = body.repository?.full_name;
+  const issueNumber = body.issue?.number;
+  const author = body.comment?.user?.login;
+  const createdAt = body.comment?.created_at;
+  if (typeof repoFullName !== "string" || !repoFullName || typeof issueNumber !== "number") {
+    return errorResponse("Missing repository.full_name or issue.number in payload", 400);
+  }
+  if (typeof author !== "string" || typeof createdAt !== "string") {
+    return errorResponse("Missing comment.user.login or comment.created_at in payload", 400);
+  }
+
+  const repo = await prisma.repository.findUnique({ where: { fullName: repoFullName } });
+  if (!repo) return NextResponse.json({ message: "Repo not tracked, ignored" });
+  const cachedIssue = await prisma.issue.findUnique({
+    where: { repositoryId_number: { repositoryId: repo.id, number: issueNumber } },
+    select: { id: true },
+  });
+  if (!cachedIssue) return NextResponse.json({ message: "Issue not cached, ignored" });
+
+  const staled = await invalidateGroomingForComment({
+    issueId: cachedIssue.id,
+    repoFullName,
+    issueNumber,
+    author,
+    createdAt,
+  });
+  return NextResponse.json({
+    message: staled
+      ? `Grooming result marked stale: ${repoFullName}#${issueNumber}`
+      : `Comment does not invalidate grooming: ${repoFullName}#${issueNumber}`,
+    groomingStale: staled,
+  });
 }

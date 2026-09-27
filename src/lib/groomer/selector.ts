@@ -6,6 +6,13 @@ import {
   buildGroomingStateExclusionWhere,
   isRenovateIssue,
 } from "@/lib/issue-filters";
+import { isFreshnessTrackedStatus } from "./freshness";
+
+/**
+ * Why a candidate was chosen. "stale" and "freshness_unknown" are the
+ * freshness paths (#1064); the rest is the pre-existing classification logic.
+ */
+export type GroomingSelectionReason = "targeted" | "classification" | "stale" | "freshness_unknown";
 
 export interface GroomingCandidate {
   id: string;
@@ -17,11 +24,32 @@ export interface GroomingCandidate {
   labels: string[];
   currentLane: string | null;
   groomingSummary: string | null;
+  /** Cached GitHub comment count at selection; the freshness comment baseline. */
+  commentsCount?: number;
+  selectionReason?: GroomingSelectionReason;
+  /** Why the previous result went stale, when selectionReason is "stale". */
+  staleReasons?: string[];
 }
+
+/** A stale result is re-groomed only after this long, so no trigger can spin the groomer on one issue. */
+export const STALE_REGROOM_MIN_AGE_MINUTES = 30;
+
+/** Score bonus for a stale result: above routine backlog re-grooming, below any missing classification. */
+const STALE_SCORE = 200;
+/** Score for a baseline-less fully classified issue: only when nothing else wants grooming. */
+const FRESHNESS_UNKNOWN_SCORE = 1;
 
 export interface SelectGroomingCandidateOptions {
   repoFullName?: string;
   issueNumber?: number;
+  /**
+   * Also offer fully classified issues with no freshness baseline, at the
+   * lowest priority, so they acquire one. Only the hosted groomer records a
+   * baseline; an external groomer (next-task?mode=groom) applies decisions
+   * through /api/issues/groom, which leaves freshness unknown, so offering it
+   * these would re-groom every ready issue once per cooldown forever.
+   */
+  freshnessBackfill?: boolean;
 }
 
 export async function selectGroomingCandidate(
@@ -50,15 +78,24 @@ export async function selectGroomingCandidate(
   const skipGroomingStateExclusion = options.issueNumber !== undefined;
   if (!skipGroomingStateExclusion) {
     const groomingStateWhere = buildGroomingStateExclusionWhere(24);
-    if (groomingStateWhere.AND) {
-      const existing = issueWhere.AND;
-      if (Array.isArray(existing)) {
-        existing.push(...groomingStateWhere.AND);
-      } else if (existing) {
-        issueWhere.AND = [existing, ...groomingStateWhere.AND];
-      } else {
-        issueWhere.AND = groomingStateWhere.AND;
-      }
+    // A stale grooming result (#1064) bypasses the cooldown and the
+    // blocked/not-ready parking: the evidence that parked it has changed, so
+    // the parking decision is exactly what needs revisiting. A short floor
+    // still applies so a trigger that keeps firing cannot re-groom one issue
+    // every run.
+    const staleFloor = new Date(Date.now() - STALE_REGROOM_MIN_AGE_MINUTES * 60 * 1000);
+    const staleWhere = {
+      groomingStaleAt: { not: null },
+      OR: [{ groomedAt: null }, { groomedAt: { lt: staleFloor } }],
+    };
+    const clause = { OR: [{ AND: groomingStateWhere.AND }, staleWhere] };
+    const existing = issueWhere.AND;
+    if (Array.isArray(existing)) {
+      existing.push(clause);
+    } else if (existing) {
+      issueWhere.AND = [existing, clause];
+    } else {
+      issueWhere.AND = [clause];
     }
   }
 
@@ -76,6 +113,10 @@ export async function selectGroomingCandidate(
       // Carried so run.ts can fall back to it as notReadyReason when the model
       // omits the field on a mark_not_ready decision (dispatch#839).
       groomingSummary: true,
+      commentsCount: true,
+      groomedIssueFingerprint: true,
+      groomingStaleAt: true,
+      groomingStaleReasons: true,
       repository: { select: { fullName: true } },
     },
     orderBy: { number: "asc" },
@@ -93,10 +134,7 @@ export async function selectGroomingCandidate(
       const isUnlabeled = issue.labels.length === 0;
       const isUnexplainedBlocked = issue.labels.includes("status/blocked") && issue.blockedReason == null;
 
-      // Targeted runs are an explicit operator request, so they must reach
-      // fully classified issues as well as issues parked by grooming.
-      const eligible =
-        options.issueNumber !== undefined ||
+      const needsClassification =
         isUnexplainedBlocked ||
         isUnlabeled ||
         !hasStatus ||
@@ -105,15 +143,38 @@ export async function selectGroomingCandidate(
         !hasLane ||
         isBacklog;
 
+      // Freshness (#1064). Worker-owned statuses are never re-groomed.
+      const groomable = isFreshnessTrackedStatus(issue.labels);
+      const isStale = groomable && issue.groomingStaleAt != null;
+      // A baseline-less result is backfilled only when nothing else wants the
+      // groomer; a deliberate block stays parked until something stales it.
+      const freshnessUnknown =
+        options.freshnessBackfill === true && groomable && !issue.groomedIssueFingerprint && issue.blockedReason == null;
+
+      // Targeted runs are an explicit operator request, so they must reach
+      // fully classified issues as well as issues parked by grooming.
+      const eligible = options.issueNumber !== undefined || needsClassification || isStale || freshnessUnknown;
+
       let score = 0;
       if (isUnlabeled) score += 1000;
       if (!hasStatus) score += 500;
       if (!hasPriority) score += 250;
+      if (isStale) score += STALE_SCORE;
       if (isBacklog) score += 100;
       if (!hasAgent) score += 50;
       if (!hasLane && !isBacklog) score += 25;
+      if (freshnessUnknown && score === 0) score = FRESHNESS_UNKNOWN_SCORE;
 
-      return { issue, eligible, score };
+      const selectionReason: GroomingSelectionReason =
+        options.issueNumber !== undefined
+          ? "targeted"
+          : needsClassification
+            ? "classification"
+            : isStale
+              ? "stale"
+              : "freshness_unknown";
+
+      return { issue, eligible, score, selectionReason, isStale };
     })
     .filter((c) => c.eligible)
     .sort((a, b) => b.score - a.score || a.issue.number - b.issue.number);
@@ -122,7 +183,7 @@ export async function selectGroomingCandidate(
     return null;
   }
 
-  const best = candidates[0].issue;
+  const { issue: best, selectionReason, isStale } = candidates[0];
   return {
     id: best.id,
     number: best.number,
@@ -133,5 +194,8 @@ export async function selectGroomingCandidate(
     labels: best.labels,
     currentLane: best.currentLane ?? getBacklogLane()?.id ?? "backlog",
     groomingSummary: best.groomingSummary,
+    commentsCount: best.commentsCount,
+    selectionReason,
+    staleReasons: isStale ? (best.groomingStaleReasons ?? []) : [],
   };
 }

@@ -35,7 +35,7 @@ describe("selectGroomingCandidate", () => {
     expect(result).toBeNull();
   });
 
-  it("returns null when all issues are fully labeled", async () => {
+  it("returns null when all issues are fully labeled and fresh (or not backfilled)", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {
         number: 10,
@@ -44,6 +44,8 @@ describe("selectGroomingCandidate", () => {
         labels: ["status/ready", "priority/p0", "agent/alice"],
         currentLane: "local",
         blockedReason: null,
+        groomedIssueFingerprint: "fp",
+        groomingStaleAt: null,
         repository: { fullName: "org/repo" },
       },
     ]);
@@ -331,5 +333,112 @@ describe("selectGroomingCandidate", () => {
     // The default pool run still applies the exclusion — the bypass is targeted only.
     expect(serialized).toContain('"blockedReason":null');
     expect(serialized).toContain('"notReadyReason":null');
+  });
+
+  describe("grooming freshness (#1064)", () => {
+    const fullyClassified = {
+      title: "Ready issue",
+      url: "https://github.com/org/repo/issues/1",
+      labels: ["status/ready", "priority/p1", "agent/alice"],
+      currentLane: "local",
+      blockedReason: null,
+      groomedIssueFingerprint: "fp",
+      groomingStaleAt: null,
+      groomingStaleReasons: [],
+      commentsCount: 3,
+      repository: { fullName: "org/repo" },
+    };
+
+    it("selects a stale fully classified ready issue and says why", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        { ...fullyClassified, number: 1 },
+        {
+          ...fullyClassified,
+          number: 2,
+          groomingStaleAt: new Date(),
+          groomingStaleReasons: ["evidence_path_changed"],
+        },
+      ]);
+      const result = await selectGroomingCandidate();
+      expect(result).toMatchObject({
+        number: 2,
+        selectionReason: "stale",
+        staleReasons: ["evidence_path_changed"],
+        commentsCount: 3,
+      });
+    });
+
+    it("selects a stale blocked deferral whose blocker changed", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          ...fullyClassified,
+          number: 3,
+          labels: ["status/blocked", "priority/p1", "agent/alice"],
+          blockedReason: "Blocked by open #5",
+          groomingStaleAt: new Date(),
+          groomingStaleReasons: ["dependency_changed"],
+        },
+      ]);
+      const result = await selectGroomingCandidate();
+      expect(result).toMatchObject({ number: 3, selectionReason: "stale" });
+    });
+
+    it("never re-grooms a stale issue a worker owns", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        {
+          ...fullyClassified,
+          number: 4,
+          labels: ["status/in-progress", "priority/p1", "agent/alice"],
+          groomingStaleAt: new Date(),
+          groomingStaleReasons: ["human_comment"],
+        },
+      ]);
+      expect(await selectGroomingCandidate()).toBeNull();
+    });
+
+    it("ranks stale below missing classification", async () => {
+      mocks.issueFindMany.mockResolvedValue([
+        { ...fullyClassified, number: 5, groomingStaleAt: new Date() },
+        { ...fullyClassified, number: 6, labels: ["status/ready", "agent/alice"] },
+      ]);
+      const result = await selectGroomingCandidate();
+      expect(result).toMatchObject({ number: 6, selectionReason: "classification" });
+    });
+
+    it("backfills a baseline-less fully classified issue only when asked and nothing else is eligible", async () => {
+      const backfill = { freshnessBackfill: true };
+      const unknown = { ...fullyClassified, number: 7, groomedIssueFingerprint: null };
+      mocks.issueFindMany.mockResolvedValue([unknown, { ...fullyClassified, number: 8, groomingStaleAt: new Date() }]);
+      expect((await selectGroomingCandidate(backfill))!.number).toBe(8);
+
+      mocks.issueFindMany.mockResolvedValue([unknown]);
+      expect(await selectGroomingCandidate(backfill)).toMatchObject({ number: 7, selectionReason: "freshness_unknown" });
+      // External groomers (next-task) never get backfill work.
+      expect(await selectGroomingCandidate()).toBeNull();
+
+      // A deliberately blocked issue without a baseline stays parked.
+      mocks.issueFindMany.mockResolvedValue([
+        { ...unknown, labels: ["status/blocked", "priority/p1", "agent/alice"], blockedReason: "External" },
+      ]);
+      expect(await selectGroomingCandidate(backfill)).toBeNull();
+    });
+
+    it("lets stale issues bypass the cooldown and parking, behind a short floor", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+      await selectGroomingCandidate();
+      const where = mocks.issueFindMany.mock.calls[0][0].where;
+      const clause = where.AND.find((c: Record<string, unknown>) => Array.isArray(c.OR) && (c.OR as unknown[]).length === 2);
+      expect(clause).toBeDefined();
+      const [parked, stale] = clause.OR;
+      expect(JSON.stringify(parked)).toContain('"blockedReason":null');
+      expect(stale.groomingStaleAt).toEqual({ not: null });
+      const floor = stale.OR[1].groomedAt.lt as Date;
+      expect(Date.now() - floor.getTime()).toBeGreaterThanOrEqual(29 * 60 * 1000);
+    });
+
+    it("targeted runs report the targeted reason", async () => {
+      mocks.issueFindMany.mockResolvedValue([{ ...fullyClassified, number: 9 }]);
+      expect(await selectGroomingCandidate({ issueNumber: 9 })).toMatchObject({ selectionReason: "targeted" });
+    });
   });
 });
