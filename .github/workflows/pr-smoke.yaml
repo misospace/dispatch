@@ -129,7 +129,7 @@ jobs:
           # assertions. Require consecutive successes so a restarting pod is
           # not mistaken for a healthy one.
           ok=0
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if kubectl run "probe-${INSTANCE}-$RANDOM" -n "$NS" --rm -i --restart=Never \
                  --image=curlimages/curl:latest --quiet -- \
                  -sf -o /dev/null --max-time 5 "http://dispatch-${INSTANCE}.${NS}:3000/api/health" 2>/dev/null; then
@@ -171,7 +171,7 @@ jobs:
 
           # --attach=false because the runner's Role has pods/log but not
           # pods/attach; `kubectl run -i` silently degrades and loses output.
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             phase=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
             case "$phase" in Succeeded|Failed) break;; esac
             sleep 2
