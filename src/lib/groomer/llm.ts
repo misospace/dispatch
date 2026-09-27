@@ -1,7 +1,8 @@
-import { ALLOWED_GROOMER_LABELS, type GroomerOutput } from "./schema";
-import { getConfiguredLanes, getClaimableLanes, getBacklogLane, getLaneIds } from "@/lib/lane-config";
+import { getConfiguredLanes, getClaimableLanes, getBacklogLane } from "@/lib/lane-config";
 import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 import { buildGroomerSystemPrompt } from "./prompts/system-prompt";
+import { buildGroomingPlanResponseSchema } from "./plan-schema";
+import { renderEvidenceCatalog, type EvidenceCatalog } from "./plan-evidence";
 
 export interface CallLlmOptions {
   baseUrl: string;
@@ -12,7 +13,7 @@ export interface CallLlmOptions {
   /**
    * Send `response_format` (json_schema, falling back to json_object). Set
    * false for backends that implement neither; the system prompt still
-   * demands JSON and `validateGroomerOutput` still checks it. Defaults to true.
+   * demands JSON and `validateGroomingPlan` still checks it. Defaults to true.
    */
   responseFormat?: boolean;
   /**
@@ -22,6 +23,11 @@ export interface CallLlmOptions {
   explorationFindings?: string;
   /** Cap on the appended findings block. Defaults to MAX_FINDINGS_BYTES. */
   maxFindingsBytes?: number;
+  /**
+   * The run's citable evidence. Rendered into the user turn and used to
+   * enum-constrain every evidence id in the response schema.
+   */
+  evidenceCatalog?: EvidenceCatalog;
 }
 
 const VALID_TYPE_LABELS = ["type/bug", "type/feature", "type/chore", "type/research", "type/security"];
@@ -53,56 +59,17 @@ function buildSystemPrompt(): string {
   });
 }
 
-const CONFIDENCE_ENUM = ["high", "medium", "low"] as const;
-
 /**
- * JSON Schema for the groomer's output, used as an OpenAI-style `json_schema`
- * response_format. On a self-hosted llama.cpp backend (via litellm) this
- * grammar-constrains decoding to the exact shape — the key to reliable output
- * from a small model. `lane.id` is a dynamic enum built from the configured
- * lanes so the model can only emit a real lane, never a hallucinated one.
- * `validateGroomerOutput` still runs afterward as the safety net (and handles
- * enum alias canonicalization), so this is belt-and-suspenders.
+ * JSON Schema for the groomer's output: the GroomingPlan draft
+ * (dispatch#1062), sent as an OpenAI-style `json_schema` response_format. On a
+ * self-hosted llama.cpp backend (via litellm) this grammar-constrains decoding
+ * to the exact shape — the key to reliable output from a small model. Lanes,
+ * labels and evidence ids are enums built from the configured lanes, the
+ * label allowlist and this run's evidence catalog. `validateGroomingPlan`
+ * still runs afterward for the cross-field readiness invariants.
  */
-export function buildGroomerResponseSchema(): Record<string, unknown> {
-  const laneIds = getLaneIds();
-  const confidence = { type: "string", enum: [...CONFIDENCE_ENUM] };
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ["labelsToAdd", "labelsToRemove", "lane"],
-    properties: {
-      actionability: { type: "string", enum: ["ready", "needs_info", "blocked", "backlog", "already_done"] },
-      confidence,
-      // Enum-constrained to the validator's allowlist so the model cannot
-      // invent labels (a 4B happily emits "type/refactor" otherwise).
-      labelsToAdd: { type: "array", items: { type: "string", enum: [...ALLOWED_GROOMER_LABELS] } },
-      labelsToRemove: { type: "array", items: { type: "string", enum: [...ALLOWED_GROOMER_LABELS] } },
-      lane: {
-        type: "object",
-        additionalProperties: false,
-        required: ["id", "confidence", "reason"],
-        properties: {
-          id: laneIds.length > 0 ? { type: "string", enum: laneIds } : { type: "string" },
-          confidence,
-          reason: { type: "string" },
-        },
-      },
-      summary: { type: "string" },
-      githubComment: { type: "string" },
-          needsInfoReason: { type: "string" },
-          blockedReason: { type: "string" },
-          notReadyReason: { type: "string" },
-          nextGroomingAction: {
-        type: "string",
-        enum: ["promote_to_ready", "escalate", "mark_not_ready", "mark_needs_info", "mark_blocked"],
-      },
-      // The validator requires 10-200 chars (or omitted/null). Without the
-      // bounds in the grammar a small model emits "" instead of omitting.
-      proposedTitle: { anyOf: [{ type: "null" }, { type: "string", minLength: 10, maxLength: 200 }] },
-      proposedBody: { anyOf: [{ type: "null" }, { type: "string", maxLength: 9999 }] },
-    },
-  };
+export function buildGroomerResponseSchema(catalog?: EvidenceCatalog): Record<string, unknown> {
+  return buildGroomingPlanResponseSchema(catalog);
 }
 
 /**
@@ -113,7 +80,7 @@ export function buildGroomerResponseSchema(): Record<string, unknown> {
  */
 export const MAX_FINDINGS_BYTES = 4096;
 
-function buildUserContent(options: CallLlmOptions): string {
+function withFindings(options: CallLlmOptions): string {
   const findings = options.explorationFindings?.trim();
   if (!findings) return options.prompt;
   const limit = options.maxFindingsBytes ?? MAX_FINDINGS_BYTES;
@@ -122,6 +89,12 @@ function buildUserContent(options: CallLlmOptions): string {
   const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
   const clipped = decoder.decode(buf.subarray(0, limit)).replace(/\uFFFD$/, "");
   return `${options.prompt}\n\n${clipped}\n… (findings truncated)`;
+}
+
+function buildUserContent(options: CallLlmOptions): string {
+  const content = withFindings(options);
+  if (!options.evidenceCatalog) return content;
+  return `${content}\n\n${renderEvidenceCatalog(options.evidenceCatalog)}`;
 }
 
 function postChatCompletion(
@@ -209,7 +182,10 @@ async function attemptChatCompletion(
   let response = await postChatCompletion(
     url,
     options,
-    { type: "json_schema", json_schema: { name: "groomer_output", schema: buildGroomerResponseSchema() } },
+    {
+      type: "json_schema",
+      json_schema: { name: "grooming_plan", schema: buildGroomerResponseSchema(options.evidenceCatalog) },
+    },
     signal,
   );
   if (response.status === 400) {
@@ -255,7 +231,11 @@ async function callWithRetry(
   throw new Error("callWithRetry: unreachable");
 }
 
-export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOutput> {
+/**
+ * Returns the model's parsed JSON, unvalidated. The caller validates it as a
+ * GroomingPlan against the same evidence catalog.
+ */
+export async function callGroomerLLM(options: CallLlmOptions): Promise<unknown> {
   const url = `${options.baseUrl}/chat/completions`;
 
   const controller = new AbortController();
@@ -264,7 +244,7 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOu
   try {
     // Prefer schema-constrained decoding. Fall back to plain JSON mode if the
     // backend rejects json_schema (400), so grooming never breaks on a serving
-    // stack that doesn't support it; validateGroomerOutput repairs content either way.
+    // stack that doesn't support it; validateGroomingPlan checks content either way.
     // The call is wrapped in a bounded retry so a transient transport failure
     // (socket drop / connection reset) or a retryable 5xx from a rolling
     // litellm restart re-issues to a healthy replica instead of losing the run.
@@ -282,7 +262,7 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<GroomerOu
     }
 
     const trimmed = trimJsonFences(content);
-    let parsed: GroomerOutput;
+    let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);
     } catch {

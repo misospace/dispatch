@@ -5,7 +5,9 @@ import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerL
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
-import { validateGroomerOutput, type GroomerOutput } from "./schema";
+import type { GroomerOutput } from "./schema";
+import { inFlightStatus, toGroomerOutput, validateGroomingPlan, type GroomingPlan } from "./plan";
+import { buildEvidenceCatalog } from "./plan-evidence";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
 import { exploreRepository } from "./explore";
@@ -19,13 +21,14 @@ import {
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { neutralizeMentions } from "./sanitize";
-import { isClaimableLane } from "@/lib/lane-config";
 
 export interface GroomerRunResult {
   candidateNumber: number;
   repoFullName: string;
   dryRun: boolean;
   output: any;
+  /** The validated GroomingPlan; `output` is its legacy GroomerOutput view. */
+  plan?: GroomingPlan;
   plannedLabels: string[];
   groomingRunId?: string;
   contextWarnings?: string[];
@@ -48,7 +51,7 @@ export interface GroomerDeps {
   fetchComments: typeof fetchIssueComments;
   buildContext: typeof buildIssueContext;
   callLLM: typeof callGroomerLLM;
-  validateOutput: typeof validateGroomerOutput;
+  validateOutput: typeof validateGroomingPlan;
   getConfig: typeof getHostedGroomerConfig;
   updateLabels: typeof updateIssueLabels;
   addComment: typeof addIssueComment;
@@ -71,7 +74,7 @@ const defaultDeps: GroomerDeps = {
   fetchComments: fetchIssueComments,
   buildContext: buildIssueContext,
   callLLM: callGroomerLLM,
-  validateOutput: validateGroomerOutput,
+  validateOutput: validateGroomingPlan,
   getConfig: getHostedGroomerConfig,
   updateLabels: updateIssueLabels,
   addComment: addIssueComment,
@@ -291,7 +294,10 @@ async function executeGroomerRun(
       // evidence of what the groomer saw was whatever comment it happened to
       // leave on the issue. Related-work refs are GitHub state, not repository
       // content, so they enter as their own unpinned provenance.
-      evidence = addEvidenceSources(evidence, exploration.sources);
+      // Only read_file results were read at the pinned SHA; search hits and
+      // submitted findings enter as surfaced (unpinned) repository evidence.
+      evidence = addEvidenceSources(evidence, exploration.readSources ?? []);
+      evidence = addEvidenceSources(evidence, exploration.sources, "surfaced");
       evidence = addRelatedWorkEvidence(evidence, exploration.relatedWork);
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         stage: "explored",
@@ -316,6 +322,10 @@ async function executeGroomerRun(
       });
     }
 
+    // The citable view of the snapshot: rendered into the prompt, used to
+    // enum-constrain evidence ids, and the set the plan is validated against.
+    const evidenceCatalog = buildEvidenceCatalog(evidence);
+
     // Call LLM
     const rawOutput = await deps.callLLM({
       baseUrl: config.llmBaseUrl!,
@@ -325,15 +335,27 @@ async function executeGroomerRun(
       prompt: context,
       timeoutMs: config.timeoutMs,
       explorationFindings: exploration?.findings,
+      evidenceCatalog,
     });
 
-    // Validate output
-    const validation = deps.validateOutput(rawOutput);
+    // Validate the GroomingPlan against this run's evidence (dispatch#1062).
+    // A rejected plan applies no mutation; its output and deterministic
+    // errors are kept on the run so the rejection can be inspected.
+    const validation = deps.validateOutput(rawOutput, { catalog: evidenceCatalog });
     if (!validation.valid) {
+      await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
+        rawOutput,
+        validationErrors: validation.errors ?? [],
+      }).catch(() => {
+        /* the validation failure below is the error that matters */
+      });
       throw new Error(`Groomer output validation failed: ${validation.errors?.join(", ")}`);
     }
 
-    const output = validation.parsed!;
+    const plan = validation.plan!;
+    // Legacy GroomerOutput view: the mutation path below and existing
+    // run/history consumers read this shape during the plan rollout.
+    const output = toGroomerOutput(plan, candidate.labels);
 
     // mark_not_ready degrades instead of failing the run (dispatch#839). The
     // model is not obliged to emit notReadyReason, so a routine omission must
@@ -371,7 +393,7 @@ async function executeGroomerRun(
     // Record structured alias-resolution warnings for observability
     if (validation.resolutions && validation.resolutions.length > 0) {
       for (const r of validation.resolutions) {
-        contextWarnings.push(`enum:${r.field}: resolved '${r.rawValue}' -> '${r.resolvedValue}' via alias`);
+        contextWarnings.push(`enum:${r.field}: resolved '${r.rawValue}' -> '${r.resolvedValue}' via ${r.source}`);
       }
     }
 
@@ -384,7 +406,7 @@ async function executeGroomerRun(
     // the readyForWork path; this catches every path, including a non-ready re-groom
     // that dropped the status label. It needs the current labels, which only live
     // here, so it is enforced on the final label set rather than the LLM output.
-    newLabels = ensureSingleStatusLabel(newLabels, isReadyForWork(output), isAlreadyDone(output));
+    newLabels = ensureSingleStatusLabel(newLabels, plan.readiness.ready, isAlreadyDone(output));
 
     // Compute title/body enrichment decisions
     const titleBodyMutations = computeTitleBodyMutations(candidate, output);
@@ -403,17 +425,37 @@ async function executeGroomerRun(
       proposedTitle: titleBodyMutations.proposedTitle,
       bodyEnriched: titleBodyMutations.shouldEnrich,
       proposedBody: titleBodyMutations.proposedBody,
+      planSchemaVersion: plan.schemaVersion,
+      evidenceDigest: plan.evidence.evidenceDigest,
+      readiness: plan.readiness,
+      closeRecommendation: plan.mutations.close,
     };
+
+    // An issue already claimed or under review (status/in-progress or
+    // status/in-review) is not the groomer's to move. The plan is recorded,
+    // but no label, lane, title/body, comment or close mutation is applied.
+    const inFlight = inFlightStatus(candidate.labels);
+    if (inFlight) {
+      newLabels = [...candidate.labels];
+      Object.assign(mutationPlan, {
+        skippedReason: "in_flight_status",
+        inFlightStatus: inFlight,
+        willComment: false,
+        willCloseIssue: false,
+        titleRewritten: false,
+        bodyEnriched: false,
+      });
+    }
 
     // Persist stage planned
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
       stage: "planned",
       rawOutput,
-      validatedOutput: output,
-      labelsToAdd: output.labelsToAdd,
-      labelsToRemove: output.labelsToRemove,
+      validatedOutput: plan,
+      labelsToAdd: inFlight ? [] : output.labelsToAdd,
+      labelsToRemove: inFlight ? [] : output.labelsToRemove,
       labelsAfter: newLabels,
-      laneAfter: output.lane.id,
+      laneAfter: inFlight ? candidate.currentLane : output.lane.id,
       mutationPlan,
       commentBodyPreview: output.githubComment?.trim()?.slice(0, 500) ?? null,
     });
@@ -429,10 +471,63 @@ async function executeGroomerRun(
         repoFullName: candidate.repoFullName,
         dryRun: true,
         output,
+        plan,
         plannedLabels: newLabels,
         groomingRunId: groomingRun.id,
         contextWarnings,
         mutationPlan,
+      };
+    }
+
+    if (inFlight) {
+      // Only the Dispatch-local groomedAt stamp is written, so the 24h
+      // re-groom cooldown still applies and an eligible in-flight issue is
+      // not re-selected (and re-billed) every scheduler tick.
+      const skipped: Record<string, unknown> = { skipped: "in_flight_status", inFlightStatus: inFlight };
+      await deps.prisma.issue.update({
+        where: { id: candidate.id },
+        data: { groomedAt: new Date(), groomedBy: "hosted-groomer" },
+      });
+      const skippedRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: `No mutations applied: issue is ${inFlight}`,
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await deps.prisma.auditLog.create({
+        data: {
+          actor: "hosted-groomer",
+          action: "groom",
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          beforeLabels: candidate.labels,
+          afterLabels: candidate.labels,
+          success: true,
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "completed",
+        stage: "skipped",
+        appliedMutations: skipped,
+        agentRunId: skippedRun.id,
+      });
+      return {
+        candidateNumber: candidate.number,
+        repoFullName: candidate.repoFullName,
+        dryRun: false,
+        output,
+        plan,
+        plannedLabels: newLabels,
+        groomingRunId: groomingRun.id,
+        contextWarnings,
+        mutationPlan,
+        appliedMutations: skipped,
       };
     }
 
@@ -608,6 +703,7 @@ async function executeGroomerRun(
       repoFullName: candidate.repoFullName,
       dryRun: false,
       output,
+      plan,
       plannedLabels: newLabels,
       groomingRunId: groomingRun.id,
       contextWarnings,
@@ -724,18 +820,6 @@ function computeTitleBodyMutations(
     ...(shouldRewrite ? { proposedTitle } : {}),
     ...(shouldEnrich ? { proposedBody } : {}),
   };
-}
-
-/**
- * Mirror of the schema's readyForWork signal: a groomer can express readiness
- * through actionability, its explicit next action, or a claimable lane.
- */
-function isReadyForWork(output: GroomerOutput): boolean {
-  return (
-    output.actionability === "ready" ||
-    output.nextGroomingAction === "promote_to_ready" ||
-    isClaimableLane(output.lane.id)
-  );
 }
 
 /**

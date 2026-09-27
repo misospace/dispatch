@@ -44,6 +44,11 @@ export interface ExploreResult {
   ask: string | null;
   /** Repository paths the exploration read or surfaced. Never related-work refs. */
   sources: string[];
+  /**
+   * The subset of `sources` actually fetched with read_file (at the pinned
+   * ref when one is set). Search hits and submitted findings are not reads.
+   */
+  readSources: string[];
   toolCalls: ExploreToolRecord[];
   bytes: number;
   warnings: string[];
@@ -96,6 +101,7 @@ const EMPTY: Omit<ExploreResult, "warnings"> = {
   files: [],
   ask: null,
   sources: [],
+  readSources: [],
   toolCalls: [],
   bytes: 0,
   relatedWorkQueries: [],
@@ -170,6 +176,7 @@ export async function exploreRepository(
   const warnings: string[] = [];
   const records: ExploreToolRecord[] = [];
   const sources: string[] = [];
+  const readSources: string[] = [];
   const relatedWorkQueries: string[] = [];
   const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
@@ -291,6 +298,7 @@ export async function exploreRepository(
 
         bytes += result.bytes;
         sources.push(...result.sources);
+        if (name === "read_file" && result.ok) readSources.push(...result.sources);
         if (result.warnings?.length) warnings.push(...result.warnings);
         if (result.relatedWork?.length) relatedWork.push(...result.relatedWork);
         if (name === "search_related_work" && result.ok) {
@@ -313,6 +321,7 @@ export async function exploreRepository(
           files: submitted.files,
           ask: submitted.ask,
           sources: [...new Set(sources)],
+          readSources: [...new Set(readSources)],
           toolCalls: records,
           bytes,
           warnings,
@@ -331,6 +340,7 @@ export async function exploreRepository(
       ...EMPTY,
       findings: renderFindings([], null, "", records),
       sources: [...new Set(sources)],
+      readSources: [...new Set(readSources)],
       toolCalls: records,
       bytes,
       warnings,
@@ -349,6 +359,7 @@ export async function exploreRepository(
       ...EMPTY,
       findings: renderFindings([], null, "", records),
       sources: [...new Set(sources)],
+      readSources: [...new Set(readSources)],
       toolCalls: records,
       bytes,
       warnings,

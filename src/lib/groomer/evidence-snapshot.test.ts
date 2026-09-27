@@ -248,14 +248,26 @@ describe("collectGroomingEvidenceSnapshot", () => {
 });
 
 describe("addEvidenceSources", () => {
+  it("stores surfaced paths unpinned, and a later read supersedes them (dispatch#1062)", () => {
+    const surfaced = addEvidenceSources(baseSnapshot(), ["src/a.ts", "src/b.ts"], "surfaced");
+    expect(surfaced.sources).toEqual([
+      { path: "src/a.ts", provenance: "repository", via: "surfaced", ref: null },
+      { path: "src/b.ts", provenance: "repository", via: "surfaced", ref: null },
+    ]);
+    const read = addEvidenceSources(surfaced, ["src/a.ts"]);
+    expect(read.sources[0]).toEqual({ path: "src/a.ts", provenance: "repository", via: "read", ref: HEAD_SHA });
+    // A surfaced hit never downgrades an earlier read.
+    expect(addEvidenceSources(read, ["src/a.ts"], "surfaced").sources[0]).toEqual(read.sources[0]);
+  });
+
   it("appends sources pinned to the run head SHA, deduped, without mutating the input", async () => {
     const snapshot = await collectGroomingEvidenceSnapshot(input, happyDeps());
 
     const next = addEvidenceSources(snapshot, ["src/a.ts", "src/a.ts", "src/b.ts"]);
 
     expect(next.sources).toEqual([
-      { path: "src/a.ts", provenance: "repository", ref: HEAD_SHA },
-      { path: "src/b.ts", provenance: "repository", ref: HEAD_SHA },
+      { path: "src/a.ts", provenance: "repository", via: "read", ref: HEAD_SHA },
+      { path: "src/b.ts", provenance: "repository", via: "read", ref: HEAD_SHA },
     ]);
     expect(snapshot.sources).toEqual([]);
   });
@@ -284,7 +296,7 @@ describe("addRelatedWorkEvidence", () => {
     ]);
 
     expect(next.sources).toEqual([
-      { path: "src/a.ts", provenance: "repository", ref: HEAD_SHA },
+      { path: "src/a.ts", provenance: "repository", via: "read", ref: HEAD_SHA },
       { key: "github:issue:org/repo#7", provenance: "github_issue", state: "closed", url: "u7", via: "read", observedAt, ref: null },
       { key: "github:pr:org/repo#8", provenance: "github_pull_request", state: "merged", url: "u8", via: "read", observedAt, ref: null },
       { key: "github:commit:org/repo@abc", provenance: "github_commit", state: null, url: null, via: "read", observedAt, ref: null },
@@ -362,8 +374,8 @@ describe("summarizeEvidenceForPersistence", () => {
       })),
     );
     expect(summary.sources).toEqual([
-      { path: "src/a.ts", provenance: "repository", ref: HEAD_SHA },
-      { path: "src/b.ts", provenance: "repository", ref: HEAD_SHA },
+      { path: "src/a.ts", provenance: "repository", via: "read", ref: HEAD_SHA },
+      { path: "src/b.ts", provenance: "repository", via: "read", ref: HEAD_SHA },
     ]);
     expect(summary.warnings).toEqual([]);
   });

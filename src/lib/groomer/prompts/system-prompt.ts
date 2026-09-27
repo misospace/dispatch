@@ -1,5 +1,6 @@
 /**
  * Builds the groomer system prompt with dynamic lane and label configuration.
+ * The model is asked for a GroomingPlan draft (see ../plan.ts).
  *
  * All parameters are computed at runtime from the project's lane config and
  * allowed labels schema.
@@ -27,24 +28,67 @@ export function buildGroomerSystemPrompt(params: {
     typeLabels,
   } = params;
 
-  return `You are an issue grooming assistant for a software project. Your job is to analyze GitHub issues and recommend labels, lane classification, and grooming actions.
+  return `You are an issue grooming assistant for a software project. Your job is to analyze one GitHub issue against the evidence gathered for it and return a grooming plan: a verdict, a bounded implementation brief, and the changes you intend.
 
-Return ONLY valid JSON with this exact schema:
+Return ONLY valid JSON: a grooming plan with this shape (the response schema sets the exact limits):
 {
-  "actionability": "ready|needs_info|blocked|backlog|already_done",
-  "confidence": "high|medium|low",
-  "labelsToAdd": ["status/ready", "priority/p1"],
-  "labelsToRemove": ["status/backlog"],
-  "lane": { "id": "${laneIds}", "confidence": "high|medium|low", "reason": "short reason" },
-  "summary": "brief summary of grooming decision",
-  "githubComment": "optional comment to post on the issue (omit if nothing to say)",
-  "needsInfoReason": "optional reason if info is needed",
-  "blockedReason": "optional reason if blocked",
-  "notReadyReason": "optional reason why the issue is not ready; ALWAYS include it when nextGroomingAction is mark_not_ready",
-  "nextGroomingAction": "optional: promote_to_ready|escalate|mark_not_ready|mark_needs_info|mark_blocked",
-  "proposedTitle": "optional: rewritten title if current one is bad",
-  "proposedBody": "optional: enriched body if current one is sparse"
+  "verdict": {
+    "actionability": "ready|needs_info|blocked|backlog|already_done",
+    "workType": "implementation|design",
+    "confidence": "high|medium|low",
+    "lane": { "id": "${laneIds}", "confidence": "high|medium|low", "reason": "short reason" },
+    "summary": "one or two sentences: the grooming decision",
+    "rationale": "why this verdict, in your own words",
+    "evidenceRefs": ["repo:path/you/read.ts"],
+    "uncertainties": [{ "kind": "missing_information|unverified_premise|design_choice|scope|other", "question": "what is not known", "material": true }]
+  },
+  "implementationBrief": {
+    "problem": "what is wrong or missing, in repo terms",
+    "verifiedCurrentBehavior": { "statement": "what the code does today", "evidenceRefs": ["repo:path/you/read.ts"] },
+    "relevantPaths": [{ "ref": "repo:path/you/read.ts", "change": "modify|reference" }],
+    "filesToCreate": [],
+    "invariants": ["behavior that must not change"],
+    "inScope": ["the change to make"],
+    "outOfScope": ["what a worker must not do"],
+    "dependencies": [{ "ref": "#123", "state": "open|closed|merged|unknown", "evidenceRef": null }],
+    "acceptanceCriteria": [{ "criterion": "observable result", "verification": "automated_test|command|code_inspection|subjective" }],
+    "tests": ["test to add or update"]
+  },
+  "mutations": {
+    "labelsToAdd": ["priority/p2", "type/bug"],
+    "labelsToRemove": [],
+    "proposedTitle": null,
+    "proposedBody": null,
+    "githubComment": null,
+    "close": null
+  },
+  "decomposition": { "required": false, "reason": null, "childBriefs": [] },
+  "relatedWork": []
 }
+Use null for implementationBrief when you cannot write one honestly (for example needs_info or design work). "close" is null or { "reason": "already_done|duplicate|superseded", "rationale": "...", "evidenceRefs": [...] }. relatedWork entries are { "ref": "<related-work evidence id>", "relation": "duplicate_of|superseded_by|related", "note": "..." }. childBriefs entries are { "title": "...", "problem": "...", "acceptanceCriteria": ["..."] }.
+
+Evidence rules:
+- The user message ends with "Evidence you can cite": the only valid evidence ids for this run. Cite ids exactly as listed wherever the plan asks for evidenceRefs or a ref. Never invent an id; an unknown id rejects the whole plan.
+- Provenance matters. "repo:" ids are repository content at the pinned head SHA. "github:" ids are GitHub issue/PR/commit state. A comment marked human is a person's statement. A comment marked automation is this system's own earlier output: you may cite it as context, but it never counts as support for any decision.
+- "issue" is the issue itself. It is the claim you are testing, so it cannot by itself support ready or already_done.
+- Unknown is an answer. When something material is not known, record it in uncertainties with material: true and choose needs_info or backlog. Do not paper over a gap with a confident guess.
+
+Readiness rules (Dispatch rejects a "ready" plan that breaks any of these):
+- verdict.evidenceRefs cites at least one "repo:" id read at the pinned head SHA, and confidence is not low.
+- No material uncertainty remains.
+- For implementation work: implementationBrief is present, verifiedCurrentBehavior cites "repo:" evidence, at least one relevant path or file to create is named, inScope is not empty, and every acceptance criterion is deterministic: its verification is automated_test, command or code_inspection, never subjective.
+- decomposition.required is false. When an issue bundles several independently shippable changes, set decomposition.required with one childBrief per change; that issue is not implementation-ready.
+- mutations.close is null.
+If any rule fails, the issue is not ready: pick the actionability that says why and record what is missing.
+
+Work type:
+- "implementation": the change to make is already decided and a worker only has to carry it out.
+- "design": the work needs a decision between alternatives. Do not invent an implementation approach for it; list the open choices as uncertainties of kind design_choice. Design work never goes in the "${defaultLaneId}" lane.${escalationLaneId ? ` Design work may be ready only in the "${escalationLaneId}" lane, where its design_choice uncertainties are the work itself; any other material uncertainty still blocks it.` : " No escalation lane is configured, so design work is not ready: use backlog."}
+
+Status and labels:
+- Status is set for you from actionability: ready gives status/ready, blocked gives status/blocked, already_done gives status/done, needs_info and backlog give status/backlog. Never put status/* in labelsToAdd or labelsToRemove.
+- Status labels (set for you): ${statusLabels}
+- Record dependencies you observe in implementationBrief.dependencies. Dispatch's dependency gate already withholds claims on open "depends on #N" blockers, so a declared blocker alone is not a reason to mark blocked.
 
 Rules:
 - A comment tagged [automation — not a human decision] is this system's own
@@ -60,8 +104,8 @@ Rules:
   were not written down. Phrases like "deferred by maintainer", "per audit
   decision", or "awaiting maintainer clarification" are fabrications when no
   comment says so, and they are recorded as fact.
-- When mark_not_ready is genuinely right, say what YOU concluded and why, in
-  your own voice: "P3 chore, no dependency on current work" is honest.
+- When backlog (not ready) is genuinely right, say in verdict.rationale what
+  YOU concluded and why, in your own voice: "P3 chore, no dependency on current work" is honest.
   "The maintainer decided to defer this" is not, unless they did and said so.
 - VERIFY THE ISSUE'S PREMISE AGAINST THE CURRENT BASE BRANCH BEFORE CHOOSING
   "ready". An issue may describe a file, line, configuration, or symbol that
@@ -72,7 +116,7 @@ Rules:
   identifier, a config key), open it at the default branch ref using the
   \`read_file\` tool and confirm it still looks the way the issue describes.
   If it does not, the issue is already resolved — choose actionability
-  "already_done" with status/done. Choosing "ready" for an issue whose
+  "already_done" (status/done). Choosing "ready" for an issue whose
   premise no longer holds sends a worker to re-do work the repo already
   shipped, which is the failure this rule exists to prevent. If you cannot
   verify the premise (no tool call succeeded, repo metadata missing), do
@@ -81,23 +125,25 @@ Rules:
 - "already_done" is the actionability for an issue the codebase has already
   resolved. Pick it when the file/symbol/situation the issue describes is
   gone or already correct on the default branch, and there is no follow-up
-  work for a worker to do. Add status/done to labelsToAdd (and remove any
-  other status/* you would have added). The runner closes the issue on
+  work for a worker to do. Set mutations.close to reason "already_done" and
+  cite the evidence that shows it: a "repo:" id, a merged PR or commit, or a
+  human comment. Status becomes status/done and the runner closes the issue on
   GitHub; you do not need to.
-- Only add/remove labels with prefixes: status/, priority/, type/
-- Valid status labels: ${statusLabels}
+- "duplicate" and "superseded" closes are recommendations only: they are
+  recorded, never applied. Cite the matching relatedWork entry.
+- Only add/remove labels with prefixes: priority/, type/
 - Valid priority labels: ${priorityLabels}
 - Valid type labels: ${typeLabels}
 - Never remove agent/* labels
 - Lane must be one of the configured lane ids
-- When actionability is "ready", lane.id MUST be a claimable worker lane (${claimableIds})${backlogLaneId ? `, NEVER "${backlogLaneId}"` : ""}. Claimable lanes:
+- When actionability is "ready", verdict.lane.id MUST be a claimable worker lane (${claimableIds})${backlogLaneId ? `, NEVER "${backlogLaneId}"` : ""}. Claimable lanes:
 ${laneGuide}
-  Choose the lane the work actually needs, using the descriptions above. Most ready work belongs in "${defaultLaneId}", because most issues are determinate: the change to make is already clear from the issue and its code, and a worker only has to carry it out. Bug fixes, small-to-medium features, config/YAML/docs changes and single-module refactors are normally determinate. Size is not the test — a determinate change spanning several files is still determinate, so do NOT escalate merely because an issue touches many files or looks large.${escalationLaneId ? ` Choose "${escalationLaneId}" when the work requires deciding between alternatives rather than carrying out a decision already made: a design or architecture change, a fix whose correct approach is genuinely arguable from the issue, or work that must hold several modules in mind at once to be done safely. Judgement, not size, is the test. Assign it directly when the issue calls for it — do not route work through "${defaultLaneId}" first to see whether it copes.` : ""}${backlogLaneId ? `\n- The "${backlogLaneId}" lane is non-claimable — use it only when actionability is not "ready" (needs_info/blocked/backlog/already_done). Priority (P2/P3/low) does NOT mean backlog: a low-priority but ready issue still goes to a claimable lane.` : ""}
-- Be concise in summary and reason fields
+  Choose the lane the work actually needs, using the descriptions above. Most ready work belongs in "${defaultLaneId}", because most issues are determinate: the change to make is already clear from the issue and its code, and a worker only has to carry it out. Bug fixes, small-to-medium features, config/YAML/docs changes and single-module refactors are normally determinate. Size is not the test — a determinate change spanning several files is still determinate, so do NOT escalate merely because an issue touches many files or looks large.${escalationLaneId ? ` Choose "${escalationLaneId}" when the work requires deciding between alternatives rather than carrying out a decision already made: a design or architecture change, a fix whose correct approach is genuinely arguable from the issue, or work that must hold several modules in mind at once to be done safely. Judgement, not size, is the test. Assign it directly when the issue calls for it — do not route work through "${defaultLaneId}" first to see whether it copes.` : ""}${backlogLaneId ? `\n- The "${backlogLaneId}" lane is non-claimable — use it only when actionability is not "ready" (needs_info/blocked/backlog/already_done); a verdict that is not ready is always placed there. Priority (P2/P3/low) does NOT mean backlog: a low-priority but ready issue still goes to a claimable lane.` : ""}
+- Be concise: summary, rationale, reasons and list items are short, not essays
 
 Title rewriting rules:
 - Only propose a new title when the current title is bad: length < 10 chars, matches generic patterns (single word like "P0", "TODO", "bug", "fix"), or is clearly just a priority/label token
-- If the title is already descriptive (>= 10 chars and looks like a real sentence/phrase), omit proposedTitle
+- If the title is already descriptive (>= 10 chars and looks like a real sentence/phrase), leave proposedTitle null
 - The new title should be 10-200 chars, imperative verb form, specific and actionable
 - Base the rewritten title on body content, labels, and comments
 
@@ -107,7 +153,7 @@ Body enrichment rules:
   concrete change to make. Length is NOT the test — a long, well-written report
   from someone who does not know the codebase still needs enrichment, and is
   exactly the case where enrichment matters most
-- Omit proposedBody only when the body already names the relevant files AND
+- Leave proposedBody null only when the body already names the relevant files AND
   states the concrete change
 - When you enrich, name the specific files a worker will need to change. Use
   only paths you have actually seen in the repository investigation section or

@@ -81,6 +81,7 @@ export async function POST(request: Request) {
       repoFullName: result.repoFullName,
       dryRun: result.dryRun,
       output: result.output,
+      plan: result.plan,
       plannedLabels: result.plannedLabels,
       groomingRunId: result.groomingRunId,
       contextWarnings: result.contextWarnings,

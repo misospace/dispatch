@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ExternalLink, Play, RefreshCw, Loader2, AlertCircle, CheckCircle2, Hash, GitBranch } from "lucide-react";
+import { summarizeGroomingOutput } from "@/lib/groomer/plan-summary";
 
 interface GroomingRunRow {
   id: string;
@@ -24,6 +25,7 @@ interface GroomingRunRow {
   laneAfter: string | null;
   errorMessage: string | null;
   createdAt: string;
+  validatedOutput?: unknown;
   issue?: { title: string; state: string };
 }
 
@@ -60,6 +62,37 @@ function StatusBadge({ status }: { status: string }) {
         ? "bg-red-100 text-red-700"
         : "bg-blue-100 text-blue-700";
   return <Badge className={cls}>{status.replace(/_/g, " ")}</Badge>;
+}
+
+/**
+ * The run's verdict. Plan-contract runs show evidence-checked readiness;
+ * runs recorded before it (legacy output) show their actionability only.
+ */
+function VerdictCell({ validatedOutput }: { validatedOutput: unknown }) {
+  const verdict = summarizeGroomingOutput(validatedOutput);
+  if (verdict.format === "unknown") return <span className="text-xs text-muted-foreground">-</span>;
+  const label = verdict.actionability?.replace(/_/g, " ") ?? "unknown";
+  const cls =
+    verdict.ready === true
+      ? "bg-green-100 text-green-700"
+      : verdict.ready === false
+        ? "bg-amber-100 text-amber-800"
+        : "bg-muted text-muted-foreground";
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center gap-1">
+        <Badge className={cls}>{label}</Badge>
+        {verdict.admission && <Badge variant="outline" className="text-xs">{verdict.admission}</Badge>}
+        {verdict.format === "legacy" && <Badge variant="outline" className="text-xs">legacy</Badge>}
+      </div>
+      {verdict.format === "grooming-plan" && (
+        <div className="text-xs text-muted-foreground">
+          {verdict.citationCount} cited
+          {verdict.materialUncertaintyCount > 0 && `, ${verdict.materialUncertaintyCount} open question${verdict.materialUncertaintyCount === 1 ? "" : "s"}`}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function GroomResultSummary({ result }: { result: GroomResult }) {
@@ -372,6 +405,7 @@ export default function GroomerHistoryPage() {
                   <TableHead>Status</TableHead>
                   <TableHead>Issue</TableHead>
                   <TableHead>Mode</TableHead>
+                  <TableHead>Verdict</TableHead>
                   <TableHead>Lane</TableHead>
                   <TableHead>Labels</TableHead>
                   <TableHead>Model</TableHead>
@@ -398,6 +432,9 @@ export default function GroomerHistoryPage() {
                     </TableCell>
                     <TableCell>
                       <Badge variant="secondary">{run.dryRun ? "dry-run" : "write"}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <VerdictCell validatedOutput={run.validatedOutput} />
                     </TableCell>
                     <TableCell className="text-sm">
                       {run.laneBefore || "-"} &rarr; {run.laneAfter || "-"}
