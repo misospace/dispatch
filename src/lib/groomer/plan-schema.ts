@@ -121,6 +121,15 @@ export function buildGroomingPlanResponseSchema(catalog?: EvidenceCatalog): Sche
           reason: enumOf(CLOSE_REASON_VALUES),
           rationale: str(L.text),
           evidenceRefs: refs(anyRef, L.evidenceRefs),
+          // already_done: one entry per acceptance criterion, each grounded in
+          // a file read at the pinned head with a verbatim excerpt (#1099).
+          criteria:
+            repoRef && repoRef.length === 0
+              ? { type: "array", items: { type: "object" }, maxItems: 0 }
+              : list(
+                  obj({ criterion: str(L.shortText), evidenceRef: ref(repoRef), excerpt: str(L.excerpt, L.excerptMin) }),
+                  L.closeCriteria,
+                ),
         }),
       ),
     }),

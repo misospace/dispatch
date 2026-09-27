@@ -23,6 +23,7 @@ function makeDeps(overrides: Partial<GroomerToolDeps> = {}): GroomerToolDeps {
     fetchRelatedPullRequest: vi.fn().mockResolvedValue({}),
     fetchRelatedCommit: vi.fn().mockResolvedValue({}),
     searchRelatedWork: vi.fn().mockResolvedValue([]),
+    fetchPullRequestClosingIssues: vi.fn().mockResolvedValue({ issues: [], truncated: false }),
     ...overrides,
   };
 }
@@ -671,5 +672,68 @@ describe("executeGroomerTool pinned ref", () => {
       deps,
     );
     expect(deps.listDir).toHaveBeenCalledWith("org/repo", "src", "deadbeef");
+  });
+});
+
+describe("close-grounding evidence (dispatch#1099)", () => {
+  const mergedPr = {
+    kind: "pull_request",
+    number: 590,
+    title: "Tangled sessions",
+    state: "merged",
+    baseRef: "main",
+    htmlUrl: "https://github.com/org/repo/pull/590",
+    evidenceKey: "github:pr:org/repo#590",
+  };
+
+  it("read_file hands back exactly what the model saw and the ref it was read at", async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockResolvedValue("x".repeat(500)) });
+    const pinned = await executeGroomerTool(
+      { name: "read_file", arguments: { path: "src/a.ts", ref: "main" } },
+      { ...options, maxFileBytes: 100, pinnedRef: "deadbeef" },
+      deps,
+    );
+    expect(pinned.file).toEqual({ path: "src/a.ts", ref: "deadbeef", content: "x".repeat(100) });
+    const unpinned = await executeGroomerTool({ name: "read_file", arguments: { path: "src/a.ts" } }, options, deps);
+    expect(unpinned.file).toMatchObject({ path: "src/a.ts", ref: null });
+  });
+
+  it("adds GitHub's closing references and base branch to a merged PR read", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi.fn().mockResolvedValue(mergedPr),
+      fetchPullRequestClosingIssues: vi.fn().mockResolvedValue({ issues: ["org/repo#587"], truncated: false }),
+    });
+    const result = await executeGroomerTool({ name: "read_related_pr", arguments: { number: 590 } }, options, deps);
+    expect(deps.fetchPullRequestClosingIssues).toHaveBeenCalledWith("org/repo", 590, { maxResults: 10 });
+    expect(JSON.parse(result.content)).toMatchObject({ closingIssues: ["org/repo#587"], closingIssuesTruncated: false });
+    expect(result.relatedWork).toEqual([expect.objectContaining({ key: "github:pr:org/repo#590", closes: ["org/repo#587"], baseRef: "main" })]);
+  });
+
+  it("does the same for a PR number read through read_related_issue", async () => {
+    const deps = makeDeps({
+      fetchRelatedIssue: vi.fn().mockResolvedValue(mergedPr),
+      fetchPullRequestClosingIssues: vi.fn().mockResolvedValue({ issues: ["org/repo#583"], truncated: false }),
+    });
+    const result = await executeGroomerTool({ name: "read_related_issue", arguments: { number: 590 } }, options, deps);
+    expect(result.relatedWork).toEqual([expect.objectContaining({ kind: "pull_request", closes: ["org/repo#583"] })]);
+  });
+
+  it("costs no extra call for an unmerged PR", async () => {
+    const deps = makeDeps({ fetchRelatedPullRequest: vi.fn().mockResolvedValue({ ...mergedPr, state: "open" }) });
+    const result = await executeGroomerTool({ name: "read_related_pr", arguments: { number: 590 } }, options, deps);
+    expect(deps.fetchPullRequestClosingIssues).not.toHaveBeenCalled();
+    expect(result.relatedWork?.[0]).not.toHaveProperty("closes");
+  });
+
+  it("leaves closing references unknown, not empty, when the lookup fails", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi.fn().mockResolvedValue(mergedPr),
+      fetchPullRequestClosingIssues: vi.fn().mockRejectedValue(new Error("GraphQL 502")),
+    });
+    const result = await executeGroomerTool({ name: "read_related_pr", arguments: { number: 590 } }, options, deps);
+    expect(result.ok).toBe(true);
+    expect(result.warnings).toEqual(["related-work: closing references lookup failed for org/repo#590"]);
+    expect(result.relatedWork?.[0]).not.toHaveProperty("closes");
+    expect(result.relatedWork?.[0]).toMatchObject({ state: "merged", baseRef: "main" });
   });
 });

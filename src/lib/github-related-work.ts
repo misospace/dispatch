@@ -307,6 +307,79 @@ export async function fetchRelatedPullRequest(
   };
 }
 
+export type PullRequestClosingIssues = {
+  /** Issues GitHub records the PR as closing, as `owner/repo#N`. */
+  issues: string[];
+  /** GitHub reports more closing references than were returned. */
+  truncated: boolean;
+};
+
+const DEFAULT_MAX_CLOSING_ISSUES = 10;
+
+const CLOSING_ISSUES_QUERY = `query($owner: String!, $repo: String!, $number: Int!, $first: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      closingIssuesReferences(first: $first) {
+        totalCount
+        nodes { number repository { nameWithOwner } }
+      }
+    }
+  }
+}`;
+
+interface RawClosingIssues {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        closingIssuesReferences?: {
+          totalCount?: number;
+          nodes?: Array<{ number?: number; repository?: { nameWithOwner?: string } | null } | null> | null;
+        } | null;
+      } | null;
+    } | null;
+  } | null;
+  errors?: Array<{ message?: string }>;
+}
+
+/**
+ * The issues GitHub links a pull request as closing (`Closes #N` keywords in
+ * the PR body/commits, or a manual Development link), from the GraphQL
+ * `closingIssuesReferences` connection: the REST API does not expose them.
+ * One read-only query, bounded to `maxResults` references (dispatch#1099).
+ */
+export async function fetchPullRequestClosingIssues(
+  repoFullName: string,
+  prNumber: number,
+  limits?: RelatedWorkLimits,
+): Promise<PullRequestClosingIssues> {
+  const [owner, repo] = repoFullName.split("/");
+  const first = Math.max(1, Math.min(limits?.maxResults ?? DEFAULT_MAX_CLOSING_ISSUES, 50));
+  const ref = `${repoFullName}#${prNumber}`;
+  // A GraphQL query is a read; it is POSTed but idempotent, so retrying is safe.
+  const response = await fetchWithRetry(`${GITHUB_API}/graphql`, {
+    method: "POST",
+    headers: { ...(await getHeadersAsync()), "Content-Type": "application/json" },
+    body: JSON.stringify({ query: CLOSING_ISSUES_QUERY, variables: { owner, repo, number: prNumber, first } }),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub GraphQL error for ${ref} closing references: ${response.status}`);
+  }
+  const data = (await response.json()) as RawClosingIssues;
+  const connection = data.data?.repository?.pullRequest?.closingIssuesReferences;
+  if (!connection) {
+    const why = data.errors?.map((e) => e.message).filter(Boolean).join("; ") || "no pull request data";
+    throw new Error(`GitHub GraphQL error for ${ref} closing references: ${why}`);
+  }
+  const issues = (connection.nodes ?? [])
+    .slice(0, first)
+    .flatMap((node) =>
+      node && typeof node.number === "number" && node.repository?.nameWithOwner
+        ? [`${node.repository.nameWithOwner}#${node.number}`]
+        : [],
+    );
+  return { issues, truncated: (connection.totalCount ?? issues.length) > issues.length };
+}
+
 export async function fetchRelatedCommit(
   repoFullName: string,
   ref: string,

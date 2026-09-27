@@ -5,6 +5,7 @@ import {
   type GroomerToolDeps,
 } from "./tools";
 import type { RelatedWorkObservation } from "./evidence-snapshot";
+import type { PinnedRead } from "./close-grounding";
 
 export interface ExploreOptions {
   baseUrl: string;
@@ -49,6 +50,12 @@ export interface ExploreResult {
    * ref when one is set). Search hits and submitted findings are not reads.
    */
   readSources: string[];
+  /**
+   * What each successful read_file showed the model, with the ref it was read
+   * at. Held in memory for close-excerpt checks (dispatch#1099); bounded by
+   * the exploration byte budget and never persisted.
+   */
+  readContents: PinnedRead[];
   toolCalls: ExploreToolRecord[];
   bytes: number;
   warnings: string[];
@@ -102,6 +109,7 @@ const EMPTY: Omit<ExploreResult, "warnings"> = {
   ask: null,
   sources: [],
   readSources: [],
+  readContents: [],
   toolCalls: [],
   bytes: 0,
   relatedWorkQueries: [],
@@ -177,6 +185,7 @@ export async function exploreRepository(
   const records: ExploreToolRecord[] = [];
   const sources: string[] = [];
   const readSources: string[] = [];
+  const readContents: PinnedRead[] = [];
   const relatedWorkQueries: string[] = [];
   const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
@@ -299,6 +308,7 @@ export async function exploreRepository(
         bytes += result.bytes;
         sources.push(...result.sources);
         if (name === "read_file" && result.ok) readSources.push(...result.sources);
+        if (name === "read_file" && result.ok && result.file) readContents.push(result.file);
         if (result.warnings?.length) warnings.push(...result.warnings);
         if (result.relatedWork?.length) relatedWork.push(...result.relatedWork);
         if (name === "search_related_work" && result.ok) {
@@ -322,6 +332,7 @@ export async function exploreRepository(
           ask: submitted.ask,
           sources: [...new Set(sources)],
           readSources: [...new Set(readSources)],
+          readContents,
           toolCalls: records,
           bytes,
           warnings,
@@ -341,6 +352,7 @@ export async function exploreRepository(
       findings: renderFindings([], null, "", records),
       sources: [...new Set(sources)],
       readSources: [...new Set(readSources)],
+      readContents,
       toolCalls: records,
       bytes,
       warnings,
@@ -360,6 +372,7 @@ export async function exploreRepository(
       findings: renderFindings([], null, "", records),
       sources: [...new Set(sources)],
       readSources: [...new Set(readSources)],
+      readContents,
       toolCalls: records,
       bytes,
       warnings,

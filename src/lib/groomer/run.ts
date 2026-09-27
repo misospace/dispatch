@@ -7,6 +7,7 @@ import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
 import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
+import { collectPinnedReadContent } from "./close-grounding";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
 import { exploreRepository } from "./explore";
@@ -429,7 +430,14 @@ async function executeGroomerRun(
 
     // The citable view of the snapshot: rendered into the prompt, used to
     // enum-constrain evidence ids, and the set the plan is validated against.
-    const evidenceCatalog = buildEvidenceCatalog(evidence);
+    // It also carries what this run read at the pinned head, so an
+    // already_done close's excerpts are checked against the files as fetched
+    // (dispatch#1099). Held for this run only, never persisted.
+    const pinnedContent = collectPinnedReadContent(evidence.headSha, [
+      ...(repositoryContext.files ?? []),
+      ...(exploration?.readContents ?? []),
+    ]);
+    const evidenceCatalog = buildEvidenceCatalog(evidence, pinnedContent);
 
     // Call LLM
     const rawOutput = await deps.callLLM({

@@ -34,6 +34,7 @@ import type {
   GroomingPlanEvidenceBinding,
 } from "./plan-evidence";
 import { ISSUE_EVIDENCE_ID } from "./plan-evidence";
+import { evaluateCloseGrounding } from "./close-grounding";
 import type { GroomerOutput } from "./schema";
 
 export const GROOMING_PLAN_SCHEMA_VERSION = 1 as const;
@@ -93,6 +94,10 @@ export const PLAN_LIMITS = {
   titleMax: 200,
   body: 9999,
   comment: 4000,
+  /** already_done criterion evidence (dispatch#1099). */
+  closeCriteria: 12,
+  excerptMin: 8,
+  excerpt: 300,
 } as const;
 
 // ─── Contract types ───────────────────────────────────────────────────────────
@@ -131,10 +136,28 @@ export interface ImplementationBrief {
   tests: string[];
 }
 
+/**
+ * One acceptance criterion of the issue, grounded for an already_done close
+ * (dispatch#1099): a repository file read at the pinned head and a short
+ * excerpt that occurs verbatim in it.
+ */
+export interface CloseCriterionEvidence {
+  criterion: string;
+  /** A `repo:` evidence id read at the pinned head SHA. */
+  evidenceRef: string;
+  excerpt: string;
+}
+
 export interface CloseRecommendation {
   reason: CloseReason;
   rationale: string;
   evidenceRefs: string[];
+  /**
+   * already_done: every acceptance criterion, grounded (dispatch#1099).
+   * Validation always sets it (empty when absent); plans stored before
+   * #1099 lack it.
+   */
+  criteria?: CloseCriterionEvidence[];
 }
 
 export interface GroomingMutationIntent {
@@ -392,6 +415,15 @@ function parseDraft(data: Obj, r: Reader): GroomingPlanDraft {
       reason: r.enumValue(c.reason, "mutations.close.reason", CLOSE_REASON_VALUES, "already_done"),
       rationale: r.text(c.rationale, "mutations.close.rationale", L.text),
       evidenceRefs: r.textList(c.evidenceRefs, "mutations.close.evidenceRefs", L.evidenceRefs, L.shortText),
+      criteria: r.array(c.criteria, "mutations.close.criteria", L.closeCriteria).map((item, i) => {
+        const path = `mutations.close.criteria[${i}]`;
+        const e = r.object(item, path);
+        return {
+          criterion: r.text(e.criterion, `${path}.criterion`, L.shortText),
+          evidenceRef: r.text(e.evidenceRef, `${path}.evidenceRef`, L.shortText),
+          excerpt: r.text(e.excerpt, `${path}.excerpt`, L.excerpt, L.excerptMin),
+        };
+      }),
     };
   }
   const mutations: GroomingMutationIntent = {
@@ -461,6 +493,9 @@ function citedRefs(draft: GroomingPlanDraft): CitedRef[] {
     });
   }
   draft.mutations.close?.evidenceRefs.forEach((id, i) => refs.push({ path: `mutations.close.evidenceRefs[${i}]`, id }));
+  draft.mutations.close?.criteria?.forEach((c, i) =>
+    refs.push({ path: `mutations.close.criteria[${i}].evidenceRef`, id: c.evidenceRef, subject: "repository" }),
+  );
   draft.relatedWork.forEach((w, i) => refs.push({ path: `relatedWork[${i}].ref`, id: w.ref, subject: "related_work" }));
   return refs;
 }
@@ -715,6 +750,11 @@ export function validateGroomingPlan(data: unknown, context: GroomingPlanValidat
       draft.verdict.uncertainties.forEach((u, i) => {
         if (u.material) errors.push(`verdict.uncertainties[${i}]: already_done cannot carry a material uncertainty: ${u.question}`);
       });
+      // Grounding (dispatch#1099): the evidence must establish THIS issue's
+      // acceptance, criterion by criterion with verbatim excerpts, or be a
+      // merged PR whose closing reference is this issue. Evidence about
+      // sibling, parent or dependent work only corroborates.
+      errors.push(...evaluateCloseGrounding({ evidenceRefs: close.evidenceRefs, criteria: close.criteria ?? [] }, catalog).errors);
     }
   } else if (close) {
     if (close.reason === "already_done") {

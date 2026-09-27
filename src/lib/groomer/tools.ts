@@ -9,6 +9,7 @@ import {
 import {
   fetchRelatedCommit,
   fetchRelatedIssue,
+  fetchPullRequestClosingIssues,
   fetchRelatedPullRequest,
   searchRelatedWork,
   RelatedWorkNotFoundError,
@@ -57,6 +58,12 @@ export interface GroomerToolResult {
   relatedWork?: RelatedWorkObservation[];
   /** Warnings to surface on the exploration result, e.g. a failed lookup. */
   warnings?: string[];
+  /**
+   * read_file only: the text the model was shown and the ref it was read at
+   * (null for the default branch), so close excerpts can be checked against
+   * exactly what was read (dispatch#1099).
+   */
+  file?: { path: string; ref: string | null; content: string };
 }
 
 export interface GroomerToolDeps {
@@ -71,6 +78,7 @@ export interface GroomerToolDeps {
   fetchRelatedPullRequest: typeof fetchRelatedPullRequest;
   fetchRelatedCommit: typeof fetchRelatedCommit;
   searchRelatedWork: typeof searchRelatedWork;
+  fetchPullRequestClosingIssues: typeof fetchPullRequestClosingIssues;
 }
 
 export const defaultGroomerToolDeps: GroomerToolDeps = {
@@ -81,6 +89,7 @@ export const defaultGroomerToolDeps: GroomerToolDeps = {
   fetchRelatedPullRequest,
   fetchRelatedCommit,
   searchRelatedWork,
+  fetchPullRequestClosingIssues,
 };
 
 /** OpenAI-style tool definitions sent with each exploration turn. */
@@ -207,7 +216,8 @@ export function buildGroomerToolDefinitions(): Record<string, unknown>[] {
         description:
           "Read a pull request in this repository by number. Read-only evidence about the " +
           "project's history: title, body, and its state. The open/closed/merged state is " +
-          "structured, authoritative evidence — do not infer status from prose.",
+          "structured, authoritative evidence — do not infer status from prose. A merged PR " +
+          "also lists `closingIssues`: the issues GitHub records it as closing.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -329,6 +339,9 @@ function toRelatedWorkObservation(
     kind !== "commit" && (v.state === "open" || v.state === "closed" || v.state === "merged")
       ? v.state
       : null;
+  const closes = Array.isArray(v.closingIssues)
+    ? v.closingIssues.filter((key): key is string => typeof key === "string")
+    : undefined;
   return {
     key: v.evidenceKey,
     kind,
@@ -336,7 +349,39 @@ function toRelatedWorkObservation(
     url: typeof v.htmlUrl === "string" && v.htmlUrl ? v.htmlUrl : null,
     via,
     observedAt: new Date().toISOString(),
+    ...(kind === "pull_request" && via === "read" && closes !== undefined ? { closes } : {}),
+    ...(kind === "pull_request" && via === "read" && typeof v.baseRef === "string" ? { baseRef: v.baseRef } : {}),
   };
+}
+
+/** Closing references fetched per merged PR read; bounded like the other related-work reads. */
+const MAX_CLOSING_ISSUES = 10;
+
+/**
+ * Add GitHub's closing references to a merged PR read (dispatch#1099): the
+ * one fact that lets a merged PR prove an issue done is that it closes THAT
+ * issue. Only merged PRs need it, so an open or closed PR costs no extra
+ * call. A failed lookup leaves the references unknown (never "none") and
+ * warns; the PR read itself still succeeds.
+ */
+async function withClosingIssues(
+  evidence: unknown,
+  repoFullName: string,
+  deps: GroomerToolDeps,
+): Promise<{ evidence: unknown; warnings: string[] }> {
+  const pr = evidence as { kind?: unknown; state?: unknown; number?: unknown } | null;
+  if (!pr || pr.kind !== "pull_request" || pr.state !== "merged" || typeof pr.number !== "number") {
+    return { evidence, warnings: [] };
+  }
+  try {
+    const closing = await deps.fetchPullRequestClosingIssues(repoFullName, pr.number, { maxResults: MAX_CLOSING_ISSUES });
+    return {
+      evidence: { ...(evidence as object), closingIssues: closing.issues, closingIssuesTruncated: closing.truncated },
+      warnings: [],
+    };
+  } catch {
+    return { evidence, warnings: [`related-work: closing references lookup failed for ${repoFullName}#${pr.number}`] };
+  }
 }
 
 /** Commit refs the model may pass: a SHA, tag, or branch name, bounded. */
@@ -346,9 +391,11 @@ const MAX_COMMIT_REF_LENGTH = 100;
 async function runRelatedWorkLookup(
   kind: RelatedWorkObservation["kind"],
   invoke: () => Promise<unknown>,
+  enrich?: (evidence: unknown) => Promise<{ evidence: unknown; warnings: string[] }>,
 ): Promise<GroomerToolResult> {
   try {
-    const evidence = await invoke();
+    const read = await invoke();
+    const { evidence, warnings } = enrich ? await enrich(read) : { evidence: read, warnings: [] };
     const content = JSON.stringify(evidence);
     const observation = toRelatedWorkObservation(evidence, kind, "read");
     return {
@@ -357,6 +404,7 @@ async function runRelatedWorkLookup(
       bytes: Buffer.byteLength(content, "utf8"),
       sources: [],
       relatedWork: observation ? [observation] : [],
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   } catch (err) {
     if (err instanceof RelatedWorkNotFoundError) {
@@ -449,7 +497,13 @@ export async function executeGroomerTool(
         }
         const { text: body, truncated } = truncate(text, options.maxFileBytes);
         const content = `${path}:\n${body}${truncated ? "\n… (truncated)" : ""}`;
-        return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources: [path] };
+        return {
+          ok: true,
+          content,
+          bytes: Buffer.byteLength(content, "utf8"),
+          sources: [path],
+          file: { path, ref: ref ?? null, content: body },
+        };
       }
 
       case "list_directory": {
@@ -523,16 +577,20 @@ export async function executeGroomerTool(
       case "read_related_issue": {
         const number = asNumber(call.arguments.number);
         if (!number) return fail("read_related_issue needs a positive integer issue number.");
-        return runRelatedWorkLookup("issue", () =>
-          deps.fetchRelatedIssue(options.repoFullName, number),
+        return runRelatedWorkLookup(
+          "issue",
+          () => deps.fetchRelatedIssue(options.repoFullName, number),
+          (evidence) => withClosingIssues(evidence, options.repoFullName, deps),
         );
       }
 
       case "read_related_pr": {
         const number = asNumber(call.arguments.number);
         if (!number) return fail("read_related_pr needs a positive integer pull request number.");
-        return runRelatedWorkLookup("pull_request", () =>
-          deps.fetchRelatedPullRequest(options.repoFullName, number),
+        return runRelatedWorkLookup(
+          "pull_request",
+          () => deps.fetchRelatedPullRequest(options.repoFullName, number),
+          (evidence) => withClosingIssues(evidence, options.repoFullName, deps),
         );
       }
 

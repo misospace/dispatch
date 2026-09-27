@@ -72,6 +72,14 @@ describe("renderEvidenceCatalog", () => {
     expect(text).toContain("pinned to abc123def456 on main");
   });
 
+  it("tells the model the issue's expected files and acceptance criteria (dispatch#1099)", () => {
+    const body = "## Expected files\n\n- `src/a.ts`\n\n## Acceptance criteria\n\n- [ ] a() returns 1.";
+    const text = renderEvidenceCatalog(buildEvidenceCatalog({ ...base, issue: { ...base.issue, body } }));
+    expect(text).toContain("This issue names expected files: src/a.ts.");
+    expect(text).toContain("an already_done close must ground one by one:\n- a() returns 1.");
+    expect(renderEvidenceCatalog(buildEvidenceCatalog(base))).not.toContain("expected files");
+  });
+
   it("says when repository reads are unpinned", () => {
     const text = renderEvidenceCatalog(buildEvidenceCatalog({ ...base, headSha: null, pinnedRef: null }));
     expect(text).toContain("NOT pinned");

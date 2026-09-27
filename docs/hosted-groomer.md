@@ -6,7 +6,7 @@ The hosted groomer is intentionally narrow:
 
 - It enriches issue labels, lane, grooming metadata, and optionally one GitHub comment.
 - It runs at most one issue per request.
-- It does not edit code, open PRs, merge PRs, or run shell commands. It closes an issue only when its plan's verdict is `already_done` at high confidence with current-revision evidence (see [Grooming plan contract](#grooming-plan-contract)).
+- It does not edit code, open PRs, merge PRs, or run shell commands. It closes an issue only when its plan's verdict is `already_done` at high confidence with current-revision evidence that proves that issue's own acceptance (see [Close policy](#close-policy)).
 - Before writing anything it re-checks that the issue and default branch still match the evidence the plan was built on, and it applies each plan at most once (see [Applying a plan](#applying-a-plan)).
 - Existing external groomer workers using `next-task?mode=groom` remain supported.
 
@@ -143,10 +143,29 @@ Other rules the validator enforces:
 - Status is derived from actionability (`ready` → `status/ready`, `blocked` → `status/blocked`, `already_done` → `status/done`, otherwise `status/backlog`); the plan cannot set `status/*` or `agent/*` labels. After an applied groom the derived status is the only `status/*` label: every other one is removed, including statuses the groomer does not own (such as `status/needs-review`), as the external groom route already does.
 - An issue carrying `status/in-progress` or `status/in-review` (claimed, or with an open PR) is never moved, including on targeted runs. Its plan is recorded on the run, with `mutationPlan.skippedReason: "in_flight_status"`, but no label, lane, title/body, comment or close mutation is applied. Only `groomedAt` is stamped, so the 24h re-groom cooldown still applies.
 - A non-ready verdict is placed in the non-claimable lane, so a lane alone never promotes an issue. A ready verdict placed there is moved to the default lane (implementation) or escalation lane (design). Both moves are recorded in `contextWarnings`.
-- `already_done` requires a close with reason `already_done`, `high` verdict confidence, no material uncertainty, and at least one close citation that is repository content read at the pinned head SHA: direct evidence that the work is done on the code as it is now. A merged PR, a commit or a human comment may corroborate, but none of them can close an issue alone, and the issue itself and automation comments never count. It remains the only close the runner applies.
+- `already_done` is the only close the runner applies; see [Close policy](#close-policy).
 - `duplicate` and `superseded` closes are recorded recommendations only; each must cite a matching `relatedWork` entry.
 - A dependency state that contradicts the cited GitHub state is rejected. Dependencies are descriptive: the `depends on #N` claim gate stays authoritative.
 - Output in the legacy `GroomerOutput` shape is rejected with a clear error rather than migrated.
+
+### Close policy
+
+An `already_done` plan closes the issue, the highest-impact write the groomer makes. It validates only when all of these hold:
+
+- the close has reason `already_done`, verdict confidence is `high`, and no material uncertainty remains;
+- at least one close citation (`mutations.close.evidenceRefs`) is repository content read at the pinned head SHA. The issue itself, automation comments, a merged PR, a commit or a human comment may corroborate but never meet this alone;
+- the evidence proves **this** issue's acceptance, not a sibling's, parent's or dependent's (dispatch#1099). Either:
+  - **Grounded criteria.** `mutations.close.criteria` maps every acceptance criterion to `{ criterion, evidenceRef, excerpt }`: a `repo:` file read at the pinned head and a short excerpt (8 to 300 characters) of it. Dispatch checks each excerpt against the file's content as fetched this run: both sides have every run of whitespace collapsed to one space and are trimmed, then the excerpt must be an exact, case-sensitive substring. Re-wrapped lines pass; a paraphrase does not. When the issue lists acceptance criteria (list items under an `Acceptance criteria` heading or label), every one of them must appear in `criteria`, compared ignoring case, backticks/emphasis, spacing and a trailing stop; with no enumerable criteria, at least one grounded criterion is required. When the issue names expected files, at least one grounded criterion must cite one of them.
+  - **A closing PR.** A cited merged pull request, merged into the default branch, whose GitHub closing reference is this exact issue (`owner/repo#N`). That is sufficient on its own, without criteria. Any criteria it does carry are still checked, so a fabricated excerpt still rejects the close.
+- evidence about other issues never satisfies the close: a changelog or release-notes file (`CHANGELOG`, `CHANGES`, `HISTORY`, `NEWS`, `RELEASE_NOTES`, `RELEASES`, any extension) cannot ground a criterion unless the issue lists it as an expected file; an excerpt that mentions another issue or PR (`#N`, `owner/repo#N`, or a GitHub issue/PR URL) cannot ground a criterion; and a PR whose closing references are other issues, or that is unmerged or merged elsewhere, is not closing proof.
+
+Expected files come from the issue body as captured: an `Expected files` (or `Affected files`, `Target files`) section, as a heading or a label line such as `Expected files:` / `**Expected files:**`, contributes its backticked paths or each list item's leading path. Without such a section, the explicit backticked repository paths anywhere in the body are the expected files. A token counts only when it looks like a file: a path with a directory and an extension (or a well-known name such as `Dockerfile`), a bare file name with a known source/config extension, or a dotfile. Identifiers, config keys, `owner/repo` refs, URLs and directories are ignored.
+
+Closing references come from `read_related_pr` (and `read_related_issue` when the number is a PR): for a merged PR it makes one bounded, read-only GraphQL query for `closingIssuesReferences` (at most 10), which covers closing keywords and manual Development links. The references and the PR's base branch are recorded on the related-work evidence and shown in the catalog. If the lookup fails, the references stay unknown and the PR cannot prove a close. Search hits never carry them.
+
+The content excerpts are checked against is what the run's repository-context fetches and `read_file` calls returned at the pinned head (what the model was shown, after truncation), held in memory for the run only, capped at 1 MB, and never persisted. The catalog rendered into the prompt lists the issue's expected files and acceptance criteria so the model knows what it must ground.
+
+A close that fails any rule is a validation error and applies nothing. The applier re-checks the whole policy, grounding included, against the run's catalog before closing (see [What is applied, and in which order](#what-is-applied-and-in-which-order)); a close that fails there is withheld and the plan lands as backlog.
 
 ### Compatibility
 

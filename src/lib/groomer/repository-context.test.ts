@@ -186,6 +186,8 @@ describe("buildRepositoryContext", () => {
 
       expect(result.text).toContain("[truncated]");
       expect(result.sources).toContain("big.ts");
+      // The recorded content is what was shown, without the truncation marker (dispatch#1099).
+      expect(result.files).toEqual([{ path: "big.ts", ref: null, content: "x".repeat(1000) }]);
     });
 
     it("respects maxTotalBytes across all files", async () => {
@@ -292,6 +294,7 @@ describe("buildRepositoryContext", () => {
       expect(deps.fetchFile).toHaveBeenCalledWith("org/repo", "src/auth.ts", "abc123");
       expect(result.text).toContain("- default branch: main");
       expect(result.text).toContain("- pinned revision: abc123");
+      expect(result.files).toEqual([{ path: "src/auth.ts", ref: "abc123", content: "export const auth = true;" }]);
     });
 
     it("reads files at the default branch and renders no pinned line when no ref is provided", async () => {

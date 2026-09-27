@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
+import { collectPinnedReadContent } from "./close-grounding";
 import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
 import {
   evaluateClosePolicy,
@@ -52,6 +53,13 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
   };
 }
 
+const LOGIN_TS = "export function redirectAfterLogin(session: Session) {\n  return session.returnTo ?? \"/\";\n}\n";
+
+/** The run's catalog, with login.ts as read at the pinned head (dispatch#1099). */
+function catalogFor(snap: GroomingEvidenceSnapshot) {
+  return buildEvidenceCatalog(snap, collectPinnedReadContent(HEAD, [{ path: "src/auth/login.ts", ref: HEAD, content: LOGIN_TS }]));
+}
+
 function readyDraft(): GroomingPlanDraft {
   return {
     verdict: {
@@ -93,13 +101,20 @@ function alreadyDoneDraft(evidenceRefs: string[] = ["repo:src/auth/login.ts"]): 
     implementationBrief: null,
     mutations: {
       ...readyDraft().mutations,
-      close: { reason: "already_done", rationale: "login.ts already keeps returnTo", evidenceRefs },
+      close: {
+        reason: "already_done",
+        rationale: "login.ts already keeps returnTo",
+        evidenceRefs,
+        criteria: [
+          { criterion: "login redirects to the saved return URL", evidenceRef: "repo:src/auth/login.ts", excerpt: 'return session.returnTo ?? "/";' },
+        ],
+      },
     },
   };
 }
 
 function planFor(draft: GroomingPlanDraft, snap = snapshot()): GroomingPlan {
-  const result = validateGroomingPlan(draft, { catalog: buildEvidenceCatalog(snap) });
+  const result = validateGroomingPlan(draft, { catalog: catalogFor(snap) });
   if (!result.valid) throw new Error(result.errors!.join("; "));
   return result.plan!;
 }
@@ -324,7 +339,7 @@ describe("validateApplyPreconditions", () => {
 });
 
 describe("evaluateClosePolicy", () => {
-  const catalog = buildEvidenceCatalog(snapshot());
+  const catalog = catalogFor(snapshot());
 
   it("allows a high-confidence already_done close on pinned repository evidence", () => {
     expect(evaluateClosePolicy(planFor(alreadyDoneDraft()), catalog)).toEqual([]);
@@ -355,21 +370,44 @@ describe("evaluateClosePolicy", () => {
     expect(evaluateClosePolicy(forged, catalog)).toEqual(["only an already_done verdict with an already_done close is ever applied"]);
   });
 
+  it("re-checks close grounding at apply time (dispatch#1099)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const paraphrased: GroomingPlan = {
+      ...plan,
+      mutations: {
+        ...plan.mutations,
+        close: {
+          ...plan.mutations.close!,
+          criteria: [{ criterion: "login keeps returnTo", evidenceRef: "repo:src/auth/login.ts", excerpt: "returns session.returnTo" }],
+        },
+      },
+    };
+    expect(evaluateClosePolicy(paraphrased, catalog)).toEqual([
+      expect.stringMatching(/^mutations\.close\.criteria\[0\]\.excerpt: not found verbatim in src\/auth\/login\.ts/),
+    ]);
+    const ungrounded: GroomingPlan = { ...plan, mutations: { ...plan.mutations, close: { ...plan.mutations.close!, criteria: [] } } };
+    expect(evaluateClosePolicy(ungrounded, catalog)).toEqual([expect.stringContaining("already_done must ground every acceptance criterion")]);
+    // Without the pinned content (a catalog built without the run's reads) nothing can be checked.
+    expect(evaluateClosePolicy(plan, buildEvidenceCatalog(snapshot()))).toEqual([
+      expect.stringContaining("the content of src/auth/login.ts as read at the pinned head is not available"),
+    ]);
+  });
+
   it("refuses a close when the catalog is not pinned", () => {
     const plan = planFor(alreadyDoneDraft());
-    const unpinned = buildEvidenceCatalog(snapshot({ headSha: null, pinnedRef: null }));
+    const unpinned = catalogFor(snapshot({ headSha: null, pinnedRef: null }));
     expect(evaluateClosePolicy(plan, unpinned)).toContain("the close cites no repository content read at the pinned head SHA");
   });
 });
 
 describe("evaluateReadyPolicy", () => {
   it("accepts a plan whose readiness holds against the catalog", () => {
-    expect(evaluateReadyPolicy(planFor(readyDraft()), buildEvidenceCatalog(snapshot()))).toEqual([]);
+    expect(evaluateReadyPolicy(planFor(readyDraft()), catalogFor(snapshot()))).toEqual([]);
   });
 
   it("refuses a ready plan bound to a different snapshot or whose invariants fail", () => {
     const plan = planFor(readyDraft());
-    const other = buildEvidenceCatalog(snapshot({ evidenceDigest: "other", headSha: null, pinnedRef: null }));
+    const other = catalogFor(snapshot({ evidenceDigest: "other", headSha: null, pinnedRef: null }));
     const reasons = evaluateReadyPolicy(plan, other);
     expect(reasons).toContain("the plan's readiness is bound to a different evidence snapshot");
     expect(reasons).toContain("the evidence snapshot is not pinned to a default-branch head SHA");
@@ -378,6 +416,6 @@ describe("evaluateReadyPolicy", () => {
   it("refuses a plan whose derived readiness is not ready", () => {
     const plan = planFor(readyDraft());
     const forged: GroomingPlan = { ...plan, readiness: { ...plan.readiness, ready: false } };
-    expect(evaluateReadyPolicy(forged, buildEvidenceCatalog(snapshot()))).toContain("the plan's derived readiness is not ready");
+    expect(evaluateReadyPolicy(forged, catalogFor(snapshot()))).toContain("the plan's derived readiness is not ready");
   });
 });

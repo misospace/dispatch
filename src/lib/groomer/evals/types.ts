@@ -46,6 +46,12 @@ export interface CaseRepository {
   defaultBranch?: string;
   /** Paths read with read_file at the pinned SHA. */
   read?: string[];
+  /**
+   * What read_file returned for some of `read`, keyed by path: the content an
+   * already_done close's excerpts are checked against (dispatch#1099). A read
+   * path without content here was read but its text is not available.
+   */
+  contents?: Record<string, string>;
   /** Paths only surfaced by a code-search hit or named in findings; never read. */
   surfaced?: string[];
 }
@@ -156,7 +162,7 @@ export interface GroomingCase {
   issue: CaseIssue;
   comments?: CaseComment[];
   repository: CaseRepository;
-  relatedWork?: Array<Pick<RelatedWorkObservation, "key" | "kind" | "state" | "via">>;
+  relatedWork?: Array<Pick<RelatedWorkObservation, "key" | "kind" | "state" | "via" | "closes" | "baseRef">>;
   trackedIssues?: TrackedIssue[];
   /** Dependency keys (`owner/repo#N`) that are merged/closed and must never count as open blockers. */
   closedDependencies?: string[];
