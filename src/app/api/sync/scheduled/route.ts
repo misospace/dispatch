@@ -15,6 +15,7 @@ import {
 import { syncAutomationRepo } from "@/lib/automation-sync";
 import { authorizeRequest } from "@/lib/auth";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
+import { runGroomingFreshnessPassBestEffort, type FreshnessPassResult } from "@/lib/groomer/freshness-invalidation";
 
 // ---------------------------------------------------------------------------
 // Route handlers
@@ -57,6 +58,7 @@ export async function POST(request: Request) {
     let issueSync: SyncResponse | null = null;
     let closedIssueReconcile: ClosedIssueReconcileResponse | null = null;
     let automationResult: { synced: number; failed: number } | null = null;
+    let groomingFreshness: FreshnessPassResult | null = null;
 
     // Issue sync (default enabled)
     if (syncIssues) {
@@ -90,6 +92,10 @@ export async function POST(request: Request) {
           results: [{ repo: "", issueNumber: 0, reconciled: false, action: "no_change", error: message }],
         };
       }
+
+      // Mark grooming results stale against the state this sync just cached
+      // (#1064). Bounded and best-effort: it never fails the sync.
+      groomingFreshness = await runGroomingFreshnessPassBestEffort(repos);
     }
 
     // Automation sync (optional, opt-in)
@@ -155,6 +161,7 @@ export async function POST(request: Request) {
               }
             : null,
           automationResult,
+          groomingFreshness,
         }),
       },
     });
@@ -181,6 +188,15 @@ export async function POST(request: Request) {
         syncedCount: issueSync.syncedCount,
         results: issueSync.results,
       };
+
+      if (groomingFreshness) {
+        response.groomingFreshness = {
+          issuesChecked: groomingFreshness.issuesChecked,
+          markedStale: groomingFreshness.markedStale,
+          deferred: groomingFreshness.deferred,
+          githubCalls: groomingFreshness.githubCalls,
+        };
+      }
 
       if (closedIssueReconcile) {
         response.closedIssueReconcile = {

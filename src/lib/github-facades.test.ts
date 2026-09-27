@@ -64,6 +64,8 @@ describe("github domain modules expose expected exports", () => {
 
   it("github-code-search exports repo metadata/search/contents symbols", () => {
     expect(Object.keys(CodeSearch).sort()).toEqual([
+      "COMPARE_MAX_FILES",
+      "compareCommits",
       "fetchRepo",
       "fetchRepositoryFileText",
       "fetchRepositoryMetadata",

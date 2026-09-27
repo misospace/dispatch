@@ -97,7 +97,7 @@ Optional body:
 2. Invoke `POST /api/groomer/run` and inspect the returned `plannedLabels` and model output.
 3. Once plans look safe, set `dryRun=false` for a targeted request or change `DISPATCH_GROOMER_DRY_RUN=false`.
 
-Write mode updates GitHub labels, posts one comment only when the model returned `githubComment`, updates Dispatch grooming fields and lane history, and records `AgentRun`/`AuditLog` rows.
+Write mode updates GitHub labels, posts one comment only when the model returned `githubComment`, updates Dispatch grooming fields and lane history, records the result's freshness baseline (see [Grooming Freshness](#grooming-freshness)), and records `AgentRun`/`AuditLog` rows.
 
 ## History and Audit
 
@@ -109,6 +109,44 @@ Two history API endpoints back the UI and integrations:
 
 - `GET /api/groomer/runs` lists recent runs with filters for repo, issue number, status, dry-run/write mode, and model.
 - `GET /api/groomer/runs/[id]` returns one run with its full plan, applied result, context summary, and error details.
+
+## Grooming Freshness
+
+A grooming result is only valid for the evidence it was checked against. After every applied (non-dry-run) groom, Dispatch records that evidence on the issue, and later syncs mark the result stale when the evidence changes. The groomer then picks the issue up again, even when it is fully classified `status/ready`, `status/backlog` or a parked `status/blocked`.
+
+What is recorded (the `groomed*` columns on `Issue`):
+
+- the default-branch head SHA and branch the run was pinned to;
+- a fingerprint of the issue as the groom left it: title, body, state and labels, excluding `agent/*` claim labels. It is computed from what the groomer itself wrote, so its own label/title/body/close writes never read back as an external change;
+- the comment count and the start of the run's evidence window;
+- the evidence digest from the evidence snapshot, and the `GroomingRun` that produced the result;
+- the repository paths the run read, plus an evidence scope: `paths` (a bounded path set), `global` (a code search found nothing, or the run consulted the repository without reading a path), or `none` (the run used no repository evidence);
+- the `depends on #N` keys in the body (parsed by the same code as dependency gating) and which of them were open;
+- related issues and PRs the run read directly, with the state it saw.
+
+What makes a result stale (`groomingStaleAt`, `groomingStaleReasons`, `groomingStaleDetail`):
+
+| Reason | Trigger |
+| --- | --- |
+| `issue_changed` | Title, body, state or a non-`agent/*` label differs from what the groom left. |
+| `human_comment` | A comment by a non-automation author after the run started. Automation authors (the same list the groomer uses to tag comments) never stale a result, including the groomer's own comment. |
+| `dependency_changed` | A declared blocker closed or reopened. |
+| `related_work_changed` | A related issue or PR the run read changed state (e.g. a PR merged). |
+| `evidence_path_changed` | A default-branch commit touched a path the result relied on (exact file, or a file under an evidenced directory). |
+| `global_evidence_commit` | Any new default-branch commit, when the result relied on `global` evidence. |
+| `compare_unreliable` | The commit comparison cannot be trusted: the base SHA is gone, the histories diverged, or GitHub truncated the changed-file list. |
+
+A commit that only touches unrelated paths does not stale a `paths` result; the issue's `groomingVerifiedSha` advances to the new head instead, so each later check compares a small range. A transient compare failure leaves the result fresh but unverified (`groomingVerifiedSha` behind the head) and is retried on the next sync. A run whose head SHA could not be pinned stays unverified rather than stale, so a repository whose head cannot be resolved does not re-groom in a loop.
+
+How it runs:
+
+- The scheduled and manual issue syncs run a freshness pass after syncing. It never calls the model. Database checks (issue fingerprint, dependencies, tracked related issues) cost nothing extra; GitHub reads are capped per pass: one head lookup per repository branch, at most 10 commit comparisons (shared by every issue verified at the same SHA), 10 comment reads (only when the comment count grew) and 10 related-work reads. Anything the budget does not reach is checked on a later pass. Issues a worker owns (`status/in-progress`, `status/in-review`) are not evaluated.
+- `POST /api/issues/webhook` also accepts `issue_comment` `created` events and stales a result immediately for a new human comment. Without webhooks, the sync pass catches it.
+- Writes are guarded on the recorded `GroomingRun` id and on the result still being fresh, so repeated passes are idempotent and a pass racing a new groom cannot stale the newer result. Each invalidation writes a `grooming_stale` `AuditLog` row.
+- The selector offers stale issues ahead of routine backlog re-grooming but behind anything missing classification. A stale issue skips the 24h cooldown and the blocked/not-ready parking (the evidence that parked it changed), but is not re-groomed within 30 minutes of its last groom. The re-groom's `GroomingRun` records `candidateSource: "stale"` and the `staleReasons` that triggered it.
+- Targeted runs (`issueNumber`) still force a re-evaluation regardless of freshness.
+
+Freshness unknown: issues groomed before this existed, or through `POST /api/issues/groom` (which carries no evidence and resets any recorded baseline), have no fingerprint. The hosted groomer backfills them at the lowest priority, only when nothing else wants grooming and outside the usual 24h cooldown; deliberately blocked issues are not backfilled. External groomers polling `next-task?mode=groom` are not offered backfill work. Worker admission (#1065) decides how unknown and unverified results are treated.
 
 ## Repository Context
 

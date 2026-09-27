@@ -14,6 +14,28 @@ interface AnnotatableIssue {
 }
 
 /**
+ * Keys (`owner/repo#N`) of the open issues, in enabled repos, among the given
+ * issue numbers: the universe the agent queue gates dependencies on. One
+ * query, skipped entirely when no number is given.
+ */
+export async function findOpenIssueKeys(numbers: number[], client: typeof prisma = prisma): Promise<Set<string>> {
+  const openIssueKeys = new Set<string>();
+  if (numbers.length === 0) return openIssueKeys;
+  const openIssues = await client.issue.findMany({
+    where: {
+      state: "open",
+      repository: { enabled: true },
+      number: { in: [...new Set(numbers)] },
+    },
+    select: { number: true, repository: { select: { fullName: true } } },
+  });
+  for (const open of openIssues) {
+    openIssueKeys.add(dependencyKey(open.repository.fullName, open.number));
+  }
+  return openIssueKeys;
+}
+
+/**
  * Attach `dependencyBlockReason` to each issue, resolving blockers against the
  * same universe the agent queue gates on (every open issue in an enabled repo),
  * NOT against the caller's filtered list. A board filtered to one repo, agent,
@@ -37,20 +59,7 @@ export async function withDependencyBlockReasons<T extends AnnotatableIssue>(
     for (const ref of refs) referencedNumbers.add(ref.number);
   }
 
-  const openIssueKeys = new Set<string>();
-  if (referencedNumbers.size > 0) {
-    const openIssues = await prisma.issue.findMany({
-      where: {
-        state: "open",
-        repository: { enabled: true },
-        number: { in: Array.from(referencedNumbers) },
-      },
-      select: { number: true, repository: { select: { fullName: true } } },
-    });
-    for (const open of openIssues) {
-      openIssueKeys.add(dependencyKey(open.repository.fullName, open.number));
-    }
-  }
+  const openIssueKeys = await findOpenIssueKeys(Array.from(referencedNumbers));
 
   return issues.map((issue, index) => {
     const refs = refsByIssue[index];

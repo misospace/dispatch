@@ -8,6 +8,7 @@ import { transitionIssueStatus } from "@/lib/issue-status";
 import { refreshSingleIssue } from "@/lib/issue-sync";
 import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { UNKNOWN_FRESHNESS } from "@/lib/groomer/freshness";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
@@ -107,10 +108,15 @@ export async function POST(request: Request) {
       const groomedAt = new Date();
 
       // Build grooming data
+      // A decision made here carries no evidence snapshot, so any hosted
+      // freshness baseline (#1064) no longer describes the latest grooming
+      // result: reset it to unknown rather than let the label change read as
+      // an external edit that stales the old baseline.
       const groomingData: Record<string, unknown> = {
         groomedAt,
         groomedBy: auditActor,
         groomingSummary: (groomingSummary as string | undefined) ?? null,
+        ...UNKNOWN_FRESHNESS,
       };
 
       // Clear reason fields that don't apply to this action

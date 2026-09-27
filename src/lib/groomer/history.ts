@@ -22,6 +22,10 @@ export interface CreateGroomingRunInput {
   provider: string | null;
   timeoutMs: number | null;
   maxContextBytes: number | null;
+  /** Why the candidate was chosen (selector, targeted, stale, freshness_unknown). */
+  candidateSource?: string;
+  /** Stale reasons behind a freshness-driven re-groom (#1064). */
+  staleReasons?: string[];
 }
 
 export interface GroomingRunFilters {
@@ -65,6 +69,8 @@ export async function createGroomingRunRecord(
       provider: input.provider,
       timeoutMs: input.timeoutMs,
       maxContextBytes: input.maxContextBytes,
+      ...(input.candidateSource ? { candidateSource: input.candidateSource } : {}),
+      ...(input.staleReasons?.length ? { staleReasons: input.staleReasons } : {}),
     },
   });
 }

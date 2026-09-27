@@ -416,6 +416,22 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
     expect(github.fetchIssues).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ state: "closed" }));
   });
 
+  it("runs the grooming freshness pass against the synced repos (#1064)", async () => {
+    const { POST } = await import("./route");
+    const res = await POST(makeRequest());
+    const body = await res.json();
+    expect(body.groomingFreshness).toEqual({ issuesChecked: 0, markedStale: [], deferred: 0, githubCalls: 0 });
+    expect(prismaMock.prisma.issue.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          repositoryId: "repo-1",
+          groomedIssueFingerprint: { not: null },
+          groomingStaleAt: null,
+        }),
+      }),
+    );
+  });
+
   it("does not sync automation by default", async () => {
     const { POST } = await import("./route");
     const res = await POST(makeRequest());
@@ -438,6 +454,7 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
     const body = await res.json();
     expect(body.success).toBe(true);
     expect(body.issues).toBeUndefined();
+    expect(body.groomingFreshness).toBeUndefined();
   });
 
   it("includes startedAt and finishedAt in response", async () => {
