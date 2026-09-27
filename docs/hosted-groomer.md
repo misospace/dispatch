@@ -150,6 +150,8 @@ Other rules the validator enforces:
 
 ### Close policy
 
+The approved scope is limited to the existing deterministic `already_done` policy below. Duplicate and superseded outcomes remain recommendations for human review; see [Groomer Close Policy](./groomer-close-policy.md).
+
 An `already_done` plan closes the issue, the highest-impact write the groomer makes. It validates only when all of these hold:
 
 - the close has reason `already_done`, verdict confidence is `high`, and no material uncertainty remains;
@@ -225,7 +227,7 @@ Every run captures its own snapshot, so the key only recurs when the issue, its 
 
 Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` or `unverifiable` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key, so it never reports `busy`, and it never writes a backoff.
 
-Out of scope here, and still to come: worker admission gating on these results (#1065), child issue creation (#1066), semantic duplicate/superseded closes (design gate #1069), and UI exposure of the new history fields (#1067).
+Out of scope here, and still to come: worker admission gating on these results (#1065), child issue creation (#1066), and UI exposure of the new history fields (#1067).
 
 ## History and Audit
 
