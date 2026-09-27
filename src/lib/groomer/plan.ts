@@ -577,6 +577,22 @@ export function evaluateReadiness(draft: GroomingPlanDraft, catalog: EvidenceCat
 
 // ─── Status derivation ────────────────────────────────────────────────────────
 
+/** Statuses the groomer manages. status/done only via the already_done close. */
+export const GROOMING_OWNED_STATUSES: readonly StatusLabel[] = [
+  "status/ready",
+  "status/backlog",
+  "status/blocked",
+  "status/done",
+];
+
+/** Claimed or under-review work: never the groomer's to move. */
+export const IN_FLIGHT_STATUSES: readonly StatusLabel[] = ["status/in-progress", "status/in-review"];
+
+/** The in-flight status an issue carries, if any. */
+export function inFlightStatus(labels: readonly string[]): StatusLabel | null {
+  return IN_FLIGHT_STATUSES.find((status) => labels.includes(status)) ?? null;
+}
+
 /** Status is a function of the verdict, not a free-form label choice. */
 export function statusForActionability(actionability: Actionability): StatusLabel {
   switch (actionability) {
@@ -801,18 +817,22 @@ function nextGroomingActionFor(plan: GroomingPlan): GroomAction | undefined {
  * Map a plan onto the legacy GroomerOutput the run path and existing
  * run/history consumers read, during the rollout of the plan contract.
  *
- * `currentLabels` are the labels the mutation will be applied to: every
- * status/* other than the plan's derived status is removed, so the
- * exactly-one-status post-condition cannot keep a stale status/ready.
+ * `currentLabels` are the labels the mutation will be applied to. Every other
+ * grooming-owned status is removed, so the exactly-one-status post-condition
+ * cannot keep a stale status/ready. An issue carrying an in-flight status
+ * (in-progress/in-review) keeps its status labels untouched.
  */
 export function toGroomerOutput(plan: GroomingPlan, currentLabels: string[]): GroomerOutput {
   const { verdict, mutations } = plan;
   const status = mutations.status;
-  const staleStatuses = currentLabels.filter((label) => label.startsWith("status/") && label !== status);
+  const inFlight = inFlightStatus(currentLabels) !== null;
+  const staleStatuses = inFlight
+    ? []
+    : currentLabels.filter((label) => GROOMING_OWNED_STATUSES.includes(label as StatusLabel) && label !== status);
   const output: GroomerOutput = {
     actionability: verdict.actionability,
     confidence: verdict.confidence,
-    labelsToAdd: [...mutations.labelsToAdd, status],
+    labelsToAdd: inFlight ? [...mutations.labelsToAdd] : [...mutations.labelsToAdd, status],
     labelsToRemove: [...new Set([...mutations.labelsToRemove, ...staleStatuses])],
     lane: { ...verdict.lane },
     summary: verdict.summary,

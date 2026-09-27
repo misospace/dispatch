@@ -620,6 +620,19 @@ describe("toGroomerOutput (legacy compatibility view)", () => {
     expect(toGroomerOutput(plan, []).nextGroomingAction).toBe("escalate");
   });
 
+  it("never touches in-progress or in-review status labels", () => {
+    for (const status of ["status/in-progress", "status/in-review"]) {
+      const output = toGroomerOutput(validPlan(notReady("blocked")), [status, "priority/p1"]);
+      expect(output.labelsToAdd).toEqual(["type/bug"]);
+      expect(output.labelsToRemove).toEqual([]);
+    }
+  });
+
+  it("only removes grooming-owned statuses", () => {
+    const output = toGroomerOutput(validPlan(readyDraft()), ["status/backlog", "status/done"]);
+    expect(output.labelsToRemove).toEqual(["status/backlog", "status/done"]);
+  });
+
   it("omits null text mutations", () => {
     const output = toGroomerOutput(validPlan(readyDraft()), []);
     expect(output).not.toHaveProperty("githubComment");

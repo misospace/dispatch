@@ -6,7 +6,7 @@ import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
 import type { GroomerOutput } from "./schema";
-import { toGroomerOutput, validateGroomingPlan, type GroomingPlan } from "./plan";
+import { inFlightStatus, toGroomerOutput, validateGroomingPlan, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
@@ -431,15 +431,31 @@ async function executeGroomerRun(
       closeRecommendation: plan.mutations.close,
     };
 
+    // An issue already claimed or under review (status/in-progress or
+    // status/in-review) is not the groomer's to move. The plan is recorded,
+    // but no label, lane, title/body, comment or close mutation is applied.
+    const inFlight = inFlightStatus(candidate.labels);
+    if (inFlight) {
+      newLabels = [...candidate.labels];
+      Object.assign(mutationPlan, {
+        skippedReason: "in_flight_status",
+        inFlightStatus: inFlight,
+        willComment: false,
+        willCloseIssue: false,
+        titleRewritten: false,
+        bodyEnriched: false,
+      });
+    }
+
     // Persist stage planned
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
       stage: "planned",
       rawOutput,
       validatedOutput: plan,
-      labelsToAdd: output.labelsToAdd,
-      labelsToRemove: output.labelsToRemove,
+      labelsToAdd: inFlight ? [] : output.labelsToAdd,
+      labelsToRemove: inFlight ? [] : output.labelsToRemove,
       labelsAfter: newLabels,
-      laneAfter: output.lane.id,
+      laneAfter: inFlight ? candidate.currentLane : output.lane.id,
       mutationPlan,
       commentBodyPreview: output.githubComment?.trim()?.slice(0, 500) ?? null,
     });
@@ -460,6 +476,58 @@ async function executeGroomerRun(
         groomingRunId: groomingRun.id,
         contextWarnings,
         mutationPlan,
+      };
+    }
+
+    if (inFlight) {
+      // Only the Dispatch-local groomedAt stamp is written, so the 24h
+      // re-groom cooldown still applies and an eligible in-flight issue is
+      // not re-selected (and re-billed) every scheduler tick.
+      const skipped: Record<string, unknown> = { skipped: "in_flight_status", inFlightStatus: inFlight };
+      await deps.prisma.issue.update({
+        where: { id: candidate.id },
+        data: { groomedAt: new Date(), groomedBy: "hosted-groomer" },
+      });
+      const skippedRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: `No mutations applied: issue is ${inFlight}`,
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await deps.prisma.auditLog.create({
+        data: {
+          actor: "hosted-groomer",
+          action: "groom",
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          beforeLabels: candidate.labels,
+          afterLabels: candidate.labels,
+          success: true,
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "completed",
+        stage: "skipped",
+        appliedMutations: skipped,
+        agentRunId: skippedRun.id,
+      });
+      return {
+        candidateNumber: candidate.number,
+        repoFullName: candidate.repoFullName,
+        dryRun: false,
+        output,
+        plan,
+        plannedLabels: newLabels,
+        groomingRunId: groomingRun.id,
+        contextWarnings,
+        mutationPlan,
+        appliedMutations: skipped,
       };
     }
 

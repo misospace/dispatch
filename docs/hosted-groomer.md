@@ -139,7 +139,8 @@ A ready verdict that breaks any rule is a validation error: the run fails as ret
 
 Other rules the validator enforces:
 
-- Status is derived from actionability (`ready` → `status/ready`, `blocked` → `status/blocked`, `already_done` → `status/done`, otherwise `status/backlog`); the plan cannot set `status/*` or `agent/*` labels. Any other status on the issue is removed.
+- Status is derived from actionability (`ready` → `status/ready`, `blocked` → `status/blocked`, `already_done` → `status/done`, otherwise `status/backlog`); the plan cannot set `status/*` or `agent/*` labels. The groomer only manages these grooming-owned statuses, and any other one on the issue is removed.
+- An issue carrying `status/in-progress` or `status/in-review` (claimed, or with an open PR) is never moved, including on targeted runs. Its plan is recorded on the run, with `mutationPlan.skippedReason: "in_flight_status"`, but no label, lane, title/body, comment or close mutation is applied. Only `groomedAt` is stamped, so the 24h re-groom cooldown still applies.
 - A non-ready verdict is placed in the non-claimable lane, so a lane alone never promotes an issue. A ready verdict placed there is moved to the default lane (implementation) or escalation lane (design). Both moves are recorded in `contextWarnings`.
 - `already_done` requires a close with reason `already_done`, backed by pinned repository evidence, related GitHub work, or a human comment, and no material uncertainty. It remains the only close the runner applies.
 - `duplicate` and `superseded` closes are recorded recommendations only; each must cite a matching `relatedWork` entry.

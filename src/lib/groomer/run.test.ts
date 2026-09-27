@@ -1306,6 +1306,79 @@ Investigate session handling in auth module.`;
       expect(mocks.closeIssue).not.toHaveBeenCalled();
     });
 
+    describe("in-flight issues keep their status (in-progress/in-review)", () => {
+      const expectNoGitHubMutation = () => {
+        expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+        expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+        expect(mocks.addIssueComment).not.toHaveBeenCalled();
+        expect(mocks.closeIssue).not.toHaveBeenCalled();
+        expect(mocks.prisma.issueLane.create).not.toHaveBeenCalled();
+      };
+
+      it("records the plan but applies nothing to a status/in-progress issue", async () => {
+        const claimed = { ...mockCandidate, labels: ["status/in-progress", "agent/alpha"], currentLane: "local" };
+        mocks.selectGroomingCandidate.mockResolvedValue(claimed);
+        mocks.callGroomerLLM.mockResolvedValue(
+          notReadyDraft("blocked", { mutations: { labelsToAdd: ["priority/p2"], githubComment: "Parking this." } }),
+        );
+
+        const result = await runHostedGroomer();
+
+        expectNoGitHubMutation();
+        expect(result!.plannedLabels).toEqual(["status/in-progress", "agent/alpha"]);
+        expect(result!.plan!.verdict.actionability).toBe("blocked");
+        expect(result!.appliedMutations).toEqual({ skipped: "in_flight_status", inFlightStatus: "status/in-progress" });
+        // Only the cooldown stamp is written locally: no lane, status reason or summary.
+        expect(mocks.prisma.issue.update).toHaveBeenCalledWith({
+          where: { id: "issue-42" },
+          data: { groomedAt: expect.any(Date), groomedBy: "hosted-groomer" },
+        });
+        const plannedCall = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+        expect(plannedCall![0].data).toMatchObject({
+          validatedOutput: result!.plan,
+          labelsToAdd: [],
+          labelsToRemove: [],
+          labelsAfter: ["status/in-progress", "agent/alpha"],
+          laneAfter: "local",
+          mutationPlan: expect.objectContaining({ skippedReason: "in_flight_status", willComment: false }),
+        });
+        expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ status: "completed", stage: "skipped" }) }),
+        );
+      });
+
+      it("leaves a status/in-review issue untouched on a targeted run, even for already_done", async () => {
+        const inReview = { ...mockCandidate, labels: ["status/in-review", "priority/p1"] };
+        mocks.selectGroomingCandidate.mockResolvedValue(inReview);
+        mocks.callGroomerLLM.mockResolvedValue(
+          notReadyDraft("already_done", {
+            mutations: { close: { reason: "already_done", rationale: "gone", evidenceRefs: ["repo:src/auth/login.ts"] } },
+          }),
+        );
+
+        const result = await runHostedGroomer({ repoFullName: "org/repo", issueNumber: 42 });
+
+        expect(mocks.selectGroomingCandidate).toHaveBeenCalledWith({ repoFullName: "org/repo", issueNumber: 42 });
+        expectNoGitHubMutation();
+        expect(result!.plannedLabels).toEqual(["status/in-review", "priority/p1"]);
+        expect(result!.mutationPlan).toMatchObject({ skippedReason: "in_flight_status", inFlightStatus: "status/in-review", willCloseIssue: false });
+        expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ state: "closed" }) }),
+        );
+      });
+
+      it("reports the skip in a dry run", async () => {
+        mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+        mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-progress"] });
+
+        const result = await runHostedGroomer();
+
+        expect(result!.mutationPlan).toMatchObject({ skippedReason: "in_flight_status", inFlightStatus: "status/in-progress" });
+        expect(result!.plannedLabels).toEqual(["status/in-progress"]);
+        expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+      });
+    });
+
     it("routes ready design work to the escalation lane and never the default lane", async () => {
       mocks.callGroomerLLM.mockResolvedValue(
         planDraft({
