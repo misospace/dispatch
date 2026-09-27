@@ -305,6 +305,7 @@ export async function markPrFix(input: {
   pr: number;
   status: string;
   note?: string;
+  generation?: number;
 }): Promise<unknown> {
   return mcJson<unknown>("/api/pr-fix-queue/mark", {
     method: "POST",

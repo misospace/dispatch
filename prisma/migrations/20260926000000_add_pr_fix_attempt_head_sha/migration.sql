@@ -1,0 +1,11 @@
+-- AlterTable: immutable per-attempt head baseline for PR-fix queue items (#1074).
+-- Captured when an attempt becomes dispatchable (fresh enqueue, requeue, or a
+-- mark back to QUEUED) and used by the no-progress FIXED guard as its
+-- comparison baseline. Deliberately distinct from the mutable `headSha`
+-- column (latest known head at enqueue time, used by the #940 reopen check):
+-- the enqueue-time headSha is overwritten by every re-observation, so a
+-- worker pushing to exactly that SHA made the guard compare a SHA against
+-- itself and refuse a real fix. NULL (the default for pre-existing rows and
+-- for fresh attempts with no head record) means "no baseline recorded" and
+-- the guard accepts, matching the legacy no-record behavior.
+ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "attemptHeadSha" TEXT;
