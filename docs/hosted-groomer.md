@@ -150,7 +150,7 @@ Other rules the validator enforces:
 
 ### Close policy
 
-The approved scope is limited to the existing deterministic `already_done` policy below. Duplicate and superseded outcomes remain recommendations for human review; issue #1069's design boundaries and the gate for any future extension are in [Groomer Close Policy](./groomer-close-policy.md). This link documents policy intent, not support for any hypothetical authority or target-verification feature.
+The approved scope is limited to the existing deterministic `already_done` policy below. Duplicate and superseded outcomes remain recommendations for human review; see [Groomer Close Policy](./groomer-close-policy.md).
 
 An `already_done` plan closes the issue, the highest-impact write the groomer makes. It validates only when all of these hold:
 
@@ -227,7 +227,7 @@ Every run captures its own snapshot, so the key only recurs when the issue, its 
 
 Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` or `unverifiable` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key, so it never reports `busy`, and it never writes a backoff.
 
-The v1 decision for #1069 is made in [Groomer Close Policy](./groomer-close-policy.md): duplicate and superseded remain recommendations, and no new autonomous close class is approved. The decision does not mean an extension is implemented or fully designed; authority/target verification and the other extension gates remain open design work. Recommendations are persisted in `GroomingRun.mutationPlan`, not surfaced in the UI; operators can inspect an individual run through the authorized `GET /api/groomer/runs/[id]` detail API. Worker admission gating on these results (#1065), child issue creation (#1066), and UI exposure of history fields (#1067) remain out of scope here.
+Out of scope here, and still to come: worker admission gating on these results (#1065), child issue creation (#1066), and UI exposure of the new history fields (#1067).
 
 ## History and Audit
 
