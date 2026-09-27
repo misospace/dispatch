@@ -12,6 +12,7 @@ import {
   getDoneRetentionDays,
 } from "@/lib/issue-filters";
 import { getConfiguredLanes, isValidLane } from "@/lib/lane-config";
+import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
 
 export const dynamic = "force-dynamic";
 
@@ -30,11 +31,13 @@ async function getIssues(repo?: string, agent?: string, owner?: string, priority
     where.currentLane = lane.toLowerCase();
   }
 
-  return prisma.issue.findMany({
+  const issues = await prisma.issue.findMany({
     where,
     include: { repository: true },
     orderBy: { updatedAt: "desc" },
   });
+
+  return withDependencyBlockReasons(issues);
 }
 
 async function getRepos() {

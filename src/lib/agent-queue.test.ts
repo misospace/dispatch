@@ -1,13 +1,16 @@
 import { describe, expect, it, afterEach } from "vitest";
 import { buildAgentQueue, isRenovateIssue, issueAgeDays } from "./agent-queue";
 import { setLaneConfig, resetLaneConfig } from "./lane-config";
+import { dependencyKey } from "./issue-dependencies";
 
-const makeIssue = (overrides: Partial<{ number: number; title: string; url: string; labels: string[]; lane?: string }> = {}) => ({
+const makeIssue = (overrides: Partial<{ number: number; title: string; url: string; labels: string[]; lane?: string; body?: string | null; repoFullName?: string }> = {}) => ({
   number: overrides.number ?? 1,
   title: overrides.title ?? "Test issue",
   url: overrides.url ?? "https://github.com/test/repo/issues/1",
   labels: overrides.labels ?? [],
   lane: overrides.lane,
+  body: overrides.body,
+  repoFullName: overrides.repoFullName,
 });
 
 describe("isRenovateIssue", () => {
@@ -1013,6 +1016,99 @@ describe("buildAgentQueue excludes non-worker-actionable issues (issue #369)", (
   });
 });
 
+
+describe("buildAgentQueue dependency gating (issue #1038)", () => {
+  const readyDependent = (overrides: { body: string; repoFullName: string; number?: number } = { body: "depends on #5", repoFullName: "test/repo" }) =>
+    makeIssue({
+      number: overrides.number ?? 1,
+      labels: ["status/ready", "priority/p1"],
+      body: overrides.body,
+      repoFullName: overrides.repoFullName,
+    });
+
+  it("excludes a ready issue with an open blocker from the claimable queue", () => {
+    const issues = [readyDependent()];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 5)]),
+    });
+    expect(result).toHaveLength(0);
+  });
+
+  it("surfaces blockedBy and dependencyBlockReason on the ranking output", () => {
+    const issues = [readyDependent()];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 5)]),
+      claimableOnly: false,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].blockedBy).toEqual([5]);
+    expect(result[0].dependencyBlockReason).toContain("#5");
+    expect(result[0].claimable).toBe(false);
+  });
+
+  it("keeps a dependent claimable when its blocker is closed", () => {
+    const issues = [readyDependent()];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set<string>(),
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].claimable).toBe(true);
+    expect(result[0].blockedBy).toEqual([]);
+    expect(result[0].dependencyBlockReason).toBe("");
+  });
+
+  it("gates when any blocker is open and lists only the open ones in the reason", () => {
+    const issues = [readyDependent({ body: "depends on #5 and #6", repoFullName: "test/repo" })];
+    const openIssueKeys = new Set([dependencyKey("test/repo", 5)]); // #6 closed
+
+    const gated = buildAgentQueue(issues, "worker-agent", { openIssueKeys });
+    expect(gated).toHaveLength(0);
+
+    const ranked = buildAgentQueue(issues, "worker-agent", { openIssueKeys, claimableOnly: false });
+    expect(ranked[0].blockedBy).toEqual([5]);
+    expect(ranked[0].dependencyBlockReason).toBe("Blocked by open #5");
+  });
+
+  it("gates independently on cross-repo refs", () => {
+    const issues = [
+      readyDependent({ body: "depends on other/repo#9", repoFullName: "test/repo" }),
+    ];
+
+    const gated = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("other/repo", 9)]),
+    });
+    expect(gated).toHaveLength(0);
+
+    // A same-number issue open in the dependent's own repo is not its blocker
+    const unblocked = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 9)]),
+    });
+    expect(unblocked).toHaveLength(1);
+
+    const ranked = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("other/repo", 9)]),
+      claimableOnly: false,
+    });
+    expect(ranked[0].dependencyBlockReason).toContain("other/repo#9");
+  });
+
+  it("does not gate when openIssueKeys is omitted", () => {
+    const issues = [readyDependent()];
+    const result = buildAgentQueue(issues, "worker-agent");
+    expect(result).toHaveLength(1);
+    expect(result[0].claimable).toBe(true);
+    expect(result[0].blockedBy).toEqual([]);
+  });
+
+  it("does not gate when an issue depends on itself", () => {
+    const issues = [readyDependent({ body: "depends on #1", repoFullName: "test/repo", number: 1 })];
+    const result = buildAgentQueue(issues, "worker-agent", {
+      openIssueKeys: new Set([dependencyKey("test/repo", 1)]),
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].claimable).toBe(true);
+  });
+});
 
 // ─── Anti-starvation aging ──────────────────────────────────────────────────
 

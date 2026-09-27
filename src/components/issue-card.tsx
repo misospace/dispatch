@@ -662,7 +662,7 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
             </a>
           )}
         </div>
-        {(issue.notReadyReason || issue.blockedReason || issue.needsInfoReason || issue.groomingSummary) && (
+        {(issue.notReadyReason || issue.blockedReason || issue.dependencyBlockReason || issue.needsInfoReason || issue.groomingSummary) && (
           <div className="mt-2 space-y-1">
             {issue.notReadyReason && (
               <div className="flex items-start gap-1 text-xs text-amber-700">
@@ -674,6 +674,12 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
               <div className="flex items-start gap-1 text-xs text-red-700">
                 <Ban className="h-3 w-3 mt-0.5 shrink-0" />
                 <span>{issue.blockedReason}</span>
+              </div>
+            )}
+            {issue.dependencyBlockReason && (
+              <div className="flex items-start gap-1 text-xs text-red-700">
+                <Ban className="h-3 w-3 mt-0.5 shrink-0" />
+                <span>{issue.dependencyBlockReason}</span>
               </div>
             )}
             {issue.needsInfoReason && (

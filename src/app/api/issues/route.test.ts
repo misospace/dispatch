@@ -288,7 +288,7 @@ describe("GET /api/issues — visible issue filtering", () => {
     const body = await res.json();
 
     expect(res.status).toBe(200);
-    expect(body).toEqual(expectedIssues);
+    expect(body).toEqual(expectedIssues.map((issue) => ({ ...issue, dependencyBlockReason: null })));
   });
 
   it("returns 500 on database error", async () => {
@@ -424,5 +424,35 @@ describe("GET /api/issues — lane aliases", () => {
     expect(call.where.currentLane.in).toContain("local");
     expect(call.where.currentLane.in).toContain("normal");
     expect(call.where.currentLane.in).toContain("escalated");
+  });
+});
+
+describe("GET /api/issues — dependency block reason", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.findManyIssues.mockResolvedValue([]);
+  });
+
+  it("annotates a card whose blocker is hidden by the repo filter", async () => {
+    mocks.findManyIssues
+      .mockResolvedValueOnce([
+        { id: "a", number: 10, state: "open", body: "depends on bar/repo#20", repository: { fullName: "foo/repo" } },
+      ])
+      .mockResolvedValueOnce([{ number: 20, repository: { fullName: "bar/repo" } }]);
+
+    const res = await makeRequest("http://localhost/api/issues?repo=foo/repo");
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].dependencyBlockReason).toBe("Blocked by open bar/repo#20");
+    // The filtered listing is scoped to the repo; the blocker lookup is not.
+    expect(mocks.findManyIssues.mock.calls[0][0].where.repository.fullName).toBe("foo/repo");
+    expect(mocks.findManyIssues.mock.calls[1][0].where).toEqual({
+      state: "open",
+      repository: { enabled: true },
+      number: { in: [20] },
+    });
   });
 });

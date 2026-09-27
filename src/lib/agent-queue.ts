@@ -8,6 +8,11 @@ import {
 } from "@/types";
 import { isIssueExcludedByLabels, isRenovateIssue } from "@/lib/issue-filters";
 import { isBacklogLane, resolveLaneId, laneMatchesConfigured } from "@/lib/lane-config";
+import {
+  parseIssueDependencies,
+  resolveOpenBlockers,
+  formatDependencyBlockReason,
+} from "@/lib/issue-dependencies";
 
 export { isRenovateIssue } from "@/lib/issue-filters";
 
@@ -47,6 +52,8 @@ export interface RankedIssue {
   issueId?: string;
   repoFullName?: string;
   claimable?: boolean;
+  blockedBy?: number[];
+  dependencyBlockReason?: string;
   linkedPrHealth?: QueueLinkedPrHealth | null;
 }
 
@@ -213,6 +220,11 @@ function isClaimableStatus(labels: string[]): boolean {
  * By default, only claimable work is returned (excludes status/backlog).
  * Pass claimableOnly=false to include all actionable issues including backlog.
  * Excludes issues with labels matching DISPATCH_EXCLUDED_LABELS by default.
+ * Dependency gating: pass openIssueKeys (a Set of dependencyKey strings for
+ * currently-open issues) to exclude claimable issues whose body declares an
+ * open blocker (e.g. "depends on #5"). Only applied when claimableOnly is
+ * true; when omitted the queue behaves as before. Every result item carries
+ * blockedBy (open blocker numbers) and dependencyBlockReason ("" when none).
  */
 export function buildAgentQueue(
   issues: Array<{
@@ -224,6 +236,7 @@ export function buildAgentQueue(
     decomposed?: boolean;
     issueId?: string;
     repoFullName?: string;
+    body?: string | null;
     linkedPrHealth?: QueueLinkedPrHealth | null;
     createdAt?: Date | string | null;
   }>,
@@ -235,6 +248,7 @@ export function buildAgentQueue(
     includeRenovate?: boolean;
     claimableOnly?: boolean;
     excludedLabels?: string[];
+    openIssueKeys?: Set<string>;
   },
 ): RankedIssue[] {
   // Normalize lane to lowercase for consistent comparison
@@ -242,6 +256,9 @@ export function buildAgentQueue(
 
   // Default claimableOnly to true per the worker contract (backlog is triage-only)
   const claimableOnly = options?.claimableOnly ?? true;
+
+  // Open-issue key set for dependency gating; undefined disables the gate.
+  const openIssueKeys = options?.openIssueKeys;
 
   // Filter actionable issues (open, not done)
   let actionable = issues.filter((issue) => isActionable(issue.labels));
@@ -282,6 +299,21 @@ export function buildAgentQueue(
     actionable = actionable.filter((issue) => !isIssueExcludedByLabels(issue.labels, excludedLabels));
   }
 
+  // Dependency gating: a claimable issue that declares an open blocker in its
+  // body (e.g. "depends on #5") is withheld until the blocker closes. Only
+  // active when openIssueKeys is provided and the claimable filter is on.
+  if (openIssueKeys !== undefined && claimableOnly) {
+    actionable = actionable.filter((issue) => {
+      const blockers = resolveOpenBlockers(
+        parseIssueDependencies(issue.body),
+        openIssueKeys,
+        issue.repoFullName,
+        { repo: issue.repoFullName, number: issue.number },
+      );
+      return blockers.length === 0;
+    });
+  }
+
   // Lane filter: exclude backlog lane items from normal agent queue
   // When claimableOnly=false, include all lanes (including backlog/non-claimable)
   const filtered = normalizedLane
@@ -318,6 +350,14 @@ export function buildAgentQueue(
     const agentMatch = Boolean(agentLabel && agentLabel === `agent/${agentName}`);
     const priority = getPriorityFromLabels(item.labels);
     const status = getStatusFromLabels(item.labels);
+    const openBlockers = openIssueKeys
+      ? resolveOpenBlockers(
+          parseIssueDependencies(item.body),
+          openIssueKeys,
+          item.repoFullName,
+          { repo: item.repoFullName, number: item.number },
+        )
+      : [];
 
     return {
       type: "issue" as const,
@@ -333,7 +373,9 @@ export function buildAgentQueue(
       decomposed: item.decomposed ?? false,
       issueId: item.issueId,
       repoFullName: item.repoFullName,
-      claimable: status !== BACKLOG_STATUS,
+      claimable: status !== BACKLOG_STATUS && openBlockers.length === 0,
+      blockedBy: openBlockers.map((b) => b.number),
+      dependencyBlockReason: formatDependencyBlockReason(openBlockers, item.repoFullName),
       linkedPrHealth: item.linkedPrHealth ?? null,
     };
   });

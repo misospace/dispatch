@@ -33,6 +33,7 @@ vi.mock("@/components/ui/card", () => ({
 }));
 
 import BoardPage from "./page";
+import { KanbanBoardClient } from "./kanban-board-client";
 
 function findElementByType(node: React.ReactNode, type: unknown): React.ReactElement | null {
   if (!React.isValidElement(node)) return null;
@@ -144,5 +145,34 @@ describe("BoardPage searchParams handling (Next 16 async)", () => {
 
     const filteredCall = mocks.findManyIssues.mock.calls[0][0];
     expect(filteredCall.where).toEqual(expect.objectContaining({ OR: expect.any(Array) }));
+  });
+});
+
+describe("BoardPage dependency block reason", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findManyRepos.mockResolvedValue([]);
+    mocks.aggregateIssues.mockResolvedValue({ _count: { _all: 1 }, _max: { lastSyncedAt: null } });
+    mocks.getTrackedRepos.mockResolvedValue([]);
+  });
+
+  it("annotates cards against all open issues, not the repo-filtered subset", async () => {
+    mocks.findManyIssues.mockImplementation(async (args: { where: Record<string, unknown>; select?: unknown }) => {
+      // Blocker lookup: the unfiltered open universe.
+      if ((args.where.number as { in?: number[] } | undefined)?.in) {
+        return [{ number: 20, repository: { fullName: "bar/repo" } }];
+      }
+      // Filter-options query selects labels only.
+      if (args.select) return [];
+      return [
+        { id: "a", number: 10, state: "open", labels: [], body: "Depends on bar/repo#20", repository: { fullName: "foo/repo" } },
+      ];
+    });
+
+    const page = await BoardPage({ searchParams: Promise.resolve({ repo: "foo/repo" }) });
+
+    const board = findElementByType(page, KanbanBoardClient);
+    const initialIssues = (board?.props as { initialIssues: Array<{ dependencyBlockReason: string | null }> }).initialIssues;
+    expect(initialIssues[0].dependencyBlockReason).toBe("Blocked by open bar/repo#20");
   });
 });
