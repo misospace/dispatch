@@ -79,18 +79,20 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
       const issue = issueComment.issue;
       if (!issue || !issue.pull_request) break; // Only handle PR comments (not issue comments)
 
+      // The issue object carries no repository or head ref; the repo is the
+      // top-level `repository`, and the PR's branch/head are not in this payload.
       events.push({
         eventType: "comment",
-        repoFullName: issue.repository?.full_name ?? null,
+        repoFullName: issueComment.repository?.full_name ?? null,
         prNumber: issue.number,
-        branch: issue.head?.ref ?? null,
+        branch: null,
         url: issue.html_url,
         title: issue.title,
         author: issue.user?.login ?? null,
         body: issueComment.comment?.body ?? "",
         id: String(issueComment.comment?.id),
         linkedIssue: extractLinkedIssue(issue),
-        headSha: issue.head?.sha ?? null,
+        headSha: null,
       });
       break;
     }
@@ -100,44 +102,33 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
       const check = checkRun.check_run;
       if (!check) break;
 
-      // Derive PR association from check.pull_requests (not checkRun.sender)
-      let prNumber: number | undefined = undefined;
-      let prAuthor: string | null = null;
-      let prLinkedIssue: number | null = null;
-      const prList = check.pull_requests ?? [];
-      if (Array.isArray(prList) && prList.length > 0) {
-        const firstPr = prList[0] as Record<string, any> | undefined;
-        if (firstPr?.url) {
-          const match = firstPr.url.match(/\/pull\/(\d+)/);
-          if (match) {
-            prNumber = parseInt(match[1], 10);
-            prAuthor = firstPr.user?.login ?? null;
-            prLinkedIssue = extractLinkedIssue(firstPr);
-          }
-        }
-      }
+      // check_run.pull_requests[] items are pull-request-minimal objects
+      // ({ id, number, url, head, base }): the number is given directly (url is
+      // the API URL, /repos/o/r/pulls/N) and there is no author, title or body.
+      // A webhook check_run therefore has author null and does not pass the
+      // bot-author gate; the sync route covers failing checks with the real PR
+      // author.
+      const prList = Array.isArray(check.pull_requests) ? check.pull_requests : [];
+      const firstPr = prList[0] as Record<string, any> | undefined;
+      const prNumber = typeof firstPr?.number === "number" ? firstPr.number : undefined;
 
       // Skip check runs that cannot be associated with a PR
       if (prNumber === undefined || prNumber === 0) break;
 
       events.push({
         eventType: "check_run",
-        repoFullName: check.repository?.full_name ?? null,
+        repoFullName: checkRun.repository?.full_name ?? null,
         prNumber,
-        branch: check.head_branch ?? null,
+        branch: firstPr?.head?.ref ?? check.check_suite?.head_branch ?? null,
         url: check.html_url,
         title: check.name,
-        author: prAuthor,
-        body: check.details ?? check.output?.summary ?? "",
+        author: null,
+        body: check.output?.summary ?? "",
         id: String(check.id),
         conclusion: check.conclusion,
         checkName: check.name,
-        linkedIssue: prLinkedIssue,
-        // GitHub does not include `head.sha` directly on the check_run payload;
-        // fall back to `head_branch` only. The PR detail fetcher in the sync
-        // route still has it; webhooks degrade to "no head sha recorded" and
-        // skip the FIXED head-SHA guard for that path.
-        headSha: null,
+        linkedIssue: null,
+        headSha: firstPr?.head?.sha ?? check.head_sha ?? null,
       });
       break;
     }

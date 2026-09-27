@@ -187,6 +187,15 @@ describe("isAllowedBranchOwner", () => {
     expect(isAllowedBranchOwner("some-org/repo")).toBe(true);
   });
 
+  it("rejects a missing repo name without throwing, with or without an allowlist", () => {
+    delete process.env.PR_FOLLOWUP_BRANCH_OWNERS;
+    expect(isAllowedBranchOwner(null)).toBe(false);
+    expect(isAllowedBranchOwner(undefined)).toBe(false);
+    expect(isAllowedBranchOwner("")).toBe(false);
+    process.env.PR_FOLLOWUP_BRANCH_OWNERS = "misospace";
+    expect(isAllowedBranchOwner(null)).toBe(false);
+  });
+
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BRANCH_OWNERS;
   });
@@ -972,6 +981,34 @@ describe("processPrFollowupEvents", () => {
 
     expect(result.enqueued).toBe(0);
     expect(result.skipped).toBe(1);
+  });
+
+  it("skips an event with no repository before ingesting, instead of throwing", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await processPrFollowupEvents(client, [
+      {
+        eventType: "comment",
+        repoFullName: null as unknown as string,
+        prNumber: 1,
+        branch: null,
+        url: "https://github.com/org/repo/pull/1",
+        title: "Fix A",
+        author: "itsmiso-ai",
+        body: "Test failed: expected 200 but got 500",
+        id: "c3",
+      },
+    ]);
+
+    expect(result).toEqual({ enqueued: 0, skipped: 1 });
+    expect(client.items).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("no repository full name"));
+    expect(error).not.toHaveBeenCalled();
+    warn.mockRestore();
+    error.mockRestore();
   });
 
   afterEach(() => {
