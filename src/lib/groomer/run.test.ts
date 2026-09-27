@@ -309,9 +309,9 @@ describe("runHostedGroomer", () => {
       return row;
     });
     mocks.prisma.groomingApplication.updateMany.mockImplementation(
-      async ({ where, data }: { where: { applicationKey: string; status: string }; data: Record<string, any> }) => {
+      async ({ where, data }: { where: { applicationKey: string; status: string; attempts: number }; data: Record<string, any> }) => {
         const row = mocks.applications.get(where.applicationKey);
-        if (!row || row.status !== where.status) return { count: 0 };
+        if (!row || row.status !== where.status || row.attempts !== where.attempts) return { count: 0 };
         if (data.attempts?.increment) row.attempts += data.attempts.increment;
         return { count: 1 };
       },
@@ -1819,6 +1819,16 @@ Investigate session handling in auth module.`;
       expect((data.groomingRetryAfter as Date).getTime() - before).toBeGreaterThanOrEqual(59 * 60 * 1000);
     });
 
+    it("still records the unverifiable run when the backoff itself cannot be written", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      liveStateChangesTo({}, { state: "unknown" });
+      mocks.prisma.issue.update.mockRejectedValueOnce(new Error("db blip"));
+      const result = await runHostedGroomer();
+      warnSpy.mockRestore();
+      expect(result!.appliedMutations).toMatchObject({ outcome: "unverifiable", retryAfterError: "db blip" });
+      expect(completedRun()).toMatchObject({ status: "unverifiable", applyOutcome: "unverifiable" });
+    });
+
     it("backs off when a check is unverifiable even if another one also changed", async () => {
       liveStateChangesTo({ headSha: null, pinnedRef: null }, { body: "edited" });
       await runHostedGroomer();
@@ -1861,7 +1871,11 @@ Investigate session handling in auth module.`;
       expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledTimes(1);
       // The replay writes no lane history and only the local cooldown stamp.
       expect(mocks.prisma.issueLane.create).toHaveBeenCalledTimes(1);
-      expect(Object.keys(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).sort()).toEqual(["groomedAt", "groomedBy"]);
+      expect(Object.keys(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).sort()).toEqual([
+        "groomedAt",
+        "groomedBy",
+        "groomingRetryAfter",
+      ]);
       expect(first!.mutationPlan!.applicationKey).toBe(second!.mutationPlan!.applicationKey);
     });
 

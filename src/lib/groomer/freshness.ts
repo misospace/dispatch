@@ -347,6 +347,7 @@ export const UNKNOWN_FRESHNESS: Record<string, unknown> = {
   groomingStaleAt: null,
   groomingStaleReasons: [],
   groomingStaleDetail: null,
+  groomingRetryAfter: null,
 };
 
 export interface GroomingFreshnessInput {

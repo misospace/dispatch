@@ -266,12 +266,19 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
 
   // status/done lands only after the close succeeds, so a failed close
   // leaves the issue open with its previous status (still groomable),
-  // never open with status/done (which the selector skips forever).
-  const labelsStep = done
-    ? [...labelsAfter.filter((l) => !l.startsWith("status/")), ...labelsBefore.filter((l) => l.startsWith("status/"))]
-    : labelsAfter;
+  // never open with status/done (which the selector skips forever). An issue
+  // that carried several statuses is collapsed to status/backlog here, so a
+  // failed close cannot leave it with more than one.
+  const liveStatuses = labelsBefore.filter((l) => l.startsWith("status/"));
+  const withoutStatus = labelsAfter.filter((l) => !l.startsWith("status/"));
+  const labelsStep = !done
+    ? labelsAfter
+    : liveStatuses.length > 1
+      ? withDerivedStatus(labelsAfter, "status/backlog")
+      : [...withoutStatus, ...liveStatuses];
 
-  const proposedTitle = output.proposedTitle;
+  // Model text written to the issue never carries a live @-mention.
+  const proposedTitle = output.proposedTitle !== undefined ? neutralizeMentions(output.proposedTitle) : undefined;
   const title =
     proposedTitle !== undefined && shouldRewriteTitle(live.title) && proposedTitle !== live.title ? proposedTitle : null;
 
@@ -284,7 +291,7 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     } else if (!shouldEnrichBody(parsed.human)) {
       bodySkippedReason = "the human-authored body is not sparse";
     } else {
-      const rendered = renderManagedBody(parsed, output.proposedBody);
+      const rendered = renderManagedBody(parsed, neutralizeMentions(output.proposedBody));
       if (rendered !== (live.body ?? "")) body = rendered;
       else bodySkippedReason = "the managed section already holds this content";
     }
@@ -406,8 +413,8 @@ export interface ApplicationStore {
   save(applicationKey: string, data: { status: string; steps: ApplySteps }): Promise<void>;
   /**
    * Take over an unfinished claim, atomically: succeeds only if the record is
-   * still as `seen` (same updatedAt), so of two attempts resuming the same
-   * abandoned claim exactly one proceeds.
+   * still as `seen` (same status and attempt count), so of two attempts
+   * resuming the same abandoned claim exactly one proceeds.
    */
   resume(applicationKey: string, seen: ApplicationRecord): Promise<boolean>;
   /** Whether a hosted-groomer comment was recorded on this issue since `since`. */
@@ -546,13 +553,13 @@ export async function applyGroomingMutations(
     write: () => Promise<Omit<ApplyStepResult, "at" | "status"> | void>,
     noopDetail?: string,
   ): Promise<void> => {
-    if (failure) {
-      steps[step] = { status: "not_attempted", detail: `halted after ${failure.step} failed` };
-      return;
-    }
     if (landed(prior[step])) {
       steps[step] = { ...prior[step]!, status: "replayed" };
       if (step === "comment") commentUrl = prior.comment?.commentUrl ?? null;
+      return;
+    }
+    if (failure) {
+      steps[step] = { status: "not_attempted", detail: `halted after ${failure.step} failed` };
       return;
     }
     if (!needed) {
@@ -616,7 +623,9 @@ export async function applyGroomingMutations(
             (c) => groomerCommentKey(c) === applicationKey,
           );
         } catch {
-          found = undefined;
+          // Cannot tell whether the first write landed: retrying could post
+          // it twice, so fail the step; a later attempt finds the marker.
+          throw first;
         }
         if (found) {
           posted = { url: found.url };
@@ -664,7 +673,7 @@ export async function applyGroomingMutations(
 
   const wrote = APPLY_STEPS.some((step) => steps[step]?.status === "applied" || steps[step]?.status === "replayed");
   const outcome: ApplyOutcome = failure ? (wrote ? "partial" : "failed") : wrote ? "applied" : "noop";
-  await persist(failure ? "partial" : "applied");
+  await persist(failure ? (wrote ? "partial" : "failed") : "applied");
 
   return {
     outcome,
@@ -732,13 +741,14 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
       await delegate.update({ where: { applicationKey }, data: { status: data.status, steps: data.steps } });
     },
     async resume(applicationKey, seen) {
-      // Compare-and-swap on the record as read. Bumping attempts also bumps
-      // updatedAt, so a second resumer holding the same read matches nothing.
-      // Every run that works on the application records its key on its own
-      // GroomingRun, so attribution is by applicationKey, not a pointer here.
-      const where: Record<string, unknown> = { applicationKey, status: seen.status };
-      if (seen.updatedAt) where.updatedAt = new Date(seen.updatedAt);
-      const { count } = await delegate.updateMany({ where, data: { attempts: { increment: 1 } } });
+      // Compare-and-swap on the record as read, with attempts as the version:
+      // the winner bumps it, so a second resumer holding the same read
+      // matches nothing. Every run that works on the application records its
+      // key on its own GroomingRun, so attribution is by applicationKey.
+      const { count } = await delegate.updateMany({
+        where: { applicationKey, status: seen.status, attempts: seen.attempts },
+        data: { attempts: { increment: 1 } },
+      });
       return count > 0;
     },
     async hasRecentComment(issueId, since) {

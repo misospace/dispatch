@@ -179,6 +179,20 @@ describe("computeMutationDiff", () => {
     expect(diff.labelsStep).toEqual(["priority/p1", "status/backlog"]);
   });
 
+  it("collapses several live statuses to status/backlog before a close, so a failed close leaves exactly one", () => {
+    const snap = snapshot({ issue: { ...snapshot().issue, labels: ["priority/p1", "status/backlog", "status/needs-review"] } });
+    const diff = diffFor(alreadyDone(), snap);
+    expect(diff.labelsStep.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
+    expect(diff.labelsAfter.filter((l) => l.startsWith("status/"))).toEqual(["status/done"]);
+  });
+
+  it("neutralizes @-mentions in a rewritten title and in the managed body section", () => {
+    const snap = snapshot({ issue: { ...snapshot().issue, title: "P0" } });
+    const diff = diffFor(draft({}, { proposedTitle: "Ask @alice about the redirect", proposedBody: "cc @bob" }), snap);
+    expect(diff.title).toBe("Ask `@alice` about the redirect");
+    expect(diff.body).toContain("cc `@bob`");
+  });
+
   it("keeps good titles and non-sparse bodies, and records why the body was skipped", () => {
     const long = "A".repeat(150);
     const snap = snapshot({ issue: { ...snapshot().issue, body: long } });
@@ -286,7 +300,7 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Ma
     hasRecentComment: async () => false,
     resume: async (key, seen) => {
       const row = rows.get(key)!;
-      if (row.updatedAt !== seen.updatedAt || row.status !== seen.status) return false;
+      if (row.attempts !== seen.attempts || row.status !== seen.status) return false;
       row.attempts += 1;
       row.updatedAt = new Date();
       return true;
@@ -378,8 +392,10 @@ describe("applyGroomingMutations", () => {
         throw new Error("422");
       }),
     });
-    const result = await applyGroomingMutations(applyInput(fullDiff()), github, memoryStore());
+    const store = memoryStore();
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, store);
     expect(result.outcome).toBe("failed");
+    expect(store.rows.get(KEY)).toMatchObject({ status: "failed" });
     expect(github.addComment).not.toHaveBeenCalled();
     expect(github.closeIssue).not.toHaveBeenCalled();
   });
@@ -428,6 +444,41 @@ describe("applyGroomingMutations", () => {
     expect(github.addComment).not.toHaveBeenCalled();
     expect(result.steps.comment).toMatchObject({ status: "replayed", commentUrl: "u7" });
     expect(result.commentUrl).toBe("u7");
+  });
+
+  it("does not retry a failed comment when it cannot tell whether the first write landed", async () => {
+    const { github } = fakeGitHub({
+      addComment: vi.fn(async () => {
+        throw new Error("504");
+      }),
+      fetchRecentComments: vi.fn(async () => {
+        throw new Error("502");
+      }),
+    });
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, memoryStore());
+    expect(github.addComment).toHaveBeenCalledTimes(1);
+    expect(result.steps.comment).toMatchObject({ status: "failed", error: "504" });
+    expect(github.closeIssue).not.toHaveBeenCalled();
+  });
+
+  it("records steps that landed earlier as replayed even when an earlier step fails this time", async () => {
+    const store = memoryStore({
+      applicationKey: KEY,
+      groomingRunId: "run-0",
+      status: "partial",
+      steps: { comment: { status: "applied", commentUrl: "u0" } },
+      attempts: 1,
+    });
+    const { github } = fakeGitHub({
+      updateLabels: vi.fn(async () => {
+        throw new Error("422");
+      }),
+    });
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, store);
+    expect(result.steps.labels?.status).toBe("failed");
+    expect(result.steps.comment).toMatchObject({ status: "replayed", commentUrl: "u0" });
+    expect(result.steps.close?.status).toBe("not_attempted");
+    expect(github.addComment).not.toHaveBeenCalled();
   });
 
   it("does not retry a comment that landed despite a failed response", async () => {
@@ -580,10 +631,10 @@ describe("makePrismaApplicationStore", () => {
     expect(second.existing).toMatchObject({ applicationKey: KEY, groomingRunId: "r1" });
     // A repeat claim only reads; resuming it is what counts an attempt.
     expect(c.groomingApplication.update).not.toHaveBeenCalled();
-    const seen = { ...second.existing!, updatedAt: new Date("2026-09-26T00:00:00Z") };
+    const seen = second.existing!;
     expect(await store.resume(KEY, seen)).toBe(true);
     expect(c.groomingApplication.updateMany).toHaveBeenCalledWith({
-      where: { applicationKey: KEY, status: seen.status, updatedAt: new Date("2026-09-26T00:00:00Z") },
+      where: { applicationKey: KEY, status: seen.status, attempts: 1 },
       data: { attempts: { increment: 1 } },
     });
   });

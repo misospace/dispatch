@@ -279,7 +279,7 @@ async function executeGroomerRun(
           appliedMutations: unverifiable,
         };
       }
-      unverifiable.retryAfter = (await backOffUnreadableIssue(deps, candidate.id)).toISOString();
+      Object.assign(unverifiable, await backOffUnreadableIssue(deps, candidate.id));
       const skippedRun = await deps.prisma.agentRun.create({
         data: {
           agentName: "hosted-groomer",
@@ -712,7 +712,7 @@ async function executeGroomerRun(
       const unreadable = preconditions.checks.some((c) => c.status === "unverifiable");
       const outcome = unreadable ? "unverifiable" : "stale";
       const stale: Record<string, unknown> = { outcome, preconditionFailures: preconditions.failures };
-      if (unreadable) stale.retryAfter = (await backOffUnreadableIssue(deps, candidate.id)).toISOString();
+      if (unreadable) Object.assign(stale, await backOffUnreadableIssue(deps, candidate.id));
       const failed = preconditions.checks.filter((c) => c.status === "changed" || c.status === "unverifiable");
       const staleRun = await deps.prisma.agentRun.create({
         data: {
@@ -824,7 +824,7 @@ async function executeGroomerRun(
       // same plan is not re-billed every scheduler tick.
       await deps.prisma.issue.update({
         where: { id: candidate.id },
-        data: { groomedAt: new Date(), groomedBy: "hosted-groomer" },
+        data: { groomedAt: new Date(), groomedBy: "hosted-groomer", groomingRetryAfter: null },
       });
       const replayRun = await deps.prisma.agentRun.create({
         data: {
@@ -1070,8 +1070,14 @@ function describeApplication(applied: ApplyResult, withheld: Record<string, stri
  * Only the backoff column is written: grooming fields, the cooldown stamp and
  * any freshness baseline stay as they were.
  */
-async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promise<Date> {
+async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promise<Record<string, unknown>> {
   const retryAfter = new Date(Date.now() + UNVERIFIABLE_RETRY_BACKOFF_MINUTES * 60 * 1000);
-  await deps.prisma.issue.update({ where: { id: issueId }, data: { groomingRetryAfter: retryAfter } });
-  return retryAfter;
+  try {
+    await deps.prisma.issue.update({ where: { id: issueId }, data: { groomingRetryAfter: retryAfter } });
+    return { retryAfter: retryAfter.toISOString() };
+  } catch (error) {
+    // The run is still recorded; only the backoff is lost for this attempt.
+    console.warn(`[groomer] failed to record the retry backoff for issue ${issueId}:`, error);
+    return { retryAfterError: error instanceof Error ? error.message : String(error) };
+  }
 }
