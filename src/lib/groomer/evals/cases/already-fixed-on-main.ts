@@ -2,6 +2,19 @@ import { alreadyDone, readyImplementation } from "../drafts";
 import type { GroomingCase } from "../types";
 import { STOREFRONT, STOREFRONT_HEAD } from "./shared";
 
+const COUPONS_TS = `export function validateCoupon(code: string, now = new Date()): CouponResult {
+  const coupon = COUPONS[code];
+  if (!coupon) return { ok: false, reason: "unknown" };
+  if (coupon.expiresAt <= now) return { ok: false, reason: "expired" };
+  return { ok: true, discount: coupon.discount };
+}
+`;
+
+/** The acceptance the issue implies, grounded in coupons.ts as read at head (dispatch#1099). */
+const GROUNDED: Array<[string, string, string]> = [
+  ["expired coupon codes are rejected at checkout", "repo:src/checkout/coupons.ts", 'if (coupon.expiresAt <= now) return { ok: false, reason: "expired" };'],
+];
+
 const fixed = {
   summary: "validateCoupon rejects expired codes at head; the fix merged in #238.",
   evidence: ["repo:src/checkout/coupons.ts", "github:pr:acme/storefront#238"],
@@ -22,6 +35,7 @@ export const alreadyFixedOnMain: GroomingCase = {
   repository: {
     headSha: STOREFRONT_HEAD,
     read: ["src/checkout/coupons.ts", "src/checkout/coupons.test.ts"],
+    contents: { "src/checkout/coupons.ts": COUPONS_TS },
     surfaced: ["src/checkout/legacy-coupons.js"],
   },
   relatedWork: [{ key: "github:pr:acme/storefront#238", kind: "pull_request", state: "merged", via: "read" }],
@@ -29,8 +43,17 @@ export const alreadyFixedOnMain: GroomingCase = {
   candidates: [
     {
       name: "already_done on the expiry check read at head and the merged fix",
-      output: alreadyDone({ ...fixed, closeEvidence: ["repo:src/checkout/coupons.ts", "github:pr:acme/storefront#238"] }),
+      output: alreadyDone({
+        ...fixed,
+        closeEvidence: ["repo:src/checkout/coupons.ts", "github:pr:acme/storefront#238"],
+        criteria: GROUNDED,
+      }),
       expect: { accepted: true, status: "status/done", ready: false, closes: true },
+    },
+    {
+      name: "already_done on the code read at head without grounding the acceptance in it",
+      output: alreadyDone({ ...fixed, closeEvidence: ["repo:src/checkout/coupons.ts", "github:pr:acme/storefront#238"] }),
+      expect: { accepted: false, rejectedFor: "already_done must ground every acceptance criterion" },
     },
     {
       name: "already_done on the issue text alone",
@@ -51,6 +74,7 @@ export const alreadyFixedOnMain: GroomingCase = {
       output: alreadyDone({
         ...fixed,
         closeEvidence: ["repo:src/checkout/coupons.ts"],
+        criteria: GROUNDED,
         uncertainties: [{ kind: "unverified_premise", question: "Do gift-card coupons use validateCoupon?", material: true }],
       }),
       expect: { accepted: false, rejectedFor: "already_done cannot carry a material uncertainty" },
@@ -84,7 +108,7 @@ export const alreadyFixedOnMain: GroomingCase = {
     },
     {
       name: "already_done at medium confidence does not close",
-      output: alreadyDone({ ...fixed, confidence: "medium", closeEvidence: ["repo:src/checkout/coupons.ts"] }),
+      output: alreadyDone({ ...fixed, confidence: "medium", closeEvidence: ["repo:src/checkout/coupons.ts"], criteria: GROUNDED }),
       expect: { accepted: false, rejectedFor: "confidence" },
     },
     {

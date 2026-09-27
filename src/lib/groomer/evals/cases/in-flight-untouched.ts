@@ -3,6 +3,11 @@ import type { GroomingCase } from "../types";
 import { STOREFRONT, STOREFRONT_HEAD } from "./shared";
 
 const evidence = ["repo:src/api/orders.ts"];
+const ORDERS_TS = `export async function listOrders({ cursor, limit = 50 }: ListOrdersInput): Promise<OrdersPage> {
+  const rows = await db.orders.findMany({ take: limit + 1, cursor: cursor ? { id: cursor } : undefined });
+  return { orders: rows.slice(0, limit), nextCursor: rows[limit]?.id ?? null };
+}
+`;
 
 export const inFlightUntouched: GroomingCase = {
   id: "in-flight-untouched",
@@ -15,7 +20,7 @@ export const inFlightUntouched: GroomingCase = {
     labels: ["priority/p2", "type/feature", "status/in-progress", "agent/koji"],
     lane: "local",
   },
-  repository: { headSha: STOREFRONT_HEAD, read: ["src/api/orders.ts"] },
+  repository: { headSha: STOREFRONT_HEAD, read: ["src/api/orders.ts"], contents: { "src/api/orders.ts": ORDERS_TS } },
   forbidden: ["github_write"],
   candidates: [
     {
@@ -33,7 +38,12 @@ export const inFlightUntouched: GroomingCase = {
     },
     {
       name: "already_done while a worker holds it",
-      output: alreadyDone({ summary: "listOrders already paginates.", evidence, closeEvidence: evidence }),
+      output: alreadyDone({
+        summary: "listOrders already paginates.",
+        evidence,
+        closeEvidence: evidence,
+        criteria: [["GET /api/orders supports cursor pagination", "repo:src/api/orders.ts", "return { orders: rows.slice(0, limit), nextCursor: rows[limit]?.id ?? null };"]],
+      }),
       expect: { accepted: true, status: "status/done", ready: false, closes: false },
     },
   ],

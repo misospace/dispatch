@@ -1,4 +1,11 @@
 import type { EvidenceProvenance, GroomingEvidenceSnapshot } from "./evidence-snapshot";
+import {
+  EMPTY_PINNED_CONTENT,
+  parseAcceptanceCriteria,
+  parseExpectedFiles,
+  type CloseGroundingContext,
+  type PinnedReadContent,
+} from "./close-grounding";
 
 /**
  * The citable view of a run's evidence snapshot.
@@ -27,6 +34,10 @@ export interface EvidenceCatalogEntry {
   pinned: boolean;
   /** Related work only: the GitHub state observed for it. */
   state: "open" | "closed" | "merged" | null;
+  /** Pull requests read directly: the issues GitHub records it as closing (`owner/repo#N`). */
+  closes?: string[];
+  /** Pull requests read directly: the branch it targets. */
+  baseRef?: string;
   /** Short description for the prompt and for history. */
   label: string;
 }
@@ -44,6 +55,13 @@ export interface GroomingPlanEvidenceBinding {
 export interface EvidenceCatalog {
   binding: GroomingPlanEvidenceBinding;
   entries: EvidenceCatalogEntry[];
+  /**
+   * What an already_done close is grounded against (dispatch#1099): the
+   * issue's own expected files and acceptance criteria, parsed from the
+   * captured body, and the content of files read at the pinned head. Not
+   * evidence ids: never rendered as citable, never persisted.
+   */
+  grounding: CloseGroundingContext;
 }
 
 export const ISSUE_EVIDENCE_ID = "issue";
@@ -65,8 +83,13 @@ export function commentEvidenceId(commentId: string): string {
 /**
  * Build the catalog from a snapshot. Deterministic: entries keep snapshot
  * order (issue, comments, then sources) and duplicate ids keep the first.
+ * `pinnedContent` is what the run read at the pinned head; without it no
+ * close excerpt can be checked, so no criterion-grounded close is possible.
  */
-export function buildEvidenceCatalog(snapshot: GroomingEvidenceSnapshot): EvidenceCatalog {
+export function buildEvidenceCatalog(
+  snapshot: GroomingEvidenceSnapshot,
+  pinnedContent: PinnedReadContent = EMPTY_PINNED_CONTENT,
+): EvidenceCatalog {
   const entries: EvidenceCatalogEntry[] = [];
   const seen = new Set<string>();
   const push = (entry: EvidenceCatalogEntry) => {
@@ -121,6 +144,8 @@ export function buildEvidenceCatalog(snapshot: GroomingEvidenceSnapshot): Eviden
         ),
       });
     } else {
+      const closes = source.closes && source.closes.length > 0 ? `, closes ${source.closes.join(" ")}` : "";
+      const base = source.baseRef ? `, into ${source.baseRef}` : "";
       push({
         id: source.key,
         subject: "related_work",
@@ -128,8 +153,10 @@ export function buildEvidenceCatalog(snapshot: GroomingEvidenceSnapshot): Eviden
         authoritative: true,
         pinned: false,
         state: source.state,
+        ...(source.closes !== undefined ? { closes: [...source.closes] } : {}),
+        ...(source.baseRef !== undefined ? { baseRef: source.baseRef } : {}),
         label: clip(
-          `${source.provenance.replace("github_", "").replace("_", " ")}${source.state ? `, ${source.state}` : ""} (GitHub state via ${source.via})`,
+          `${source.provenance.replace("github_", "").replace("_", " ")}${source.state ? `, ${source.state}` : ""}${base}${closes} (GitHub state via ${source.via})`,
         ),
       });
     }
@@ -145,6 +172,12 @@ export function buildEvidenceCatalog(snapshot: GroomingEvidenceSnapshot): Eviden
       capturedAt: snapshot.capturedAt,
     },
     entries,
+    grounding: {
+      issueKey: `${snapshot.repoFullName}#${snapshot.issue.number}`,
+      expectedFiles: parseExpectedFiles(snapshot.issue.body),
+      acceptanceCriteria: parseAcceptanceCriteria(snapshot.issue.body),
+      pinnedContent: pinnedContent.headSha === snapshot.headSha ? pinnedContent : EMPTY_PINNED_CONTENT,
+    },
   };
 }
 
@@ -161,6 +194,17 @@ export function renderEvidenceCatalog(catalog: EvidenceCatalog): string {
   const pin = catalog.binding.headSha
     ? `Repository reads are pinned to ${catalog.binding.headSha.slice(0, 12)} on ${catalog.binding.defaultBranch ?? "the default branch"}.`
     : "Repository reads this run are NOT pinned to a head SHA, so they cannot support a ready verdict.";
+  const { grounding } = catalog;
+  const closeLines: string[] = [];
+  if (grounding.expectedFiles.length > 0) {
+    closeLines.push(`This issue names expected files: ${grounding.expectedFiles.join(", ")}.`);
+  }
+  if (grounding.acceptanceCriteria.length > 0) {
+    closeLines.push(
+      "Its acceptance criteria, which an already_done close must ground one by one:",
+      ...grounding.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+    );
+  }
   return [
     "## Evidence you can cite",
     "",
@@ -168,5 +212,6 @@ export function renderEvidenceCatalog(catalog: EvidenceCatalog): string {
     pin,
     "",
     ...lines,
+    ...(closeLines.length > 0 ? ["", ...closeLines] : []),
   ].join("\n");
 }

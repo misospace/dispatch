@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
+import { collectPinnedReadContent } from "./close-grounding";
 import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
 import type { LiveComment, LiveIssueState } from "./mutation-validator";
 import {
@@ -49,6 +50,13 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
     sources: [{ path: "src/auth/login.ts", provenance: "repository", via: "read", ref: HEAD }],
     ...overrides,
   };
+}
+
+const LOGIN_TS = "export function redirectAfterLogin(session: Session) {\n  return session.returnTo ?? \"/\";\n}\n";
+
+/** The run's catalog, with login.ts as read at the pinned head (dispatch#1099). */
+function catalogFor(snap: GroomingEvidenceSnapshot) {
+  return buildEvidenceCatalog(snap, collectPinnedReadContent(HEAD, [{ path: "src/auth/login.ts", ref: HEAD, content: LOGIN_TS }]));
 }
 
 function draft(patch: Partial<GroomingPlanDraft["verdict"]> = {}, mutations: Partial<GroomingPlanDraft["mutations"]> = {}): GroomingPlanDraft {
@@ -100,14 +108,21 @@ function alreadyDone(mutations: Partial<GroomingPlanDraft["mutations"]> = {}): G
       proposedTitle: null,
       proposedBody: null,
       githubComment: "Already fixed on main.",
-      close: { reason: "already_done", rationale: "login.ts keeps returnTo", evidenceRefs: ["repo:src/auth/login.ts"] },
+      close: {
+        reason: "already_done",
+        rationale: "login.ts keeps returnTo",
+        evidenceRefs: ["repo:src/auth/login.ts"],
+        criteria: [
+          { criterion: "login redirects to the saved return URL", evidenceRef: "repo:src/auth/login.ts", excerpt: 'return session.returnTo ?? "/";' },
+        ],
+      },
       ...mutations,
     },
   };
 }
 
 function planFor(d: GroomingPlanDraft, snap = snapshot()): GroomingPlan {
-  const result = validateGroomingPlan(d, { catalog: buildEvidenceCatalog(snap) });
+  const result = validateGroomingPlan(d, { catalog: catalogFor(snap) });
   if (!result.valid) throw new Error(result.errors!.join("; "));
   return result.plan!;
 }
@@ -117,7 +132,7 @@ function live(snap = snapshot()): LiveIssueState {
 }
 
 function diffFor(d: GroomingPlanDraft, snap = snapshot()): GroomingMutationDiff {
-  return computeMutationDiff({ plan: planFor(d, snap), live: live(snap), catalog: buildEvidenceCatalog(snap) });
+  return computeMutationDiff({ plan: planFor(d, snap), live: live(snap), catalog: catalogFor(snap) });
 }
 
 describe("managed body section", () => {
@@ -213,7 +228,7 @@ describe("computeMutationDiff", () => {
   it("withholds a close the close policy rejects, landing it as backlog with nothing else", () => {
     const plan = planFor(alreadyDone({ proposedTitle: "Rewritten title here" }));
     const forged: GroomingPlan = { ...plan, verdict: { ...plan.verdict, confidence: "medium" } };
-    const diff = computeMutationDiff({ plan: forged, live: live(), catalog: buildEvidenceCatalog(snapshot()) });
+    const diff = computeMutationDiff({ plan: forged, live: live(), catalog: catalogFor(snapshot()) });
     expect(diff.withheld.close).toEqual(["verdict confidence is medium; closing requires high"]);
     expect(diff.close).toBe(false);
     expect(diff.comment).toBeNull();
@@ -224,7 +239,7 @@ describe("computeMutationDiff", () => {
 
   it("withholds a ready promotion whose readiness does not hold against the catalog", () => {
     const plan = planFor(draft({}, { githubComment: "Ready!" }));
-    const unpinned = buildEvidenceCatalog(snapshot({ headSha: null, pinnedRef: null }));
+    const unpinned = catalogFor(snapshot({ headSha: null, pinnedRef: null }));
     const diff = computeMutationDiff({ plan, live: live(), catalog: unpinned });
     expect(diff.withheld.ready?.length).toBeGreaterThan(0);
     expect(diff.labelsAfter).not.toContain("status/ready");

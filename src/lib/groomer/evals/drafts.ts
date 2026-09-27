@@ -124,10 +124,20 @@ export function parked(
   return draft;
 }
 
-/** An already_done verdict with its close recommendation. */
-export function alreadyDone(o: CommonOptions & { closeEvidence: string[] }): GroomingPlanDraft {
+/**
+ * An already_done verdict with its close recommendation. `criteria` grounds
+ * each acceptance criterion: [criterion, repo evidence id, verbatim excerpt].
+ */
+export function alreadyDone(
+  o: CommonOptions & { closeEvidence: string[]; criteria?: Array<[criterion: string, evidenceRef: string, excerpt: string]> },
+): GroomingPlanDraft {
   const draft = base("already_done", "implementation", o, "backlog");
-  draft.mutations.close = { reason: "already_done", rationale: o.rationale ?? o.summary, evidenceRefs: o.closeEvidence };
+  draft.mutations.close = {
+    reason: "already_done",
+    rationale: o.rationale ?? o.summary,
+    evidenceRefs: o.closeEvidence,
+    criteria: (o.criteria ?? []).map(([criterion, evidenceRef, excerpt]) => ({ criterion, evidenceRef, excerpt })),
+  };
   return draft;
 }
 

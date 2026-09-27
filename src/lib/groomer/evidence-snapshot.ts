@@ -48,6 +48,10 @@ export interface RelatedWorkEvidenceSource {
   via: "read" | "search"; // direct read, or a search-index hit (may lag)
   observedAt: string;
   ref: null;
+  /** A pull request read directly: the issues GitHub records it as closing (`owner/repo#N`). */
+  closes?: string[];
+  /** A pull request read directly: its base branch. */
+  baseRef?: string;
 }
 
 export type EvidenceSource = RepositoryEvidenceSource | RelatedWorkEvidenceSource;
@@ -60,6 +64,13 @@ export interface RelatedWorkObservation {
   url: string | null;
   via: "read" | "search";
   observedAt: string;
+  /**
+   * Pull requests read directly: GitHub's closing references (`owner/repo#N`).
+   * Absent when unknown (a search hit, or the lookup failed).
+   */
+  closes?: string[];
+  /** Pull requests read directly: the base branch it targets. */
+  baseRef?: string;
 }
 
 export interface EvidenceSnapshotIssue {
@@ -237,6 +248,8 @@ export function addRelatedWorkEvidence(
       via: observation.via,
       observedAt: observation.observedAt,
       ref: null,
+      ...(observation.closes !== undefined ? { closes: [...observation.closes] } : {}),
+      ...(observation.baseRef !== undefined ? { baseRef: observation.baseRef } : {}),
     };
     const existing = indexByKey.get(observation.key);
     if (existing !== undefined) {
@@ -286,6 +299,8 @@ export function summarizeEvidenceForPersistence(snapshot: GroomingEvidenceSnapsh
             via: source.via,
             observedAt: source.observedAt,
             ref: source.ref,
+            ...(source.closes !== undefined ? { closes: source.closes } : {}),
+            ...(source.baseRef !== undefined ? { baseRef: source.baseRef } : {}),
           },
     ),
     warnings: snapshot.warnings.slice(0, MAX_PERSISTED_WARNINGS),

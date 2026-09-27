@@ -2,6 +2,7 @@ import type {
   GitHubCodeSearchResult,
   GitHubRepoMetadata,
 } from "@/lib/github";
+import type { PinnedRead } from "./close-grounding";
 import { fetchRepositoryMetadata as defaultFetchRepo } from "@/lib/github";
 import { searchRepositoryCode as defaultSearchCode } from "@/lib/github";
 import { fetchRepositoryFileText as defaultFetchFile } from "@/lib/github";
@@ -29,6 +30,11 @@ export interface RepositoryContextResult {
   warnings: string[];
   bytes: number;
   queries: string[];
+  /**
+   * The content of each file in `text`, with the ref it was read at (null
+   * for the default branch), for close-excerpt checks (dispatch#1099).
+   */
+  files?: PinnedRead[];
 }
 
 /** Default extensions considered text-like for repository context. */
@@ -150,6 +156,7 @@ export async function buildRepositoryContext(
 
   const fetchedPaths = new Set<string>();
   const fileLines: string[] = [];
+  const files: PinnedRead[] = [];
 
   for (const query of queries) {
     if (fetchedPaths.size >= config.maxFiles) break;
@@ -180,6 +187,7 @@ export async function buildRepositoryContext(
       if (!content) continue;
 
       // Enforce per-file byte limit
+      let shown = content;
       const contentBytes = Buffer.byteLength(content, "utf8");
       if (contentBytes > config.maxFileBytes) {
         // Truncate to roughly the byte limit
@@ -187,6 +195,7 @@ export async function buildRepositoryContext(
         while (Buffer.byteLength(truncated, "utf8") > config.maxFileBytes && truncated.length > 0) {
           truncated = truncated.slice(0, -100);
         }
+        shown = truncated;
         content = truncated + "\n...[truncated]";
       }
 
@@ -198,6 +207,7 @@ export async function buildRepositoryContext(
       }
 
       fileLines.push(fileText);
+      files.push({ path: result.path, ref: input.ref ?? null, content: shown });
       sources.push(result.path);
       totalBytes += fileBytes;
     }
@@ -211,5 +221,6 @@ export async function buildRepositoryContext(
     warnings,
     bytes: Buffer.byteLength(text, "utf8"),
     queries,
+    files,
   };
 }
