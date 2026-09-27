@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
+import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems } from "@/lib/pr-fix-queue";
 import { authorizeRequest } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
@@ -389,6 +389,10 @@ export async function POST(request: NextRequest) {
       mergedOrClosedPrsByRepo,
       prStatesByRepo,
     );
+    // Archived repos can't take a push, so their items are dead too (#1106).
+    const archivedResult = rateLimited
+      ? { markedStale: 0 }
+      : await reconcileArchivedRepoPrFixItems(asPrFixQueueClient(prisma));
 
     if (reposFailed > 0) {
       console.warn(
@@ -405,6 +409,7 @@ export async function POST(request: NextRequest) {
       enqueued: result.enqueued,
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
+      archivedReaped: archivedResult.markedStale,
       rateLimited,
     });
   } catch (error) {

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -1462,5 +1462,40 @@ describe("parseMarkPrFixInput generation (#1074)", () => {
     const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED" });
     if ("error" in input) throw new Error(input.error);
     expect(input.expectedGeneration).toBeUndefined();
+  });
+});
+
+describe("archived repos (#1106)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+  });
+
+  it("reaps QUEUED and BLOCKED items of archived repos to STALE, one lookup per repo", async () => {
+    await enqueuePrFixItem(client, { repo: "org/archived", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1" });
+    await enqueuePrFixItem(client, { repo: "org/archived", pr: 2, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1" });
+    await markPrFixItem(client, { repo: "org/archived", pr: 2, status: "blocked" });
+    await enqueuePrFixItem(client, { repo: "org/archived", pr: 3, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1" });
+    await markPrFixItem(client, { repo: "org/archived", pr: 3, status: "fixed" });
+    await enqueuePrFixItem(client, { repo: "org/live", pr: 4, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1" });
+
+    const isArchived = vi.fn(async (repo: string) => repo === "org/archived");
+    const result = await reconcileArchivedRepoPrFixItems(client, isArchived);
+
+    expect(result).toEqual({ checked: 3, markedStale: 2, errored: 0 });
+    expect(isArchived).toHaveBeenCalledTimes(2);
+    expect(client.items.map((i) => `${i.pr}:${i.status}`)).toEqual(["1:STALE", "2:STALE", "3:FIXED", "4:QUEUED"]);
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "STALE", note: "Upstream repo archived at reconcile time (#1106)" });
+  });
+
+  it("refuses to requeue an item in an archived repo", async () => {
+    await enqueuePrFixItem(client, { repo: "org/archived", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k1" });
+    await markPrFixItem(client, { repo: "org/archived", pr: 1, status: "blocked" });
+
+    await expect(requeuePrFixItem(client, { repo: "org/archived", pr: 1, isRepoArchived: true })).rejects.toThrow("repository is archived");
+    expect(client.items[0].status).toBe("BLOCKED");
   });
 });

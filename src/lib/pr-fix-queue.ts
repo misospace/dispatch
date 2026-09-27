@@ -2,6 +2,7 @@ import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane
 import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
 import { fetchPullRequestMergeState, fetchPullRequestHeadSha } from "./github-prs";
+import { fetchRepositoryMetadata } from "./github-code-search";
 
 export type PrFixQueueClient = {
   issue: {
@@ -57,6 +58,7 @@ export interface RequeuePrFixInput {
   pr: number;
   note?: string | null;
   isPrMergedOrClosed?: boolean;
+  isRepoArchived?: boolean;
 }
 
 export function nonEmpty(value: unknown): value is string {
@@ -644,6 +646,66 @@ export async function reconcileStalePrFixItems(
 }
 
 /**
+ * Whether a repo is archived, for the archived-repo guards (#1106). Fails open
+ * (false) when GitHub can't answer: refusing or reaping on a lookup failure
+ * would strand work that is fine.
+ */
+export async function isPrFixRepoArchived(repo: string): Promise<boolean> {
+  try {
+    return (await fetchRepositoryMetadata(repo)).archived === true;
+  } catch (error) {
+    console.warn(`[pr-fix-queue] archived check failed for ${repo}:`, error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
+/**
+ * Mark QUEUED/BLOCKED pr-fix items STALE when their repo is archived (#1106).
+ * Nothing can push to an archived repo, so a dispatched worker can only fail;
+ * observed on misospace/llmkube-images#436. Works from the items themselves,
+ * not the tracked-repo list, so a repo dropped from tracking still gets
+ * reaped. One lookup per distinct repo with active items.
+ */
+export async function reconcileArchivedRepoPrFixItems(
+  client: PrFixQueueClient,
+  isArchived: (repo: string) => Promise<boolean> = isPrFixRepoArchived,
+): Promise<{ checked: number; markedStale: number; errored: number }> {
+  let checked = 0;
+  let markedStale = 0;
+  let errored = 0;
+
+  const active = await client.prFixQueueItem.findMany({ where: { status: { in: ["QUEUED", "BLOCKED"] } } });
+  const byRepo = new Map<string, any[]>();
+  for (const item of active) byRepo.set(item.repo, [...(byRepo.get(item.repo) ?? []), item]);
+
+  for (const [repo, items] of byRepo) {
+    checked += items.length;
+    if (!(await isArchived(repo))) continue;
+    for (const item of items) {
+      try {
+        await client.$transaction(async (tx) => {
+          await tx.prFixQueueItem.update({ where: { id: item.id }, data: { status: "STALE" } });
+          await tx.prFixHistory.create({
+            data: {
+              itemId: item.id,
+              action: "mark",
+              status: "STALE",
+              lane: item.lane,
+              note: "Upstream repo archived at reconcile time (#1106)",
+            },
+          });
+        });
+        markedStale++;
+      } catch (err) {
+        errored++;
+      }
+    }
+  }
+
+  return { checked, markedStale, errored };
+}
+
+/**
  * Patch that bumps a PrFixQueueItem's `generation` — Dispatch-owned work
  * identity (#1044), exposed to workers via next-task as
  * `followup-pr.prFixItem.generation`. Merge it into the same Prisma update
@@ -708,6 +770,9 @@ export function toAgentQueuePrFixItem(item: any) {
 export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeuePrFixInput) {
   if (input.isPrMergedOrClosed) {
     throw new Error("Cannot requeue: upstream PR is merged or closed");
+  }
+  if (input.isRepoArchived) {
+    throw new Error("Cannot requeue: repository is archived");
   }
 
   const item = await client.$transaction(async (tx) => {

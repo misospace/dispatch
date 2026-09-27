@@ -209,13 +209,14 @@ describe("github-code-search: repository metadata and contents fetchers", () => 
 
   it("fetchRepositoryMetadata maps the raw repo JSON into the normalized shape", async () => {
     fetchSpy.mockResolvedValueOnce(
-      mockResponse({ full_name: "org/repo", default_branch: "main", description: "A repo" }),
+      mockResponse({ full_name: "org/repo", default_branch: "main", description: "A repo", archived: true }),
     );
 
     await expect(fetchRepositoryMetadata("org/repo")).resolves.toEqual({
       fullName: "org/repo",
       defaultBranch: "main",
       description: "A repo",
+      archived: true,
     });
   });
 
@@ -226,6 +227,7 @@ describe("github-code-search: repository metadata and contents fetchers", () => 
       fullName: "org/repo",
       defaultBranch: "main",
       description: null,
+      archived: false,
     });
   });
 

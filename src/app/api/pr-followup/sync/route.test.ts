@@ -16,6 +16,7 @@ const { mocks } = vi.hoisted(() => ({
     getTrackedRepos: vi.fn().mockResolvedValue([]),
     isAllowedBotAuthor: vi.fn(() => false),
     reconcileStalePrFixItems: vi.fn().mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 }),
+    reconcileArchivedRepoPrFixItems: vi.fn().mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 }),
   },
 }));
 
@@ -43,6 +44,7 @@ vi.mock("@/lib/config", () => ({
 
 vi.mock("@/lib/pr-fix-queue", () => ({
   reconcileStalePrFixItems: mocks.reconcileStalePrFixItems,
+  reconcileArchivedRepoPrFixItems: mocks.reconcileArchivedRepoPrFixItems,
 }));
 
 import { POST } from "./route";
@@ -67,6 +69,7 @@ describe("POST /api/pr-followup/sync", () => {
     mocks.prFixQueueClient.mockReturnValue({});
     mocks.getTrackedRepos.mockResolvedValue([]);
     mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
+    mocks.reconcileArchivedRepoPrFixItems.mockResolvedValue({ checked: 0, markedStale: 0, errored: 0 });
   });
 
   it("returns 401 when no auth header is present", async () => {
@@ -281,6 +284,7 @@ describe("POST /api/pr-followup/sync", () => {
     mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
     mocks.isAllowedBotAuthor.mockReturnValue(true);
     mocks.reconcileStalePrFixItems.mockResolvedValue({ checked: 5, markedStale: 3, errored: 0 });
+    mocks.reconcileArchivedRepoPrFixItems.mockResolvedValue({ checked: 2, markedStale: 2, errored: 0 });
 
     const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
     const fetchMock = vi.fn(async (url: string) => {
@@ -298,6 +302,8 @@ describe("POST /api/pr-followup/sync", () => {
     const body = await res.json();
     expect(body.staleReaped).toBe(3);
     expect(mocks.reconcileStalePrFixItems).toHaveBeenCalled();
+    expect(body.archivedReaped).toBe(2);
+    expect(mocks.reconcileArchivedRepoPrFixItems).toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });

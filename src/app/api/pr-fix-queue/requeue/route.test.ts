@@ -9,6 +9,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     parseRequeuePrFixInput: vi.fn(),
     requeuePrFixItem: vi.fn().mockResolvedValue({ id: "fix-1" }),
+    isPrFixRepoArchived: vi.fn().mockResolvedValue(false),
   },
 }));
 
@@ -19,6 +20,7 @@ vi.mock("@/lib/prisma", () => ({
 vi.mock("@/lib/pr-fix-queue", () => ({
   parseRequeuePrFixInput: mocks.parseRequeuePrFixInput,
   requeuePrFixItem: mocks.requeuePrFixItem,
+  isPrFixRepoArchived: mocks.isPrFixRepoArchived,
 }));
 
 import { POST } from "./route";
@@ -38,6 +40,7 @@ describe("POST /api/pr-fix-queue/requeue", () => {
     vi.clearAllMocks();
     mocks.parseRequeuePrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, note: null, isPrMergedOrClosed: false });
     mocks.requeuePrFixItem.mockResolvedValue({ id: "fix-1", status: "QUEUED", lane: "NORMAL" });
+    mocks.isPrFixRepoArchived.mockResolvedValue(false);
   });
 
   it("returns 401 when no auth header is present", async () => {
@@ -127,5 +130,17 @@ describe("POST /api/pr-fix-queue/requeue", () => {
     await postRequest({ repo: "org/repo", pr: 42 }, false);
 
     expect(mocks.requeuePrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("passes the repo's archived state to the requeue guard (#1106)", async () => {
+    mocks.isPrFixRepoArchived.mockResolvedValue(true);
+    mocks.requeuePrFixItem.mockRejectedValue(new Error("Cannot requeue: repository is archived"));
+
+    const res = await postRequest({ repo: "org/repo", pr: 42 });
+
+    expect(mocks.isPrFixRepoArchived).toHaveBeenCalledWith("org/repo");
+    expect(mocks.requeuePrFixItem).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ isRepoArchived: true }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot requeue: repository is archived");
   });
 });
