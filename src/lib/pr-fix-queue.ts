@@ -12,6 +12,7 @@ export type PrFixQueueClient = {
     findMany: (args?: any) => Promise<any[]>;
     create: (args: any) => Promise<any>;
     update: (args: any) => Promise<any>;
+    updateMany: (args: any) => Promise<{ count: number }>;
   };
   prFixHistory: {
     create: (args: any) => Promise<any>;
@@ -41,6 +42,14 @@ export interface MarkPrFixInput {
   pr: number;
   status: string;
   note?: string | null;
+  // Commit-time revalidation (#1074): when provided, every status write goes
+  // through `updateMany({ where: { id, generation } })` and the mark is
+  // skipped (no mutation) if the row's generation no longer matches — i.e.
+  // the attempt was re-issued (new evidence, requeue) between read and write.
+  expectedGeneration?: number | null;
+  // Fresh per-attempt head baseline carried into the row when this mark bumps
+  // the item back to QUEUED as a new attempt (#1074).
+  attemptHeadSha?: string | null;
 }
 
 export interface RequeuePrFixInput {
@@ -87,11 +96,24 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
   if (input.pr === undefined || input.pr === null || !Number.isInteger(Number(input.pr))) return { error: "Missing required field: pr" };
   if (!nonEmpty(input.status)) return { error: "Missing required field: status" };
   if (!normalizePrFixStatus(input.status)) return { error: "Invalid status" };
+  if (input.generation !== undefined && input.generation !== null) {
+    if (typeof input.generation !== "number" || !Number.isInteger(input.generation) || input.generation < 1) {
+      return { error: "generation must be an integer >= 1" };
+    }
+  }
+  if (input.attemptHeadSha !== undefined && input.attemptHeadSha !== null) {
+    if (typeof input.attemptHeadSha !== "string" || !/^[0-9a-fA-F]{7,40}$/.test(input.attemptHeadSha.trim())) {
+      return { error: "Invalid attemptHeadSha" };
+    }
+  }
   return {
     repo: input.repo.trim(),
     pr: Number(input.pr),
     status: normalizePrFixStatus(input.status) as PrFixStatus,
     note: typeof input.note === "string" ? input.note : null,
+    expectedGeneration:
+      typeof input.generation === "number" && input.generation !== null ? input.generation : undefined,
+    attemptHeadSha: typeof input.attemptHeadSha === "string" ? input.attemptHeadSha.trim() : null,
   };
 }
 
@@ -292,7 +314,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: nextEvidenceKeys,
-          ...(isFreshAttempt ? freshAttemptGeneration() : {}),
+          // A fresh attempt gets a fresh per-attempt head baseline (#1074):
+          // the head the sync observed in THIS enqueue. metadataPatch below
+          // keeps refreshing the mutable `headSha` as before — the two
+          // columns now mean different things.
+          ...(isFreshAttempt
+            ? { ...freshAttemptGeneration(), attemptHeadSha: input.headSha ?? null }
+            : {}),
           ...metadataPatch(input),
         },
       });
@@ -322,6 +350,9 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         reason: input.reason,
         feedback: [input.feedback],
         evidenceKeys: [input.evidenceKey],
+        // A brand-new item is a fresh attempt: capture the head the sync
+        // observed now as its immutable per-attempt baseline (#1074).
+        attemptHeadSha: input.headSha ?? null,
         ...metadataPatch(input),
       },
     });
@@ -363,24 +394,32 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
 }
 
 /**
- * Verify that the PR head SHA at fix-time differs from the head SHA recorded
- * at enqueue-time. Returns one of:
+ * Verify that the PR head SHA at fix-time differs from the per-attempt
+ * baseline head. Returns one of:
  *
- * - `"passed"` — current head differs from the recorded head (or both are
- *   null on a freshly re-pushed fix). The fix is real.
- * - `"no-record"` — the item has no recorded headSha (legacy rows enqueued
- *   before #940, or a non-sync enqueue). Guard cannot run; we accept.
- * - `"head-unchanged"` — recorded head equals current head. Workload
- *   reported success but pushed nothing. Caller must refuse the FIXED.
- * - `"head-unavailable"` — GitHub fetch failed or returned no headSha. Guard
- *   could not run; we accept (better than stranding).
+ * - `"passed"` — current head differs from the baseline head. The fix is
+ *   real.
+ * - `"no-record"` — the caller has no baseline to compare against (legacy
+ *   rows, or a fresh attempt that was captured without a head record).
+ *   Guard cannot run; we accept.
+ * - `"head-unchanged"` — baseline equals current head. Workload reported
+ *   success but pushed nothing. Caller must refuse the FIXED.
+ * - `"head-unavailable"` — GitHub fetch failed or returned no headSha.
+ *   Guard could not run; we accept (better than stranding).
  *
- * The `enqueuePrFixItem` path keeps `headSha` up to date; the bridge's
- * `tasks/report` path also runs through this function via `markPrFixItem`
- * so the same guard fires regardless of who called the transition.
+ * #1074: the baseline passed in is the immutable per-attempt
+ * `attemptHeadSha` (falling back to the mutable `headSha`), captured when
+ * the attempt became dispatchable — NOT the raw enqueue-time `headSha`,
+ * which every re-observation overwrites and which let a worker pushing to
+ * exactly the recorded SHA defeat the guard by comparison against itself.
+ *
+ * The `enqueuePrFixItem` path keeps both columns up to date; the
+ * `tasks/report` settlement path runs through this function via
+ * `markPrFixItem`, so the same guard fires regardless of who called the
+ * transition.
  *
  * Best-effort by design: it does not throw. The caller decides what to do
- * with `"head-unchanged"` (roll back to QUEUED).
+ * with `"head-unchanged"` (refuse the FIXED before any write lands).
  */
 export async function assertPrHeadMovedForFix(
   client: PrFixQueueClient,
@@ -420,76 +459,130 @@ export async function assertPrHeadMovedForFix(
   return "passed";
 }
 
-export async function markPrFixItem(client: PrFixQueueClient, input: MarkPrFixInput) {
+/**
+ * Result of `markPrFixItem` (#1074). A mark either mutated the row
+ * (`mutated: true`, with the fresh row) or was skipped without any write
+ * (`mutated: false`): `not-found` when no item matches, `generation-mismatch`
+ * when an `expectedGeneration` was supplied and the row's generation no
+ * longer matches (the attempt was re-issued between read and write).
+ */
+export type MarkPrFixResult =
+  | { mutated: true; item: any }
+  | { mutated: false; reason: "generation-mismatch" | "not-found" };
+
+export async function markPrFixItem(
+  client: PrFixQueueClient,
+  input: MarkPrFixInput,
+): Promise<MarkPrFixResult> {
   const nextStatus = normalizePrFixStatus(input.status) as PrFixStatus | null;
   if (!nextStatus) throw new Error("Invalid status");
 
-  let previousStatus: PrFixStatus | undefined;
-  let previousLane: PrFixLane | undefined;
-  const item = await client.$transaction(async (tx) => {
-    const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
-    if (!existing) return null;
-    previousStatus = existing.status;
-    previousLane = existing.lane;
-    // Give-up: BLOCKED items always land in NEEDS_HUMAN so the existing red badge
-    // actually means something and so the bridge's ACTIONABLE_LANES filter
-    // continues to skip them. See bridge/prfix.py ACTIONABLE_LANES.
-    const data: Record<string, unknown> = { status: nextStatus };
-    if (nextStatus === "BLOCKED") {
-      data.lane = "NEEDS_HUMAN";
-    } else if (nextStatus === "QUEUED") {
-      data.lane = "NORMAL";
-      // Marking a non-QUEUED item back to QUEUED creates a fresh dispatchable
-      // attempt (same semantics as requeuePrFixItem) — bump the generation
-      // alongside the status flip so the work identity changes (#1044).
-      if (existing.status !== "QUEUED") {
-        Object.assign(data, freshAttemptGeneration());
-      }
-    }
-    const updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data });
-    await tx.prFixHistory.create({
-      data: { itemId: updated.id, action: "mark", status: nextStatus, lane: updated.lane, note: input.note ?? undefined },
-    });
-    return updated;
-  });
+  const expectedGeneration =
+    input.expectedGeneration !== undefined && input.expectedGeneration !== null
+      ? input.expectedGeneration
+      : undefined;
 
-  if (item && previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
-    const context = await buildPrFixBlockedContext(client, item);
-    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: input.note ?? null, context });
+  // Load the row BEFORE any write: the #940/#1074 guard and the
+  // generation-conditional writes both decide on this snapshot, and every
+  // write below revalidates at commit time.
+  const existing = await client.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
+  if (!existing) return { mutated: false, reason: "not-found" };
+
+  // Give-up: BLOCKED items always land in NEEDS_HUMAN so the existing red
+  // badge actually means something and so the bridge's ACTIONABLE_LANES
+  // filter continues to skip them. See bridge/prfix.py ACTIONABLE_LANES.
+  const data: Record<string, unknown> = { status: nextStatus };
+  if (nextStatus === "BLOCKED") {
+    data.lane = "NEEDS_HUMAN";
+  } else if (nextStatus === "QUEUED") {
+    data.lane = "NORMAL";
+    // Marking a non-QUEUED item back to QUEUED creates a fresh dispatchable
+    // attempt (same semantics as requeuePrFixItem) — bump the generation
+    // alongside the status flip so the work identity changes (#1044).
+    if (existing.status !== "QUEUED") {
+      Object.assign(data, freshAttemptGeneration());
+      // A fresh attempt with no fresher head observation: reset the
+      // per-attempt baseline so the next FIXED guard re-baselines from the
+      // (newer) mutable headSha. A caller that DOES carry a fresh head
+      // (sync re-observation) passes it through here (#1074).
+      data.attemptHeadSha = input.attemptHeadSha ?? null;
+    }
   }
-  // Verify head SHA on the FIXED transition (#940): if a workload reports
-  // success but the PR head hasn't moved, the item must NOT be marked FIXED.
-  // We compare against the head SHA recorded at enqueue time. When the record
-  // is missing (legacy rows enqueued before headSha was populated) or the
-  // current head can't be fetched (GitHub unreachable), we accept the
-  // transition — losing the guard is better than stranding the PR forever.
-  if (item && previousStatus !== "FIXED" && item.status === "FIXED") {
-    const headShaGuard = await assertPrHeadMovedForFix(client, input.repo, input.pr, item.headSha, input.note ?? null);
+
+  // No-progress guard (#940, rebuilt in #1074): run it BEFORE any write,
+  // against the immutable per-attempt baseline, so a refused FIXED never
+  // transiently exists. Compare `attemptHeadSha` (this attempt's baseline)
+  // with a fallback to the mutable `headSha` for legacy rows.
+  if (nextStatus === "FIXED" && existing.status !== "FIXED") {
+    const baseline = existing.attemptHeadSha ?? existing.headSha;
+    const headShaGuard = await assertPrHeadMovedForFix(client, input.repo, input.pr, baseline, input.note ?? null);
     if (headShaGuard === "head-unchanged") {
-      // Refuse the tombstone: roll the item back to QUEUED so the loop
-      // dispatches another fix attempt, and audit why we rejected. This is a
-      // fresh dispatchable attempt — bump the generation in the same update so
-      // the identity a worker already consumed is not silently reused (#1044).
-      const reverted = await client.$transaction(async (tx) => {
-        const updated = await tx.prFixQueueItem.update({
-          where: { id: item.id },
-          data: { status: "QUEUED", lane: "NORMAL", ...freshAttemptGeneration() },
+      // Refuse the tombstone: go straight to QUEUED as a fresh dispatchable
+      // attempt — bump the generation in the same update so the identity a
+      // worker already consumed is not silently reused (#1044) — and audit
+      // why we rejected. No FIXED row is ever written.
+      const refusalData: Record<string, unknown> = {
+        status: "QUEUED",
+        lane: "NORMAL",
+        ...freshAttemptGeneration(),
+        attemptHeadSha: input.attemptHeadSha ?? null,
+      };
+      const refusal = await client.$transaction(async (tx) => {
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: {
+            id: existing.id,
+            ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+          },
+          data: refusalData,
         });
+        if (count !== 1) return null;
         await tx.prFixHistory.create({
           data: {
-            itemId: updated.id,
+            itemId: existing.id,
             action: "mark",
             status: "QUEUED",
             lane: "NORMAL",
-            note: `Refused FIXED: PR head SHA unchanged since enqueue (recorded=${item.headSha ?? "null"}). Workload reported success but pushed nothing (#940).`,
+            note: `Refused FIXED: PR head unchanged since attempt baseline (recorded=${baseline ?? "null"}). Workload reported success but pushed nothing (#940, #1074).`,
           },
         });
-        return updated;
+        return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
       });
-      return reverted;
+      if (!refusal) return { mutated: false, reason: "generation-mismatch" };
+      return { mutated: true, item: refusal };
     }
   }
-  return item;
+
+  const updated = await client.$transaction(async (tx) => {
+    // #1074: with an expected generation, the status write is conditional on
+    // the row still being at that generation — commit-time revalidation. A
+    // concurrent re-issue (new evidence, requeue) moves the generation and
+    // makes this write a no-op; the history row is skipped too.
+    if (expectedGeneration !== undefined) {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: { id: existing.id, generation: expectedGeneration },
+        data,
+      });
+      if (count !== 1) return null;
+    } else {
+      await tx.prFixQueueItem.update({ where: { id: existing.id }, data });
+    }
+    const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    await tx.prFixHistory.create({
+      data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.note ?? undefined },
+    });
+    return row;
+  });
+
+  if (!updated) return { mutated: false, reason: "generation-mismatch" };
+
+  // Only surface a blocked notification when THIS mark is what first puts the
+  // item into BLOCKED (from a non-BLOCKED status).
+  if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
+    const context = await buildPrFixBlockedContext(client, updated);
+    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: updated.reason, latestNote: input.note ?? null, context });
+  }
+
+  return { mutated: true, item: updated };
 }
 
 /**
@@ -588,6 +681,9 @@ export function toAgentQueuePrFixItem(item: any) {
     feedback: item.feedback ?? [],
     evidenceKeys: item.evidenceKeys ?? [],
     headSha: item.headSha,
+    // Immutable per-attempt baseline for the current generation (#1074);
+    // exposed additively so consumers can distinguish it from headSha.
+    attemptHeadSha: item.attemptHeadSha,
     author: item.author,
     generation: item.generation,
     queuedAt: item.queuedAt,
@@ -629,7 +725,15 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
       // Requeue hands the PR back to the worker loop as a fresh attempt —
       // bump the generation in the same update so consumers see a new work
       // identity rather than one they may already have deduplicated (#1044).
-      data: { status: "QUEUED", lane: "NORMAL", ...freshAttemptGeneration() },
+      // Requeue observes no head, so the per-attempt baseline resets to null
+      // and the next FIXED guard re-baselines from the mutable headSha
+      // (#1074).
+      data: {
+        status: "QUEUED",
+        lane: "NORMAL",
+        ...freshAttemptGeneration(),
+        attemptHeadSha: null,
+      },
     });
     await tx.prFixHistory.create({
       data: {
@@ -681,6 +785,15 @@ export type AgentReportOutcome =
   | "blocked"
   | "failed";
 
+/**
+ * The (id, generation) attempt token `next-task` issues on a followup-pr
+ * task and the worker echoes back in `tasks/report` as `prFixItem` (#1074).
+ */
+export interface PrFixReportAttempt {
+  itemId: string;
+  generation: number;
+}
+
 export interface ResolvePrFixFromAgentReportInput {
   repoFullName?: string | null;
   pullRequestNumber?: number | null;
@@ -688,6 +801,10 @@ export interface ResolvePrFixFromAgentReportInput {
   outcome: AgentReportOutcome;
   summary?: string | null;
   client?: PrFixQueueClient;
+  // #1074: required for queue settlement. When present, the report settles
+  // exactly the item + generation the token identifies; when absent (legacy
+  // report), the queue is never touched.
+  attempt?: PrFixReportAttempt | null;
 }
 
 export interface ResolvePrFixFromAgentReportResult {
@@ -695,6 +812,9 @@ export interface ResolvePrFixFromAgentReportResult {
   action: "none" | "blocked" | "fixed" | "deferred" | "skipped";
   itemId?: number | null;
   reason: string;
+  // Echoes the attempt generation the report carried (null when the report
+  // was legacy / token-less), for audit and idempotency-replay visibility.
+  attemptGeneration?: number | null;
 }
 
 /**
@@ -704,7 +824,22 @@ export interface ResolvePrFixFromAgentReportResult {
  * the pr-fix item served first, do the work, report — and the PrFixQueueItem
  * stays QUEUED, so the next poll serves it again ahead of issue work.
  *
- * Behaviour, matching the bridge's own marking:
+ * Attempt-token settlement (#1074): a report carries the `prFixItem`
+ * (id, generation) token that `next-task` issued. Settlement is only
+ * authorized by that token:
+ * - Token present → settle exactly that item + generation. A missing item,
+ *   a repo/PR that doesn't match the token's item, a stale generation
+ *   (the attempt was re-issued: new evidence, requeue), or an already
+ *   settled status all skip without mutation. Every status write below is
+ *   generation-conditional, so a concurrent re-issue between the check and
+ *   the write still lands as a no-op (commit-time revalidation).
+ * - Token absent (legacy report) → the queue is NEVER mutated: the report
+ *   matches the item (so the response is informative) but takes no action
+ *   and makes no GitHub calls. A pre-token worker can no longer settle an
+ *   item it was never issued.
+ *
+ * Within an authorized settlement, behaviour matches the bridge's own
+ * marking:
  * - No matching item or no PR coordinates → no-op (issue-work reports pass
  *   through untouched).
  * - Outcome `blocked` → mark BLOCKED immediately. Doesn't need PR state; the
@@ -733,11 +868,60 @@ export async function resolvePrFixFromAgentReport(
   }
 
   const client = input.client ?? prisma;
-  const existing = await client.prFixQueueItem.findUnique({
-    where: { repo_pr: { repo, pr } },
-  });
-  if (!existing) {
-    return { matched: false, action: "none", reason: "no matching pr-fix queue item" };
+  const attempt = input.attempt ?? null;
+
+  let existing: any;
+  if (attempt) {
+    // The token is the settlement authority: load the item the token names
+    // and cross-check the report's repo/PR against it (not the other way
+    // around).
+    existing = await client.prFixQueueItem.findUnique({
+      where: { id: attempt.itemId },
+    });
+    if (!existing) {
+      return {
+        matched: false,
+        action: "none",
+        reason: "attempt item not found",
+        attemptGeneration: attempt.generation,
+      };
+    }
+    if (existing.repo !== repo || existing.pr !== pr) {
+      return {
+        matched: true,
+        action: "skipped",
+        itemId: existing.id ?? null,
+        reason: `attempt item does not match reported repo/PR (item is ${existing.repo}#${existing.pr})`,
+        attemptGeneration: attempt.generation,
+      };
+    }
+    if (existing.generation !== attempt.generation) {
+      // The attempt was re-issued (new evidence, requeue, refused-FIXED
+      // rollback) after this worker was dispatched. Its report is stale:
+      // settling it would clobber the newer attempt's state.
+      return {
+        matched: true,
+        action: "skipped",
+        itemId: existing.id ?? null,
+        reason: `stale attempt generation: report issued for generation ${attempt.generation}, item is at generation ${existing.generation}`,
+        attemptGeneration: attempt.generation,
+      };
+    }
+  } else {
+    existing = await client.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo, pr } },
+    });
+    if (!existing) {
+      return { matched: false, action: "none", reason: "no matching pr-fix queue item" };
+    }
+    // #1074: legacy report (no attempt token). Match, but never settle —
+    // no mutation, no GitHub round-trips.
+    return {
+      matched: true,
+      action: "skipped",
+      itemId: existing.id ?? null,
+      reason: "legacy report without prFixItem attempt token; queue settlement requires an attempt token (#1074)",
+    };
   }
 
   const currentStatus = normalizePrFixStatus(existing.status) as PrFixStatus | null;
@@ -748,21 +932,35 @@ export async function resolvePrFixFromAgentReport(
       action: "skipped",
       itemId: existing.id ?? null,
       reason: `pr-fix item already ${existing.status}`,
+      attemptGeneration: attempt?.generation ?? null,
     };
   }
 
+  const expectedGeneration = attempt?.generation ?? undefined;
+
   if (input.outcome === "blocked") {
-    await markPrFixItem(client as PrFixQueueClient, {
+    const markResult = await markPrFixItem(client as PrFixQueueClient, {
       repo,
       pr,
       status: "BLOCKED",
       note: input.summary ?? null,
+      expectedGeneration,
     });
+    if (!markResult.mutated) {
+      return {
+        matched: true,
+        action: "skipped",
+        itemId: existing.id ?? null,
+        reason: `settlement skipped: ${markResult.reason}`,
+        attemptGeneration: attempt?.generation ?? null,
+      };
+    }
     return {
       matched: true,
       action: "blocked",
       itemId: existing.id ?? null,
       reason: "agent reported blocked",
+      attemptGeneration: attempt?.generation ?? null,
     };
   }
 
@@ -774,6 +972,7 @@ export async function resolvePrFixFromAgentReport(
       action: "skipped",
       itemId: existing.id ?? null,
       reason: "agent reported failed; leaving for bridge reconcile",
+      attemptGeneration: attempt?.generation ?? null,
     };
   }
 
@@ -790,6 +989,7 @@ export async function resolvePrFixFromAgentReport(
         action: "deferred",
         itemId: existing.id ?? null,
         reason: `pr not mergeable (mergeable_state=${mergeState.mergeableState ?? "unknown"})`,
+        attemptGeneration: attempt?.generation ?? null,
       };
     }
   } catch (error) {
@@ -801,19 +1001,34 @@ export async function resolvePrFixFromAgentReport(
       action: "deferred",
       itemId: existing.id ?? null,
       reason: "pr merge state check failed; leaving for bridge reconcile",
+      attemptGeneration: attempt?.generation ?? null,
     };
   }
 
-  await markPrFixItem(client as PrFixQueueClient, {
+  // The FIXED baseline is the item's immutable per-attempt `attemptHeadSha`
+  // (fallback: mutable `headSha`), re-read inside markPrFixItem BEFORE any
+  // write, so a refused FIXED never transiently exists (#1074).
+  const markResult = await markPrFixItem(client as PrFixQueueClient, {
     repo,
     pr,
     status: "FIXED",
     note: input.summary ?? null,
+    expectedGeneration,
   });
+  if (!markResult.mutated) {
+    return {
+      matched: true,
+      action: "skipped",
+      itemId: existing.id ?? null,
+      reason: `settlement skipped: ${markResult.reason}`,
+      attemptGeneration: attempt?.generation ?? null,
+    };
+  }
   return {
     matched: true,
     action: "fixed",
     itemId: existing.id ?? null,
     reason: "pr merge state verified",
+    attemptGeneration: attempt?.generation ?? null,
   };
 }

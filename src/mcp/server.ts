@@ -181,6 +181,7 @@ export async function markPrFixHandler(args: ExtraArgs): Promise<ToolResult> {
       pr: args.pr as number,
       status: args.status as string,
       note: args.note as string | undefined,
+      generation: args.generation as number | undefined,
     }),
   );
 }
@@ -376,6 +377,12 @@ export function createServer(): McpServerType {
         pr: z.number().int().positive().describe("Pull request number"),
         status: z.string().describe("Outcome: fixed, blocked, stale, or ignored"),
         note: z.string().optional().describe("Optional note explaining the outcome"),
+        generation: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Queue item generation being settled; agent marks are rejected without it once attempt-token settlement ships (#1074)"),
       },
     },
     markPrFixHandler,

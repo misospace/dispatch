@@ -1066,3 +1066,209 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     });
   });
 });
+
+describe("POST /api/agents/[agentName]/tasks/report — prFixItem attempt token (#1074)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  const validReport = {
+    taskType: "followup-pr",
+    outcome: "pr_updated",
+    repoFullName: "org/repo",
+    pullRequestNumber: 10,
+  };
+
+  it("returns 200 for a report carrying a valid prFixItem token", async () => {
+    const res = await postRequest({
+      ...validReport,
+      prFixItem: { id: "cktz-abc", generation: 2 },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.report.prFixItem).toEqual({ id: "cktz-abc", generation: 2 });
+  });
+
+  it("returns 400 when prFixItem is not an object", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: "cktz-abc" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem must be an object/);
+  });
+
+  it("returns 400 when prFixItem is an array", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: ["cktz-abc"] });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem must be an object/);
+  });
+
+  it("returns 400 when prFixItem.id is missing", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: { generation: 2 } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem.id must be a non-empty string/);
+  });
+
+  it("returns 400 when prFixItem.id is empty/whitespace", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: { id: "   ", generation: 2 } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem.id must be a non-empty string/);
+  });
+
+  it("returns 400 when prFixItem.generation is missing", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: { id: "cktz-abc" } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem.generation must be an integer >= 1/);
+  });
+
+  it("returns 400 when prFixItem.generation is not an integer", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: { id: "cktz-abc", generation: 1.5 } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem.generation must be an integer >= 1/);
+  });
+
+  it("returns 400 when prFixItem.generation is below 1", async () => {
+    const res = await postRequest({ ...validReport, prFixItem: { id: "cktz-abc", generation: 0 } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prFixItem.generation must be an integer >= 1/);
+  });
+
+  it("validation failures with a bad prFixItem create no AgentRun and resolve nothing", async () => {
+    await postRequest({ ...validReport, prFixItem: { id: "", generation: 2 } });
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+    expect(prFixResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("passes the attempt token through to PR-fix settlement", async () => {
+    const res = await postRequest({
+      ...validReport,
+      prFixItem: { id: "  cktz-abc  ", generation: 3 },
+    });
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({ attempt: { itemId: "cktz-abc", generation: 3 } }),
+    );
+  });
+
+  it("passes a null attempt when no prFixItem is provided (legacy report)", async () => {
+    const res = await postRequest(validReport);
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({ attempt: null }));
+  });
+
+  it("a prFixItem change alters the report payload identity (idempotency)", async () => {
+    const withToken = { ...validReport, idempotencyKey: "key-a", prFixItem: { id: "cktz", generation: 1 } };
+    const first = await postRequest(withToken);
+    expect(first.status).toBe(200);
+
+    // Same key, same coordinates, but a different attempt token → different
+    // payload → conflict, because settlement identity differs (#1074).
+    const other = { ...validReport, idempotencyKey: "key-a", prFixItem: { id: "cktz", generation: 2 } };
+    mockDedupe.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+        code: "P2002",
+        clientVersion: "test",
+      }),
+    );
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "key-a",
+      payloadHash: "hash-of-a-different-payload",
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+    const conflict = await postRequest(other);
+    expect(conflict.status).toBe(409);
+    expect((await conflict.json()).error).toContain("different report payload");
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — late/duplicate settlement (#1074)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  const tokenReport = {
+    taskType: "followup-pr",
+    outcome: "pr_updated",
+    repoFullName: "org/repo",
+    pullRequestNumber: 10,
+    prFixItem: { id: "cktz-abc", generation: 1 },
+  };
+
+  it("first keyed report persists the settlement resolution on the dedupe row for replay", async () => {
+    prFixResolveMock.mockResolvedValueOnce({
+      matched: true,
+      action: "fixed",
+      itemId: 7,
+      reason: "pr merge state verified",
+      attemptGeneration: 1,
+    });
+
+    const res = await postRequest({
+      ...tokenReport,
+      idempotencyKey: "worker-run-9:report",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.prFixResolution.action).toBe("fixed");
+    // The in-transaction agentRunId stamp is the first update; the
+    // resolution store is the second — this is what a retry replays.
+    expect(mockDedupe.update).toHaveBeenNthCalledWith(1, {
+      where: { id: "claim-1" },
+      data: { agentRunId: "run-1" },
+    });
+    expect(mockDedupe.update).toHaveBeenNthCalledWith(2, {
+      where: { agentName_idempotencyKey: { agentName: "test-agent", idempotencyKey: "worker-run-9:report" } },
+      data: { prFixResolution: expect.objectContaining({ action: "fixed" }) },
+    });
+  });
+
+  it("a second report with a NEW key against the now-FIXED item is skipped and the skip is stored", async () => {
+    prFixResolveMock
+      .mockResolvedValueOnce({
+        matched: true,
+        action: "fixed",
+        itemId: 7,
+        reason: "pr merge state verified",
+        attemptGeneration: 1,
+      })
+      .mockResolvedValueOnce({
+        matched: true,
+        action: "skipped",
+        itemId: 7,
+        reason: "pr-fix item already FIXED",
+        attemptGeneration: 1,
+      });
+
+    const first = await postRequest({
+      ...tokenReport,
+      idempotencyKey: "worker-run-9:report",
+    });
+    expect(first.status).toBe(200);
+
+    // A different logical report (new key) for the same repo/PR lands after
+    // the first one settled the item.
+    const second = await postRequest({
+      ...tokenReport,
+      idempotencyKey: "worker-run-9:report-2",
+      prFixItem: { id: "cktz-abc", generation: 2 },
+    });
+    expect(second.status).toBe(200);
+    const body = await second.json();
+    expect(body.duplicate).toBeUndefined();
+    expect(body.prFixResolution.action).toBe("skipped");
+    expect(body.prFixResolution.reason).toContain("already FIXED");
+    // The skip is persisted for the second key's future retries too.
+    expect(mockDedupe.update).toHaveBeenNthCalledWith(4, {
+      where: { agentName_idempotencyKey: { agentName: "test-agent", idempotencyKey: "worker-run-9:report-2" } },
+      data: { prFixResolution: expect.objectContaining({ action: "skipped" }) },
+    });
+  });
+});

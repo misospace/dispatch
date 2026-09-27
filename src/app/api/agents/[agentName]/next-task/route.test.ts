@@ -51,7 +51,11 @@ function makeQueueStore() {
     $transaction: async (fn: any) => fn(client),
     prFixQueueItem: {
       findUnique: async ({ where }: any) =>
-        items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null,
+        items.find((i) =>
+          where.id !== undefined
+            ? i.id === where.id
+            : i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr,
+        ) ?? null,
       create: async ({ data }: any) => {
         const item = { id: `prfix-${++seq}`, generation: 1, queuedAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-01T00:00:00Z"), ...data };
         items.push(item);
@@ -68,6 +72,23 @@ function makeQueueStore() {
         }
         items[idx] = { ...items[idx], ...patch, updatedAt: new Date("2026-01-02T00:00:00Z") };
         return items[idx];
+      },
+      updateMany: async ({ where, data }: any) => {
+        const idx = items.findIndex((i) =>
+          where.id !== undefined
+            ? i.id === where.id && (where.generation === undefined || i.generation === where.generation)
+            : i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr,
+        );
+        if (idx === -1) return { count: 0 };
+        const patch: Record<string, any> = { ...data };
+        for (const key of Object.keys(patch)) {
+          const value = patch[key];
+          if (value && typeof value === "object" && typeof value.increment === "number") {
+            patch[key] = (items[idx][key] ?? 0) + value.increment;
+          }
+        }
+        items[idx] = { ...items[idx], ...patch, updatedAt: new Date("2026-01-02T00:00:00Z") };
+        return { count: 1 };
       },
       findMany: async ({ where }: any) => {
         let result = items.slice();
