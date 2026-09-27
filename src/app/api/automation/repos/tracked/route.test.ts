@@ -1,91 +1,164 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
-vi.mock("@/lib/auth", () => ({
-  authorizeRequest: vi.fn(),
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+const { mocks } = vi.hoisted(() => ({
+  mocks: {
+    repositoryFindMany: vi.fn(),
+    automationRepoFindMany: vi.fn(),
+  },
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    repository: {
-      findMany: vi.fn(),
-    },
-    automationRepo: {
-      findMany: vi.fn(),
-    },
+    repository: { findMany: mocks.repositoryFindMany },
+    automationRepo: { findMany: mocks.automationRepoFindMany },
   },
 }));
 
-import { GET } from "./route";
-import { prisma } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
-const mockRepoFindMany = prisma.repository.findMany as any;
-const mockAutomationRepoFindMany = prisma.automationRepo.findMany as any;
-const mockAuthorizeRequest = vi.mocked(authorizeRequest);
+import { GET } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
+
+const URL = "http://localhost/api/automation/repos/tracked";
+
+describe("GET /api/automation/repos/tracked — auth", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await GET(authedRequest(URL, { includeAuth: false }));
+
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe("Unauthorized");
+    expect(mocks.repositoryFindMany).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when the bearer token is incorrect", async () => {
+    const res = await GET(authedRequest(URL, { token: "wrong-token" }));
+
+    expect(res.status).toBe(401);
+    expect(mocks.repositoryFindMany).not.toHaveBeenCalled();
+  });
+});
 
 describe("GET /api/automation/repos/tracked", () => {
   beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+    mocks.repositoryFindMany.mockResolvedValue([]);
+    mocks.automationRepoFindMany.mockResolvedValue([]);
   });
 
-  it("returns 401 when not authenticated", async () => {
-    mockAuthorizeRequest.mockResolvedValue({ authorized: false });
+  it("queries only enabled repositories ordered by fullName asc", async () => {
+    const res = await GET(authedRequest(URL));
 
-    const response = await GET(new Request("http://localhost/api/automation/repos/tracked"));
-
-    expect(response.status).toBe(401);
-    const body = await response.json();
-    expect(body.error).toBe("Unauthorized");
-  });
-
-  it("returns tracked repos with automation metadata", async () => {
-    mockRepoFindMany.mockResolvedValue([
-      { fullName: "owner/repo", owner: "owner", name: "repo", enabled: true },
-    ]);
-    mockAutomationRepoFindMany.mockResolvedValue([
-      {
-        fullName: "owner/repo",
-        defaultBranch: "main",
-        source: "user",
-        lastSyncedAt: new Date("2024-01-01"),
-      },
-    ]);
-
-    const response = await GET(new Request("http://localhost/api/automation/repos/tracked"));
-
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body).toHaveLength(1);
-    expect(body[0]).toMatchObject({
-      fullName: "owner/repo",
-      owner: "owner",
-      name: "repo",
-      enabled: true,
-      defaultBranch: "main",
-      source: "user",
+    expect(res.status).toBe(200);
+    expect(mocks.repositoryFindMany).toHaveBeenCalledWith({
+      where: { enabled: true },
+      orderBy: { fullName: "asc" },
+    });
+    expect(mocks.automationRepoFindMany).toHaveBeenCalledWith({
+      select: { fullName: true, defaultBranch: true, source: true, lastSyncedAt: true },
     });
   });
 
-  it("defaults to main branch when no automation repo exists", async () => {
-    mockRepoFindMany.mockResolvedValue([
-      { fullName: "owner/repo", owner: "owner", name: "repo", enabled: true },
+  it("joins AutomationRepo metadata onto each repository and preserves query order", async () => {
+    mocks.repositoryFindMany.mockResolvedValue([
+      { id: "r1", fullName: "alpha/one", owner: "alpha", name: "one", enabled: true },
+      { id: "r2", fullName: "beta/two", owner: "beta", name: "two", enabled: true },
     ]);
-    mockAutomationRepoFindMany.mockResolvedValue([]);
+    mocks.automationRepoFindMany.mockResolvedValue([
+      {
+        fullName: "beta/two",
+        defaultBranch: "develop",
+        source: "env",
+        lastSyncedAt: new Date("2026-01-02T03:04:05.000Z"),
+      },
+      {
+        fullName: "alpha/one",
+        defaultBranch: "main",
+        source: "user",
+        lastSyncedAt: null,
+      },
+    ]);
 
-    const response = await GET(new Request("http://localhost/api/automation/repos/tracked"));
+    const res = await GET(authedRequest(URL));
 
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body[0].defaultBranch).toBe("main");
-    expect(body[0].source).toBe("unknown");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      {
+        fullName: "alpha/one",
+        owner: "alpha",
+        name: "one",
+        enabled: true,
+        defaultBranch: "main",
+        source: "user",
+        lastSyncedAt: null,
+      },
+      {
+        fullName: "beta/two",
+        owner: "beta",
+        name: "two",
+        enabled: true,
+        defaultBranch: "develop",
+        source: "env",
+        lastSyncedAt: "2026-01-02T03:04:05.000Z",
+      },
+    ]);
   });
 
-  it("returns 500 on database error", async () => {
-    mockRepoFindMany.mockRejectedValue(new Error("DB down"));
+  it("defaults defaultBranch to main and source to unknown when no AutomationRepo row exists", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.repositoryFindMany.mockResolvedValue([
+      { id: "r1", fullName: "owner/repo", owner: "owner", name: "repo", enabled: true },
+    ]);
 
-    const response = await GET(new Request("http://localhost/api/automation/repos/tracked"));
+    const res = await GET(authedRequest(URL));
 
-    expect(response.status).toBe(500);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      {
+        fullName: "owner/repo",
+        owner: "owner",
+        name: "repo",
+        enabled: true,
+        defaultBranch: "main",
+        source: "unknown",
+        lastSyncedAt: null,
+      },
+    ]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("no AutomationRepo row for owner/repo"));
+    warn.mockRestore();
+  });
+
+  it("returns 500 when the repository query fails", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.repositoryFindMany.mockRejectedValue(new Error("DB down"));
+
+    const res = await GET(authedRequest(URL));
+
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("Failed to fetch tracked repositories");
+    error.mockRestore();
+  });
+
+  it("returns 500 when the AutomationRepo query fails", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.repositoryFindMany.mockResolvedValue([
+      { id: "r1", fullName: "owner/repo", owner: "owner", name: "repo", enabled: true },
+    ]);
+    mocks.automationRepoFindMany.mockRejectedValue(new Error("DB down"));
+
+    const res = await GET(authedRequest(URL));
+
+    expect(res.status).toBe(500);
+    error.mockRestore();
   });
 });
