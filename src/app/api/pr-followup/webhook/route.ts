@@ -120,7 +120,11 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         repoFullName: checkRun.repository?.full_name ?? null,
         prNumber,
         branch: firstPr?.head?.ref ?? check.check_suite?.head_branch ?? null,
-        url: check.html_url,
+        // #1098: `url` is the item's identity and the queue guard is
+        // write-once — a job-URL fallback would freeze it in place. The empty
+        // string stays falsy, so the next sync enqueue backfills the real PR URL.
+        url: typeof firstPr?.url === "string" ? firstPr.url : "",
+        checkRunUrl: check.html_url,
         title: check.name,
         author: null,
         body: check.output?.summary ?? "",

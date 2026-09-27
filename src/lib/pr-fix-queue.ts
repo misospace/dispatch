@@ -32,6 +32,7 @@ export interface EnqueuePrFixInput {
   evidenceKey: string;
   issue?: number | null;
   branch?: string | null;
+  /** Item identity — should be the PR URL. Set at first enqueue, only backfilled while empty (#1098). */
   url?: string | null;
   title?: string | null;
   headSha?: string | null;
@@ -206,12 +207,15 @@ function extractUrlsFromTextSafe(text: string): string[] {
   }
 }
 
+// `url` is not part of this patch (#1098): the item URL is identity (the PR
+// URL) — set at first enqueue, backfilled only while empty. A CI-failure
+// re-enqueue's job URL must not flip it; job links belong in feedback/
+// evidence (pr-followup-ingestion), not the item URL.
 function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number> {
   const patch: Record<string, string | number> = {};
   for (const [key, value] of Object.entries({
     issue: input.issue ?? undefined,
     branch: input.branch ?? undefined,
-    url: input.url ?? undefined,
     title: input.title ?? undefined,
     headSha: input.headSha ?? undefined,
     author: input.author ?? undefined,
@@ -324,6 +328,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           reason: input.reason,
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: nextEvidenceKeys,
+          // #1098: the item URL is identity — write-once. Backfill it only
+          // while empty; never overwrite an existing URL with a
+          // re-enqueue's value (e.g. a CI job URL).
+          ...(!existing.url && input.url ? { url: input.url } : {}),
           // A fresh attempt gets a fresh per-attempt head baseline (#1074):
           // the head the sync observed in THIS enqueue, else the last one
           // observed (#1104). metadataPatch below keeps refreshing the mutable
@@ -364,6 +372,9 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         reason: input.reason,
         feedback: [input.feedback],
         evidenceKeys: [input.evidenceKey],
+        // #1098: the item URL is identity (the PR URL) — set it at first
+        // enqueue, explicitly, so it is never left to the update patch.
+        ...(input.url ? { url: input.url } : {}),
         // A brand-new item is a fresh attempt: capture the head the sync
         // observed now as its immutable per-attempt baseline (#1074).
         attemptHeadSha: input.headSha ?? null,

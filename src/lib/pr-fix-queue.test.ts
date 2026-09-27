@@ -274,6 +274,78 @@ describe("PR review-fix queue", () => {
   });
 });
 
+describe("item URL is identity, write-once (#1098)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+  });
+
+  it("keeps the PR URL when a CI-failure re-enqueue carries a job URL", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 7, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED", feedback: "changes requested",
+      evidenceKey: "rev-1",
+      url: "https://api.github.com/repos/o/repo/pulls/7",
+    });
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 7, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "checks failed", feedback: "build failed",
+      evidenceKey: "cr-1",
+      url: "https://github.com/o/repo/actions/runs/9/job/1",
+    });
+
+    // The item URL is identity: it must stay the PR URL, never flip to the
+    // CI job URL, so next-task keeps handing out pullRequest.url.
+    expect(after.url).toBe("https://api.github.com/repos/o/repo/pulls/7");
+    expect(client.items[0].url).toBe("https://api.github.com/repos/o/repo/pulls/7");
+    // Evidence is still appended even when the URL is not.
+    expect(client.items[0].feedback).toEqual(["changes requested", "build failed"]);
+    expect(client.items[0].evidenceKeys).toEqual(["rev-1", "cr-1"]);
+  });
+
+  it("backfills the URL only when the item has none", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 8, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+      reason: "r", feedback: "f1", evidenceKey: "rev-1",
+    });
+    expect(client.items[0].url).toBeUndefined();
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 8, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f2", evidenceKey: "cr-1",
+      url: "https://api.github.com/repos/o/repo/pulls/8",
+    });
+
+    expect(after.url).toBe("https://api.github.com/repos/o/repo/pulls/8");
+    expect(client.items[0].url).toBe("https://api.github.com/repos/o/repo/pulls/8");
+  });
+
+  it("backfills the URL when the stored value is the empty string (String? column shape)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 8, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f1", evidenceKey: "cr-1",
+      url: "",
+    });
+    // The webhook enqueues with url: "" when the PR object has no url (#1098);
+    // a String? column can carry the empty string, which the write-once guard
+    // must treat as empty.
+    client.items[0].url = "";
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "o/repo", pr: 8, lane: "NORMAL", type: "CI_FAILURE",
+      reason: "r", feedback: "f2", evidenceKey: "cr-2",
+      url: "https://api.github.com/repos/o/repo/pulls/8",
+    });
+
+    expect(after.url).toBe("https://api.github.com/repos/o/repo/pulls/8");
+    expect(client.items[0].url).toBe("https://api.github.com/repos/o/repo/pulls/8");
+  });
+});
+
 describe("work generation identity (#1044)", () => {
   let client: ReturnType<typeof makeClient>;
 
