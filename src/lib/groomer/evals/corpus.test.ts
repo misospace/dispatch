@@ -1,0 +1,172 @@
+/**
+ * Offline grooming regression corpus (dispatch#1068): one table-driven
+ * runner over every case in ./cases. No network, database or model: fetch is
+ * stubbed to throw and the Prisma client is a guard that throws on use, so a
+ * path that escapes the injected fakes fails loudly instead of going online.
+ */
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        throw new Error(`grooming corpus is offline: prisma.${String(prop)} was reached outside the injected fakes`);
+      },
+    },
+  ),
+}));
+
+import { CASES } from "./cases";
+import { runCandidate, runFreshnessProbe, type GroomingOutcome } from "./harness";
+import { formatViolations, GLOBAL_INVARIANTS, scoreOutcome } from "./invariants";
+import type { CaseCandidate, GroomingCase } from "./types";
+
+beforeAll(() => {
+  vi.stubGlobal("fetch", () => {
+    throw new Error("grooming corpus is offline: fetch was called");
+  });
+});
+
+afterAll(() => {
+  vi.unstubAllGlobals();
+});
+
+const REQUIRED_SCENARIOS = [
+  "moved-code-reference",
+  "dependency-already-merged",
+  "already-fixed-on-main",
+  "duplicate-candidate",
+  "broad-needs-decomposition",
+  "unresolved-architecture",
+  "well-groomed-stays-unchanged",
+  "automation-comment-false-claim",
+];
+
+function label(c: GroomingCase, candidate: CaseCandidate): string {
+  return `[${c.id} › ${candidate.name}]`;
+}
+
+/** Everything a candidate must satisfy; throws with the fixture and invariant named. */
+async function assertCandidate(c: GroomingCase, candidate: CaseCandidate): Promise<GroomingOutcome> {
+  const outcome = await runCandidate(c, candidate);
+  const at = label(c, candidate);
+  const { expect: want } = candidate;
+
+  if (!want.accepted) {
+    expect(outcome.accepted, `${at} expected rejection for "${want.rejectedFor}", but the plan was accepted`).toBe(false);
+    expect(
+      outcome.errors.some((e) => e.includes(want.rejectedFor)),
+      `${at} expected a validation error containing "${want.rejectedFor}", got:\n${outcome.errors.join("\n")}`,
+    ).toBe(true);
+  } else {
+    expect(outcome.accepted, `${at} expected the plan to be accepted, got:\n${outcome.errors.join("\n")}`).toBe(true);
+    expect(outcome.plan?.mutations.status, `${at} derived status`).toBe(want.status);
+    expect(outcome.plan?.readiness.ready, `${at} readiness.ready`).toBe(want.ready);
+    if (want.admission !== undefined) {
+      expect(outcome.plan?.readiness.admission, `${at} readiness.admission`).toBe(want.admission);
+    }
+    expect(outcome.writes.closes > 0, `${at} closed on GitHub`).toBe(want.closes ?? false);
+  }
+
+  const violations = scoreOutcome(c, outcome);
+  const expected = want.accepted ? (want.violations ?? []) : [];
+  const unexpected = violations.filter((v) => !expected.includes(v.invariant));
+  const missing = expected.filter((id) => !violations.some((v) => v.invariant === id));
+  expect(unexpected, `invariant violated:\n${formatViolations(c, candidate, unexpected)}`).toEqual([]);
+  expect(missing, `${at} the scorer no longer reports: ${missing.join(", ")}`).toEqual([]);
+  return outcome;
+}
+
+describe("grooming corpus", () => {
+  it("covers every scenario #1068 requires, with unique ids and candidate names", () => {
+    const ids = CASES.map((c) => c.id);
+    expect(new Set(ids).size, "duplicate case id").toBe(ids.length);
+    for (const id of REQUIRED_SCENARIOS) expect(ids, `required scenario missing: ${id}`).toContain(id);
+    for (const c of CASES) {
+      const names = c.candidates.map((candidate) => candidate.name);
+      expect(new Set(names).size, `[${c.id}] duplicate candidate name`).toBe(names.length);
+      for (const candidate of c.candidates) {
+        for (const id of candidate.expect.accepted ? (candidate.expect.violations ?? []) : []) {
+          const known = (GLOBAL_INVARIANTS as readonly string[]).includes(id) || c.forbidden.some((f) => id === `forbidden:${f}`);
+          expect(known, `[${c.id} › ${candidate.name}] expects unknown invariant "${id}"`).toBe(true);
+        }
+      }
+      for (const probe of c.freshness ?? []) {
+        const from = c.candidates.find((candidate) => candidate.name === probe.from);
+        expect(from?.expect.accepted, `[${c.id}] freshness probe "${probe.name}" needs an accepted candidate`).toBe(true);
+      }
+    }
+  });
+
+  describe("scorer self-checks: the corpus fails when the pipeline regresses", () => {
+    const byId = (id: string) => CASES.find((c) => c.id === id)!;
+    const accepted = (c: GroomingCase, name: string) => c.candidates.find((candidate) => candidate.name === name)!;
+    const ids = (c: GroomingCase, o: GroomingOutcome) => scoreOutcome(c, o).map((v) => v.invariant);
+
+    it("well-groomed-stays-unchanged fails on title/body churn", async () => {
+      const c = byId("well-groomed-stays-unchanged");
+      const outcome = await runCandidate(c, accepted(c, "re-confirms ready with no rewrites"));
+      expect(ids(c, outcome)).toEqual([]);
+      outcome.writes.titleBody.push({ title: "Orders: CSV export", body: "Rewritten." });
+      expect(ids(c, outcome)).toEqual(["forbidden:title_change", "forbidden:body_change"]);
+    });
+
+    it("automation-comment-false-claim fails when prior automation text is treated as authoritative", async () => {
+      const c = byId("automation-comment-false-claim");
+      const outcome = await runCandidate(
+        c,
+        accepted(c, "ready on the filter code read at head, with the automation claim kept as context"),
+      );
+      expect(ids(c, outcome)).toEqual([]);
+      const entry = outcome.catalog!.entries.find((e) => e.id === "comment:9001")!;
+      entry.authoritative = true;
+      outcome.plan!.citations.find((citation) => citation.id === "comment:9001")!.authoritative = true;
+      outcome.context = outcome.context.replace(" [automation — not a human decision]", "");
+      expect(ids(c, outcome).filter((id) => id === "automation-never-authority")).toHaveLength(3);
+    });
+
+    it("exactly-one-status fails when a groom leaves two statuses", async () => {
+      const c = byId("exactly-one-status");
+      const outcome = await runCandidate(c, accepted(c, "re-grooms to backlog"));
+      expect(ids(c, outcome)).toEqual([]);
+      outcome.labelsAfter = [...outcome.labelsAfter, "status/ready"];
+      expect(ids(c, outcome)).toContain("single-status");
+    });
+  });
+
+  for (const c of CASES) {
+    describe(`${c.id}: ${c.scenario}`, () => {
+      for (const candidate of c.candidates) {
+        const name = candidate.name;
+        if (candidate.pendingOn) {
+          it.skip(`${name} [pending ${candidate.pendingOn}]`, () => {});
+        } else if (candidate.knownBug) {
+          it.fails(`${name} [known bug: ${candidate.knownBug}]`, async () => {
+            await assertCandidate(c, candidate);
+          });
+        } else {
+          it(name, async () => {
+            await assertCandidate(c, candidate);
+          });
+        }
+      }
+
+      for (const probe of c.freshness ?? []) {
+        it(`freshness: ${probe.name}`, async () => {
+          const from = c.candidates.find((candidate) => candidate.name === probe.from)!;
+          const outcome = await runCandidate(c, from);
+          const { stale, warnings } = await runFreshnessProbe(c, outcome, probe);
+          expect(
+            [...stale].sort(),
+            `[${c.id} › freshness: ${probe.name}] freshness: expected stale reasons [${probe.stale.join(", ")}], got [${stale.join(", ")}]${warnings.length ? `\nwarnings: ${warnings.join("; ")}` : ""}`,
+          ).toEqual([...probe.stale].sort());
+        });
+      }
+
+      for (const pending of c.pending ?? []) {
+        it.todo(`${pending.name} [pending ${pending.on}]`);
+      }
+    });
+  }
+});
