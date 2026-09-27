@@ -161,6 +161,12 @@ export type CommitComparison =
       files: string[];
       /** True when GitHub's file cap was reached, so `files` may be incomplete. */
       truncated: boolean;
+      /**
+       * Committer timestamp of the first (oldest) commit in base...head, when
+       * the response carried one. Lets callers bound how long a recheck may
+       * stay deferred on an unverified range (#1091).
+       */
+      firstCommitDate?: string | null;
     }
   | {
       ok: false;
@@ -196,6 +202,7 @@ export async function compareCommits(
     const data = (await response.json()) as {
       status?: string;
       files?: Array<{ filename?: string; previous_filename?: string }>;
+      commits?: Array<{ commit?: { committer?: { date?: string } } }>;
     };
     const rawFiles = Array.isArray(data.files) ? data.files : [];
     const files = new Set<string>();
@@ -203,11 +210,14 @@ export async function compareCommits(
       if (typeof file.filename === "string" && file.filename) files.add(file.filename);
       if (typeof file.previous_filename === "string" && file.previous_filename) files.add(file.previous_filename);
     }
+    // per_page=1 still returns the first (oldest) commit of the range.
+    const firstCommitDate = Array.isArray(data.commits) ? data.commits[0]?.commit?.committer?.date ?? null : null;
     return {
       ok: true,
       status: typeof data.status === "string" ? data.status : "unknown",
       files: [...files],
       truncated: rawFiles.length >= COMPARE_MAX_FILES,
+      firstCommitDate,
     };
   } catch (err) {
     return {

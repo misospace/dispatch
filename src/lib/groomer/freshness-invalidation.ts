@@ -125,6 +125,14 @@ export const DEFAULT_FRESHNESS_BUDGET: FreshnessBudget = {
  */
 export const SEARCH_RECHECK_INDEX_GRACE_MS = 30 * 60 * 1000;
 
+/**
+ * How long a recheck may stay deferred because the code-search index has not
+ * demonstrably caught up. Once the oldest unverified commit in base...head is
+ * older than this, the deferral is bounded and the result goes stale
+ * conservatively instead of starving forever in a busy repo (#1091 review).
+ */
+export const SEARCH_RECHECK_DEFER_LIMIT_MS = 2 * 60 * 60 * 1000;
+
 export interface FreshnessPassResult {
   issuesChecked: number;
   markedStale: Array<{ repo: string; issueNumber: number; reasons: GroomingStaleReason[] }>;
@@ -453,6 +461,27 @@ async function applyComparison(
     for (const evaluation of members) stale(evaluation, "compare_unreliable", `${range}: ${why}`);
     return;
   }
+  // The head commit timestamp is shared by every member of the comparison
+  // (they compare against the same head), so it is fetched at most once and
+  // costs one budget unit per comparison, not per issue (#1091 review).
+  let headCommittedAt: number | null = null;
+  let headDateResolved = false;
+  const resolveHeadDate = async (fetchCommitDate: NonNullable<FreshnessGitHub["fetchCommitDate"]>): Promise<number | null> => {
+    if (headDateResolved) return headCommittedAt;
+    headDateResolved = true;
+    if (remaining.searchCode <= 0) return null;
+    remaining.searchCode--;
+    result.githubCalls++;
+    try {
+      const date = await fetchCommitDate(repoFullName, head);
+      const parsed = date ? Date.parse(date) : Number.NaN;
+      headCommittedAt = Number.isNaN(parsed) ? null : parsed;
+    } catch {
+      headCommittedAt = null;
+    }
+    return headCommittedAt;
+  };
+
   for (const evaluation of members) {
     if (evaluation.issue.groomedEvidenceScope === "global") {
       const queries = evaluation.issue.groomedSearchCodeQueries ?? [];
@@ -466,59 +495,60 @@ async function applyComparison(
         continue;
       }
       if (queries.length > 0 && github.searchCode && github.fetchCommitDate) {
-        if (remaining.searchCode <= 0) {
-          stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
-          continue;
-        }
-        remaining.searchCode--;
-        result.githubCalls++;
-        let committedAt: string | null = null;
-        try {
-          committedAt = await github.fetchCommitDate(repoFullName, head);
-        } catch {
-          committedAt = null;
-        }
-        const at = committedAt ? Date.parse(committedAt) : Number.NaN;
-        if (Number.isNaN(at)) {
-          // No trustworthy timestamp: cannot confirm the index caught up, so
-          // stay conservative (stale), never fresh-and-verified.
-          stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
-          continue;
-        }
-        if (now().getTime() - at < SEARCH_RECHECK_INDEX_GRACE_MS) {
-          // The head is too recent for the code-search index to have caught
-          // up; an empty recheck now would not mean "still absent". Defer to
-          // a later pass without advancing or staling.
-          evaluation.deferred = true;
-          continue;
-        }
-        let matchedQuery: string | null = null;
-        let allEmpty = true;
-        for (const query of queries) {
-          if (remaining.searchCode <= 0) {
-            allEmpty = false;
-            break;
+        const fetchCommitDate = github.fetchCommitDate;
+        const headAt = await resolveHeadDate(fetchCommitDate);
+        const headAge = headAt === null ? Number.NaN : now().getTime() - headAt;
+        if (!Number.isNaN(headAge)) {
+          if (headAge < SEARCH_RECHECK_INDEX_GRACE_MS) {
+            // The head is too recent for the code-search index to have caught
+            // up; an empty recheck now would not mean "still absent". Defer,
+            // but only while the oldest unverified commit is young enough:
+            // code search indexes the branch as a whole, so once that commit
+            // has waited past the limit the index cannot be trusted and the
+            // result goes stale instead of starving forever (#1091 review).
+            const firstAt = comparison.firstCommitDate ? Date.parse(comparison.firstCommitDate) : Number.NaN;
+            const firstAge = Number.isNaN(firstAt) ? Number.POSITIVE_INFINITY : now().getTime() - firstAt;
+            if (Number.isNaN(firstAt) || firstAge > SEARCH_RECHECK_DEFER_LIMIT_MS) {
+              stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
+              continue;
+            }
+            evaluation.deferred = true;
+            continue;
           }
-          remaining.searchCode--;
-          result.githubCalls++;
-          try {
-            if ((await github.searchCode(repoFullName, query, 1)).length > 0) {
-              matchedQuery = query;
-              allEmpty = false;
+          let matchedQuery: string | null = null;
+          let exhausted = false;
+          let failed = false;
+          for (const query of queries) {
+            if (remaining.searchCode <= 0) {
+              exhausted = true;
               break;
             }
-          } catch {
-            allEmpty = false;
-            break;
+            remaining.searchCode--;
+            result.githubCalls++;
+            try {
+              if ((await github.searchCode(repoFullName, query, 1)).length > 0) {
+                matchedQuery = query;
+                break;
+              }
+            } catch {
+              failed = true;
+              break;
+            }
           }
-        }
-        if (matchedQuery) {
-          stale(evaluation, "global_evidence_commit", `default branch moved ${range}; previously empty search query now matches: ${matchedQuery}`);
-          continue;
-        }
-        if (allEmpty) {
-          evaluation.advance.groomingVerifiedSha = head;
-          continue;
+          if (matchedQuery) {
+            stale(evaluation, "global_evidence_commit", `default branch moved ${range}; previously empty search query now matches: ${matchedQuery}`);
+            continue;
+          }
+          if (!failed) {
+            if (exhausted) {
+              // Out of budget, not evidence of change: leave unverified for a
+              // later pass rather than forcing a re-groom (#1091 review).
+              evaluation.deferred = true;
+              continue;
+            }
+            evaluation.advance.groomingVerifiedSha = head;
+            continue;
+          }
         }
       }
       stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);

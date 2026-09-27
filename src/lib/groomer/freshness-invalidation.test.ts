@@ -296,19 +296,33 @@ describe("runGroomingFreshnessPass", () => {
       expect(store.stale.get("issue-1")?.detail).toContain("specific missing query");
     });
 
-    it("falls back to global staleness when the search budget is exhausted", async () => {
+    it("defers instead of staling when the search budget runs out mid-recheck", async () => {
       github.fetchHeadSha.mockResolvedValue("sha-2");
-      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      github.compareCommits.mockResolvedValue({
+        ok: true,
+        status: "ahead",
+        files: [],
+        truncated: false,
+        firstCommitDate: new Date(Date.now() - 5 * 60_000).toISOString(),
+      });
       const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["first", "second"] }]);
       await pass(store, github, { ...DEFAULT_FRESHNESS_BUDGET, maxSearchCodeRechecks: 2 });
-      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
-      // One budget unit goes to the commit-date check, one to the first query.
+      // One budget unit goes to the commit-date check, one to the first query;
+      // the second query exhausts the budget, which defers rather than stales.
+      expect(store.stale.size).toBe(0);
+      expect(store.advanced).toEqual([]);
       expect(github.searchCode).toHaveBeenCalledTimes(1);
     });
 
     it("defers the recheck while the new head is younger than the index grace window", async () => {
       github.fetchHeadSha.mockResolvedValue("sha-2");
-      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      github.compareCommits.mockResolvedValue({
+        ok: true,
+        status: "ahead",
+        files: [],
+        truncated: false,
+        firstCommitDate: new Date(Date.now() - 5 * 60_000).toISOString(),
+      });
       github.fetchCommitDate.mockResolvedValue(new Date(Date.now() - 60_000).toISOString());
       const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] }]);
       const result = await pass(store, github);
@@ -316,6 +330,32 @@ describe("runGroomingFreshnessPass", () => {
       expect(store.advanced).toEqual([]);
       expect(github.searchCode).not.toHaveBeenCalled();
       expect(result.deferred).toBe(1);
+    });
+
+    it("bounds the deferral: stales once the oldest unverified commit outlives the defer limit", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({
+        ok: true,
+        status: "ahead",
+        files: [],
+        truncated: false,
+        firstCommitDate: new Date(Date.now() - 3 * 3_600_000).toISOString(),
+      });
+      github.fetchCommitDate.mockResolvedValue(new Date(Date.now() - 60_000).toISOString());
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] }]);
+      const result = await pass(store, github);
+      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      expect(store.advanced).toEqual([]);
+      expect(result.deferred).toBe(0);
+    });
+
+    it("stales instead of deferring when the oldest unverified commit age is unknown", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      github.fetchCommitDate.mockResolvedValue(new Date(Date.now() - 60_000).toISOString());
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] }]);
+      await pass(store, github);
+      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
     });
 
     it("falls back to global staleness when the commit date is missing or unavailable", async () => {

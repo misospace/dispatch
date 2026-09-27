@@ -20,6 +20,7 @@ import {
 } from "./evidence-snapshot";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
+import { explorationCallsForFreshness } from "./freshness";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
 import { compareCommits } from "@/lib/github-code-search";
 import { validateApplyPreconditions, type LiveComment, type PreconditionReader } from "./mutation-validator";
@@ -676,7 +677,7 @@ async function executeGroomerRun(
         plan,
         repositoryQueries: repositoryContext.queries,
         explorationRan: exploration !== null,
-        explorationToolCalls: exploration?.toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes })) ?? [],
+        explorationToolCalls: exploration ? explorationCallsForFreshness(exploration.toolCalls) : [],
       },
       reader,
     );
@@ -913,7 +914,7 @@ async function executeGroomerRun(
         evidenceWindowStart,
         repositoryQueries: repositoryContext.queries,
         explorationRan: exploration !== null,
-        explorationToolCalls: exploration?.toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes })) ?? [],
+        explorationToolCalls: exploration ? explorationCallsForFreshness(exploration.toolCalls) : [],
         citations: plan.citations,
       }),
     );

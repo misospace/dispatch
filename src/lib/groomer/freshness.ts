@@ -101,6 +101,16 @@ export interface ExplorationToolCallLike {
   arguments?: Record<string, unknown>;
 }
 
+/**
+ * Map exploration tool records to the freshness input shape, keeping the
+ * call arguments so saved empty search queries can be recovered later.
+ */
+export function explorationCallsForFreshness(
+  toolCalls: Array<{ name: string; arguments: Record<string, unknown>; ok: boolean; bytes: number; preview?: string }>,
+): ExplorationToolCallLike[] {
+  return toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes }));
+}
+
 function emptySearchCodeQueries(toolCalls: ExplorationToolCallLike[]): string[] {
   const queries: string[] = [];
   for (const call of toolCalls) {
@@ -431,8 +441,17 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     // global cases — a relied-on path that was only surfaced, or repository
     // access with no read path — keep the conservative stale-on-commit
     // behaviour even when an empty search also happened during the run.
+    // A no-read-path global may still save its queries when exploration
+    // searches were its ONLY repository evidence: no repository-context
+    // queries ran and nothing else (e.g. list_directory) surfaced paths.
     groomedSearchCodeQueries:
-      scope === "global" && !reliance.reliesOnSurfacedPath ? emptySearchCodeQueries(input.explorationToolCalls) : [],
+      scope === "global" &&
+      !reliance.reliesOnSurfacedPath &&
+      (reliance.repositoryPaths.length > 0 ||
+        (input.repositoryQueries.length === 0 &&
+          !input.explorationToolCalls.some((call) => call.name === "list_directory")))
+        ? emptySearchCodeQueries(input.explorationToolCalls)
+        : [],
     groomedDependencyKeys: dependencyKeys,
     groomedOpenBlockerKeys: dependencyKeys.filter((key) => openKeys.has(key)).sort(),
     groomedRelatedWork: reliance.relatedWork,

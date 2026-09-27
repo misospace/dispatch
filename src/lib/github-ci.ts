@@ -164,6 +164,9 @@ export async function fetchLatestCommit(repoFullName: string, branch: string): P
  * Committer timestamp (ISO string) for an existing commit sha, or null when
  * the ref does not resolve. Used by the grooming freshness pass to judge
  * whether the code-search index has had time to catch up with a new head.
+ * GitHub always returns a committer date for a commit; the author date is
+ * deliberately not used as a fallback (it can make a rebased head look
+ * older than it is).
  */
 export async function fetchCommitDate(repoFullName: string, ref: string): Promise<string | null> {
   const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/commits/${encodeURIComponent(ref)}`, {
@@ -174,8 +177,8 @@ export async function fetchCommitDate(repoFullName: string, ref: string): Promis
     const text = await response.text();
     throw new Error(`Failed to fetch commit ${ref} for ${repoFullName}: ${response.status} ${text}`);
   }
-  const data = (await response.json()) as { commit?: { committer?: { date?: string }; author?: { date?: string } } };
-  return data.commit?.committer?.date ?? data.commit?.author?.date ?? null;
+  const data = (await response.json()) as { commit?: { committer?: { date?: string } } };
+  return data.commit?.committer?.date ?? null;
 }
 
 export function jobIdFromCheckRunUrl(url: string | undefined | null): string | null {
