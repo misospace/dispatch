@@ -20,6 +20,7 @@ vi.mock("@/lib/prisma", () => ({
 import { CASES } from "./cases";
 import { runCandidate, runFreshnessProbe, type GroomingOutcome } from "./harness";
 import { formatViolations, GLOBAL_INVARIANTS, scoreOutcome } from "./invariants";
+import type { GroomingPlanDraft } from "../plan";
 import type { CaseCandidate, GroomingCase } from "./types";
 
 beforeAll(() => {
@@ -132,6 +133,24 @@ describe("grooming corpus", () => {
       expect(ids(c, outcome)).toEqual([]);
       outcome.labelsAfter = [...outcome.labelsAfter, "status/ready"];
       expect(ids(c, outcome)).toContain("single-status");
+    });
+  });
+
+  describe("plan application replay (dispatch#1063)", () => {
+    it("replaying the applied already_done plan closes and comments once", async () => {
+      const c = CASES.find((candidateCase) => candidateCase.id === "already-fixed-on-main")!;
+      const closing = c.candidates.find((x) => x.name === "already_done on the expiry check read at head and the merged fix")!;
+      const output = structuredClone(closing.output) as GroomingPlanDraft;
+      output.mutations.githubComment = "Verified at head: validateCoupon rejects expired codes; closing.";
+      const candidate: CaseCandidate = { ...closing, output };
+      const applications = new Map();
+      const first = await runCandidate(c, candidate, { applications, runId: "run-1" });
+      const replay = await runCandidate(c, candidate, { applications, runId: "run-2" });
+
+      expect(first.writes.closes).toBe(1);
+      expect(first.writes.comments).toHaveLength(1);
+      expect(replay.mutationPlan?.applicationKey).toBe(first.mutationPlan?.applicationKey);
+      expect(replay.writes).toEqual({ labels: [], titleBody: [], comments: [], closes: 0 });
     });
   });
 

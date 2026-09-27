@@ -441,4 +441,57 @@ describe("selectGroomingCandidate", () => {
       expect(await selectGroomingCandidate({ issueNumber: 9 })).toMatchObject({ selectionReason: "targeted" });
     });
   });
+
+  describe("backoff after unreadable GitHub state (dispatch#1063)", () => {
+    const backoffClause = (where: { AND?: Array<Record<string, unknown>> }) =>
+      where.AND?.find((c) => JSON.stringify(c).includes("groomingRetryAfter"));
+
+    /** findMany that applies only the backoff predicate, so the next tick can be simulated. */
+    function withBackoffApplied(rows: Array<Record<string, unknown>>) {
+      mocks.issueFindMany.mockImplementation(async ({ where }: { where: { AND?: Array<Record<string, unknown>> } }) => {
+        const clause = backoffClause(where) as { OR: [unknown, { groomingRetryAfter: { lte: Date } }] } | undefined;
+        if (!clause) return rows;
+        const now = clause.OR[1].groomingRetryAfter.lte.getTime();
+        return rows.filter((row) => row.groomingRetryAfter == null || (row.groomingRetryAfter as Date).getTime() <= now);
+      });
+    }
+
+    const unlabeled = (number: number, extra: Record<string, unknown> = {}) => ({
+      number,
+      title: `Issue ${number}`,
+      url: `https://github.com/org/repo/issues/${number}`,
+      labels: [],
+      currentLane: null,
+      blockedReason: null,
+      groomingRetryAfter: null,
+      repository: { fullName: "org/repo" },
+      ...extra,
+    });
+
+    it("an unverifiable abort is not re-selected on the next tick; a stale abort still is", async () => {
+      // #5 outranks #7 on number alone. #5's last run was unverifiable (backed
+      // off an hour); #7's was a stale abort, which writes no backoff.
+      withBackoffApplied([
+        unlabeled(5, { groomingRetryAfter: new Date(Date.now() + 60 * 60 * 1000) }),
+        unlabeled(7),
+      ]);
+      expect((await selectGroomingCandidate())!.number).toBe(7);
+    });
+
+    it("re-selects a backed-off issue once its backoff has passed", async () => {
+      withBackoffApplied([unlabeled(5, { groomingRetryAfter: new Date(Date.now() - 1000) }), unlabeled(7)]);
+      expect((await selectGroomingCandidate())!.number).toBe(5);
+    });
+
+    it("applies the backoff to the stale path too, but not to targeted runs", async () => {
+      mocks.issueFindMany.mockResolvedValue([]);
+      await selectGroomingCandidate();
+      const clause = backoffClause(mocks.issueFindMany.mock.calls[0][0].where);
+      expect(clause).toEqual({ OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: expect.any(Date) } }] });
+
+      mocks.issueFindMany.mockClear();
+      await selectGroomingCandidate({ issueNumber: 5 });
+      expect(JSON.stringify(mocks.issueFindMany.mock.calls[0][0].where)).not.toContain("groomingRetryAfter");
+    });
+  });
 });

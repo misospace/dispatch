@@ -47,13 +47,13 @@ export const automationCommentFalseClaim: GroomingCase = {
       expect: { accepted: false, rejectedFor: "read at the pinned head SHA" },
     },
     {
-      name: "already_done on the automation comment plus the PR it names (validator cannot tell #285 was unrelated; the scorer must)",
+      name: "already_done on the automation comment plus the PR it names does not close (no current-revision evidence)",
       output: alreadyDone({
         summary: "#285 merged, as the earlier note says.",
         evidence: ["comment:9001", PR],
         closeEvidence: ["comment:9001", PR],
       }),
-      expect: { accepted: true, status: "status/done", ready: false, closes: true, violations: ["already-done-current-evidence", "forbidden:close"] },
+      expect: { accepted: false, rejectedFor: "already_done must cite pinned repository evidence" },
     },
     {
       name: READY,

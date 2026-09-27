@@ -133,7 +133,7 @@ jobs:
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts"
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts
 
   coverage:
     name: Coverage

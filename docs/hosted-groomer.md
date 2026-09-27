@@ -6,7 +6,8 @@ The hosted groomer is intentionally narrow:
 
 - It enriches issue labels, lane, grooming metadata, and optionally one GitHub comment.
 - It runs at most one issue per request.
-- It does not edit code, open PRs, merge PRs, or run shell commands. It closes an issue only when its plan's verdict is `already_done` (see [Grooming plan contract](#grooming-plan-contract)).
+- It does not edit code, open PRs, merge PRs, or run shell commands. It closes an issue only when its plan's verdict is `already_done` at high confidence with current-revision evidence (see [Grooming plan contract](#grooming-plan-contract)).
+- Before writing anything it re-checks that the issue and default branch still match the evidence the plan was built on, and it applies each plan at most once (see [Applying a plan](#applying-a-plan)).
 - Existing external groomer workers using `next-task?mode=groom` remain supported.
 
 ## Configuration
@@ -27,7 +28,7 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_MAX_CONTEXT_FILES` | `5` | Maximum number of files included in repository context. |
 | `DISPATCH_GROOMER_MAX_SEARCHES` | `3` | Maximum GitHub code searches per grooming run. |
 | `DISPATCH_GROOMER_MAX_FILE_BYTES` | `4096` | Maximum bytes per fetched file snippet. |
-| `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | `24` | Suppresses repeated hosted-groomer comments on the same issue. A comment is skipped (and recorded on the run) when a prior run posted a comment within this window, unless `force` is true. |
+| `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | `24` | Suppresses repeated hosted-groomer comments on the same issue. A comment is skipped (and recorded on the run) when a run that recorded a comment was last updated within this window, or a hosted-groomer comment (found by its hidden marker) was posted on the issue within it, unless `force` is true. |
 | `DISPATCH_GROOMER_TOOL_LOOP_ENABLED` | `true` | Lets the groomer drive its own repository exploration with tools (`search_code`, `read_file`, `list_directory`, `submit_findings`) instead of one pre-computed context block. |
 | `DISPATCH_GROOMER_MAX_ROUNDS` | `12` | Model round-trips the exploration loop may make. One round can carry several tool calls, so this is not a cap on calls. `DISPATCH_GROOMER_MAX_TOOL_CALLS` is accepted as a deprecated alias. |
 | `DISPATCH_GROOMER_MAX_SEARCH_RESULTS` | `10` | Maximum code-search results returned to the model per `search_code` call. |
@@ -97,7 +98,7 @@ Optional body:
 2. Invoke `POST /api/groomer/run` and inspect the returned `plannedLabels` and model output.
 3. Once plans look safe, set `dryRun=false` for a targeted request or change `DISPATCH_GROOMER_DRY_RUN=false`.
 
-Write mode updates GitHub labels, posts one comment only when the model returned `githubComment`, updates Dispatch grooming fields and lane history, records the result's freshness baseline (see [Grooming Freshness](#grooming-freshness)), and records `AgentRun`/`AuditLog` rows.
+Write mode first re-validates the plan against live GitHub state, then applies only what differs from the live issue: labels, at most one comment when the model returned `githubComment`, a bad-title rewrite or managed body section, and the `already_done` close. It then updates Dispatch grooming fields and lane history, records the result's freshness baseline (see [Grooming Freshness](#grooming-freshness)), and records `AgentRun`/`AuditLog` rows. A plan whose preconditions changed applies nothing (see [Applying a plan](#applying-a-plan)).
 
 ## Grooming plan contract
 
@@ -131,7 +132,7 @@ Dispatch derives readiness; it does not trust the model's claim. A `ready` verdi
 - the snapshot was captured and pinned to a default-branch head SHA;
 - `verdict.evidenceRefs` cites repository evidence read at that SHA, and confidence is not `low`;
 - no material uncertainty remains;
-- for `implementation` work: the brief is present, its verified current behavior cites pinned repository evidence, it names at least one path or file to create, `inScope` is not empty, every acceptance criterion is verified by an automated test, a command, or code inspection (not `subjective`), and no decomposition is required;
+- for `implementation` work: the brief is present, its verified current behavior cites pinned repository evidence, it names at least one path or file to create, every relevant path it marks `modify` was read at the pinned SHA (a path only surfaced by search may have moved; `reference` paths may stay surfaced, since they orient the worker rather than tell it what to change), `inScope` is not empty, every acceptance criterion is verified by an automated test, a command, or code inspection (not `subjective`), and no decomposition is required;
 - for `design` work: the lane is the one with role `escalation`, and only `design_choice` uncertainties remain. Design work never validates into the default lane, and without an escalation lane it cannot be ready;
 - the lane is claimable and no close is recommended.
 
@@ -139,17 +140,69 @@ A ready verdict that breaks any rule is a validation error: the run fails as ret
 
 Other rules the validator enforces:
 
-- Status is derived from actionability (`ready` → `status/ready`, `blocked` → `status/blocked`, `already_done` → `status/done`, otherwise `status/backlog`); the plan cannot set `status/*` or `agent/*` labels. The groomer only manages these grooming-owned statuses, and any other one on the issue is removed.
+- Status is derived from actionability (`ready` → `status/ready`, `blocked` → `status/blocked`, `already_done` → `status/done`, otherwise `status/backlog`); the plan cannot set `status/*` or `agent/*` labels. After an applied groom the derived status is the only `status/*` label: every other one is removed, including statuses the groomer does not own (such as `status/needs-review`), as the external groom route already does.
 - An issue carrying `status/in-progress` or `status/in-review` (claimed, or with an open PR) is never moved, including on targeted runs. Its plan is recorded on the run, with `mutationPlan.skippedReason: "in_flight_status"`, but no label, lane, title/body, comment or close mutation is applied. Only `groomedAt` is stamped, so the 24h re-groom cooldown still applies.
 - A non-ready verdict is placed in the non-claimable lane, so a lane alone never promotes an issue. A ready verdict placed there is moved to the default lane (implementation) or escalation lane (design). Both moves are recorded in `contextWarnings`.
-- `already_done` requires a close with reason `already_done`, backed by pinned repository evidence, related GitHub work, or a human comment, and no material uncertainty. It remains the only close the runner applies.
+- `already_done` requires a close with reason `already_done`, `high` verdict confidence, no material uncertainty, and at least one close citation that is repository content read at the pinned head SHA: direct evidence that the work is done on the code as it is now. A merged PR, a commit or a human comment may corroborate, but none of them can close an issue alone, and the issue itself and automation comments never count. It remains the only close the runner applies.
 - `duplicate` and `superseded` closes are recorded recommendations only; each must cite a matching `relatedWork` entry.
 - A dependency state that contradicts the cited GitHub state is rejected. Dependencies are descriptive: the `depends on #N` claim gate stays authoritative.
 - Output in the legacy `GroomerOutput` shape is rejected with a clear error rather than migrated.
 
 ### Compatibility
 
-`GroomingRun.validatedOutput` stores the full plan. `mutationPlan` keeps its existing fields and adds `planSchemaVersion`, `evidenceDigest`, `readiness`, and `closeRecommendation`. The run path applies mutations through `toGroomerOutput`, the legacy view that `POST /api/groomer/run` still returns as `output` (with the plan alongside as `plan`). A rejected plan's raw output and `validationErrors` are kept on the run. Runs recorded before the plan contract still render on `/automation/groomer`, marked `legacy`, with no readiness claim.
+`GroomingRun.validatedOutput` stores the full plan. `mutationPlan` keeps its existing fields and adds `planSchemaVersion`, `evidenceDigest`, `readiness`, `closeRecommendation`, `applicationKey`, `preconditions` and, when a policy withheld something, `withheld`. The run path applies mutations through `toGroomerOutput`, the legacy view that `POST /api/groomer/run` still returns as `output` (with the plan alongside as `plan`). A rejected plan's raw output and `validationErrors` are kept on the run. Runs recorded before the plan contract still render on `/automation/groomer`, marked `legacy`, with no readiness claim.
+
+## Applying a plan
+
+A validated plan is not written straight to GitHub. The applier (`src/lib/groomer/mutation-validator.ts`, `src/lib/groomer/mutation-applier.ts`) sits between the plan and every write.
+
+### Preconditions
+
+Immediately before the first write, the run re-reads live state with the same capture path as its evidence snapshot and checks:
+
+| Precondition | Fails when |
+| --- | --- |
+| `issue` | The live title, body, labels (any label, including `agent/*` claims) or state differ from the snapshot, the issue is no longer open, or it cannot be re-read. A snapshot that never captured the issue can never be applied. |
+| `comments` | A human comment (non-automation author) was posted after the run's evidence window opened, or the recent comments cannot be read. |
+| `head` | The default branch was renamed, its head cannot be resolved, or the head moved in a way that touches what the plan relies on: a commit changing a relied-on path, any commit when the plan relies on repo-wide evidence, or a comparison that cannot be trusted (diverged history, truncated file list, compare failure). A head that moved without touching the plan's evidence passes, with the same rules the freshness pass uses, and the result is recorded as verified at the new head. A snapshot with no pinned head skips this check; such a plan cannot be ready or close anyway. |
+
+If any precondition changed or cannot be verified, the run applies **zero** grooming mutations: no label, comment, title/body, close, lane, grooming field or freshness baseline is written. Every check is kept in `preconditions`, with one line per failed check in `preconditionFailures` (a run stopped before planning, below, records only its one failure) (for example `issue: issue changed since the evidence snapshot: body`). Stale evidence is never patched through. What happens next depends on why:
+
+- **Stale** (live state `changed`): the `GroomingRun` ends with `status: "stale"`, `stage: "validated"`, `retryable: true`, `applyOutcome: "stale"`. Nothing on the issue moves, so it stays exactly as eligible as when this run selected it and is re-groomed promptly on the fresh evidence.
+- **Unverifiable** (a live read failed or could not be completed; this wins when both occur): the same zero-mutation record, but with `status: "unverifiable"`, plus `Issue.groomingRetryAfter` set one hour ahead. The selector skips the issue until then on every path, including the stale one, so a persistently unreadable issue (deleted upstream, or GitHub failing for it) cannot win selection every tick. Targeted runs ignore the backoff. One hour rather than the 24h cooldown, because most read failures are transient. An applied groom clears the backoff.
+
+When the evidence snapshot fails to capture the live issue in the first place, the run stops right there, before any repository read or model call: a plan built on it could never be ready, close, or pass these preconditions. It records `status: "unverifiable"` and backs off the same way (a dry run records the outcome and writes nothing).
+
+Issues that are `status/in-progress` or `status/in-review` in either Dispatch's cache or the live snapshot are still skipped before any of this (no preconditions, no application).
+
+### What is applied, and in which order
+
+The diff is computed against the live issue, never Dispatch's cache, and only what differs is written, so re-applying a plan to an issue that already matches it writes nothing. Steps run from lowest to highest impact, and the first failure stops every later step:
+
+1. **labels**: priority/type changes and the derived status. For an `already_done` plan the status stays as it was here.
+2. **comment**: at most one, with `@` mentions neutralized and a hidden `<!-- dispatch-groomer:apply=<key> -->` marker at its end. Any marker the model wrote into its own text is stripped, and a marker only counts on a comment by an automation author, so nobody else can forge one to suppress or impersonate a groomer comment.
+3. **title/body**: one write. A title is rewritten only when the current one is bad (the existing guard). The body is never replaced: enrichment goes into one Dispatch-managed section between `<!-- dispatch-groomer:managed:start -->` and `<!-- dispatch-groomer:managed:end -->` markers, appended after the human text on first write and replaced in place afterwards. Text outside the section is kept byte for byte. Enrichment still applies only when the human-authored text is sparse, and a body whose markers are unpaired or repeated is left alone.
+4. **close**, only for an `already_done` plan that still satisfies the close policy.
+5. **status/done**, only once the close has landed, so a failed close leaves the issue open in its previous (groomable) status rather than open with `status/done`, which the selector would skip forever.
+
+Each step is recorded as `applied`, `replayed`, `noop`, `skipped` (comment cooldown), `failed` or `not_attempted` in `appliedMutations.steps`, alongside the existing `labelsUpdated`, `titleUpdated`, `bodyUpdated`, `commentUrl`, `commentSkippedReason`, `commentError`, `issueClosed` and `issueClosedError` fields. A run where a later step failed after earlier ones landed ends with `status: "partial"`, `retryable: true` and an `errorMessage` naming the failed step; the grooming fields and freshness baseline record only what actually landed. A run whose first needed write failed (nothing landed) fails as before.
+
+The ready and close policies are checked again here against the run's catalog. They cannot normally disagree with plan validation, but if they do, the ready promotion or close is withheld: the plan lands as `status/backlog` in the non-claimable lane with only its priority/type labels, and `withheld` records why.
+
+### Idempotency
+
+Every application has a key: a SHA-256 over the repository, issue number, the plan's evidence digest, the plan schema version and the normalized mutation intent (final label set, lane, comment text, title, body, close). The key is claimed in the `GroomingApplication` table (unique on the key) before the first write, and each step's result is recorded as it lands.
+
+Every run captures its own snapshot, so the key only recurs when the issue, its comments and the head are exactly as they were for the earlier attempt:
+
+- A run whose key was already fully applied is a **replay**: it writes nothing to GitHub and no lane history, stamps only `groomedAt` (so the same plan is not re-billed every tick), and records `applyOutcome: "replayed"` with the claiming run.
+- A run whose key was claimed but not finished **resumes** it: steps recorded as landed are replayed, not repeated, and only the rest are attempted. Because a landed label, title/body or close write changes the issue (and so the next snapshot and key), in practice what a resume skips is a comment that landed before the attempt failed or crashed. An unfinished claim updated in the last 10 minutes may belong to an attempt that is still running, so a run that meets one writes nothing (`applyOutcome: "busy"`, retryable, no cooldown stamp); an older one is treated as abandoned and taken over with a compare-and-swap, so of two runs resuming the same abandoned claim only one proceeds.
+- A comment that landed without being recorded is found on GitHub by its marker instead of being posted again, including when the comment write itself reported a failure after GitHub accepted it.
+- A retry after earlier writes landed sees them in its own snapshot, so its preconditions pass and it has a new key. The diff from live state makes the already-applied parts no-ops, and the comment cooldown (recorded runs, or groomer markers on the issue) stops a second comment within the window.
+
+Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` or `unverifiable` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key, so it never reports `busy`, and it never writes a backoff.
+
+Out of scope here, and still to come: worker admission gating on these results (#1065), child issue creation (#1066), semantic duplicate/superseded closes (design gate #1069), and UI exposure of the new history fields (#1067).
 
 ## History and Audit
 

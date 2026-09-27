@@ -62,6 +62,7 @@ export interface GitHubIssueComment {
   user?: { login?: string };
   body?: string | null;
   created_at?: string;
+  html_url?: string;
 }
 
 export async function fetchIssueComments(

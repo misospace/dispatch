@@ -130,7 +130,7 @@ describe("fetchIssueComments", () => {
 
     const result = await fetchIssueComments("org/repo", 42);
     expect(result.length).toBeLessThanOrEqual(5);
-    expect(mocks.fetchGitHubIssueComments).toHaveBeenCalledWith("org/repo", 42, 5);
+    expect(mocks.fetchGitHubIssueComments).toHaveBeenCalledWith("org/repo", 42, 5, "asc");
   });
 
   it("propagates comment fetch failures so the run can fail cleanly", async () => {
@@ -160,6 +160,17 @@ describe("fetchIssueComments", () => {
       { id: 555, author: "alice", body: "First comment", createdAt: "2026-01-01T00:00:00Z" },
       { id: null, author: "bob", body: "Second comment", createdAt: "2026-01-02T00:00:00Z" },
     ]);
+  });
+
+  it("reads the newest comments, with their URLs, for apply-time checks", async () => {
+    mocks.fetchGitHubIssueComments.mockResolvedValue([
+      { id: 9, user: { login: "carol" }, body: "latest", created_at: "2026-01-09T00:00:00Z", html_url: "https://github.com/org/repo/issues/42#issuecomment-9" },
+    ]);
+
+    const result = await fetchIssueComments("org/repo", 42, 30, "desc");
+
+    expect(mocks.fetchGitHubIssueComments).toHaveBeenCalledWith("org/repo", 42, 30, "desc");
+    expect(result[0]).toMatchObject({ id: 9, url: "https://github.com/org/repo/issues/42#issuecomment-9" });
   });
 });
 

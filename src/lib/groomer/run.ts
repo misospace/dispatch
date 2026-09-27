@@ -5,8 +5,7 @@ import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerL
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
-import type { GroomerOutput } from "./schema";
-import { inFlightStatus, toGroomerOutput, validateGroomingPlan, type GroomingPlan } from "./plan";
+import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { getHostedGroomerConfig } from "./config";
 import { buildRepositoryContext } from "./repository-context";
@@ -20,8 +19,18 @@ import {
 } from "./evidence-snapshot";
 import type { RepositoryContextInput, RepositoryContextConfig } from "./repository-context";
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
-import { neutralizeMentions } from "./sanitize";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
+import { compareCommits } from "@/lib/github-code-search";
+import { validateApplyPreconditions, type LiveComment, type PreconditionReader } from "./mutation-validator";
+import {
+  applyGroomingMutations,
+  computeApplicationKey,
+  computeMutationDiff,
+  makePrismaApplicationStore,
+  type ApplicationStore,
+  type ApplierGitHub,
+  type ApplyResult,
+} from "./mutation-applier";
 
 export interface GroomerRunResult {
   candidateNumber: number;
@@ -45,7 +54,16 @@ export interface RunHostedGroomerOptions {
 }
 
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
-const MAX_GITHUB_COMMENT_CHARS = 4096;
+
+/**
+ * Backoff after a groom that could not read GitHub state (dispatch#1063).
+ * Short enough that a transient GitHub failure delays grooming by an hour,
+ * not the 24h cooldown; long enough that a persistently unreadable issue
+ * (deleted upstream, say) costs one cheap capture an hour instead of
+ * monopolizing every scheduler tick. When the snapshot capture fails the
+ * model is never called, so a backed-off retry is only a few GitHub reads.
+ */
+export const UNVERIFIABLE_RETRY_BACKOFF_MINUTES = 60;
 
 export interface GroomerDeps {
   selectCandidate: typeof selectGroomingCandidate;
@@ -68,6 +86,10 @@ export interface GroomerDeps {
   acquireGroomerLock: typeof acquireGroomerLock;
   heartbeatGroomerLock: typeof heartbeatGroomerLock;
   releaseGroomerLock: typeof releaseGroomerLock;
+  /** Apply-time head comparison (#1063); defaults to the GitHub compare API. */
+  compareCommits?: typeof compareCommits;
+  /** Plan application claims (#1063); defaults to GroomingApplication via `prisma`. */
+  applicationStore?: ApplicationStore;
 }
 
 const defaultDeps: GroomerDeps = {
@@ -91,6 +113,7 @@ const defaultDeps: GroomerDeps = {
   acquireGroomerLock,
   heartbeatGroomerLock,
   releaseGroomerLock,
+  compareCommits,
 };
 
 export async function runHostedGroomer(
@@ -228,12 +251,86 @@ async function executeGroomerRun(
       };
     }
 
+    // A snapshot that did not capture the live issue can never be applied
+    // (the apply preconditions refuse it, and it cannot be ready or close),
+    // so stop before any repository read or model call (dispatch#1063). The
+    // issue backs off instead of being re-selected, and re-billed, every tick.
+    if (evidence.issue.state === "unknown") {
+      const why = captureFailureReason(evidence.warnings);
+      const failures = [`issue: the evidence snapshot did not capture the live issue: ${why}`];
+      const unverifiable: Record<string, unknown> = { outcome: "unverifiable", preconditionFailures: failures };
+      const evidenceSummary = { evidence: summarizeEvidenceForPersistence(evidence) };
+      if (dryRun) {
+        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+          status: "dry_run_completed",
+          stage: "selected",
+          contextSummary: evidenceSummary,
+          preconditionFailures: failures,
+          applyOutcome: "unverifiable",
+        });
+        return {
+          candidateNumber: candidate.number,
+          repoFullName: candidate.repoFullName,
+          dryRun: true,
+          output: null,
+          plannedLabels: candidate.labels,
+          groomingRunId: groomingRun.id,
+          contextWarnings: [],
+          appliedMutations: unverifiable,
+        };
+      }
+      Object.assign(unverifiable, await backOffUnreadableIssue(deps, candidate.id));
+      const skippedRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: "No mutations applied: the live issue could not be read, so no plan was made",
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "unverifiable",
+        stage: "selected",
+        contextSummary: evidenceSummary,
+        preconditionFailures: failures,
+        applyOutcome: "unverifiable",
+        appliedMutations: unverifiable,
+        errorMessage: `Evidence snapshot did not capture the live issue: ${why}`,
+        retryable: true,
+        agentRunId: skippedRun.id,
+      });
+      return {
+        candidateNumber: candidate.number,
+        repoFullName: candidate.repoFullName,
+        dryRun: false,
+        output: null,
+        plannedLabels: candidate.labels,
+        groomingRunId: groomingRun.id,
+        contextWarnings: [],
+        appliedMutations: unverifiable,
+      };
+    }
+
+    // The issue the model analyzes is the one the snapshot pinned (#1063):
+    // the apply-time preconditions compare live state against the snapshot,
+    // so the prompt must be built from the same state, not Dispatch's cache.
+    // Falls back to the cached issue only when the live capture failed (and
+    // then the preconditions refuse to apply the plan).
+    const liveCaptured = evidence.issue.state !== "unknown";
+    const analyzed = liveCaptured
+      ? { title: evidence.issue.title, body: evidence.issue.body, labels: evidence.issue.labels, state: evidence.issue.state }
+      : { title: candidate.title, body: candidate.body, labels: candidate.labels, state: "open" };
+
     // Build repository context
     const repositoryContext = await deps.buildRepositoryContext(
       {
         repoFullName: candidate.repoFullName,
-        issueTitle: candidate.title,
-        issueBody: candidate.body,
+        issueTitle: analyzed.title,
+        issueBody: analyzed.body,
         ref: evidence.pinnedRef ?? undefined,
       },
       {
@@ -265,9 +362,9 @@ async function executeGroomerRun(
     // Build context
     const context = await deps.buildContext({
       number: candidate.number,
-      title: candidate.title,
-      body: candidate.body,
-      labels: candidate.labels,
+      title: analyzed.title,
+      body: analyzed.body,
+      labels: analyzed.labels,
       currentLane: candidate.currentLane,
       comments,
       maxContextBytes: config.maxContextBytes,
@@ -360,9 +457,30 @@ async function executeGroomerRun(
     }
 
     const plan = validation.plan!;
-    // Legacy GroomerOutput view: the mutation path below and existing
-    // run/history consumers read this shape during the plan rollout.
-    const output = toGroomerOutput(plan, candidate.labels);
+
+    // Record structured alias-resolution warnings for observability
+    if (validation.resolutions && validation.resolutions.length > 0) {
+      for (const r of validation.resolutions) {
+        contextWarnings.push(`enum:${r.field}: resolved '${r.rawValue}' -> '${r.resolvedValue}' via ${r.source}`);
+      }
+    }
+
+    // The diff this plan would write, computed against the issue the model
+    // analyzed (the snapshot's live state). The apply-time preconditions
+    // below guarantee live state still equals it before anything is written,
+    // so this is also the diff from current state. The close and ready
+    // policies are applied here: a close or ready promotion they reject is
+    // withheld and the plan lands as backlog (dispatch#1063).
+    const diff = computeMutationDiff({ plan, live: analyzed, catalog: evidenceCatalog });
+    // Legacy GroomerOutput view of what is applied: the mutation path below
+    // and existing run/history consumers read this shape.
+    const output = diff.output;
+    const applicationKey = computeApplicationKey({
+      repoFullName: candidate.repoFullName,
+      issueNumber: candidate.number,
+      plan,
+      diff,
+    });
 
     // mark_not_ready degrades instead of failing the run (dispatch#839). The
     // model is not obliged to emit notReadyReason, so a routine omission must
@@ -396,27 +514,13 @@ async function executeGroomerRun(
       }
     }
 
-
-    // Record structured alias-resolution warnings for observability
-    if (validation.resolutions && validation.resolutions.length > 0) {
-      for (const r of validation.resolutions) {
-        contextWarnings.push(`enum:${r.field}: resolved '${r.rawValue}' -> '${r.resolvedValue}' via ${r.source}`);
-      }
+    for (const [what, reasons] of Object.entries(diff.withheld)) {
+      contextWarnings.push(`apply: withheld ${what === "close" ? "the already_done close" : "the ready promotion"}: ${reasons!.join("; ")}`);
     }
 
-    let newLabels = applyLabelChanges(candidate.labels, output.labelsToAdd, output.labelsToRemove);
-
-    // Post-condition invariant (dispatch#941): after a groom the issue must carry
-    // exactly one status/* label. A re-groom that removes the old status label but
-    // adds no new one (or adds several) leaves the issue invisible to the queue —
-    // strictly worse than either end state. The schema's ready-invariant only covers
-    // the readyForWork path; this catches every path, including a non-ready re-groom
-    // that dropped the status label. It needs the current labels, which only live
-    // here, so it is enforced on the final label set rather than the LLM output.
-    newLabels = ensureSingleStatusLabel(newLabels, plan.readiness.ready, isAlreadyDone(output));
-
-    // Compute title/body enrichment decisions
-    const titleBodyMutations = computeTitleBodyMutations(candidate, output);
+    // Post-condition invariant (dispatch#941): exactly one status/* label.
+    // computeMutationDiff enforces it on the final label set.
+    let newLabels = diff.labelsAfter;
 
     // Build mutationPlan
     const mutationPlan: Record<string, unknown> = {
@@ -425,23 +529,28 @@ async function executeGroomerRun(
       lane: output.lane,
       summary: output.summary ?? null,
       notReadyReason: notReadyReason ?? null,
-      willComment: Boolean(output.githubComment?.trim()),
-      willCloseIssue: isAlreadyDone(output),
-      titleRewritten: titleBodyMutations.shouldRewrite,
-      originalTitle: titleBodyMutations.shouldRewrite ? candidate.title : undefined,
-      proposedTitle: titleBodyMutations.proposedTitle,
-      bodyEnriched: titleBodyMutations.shouldEnrich,
-      proposedBody: titleBodyMutations.proposedBody,
+      willComment: diff.comment !== null,
+      willCloseIssue: diff.close,
+      titleRewritten: diff.title !== null,
+      originalTitle: diff.title !== null ? analyzed.title : undefined,
+      proposedTitle: diff.title ?? undefined,
+      bodyEnriched: diff.body !== null,
+      proposedBody: diff.body !== null ? output.proposedBody : undefined,
+      ...(output.proposedBody !== undefined && diff.body === null ? { bodySkippedReason: diff.bodySkippedReason } : {}),
       planSchemaVersion: plan.schemaVersion,
       evidenceDigest: plan.evidence.evidenceDigest,
       readiness: plan.readiness,
       closeRecommendation: plan.mutations.close,
+      applicationKey,
+      ...(Object.keys(diff.withheld).length > 0 ? { withheld: diff.withheld } : {}),
     };
 
     // An issue already claimed or under review (status/in-progress or
     // status/in-review) is not the groomer's to move. The plan is recorded,
     // but no label, lane, title/body, comment or close mutation is applied.
-    const inFlight = inFlightStatus(candidate.labels);
+    // Checked on both Dispatch's cache and the live snapshot, so a claim the
+    // cache has not synced yet is still respected.
+    const inFlight = inFlightStatus(candidate.labels) ?? inFlightStatus(analyzed.labels);
     if (inFlight) {
       newLabels = [...candidate.labels];
       Object.assign(mutationPlan, {
@@ -452,6 +561,7 @@ async function executeGroomerRun(
         titleRewritten: false,
         bodyEnriched: false,
       });
+      delete mutationPlan.applicationKey;
     }
 
     // Persist stage planned
@@ -464,26 +574,28 @@ async function executeGroomerRun(
       labelsAfter: newLabels,
       laneAfter: inFlight ? candidate.currentLane : output.lane.id,
       mutationPlan,
-      commentBodyPreview: output.githubComment?.trim()?.slice(0, 500) ?? null,
+      commentBodyPreview: inFlight ? null : (diff.comment?.slice(0, 500) ?? null),
     });
 
-    if (dryRun) {
+    const result = (extra: Partial<GroomerRunResult>): GroomerRunResult => ({
+      candidateNumber: candidate.number,
+      repoFullName: candidate.repoFullName,
+      dryRun,
+      output,
+      plan,
+      plannedLabels: newLabels,
+      groomingRunId: groomingRun.id,
+      contextWarnings,
+      mutationPlan,
+      ...extra,
+    });
+
+    if (inFlight && dryRun) {
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "dry_run_completed",
         stage: "planned",
       });
-
-      return {
-        candidateNumber: candidate.number,
-        repoFullName: candidate.repoFullName,
-        dryRun: true,
-        output,
-        plan,
-        plannedLabels: newLabels,
-        groomingRunId: groomingRun.id,
-        contextWarnings,
-        mutationPlan,
-      };
+      return result({});
     }
 
     if (inFlight) {
@@ -524,120 +636,240 @@ async function executeGroomerRun(
         appliedMutations: skipped,
         agentRunId: skippedRun.id,
       });
-      return {
-        candidateNumber: candidate.number,
+      return result({ appliedMutations: skipped });
+    }
+
+    // Precondition validation (dispatch#1063): immediately before the first
+    // write, re-read the live issue, recent comments and the default-branch
+    // head, and check the evidence this plan was built on still holds. Dry
+    // runs run the same read-only checks.
+    const reader: PreconditionReader = {
+      recapture: () =>
+        deps.collectEvidence({ repoFullName: candidate.repoFullName, issueNumber: candidate.number, comments }),
+      fetchRecentComments: async (max) =>
+        (await deps.fetchComments(candidate.repoFullName, candidate.number, max, "desc")).map(
+          (comment): LiveComment => ({
+            id: comment.id ?? null,
+            author: comment.author,
+            createdAt: comment.createdAt,
+            body: comment.body,
+            url: comment.url ?? null,
+          }),
+        ),
+      compareCommits: (base, head) => (deps.compareCommits ?? compareCommits)(candidate.repoFullName, base, head),
+    };
+    const preconditions = await validateApplyPreconditions(
+      {
         repoFullName: candidate.repoFullName,
-        dryRun: false,
-        output,
+        issueNumber: candidate.number,
+        evidence,
+        evidenceWindowStart,
         plan,
-        plannedLabels: newLabels,
+        repositoryQueries: repositoryContext.queries,
+        explorationRan: exploration !== null,
+        explorationToolCalls: exploration?.toolCalls ?? [],
+      },
+      reader,
+    );
+    const preconditionRecord = { ok: preconditions.ok, checks: preconditions.checks };
+    mutationPlan.preconditions = preconditionRecord;
+    const store = deps.applicationStore ?? makePrismaApplicationStore(deps.prisma);
+    const validationFields = {
+      applicationKey,
+      preconditions: preconditionRecord,
+      preconditionFailures: preconditions.failures,
+      mutationPlan,
+    };
+
+    if (dryRun) {
+      const existing = preconditions.ok ? await store.find(applicationKey) : null;
+      const unreadable = preconditions.checks.some((c) => c.status === "unverifiable");
+      const applyOutcome = !preconditions.ok
+        ? unreadable
+          ? "unverifiable"
+          : "stale"
+        : existing?.status === "applied"
+          ? "would_replay"
+          : "dry_run";
+      mutationPlan.applyOutcome = applyOutcome;
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "dry_run_completed",
+        stage: "planned",
+        ...validationFields,
+        applyOutcome,
+      });
+      return result({ dryRun: true });
+    }
+
+    if (!preconditions.ok) {
+      // Stale or unverifiable evidence: apply zero grooming mutations.
+      // - Stale (live state changed): the grooming fields are left untouched,
+      //   so the issue stays exactly as eligible as when this run selected it
+      //   and is re-groomed promptly on the fresh evidence.
+      // - Unverifiable (a live read failed, or could not be completed): the
+      //   issue also backs off, so an unreadable issue cannot win selection
+      //   every tick. A run with both counts as unverifiable.
+      const unreadable = preconditions.checks.some((c) => c.status === "unverifiable");
+      const outcome = unreadable ? "unverifiable" : "stale";
+      const stale: Record<string, unknown> = { outcome, preconditionFailures: preconditions.failures };
+      if (unreadable) Object.assign(stale, await backOffUnreadableIssue(deps, candidate.id));
+      const failed = preconditions.checks.filter((c) => c.status === "changed" || c.status === "unverifiable");
+      const staleRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: `No mutations applied: preconditions failed (${failed.map((c) => c.name).join(", ")})`,
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await deps.prisma.auditLog.create({
+        data: {
+          actor: "hosted-groomer",
+          action: "groom",
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          beforeLabels: candidate.labels,
+          afterLabels: candidate.labels,
+          success: true,
+          notes: JSON.stringify({ outcome, preconditionFailures: preconditions.failures }),
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: outcome,
+        stage: "validated",
+        ...validationFields,
+        applyOutcome: outcome,
+        appliedMutations: stale,
+        errorMessage: `Apply preconditions failed: ${preconditions.failures.join("; ")}`,
+        retryable: true,
+        agentRunId: staleRun.id,
+      });
+      return result({ appliedMutations: stale });
+    }
+
+    // Write mode: apply the diff idempotently, lowest impact first.
+    const github: ApplierGitHub = {
+      updateLabels: deps.updateLabels,
+      addComment: deps.addComment,
+      updateTitleAndBody: deps.updateTitleAndBody,
+      closeIssue: deps.closeIssue,
+      fetchRecentComments: (_repo, _number, max) => reader.fetchRecentComments(max),
+    };
+    const applied = await applyGroomingMutations(
+      {
+        repoFullName: candidate.repoFullName,
+        issueNumber: candidate.number,
+        issueId: candidate.id,
         groomingRunId: groomingRun.id,
-        contextWarnings,
-        mutationPlan,
-        appliedMutations: skipped,
-      };
+        applicationKey,
+        diff,
+        recentComments: preconditions.recentComments,
+        force: options.force === true,
+        commentCooldownHours: config.commentCooldownHours,
+      },
+      github,
+      store,
+    );
+    const appliedMutations = describeApplication(applied, diff.withheld);
+
+    if (applied.outcome === "failed") {
+      // The first needed write failed and nothing landed: fail the run
+      // (retryable) with the step results kept on it.
+      await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
+        ...validationFields,
+        applyOutcome: "failed",
+        appliedMutations,
+      }).catch(() => {
+        /* the failure below is the error that matters */
+      });
+      throw new Error(`Grooming mutation failed at ${applied.failure!.step}: ${applied.failure!.error}`);
     }
 
-    // Write mode: apply mutations
-    const appliedMutations: Record<string, unknown> = {};
-
-    await deps.updateLabels(candidate.repoFullName, candidate.number, newLabels);
-    appliedMutations.labelsUpdated = true;
-
-    // Apply title and/or body updates if guardrails pass
-    const titleBodyFields: Record<string, unknown> = {};
-    if (titleBodyMutations.shouldRewrite && titleBodyMutations.proposedTitle) {
-      titleBodyFields.title = titleBodyMutations.proposedTitle;
-    }
-    if (titleBodyMutations.shouldEnrich && titleBodyMutations.proposedBody) {
-      titleBodyFields.body = titleBodyMutations.proposedBody;
-    }
-    if (Object.keys(titleBodyFields).length > 0) {
-      await deps.updateTitleAndBody(candidate.repoFullName, candidate.number, titleBodyFields as Parameters<typeof updateIssueTitleAndBody>[2]);
-      appliedMutations.titleUpdated = titleBodyMutations.shouldRewrite;
-      appliedMutations.bodyUpdated = titleBodyMutations.shouldEnrich;
-    }
-
-    // Comment with cooldown enforcement. Posting the rationale comment is
-    // non-essential: the labels/lane/status mutations above are what actually
-    // matter, so a comment failure (e.g. a transient GitHub 504) must not
-    // fail the whole run and turn this candidate into a poison pill.
-    if (output.githubComment?.trim()) {
-      let commentPosted = false;
-      let skipCommentPost = false;
-
-      // Check cooldown unless force or cooldown disabled
-      const shouldCheckCooldown = !options.force && config.commentCooldownHours > 0;
-      if (shouldCheckCooldown) {
-        const cooldownSince = new Date(Date.now() - config.commentCooldownHours * 60 * 60 * 1000);
-        const recentComment = await deps.prisma.groomingRun.findFirst({
-          where: {
-            issueId: candidate.id,
-            commentUrl: { not: null },
-            createdAt: { gte: cooldownSince },
-          },
-        });
-        if (recentComment) {
-          appliedMutations.commentSkippedReason = "cooldown";
-          skipCommentPost = true;
-        }
-      }
-
-      if (!skipCommentPost) {
-        const commentBody = neutralizeMentions(output.githubComment.trim()).slice(0, MAX_GITHUB_COMMENT_CHARS);
-        try {
-          let result;
-          try {
-            result = await deps.addComment(candidate.repoFullName, candidate.number, commentBody);
-          } catch {
-            // One best-effort retry before giving up on transient errors (e.g. 504s).
-            result = await deps.addComment(candidate.repoFullName, candidate.number, commentBody);
-          }
-          const commentUrl = result.url ?? null;
-          if (commentUrl) appliedMutations.commentUrl = commentUrl;
-          commentPosted = true;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Unknown error adding comment";
-          console.error(
-            `[groomer] failed to post comment on ${candidate.repoFullName}#${candidate.number}, continuing without it:`,
-            error,
-          );
-          appliedMutations.commentError = message;
-        }
-      }
-
-      if (!commentPosted && !("commentSkippedReason" in appliedMutations)) {
-        appliedMutations.commentPosted = false;
-      }
+    if (applied.outcome === "busy") {
+      // Another attempt claimed this exact application moments ago and has
+      // not finished. Nothing is written, not even the cooldown stamp, so the
+      // issue is retried once that claim completes or ages out.
+      const busy: Record<string, unknown> = { outcome: "busy", claimedByRunId: applied.claimedByRunId };
+      const busyRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: "No mutations applied: this plan application is in progress in another run",
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "completed",
+        stage: "skipped",
+        ...validationFields,
+        applyOutcome: "busy",
+        appliedMutations: busy,
+        retryable: true,
+        agentRunId: busyRun.id,
+      });
+      return result({ appliedMutations: busy });
     }
 
-    // Close the issue on GitHub when the groomer concluded it is already
-    // resolved (dispatch#957). Without this step "already_done" was a dead
-    // enum value: the issue landed in the non-claimable backlog lane and
-    // stayed open forever. The label work above already coerced the local
-    // state to status/done; the close here makes GitHub agree so the local
-    // sync picks the issue up as closed on its next pass. Best-effort, like
-    // the comment path: a GitHub-side failure must not poison the run, but
-    // it should be surfaced on the GroomingRun so an operator can retry.
-    if (isAlreadyDone(output)) {
-      try {
-        await deps.closeIssue(candidate.repoFullName, candidate.number);
-        appliedMutations.issueClosed = true;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error closing issue";
-        console.error(
-          `[groomer] failed to close ${candidate.repoFullName}#${candidate.number} on already_done, continuing without it:`,
-          error,
-        );
-        appliedMutations.issueClosedError = message;
-      }
+    if (applied.outcome === "replayed") {
+      // This exact application already landed: nothing is written again,
+      // not even lane history. Only the local cooldown stamp moves, so the
+      // same plan is not re-billed every scheduler tick.
+      await deps.prisma.issue.update({
+        where: { id: candidate.id },
+        data: { groomedAt: new Date(), groomedBy: "hosted-groomer", groomingRetryAfter: null },
+      });
+      const replayRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: `No mutations applied: plan application already applied${applied.claimedByRunId ? ` by run ${applied.claimedByRunId}` : ""}`,
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await deps.prisma.auditLog.create({
+        data: {
+          actor: "hosted-groomer",
+          action: "groom",
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          beforeLabels: analyzed.labels,
+          afterLabels: analyzed.labels,
+          success: true,
+          notes: JSON.stringify({ outcome: "replayed", applicationKey }),
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "completed",
+        stage: "applied",
+        ...validationFields,
+        applyOutcome: "replayed",
+        appliedMutations,
+        agentRunId: replayRun.id,
+        commentUrl: applied.commentUrl,
+      });
+      return result({ appliedMutations });
     }
+
+    newLabels = applied.labels;
 
     // Update issue grooming fields
     const issueData: Record<string, unknown> = {
       groomedAt: new Date(),
       groomedBy: "hosted-groomer",
       currentLane: output.lane.id,
+      groomingRetryAfter: null,
     };
     if (output.summary) issueData.groomingSummary = output.summary;
     if (output.needsInfoReason) issueData.needsInfoReason = output.needsInfoReason;
@@ -646,16 +878,17 @@ async function executeGroomerRun(
     if (output.nextGroomingAction) issueData.nextGroomingAction = output.nextGroomingAction;
     // When the groomer closes the issue, mirror the closed state locally so
     // the selector stops considering it (state: "open" is the implicit filter)
-    // and the next sync confirms what we just wrote. Best-effort on GitHub
-    // failure: appliedMutations.issueClosedError already captures that case.
-    if (appliedMutations.issueClosed === true) {
+    // and the next sync confirms what we just wrote. A close that did not
+    // land leaves the issue open locally too, so it can be retried.
+    if (applied.closed) {
       issueData.state = "closed";
       issueData.closedAt = new Date();
     }
 
     // Freshness baseline (#1064): the evidence this applied result was
-    // validated against, including the post-apply state Dispatch just wrote,
-    // so the groomer's own writes never read back as an external change.
+    // validated against, including the post-apply state Dispatch actually
+    // wrote (a partial application records only what landed), so the
+    // groomer's own writes never read back as an external change.
     Object.assign(
       issueData,
       await freshnessBaselineIssueData(deps.prisma, {
@@ -664,10 +897,10 @@ async function executeGroomerRun(
         issueNumber: candidate.number,
         evidence,
         candidate,
-        appliedTitle: titleBodyFields.title as string | undefined,
-        appliedBody: titleBodyFields.body as string | undefined,
-        labelsAfter: newLabels,
-        closed: appliedMutations.issueClosed === true,
+        appliedTitle: applied.title ?? undefined,
+        appliedBody: applied.body ?? undefined,
+        labelsAfter: applied.labels,
+        closed: applied.closed,
         evidenceWindowStart,
         repositoryQueries: repositoryContext.queries,
         explorationRan: exploration !== null,
@@ -675,6 +908,11 @@ async function executeGroomerRun(
         citations: plan.citations,
       }),
     );
+    // The preconditions just verified the evidence against the live head.
+    const head = preconditions.checks.find((c) => c.name === "head");
+    if (issueData.groomedIssueFingerprint && head?.status === "passed" && preconditions.liveHeadSha) {
+      issueData.groomingVerifiedSha = preconditions.liveHeadSha;
+    }
 
     await deps.prisma.issue.update({
       where: { id: candidate.id },
@@ -692,6 +930,11 @@ async function executeGroomerRun(
       },
     });
 
+    const partial = applied.outcome === "partial";
+    const partialMessage = partial
+      ? `Grooming partially applied: ${applied.failure!.step} failed (${applied.failure!.error}); later steps were not attempted`
+      : null;
+
     // Create AgentRun row
     const agentRun = await deps.prisma.agentRun.create({
       data: {
@@ -701,6 +944,7 @@ async function executeGroomerRun(
         startedAt: new Date(),
         finishedAt: new Date(),
         summary: output.summary ?? null,
+        ...(partialMessage ? { errorMessage: partialMessage } : {}),
         issueId: candidate.id,
         touchedIssueUrls: [candidate.url],
       },
@@ -713,33 +957,29 @@ async function executeGroomerRun(
         action: "groom",
         repoFullName: candidate.repoFullName,
         issueNumber: candidate.number,
-        beforeLabels: candidate.labels,
-        afterLabels: newLabels,
+        beforeLabels: analyzed.labels,
+        afterLabels: applied.labels,
         success: true,
+        ...(partialMessage ? { errorMessage: partialMessage } : {}),
       },
     });
 
-    // Complete GroomingRun
+    // Complete GroomingRun. A partial application is explicit in history
+    // and retryable: every landed step is recorded, so a retry of the same
+    // application replays them instead of repeating them.
     await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
-      status: "completed",
+      status: partial ? "partial" : "completed",
       stage: "applied",
+      ...validationFields,
+      applyOutcome: applied.outcome,
       appliedMutations,
       agentRunId: agentRun.id,
-      commentUrl: (appliedMutations.commentUrl as string | null) ?? null,
+      commentUrl: applied.commentUrl,
+      labelsAfter: applied.labels,
+      ...(partial ? { errorMessage: partialMessage, retryable: true } : {}),
     });
 
-    return {
-      candidateNumber: candidate.number,
-      repoFullName: candidate.repoFullName,
-      dryRun: false,
-      output,
-      plan,
-      plannedLabels: newLabels,
-      groomingRunId: groomingRun.id,
-      contextWarnings,
-      mutationPlan,
-      appliedMutations,
-    };
+    return result({ plannedLabels: newLabels, appliedMutations });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown groomer error";
 
@@ -797,133 +1037,64 @@ function candidateSourceOf(candidate: { selectionReason?: string }): string {
 }
 
 /**
- * Check if a title is "bad" and should be rewritten.
- * Bad titles: length < 10 chars, or matches generic patterns (single word like "P0", "TODO", etc.),
- * or is clearly just a priority/label token.
+ * The legacy appliedMutations fields (read by /automation/groomer and the run
+ * API) plus the per-step record of what this attempt applied.
  */
-function shouldRewriteTitle(title: string): boolean {
-  const trimmed = title.trim();
-  if (trimmed.length === 0) return true;
-  if (trimmed.length < 10) return true;
-
-  // Single word that looks like a generic token
-  const words = trimmed.split(/\s+/);
-  if (words.length === 1) {
-    const lower = trimmed.toLowerCase();
-    const GENERIC_TOKENS = ["p0", "p1", "p2", "p3", "p4", "todo", "bug", "fix", "fixme", "wip", "help", "urgent", "critical"];
-    if (GENERIC_TOKENS.includes(lower)) return true;
-
-    // Priority/label-like tokens: starts with a letter/digit, no spaces, looks like a label prefix
-    if (/^[a-z0-9]+$/i.test(trimmed) && trimmed.length <= 6) return true;
-  }
-
-  return false;
-}
-
-/**
- * Check if a body is "sparse" and should be enriched.
- * Sparse bodies: missing, empty, or < 100 chars (excluding markdown/HTML comments).
- */
-function shouldEnrichBody(body: string | null): boolean {
-  if (body === null || body.trim().length === 0) return true;
-
-  // Strip HTML comments
-  let stripped = body.replace(/<!--[sS]*?-->/g, "");
-  // Strip markdown-style block comments (if any)
-  stripped = stripped.replace(/^<!--[\s\S]*?-->/gm, "");
-
-  if (stripped.trim().length < 100) return true;
-  return false;
-}
-
-/**
- * Compute title/body enrichment decisions and build the mutation plan entries.
- */
-function computeTitleBodyMutations(
-  candidate: { title: string; body: string | null },
-  output: GroomerOutput,
-): {
-  shouldRewrite: boolean;
-  shouldEnrich: boolean;
-  proposedTitle?: string;
-  proposedBody?: string;
-} {
-  // validateGroomerOutput normalizes explicit nulls to absent at the schema
-  // boundary, so these are always `string | undefined` — no runtime type check.
-  const { proposedTitle, proposedBody } = output;
-
-  const shouldRewrite = proposedTitle !== undefined && shouldRewriteTitle(candidate.title);
-  const shouldEnrich = proposedBody !== undefined && shouldEnrichBody(candidate.body);
-
-  return {
-    shouldRewrite,
-    shouldEnrich,
-    ...(shouldRewrite ? { proposedTitle } : {}),
-    ...(shouldEnrich ? { proposedBody } : {}),
+function describeApplication(applied: ApplyResult, withheld: Record<string, string[] | undefined>): Record<string, unknown> {
+  const { steps } = applied;
+  const out: Record<string, unknown> = {
+    outcome: applied.outcome,
+    steps,
+    labelsUpdated: steps.labels?.status === "applied" || steps.done_label?.status === "applied",
   };
+  if (applied.claimedByRunId) out.claimedByRunId = applied.claimedByRunId;
+  if (Object.keys(withheld).length > 0) out.withheld = withheld;
+  if (steps.content?.status === "applied" || steps.content?.status === "replayed") {
+    out.titleUpdated = applied.title !== null;
+    out.bodyUpdated = applied.body !== null;
+  }
+  const comment = steps.comment;
+  if (comment && comment.status !== "noop") {
+    if (applied.commentUrl) out.commentUrl = applied.commentUrl;
+    if (comment.status === "skipped") out.commentSkippedReason = comment.detail ?? "skipped";
+    if (comment.status === "failed" || comment.status === "not_attempted") out.commentPosted = false;
+    if (comment.status === "failed") out.commentError = comment.error;
+  }
+  if (steps.close?.status === "applied" || steps.close?.status === "replayed") out.issueClosed = true;
+  if (steps.close?.status === "failed") out.issueClosedError = steps.close.error;
+  return out;
 }
 
 /**
- * The "done" signal: the groomer concluded the issue is already resolved
- * (actionability === "already_done"). Previously this was a no-op — the issue
- * landed on status/backlog, sat in the non-claimable backlog lane, and stayed
- * open until something else closed it (dispatch#957). Treating it as a label
- * category lets the rest of the pipeline (selector, status post-condition,
- * close-on-GitHub) react to it without each consumer re-checking actionability.
+ * Back an issue off after its GitHub state could not be read (dispatch#1063).
+ * Only the backoff column is written: grooming fields, the cooldown stamp and
+ * any freshness baseline stay as they were.
  */
-function isAlreadyDone(output: GroomerOutput): boolean {
-  return output.actionability === "already_done";
+async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promise<Record<string, unknown>> {
+  const retryAfter = new Date(Date.now() + UNVERIFIABLE_RETRY_BACKOFF_MINUTES * 60 * 1000);
+  try {
+    await deps.prisma.issue.update({ where: { id: issueId }, data: { groomingRetryAfter: retryAfter } });
+    return { retryAfter: retryAfter.toISOString() };
+  } catch (error) {
+    // The run is still recorded; only the backoff is lost for this attempt.
+    // The error itself is logged, not persisted: driver text stays out of history.
+    console.warn(`[groomer] failed to record the retry backoff for issue ${issueId}:`, error);
+    return { retryAfterError: "the retry backoff could not be recorded" };
+  }
 }
+
+/** Snapshot capture warnings that explain a missing live issue, most specific first. */
+const CAPTURE_FAILURE_PREFIXES = ["evidence: failed to fetch live issue state", "evidence: snapshot collection failed"];
+const MAX_PERSISTED_REASON_CHARS = 300;
 
 /**
- * Enforce the post-condition that a groomed issue carries exactly one status/*
- * label (dispatch#941). Done wins: an "already_done" decision collapses every
- * other status to status/done, so the close-on-GitHub step and the local
- * selector (which excludes status/done) both see the same end state.
- *
- * - done=true: always end on status/done. Strips any other status the LLM
- *   added (e.g. status/ready, status/backlog).
- * - Zero status labels otherwise: the groom removed the old one and added
- *   none. Restore a status so the issue stays visible — status/ready when
- *   the groom concluded the issue is workable, otherwise status/backlog
- *   (visible, deprioritised).
- * - More than one (non-done): keep the single most relevant status (ready
- *   wins, then the first present) and drop the rest.
- *
- * Returns a new array; the input is not mutated.
+ * Why the snapshot has no live issue, from its own capture warnings: only a
+ * warning about the issue fetch itself, bounded, never an unrelated warning.
  */
-function ensureSingleStatusLabel(labels: string[], ready: boolean, done: boolean): string[] {
-  if (done) {
-    const without = labels.filter((l) => !l.startsWith("status/"));
-    return [...without, "status/done"];
+export function captureFailureReason(warnings: string[]): string {
+  for (const prefix of CAPTURE_FAILURE_PREFIXES) {
+    const match = warnings.find((w) => w.startsWith(prefix));
+    if (match) return match.length <= MAX_PERSISTED_REASON_CHARS ? match : `${match.slice(0, MAX_PERSISTED_REASON_CHARS - 1)}…`;
   }
-
-  const statusLabels = labels.filter((l) => l.startsWith("status/"));
-  if (statusLabels.length === 1) return labels;
-
-  if (statusLabels.length === 0) {
-    const restored = ready ? "status/ready" : "status/backlog";
-    return [...labels, restored];
-  }
-
-  const keep =
-    statusLabels.includes("status/ready") ? "status/ready" : statusLabels[0];
-  return labels.filter((l) => !l.startsWith("status/") || l === keep);
-}
-
-function applyLabelChanges(
-  current: string[],
-  toAdd: string[],
-  toRemove: string[],
-): string[] {
-  let labels = [...current];
-  for (const label of toAdd) {
-    if (!labels.includes(label)) {
-      labels.push(label);
-    }
-  }
-  for (const label of toRemove) {
-    labels = labels.filter((l) => l !== label);
-  }
-  return labels;
+  return "the live issue could not be read";
 }

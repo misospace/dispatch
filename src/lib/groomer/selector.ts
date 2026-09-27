@@ -89,13 +89,17 @@ export async function selectGroomingCandidate(
       OR: [{ groomedAt: null }, { groomedAt: { lt: staleFloor } }],
     };
     const clause = { OR: [{ AND: groomingStateWhere.AND }, staleWhere] };
+    // An issue backed off after unreadable GitHub state waits out its
+    // backoff on every path, including the stale one (dispatch#1063; the
+    // backoff is set by run.ts, UNVERIFIABLE_RETRY_BACKOFF_MINUTES).
+    const backoff = { OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: new Date() } }] };
     const existing = issueWhere.AND;
     if (Array.isArray(existing)) {
-      existing.push(clause);
+      existing.push(clause, backoff);
     } else if (existing) {
-      issueWhere.AND = [existing, clause];
+      issueWhere.AND = [existing, clause, backoff];
     } else {
-      issueWhere.AND = [clause];
+      issueWhere.AND = [clause, backoff];
     }
   }
 

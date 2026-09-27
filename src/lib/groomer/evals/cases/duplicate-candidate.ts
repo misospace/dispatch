@@ -41,7 +41,6 @@ export const duplicateCandidate: GroomingCase = {
       name: "already_done because an open issue covers it",
       output: alreadyDone({ summary: "#212 covers this.", evidence: [DUP], closeEvidence: [DUP] }),
       expect: { accepted: false, rejectedFor: "already_done" },
-      pendingOn: "#1063: an open related issue is not current-revision evidence that the work is done",
     },
   ],
 };

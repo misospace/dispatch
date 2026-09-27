@@ -471,17 +471,6 @@ function isPinnedRepository(entry: EvidenceCatalogEntry | undefined): boolean {
 }
 
 /**
- * Evidence that can justify closing an issue: pinned repository content,
- * related GitHub work, or a human comment. The issue itself (it is the claim
- * under test) and automation comments (context, not authority) never can.
- */
-function isDecisive(entry: EvidenceCatalogEntry | undefined): boolean {
-  if (!entry || !entry.authoritative || entry.id === ISSUE_EVIDENCE_ID) return false;
-  if (entry.subject === "repository") return entry.pinned;
-  return entry.subject === "related_work" || entry.subject === "comment";
-}
-
-/**
  * The lane explicitly configured for escalation. Unlike getEscalationLane()
  * this never falls back to the default lane: design work must not land there.
  */
@@ -503,7 +492,8 @@ function explicitEscalationLane(): LaneConfig | undefined {
  * - no material uncertainty remains (for design work, only the design
  *   choices themselves may remain);
  * - implementation work has a bounded brief with deterministic acceptance
- *   criteria and needs no decomposition;
+ *   criteria, every path it marks "modify" was read at the pin, and it needs
+ *   no decomposition;
  * - design work routes to the escalation lane, never the default lane;
  * - the lane is claimable and no close is recommended.
  */
@@ -558,6 +548,16 @@ export function evaluateReadiness(draft: GroomingPlanDraft, catalog: EvidenceCat
       if (brief.relevantPaths.length === 0 && brief.filesToCreate.length === 0) {
         reasons.push("implementationBrief must name at least one relevant path or file to create");
       }
+      // A path the worker is told to modify must exist as read at the pin:
+      // a search hit or a path the model named may be stale or moved.
+      // Reference-only paths are orientation and may stay surfaced.
+      brief.relevantPaths.forEach((p, i) => {
+        if (p.change === "modify" && !isPinnedRepository(byId.get(p.ref))) {
+          reasons.push(
+            `implementationBrief.relevantPaths[${i}] ("${p.ref}") is marked modify but was not read at the pinned head SHA`,
+          );
+        }
+      });
       if (brief.inScope.length === 0) {
         reasons.push("implementationBrief.inScope must not be empty");
       }
@@ -699,9 +699,17 @@ export function validateGroomingPlan(data: unknown, context: GroomingPlanValidat
     if (!close || close.reason !== "already_done") {
       errors.push('mutations.close: an already_done verdict requires a close with reason "already_done"');
     } else {
-      if (!close.evidenceRefs.some((id) => isDecisive(byId.get(id)))) {
+      // The close policy (dispatch#1063): closing an issue is the
+      // highest-impact write, so it needs high confidence and direct
+      // current-revision evidence. A merged PR, a commit or a human comment
+      // may corroborate, but only repository content read at the pinned
+      // head shows the work is done on the code as it is now.
+      if (draft.verdict.confidence !== "high") {
+        errors.push(`verdict.confidence: already_done closes the issue, which requires high confidence, got "${draft.verdict.confidence}"`);
+      }
+      if (!close.evidenceRefs.some((id) => isPinnedRepository(byId.get(id)))) {
         errors.push(
-          "mutations.close.evidenceRefs: already_done must cite pinned repository evidence, related GitHub work, or a human comment (not the issue itself or automation comments)",
+          "mutations.close.evidenceRefs: already_done must cite pinned repository evidence, read at the head SHA (not the issue itself or automation comments); related work or a human comment may corroborate but cannot close an issue alone",
         );
       }
       draft.verdict.uncertainties.forEach((u, i) => {
@@ -818,17 +826,19 @@ function nextGroomingActionFor(plan: GroomingPlan): GroomAction | undefined {
  * run/history consumers read, during the rollout of the plan contract.
  *
  * `currentLabels` are the labels the mutation will be applied to. Every other
- * grooming-owned status is removed, so the exactly-one-status post-condition
- * cannot keep a stale status/ready. An issue carrying an in-flight status
- * (in-progress/in-review) keeps its status labels untouched.
+ * status/* label is removed, so the derived status is the only one left and
+ * the exactly-one-status post-condition cannot keep a stale status/ready or a
+ * foreign status. An issue carrying an in-flight status (in-progress/in-review)
+ * keeps its status labels untouched.
  */
 export function toGroomerOutput(plan: GroomingPlan, currentLabels: string[]): GroomerOutput {
   const { verdict, mutations } = plan;
   const status = mutations.status;
   const inFlight = inFlightStatus(currentLabels) !== null;
-  const staleStatuses = inFlight
-    ? []
-    : currentLabels.filter((label) => GROOMING_OWNED_STATUSES.includes(label as StatusLabel) && label !== status);
+  // The derived status is the only status an applied groom leaves: every
+  // other status/* label goes, including ones the groomer does not own
+  // (the external groom route already strips them all).
+  const staleStatuses = inFlight ? [] : currentLabels.filter((label) => label.startsWith("status/") && label !== status);
   const output: GroomerOutput = {
     actionability: verdict.actionability,
     confidence: verdict.confidence,

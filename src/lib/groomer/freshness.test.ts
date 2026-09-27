@@ -11,6 +11,7 @@ import {
   isFreshnessTrackedStatus,
   relatedWorkBaseline,
   type GroomingFreshnessInput,
+  UNKNOWN_FRESHNESS,
 } from "./freshness";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 
@@ -294,5 +295,11 @@ describe("isFreshnessTrackedStatus", () => {
     expect(isFreshnessTrackedStatus(["status/in-progress"])).toBe(false);
     expect(isFreshnessTrackedStatus(["status/in-review"])).toBe(false);
     expect(isFreshnessTrackedStatus(["status/done"])).toBe(false);
+  });
+});
+
+describe("UNKNOWN_FRESHNESS", () => {
+  it("also clears the unreadable-state backoff (dispatch#1063), so an external groom makes the issue selectable again", () => {
+    expect(UNKNOWN_FRESHNESS).toMatchObject({ groomedIssueFingerprint: null, groomingStaleAt: null, groomingRetryAfter: null });
   });
 });

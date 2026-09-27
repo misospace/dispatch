@@ -109,7 +109,20 @@ function openTrackedIssues(c: GroomingCase, args: unknown) {
 }
 
 /** Run one candidate through the real grooming path. Never touches the network. */
-export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): Promise<GroomingOutcome> {
+/** GroomingApplication rows (#1063); share one between runs to exercise replay. */
+export type ApplicationRows = Map<string, Record<string, unknown> & { applicationKey: string }>;
+
+export interface RunCandidateOptions {
+  applications?: ApplicationRows;
+  /** Distinguishes GroomingRun ids when one case is run more than once. */
+  runId?: string;
+}
+
+export async function runCandidate(
+  c: GroomingCase,
+  candidate: CaseCandidate,
+  options: RunCandidateOptions = {},
+): Promise<GroomingOutcome> {
   const writes: GitHubWrites = { labels: [], titleBody: [], comments: [], closes: 0 };
   let validation: GroomingPlanValidationResult | null = null;
   let catalog: EvidenceCatalog | null = null;
@@ -148,10 +161,12 @@ export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): P
     relatedWork: related,
   };
 
+  const applications: ApplicationRows = options.applications ?? new Map();
+  const runId = options.runId ?? `run-${c.id}`;
   const prisma = {
     automationRepo: { findUnique: async () => ({ id: "repo-1", fullName: c.repoFullName, enabled: true }) },
     groomingRun: {
-      create: async () => ({ id: `run-${c.id}`, stage: "selected" }),
+      create: async () => ({ id: runId, stage: "selected" }),
       update: async () => ({}),
       findFirst: async () => null,
     },
@@ -165,6 +180,30 @@ export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): P
     issueLane: { create: async () => ({ id: "lane-1" }) },
     agentRun: { create: async () => ({ id: "agent-run-1" }) },
     auditLog: { create: async () => ({ id: "audit-1" }) },
+    // Plan application claims (#1063), in memory for this run.
+    groomingApplication: {
+      findUnique: async ({ where }: { where: { applicationKey: string } }) => applications.get(where.applicationKey) ?? null,
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        const key = String(data.applicationKey);
+        // The unique applicationKey, as Postgres enforces it.
+        if (applications.has(key)) throw Object.assign(new Error("Unique constraint failed on applicationKey"), { code: "P2002" });
+        const row = { ...structuredClone(data), applicationKey: key, attempts: 1 };
+        applications.set(key, row);
+        return row;
+      },
+      update: async ({ where, data }: { where: { applicationKey: string }; data: Record<string, unknown> }) => {
+        const row = applications.get(where.applicationKey)!;
+        Object.assign(row, structuredClone(data));
+        return row;
+      },
+      updateMany: async ({ where }: { where: { applicationKey: string; status?: string; attempts?: number } }) => {
+        const row = applications.get(where.applicationKey);
+        if (!row || (where.status !== undefined && row.status !== where.status)) return { count: 0 };
+        if (where.attempts !== undefined && Number(row.attempts) !== where.attempts) return { count: 0 };
+        row.attempts = Number(row.attempts) + 1;
+        return { count: 1 };
+      },
+    },
   };
 
   const deps: GroomerDeps = {

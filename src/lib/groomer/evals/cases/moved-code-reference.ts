@@ -84,8 +84,6 @@ export const movedCodeReference: GroomingCase = {
         },
       }),
       expect: { accepted: false, rejectedFor: "src/cart/totals.js" },
-      knownBug:
-        "evaluateReadiness (#1062) pins verdict and verifiedCurrentBehavior refs but not relevantPaths, so a ready brief can direct a worker to modify a path never read at head",
     },
   ],
   freshness: [

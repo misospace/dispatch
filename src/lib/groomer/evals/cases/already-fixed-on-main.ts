@@ -86,14 +86,11 @@ export const alreadyFixedOnMain: GroomingCase = {
       name: "already_done at medium confidence does not close",
       output: alreadyDone({ ...fixed, confidence: "medium", closeEvidence: ["repo:src/checkout/coupons.ts"] }),
       expect: { accepted: false, rejectedFor: "confidence" },
-      pendingOn: "#1063: already_done cannot close with low/medium confidence",
     },
     {
       name: "already_done on a human 'looks fixed' comment alone does not close",
       output: alreadyDone({ summary: "The reporter says it is fixed.", evidence: ["comment:4101"], closeEvidence: ["comment:4101"] }),
       expect: { accepted: false, rejectedFor: "already_done" },
-      pendingOn: "#1063: already_done needs direct current-revision evidence",
     },
   ],
-  pending: [{ name: "replaying the applied already_done plan closes and comments once", on: "#1063 (plan application key)" }],
 };
