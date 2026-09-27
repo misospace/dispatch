@@ -31,6 +31,7 @@ vi.mock("@/lib/lease", () => ({
 vi.mock("@/lib/pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: false, commentPosted: false, errors: [] }),
   surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: false, commentUpdated: false, errors: [] }),
+  surfacePrFixUnblocked: vi.fn().mockResolvedValue({ labelRemoved: false, commentUpdated: false, errors: [] }),
   extractUrlsFromText: vi.fn(() => []),
 }));
 

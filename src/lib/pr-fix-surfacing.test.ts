@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { buildNeedsHumanComment, surfacePrFixBlocked, surfacePrFixRequeued, NEEDS_HUMAN_LABEL, NEEDS_HUMAN_COMMENT_MARKER } from "./pr-fix-surfacing";
+import { buildNeedsHumanComment, surfacePrFixBlocked, surfacePrFixRequeued, surfacePrFixUnblocked, NEEDS_HUMAN_LABEL, NEEDS_HUMAN_COMMENT_MARKER } from "./pr-fix-surfacing";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -364,5 +364,32 @@ describe("surfacePrFixRequeued", () => {
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toMatch(/^label:/);
     expect(result.commentUpdated).toBe(false);
+  });
+});
+
+describe("surfacePrFixUnblocked (#1105)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueComment.mockResolvedValue(undefined);
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
+    mocks.fetchIssueComments.mockResolvedValue([{ id: 7, body: `${NEEDS_HUMAN_COMMENT_MARKER}\n> old block` }]);
+  });
+
+  it("folds the marker into a resolved notice and drops the label", async () => {
+    const result = await surfacePrFixUnblocked("org/repo", 42, "resolved", "approved at abc123");
+
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, NEEDS_HUMAN_LABEL);
+    const body = mocks.updateIssueComment.mock.calls[0][2] as string;
+    expect(body.startsWith(NEEDS_HUMAN_COMMENT_MARKER)).toBe(true);
+    expect(body).toContain("**resolved**");
+    expect(body).not.toContain("requeued");
+    expect(body).toContain("approved at abc123");
+    expect(result).toMatchObject({ labelRemoved: true, commentUpdated: true, errors: [] });
+  });
+
+  it("uses the requeued notice for the requeued outcome", async () => {
+    await surfacePrFixUnblocked("org/repo", 42, "requeued");
+    expect(mocks.updateIssueComment.mock.calls[0][2]).toContain("**requeued**");
   });
 });

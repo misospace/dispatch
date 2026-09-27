@@ -210,6 +210,17 @@ export interface SurfacePrFixRequeuedResult {
 }
 
 /**
+ * How a BLOCKED item left BLOCKED: back to work (`requeued`) or settled as
+ * fixed (`resolved`). Picks the notice the marker comment is folded into.
+ */
+export type PrFixUnblockOutcome = "requeued" | "resolved";
+
+const UNBLOCK_HEADLINES: Record<PrFixUnblockOutcome, string> = {
+  requeued: "> 🔄 This PR fix item has been **requeued** and is active again — no human attention needed.",
+  resolved: "> ✅ This PR fix item has been **resolved** — no human attention needed.",
+};
+
+/**
  * Best-effort cleanup when a BLOCKED item is requeued: drop the needs-human label
  * and fold the existing marker comment into a concise "back to active" notice so
  * the label/comment no longer claim the PR is abandoned. History is untouched.
@@ -220,6 +231,20 @@ export interface SurfacePrFixRequeuedResult {
 export async function surfacePrFixRequeued(
   repo: string,
   pr: number,
+  notice?: string,
+): Promise<SurfacePrFixRequeuedResult> {
+  return surfacePrFixUnblocked(repo, pr, "requeued", notice);
+}
+
+/**
+ * The same cleanup for any exit from BLOCKED, not only an operator requeue: a
+ * mark to QUEUED or FIXED, or new evidence reopening the item (#1105). A
+ * `resolved` exit folds the marker into a resolved notice instead.
+ */
+export async function surfacePrFixUnblocked(
+  repo: string,
+  pr: number,
+  outcome: PrFixUnblockOutcome,
   notice?: string,
 ): Promise<SurfacePrFixRequeuedResult> {
   const result: SurfacePrFixRequeuedResult = {
@@ -257,7 +282,7 @@ export async function surfacePrFixRequeued(
       const lines = [
         NEEDS_HUMAN_COMMENT_MARKER,
         "",
-        "> 🔄 This PR fix item has been **requeued** and is active again — no human attention needed.",
+        UNBLOCK_HEADLINES[outcome],
       ];
       if (notice) lines.push("", `**Note:** ${notice}`);
       lines.push("", `Updated automatically by Dispatch on ${new Date().toISOString()}`);
