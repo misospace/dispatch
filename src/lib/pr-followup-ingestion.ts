@@ -439,13 +439,17 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
       // checks rarely set output.summary, so without this the coder gets a
       // contentless "check failed" and fixes blind). Present the real error +
       // the log URL for reference; degrade to reason + URL when no excerpt.
+      // The job URL is evidence, not the item URL: `url` is the PR URL and the
+      // job URL belongs in the feedback text. The `?? event.url` fallback keeps
+      // legacy callers (no checkRunUrl) behaving as before (#1098).
+      const logUrl = event.checkRunUrl ?? event.url;
       const excerpt = event.body?.trim();
       const lines = [`CI check "${checkName}" failed (${event.conclusion}) on this PR.`];
       if (excerpt) {
         lines.push("", "Error from the job log:", excerpt);
       }
-      if (event.url) {
-        lines.push("", `Full log: ${event.url}`);
+      if (logUrl) {
+        lines.push("", `Full log: ${logUrl}`);
       }
       if (!excerpt) {
         lines.push("Read the full log at the URL above to find the error, then fix the root cause.");
@@ -674,6 +678,9 @@ export async function ingestReviewCommentEvent(
 
 /**
  * Ingest a failing check run event.
+ *
+ * `url` must be the PR URL; the check-run job URL goes in `checkRunUrl`
+ * (#1098) — it is evidence for the feedback text, not the item identity.
  */
 export async function ingestCheckRunEvent(
   client: PrFixQueueClient,
@@ -687,6 +694,7 @@ export async function ingestCheckRunEvent(
     checkName: string;
     conclusion: string; // "failure", "cancelled", "timed_out" etc.
     checkRunId: string;
+    checkRunUrl?: string | null;
     checkDetails?: string;
     linkedIssue?: number | null;
   },
@@ -701,6 +709,7 @@ export async function ingestCheckRunEvent(
     author: opts.author,
     body: opts.checkDetails,
     id: opts.checkRunId,
+    checkRunUrl: opts.checkRunUrl ?? null,
     conclusion: opts.conclusion,
     checkName: opts.checkName,
     linkedIssue: opts.linkedIssue,
@@ -857,6 +866,11 @@ export interface PrFollowupEvent {
   state?: string;
   conclusion?: string;
   checkName?: string;
+  /**
+   * The check-run job URL for `check_run` events. `url` is always the PR URL;
+   * the job URL is evidence for the feedback text (#1098).
+   */
+  checkRunUrl?: string | null;
   mergeStateStatus?: string;
   prState?: string | null;
   prMergedAt?: string | null;

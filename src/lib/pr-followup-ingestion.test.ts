@@ -1011,6 +1011,63 @@ describe("processPrFollowupEvents", () => {
     error.mockRestore();
   });
 
+  it("enqueues a check_run with the PR URL as the item URL and the job URL in feedback (#1098)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const result = await processPrFollowupEvents(client, [
+      {
+        eventType: "check_run",
+        repoFullName: "org/repo",
+        prNumber: 7,
+        branch: "fix/c",
+        url: "https://api.github.com/repos/org/repo/pulls/7",
+        checkRunUrl: "https://github.com/org/repo/actions/runs/9/job/1",
+        title: "Fix C",
+        author: "itsmiso-ai",
+        body: "Error: Cannot read property 'x' of undefined",
+        id: "cr1098",
+        conclusion: "failure",
+        checkName: "lint",
+      },
+    ]);
+
+    expect(result.enqueued).toBe(1);
+    expect(client.items).toHaveLength(1);
+    // The item URL is the PR URL, not the CI job URL.
+    expect(client.items[0].url).toBe("https://api.github.com/repos/org/repo/pulls/7");
+    // The job URL is evidence in the feedback text ("Full log:" line).
+    const feedback = String(client.items[0].feedback);
+    expect(feedback).toContain("Full log: https://github.com/org/repo/actions/runs/9/job/1");
+    expect(feedback).not.toContain("pulls/7");
+  });
+
+  it("keeps the job URL in feedback when checkRunUrl is absent (legacy shape)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const result = await processPrFollowupEvents(client, [
+      {
+        eventType: "check_run",
+        repoFullName: "org/repo",
+        prNumber: 7,
+        branch: "fix/c",
+        url: "https://github.com/org/repo/actions/runs/9/job/1",
+        title: "Fix C",
+        author: "itsmiso-ai",
+        body: "Error: Cannot read property 'x' of undefined",
+        id: "cr1098-legacy",
+        conclusion: "failure",
+        checkName: "lint",
+      },
+    ]);
+
+    expect(result.enqueued).toBe(1);
+    expect(client.items).toHaveLength(1);
+    const feedback = String(client.items[0].feedback);
+    expect(feedback).toContain("Full log: https://github.com/org/repo/actions/runs/9/job/1");
+  });
+
   afterEach(() => {
     delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
   });

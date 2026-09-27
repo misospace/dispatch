@@ -680,11 +680,65 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         repoFullName: "org/repo",
         prNumber: 42,
         branch: "fix/issue-7",
-        url: "https://github.com/org/repo/runs/321",
+        url: "https://api.github.com/repos/org/repo/pulls/42",
+        checkRunUrl: "https://github.com/org/repo/runs/321",
         title: "lint",
         author: null,
         body: "2 errors",
         id: "321",
+        conclusion: "failure",
+        checkName: "lint",
+        linkedIssue: null,
+        headSha: "abc123",
+      },
+    ]);
+  });
+
+  // #1098: when the associated PR object has no `url`, the event's `url` must
+  // be the empty string (falsy → the next sync enqueue backfills the real PR
+  // URL), never the CI job URL, which the write-once queue guard would freeze
+  // as the item identity. The job URL belongs in `checkRunUrl`.
+  it("sets url to the empty string when the associated PR has no url (#1098)", async () => {
+    const res = await signedRequest("check_run", {
+      action: "completed",
+      check_run: {
+        id: 324,
+        name: "lint",
+        head_sha: "abc123",
+        status: "completed",
+        conclusion: "failure",
+        url: "https://api.github.com/repos/org/repo/check-runs/324",
+        html_url: "https://github.com/org/repo/runs/324",
+        details_url: "https://github.com/org/repo/actions/runs/1/job/324",
+        output: { title: "Lint failed", summary: "2 errors", text: null, annotations_count: 2 },
+        check_suite: { id: 8, head_branch: "fix/issue-7", head_sha: "abc123" },
+        app: { slug: "github-actions" },
+        pull_requests: [
+          {
+            id: 9001,
+            number: 42,
+            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
+            base: { ref: "main", sha: "def456", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
+          },
+        ],
+      },
+      repository,
+      sender: { login: "github-actions[bot]", type: "Bot" },
+    });
+
+    expect(res.status).toBe(200);
+    expect(ingestedEvents()).toEqual([
+      {
+        eventType: "check_run",
+        repoFullName: "org/repo",
+        prNumber: 42,
+        branch: "fix/issue-7",
+        url: "",
+        checkRunUrl: "https://github.com/org/repo/runs/324",
+        title: "lint",
+        author: null,
+        body: "2 errors",
+        id: "324",
         conclusion: "failure",
         checkName: "lint",
         linkedIssue: null,
