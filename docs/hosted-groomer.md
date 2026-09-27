@@ -175,7 +175,7 @@ Issues that are `status/in-progress` or `status/in-review` in either Dispatch's 
 The diff is computed against the live issue, never Dispatch's cache, and only what differs is written, so re-applying a plan to an issue that already matches it writes nothing. Steps run from lowest to highest impact, and the first failure stops every later step:
 
 1. **labels**: priority/type changes and the derived status. For an `already_done` plan the status stays as it was here.
-2. **comment**: at most one, with `@` mentions neutralized and a hidden `<!-- dispatch-groomer:apply=<key> -->` marker.
+2. **comment**: at most one, with `@` mentions neutralized and a hidden `<!-- dispatch-groomer:apply=<key> -->` marker at its end. Any marker the model wrote into its own text is stripped, and a marker only counts on a comment by an automation author, so nobody else can forge one to suppress or impersonate a groomer comment.
 3. **title/body**: one write. A title is rewritten only when the current one is bad (the existing guard). The body is never replaced: enrichment goes into one Dispatch-managed section between `<!-- dispatch-groomer:managed:start -->` and `<!-- dispatch-groomer:managed:end -->` markers, appended after the human text on first write and replaced in place afterwards. Text outside the section is kept byte for byte. Enrichment still applies only when the human-authored text is sparse, and a body whose markers are unpaired or repeated is left alone.
 4. **close**, only for an `already_done` plan that still satisfies the close policy.
 5. **status/done**, only once the close has landed, so a failed close leaves the issue open in its previous (groomable) status rather than open with `status/done`, which the selector would skip forever.
@@ -188,10 +188,12 @@ The ready and close policies are checked again here against the run's catalog. T
 
 Every application has a key: a SHA-256 over the repository, issue number, the plan's evidence digest, the plan schema version and the normalized mutation intent (final label set, lane, comment text, title, body, close). The key is claimed in the `GroomingApplication` table (unique on the key) before the first write, and each step's result is recorded as it lands.
 
+Every run captures its own snapshot, so the key only recurs when the issue, its comments and the head are exactly as they were for the earlier attempt:
+
 - A run whose key was already fully applied is a **replay**: it writes nothing to GitHub and no lane history, stamps only `groomedAt` (so the same plan is not re-billed every tick), and records `applyOutcome: "replayed"` with the claiming run.
-- A run whose key was claimed but not finished (a partial failure or a crash) **resumes**: steps already recorded as landed are replayed, not repeated, and only the rest are attempted.
+- A run whose key was claimed but not finished **resumes** it: steps recorded as landed are replayed, not repeated, and only the rest are attempted. Because a landed label, title/body or close write changes the issue (and so the next snapshot and key), in practice what a resume skips is a comment that landed before the attempt failed or crashed. An unfinished claim updated in the last 10 minutes may belong to an attempt that is still running, so a run that meets one writes nothing (`applyOutcome: "busy"`, retryable, no cooldown stamp); an older one is treated as abandoned and resumed.
 - A comment that landed without being recorded is found on GitHub by its marker instead of being posted again, including when the comment write itself reported a failure after GitHub accepted it.
-- A retry against newer evidence (for example after the first attempt's labels landed) has a new key; the diff from live state makes the already-applied parts no-ops, and the comment cooldown (recorded runs or markers on the issue) stops a second comment within the window.
+- A retry after earlier writes landed sees them in its own snapshot, so its preconditions pass and it has a new key. The diff from live state makes the already-applied parts no-ops, and the comment cooldown (recorded runs, or groomer markers on the issue) stops a second comment within the window.
 
 Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key.
 

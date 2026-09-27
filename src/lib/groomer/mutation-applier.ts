@@ -19,6 +19,7 @@ import { createHash } from "crypto";
 
 import type { StatusLabel } from "@/types";
 import { getBacklogLane } from "@/lib/lane-config";
+import { isAutomationAuthor } from "./context";
 import { neutralizeMentions } from "./sanitize";
 import { inFlightStatus, toGroomerOutput, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
@@ -129,13 +130,18 @@ function managedSection(content: string): string {
 export function renderManagedBody(parsed: Extract<ManagedBody, { ok: true }>, content: string): string {
   const section = managedSection(content);
   if (parsed.managed !== null) return `${parsed.before}${section}${parsed.after}`;
-  const kept = parsed.before.trimEnd();
-  return kept.length > 0 ? `${kept}\n\n${section}` : section;
+  const human = parsed.before;
+  if (human.trim().length === 0) return section;
+  const separator = human.endsWith("\n\n") ? "" : human.endsWith("\n") ? "\n" : "\n\n";
+  return `${human}${separator}${section}`;
 }
 
 // ─── Comment marker ───────────────────────────────────────────────────────────
 
-const COMMENT_MARKER_PATTERN = /<!-- dispatch-groomer:apply=([0-9a-f]{64}) -->/;
+/** Only the marker Dispatch appends counts: it must end the comment. */
+const COMMENT_MARKER_PATTERN = /<!-- dispatch-groomer:apply=([0-9a-f]{64}) -->\s*$/;
+/** Any Dispatch groomer marker, to strip from model-written text. */
+const ANY_GROOMER_MARKER = /<!--\s*dispatch-groomer:[\s\S]*?-->/g;
 
 export function commentMarker(applicationKey: string): string {
   return `<!-- dispatch-groomer:apply=${applicationKey} -->`;
@@ -144,6 +150,15 @@ export function commentMarker(applicationKey: string): string {
 /** The application key a groomer comment carries, if any. */
 export function commentMarkerKey(body: string): string | null {
   return COMMENT_MARKER_PATTERN.exec(body)?.[1] ?? null;
+}
+
+/**
+ * The application key of a comment Dispatch itself posted. A marker in a
+ * comment by anyone else is ignored, so a user cannot forge one to suppress
+ * or impersonate groomer comments.
+ */
+export function groomerCommentKey(comment: Pick<LiveComment, "author" | "body">): string | null {
+  return isAutomationAuthor(comment.author) ? commentMarkerKey(comment.body) : null;
 }
 
 // ─── Diff ─────────────────────────────────────────────────────────────────────
@@ -275,7 +290,8 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     }
   }
 
-  const rawComment = output.githubComment?.trim();
+  // The model's text never carries a Dispatch marker of its own.
+  const rawComment = output.githubComment?.replace(ANY_GROOMER_MARKER, "").trim();
   const comment = rawComment ? neutralizeMentions(rawComment) : null;
 
   return {
@@ -355,8 +371,17 @@ export type ApplySteps = Partial<Record<ApplyStep, ApplyStepResult>>;
  * - partial: some writes landed, a later one failed.
  * - failed: the first needed write failed; nothing landed.
  * - replayed: this key was already fully applied; nothing written.
+ * - busy: another attempt claimed this key moments ago and has not finished;
+ *   nothing written, so two attempts never apply the same plan at once.
  */
-export type ApplyOutcome = "applied" | "noop" | "partial" | "failed" | "replayed";
+export type ApplyOutcome = "applied" | "noop" | "partial" | "failed" | "replayed" | "busy";
+
+/**
+ * An unfinished claim younger than this belongs to an attempt that may still
+ * be running; an older one was abandoned (a crash) and may be resumed. Matches
+ * the hosted groomer's issue lease TTL.
+ */
+export const ACTIVE_CLAIM_MS = 10 * 60 * 1000;
 
 export interface ApplicationRecord {
   applicationKey: string;
@@ -364,6 +389,7 @@ export interface ApplicationRecord {
   status: string;
   steps: unknown;
   attempts: number;
+  updatedAt?: Date | string | null;
 }
 
 export interface ApplicationStore {
@@ -378,6 +404,8 @@ export interface ApplicationStore {
     issueNumber: number;
   }): Promise<{ existing: ApplicationRecord | null }>;
   save(applicationKey: string, data: { status: string; steps: ApplySteps }): Promise<void>;
+  /** Record that an unfinished claim is being resumed by another attempt. */
+  resume(applicationKey: string): Promise<void>;
   /** Whether a hosted-groomer comment was recorded on this issue since `since`. */
   hasRecentComment(issueId: string, since: Date): Promise<boolean>;
 }
@@ -468,6 +496,15 @@ export async function applyGroomingMutations(
   });
   const prior = readSteps(existing?.steps);
   const claimedByRunId = existing && existing.groomingRunId !== input.groomingRunId ? existing.groomingRunId : null;
+  const nothing = { claimedByRunId, commentUrl: null, labels: diff.labelsBefore, title: null, body: null, closed: false, failure: null };
+
+  if (existing && existing.status !== "applied") {
+    const updatedAt = existing.updatedAt ? new Date(existing.updatedAt).getTime() : NaN;
+    if (existing.status === "in_progress" && Number.isFinite(updatedAt) && now().getTime() - updatedAt < ACTIVE_CLAIM_MS) {
+      return { outcome: "busy", steps: prior, ...nothing };
+    }
+    await store.resume(applicationKey);
+  }
 
   if (existing?.status === "applied") {
     const commentUrl = prior.comment?.commentUrl ?? null;
@@ -479,13 +516,8 @@ export async function applyGroomingMutations(
           landed(result) ? { ...result, status: "replayed" as const } : result,
         ]),
       ) as ApplySteps,
-      claimedByRunId,
+      ...nothing,
       commentUrl,
-      labels: diff.labelsBefore,
-      title: null,
-      body: null,
-      closed: false,
-      failure: null,
     };
   }
 
@@ -545,7 +577,7 @@ export async function applyGroomingMutations(
   //    (recorded on a run, or found on GitHub by its marker) suppresses a new one.
   let commentDecision: ApplyStepResult | null = null;
   if (!failure && !landed(prior.comment) && diff.comment) {
-    const own = input.recentComments.find((c) => commentMarkerKey(c.body) === applicationKey);
+    const own = input.recentComments.find((c) => groomerCommentKey(c) === applicationKey);
     if (own) {
       commentDecision = { status: "replayed", detail: "already posted for this application", commentUrl: own.url };
       commentUrl = own.url;
@@ -553,7 +585,7 @@ export async function applyGroomingMutations(
       const since = new Date(now().getTime() - input.commentCooldownHours * 60 * 60 * 1000);
       const markedRecently = input.recentComments.some((c) => {
         const at = Date.parse(c.createdAt);
-        return commentMarkerKey(c.body) !== null && Number.isFinite(at) && at >= since.getTime();
+        return groomerCommentKey(c) !== null && Number.isFinite(at) && at >= since.getTime();
       });
       if (markedRecently || (await store.hasRecentComment(input.issueId, since))) {
         commentDecision = { status: "skipped", detail: "cooldown" };
@@ -575,7 +607,7 @@ export async function applyGroomingMutations(
         let found: LiveComment | undefined;
         try {
           found = (await github.fetchRecentComments(repoFullName, issueNumber, 10)).find(
-            (c) => commentMarkerKey(c.body) === applicationKey,
+            (c) => groomerCommentKey(c) === applicationKey,
           );
         } catch {
           found = undefined;
@@ -670,10 +702,7 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
     },
     async claim(input) {
       const existing = await delegate.findUnique({ where: { applicationKey: input.applicationKey } });
-      if (existing) {
-        await delegate.update({ where: { applicationKey: input.applicationKey }, data: { attempts: { increment: 1 } } });
-        return { existing };
-      }
+      if (existing) return { existing };
       try {
         await delegate.create({
           data: {
@@ -694,6 +723,9 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
     },
     async save(applicationKey, data) {
       await delegate.update({ where: { applicationKey }, data: { status: data.status, steps: data.steps } });
+    },
+    async resume(applicationKey) {
+      await delegate.update({ where: { applicationKey }, data: { attempts: { increment: 1 } } });
     },
     async hasRecentComment(issueId, since) {
       const recent = await client.groomingRun.findFirst({

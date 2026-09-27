@@ -93,5 +93,4 @@ export const alreadyFixedOnMain: GroomingCase = {
       expect: { accepted: false, rejectedFor: "already_done" },
     },
   ],
-  pending: [{ name: "replaying the applied already_done plan closes and comments once", on: "#1063 (plan application key)" }],
 };

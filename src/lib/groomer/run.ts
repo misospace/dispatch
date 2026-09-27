@@ -701,6 +701,35 @@ async function executeGroomerRun(
       throw new Error(`Grooming mutation failed at ${applied.failure!.step}: ${applied.failure!.error}`);
     }
 
+    if (applied.outcome === "busy") {
+      // Another attempt claimed this exact application moments ago and has
+      // not finished. Nothing is written, not even the cooldown stamp, so the
+      // issue is retried once that claim completes or ages out.
+      const busy: Record<string, unknown> = { outcome: "busy", claimedByRunId: applied.claimedByRunId };
+      const busyRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: "No mutations applied: this plan application is in progress in another run",
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "completed",
+        stage: "skipped",
+        ...validationFields,
+        applyOutcome: "busy",
+        appliedMutations: busy,
+        retryable: true,
+        agentRunId: busyRun.id,
+      });
+      return result({ appliedMutations: busy });
+    }
+
     if (applied.outcome === "replayed") {
       // This exact application already landed: nothing is written again,
       // not even lane history. Only the local cooldown stamp moves, so the

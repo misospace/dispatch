@@ -10,6 +10,7 @@ import {
   commentMarker,
   commentMarkerKey,
   computeApplicationKey,
+  groomerCommentKey,
   computeMutationDiff,
   makePrismaApplicationStore,
   parseManagedBody,
@@ -120,12 +121,18 @@ function diffFor(d: GroomingPlanDraft, snap = snapshot()): GroomingMutationDiff 
 }
 
 describe("managed body section", () => {
-  it("appends one managed section after the human text, which is kept verbatim", () => {
-    const parsed = parseManagedBody("Broken.  ");
-    if (!parsed.ok) throw new Error("parse failed");
-    expect(renderManagedBody(parsed, "## Context\nlogin.ts")).toBe(
-      `Broken.\n\n${MANAGED_BODY_START}\n## Context\nlogin.ts\n${MANAGED_BODY_END}`,
-    );
+  it("appends one managed section after the human text, which is kept byte for byte", () => {
+    for (const [human, separator] of [
+      ["Broken.  ", "\n\n"],
+      ["Broken.\n", "\n"],
+      ["Broken.\r\n\n", ""],
+    ]) {
+      const parsed = parseManagedBody(human);
+      if (!parsed.ok) throw new Error("parse failed");
+      const rendered = renderManagedBody(parsed, "## Context\nlogin.ts");
+      expect(rendered).toBe(`${human}${separator}${MANAGED_BODY_START}\n## Context\nlogin.ts\n${MANAGED_BODY_END}`);
+      expect(rendered.startsWith(human)).toBe(true);
+    }
   });
 
   it("replaces an existing section in place and is a fixed point", () => {
@@ -236,9 +243,17 @@ describe("computeApplicationKey", () => {
     expect(computeApplicationKey({ repoFullName: "org/repo", issueNumber: 42, plan, diff: { ...diff, comment: "hi" } })).not.toBe(base);
   });
 
-  it("is carried by the comment marker", () => {
+  it("is carried by the comment marker, which only counts at the end of a comment Dispatch posted", () => {
     expect(commentMarkerKey(`text\n\n${commentMarker(KEY)}`)).toBe(KEY);
     expect(commentMarkerKey("no marker")).toBeNull();
+    expect(commentMarkerKey(`${commentMarker(KEY)}\n\nsomething after it`)).toBeNull();
+    expect(groomerCommentKey({ author: "itsmiso-ai", body: `x\n\n${commentMarker(KEY)}` })).toBe(KEY);
+    expect(groomerCommentKey({ author: "mallory", body: `x\n\n${commentMarker(KEY)}` })).toBeNull();
+  });
+
+  it("strips any Dispatch marker the model wrote into its comment", () => {
+    const diff = diffFor(draft({}, { githubComment: `Ready. ${commentMarker("b".repeat(64))}` }));
+    expect(diff.comment).toBe("Ready.");
   });
 });
 
@@ -269,6 +284,9 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Ma
       row.steps = JSON.parse(JSON.stringify(data.steps));
     },
     hasRecentComment: async () => false,
+    resume: async (key) => {
+      rows.get(key)!.attempts += 1;
+    },
   };
 }
 
@@ -443,6 +461,50 @@ describe("applyGroomingMutations", () => {
     expect(forced.github.addComment).toHaveBeenCalledTimes(1);
   });
 
+  it("ignores a forged marker from a non-automation author for replay and cooldown", async () => {
+    const forged: LiveComment[] = [
+      { id: 1, author: "mallory", createdAt: new Date().toISOString(), body: `hi\n\n${commentMarker(KEY)}`, url: "m1" },
+      { id: 2, author: "mallory", createdAt: new Date().toISOString(), body: `hi\n\n${commentMarker("b".repeat(64))}`, url: "m2" },
+    ];
+    const { github } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(fullDiff(), { recentComments: forged }), github, memoryStore());
+    expect(github.addComment).toHaveBeenCalledTimes(1);
+    expect(result.steps.comment?.status).toBe("applied");
+  });
+
+  it("does nothing while another attempt holds a fresh unfinished claim on the same key", async () => {
+    const store = memoryStore({
+      applicationKey: KEY,
+      groomingRunId: "run-0",
+      status: "in_progress",
+      steps: {},
+      attempts: 1,
+      updatedAt: new Date(Date.now() - 60 * 1000),
+    });
+    const { github, calls } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, store);
+    expect(result.outcome).toBe("busy");
+    expect(result.claimedByRunId).toBe("run-0");
+    expect(calls).toEqual([]);
+    expect(store.rows.get(KEY)!.attempts).toBe(1);
+  });
+
+  it("resumes an abandoned unfinished claim once it has aged out", async () => {
+    const store = memoryStore({
+      applicationKey: KEY,
+      groomingRunId: "run-0",
+      status: "in_progress",
+      steps: { labels: { status: "applied" } },
+      attempts: 1,
+      updatedAt: new Date(Date.now() - 11 * 60 * 1000),
+    });
+    const { github, calls } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, store);
+    expect(result.outcome).toBe("applied");
+    expect(calls).toEqual(["comment", "content:title+body", "close", "labels:status/done"]);
+    expect(store.rows.get(KEY)!.attempts).toBe(2);
+  });
+
   it("writes nothing when live state already matches the plan", async () => {
     const snap = snapshot({ issue: { ...snapshot().issue, labels: ["priority/p1", "status/ready", "type/bug"] } });
     const { github } = fakeGitHub();
@@ -492,7 +554,22 @@ describe("makePrismaApplicationStore", () => {
     });
     const second = await store.claim({ ...input, groomingRunId: "r2" });
     expect(second.existing).toMatchObject({ applicationKey: KEY, groomingRunId: "r1" });
+    // A repeat claim only reads; resuming it is what counts an attempt.
+    expect(c.groomingApplication.update).not.toHaveBeenCalled();
+    await store.resume(KEY);
     expect(c.groomingApplication.update).toHaveBeenCalledWith({ where: { applicationKey: KEY }, data: { attempts: { increment: 1 } } });
+  });
+
+  it("looks for a recorded hosted-groomer comment on this issue inside the window", async () => {
+    const c = client();
+    const since = new Date("2026-09-25T00:00:00Z");
+    const store = makePrismaApplicationStore(c);
+    expect(await store.hasRecentComment("issue-42", since)).toBe(false);
+    expect(c.groomingRun.findFirst).toHaveBeenCalledWith({
+      where: { issueId: "issue-42", commentUrl: { not: null }, createdAt: { gte: since } },
+    });
+    c.groomingRun.findFirst.mockResolvedValueOnce({ id: "gr-0" } as never);
+    expect(await store.hasRecentComment("issue-42", since)).toBe(true);
   });
 
   it("reads the winner when it loses a concurrent claim (P2002)", async () => {

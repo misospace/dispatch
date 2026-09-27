@@ -109,7 +109,20 @@ function openTrackedIssues(c: GroomingCase, args: unknown) {
 }
 
 /** Run one candidate through the real grooming path. Never touches the network. */
-export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): Promise<GroomingOutcome> {
+/** GroomingApplication rows (#1063); share one between runs to exercise replay. */
+export type ApplicationRows = Map<string, Record<string, unknown> & { applicationKey: string }>;
+
+export interface RunCandidateOptions {
+  applications?: ApplicationRows;
+  /** Distinguishes GroomingRun ids when one case is run more than once. */
+  runId?: string;
+}
+
+export async function runCandidate(
+  c: GroomingCase,
+  candidate: CaseCandidate,
+  options: RunCandidateOptions = {},
+): Promise<GroomingOutcome> {
   const writes: GitHubWrites = { labels: [], titleBody: [], comments: [], closes: 0 };
   let validation: GroomingPlanValidationResult | null = null;
   let catalog: EvidenceCatalog | null = null;
@@ -148,11 +161,12 @@ export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): P
     relatedWork: related,
   };
 
-  const applications = new Map<string, Record<string, unknown> & { applicationKey: string }>();
+  const applications: ApplicationRows = options.applications ?? new Map();
+  const runId = options.runId ?? `run-${c.id}`;
   const prisma = {
     automationRepo: { findUnique: async () => ({ id: "repo-1", fullName: c.repoFullName, enabled: true }) },
     groomingRun: {
-      create: async () => ({ id: `run-${c.id}`, stage: "selected" }),
+      create: async () => ({ id: runId, stage: "selected" }),
       update: async () => ({}),
       findFirst: async () => null,
     },
@@ -170,13 +184,16 @@ export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): P
     groomingApplication: {
       findUnique: async ({ where }: { where: { applicationKey: string } }) => applications.get(where.applicationKey) ?? null,
       create: async ({ data }: { data: Record<string, unknown> }) => {
-        const row = { ...data, applicationKey: String(data.applicationKey), attempts: 1 };
-        applications.set(row.applicationKey, row);
+        const key = String(data.applicationKey);
+        // The unique applicationKey, as Postgres enforces it.
+        if (applications.has(key)) throw Object.assign(new Error("Unique constraint failed on applicationKey"), { code: "P2002" });
+        const row = { ...structuredClone(data), applicationKey: key, attempts: 1 };
+        applications.set(key, row);
         return row;
       },
       update: async ({ where, data }: { where: { applicationKey: string }; data: Record<string, unknown> }) => {
         const row = applications.get(where.applicationKey)!;
-        Object.assign(row, "attempts" in data ? { attempts: Number(row.attempts) + 1 } : data);
+        Object.assign(row, "attempts" in data ? { attempts: Number(row.attempts) + 1 } : structuredClone(data));
         return row;
       },
     },
