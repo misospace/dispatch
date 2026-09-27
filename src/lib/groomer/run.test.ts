@@ -111,7 +111,7 @@ vi.mock("./groomer-lock", () => ({
   HEARTBEAT_MS: 30_000,
 }));
 
-import { runHostedGroomer } from "./run";
+import { captureFailureReason, runHostedGroomer, UNVERIFIABLE_RETRY_BACKOFF_MINUTES } from "./run";
 import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
@@ -1794,6 +1794,7 @@ Investigate session handling in auth module.`;
       const data = mocks.prisma.issue.update.mock.calls[0][0].data;
       expect(Object.keys(data)).toEqual(["groomingRetryAfter"]);
       expect((data.groomingRetryAfter as Date).getTime() - before).toBeGreaterThanOrEqual(59 * 60 * 1000);
+      expect((data.groomingRetryAfter as Date).getTime() - Date.now()).toBeLessThanOrEqual(UNVERIFIABLE_RETRY_BACKOFF_MINUTES * 60 * 1000);
     });
 
     it("a dry run on an uncaptured snapshot skips the model but writes no backoff", async () => {
@@ -1817,6 +1818,7 @@ Investigate session handling in auth module.`;
       const data = mocks.prisma.issue.update.mock.calls[0][0].data;
       expect(Object.keys(data)).toEqual(["groomingRetryAfter"]);
       expect((data.groomingRetryAfter as Date).getTime() - before).toBeGreaterThanOrEqual(59 * 60 * 1000);
+      expect((data.groomingRetryAfter as Date).getTime() - Date.now()).toBeLessThanOrEqual(UNVERIFIABLE_RETRY_BACKOFF_MINUTES * 60 * 1000);
     });
 
     it("still records the unverifiable run when the backoff itself cannot be written", async () => {
@@ -1825,8 +1827,30 @@ Investigate session handling in auth module.`;
       mocks.prisma.issue.update.mockRejectedValueOnce(new Error("db blip"));
       const result = await runHostedGroomer();
       warnSpy.mockRestore();
-      expect(result!.appliedMutations).toMatchObject({ outcome: "unverifiable", retryAfterError: "db blip" });
+      expect(result!.appliedMutations).toMatchObject({ outcome: "unverifiable", retryAfterError: "the retry backoff could not be recorded" });
+      expect(JSON.stringify(completedRun())).not.toContain("db blip");
       expect(completedRun()).toMatchObject({ status: "unverifiable", applyOutcome: "unverifiable" });
+    });
+
+    it("a dry run whose apply-time read is unverifiable reports it without writing a backoff", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      liveStateChangesTo({}, { state: "unknown" });
+      const result = await runHostedGroomer();
+      expect(result!.mutationPlan).toMatchObject({ applyOutcome: "unverifiable", preconditions: { ok: false } });
+      expect(completedRun()).toMatchObject({ status: "dry_run_completed", applyOutcome: "unverifiable" });
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("explains an uncaptured snapshot only from the issue-fetch warning, bounded", () => {
+      expect(
+        captureFailureReason([
+          "evidence: default-branch head SHA unavailable for org/repo@main; repository reads are unpinned for this run",
+          "evidence: failed to fetch live issue state: 404 Not Found",
+        ]),
+      ).toBe("evidence: failed to fetch live issue state: 404 Not Found");
+      expect(captureFailureReason(["evidence: snapshot collection failed"])).toBe("evidence: snapshot collection failed");
+      expect(captureFailureReason(["some unrelated issue warning"])).toBe("the live issue could not be read");
+      expect(captureFailureReason([`evidence: failed to fetch live issue state: ${"x".repeat(1000)}`])).toHaveLength(300);
     });
 
     it("backs off when a check is unverifiable even if another one also changed", async () => {

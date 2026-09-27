@@ -256,7 +256,7 @@ async function executeGroomerRun(
     // so stop before any repository read or model call (dispatch#1063). The
     // issue backs off instead of being re-selected, and re-billed, every tick.
     if (evidence.issue.state === "unknown") {
-      const why = evidence.warnings.find((w) => w.includes("issue")) ?? evidence.warnings[0] ?? "the live issue could not be read";
+      const why = captureFailureReason(evidence.warnings);
       const failures = [`issue: the evidence snapshot did not capture the live issue: ${why}`];
       const unverifiable: Record<string, unknown> = { outcome: "unverifiable", preconditionFailures: failures };
       const evidenceSummary = { evidence: summarizeEvidenceForPersistence(evidence) };
@@ -1077,7 +1077,24 @@ async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promi
     return { retryAfter: retryAfter.toISOString() };
   } catch (error) {
     // The run is still recorded; only the backoff is lost for this attempt.
+    // The error itself is logged, not persisted: driver text stays out of history.
     console.warn(`[groomer] failed to record the retry backoff for issue ${issueId}:`, error);
-    return { retryAfterError: error instanceof Error ? error.message : String(error) };
+    return { retryAfterError: "the retry backoff could not be recorded" };
   }
+}
+
+/** Snapshot capture warnings that explain a missing live issue, most specific first. */
+const CAPTURE_FAILURE_PREFIXES = ["evidence: failed to fetch live issue state", "evidence: snapshot collection failed"];
+const MAX_PERSISTED_REASON_CHARS = 300;
+
+/**
+ * Why the snapshot has no live issue, from its own capture warnings: only a
+ * warning about the issue fetch itself, bounded, never an unrelated warning.
+ */
+export function captureFailureReason(warnings: string[]): string {
+  for (const prefix of CAPTURE_FAILURE_PREFIXES) {
+    const match = warnings.find((w) => w.startsWith(prefix));
+    if (match) return match.length <= MAX_PERSISTED_REASON_CHARS ? match : `${match.slice(0, MAX_PERSISTED_REASON_CHARS - 1)}…`;
+  }
+  return "the live issue could not be read";
 }
