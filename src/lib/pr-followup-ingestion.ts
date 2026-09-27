@@ -68,7 +68,8 @@ export function isAllowedBotAuthor(author: string | null | undefined): boolean {
  * Check if the repo owner is in the allowlist.
  * If no allowlist is configured, all owners are allowed (opt-in safety).
  */
-export function isAllowedBranchOwner(repoFullName: string): boolean {
+export function isAllowedBranchOwner(repoFullName: string | null | undefined): boolean {
+  if (!repoFullName) return false;
   const config = getConfig();
   if (config.branchOwnerAllowlist.length === 0) {
     // No explicit allowlist — default to repo owner only (safe default).
@@ -889,6 +890,13 @@ export async function processPrFollowupEvents(
   let skipped = 0;
 
   for (const event of events) {
+    if (!event.repoFullName) {
+      console.warn(
+        `Skipping PR followup event (${event.eventType} #${event.prNumber}): no repository full name in payload`,
+      );
+      skipped++;
+      continue;
+    }
     try {
       const descriptor = INGEST_DESCRIPTORS[event.eventType];
       if (!descriptor || !descriptor.isIngestible(event)) {

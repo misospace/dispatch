@@ -479,24 +479,45 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
     mocks.processPrFollowupEvents.mockResolvedValue({ enqueued: 1, skipped: 0 });
   });
 
-  const pr = {
+  // Trimmed GitHub webhook payloads (shapes per the octokit/openapi-webhooks
+  // schema). `repository` and `sender` are top-level on every event.
+  const repository = {
+    id: 1296269,
+    name: "repo",
+    full_name: "org/repo",
+    owner: { login: "org" },
+    html_url: "https://github.com/org/repo",
+  };
+  const sender = { login: "itsmiso-ai", type: "User" };
+
+  const pullRequest = {
     id: 9001,
     number: 42,
     state: "open",
-    merged_at: null,
     html_url: "https://github.com/org/repo/pull/42",
+    url: "https://api.github.com/repos/org/repo/pulls/42",
     title: "Fix bug (#7)",
-    user: { login: "bot-user" },
-    head: { ref: "fix/issue-7", sha: "abc123" },
-    base: { repo: { full_name: "org/repo" } },
+    body: "Closes #7",
+    user: { login: "itsmiso-ai" },
+    merged_at: null,
     mergeable_state: "dirty",
+    head: { ref: "fix/issue-7", sha: "abc123", repo: { full_name: "org/repo" } },
+    base: { ref: "main", sha: "def456", repo: { full_name: "org/repo" } },
   };
 
   it("builds a review event from pull_request_review", async () => {
     const res = await signedRequest("pull_request_review", {
       action: "submitted",
-      review: { id: 555, body: "Please fix", state: "CHANGES_REQUESTED" },
-      pull_request: pr,
+      review: {
+        id: 555,
+        body: "Please fix",
+        state: "changes_requested",
+        user: { login: "reviewer" },
+        commit_id: "abc123",
+      },
+      pull_request: pullRequest,
+      repository,
+      sender,
     });
 
     expect(res.status).toBe(200);
@@ -508,10 +529,10 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         branch: "fix/issue-7",
         url: "https://github.com/org/repo/pull/42",
         title: "Fix bug (#7)",
-        author: "bot-user",
+        author: "itsmiso-ai",
         body: "Please fix",
         id: "555",
-        state: "CHANGES_REQUESTED",
+        state: "changes_requested",
         linkedIssue: 7,
         prState: "open",
         prMergedAt: null,
@@ -523,8 +544,16 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
   it("builds a comment event from pull_request_review_comment", async () => {
     const res = await signedRequest("pull_request_review_comment", {
       action: "created",
-      comment: { id: 777, body: "nit: rename this" },
-      pull_request: pr,
+      comment: {
+        id: 777,
+        body: "nit: rename this",
+        path: "src/app.ts",
+        line: 12,
+        user: { login: "reviewer" },
+      },
+      pull_request: pullRequest,
+      repository,
+      sender,
     });
 
     expect(res.status).toBe(200);
@@ -536,7 +565,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         branch: "fix/issue-7",
         url: "https://github.com/org/repo/pull/42",
         title: "Fix bug (#7)",
-        author: "bot-user",
+        author: "itsmiso-ai",
         body: "nit: rename this",
         id: "777",
         linkedIssue: 7,
@@ -545,38 +574,66 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
     ]);
   });
 
+  // Regression for #1087: the issue object has no `repository` or `head`, so
+  // the repo must come from the top-level `repository`.
   it("builds a comment event from issue_comment on a pull request", async () => {
     const res = await signedRequest("issue_comment", {
       action: "created",
-      comment: { id: 888, body: "please rebase" },
-      issue: {
-        number: 42,
-        html_url: "https://github.com/org/repo/pull/42",
-        title: "Fix bug (#7)",
-        user: { login: "bot-user" },
-        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/42" },
-        repository: { full_name: "org/repo" },
+      comment: {
+        id: 888,
+        body: "please rebase",
+        user: { login: "reviewer" },
+        html_url: "https://github.com/org/repo/pull/42#issuecomment-888",
       },
+      issue: {
+        id: 123,
+        number: 42,
+        state: "open",
+        title: "Fix bug (#7)",
+        body: "Closes #7",
+        html_url: "https://github.com/org/repo/pull/42",
+        repository_url: "https://api.github.com/repos/org/repo",
+        user: { login: "itsmiso-ai" },
+        pull_request: {
+          url: "https://api.github.com/repos/org/repo/pulls/42",
+          html_url: "https://github.com/org/repo/pull/42",
+          merged_at: null,
+        },
+      },
+      repository,
+      sender,
     });
 
     expect(res.status).toBe(200);
     expect(ingestedEvents()).toEqual([
-      expect.objectContaining({
+      {
         eventType: "comment",
         repoFullName: "org/repo",
         prNumber: 42,
+        branch: null,
+        url: "https://github.com/org/repo/pull/42",
+        title: "Fix bug (#7)",
+        author: "itsmiso-ai",
         body: "please rebase",
         id: "888",
         linkedIssue: 7,
-      }),
+        headSha: null,
+      },
     ]);
   });
 
   it("ignores issue_comment on a plain issue (no pull_request)", async () => {
     const res = await signedRequest("issue_comment", {
       action: "created",
-      comment: { id: 888, body: "hi" },
-      issue: { number: 3, title: "Plain issue" },
+      comment: { id: 889, body: "hi", user: { login: "someone" } },
+      issue: {
+        number: 3,
+        title: "Plain issue",
+        html_url: "https://github.com/org/repo/issues/3",
+        user: { login: "someone" },
+      },
+      repository,
+      sender,
     });
 
     expect(res.status).toBe(200);
@@ -584,21 +641,36 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
     expect(mocks.processPrFollowupEvents).not.toHaveBeenCalled();
   });
 
+  // Regression for #1087: pull_requests[] items are pull-request-minimal
+  // objects whose `url` is the API URL (/pulls/N), with the number given
+  // directly and no author; the repo is the top-level `repository`.
   it("builds a check_run event from the first associated pull request", async () => {
     const res = await signedRequest("check_run", {
       action: "completed",
       check_run: {
         id: 321,
         name: "lint",
+        head_sha: "abc123",
+        status: "completed",
         conclusion: "failure",
-        head_branch: "fix/issue-7",
+        url: "https://api.github.com/repos/org/repo/check-runs/321",
         html_url: "https://github.com/org/repo/runs/321",
-        output: { summary: "2 errors" },
-        repository: { full_name: "org/repo" },
+        details_url: "https://github.com/org/repo/actions/runs/1/job/321",
+        output: { title: "Lint failed", summary: "2 errors", text: null, annotations_count: 2 },
+        check_suite: { id: 5, head_branch: "fix/issue-7", head_sha: "abc123" },
+        app: { slug: "github-actions" },
         pull_requests: [
-          { url: "https://github.com/org/repo/pull/42", title: "Fix bug (#7)", user: { login: "bot-user" } },
+          {
+            id: 9001,
+            number: 42,
+            url: "https://api.github.com/repos/org/repo/pulls/42",
+            head: { ref: "fix/issue-7", sha: "abc123", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
+            base: { ref: "main", sha: "def456", repo: { id: 1296269, url: "https://api.github.com/repos/org/repo", name: "repo" } },
+          },
         ],
       },
+      repository,
+      sender: { login: "github-actions[bot]", type: "Bot" },
     });
 
     expect(res.status).toBe(200);
@@ -610,21 +682,54 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         branch: "fix/issue-7",
         url: "https://github.com/org/repo/runs/321",
         title: "lint",
-        author: "bot-user",
+        author: null,
         body: "2 errors",
         id: "321",
         conclusion: "failure",
         checkName: "lint",
-        linkedIssue: 7,
-        headSha: null,
+        linkedIssue: null,
+        headSha: "abc123",
       },
+    ]);
+  });
+
+  it("falls back to check_suite.head_branch and check_run.head_sha when the PR head is absent", async () => {
+    const res = await signedRequest("check_run", {
+      action: "completed",
+      check_run: {
+        id: 322,
+        name: "test",
+        head_sha: "fff999",
+        conclusion: "failure",
+        html_url: "https://github.com/org/repo/runs/322",
+        output: { summary: null },
+        check_suite: { id: 6, head_branch: "fix/other" },
+        pull_requests: [{ id: 9002, number: 43, url: "https://api.github.com/repos/org/repo/pulls/43" }],
+      },
+      repository,
+      sender,
+    });
+
+    expect(res.status).toBe(200);
+    expect(ingestedEvents()).toEqual([
+      expect.objectContaining({ prNumber: 43, branch: "fix/other", headSha: "fff999", body: "" }),
     ]);
   });
 
   it("ignores check_run with no associated pull request", async () => {
     const res = await signedRequest("check_run", {
       action: "completed",
-      check_run: { id: 321, name: "lint", conclusion: "failure", pull_requests: [] },
+      check_run: {
+        id: 323,
+        name: "lint",
+        head_sha: "abc123",
+        conclusion: "failure",
+        html_url: "https://github.com/org/repo/runs/323",
+        check_suite: { id: 7, head_branch: "main" },
+        pull_requests: [],
+      },
+      repository,
+      sender,
     });
 
     expect(res.status).toBe(200);
@@ -633,7 +738,15 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
   });
 
   it("builds a merge_state event from pull_request", async () => {
-    const res = await signedRequest("pull_request", { action: "synchronize", pull_request: pr });
+    const res = await signedRequest("pull_request", {
+      action: "synchronize",
+      number: 42,
+      before: "000111",
+      after: "abc123",
+      pull_request: pullRequest,
+      repository,
+      sender,
+    });
 
     expect(res.status).toBe(200);
     expect(ingestedEvents()).toEqual([
@@ -644,7 +757,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         branch: "fix/issue-7",
         url: "https://github.com/org/repo/pull/42",
         title: "Fix bug (#7)",
-        author: "bot-user",
+        author: "itsmiso-ai",
         mergeStateStatus: "dirty",
         id: "9001",
         linkedIssue: 7,
@@ -656,7 +769,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
   });
 
   it("returns 'No events to process' for a known event with no pull_request payload", async () => {
-    const res = await signedRequest("pull_request_review", { action: "submitted" });
+    const res = await signedRequest("pull_request_review", { action: "submitted", repository, sender });
 
     expect(res.status).toBe(200);
     expect((await res.json()).message).toBe("No events to process");
@@ -664,7 +777,12 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
   });
 
   it("treats the issues event as unhandled", async () => {
-    const res = await signedRequest("issues", { action: "opened", issue: { number: 1 } });
+    const res = await signedRequest("issues", {
+      action: "opened",
+      issue: { number: 1, title: "x" },
+      repository,
+      sender,
+    });
 
     expect(res.status).toBe(200);
     expect((await res.json()).message).toBe("Unhandled event type: issues");
