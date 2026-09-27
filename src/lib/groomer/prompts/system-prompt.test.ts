@@ -103,10 +103,60 @@ describe("buildGroomerSystemPrompt", () => {
     expect(prompt).toContain("NEVER include @username mentions in githubComment");
   });
 
-  it("includes the JSON schema example", () => {
+  it("asks for the GroomingPlan shape, analysis separate from mutations", () => {
     const prompt = buildGroomerSystemPrompt(baseParams);
     expect(prompt).toContain('"actionability": "ready|needs_info|blocked|backlog|already_done"');
-    expect(prompt).toContain('"labelsToAdd": ["status/ready", "priority/p1"]');
+    expect(prompt).toContain('"workType": "implementation|design"');
+    for (const section of ['"verdict"', '"implementationBrief"', '"mutations"', '"decomposition"', '"relatedWork"']) {
+      expect(prompt).toContain(section);
+    }
+    expect(prompt).toContain('"verification": "automated_test|command|code_inspection|subjective"');
+    // Status is derived from the verdict, never a label the model picks.
+    expect(prompt).not.toContain('"labelsToAdd": ["status/ready"');
+    expect(prompt).toContain("Never put status/* in labelsToAdd or labelsToRemove");
+  });
+
+  describe("evidence and readiness (dispatch#1062)", () => {
+    it("restricts citations to the run's evidence catalog", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("Evidence you can cite");
+      expect(prompt).toContain("Never invent an id");
+    });
+
+    it("treats automation comments as context, never support", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("it never counts as support for any decision");
+    });
+
+    it("states the readiness invariant the validator enforces", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("Readiness rules (Dispatch rejects a \"ready\" plan that breaks any of these)");
+      expect(prompt).toContain("No material uncertainty remains.");
+      expect(prompt).toContain("every acceptance criterion is deterministic");
+      expect(prompt).toContain("decomposition.required is false");
+    });
+
+    it("lets unknowns be recorded instead of guessed", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain("Unknown is an answer.");
+    });
+
+    it("keeps design work out of the default lane and routes it to escalation", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain('Design work never goes in the "local" lane.');
+      expect(prompt).toContain('Design work may be ready only in the "cloud" lane');
+      expect(prompt).toContain("Do not invent an implementation approach");
+    });
+
+    it("says design work is not ready when no escalation lane exists", () => {
+      const prompt = buildGroomerSystemPrompt({ ...baseParams, escalationLaneId: "" });
+      expect(prompt).toContain("No escalation lane is configured, so design work is not ready");
+    });
+
+    it("leaves dependency gating to Dispatch's depends-on gate", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      expect(prompt).toContain('a declared blocker alone is not a reason to mark blocked');
+    });
   });
 
   it("includes default lane guidance", () => {
@@ -153,6 +203,7 @@ describe("buildGroomerSystemPrompt", () => {
         const prompt = buildGroomerSystemPrompt(baseParams);
         expect(prompt).toContain('"already_done"');
         expect(prompt).toContain("status/done");
+        expect(prompt).toContain('Set mutations.close to reason "already_done"');
         // The model does not need to call close — the runner handles it.
         expect(prompt).toContain("closes the issue on");
       });

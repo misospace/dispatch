@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { GroomingCandidate } from "./selector";
-import type { GroomerOutput } from "./schema";
+import type { GroomingPlanDraft } from "./plan";
 import type { HostedGroomerConfig } from "./config";
 import type { ExploreResult } from "./explore";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
@@ -21,7 +21,6 @@ const { mocks } = vi.hoisted(() => ({
     callGroomerLLM: vi.fn(),
     fetchIssueComments: vi.fn(),
     buildIssueContext: vi.fn(),
-    validateGroomerOutput: vi.fn(),
     getHostedGroomerConfig: vi.fn(),
     updateIssueLabels: vi.fn(),
     addIssueComment: vi.fn(),
@@ -60,10 +59,6 @@ vi.mock("./llm", () => ({
 vi.mock("./context", () => ({
   fetchIssueComments: mocks.fetchIssueComments,
   buildIssueContext: mocks.buildIssueContext,
-}));
-
-vi.mock("./schema", () => ({
-  validateGroomerOutput: mocks.validateGroomerOutput,
 }));
 
 vi.mock("./config", () => ({
@@ -123,12 +118,71 @@ const mockCandidate: GroomingCandidate = {
   groomingSummary: null,
 };
 
-const mockOutput: GroomerOutput = {
-  labelsToAdd: ["status/ready"],
-  labelsToRemove: [],
-  lane: { id: "local", confidence: "high", reason: "clear implementation task" },
-  summary: "Ready for work.",
+// A ready GroomingPlan draft that validates against mockEvidence.
+const mockOutput: GroomingPlanDraft = {
+  verdict: {
+    actionability: "ready",
+    workType: "implementation",
+    confidence: "high",
+    lane: { id: "local", confidence: "high", reason: "clear implementation task" },
+    summary: "Ready for work.",
+    rationale: "login.ts drops the return URL after a reset; the fix is local.",
+    evidenceRefs: ["repo:src/auth/login.ts"],
+    uncertainties: [],
+  },
+  implementationBrief: {
+    problem: "Login fails after password reset.",
+    verifiedCurrentBehavior: { statement: "The reset path skips the session refresh.", evidenceRefs: ["repo:src/auth/login.ts"] },
+    relevantPaths: [{ ref: "repo:src/auth/login.ts", change: "modify" }],
+    filesToCreate: [],
+    invariants: [],
+    inScope: ["refresh the session after a reset"],
+    outOfScope: [],
+    dependencies: [],
+    acceptanceCriteria: [{ criterion: "reset-then-login test passes", verification: "automated_test" }],
+    tests: ["login after reset"],
+  },
+  mutations: {
+    labelsToAdd: [],
+    labelsToRemove: [],
+    proposedTitle: null,
+    proposedBody: null,
+    githubComment: null,
+    close: null,
+  },
+  decomposition: { required: false, reason: null, childBriefs: [] },
+  relatedWork: [],
 };
+
+type DraftPatch = {
+  verdict?: Partial<GroomingPlanDraft["verdict"]>;
+  implementationBrief?: GroomingPlanDraft["implementationBrief"];
+  mutations?: Partial<GroomingPlanDraft["mutations"]>;
+  decomposition?: GroomingPlanDraft["decomposition"];
+  relatedWork?: GroomingPlanDraft["relatedWork"];
+};
+
+function planDraft(patch: DraftPatch = {}): GroomingPlanDraft {
+  return {
+    verdict: { ...mockOutput.verdict, ...patch.verdict },
+    implementationBrief: patch.implementationBrief === undefined ? mockOutput.implementationBrief : patch.implementationBrief,
+    mutations: { ...mockOutput.mutations, ...patch.mutations },
+    decomposition: patch.decomposition ?? mockOutput.decomposition,
+    relatedWork: patch.relatedWork ?? mockOutput.relatedWork,
+  };
+}
+
+/** A non-ready draft: the model's verdict parks the issue. */
+function notReadyDraft(
+  actionability: "needs_info" | "blocked" | "backlog" | "already_done",
+  patch: DraftPatch = {},
+): GroomingPlanDraft {
+  return planDraft({
+    ...patch,
+    verdict: { actionability, lane: { id: "backlog", confidence: "medium", reason: "not ready yet" }, ...patch.verdict },
+    implementationBrief: patch.implementationBrief ?? null,
+  });
+}
 
 const mockConfig: HostedGroomerConfig = {
   enabled: true,
@@ -174,7 +228,7 @@ const mockEvidence: GroomingEvidenceSnapshot = {
   comments: [],
   evidenceDigest: "digest",
   warnings: [],
-  sources: [],
+  sources: [{ path: "src/auth/login.ts", provenance: "repository", ref: "abc123" }],
 };
 
 const mockExploration: ExploreResult = {
@@ -196,7 +250,6 @@ describe("runHostedGroomer", () => {
     mocks.selectGroomingCandidate.mockResolvedValue(mockCandidate);
     mocks.fetchIssueComments.mockResolvedValue([]);
     mocks.buildIssueContext.mockResolvedValue("test context");
-    mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: mockOutput });
     mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
     mocks.callGroomerLLM.mockResolvedValue(mockOutput);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
@@ -259,7 +312,7 @@ describe("runHostedGroomer", () => {
       // The LLM call hangs for 95s — three heartbeat intervals. Without the
       // heartbeat the 90s TTL would reclaim the lock mid-run; with it, the
       // lock stays fresh for the whole run.
-      let resolveLLM: (value: GroomerOutput) => void;
+      let resolveLLM: (value: GroomingPlanDraft) => void;
       mocks.callGroomerLLM.mockReturnValue(
         new Promise((resolve) => {
           resolveLLM = resolve;
@@ -388,6 +441,7 @@ describe("runHostedGroomer", () => {
     );
     expect(exploredCall).toBeDefined();
     expect(exploredCall![0].data.contextSummary.evidence.sources).toEqual([
+      { path: "src/auth/login.ts", provenance: "repository", ref: "abc123" },
       { path: "src/lib/prisma.ts", provenance: "repository", ref: "abc123" },
       {
         key: "github:pr:org/repo#7",
@@ -478,6 +532,9 @@ describe("runHostedGroomer", () => {
     it("evidence capture failure does not fail the run", async () => {
       mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
       mocks.collectGroomingEvidenceSnapshot.mockRejectedValue(new Error("boom"));
+      // With no snapshot the prompt says nothing can be ready; a model that
+      // listens parks the issue and the run completes.
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { evidenceRefs: [] } }));
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
         const result = await runHostedGroomer();
@@ -575,10 +632,7 @@ describe("runHostedGroomer", () => {
 
   it("write mode cooldown skips duplicate comment", async () => {
     mocks.prisma.groomingRun.findFirst.mockResolvedValue({ id: "gr-previous" });
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, githubComment: "Test comment" },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Test comment" } }));
 
     const result = await runHostedGroomer();
 
@@ -588,10 +642,7 @@ describe("runHostedGroomer", () => {
 
   it("write mode stores comment URL when comment is posted", async () => {
     mocks.addIssueComment.mockResolvedValue({ url: "https://github.com/org/repo/issues/42#issuecomment-123" });
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, githubComment: "Test comment" },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Test comment" } }));
 
     const result = await runHostedGroomer();
 
@@ -600,13 +651,14 @@ describe("runHostedGroomer", () => {
   });
 
   it("write mode neutralizes @-mentions in posted comment", async () => {
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: {
-        ...mockOutput,
-        githubComment: "@reviewer This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
-      },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(
+      planDraft({
+        mutations: {
+          githubComment:
+            "@reviewer This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
+        },
+      }),
+    );
 
     await runHostedGroomer();
 
@@ -643,9 +695,9 @@ describe("runHostedGroomer", () => {
   });
 
   it("throws when validation fails", async () => {
-    mocks.validateGroomerOutput.mockReturnValue({ valid: false, errors: ["invalid lane"] });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } }));
 
-    await expect(runHostedGroomer()).rejects.toThrow(/invalid lane/);
+    await expect(runHostedGroomer()).rejects.toThrow(/verdict\.lane\.id: must be a configured lane/);
   });
 
   it("fails on LLM error", async () => {
@@ -690,11 +742,7 @@ describe("runHostedGroomer", () => {
   });
 
   it("does not post comment when githubComment is empty", async () => {
-    const outputWithoutComment: GroomerOutput = {
-      ...mockOutput,
-      githubComment: undefined,
-    };
-    mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: outputWithoutComment });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "   " } }));
 
     await runHostedGroomer();
 
@@ -702,10 +750,7 @@ describe("runHostedGroomer", () => {
   });
 
   it("posts one comment when githubComment is present", async () => {
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, githubComment: "Likely root cause found." },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Likely root cause found." } }));
 
     await runHostedGroomer();
 
@@ -717,11 +762,10 @@ describe("runHostedGroomer", () => {
   });
 
   it("truncates githubComment before posting", async () => {
-    const longComment = "x".repeat(5000);
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, githubComment: longComment },
-    });
+    // Within the plan's 4000-char bound, but neutralized mentions grow it past
+    // the 4096-char GitHub cap.
+    const longComment = "@a ".repeat(1333);
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: longComment } }));
 
     await runHostedGroomer();
 
@@ -730,10 +774,7 @@ describe("runHostedGroomer", () => {
 
   it("comment posting is best-effort: a persistent addComment failure does not fail the run", async () => {
     mocks.addIssueComment.mockRejectedValue(new Error("GitHub API error adding comment: 504"));
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, githubComment: "Likely root cause found." },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Likely root cause found." } }));
 
     const result = await runHostedGroomer();
 
@@ -762,10 +803,7 @@ describe("runHostedGroomer", () => {
     mocks.addIssueComment
       .mockRejectedValueOnce(new Error("GitHub API error adding comment: 504"))
       .mockResolvedValueOnce({ url: "https://github.com/org/repo/issues/42#issuecomment-999" });
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, githubComment: "Likely root cause found." },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Likely root cause found." } }));
 
     const result = await runHostedGroomer();
 
@@ -830,10 +868,7 @@ describe("runHostedGroomer", () => {
   // ─── Title rewriting tests ───
 
   it("does not rewrite a good title", async () => {
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedTitle: "Fix the login bug" },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedTitle: "Fix the login bug" } }));
 
     const result = await runHostedGroomer();
 
@@ -845,13 +880,7 @@ describe("runHostedGroomer", () => {
   it("rewrites a bad short title", async () => {
     const badCandidate = { ...mockCandidate, title: "P0" };
     mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: {
-        ...mockOutput,
-        proposedTitle: "Fix SSO/OIDC callback state verification mismatch causing 400 errors",
-      },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedTitle: "Fix SSO/OIDC callback state verification mismatch causing 400 errors" } }));
 
     const result = await runHostedGroomer();
 
@@ -868,10 +897,7 @@ describe("runHostedGroomer", () => {
   it("rewrites a single-word generic title like TODO", async () => {
     const badCandidate = { ...mockCandidate, title: "TODO" };
     mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedTitle: "Implement user authentication flow" },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedTitle: "Implement user authentication flow" } }));
 
     const result = await runHostedGroomer();
 
@@ -882,10 +908,7 @@ describe("runHostedGroomer", () => {
   it("rewrites an empty title", async () => {
     const badCandidate = { ...mockCandidate, title: "" };
     mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedTitle: "Add missing error handling for database connections" },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedTitle: "Add missing error handling for database connections" } }));
 
     const result = await runHostedGroomer();
 
@@ -901,10 +924,7 @@ describe("runHostedGroomer", () => {
       body: "This is a detailed issue description that explains the problem clearly with enough context and detail for developers to understand what needs to be done.",
     };
     mocks.selectGroomingCandidate.mockResolvedValue(goodCandidate);
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedBody: "Enriched body content." },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedBody: "Enriched body content." } }));
 
     const result = await runHostedGroomer();
 
@@ -923,10 +943,7 @@ This issue relates to the login flow.
 
 ## Suggested approach
 Investigate session handling in auth module.`;
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedBody: enrichedBody },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedBody: enrichedBody } }));
 
     const result = await runHostedGroomer();
 
@@ -943,10 +960,7 @@ Investigate session handling in auth module.`;
     const noBodyCandidate = { ...mockCandidate, body: null };
     mocks.selectGroomingCandidate.mockResolvedValue(noBodyCandidate);
     const enrichedBody = "## Description\nMore detail needed.\n\n## Labels\npriority/p0";
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedBody: enrichedBody },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedBody: enrichedBody } }));
 
     const result = await runHostedGroomer();
 
@@ -958,14 +972,9 @@ Investigate session handling in auth module.`;
     const badCandidate = { ...mockCandidate, title: "P0", body: "Fix." };
     mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
     const enrichedBody = "## Context\nSSO login is broken.\n\n## What's known\nState verification fails on callback.";
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: {
-        ...mockOutput,
-        proposedTitle: "Fix SSO callback state mismatch",
-        proposedBody: enrichedBody,
-      },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(
+      planDraft({ mutations: { proposedTitle: "Fix SSO callback state mismatch", proposedBody: enrichedBody } }),
+    );
 
     const result = await runHostedGroomer();
 
@@ -987,10 +996,7 @@ Investigate session handling in auth module.`;
     const badCandidate = { ...mockCandidate, title: "P0" };
     mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
     mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: { ...mockOutput, proposedTitle: "Fix the thing" },
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedTitle: "Fix the thing" } }));
 
     const result = await runHostedGroomer();
 
@@ -1000,26 +1006,17 @@ Investigate session handling in auth module.`;
   });
 
   it("skips title/body update when LLM does not propose changes", async () => {
-    mocks.validateGroomerOutput.mockReturnValue({
-      valid: true,
-      parsed: mockOutput, // no proposedTitle or proposedBody
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft()); // no proposedTitle or proposedBody
 
     await runHostedGroomer();
 
     expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
   });
 
-  it("normalizes explicit LLM nulls to undefined through the real schema validator", async () => {
-    const { validateGroomerOutput } = await vi.importActual<typeof import("./schema")>("./schema");
-    mocks.validateGroomerOutput.mockImplementation(validateGroomerOutput);
+  it("normalizes explicit LLM nulls to undefined in the legacy output view", async () => {
     const badCandidate = { ...mockCandidate, title: "P0" };
     mocks.selectGroomingCandidate.mockResolvedValue(badCandidate);
-    mocks.callGroomerLLM.mockResolvedValue({
-      ...mockOutput,
-      proposedTitle: null,
-      proposedBody: null,
-    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { proposedTitle: null, proposedBody: null } }));
 
     const result = await runHostedGroomer();
 
@@ -1030,20 +1027,16 @@ Investigate session handling in auth module.`;
     expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
   });
 
-  describe("mark_not_ready notReadyReason degradation (dispatch#839)", () => {
-    const notReadyOutput: GroomerOutput = {
-      labelsToAdd: ["status/backlog"],
-      labelsToRemove: [],
-      lane: { id: "backlog", confidence: "medium", reason: "not ready yet" },
-      summary: "Not ready.",
-      nextGroomingAction: "mark_not_ready",
-    };
+  describe("not-ready reasons (dispatch#839)", () => {
+    // Under the plan contract a backlog verdict always carries a rationale,
+    // which becomes notReadyReason, so the run never persists mark_not_ready
+    // without a reason.
+    const notReadyOutput = notReadyDraft("backlog", {
+      verdict: { summary: "Not ready.", rationale: "auditor prioritized it low" },
+    });
 
-    it("persists the model-supplied notReadyReason in the normal case", async () => {
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: { ...notReadyOutput, notReadyReason: "auditor prioritized it low" },
-      });
+    it("persists the verdict rationale as notReadyReason", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(notReadyOutput);
 
       const result = await runHostedGroomer();
 
@@ -1058,97 +1051,36 @@ Investigate session handling in auth module.`;
       );
     });
 
-    it("uses this run's summary when the model omits notReadyReason (first-groom path)", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      // No prior groomingSummary on the candidate (first-time groom) and no
-      // model reason, but the run produced a summary — the content that is
-      // about to be written to groomingSummary anyway.
-      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: notReadyOutput });
-
-      const result = await runHostedGroomer();
-
-      expect(result).not.toBeNull();
+    it("maps blocked and needs_info rationales to their own reason fields", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("blocked", { verdict: { rationale: "waiting on the vendor API" } }));
+      await runHostedGroomer();
       expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({
-            nextGroomingAction: "mark_not_ready",
-            notReadyReason: "Not ready.",
-          }),
+          data: expect.objectContaining({ nextGroomingAction: "mark_blocked", blockedReason: "waiting on the vendor API" }),
         }),
       );
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("used this run's summary"),
+
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("needs_info", { verdict: { rationale: "which tenant?" } }));
+      await runHostedGroomer();
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ nextGroomingAction: "mark_needs_info", needsInfoReason: "which tenant?" }),
+        }),
       );
-      warnSpy.mockRestore();
     });
 
-    it("falls back to the existing groomingSummary when the model omits notReadyReason and produced no summary", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      mocks.selectGroomingCandidate.mockResolvedValue({
-        ...mockCandidate,
-        groomingSummary: "auditor prioritized it low and moved to backlog",
-      });
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: { ...notReadyOutput, summary: undefined },
-      });
-
-      const result = await runHostedGroomer();
-
-      expect(result).not.toBeNull();
-      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            nextGroomingAction: "mark_not_ready",
-            notReadyReason: "auditor prioritized it low and moved to backlog",
-          }),
-        }),
-      );
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("fell back to existing groomingSummary"),
-      );
-      warnSpy.mockRestore();
-    });
-
-    it("persists the action without a reason and warns when nothing is available", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: { ...notReadyOutput, summary: undefined },
-      });
-
-      const result = await runHostedGroomer();
-
-      expect(result).not.toBeNull();
-      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ nextGroomingAction: "mark_not_ready" }),
-        }),
-      );
-      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.not.objectContaining({ notReadyReason: expect.anything() }),
-        }),
-      );
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("persisting the action without a reason"),
-      );
-      warnSpy.mockRestore();
-    });
-
-    it("prefers this run's summary over a prior one in the dry-run mutation plan", async () => {
+    it("uses this run's rationale over a prior summary in the dry-run mutation plan", async () => {
       mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
       mocks.selectGroomingCandidate.mockResolvedValue({
         ...mockCandidate,
         groomingSummary: "deferred by maintainer",
       });
-      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: notReadyOutput });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyOutput);
 
       const result = await runHostedGroomer();
 
-      // notReadyOutput.summary ("Not ready.") outranks the prior
-      // groomingSummary ("deferred by maintainer").
-      expect(result!.mutationPlan?.notReadyReason).toBe("Not ready.");
+      expect(result!.mutationPlan?.notReadyReason).toBe("auditor prioritized it low");
       expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
     });
   });
@@ -1162,18 +1094,11 @@ Investigate session handling in auth module.`;
 
     it("restores status/backlog when a non-ready re-groom drops the status label", async () => {
       mocks.selectGroomingCandidate.mockResolvedValue(parkedCandidate);
-      // The LLM removes status/backlog but adds no status label and picks the
-      // non-claimable backlog lane — the exact pinchflat#81 shape that left the
-      // issue with zero status labels.
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: {
-          labelsToAdd: [],
-          labelsToRemove: ["status/backlog"],
-          lane: { id: "backlog", confidence: "medium", reason: "re-groomed, still parked" },
-          summary: "Re-groomed.",
-        },
-      });
+      // A non-ready re-groom: status is derived from the verdict, so the
+      // pinchflat#81 shape (old status removed, none added) cannot occur.
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", { verdict: { summary: "Re-groomed.", rationale: "still parked" } }),
+      );
 
       const result = await runHostedGroomer();
 
@@ -1185,17 +1110,8 @@ Investigate session handling in auth module.`;
 
     it("restores status/ready when a ready re-groom drops the status label", async () => {
       mocks.selectGroomingCandidate.mockResolvedValue(parkedCandidate);
-      // Ready re-groom: removes the old status, adds no status label, but the
-      // lane is claimable so the issue is workable — it must land on status/ready.
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: {
-          labelsToAdd: [],
-          labelsToRemove: ["status/backlog"],
-          lane: { id: "local", confidence: "high", reason: "determinate fix" },
-          summary: "Marking ready for the local worker lane.",
-        },
-      });
+      // Ready re-groom: the old status is replaced by status/ready.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
 
       const result = await runHostedGroomer();
 
@@ -1207,16 +1123,8 @@ Investigate session handling in auth module.`;
 
     it("keeps a single status label when the groom adds none and the issue had one", async () => {
       mocks.selectGroomingCandidate.mockResolvedValue(parkedCandidate);
-      // No status change at all: the existing status/backlog must survive.
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: {
-          labelsToAdd: [],
-          labelsToRemove: [],
-          lane: { id: "backlog", confidence: "medium", reason: "no change" },
-          summary: "No change.",
-        },
-      });
+      // Still backlog: the existing status/backlog survives, not duplicated.
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { summary: "No change." } }));
 
       const result = await runHostedGroomer();
 
@@ -1231,16 +1139,8 @@ Investigate session handling in auth module.`;
         ...parkedCandidate,
         labels: ["status/backlog", "status/ready", "priority/p2"],
       });
-      // The LLM adds a second status label on top of an existing one.
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: {
-          labelsToAdd: ["status/ready"],
-          labelsToRemove: [],
-          lane: { id: "local", confidence: "high", reason: "ready" },
-          summary: "Ready.",
-        },
-      });
+      // The issue already carries two status labels; a ready groom keeps one.
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
 
       const result = await runHostedGroomer();
 
@@ -1249,20 +1149,175 @@ Investigate session handling in auth module.`;
       expect(statusLabels).toEqual(["status/ready"]);
       expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/ready"]));
     });
+
+    it("demotes a status/ready issue when the re-groom verdict is not ready", async () => {
+      // Before the plan contract a non-ready re-groom that forgot to remove
+      // status/ready left it in place, and ready won the collapse.
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...parkedCandidate, labels: ["status/ready", "priority/p2"] });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("blocked"));
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      expect(written.filter((l) => l.startsWith("status/"))).toEqual(["status/blocked"]);
+      expect(result!.plan!.readiness.ready).toBe(false);
+    });
+  });
+
+  describe("GroomingPlan contract (dispatch#1062)", () => {
+    it("persists the validated plan and exposes readiness in the mutation plan", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+
+      const result = await runHostedGroomer();
+
+      expect(result!.plan).toMatchObject({
+        schemaVersion: 1,
+        evidence: { evidenceDigest: "digest", headSha: "abc123", issueFingerprint: "fp" },
+        readiness: { ready: true, admission: "implementation", lane: "local", evidenceDigest: "digest" },
+      });
+      expect(result!.output.labelsToAdd).toEqual(["status/ready"]);
+      const plannedCall = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(plannedCall![0].data.validatedOutput).toBe(result!.plan);
+      expect(plannedCall![0].data.mutationPlan).toMatchObject({
+        planSchemaVersion: 1,
+        evidenceDigest: "digest",
+        readiness: { ready: true },
+        closeRecommendation: null,
+      });
+    });
+
+    it("gives the model the evidence catalog built from the snapshot", async () => {
+      await runHostedGroomer();
+
+      const { evidenceCatalog } = mocks.callGroomerLLM.mock.calls[0][0];
+      expect(evidenceCatalog.binding.evidenceDigest).toBe("digest");
+      expect(evidenceCatalog.entries.map((e: { id: string }) => e.id)).toEqual(["issue", "repo:src/auth/login.ts"]);
+    });
+
+    it("fails closed on an unknown evidence reference and records why", async () => {
+      const raw = planDraft({ verdict: { evidenceRefs: ["repo:src/invented.ts"] } });
+      mocks.callGroomerLLM.mockResolvedValue(raw);
+
+      await expect(runHostedGroomer()).rejects.toThrow(/unknown evidence reference "repo:src\/invented.ts"/);
+
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            rawOutput: raw,
+            validationErrors: [expect.stringContaining('unknown evidence reference "repo:src/invented.ts"')],
+          }),
+        }),
+      );
+    });
+
+    it("fails closed on the legacy output shape", async () => {
+      mocks.callGroomerLLM.mockResolvedValue({
+        labelsToAdd: ["status/ready"],
+        labelsToRemove: [],
+        lane: { id: "local", confidence: "high", reason: "r" },
+      });
+
+      await expect(runHostedGroomer()).rejects.toThrow(/legacy GroomerOutput shape/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("rejects a ready claim when the snapshot could not be captured", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValue(new Error("boom"));
+
+      // The fallback shell has no sources, so the repository refs a ready
+      // plan needs are not even citable.
+      await expect(runHostedGroomer()).rejects.toThrow(/unknown evidence reference "repo:src\/auth\/login.ts"/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("rejects a ready claim with a material uncertainty", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ verdict: { uncertainties: [{ kind: "scope", question: "Also SSO?", material: true }] } }),
+      );
+
+      await expect(runHostedGroomer()).rejects.toThrow(/readiness: material uncertainty remains/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("does not let a claimable lane promote a non-ready verdict", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("needs_info", { verdict: { lane: { id: "local", confidence: "high", reason: "r" } } }),
+      );
+
+      const result = await runHostedGroomer();
+
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      expect(written.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
+      expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ currentLane: "backlog" }) }),
+      );
+      expect(result!.contextWarnings).toContain("enum:verdict.lane.id: resolved 'local' -> 'backlog' via invariant");
+    });
+
+    it("records a duplicate recommendation without closing the issue", async () => {
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [
+          ...mockEvidence.sources,
+          { key: "github:issue:org/repo#7", provenance: "github_issue", state: "open", url: null, via: "read", observedAt: "", ref: null },
+        ],
+      });
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", {
+          mutations: { close: { reason: "duplicate", rationale: "same as #7", evidenceRefs: ["github:issue:org/repo#7"] } },
+          relatedWork: [{ ref: "github:issue:org/repo#7", relation: "duplicate_of", note: "same bug" }],
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expect(result!.mutationPlan?.closeRecommendation).toMatchObject({ reason: "duplicate" });
+      expect(result!.mutationPlan?.willCloseIssue).toBe(false);
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+    });
+
+    it("routes ready design work to the escalation lane and never the default lane", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({
+          verdict: {
+            workType: "design",
+            lane: { id: "frontier", confidence: "high", reason: "needs a decision" },
+            uncertainties: [{ kind: "design_choice", question: "Token or session store?", material: true }],
+          },
+          implementationBrief: null,
+        }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expect(result!.plan!.readiness).toMatchObject({ ready: true, admission: "escalation", lane: "frontier" });
+      expect(result!.output.nextGroomingAction).toBe("escalate");
+
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ verdict: { workType: "design", lane: { id: "local", confidence: "high", reason: "r" } }, implementationBrief: null }),
+      );
+      await expect(runHostedGroomer()).rejects.toThrow(/design work must route to the escalation lane/);
+    });
   });
 
   describe("already_done has an effect (dispatch#957)", () => {
-    const alreadyDoneOutput: GroomerOutput = {
-      actionability: "already_done",
-      labelsToAdd: ["status/done"],
-      labelsToRemove: [],
-      lane: { id: "backlog", confidence: "high", reason: "the step is already gone on main" },
-      summary: "The Generate Token step no longer exists; closing as already resolved.",
-      githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
-    };
+    const alreadyDoneOutput = notReadyDraft("already_done", {
+      verdict: {
+        lane: { id: "backlog", confidence: "high", reason: "the step is already gone on main" },
+        summary: "The Generate Token step no longer exists; closing as already resolved.",
+      },
+      mutations: {
+        githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
+        close: { reason: "already_done", rationale: "login.ts no longer has the step", evidenceRefs: ["repo:src/auth/login.ts"] },
+      },
+    });
 
     it("closes the GitHub issue, lands status/done, and mirrors closed state locally", async () => {
-      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: alreadyDoneOutput });
+      mocks.callGroomerLLM.mockResolvedValue(alreadyDoneOutput);
 
       const result = await runHostedGroomer();
 
@@ -1289,17 +1344,11 @@ Investigate session handling in auth module.`;
       expect(result!.appliedMutations?.issueClosed).toBe(true);
     });
 
-    it("coerces conflicting status labels to status/done (issue#957 invariant)", async () => {
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: {
-          ...alreadyDoneOutput,
-          // Inconsistent LLM output: says already_done but added a non-done
-          // status. The invariant must reconcile so the close step and the
-          // selector see a single, correct status.
-          labelsToAdd: ["status/ready"],
-        },
-      });
+    it("replaces an existing status with status/done (issue#957 invariant)", async () => {
+      // The issue was status/ready; already_done must leave exactly status/done
+      // so the close step and the selector agree.
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/ready", "priority/p0"] });
+      mocks.callGroomerLLM.mockResolvedValue(alreadyDoneOutput);
 
       const result = await runHostedGroomer();
 
@@ -1314,7 +1363,7 @@ Investigate session handling in auth module.`;
     it("records issueClosedError when the GitHub close call fails but does not fail the run", async () => {
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       mocks.closeIssue.mockRejectedValue(new Error("GitHub API error: 502"));
-      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: alreadyDoneOutput });
+      mocks.callGroomerLLM.mockResolvedValue(alreadyDoneOutput);
 
       const result = await runHostedGroomer();
 
@@ -1335,7 +1384,7 @@ Investigate session handling in auth module.`;
 
     it("dry-run reports willCloseIssue in the mutation plan but does not call GitHub", async () => {
       mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
-      mocks.validateGroomerOutput.mockReturnValue({ valid: true, parsed: alreadyDoneOutput });
+      mocks.callGroomerLLM.mockResolvedValue(alreadyDoneOutput);
 
       const result = await runHostedGroomer();
 
@@ -1347,10 +1396,7 @@ Investigate session handling in auth module.`;
     });
 
     it("does not close when actionability is anything other than already_done", async () => {
-      mocks.validateGroomerOutput.mockReturnValue({
-        valid: true,
-        parsed: { ...mockOutput, actionability: "ready" },
-      });
+      mocks.callGroomerLLM.mockResolvedValue(planDraft());
 
       await runHostedGroomer();
 

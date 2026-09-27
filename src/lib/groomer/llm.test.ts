@@ -1,7 +1,22 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { callGroomerLLM, buildGroomerResponseSchema } from "./llm";
-import { ALLOWED_GROOMER_LABELS } from "./schema";
+import { PLAN_LABELS } from "./plan";
+import { buildEvidenceCatalog } from "./plan-evidence";
 import { getLaneIds } from "@/lib/lane-config";
+
+const catalog = buildEvidenceCatalog({
+  capturedAt: "2026-09-26T00:00:00.000Z",
+  repoFullName: "org/repo",
+  defaultBranch: "main",
+  headSha: "abc123",
+  pinnedRef: "abc123",
+  issue: { number: 899, title: "t", body: null, labels: [], state: "open", updatedAt: "", url: "" },
+  issueFingerprint: "fp",
+  comments: [],
+  evidenceDigest: "d",
+  warnings: [],
+  sources: [{ path: "src/lib/prisma.ts", provenance: "repository", ref: "abc123" }],
+});
 
 describe("callGroomerLLM", () => {
   const originalFetch = global.fetch;
@@ -20,7 +35,7 @@ describe("callGroomerLLM", () => {
       }),
     });
 
-    const result = await callGroomerLLM({
+    const result: any = await callGroomerLLM({
       baseUrl: "https://llm.example.com",
       apiKey: "sk-test",
       model: "gpt-4o-mini",
@@ -43,7 +58,7 @@ describe("callGroomerLLM", () => {
       }),
     });
 
-    const result = await callGroomerLLM({
+    const result: any = await callGroomerLLM({
       baseUrl: "https://llm.example.com",
       apiKey: "sk-test",
       model: "gpt-4o-mini",
@@ -195,7 +210,7 @@ describe("callGroomerLLM", () => {
       }),
     });
 
-    const result = await callGroomerLLM({
+    const result: any = await callGroomerLLM({
       baseUrl: "https://llm.example.com",
       apiKey: "sk-test",
       model: "gpt-4o-mini",
@@ -251,7 +266,7 @@ describe("callGroomerLLM transient retry", () => {
 
     const promise = callGroomerLLM(baseOptions);
     await vi.advanceTimersByTimeAsync(5000);
-    const result = await promise;
+    const result: any = await promise;
 
     expect(result.lane.id).toBe("local");
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -286,7 +301,7 @@ describe("callGroomerLLM transient retry", () => {
 
     const promise = callGroomerLLM(baseOptions);
     await vi.advanceTimersByTimeAsync(5000);
-    const result = await promise;
+    const result: any = await promise;
 
     expect(result.lane.id).toBe("local");
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -347,33 +362,38 @@ describe("callGroomerLLM transient retry", () => {
 });
 
 describe("buildGroomerResponseSchema", () => {
-  it("requires lane/labels, forbids extra props, and constrains lane.id to configured lanes", () => {
+  it("is the GroomingPlan schema: sections required, extras forbidden, lanes from config", () => {
     const schema = buildGroomerResponseSchema() as any;
-    expect(schema.required).toEqual(expect.arrayContaining(["labelsToAdd", "labelsToRemove", "lane"]));
+    expect(schema.required).toEqual(["verdict", "implementationBrief", "mutations", "decomposition", "relatedWork"]);
     expect(schema.additionalProperties).toBe(false);
-    expect(schema.properties.lane.required).toEqual(["id", "confidence", "reason"]);
-    const laneId = schema.properties.lane.properties.id;
-    expect(laneId.enum).toEqual(getLaneIds());
-    expect(laneId.enum.length).toBeGreaterThan(0);
+    const lane = schema.properties.verdict.properties.lane;
+    expect(lane.required).toEqual(["id", "confidence", "reason"]);
+    expect(lane.properties.id.enum).toEqual(getLaneIds());
+    expect(lane.properties.id.enum.length).toBeGreaterThan(0);
   });
 
-  it("enum-constrains label arrays to the validator's allowlist", () => {
+  it("enum-constrains label arrays to the plan allowlist", () => {
     const schema = buildGroomerResponseSchema() as any;
-    expect(schema.properties.labelsToAdd.items.enum).toEqual([...ALLOWED_GROOMER_LABELS]);
-    expect(schema.properties.labelsToRemove.items.enum).toEqual([...ALLOWED_GROOMER_LABELS]);
+    const mutations = schema.properties.mutations.properties;
+    expect(mutations.labelsToAdd.items.enum).toEqual([...PLAN_LABELS]);
+    expect(mutations.labelsToRemove.items.enum).toEqual([...PLAN_LABELS]);
     // The exact failure seen in prod: a 4B inventing "type/refactor".
-    expect(schema.properties.labelsToAdd.items.enum).not.toContain("type/refactor");
+    expect(mutations.labelsToAdd.items.enum).not.toContain("type/refactor");
   });
 
-  it("bounds proposedTitle to the validator's 10-200 chars (or null)", () => {
+  it("bounds proposedTitle to 10-200 chars (or null) and proposedBody to 9999", () => {
     const schema = buildGroomerResponseSchema() as any;
-    const title = schema.properties.proposedTitle;
-    expect(title.anyOf).toEqual([
+    const mutations = schema.properties.mutations.properties;
+    expect(mutations.proposedTitle.anyOf).toEqual([
       { type: "null" },
       { type: "string", minLength: 10, maxLength: 200 },
     ]);
-    const body = schema.properties.proposedBody;
-    expect(body.anyOf).toEqual([{ type: "null" }, { type: "string", maxLength: 9999 }]);
+    expect(mutations.proposedBody.anyOf).toEqual([{ type: "null" }, { type: "string", minLength: 1, maxLength: 9999 }]);
+  });
+
+  it("constrains evidence ids to the catalog it is given", () => {
+    const schema = buildGroomerResponseSchema(catalog) as any;
+    expect(schema.properties.verdict.properties.evidenceRefs.items.enum).toEqual(["issue", "repo:src/lib/prisma.ts"]);
   });
 });
 
@@ -381,15 +401,15 @@ describe("callGroomerLLM response_format", () => {
   beforeEach(() => vi.restoreAllMocks());
 
   const okContent = () =>
-    `{"labelsToAdd":[],"labelsToRemove":[],"lane":{"id":"${getLaneIds()[0]}","confidence":"high","reason":"r"}}`;
+    `{"verdict":{"lane":{"id":"${getLaneIds()[0]}","confidence":"high","reason":"r"}}}`;
 
   it("sends json_schema (name + dynamic lane enum) on the first attempt", async () => {
     global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [{ message: { content: okContent() } }] }) });
     await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000 });
     const body = JSON.parse((global.fetch as any).mock.calls[0][1].body);
     expect(body.response_format.type).toBe("json_schema");
-    expect(body.response_format.json_schema.name).toBe("groomer_output");
-    expect(body.response_format.json_schema.schema.properties.lane.properties.id.enum).toEqual(getLaneIds());
+    expect(body.response_format.json_schema.name).toBe("grooming_plan");
+    expect(body.response_format.json_schema.schema.properties.verdict.properties.lane.properties.id.enum).toEqual(getLaneIds());
   });
 
   it("falls back to json_object when the backend rejects json_schema (400)", async () => {
@@ -397,21 +417,21 @@ describe("callGroomerLLM response_format", () => {
       .mockResolvedValueOnce({ ok: false, status: 400, text: async () => "unsupported response_format" })
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: okContent() } }] }) });
     global.fetch = fetchMock as any;
-    const result = await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000 });
+    const result: any = await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000 });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).response_format.type).toBe("json_schema");
     expect(JSON.parse(fetchMock.mock.calls[1][1].body).response_format.type).toBe("json_object");
-    expect(result.lane.confidence).toBe("high");
+    expect(result.verdict.lane.confidence).toBe("high");
   });
 
   it("omits response_format entirely when responseFormat is false", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: okContent() } }] }) });
     global.fetch = fetchMock as any;
-    const result = await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000, responseFormat: false });
+    const result: any = await callGroomerLLM({ baseUrl: "https://llm.example.com", apiKey: "k", model: "vision", prompt: "p", timeoutMs: 1000, responseFormat: false });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty("response_format");
-    expect(result.lane.confidence).toBe("high");
+    expect(result.verdict.lane.confidence).toBe("high");
   });
 });
 
@@ -466,6 +486,21 @@ describe("callGroomerLLM exploration findings", () => {
     vi.stubGlobal("fetch", fetchMock);
     await callGroomerLLM({ ...baseOptions, explorationFindings: "   \n  " });
     expect(userContentFrom(fetchMock)).toBe(baseOptions.prompt);
+    vi.unstubAllGlobals();
+  });
+
+  it("appends the evidence catalog and constrains evidence ids to it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({ ...baseOptions, explorationFindings: "findings", evidenceCatalog: catalog });
+    const content = userContentFrom(fetchMock);
+    expect(content.indexOf("findings")).toBeLessThan(content.indexOf("## Evidence you can cite"));
+    expect(content).toContain("- repo:src/lib/prisma.ts");
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.response_format.json_schema.schema.properties.verdict.properties.evidenceRefs.items.enum).toEqual([
+      "issue",
+      "repo:src/lib/prisma.ts",
+    ]);
     vi.unstubAllGlobals();
   });
 

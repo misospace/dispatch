@@ -6,7 +6,7 @@ The hosted groomer is intentionally narrow:
 
 - It enriches issue labels, lane, grooming metadata, and optionally one GitHub comment.
 - It runs at most one issue per request.
-- It does not edit code, open PRs, merge PRs, run shell commands, or close issues.
+- It does not edit code, open PRs, merge PRs, or run shell commands. It closes an issue only when its plan's verdict is `already_done` (see [Grooming plan contract](#grooming-plan-contract)).
 - Existing external groomer workers using `next-task?mode=groom` remain supported.
 
 ## Configuration
@@ -98,6 +98,57 @@ Optional body:
 3. Once plans look safe, set `dryRun=false` for a targeted request or change `DISPATCH_GROOMER_DRY_RUN=false`.
 
 Write mode updates GitHub labels, posts one comment only when the model returned `githubComment`, updates Dispatch grooming fields and lane history, and records `AgentRun`/`AuditLog` rows.
+
+## Grooming plan contract
+
+The model returns a versioned `GroomingPlan` (`src/lib/groomer/plan.ts`, schema version 1), not free-form label advice. The plan keeps analysis separate from mutation intent:
+
+| Section | Holds |
+| --- | --- |
+| `verdict` | `actionability` (`ready`, `needs_info`, `blocked`, `backlog`, `already_done`), `workType` (`implementation` or `design`), confidence, lane, summary, rationale, `evidenceRefs`, and `uncertainties` (each with a kind and whether it is material). |
+| `implementationBrief` | The bounded worker brief, or `null`: problem, verified current behavior with its evidence, relevant paths (cited as evidence), files to create, invariants, in/out of scope, dependencies, acceptance criteria with how each is verified, and tests. |
+| `mutations` | Priority/type labels to add or remove, proposed title/body, one comment, and an optional close recommendation (`already_done`, `duplicate`, `superseded`) with its evidence. |
+| `decomposition` | Whether the issue must be split, and bounded child briefs. |
+| `relatedWork` | Related issues/PRs/commits cited as `duplicate_of`, `superseded_by`, or `related`. |
+
+The response schema sent as `json_schema` enum-constrains lanes (from the lane config), labels (priority/type allowlist), and every evidence id (from the run's catalog), and bounds every string and array. It names no provider or model.
+
+### Evidence
+
+Each run builds an evidence catalog from its revision-pinned snapshot and appends it to the prompt. The plan may cite only these ids:
+
+- `issue`: the groomed issue as captured;
+- `comment:<id>`: a comment, marked human or automation;
+- `repo:<path>`: a repository path read or surfaced this run, pinned to the snapshot head SHA when one was captured;
+- `github:<kind>:<ref>`: related GitHub issue/PR/commit state.
+
+An id outside the catalog fails validation. Automation-authored comments may be cited as context but never satisfy an evidence requirement.
+
+### Readiness invariant
+
+Dispatch derives readiness; it does not trust the model's claim. A `ready` verdict validates only when:
+
+- the snapshot was captured and pinned to a default-branch head SHA;
+- `verdict.evidenceRefs` cites repository evidence read at that SHA, and confidence is not `low`;
+- no material uncertainty remains;
+- for `implementation` work: the brief is present, its verified current behavior cites pinned repository evidence, it names at least one path or file to create, `inScope` is not empty, every acceptance criterion is verified by an automated test, a command, or code inspection (not `subjective`), and no decomposition is required;
+- for `design` work: the lane is the one with role `escalation`, and only `design_choice` uncertainties remain. Design work never validates into the default lane, and without an escalation lane it cannot be ready;
+- the lane is claimable and no close is recommended.
+
+A ready verdict that breaks any rule is a validation error: the run fails as retryable and applies no mutation. The persisted plan records the result as `readiness` (`ready`, `admission` of `implementation` or `escalation`, `lane`, `evidenceDigest`), which an admission gate can check against the current evidence digest. `evaluateReadiness` re-runs the rules against a fresh catalog.
+
+Other rules the validator enforces:
+
+- Status is derived from actionability (`ready` → `status/ready`, `blocked` → `status/blocked`, `already_done` → `status/done`, otherwise `status/backlog`); the plan cannot set `status/*` or `agent/*` labels. Any other status on the issue is removed.
+- A non-ready verdict is placed in the non-claimable lane, so a lane alone never promotes an issue. A ready verdict placed there is moved to the default lane (implementation) or escalation lane (design). Both moves are recorded in `contextWarnings`.
+- `already_done` requires a close with reason `already_done`, backed by pinned repository evidence, related GitHub work, or a human comment, and no material uncertainty. It remains the only close the runner applies.
+- `duplicate` and `superseded` closes are recorded recommendations only; each must cite a matching `relatedWork` entry.
+- A dependency state that contradicts the cited GitHub state is rejected. Dependencies are descriptive: the `depends on #N` claim gate stays authoritative.
+- Output in the legacy `GroomerOutput` shape is rejected with a clear error rather than migrated.
+
+### Compatibility
+
+`GroomingRun.validatedOutput` stores the full plan. `mutationPlan` keeps its existing fields and adds `planSchemaVersion`, `evidenceDigest`, `readiness`, and `closeRecommendation`. The run path applies mutations through `toGroomerOutput`, the legacy view that `POST /api/groomer/run` still returns as `output` (with the plan alongside as `plan`). A rejected plan's raw output and `validationErrors` are kept on the run. Runs recorded before the plan contract still render on `/automation/groomer`, marked `legacy`, with no readiness claim.
 
 ## History and Audit
 
