@@ -27,6 +27,7 @@ export interface GitHubRepoMetadata {
   fullName: string;
   defaultBranch: string;
   description: string | null;
+  archived?: boolean;
 }
 
 export async function fetchRepositoryMetadata(repoFullName: string): Promise<GitHubRepoMetadata> {
@@ -35,6 +36,7 @@ export async function fetchRepositoryMetadata(repoFullName: string): Promise<Git
     fullName: typeof data.full_name === "string" ? data.full_name : repoFullName,
     defaultBranch: typeof data.default_branch === "string" ? data.default_branch : "main",
     description: typeof data.description === "string" ? data.description : null,
+    archived: data.archived === true,
   };
 }
 

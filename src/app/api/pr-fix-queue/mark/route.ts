@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { markPrFixItem, parseMarkPrFixInput } from "@/lib/pr-fix-queue";
+import { markPrFixItem, parseMarkPrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -34,6 +34,12 @@ export async function POST(request: Request) {
     // disabled) keep the optional behavior for compatibility.
     if (auth.type === "bearer" && input.expectedGeneration === undefined) {
       return errorResponse("generation is required for agent/bridge marks (#1074)", 400);
+    }
+
+    // A mark back to QUEUED dispatches a worker; refuse it for an archived
+    // repo, which no worker can push to (#1106).
+    if (input.status === "QUEUED" && (await isPrFixRepoArchived(input.repo))) {
+      return errorResponse("Cannot requeue: repository is archived", 409);
     }
 
     const result = await markPrFixItem(asPrFixQueueClient(prisma), input);

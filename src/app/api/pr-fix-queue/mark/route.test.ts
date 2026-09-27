@@ -11,6 +11,7 @@ const { mocks } = vi.hoisted(() => ({
     parseMarkPrFixInput: vi.fn(),
     markPrFixItem: vi.fn().mockResolvedValue({ mutated: true, item: { id: "fix-1" } }),
     auditLogCreate: vi.fn().mockResolvedValue({ id: "log-1" }),
+    isPrFixRepoArchived: vi.fn().mockResolvedValue(false),
   },
 }));
 
@@ -24,6 +25,7 @@ vi.mock("@/lib/prisma", () => ({
 vi.mock("@/lib/pr-fix-queue", () => ({
   parseMarkPrFixInput: mocks.parseMarkPrFixInput,
   markPrFixItem: mocks.markPrFixItem,
+  isPrFixRepoArchived: mocks.isPrFixRepoArchived,
 }));
 
 import { POST } from "./route";
@@ -42,6 +44,7 @@ describe("POST /api/pr-fix-queue/mark", () => {
     mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "DONE" });
     mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "DONE" } });
     mocks.auditLogCreate.mockResolvedValue({ id: "log-1" });
+    mocks.isPrFixRepoArchived.mockResolvedValue(false);
   });
 
   it("returns 401 when no auth header is present", async () => {
@@ -207,5 +210,25 @@ describe("POST /api/pr-fix-queue/mark", () => {
     expect(body.error).toContain("2");
     // A skipped mark is not audited as a mutation.
     expect(mocks.auditLogCreate).not.toHaveBeenCalled();
+  });
+
+  it("refuses a mark back to QUEUED for an archived repo (#1106)", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "QUEUED", expectedGeneration: 1 });
+    mocks.isPrFixRepoArchived.mockResolvedValue(true);
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "QUEUED", generation: 1 });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("Cannot requeue: repository is archived");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("does not look up archived state for non-QUEUED marks (#1106)", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "BLOCKED", expectedGeneration: 1 });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "BLOCKED", generation: 1 });
+
+    expect(res.status).toBe(200);
+    expect(mocks.isPrFixRepoArchived).not.toHaveBeenCalled();
   });
 });

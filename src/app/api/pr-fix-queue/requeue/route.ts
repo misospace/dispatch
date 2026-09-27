@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { requeuePrFixItem, parseRequeuePrFixInput } from "@/lib/pr-fix-queue";
+import { requeuePrFixItem, parseRequeuePrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
 import { authorizeRequest } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const item = await requeuePrFixItem(prisma, parsed);
+    const item = await requeuePrFixItem(prisma, { ...parsed, isRepoArchived: await isPrFixRepoArchived(parsed.repo) });
     if (!item) {
       return NextResponse.json({ error: "pr-fix item not found" }, { status: 404 });
     }

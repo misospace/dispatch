@@ -164,6 +164,7 @@ describe("fetchRepositoryMetadata", () => {
       fullName: "org/repo",
       defaultBranch: "main",
       description: "A repo",
+      archived: false,
     });
   });
 
