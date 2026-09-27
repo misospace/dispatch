@@ -106,7 +106,7 @@ export async function fetchIssueNativeBlockers(
   issueNumber: number,
 ): Promise<string[] | null> {
   const [owner, repo] = repoFullName.split("/");
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocked_by`;
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocked_by?per_page=100`;
   try {
     const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
     if (!response.ok) {

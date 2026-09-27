@@ -35,7 +35,7 @@ function makeIssue(
 }
 
 const blockedByUrl = (n: number) =>
-  `https://api.github.com/repos/acme/app/issues/${n}/dependencies/blocked_by`;
+  `https://api.github.com/repos/acme/app/issues/${n}/dependencies/blocked_by?per_page=100`;
 
 beforeEach(() => {
   vi.clearAllMocks();
