@@ -137,6 +137,14 @@ describe("github-code-search: searchRepositoryCode (the groomer repo-exploration
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("fails an incomplete search with no items instead of reporting no matches", async () => {
+    fetchSpy.mockResolvedValueOnce(mockResponse({ total_count: 0, incomplete_results: true, items: [] }));
+
+    await expect(searchRepositoryCode("org/repo", "prisma", 5)).rejects.toThrow(
+      /^Code search failed for org\/repo: search timed out with incomplete results and no matches$/,
+    );
+  });
+
   // (c) HTTP 429 retried with backoff.
   it("retries a 429 rate-limit response with backoff and succeeds on the next attempt", async () => {
     fetchSpy
@@ -306,10 +314,17 @@ describe("github-code-search: compareCommits (grooming freshness, #1064)", () =>
       mockResponse({
         status: "ahead",
         files: [{ filename: "src/new.ts", previous_filename: "src/old.ts" }, { filename: "docs/a.md" }],
+        commits: [{ commit: { committer: { date: "2026-09-28T00:00:00Z" } } }],
       }),
     );
     const result = await compareCommits("org/repo", "base1", "head1");
-    expect(result).toEqual({ ok: true, status: "ahead", files: ["src/new.ts", "src/old.ts", "docs/a.md"], truncated: false });
+    expect(result).toEqual({
+      ok: true,
+      status: "ahead",
+      files: ["src/new.ts", "src/old.ts", "docs/a.md"],
+      truncated: false,
+      firstCommitDate: "2026-09-28T00:00:00Z",
+    });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(String(fetchSpy.mock.calls[0][0])).toContain("/repos/org/repo/compare/base1...head1?per_page=1");
   });

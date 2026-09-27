@@ -47,6 +47,14 @@ export const MAX_BASELINE_PATHS = 60;
 export const MAX_BASELINE_RELATED_WORK = 20;
 /** Dependency keys kept on the baseline. */
 export const MAX_BASELINE_DEPENDENCIES = 20;
+/**
+ * Empty code-search queries retained to recheck global evidence. Capped well
+ * below the freshness pass's search budget (20) so a single issue can always
+ * complete its recheck — commit-date fetch plus every saved query — even
+ * when it is first in the pass (#1091 review).
+ */
+export const MAX_BASELINE_SEARCH_CODE_QUERIES = 10;
+export const MAX_BASELINE_SEARCH_CODE_QUERY_CHARS = 200;
 
 /**
  * Statuses a worker owns. The freshness pass does not evaluate these (a claim
@@ -95,6 +103,36 @@ export interface ExplorationToolCallLike {
   name: string;
   ok: boolean;
   bytes: number;
+  arguments?: Record<string, unknown>;
+}
+
+/**
+ * Map exploration tool records to the freshness input shape, keeping the
+ * call arguments so saved empty search queries can be recovered later.
+ */
+export function explorationCallsForFreshness(
+  toolCalls: Array<{ name: string; arguments: Record<string, unknown>; ok: boolean; bytes: number; preview?: string }>,
+): ExplorationToolCallLike[] {
+  return toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes }));
+}
+
+function emptySearchCodeQueries(toolCalls: ExplorationToolCallLike[]): string[] {
+  const queries: string[] = [];
+  for (const call of toolCalls) {
+    if (call.name !== "search_code" || !call.ok || call.bytes !== 0) continue;
+    // Every empty search is part of the negative evidence. One that can't be
+    // saved whole (unreadable, too long, or past the cap) would leave the
+    // recheck verifying the result on a subset, so save none and keep the
+    // conservative stale-on-commit behaviour instead.
+    const raw = call.arguments?.query;
+    if (typeof raw !== "string") return [];
+    const query = raw.trim();
+    if (!query) return [];
+    if (queries.includes(query)) continue;
+    if (query.length > MAX_BASELINE_SEARCH_CODE_QUERY_CHARS || queries.length >= MAX_BASELINE_SEARCH_CODE_QUERIES) return [];
+    queries.push(query);
+  }
+  return queries;
 }
 
 /**
@@ -320,6 +358,7 @@ export interface GroomingFreshnessBaseline {
   groomedEvidenceCapturedAt: Date;
   groomedEvidenceScope: GroomingEvidenceScope;
   groomedEvidencePaths: string[];
+  groomedSearchCodeQueries: string[];
   groomedDependencyKeys: string[];
   groomedOpenBlockerKeys: string[];
   groomedRelatedWork: RelatedWorkBaselineEntry[];
@@ -340,6 +379,7 @@ export const UNKNOWN_FRESHNESS: Record<string, unknown> = {
   groomedEvidenceCapturedAt: null,
   groomedEvidenceScope: null,
   groomedEvidencePaths: [],
+  groomedSearchCodeQueries: [],
   groomedDependencyKeys: [],
   groomedOpenBlockerKeys: [],
   groomedRelatedWork: null,
@@ -407,6 +447,21 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     groomedEvidenceCapturedAt: input.evidenceWindowStart,
     groomedEvidenceScope: scope,
     groomedEvidencePaths: reliance.repositoryPaths,
+    // Only negative-search globals may be rechecked later (#1091). The other
+    // global cases — a relied-on path that was only surfaced, or repository
+    // access with no read path — keep the conservative stale-on-commit
+    // behaviour even when an empty search also happened during the run.
+    // A no-read-path global may still save its queries when exploration
+    // searches were its ONLY repository evidence: no repository-context
+    // queries ran and nothing else (e.g. list_directory) surfaced paths.
+    groomedSearchCodeQueries:
+      scope === "global" &&
+      !reliance.reliesOnSurfacedPath &&
+      (reliance.repositoryPaths.length > 0 ||
+        (input.repositoryQueries.length === 0 &&
+          !input.explorationToolCalls.some((call) => call.name === "list_directory")))
+        ? emptySearchCodeQueries(input.explorationToolCalls)
+        : [],
     groomedDependencyKeys: dependencyKeys,
     groomedOpenBlockerKeys: dependencyKeys.filter((key) => openKeys.has(key)).sort(),
     groomedRelatedWork: reliance.relatedWork,

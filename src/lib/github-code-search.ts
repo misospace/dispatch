@@ -57,11 +57,19 @@ export async function searchRepositoryCode(
     // so a search with more matches than fit on one page is not silently
     // truncated at the first page. Each page is fetched through fetchWithRetry,
     // so transient 429/5xx responses are retried here as well.
-    const items = await fetchPaginated<{ path?: string; html_url?: string }>(
-      url,
-      limit,
-      (data) => (data as { items?: { path?: string; html_url?: string }[] }).items ?? [],
-    );
+    let incomplete = false;
+    const items = await fetchPaginated<{ path?: string; html_url?: string }>(url, limit, (data) => {
+      const page = data as { items?: { path?: string; html_url?: string }[]; incomplete_results?: boolean };
+      if (page.incomplete_results === true) incomplete = true;
+      return page.items ?? [];
+    });
+    // Code search can time out and still answer 200 with incomplete_results
+    // and no items. That is not "no matches": the groomer treats an empty
+    // result as proof of absence and the freshness recheck advances on it
+    // (#1091), so surface it as a failure instead.
+    if (incomplete && items.length === 0) {
+      throw new Error("search timed out with incomplete results and no matches");
+    }
     return items.map((item) => ({
       path: item.path ?? "",
       url: item.html_url ?? "",
@@ -161,6 +169,12 @@ export type CommitComparison =
       files: string[];
       /** True when GitHub's file cap was reached, so `files` may be incomplete. */
       truncated: boolean;
+      /**
+       * Committer timestamp of the first (oldest) commit in base...head, when
+       * the response carried one. Lets callers bound how long a recheck may
+       * stay deferred on an unverified range (#1091).
+       */
+      firstCommitDate?: string | null;
     }
   | {
       ok: false;
@@ -196,6 +210,7 @@ export async function compareCommits(
     const data = (await response.json()) as {
       status?: string;
       files?: Array<{ filename?: string; previous_filename?: string }>;
+      commits?: Array<{ commit?: { committer?: { date?: string } } }>;
     };
     const rawFiles = Array.isArray(data.files) ? data.files : [];
     const files = new Set<string>();
@@ -203,11 +218,14 @@ export async function compareCommits(
       if (typeof file.filename === "string" && file.filename) files.add(file.filename);
       if (typeof file.previous_filename === "string" && file.previous_filename) files.add(file.previous_filename);
     }
+    // per_page=1 still returns the first (oldest) commit of the range.
+    const firstCommitDate = Array.isArray(data.commits) ? data.commits[0]?.commit?.committer?.date ?? null : null;
     return {
       ok: true,
       status: typeof data.status === "string" ? data.status : "unknown",
       files: [...files],
       truncated: rawFiles.length >= COMPARE_MAX_FILES,
+      firstCommitDate,
     };
   } catch (err) {
     return {

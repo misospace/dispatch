@@ -1632,6 +1632,25 @@ Investigate session handling in auth module.`;
       expect(issueUpdateData()).toMatchObject({ groomedEvidenceScope: "global", groomedEvidencePaths: [] });
     });
 
+    it("saves empty exploration search queries in the freshness baseline (#1091)", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue({
+        ...mockExploration,
+        sources: [],
+        readSources: [],
+        toolCalls: [
+          { name: "search_code", arguments: { query: "missing symbol" }, ok: true, bytes: 0, preview: "No matches" },
+          { name: "search_code", arguments: { query: "also missing" }, ok: true, bytes: 0, preview: "No matches" },
+          { name: "search_code", arguments: { query: "found it" }, ok: true, bytes: 400, preview: "src/a.ts" },
+        ],
+      });
+      await runHostedGroomer();
+      expect(issueUpdateData()).toMatchObject({
+        groomedEvidenceScope: "global",
+        groomedSearchCodeQueries: ["missing symbol", "also missing"],
+      });
+    });
+
     it("does not record a baseline for a skipped in-flight run, leaving the prior one untouched", async () => {
       mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-progress", "priority/p0"] });
       await runHostedGroomer();

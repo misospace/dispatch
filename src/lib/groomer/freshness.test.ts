@@ -6,6 +6,7 @@ import {
   deriveEvidenceScope,
   deriveGroomingFreshness,
   dependencyKeysForIssue,
+  explorationCallsForFreshness,
   hasNegativeSearchResult,
   intersectEvidencePaths,
   isFreshnessTrackedStatus,
@@ -259,11 +260,95 @@ describe("buildGroomingFreshnessBaseline", () => {
     expect(baseline.groomedEvidencePaths).toEqual([]);
   });
 
-  it("marks a negative code search as global evidence", async () => {
+  it("records trimmed, deduplicated empty-search queries only for global evidence", async () => {
+    const calls = [
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "  missing symbol  " } },
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } },
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "x".repeat(200) } },
+      { name: "search_code", ok: false, bytes: 0, arguments: { query: "failed" } },
+    ];
+    const global = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: calls }));
+    expect(global.groomedEvidenceScope).toBe("global");
+    expect(global.groomedSearchCodeQueries).toEqual(["missing symbol", "x".repeat(200)]);
+
+    const paths = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [{ path: "src/a.ts", provenance: "repository", via: "read", ref: "sha-1" }] },
+        explorationToolCalls: [{ name: "search_code", ok: false, bytes: 0, arguments: { query: "missing symbol" } }],
+        citations: [{ id: "repo:src/a.ts", subject: "repository", state: null }],
+      }),
+    );
+    expect(paths.groomedEvidenceScope).toBe("paths");
+    expect(paths.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("does not save queries for a global scope caused by a surfaced path", async () => {
     const baseline = await buildGroomingFreshnessBaseline(
-      input({ explorationToolCalls: [{ name: "search_code", ok: true, bytes: 0 }] }),
+      input({
+        citations: [{ id: "repo:src/hit.ts", subject: "repository", state: null }],
+        explorationToolCalls: [{ name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } }],
+      }),
     );
     expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("does not save queries for a no-read-path global when repository-context queries ran", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        repositoryQueries: ["sslmode"],
+        explorationToolCalls: [{ name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } }],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("does not save queries for a no-read-path global when list_directory surfaced evidence", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationToolCalls: [
+          { name: "list_directory", ok: true, bytes: 50, arguments: { path: "src" } },
+          { name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } },
+        ],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("explorationCallsForFreshness keeps arguments and drops other fields", () => {
+    expect(
+      explorationCallsForFreshness([
+        { name: "search_code", arguments: { query: "q" }, ok: true, bytes: 0, preview: "No matches" },
+      ]),
+    ).toEqual([{ name: "search_code", arguments: { query: "q" }, ok: true, bytes: 0 }]);
+  });
+
+  const emptySearches = (queries: unknown[]) =>
+    queries.map((query) => ({ name: "search_code", ok: true, bytes: 0, arguments: { query } }));
+
+  it("saves up to ten empty-search queries, below the pass search budget", async () => {
+    const queries = Array.from({ length: 10 }, (_, index) => `missing ${index}`);
+    const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(queries) }));
+    expect(baseline.groomedSearchCodeQueries).toEqual(queries);
+  });
+
+  it("saves none when the empty searches exceed the cap, so a subset is never rechecked", async () => {
+    const queries = Array.from({ length: 11 }, (_, index) => `missing ${index}`);
+    const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(queries) }));
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when an empty search can't be saved whole", async () => {
+    const tooLong = await buildGroomingFreshnessBaseline(
+      input({ explorationToolCalls: emptySearches(["short", "x".repeat(201)]) }),
+    );
+    expect(tooLong.groomedSearchCodeQueries).toEqual([]);
+    const unreadable = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(["short", 42]) }));
+    expect(unreadable.groomedSearchCodeQueries).toEqual([]);
   });
 });
 
