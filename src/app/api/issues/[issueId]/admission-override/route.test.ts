@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
+import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMockWithSafeEqual());
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -13,6 +13,7 @@ const { mocks } = vi.hoisted(() => ({
     fetchLatestCommit: vi.fn(),
     fetchRepositoryMetadata: vi.fn(),
     findOpenIssueKeys: vi.fn(),
+    auth: vi.fn(),
   },
 }));
 
@@ -32,6 +33,7 @@ vi.mock("@/lib/github-code-search", async (importOriginal) => ({
   fetchRepositoryMetadata: mocks.fetchRepositoryMetadata,
 }));
 vi.mock("@/lib/issue-dependency-annotation", () => ({ findOpenIssueKeys: mocks.findOpenIssueKeys }));
+vi.mock("@/lib/auth-next", () => ({ auth: mocks.auth }));
 
 import { DELETE, POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
@@ -60,14 +62,31 @@ function issue(over: Record<string, unknown> = {}) {
   };
 }
 
+const URL_ = "http://localhost/api/issues/issue-1/admission-override";
 const ctx = { params: Promise.resolve({ issueId: "issue-1" }) };
-const post = (body?: unknown, headers: Record<string, string> = {}) =>
-  POST(authedRequest("http://localhost/api/issues/issue-1/admission-override", { method: "POST", body, headers }), ctx);
-const del = () => DELETE(authedRequest("http://localhost/api/issues/issue-1/admission-override", { method: "DELETE" }), ctx);
+const BASIC = `Basic ${Buffer.from("jory:op-pass").toString("base64")}`;
+
+/** Operator (basic auth) request; the default for these tests. */
+function operatorRequest(method: string, body?: unknown, headers: Record<string, string> = {}) {
+  return new Request(URL_, {
+    method,
+    headers: { Authorization: BASIC, ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...headers },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+}
+const post = (body?: unknown, headers: Record<string, string> = {}) => POST(operatorRequest("POST", body, headers), ctx);
+const del = () => DELETE(operatorRequest("DELETE"), ctx);
+
+function useAuthMode(mode: "basic" | "oidc" | "disabled" | undefined) {
+  if (mode) process.env.DISPATCH_AUTH_MODE = mode;
+  else delete process.env.DISPATCH_AUTH_MODE;
+  resetAuthCaches();
+}
 
 beforeEach(() => {
-  delete process.env.DISPATCH_AUTH_MODE;
-  resetAuthCaches();
+  process.env.DISPATCH_AUTH_USERNAME = "jory";
+  process.env.DISPATCH_AUTH_PASSWORD = "op-pass";
+  useAuthMode("basic");
   resetRateLimits();
   vi.clearAllMocks();
   mocks.findUnique.mockResolvedValue(issue());
@@ -76,6 +95,62 @@ beforeEach(() => {
   mocks.fetchRepositoryMetadata.mockResolvedValue({ fullName: "org/repo", defaultBranch: "main", description: null });
   mocks.fetchLatestCommit.mockResolvedValue({ sha: HEAD });
   mocks.findOpenIssueKeys.mockResolvedValue(new Set(["org/repo#7"]));
+  mocks.auth.mockResolvedValue(null);
+});
+
+describe("operator-only auth", () => {
+  const bearer = (method: string) =>
+    authedRequest(URL_, { method, body: method === "POST" ? {} : undefined, headers: { "x-agent-name": "worker-1" } });
+
+  it.each([undefined, "basic", "oidc"] as const)(
+    "rejects an agent bearer token with 403 for POST and DELETE (auth mode %s)",
+    async (mode) => {
+      useAuthMode(mode);
+      mocks.findUnique.mockResolvedValue(issue({ admissionOverrideId: "override_1", groomedRunId: "override_1" }));
+      for (const [handler, method] of [[POST, "POST"], [DELETE, "DELETE"]] as const) {
+        const res = await handler(bearer(method), ctx);
+        expect(res.status).toBe(403);
+        expect((await res.json()).error).toMatch(/require operator auth.*agent bearer tokens cannot/);
+      }
+      expect(mocks.findUnique).not.toHaveBeenCalled();
+      expect(mocks.update).not.toHaveBeenCalled();
+      expect(mocks.auditCreate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts basic auth and records the operator as the actor", async () => {
+    const res = await post({});
+    expect(res.status).toBe(200);
+    expect(writtenData().admissionOverrideBy).toBe("jory");
+    expect(JSON.parse(mocks.auditCreate.mock.calls[0][0].data.notes).authType).toBe("basic");
+    mocks.findUnique.mockResolvedValue(issue({ admissionOverrideId: "override_1", groomedRunId: "override_1" }));
+    expect((await del()).status).toBe(200);
+  });
+
+  it("accepts an OIDC session for POST and DELETE", async () => {
+    useAuthMode("oidc");
+    mocks.auth.mockResolvedValue({ user: { email: "jory@example.com" } });
+    const sessionRequest = (method: string) =>
+      new Request(URL_, { method, headers: { "Content-Type": "application/json" }, body: method === "POST" ? "{}" : undefined });
+
+    const res = await POST(sessionRequest("POST"), ctx);
+    expect(res.status).toBe(200);
+    expect(writtenData().admissionOverrideBy).toBe("jory@example.com");
+    expect(mocks.auditCreate.mock.calls[0][0].data).toMatchObject({ actor: "jory@example.com", action: "admission_override" });
+    expect(JSON.parse(mocks.auditCreate.mock.calls[0][0].data.notes).authType).toBe("oidc");
+
+    mocks.findUnique.mockResolvedValue(issue({ admissionOverrideId: "override_1", groomedRunId: "override_1" }));
+    const cleared = await DELETE(sessionRequest("DELETE"), ctx);
+    expect(cleared.status).toBe(200);
+    expect(mocks.auditCreate.mock.calls[1][0].data).toMatchObject({ actor: "jory@example.com", action: "admission_override_cleared" });
+  });
+
+  it("accepts auth-disabled mode", async () => {
+    useAuthMode("disabled");
+    const res = await POST(new Request(URL_, { method: "POST" }), ctx);
+    expect(res.status).toBe(200);
+    expect(writtenData().admissionOverrideBy).toBe("operator");
+  });
 });
 
 function writtenData(): Record<string, any> {
@@ -84,11 +159,8 @@ function writtenData(): Record<string, any> {
 
 describe("POST /api/issues/[issueId]/admission-override", () => {
   it("requires auth", async () => {
-    const res = await POST(
-      authedRequest("http://localhost/api/issues/issue-1/admission-override", { method: "POST", includeAuth: false }),
-      ctx,
-    );
-    expect(res.status).toBe(401);
+    expect((await POST(new Request(URL_, { method: "POST" }), ctx)).status).toBe(401);
+    expect((await DELETE(new Request(URL_, { method: "DELETE" }), ctx)).status).toBe(401);
   });
 
   it("404s an unknown issue", async () => {
@@ -114,7 +186,7 @@ describe("POST /api/issues/[issueId]/admission-override", () => {
   });
 
   it("records the override as a global-scope freshness baseline bound to the cached issue and live head", async () => {
-    const res = await post({ reason: "groomer keeps timing out; verified by hand" }, { "x-agent-name": "jory" });
+    const res = await post({ reason: "groomer keeps timing out; verified by hand" });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.override).toMatchObject({ actor: "jory", headSha: HEAD, defaultBranch: "main" });
@@ -145,7 +217,7 @@ describe("POST /api/issues/[issueId]/admission-override", () => {
 
     const audit = mocks.auditCreate.mock.calls[0][0].data;
     expect(audit).toMatchObject({ actor: "jory", action: "admission_override", issueNumber: 42, success: true });
-    expect(JSON.parse(audit.notes)).toMatchObject({ overrideId: data.admissionOverrideId, headSha: HEAD, authType: "bearer" });
+    expect(JSON.parse(audit.notes)).toMatchObject({ overrideId: data.admissionOverrideId, headSha: HEAD, authType: "basic" });
   });
 
   it("uses a supplied headSha without resolving the head", async () => {

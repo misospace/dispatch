@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, type AuthorizedRequest } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { fetchLatestCommit } from "@/lib/github-ci";
@@ -15,6 +15,23 @@ import {
 } from "@/lib/admission-override";
 
 const RATE_LIMIT = { limit: 10, windowMs: 10_000 };
+
+/**
+ * The override exists to let a human admit work past the gate that stops
+ * autonomous workers, so an agent bearer token (DISPATCH_AGENT_TOKEN, held by
+ * every worker) must not be able to record or clear one. Only operator auth
+ * paths qualify: an OIDC session, basic auth, or auth-disabled mode, the same
+ * auth-type split pr-fix-queue/mark uses (#1074/#1079).
+ */
+function rejectAgentCaller(auth: AuthorizedRequest) {
+  if (auth.authorized && auth.type === "bearer") {
+    return errorResponse(
+      "Admission overrides require operator auth (OIDC session or basic auth); agent bearer tokens cannot record or clear them",
+      403,
+    );
+  }
+  return null;
+}
 
 async function readBody(request: Request): Promise<Record<string, unknown> | null> {
   const text = await request.text();
@@ -34,7 +51,9 @@ async function readBody(request: Request): Promise<Record<string, unknown> | nul
  * override that admits this status/ready issue to the worker queue under
  * DISPATCH_QUEUE_ADMISSION_MODE=enforce without a grooming decision (#1065).
  *
- * Body (all optional): { reason?: string, headSha?: string (40-hex), actor?: string }.
+ * Operator auth only: agent bearer tokens get 403.
+ * Body (all optional): { reason?: string, headSha?: string (40-hex) }. The
+ * actor is the authenticated operator.
  * Without headSha the live default-branch head is resolved from GitHub. The
  * override is bound to the cached issue state and that SHA, and goes stale
  * like a grooming result. It never bypasses a `depends on #N` blocker.
@@ -42,6 +61,8 @@ async function readBody(request: Request): Promise<Record<string, unknown> | nul
 export async function POST(request: Request, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) return errorResponse("Unauthorized", 401);
+  const forbidden = rejectAgentCaller(auth);
+  if (forbidden) return forbidden;
 
   const limited = enforceRateLimit(`admission-override:${auth.actor}`, RATE_LIMIT);
   if (limited) return limited;
@@ -51,7 +72,7 @@ export async function POST(request: Request, context: { params: Promise<{ issueI
     const body = await readBody(request);
     if (body === null) return errorResponse("Invalid JSON body", 400);
 
-    const { reason, headSha, actor } = body;
+    const { reason, headSha } = body;
     if (reason !== undefined && reason !== null && typeof reason !== "string") {
       return errorResponse("'reason' must be a string", 400);
     }
@@ -61,7 +82,7 @@ export async function POST(request: Request, context: { params: Promise<{ issueI
     if (headSha !== undefined && !isValidOverrideHeadSha(headSha)) {
       return errorResponse("'headSha' must be a full 40-character commit SHA", 400);
     }
-    const actorName = getAuthorizedActor(auth, request, typeof actor === "string" ? actor : undefined);
+    const actorName = getAuthorizedActor(auth, request);
 
     const issue = await prisma.issue.findUnique({ where: { id: issueId }, include: { repository: true } });
     if (!issue) return errorResponse("Issue not found in local cache", 404);
@@ -149,11 +170,14 @@ export async function POST(request: Request, context: { params: Promise<{ issueI
 
 /**
  * DELETE /api/issues/[issueId]/admission-override — clear the override. If it
- * is still the freshness baseline, freshness returns to unknown.
+ * is still the freshness baseline, freshness returns to unknown. Operator auth
+ * only, like POST.
  */
 export async function DELETE(request: Request, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) return errorResponse("Unauthorized", 401);
+  const forbidden = rejectAgentCaller(auth);
+  if (forbidden) return forbidden;
 
   const limited = enforceRateLimit(`admission-override:${auth.actor}`, RATE_LIMIT);
   if (limited) return limited;
