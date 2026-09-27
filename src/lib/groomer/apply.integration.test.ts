@@ -109,7 +109,10 @@ suite("plan application against a real PostgreSQL", () => {
 
     it("lets exactly one of two concurrent claims own a new key", async () => {
       const target = await issue(1);
-      const [a, b] = await Promise.all([run(target.id), run(target.id)]);
+      // Only the claims race. Creating both runs concurrently raced the
+      // fixture's automationRepo upsert into a P2002 on fullName (#1101).
+      const a = await run(target.id);
+      const b = await run(target.id);
       const store = makePrismaApplicationStore(prisma);
       const key = "a".repeat(64);
       const input = (groomingRunId: string) => ({ applicationKey: key, issueId: target.id, groomingRunId, repoFullName: REPO, issueNumber: 1 });
