@@ -45,7 +45,15 @@ export async function fetchIssues(
 async function enrichNativeBlockers(repoFullName: string, issues: GitHubIssue[]): Promise<GitHubIssue[]> {
   const out: GitHubIssue[] = [];
   for (const issue of issues) {
-    const blocked = issue.issue_dependencies_summary?.blocked_by ?? 0;
+    // Absent/null issue_dependencies_summary means the count is unknown, not
+    // zero: leave nativeBlockedBy unset (no fetch) so sync preserves
+    // last-known keys (#1086).
+    const summary = issue.issue_dependencies_summary;
+    if (summary === null || summary === undefined) {
+      out.push(issue);
+      continue;
+    }
+    const blocked = summary.blocked_by ?? 0;
     if (blocked <= 0) {
       out.push({ ...issue, nativeBlockedBy: [] });
       continue;

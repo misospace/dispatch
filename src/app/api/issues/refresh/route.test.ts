@@ -11,6 +11,20 @@ const { mocks } = vi.hoisted(() => ({
     findUnique: vi.fn(),
     update: vi.fn().mockResolvedValue(undefined),
     create: vi.fn().mockResolvedValue({ id: "issue-1" }),
+    fetchIssue: vi.fn().mockResolvedValue({
+      number: 42,
+      title: "Test Issue",
+      body: "Body",
+      html_url: "https://example.com",
+      labels: [],
+      assignees: [],
+      comments: 0,
+      created_at: "2026-08-15T03:00:00Z",
+      updated_at: "2026-08-15T04:00:00Z",
+      closed_at: null,
+      state: "open",
+      nativeBlockedBy: ["org/repo#7"],
+    }),
   },
 }));
 
@@ -25,6 +39,10 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
+vi.mock("@/lib/github", () => ({
+  fetchIssue: mocks.fetchIssue,
+}));
+
 vi.mock("@/lib/config", () => ({
   getSyncRepos: vi.fn().mockResolvedValue([{ id: "repo-1", fullName: "org/repo" }]),
   parseExcludedLabels: vi.fn().mockReturnValue([]),
@@ -32,25 +50,33 @@ vi.mock("@/lib/config", () => ({
 
 vi.mock("@/lib/issue-sync", () => ({
   defaultCurrentLane: vi.fn().mockReturnValue("default"),
-  refreshSingleIssue: vi.fn().mockResolvedValue({
-    success: true,
-    repo: { id: "repo-1", fullName: "org/repo" },
-    issueNumber: 42,
-    issueData: {
-      repositoryId: "repo-1",
-      number: 42,
-      title: "Test Issue",
-      body: "Body",
-      url: "https://example.com",
-      labels: [],
-      assignees: [],
-      commentsCount: 0,
-      updatedAt: new Date(),
-      closedAt: null,
-      state: "open",
-      lastSyncedAt: new Date(),
+  // Invoke the fetcher the route passes in so the includeNativeBlockedBy
+  // option is observable on the mocked fetchIssue.
+  refreshSingleIssue: vi.fn().mockImplementation(
+    async (repo: string, issueNumber: number, fetchIssueFn: (repo: string, issueNumber: number) => Promise<unknown>) => {
+      await fetchIssueFn(repo, issueNumber);
+      return {
+        success: true,
+        repo: { id: "repo-1", fullName: repo },
+        issueNumber,
+        issueData: {
+          repositoryId: "repo-1",
+          number: issueNumber,
+          title: "Test Issue",
+          body: "Body",
+          url: "https://example.com",
+          labels: [],
+          assignees: [],
+          commentsCount: 0,
+          updatedAt: new Date(),
+          closedAt: null,
+          state: "open",
+          lastSyncedAt: new Date(),
+          nativeBlockedBy: ["org/repo#7"],
+        },
+      };
     },
-  }),
+  ),
 }));
 
 import { POST } from "./route";
@@ -124,9 +150,15 @@ describe("POST /api/issues/refresh — business logic", () => {
     const body = await res.json();
     expect(body.success).toBe(true);
     expect(body.action).toBe("updated");
+    // The single-issue fetch is enriched with native blocked_by keys.
+    expect(mocks.fetchIssue).toHaveBeenCalledWith("org/repo", 42, { includeNativeBlockedBy: true });
+    // ...and the fetched keys are persisted with the refresh.
     expect(mocks.update).toHaveBeenCalledWith({
       where: { id: "issue-existing" },
-      data: expect.objectContaining({ title: "Test Issue" }),
+      data: expect.objectContaining({
+        title: "Test Issue",
+        nativeBlockedBy: ["org/repo#7"],
+      }),
     });
   });
 
@@ -136,6 +168,13 @@ describe("POST /api/issues/refresh — business logic", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.action).toBe("created");
-    expect(mocks.create).toHaveBeenCalled();
+    expect(mocks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          number: 99,
+          nativeBlockedBy: ["org/repo#7"],
+        }),
+      }),
+    );
   });
 });

@@ -99,7 +99,34 @@ describe("fetchIssues native blocker ingestion", () => {
 
     expect(issues.find((i) => i.number === 5)?.nativeBlockedBy).toEqual(["acme/other#7"]);
     expect(issues.find((i) => i.number === 6)?.nativeBlockedBy).toEqual([]);
-    expect(issues.find((i) => i.number === 7)?.nativeBlockedBy).toEqual([]);
+    // No summary → unknown, not none: nativeBlockedBy must stay unset.
+    expect(issues.find((i) => i.number === 7)?.nativeBlockedBy).toBeUndefined();
+  });
+
+  it("treats absent and null issue_dependencies_summary as unknown (no call, no nativeBlockedBy)", async () => {
+    fetchPaginated.mockResolvedValue([
+      // No issue_dependencies_summary field at all.
+      makeIssue({ number: 10 }),
+      // Explicit null summary.
+      makeIssue({ number: 11, issue_dependencies_summary: null }),
+    ]);
+    fetchWithRetry.mockImplementation(async (url: string) => {
+      if (url.includes("/dependencies/blocked_by")) {
+        throw new Error("blocked_by endpoint should not be called");
+      }
+      throw new Error("unexpected fetch");
+    });
+
+    const issues = await fetchIssues("acme/app", { includeNativeBlockers: true });
+
+    const blockedByCalls = fetchWithRetry.mock.calls.filter(
+      (call) => typeof call[0] === "string" && call[0].includes("/dependencies/blocked_by"),
+    );
+    expect(blockedByCalls).toHaveLength(0);
+    for (const issue of issues) {
+      expect((issue as any).nativeBlockedBy).toBeUndefined();
+    }
+    expect(issues).toHaveLength(2);
   });
 });
 
@@ -155,6 +182,12 @@ describe("fetchIssueNativeBlockers", () => {
     fetchWithRetry.mockResolvedValue(okJson([]));
 
     expect(await fetchIssueNativeBlockers("acme/app", 1)).toEqual([]);
+  });
+
+  it("returns null when the response body is not an array", async () => {
+    fetchWithRetry.mockResolvedValue(okJson({ message: "not an array" }));
+
+    expect(await fetchIssueNativeBlockers("acme/app", 1)).toBeNull();
   });
 });
 

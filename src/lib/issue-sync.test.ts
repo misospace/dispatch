@@ -314,6 +314,26 @@ describe("syncIssuesForRepos native blocked_by persistence", () => {
     // undefined → Prisma omits the field, so stored keys are preserved.
     expect(updateMock.mock.calls[0][1].nativeBlockedBy).toBeUndefined();
   });
+
+  it("overwrites stored keys when the fetch returns a new non-empty set", async () => {
+    const updateMock = vi.fn().mockResolvedValue(undefined);
+    store = {
+      findIssue: vi.fn().mockResolvedValue({ id: "existing-2", labels: [] }),
+      updateIssue: updateMock,
+      createIssue: vi.fn().mockResolvedValue(undefined),
+    };
+
+    // A blocker added after creation: the freshly-fetched non-empty set is
+    // authoritative and replaces the stored keys.
+    await syncIssuesForRepos(
+      [{ id: "repo-1", fullName: "org/repo" }],
+      async () => [githubIssue(2, { nativeBlockedBy: ["org/repo#10", "other/repo#4"] })],
+      store,
+    );
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    expect(updateMock.mock.calls[0][1].nativeBlockedBy).toEqual(["org/repo#10", "other/repo#4"]);
+  });
 });
 
 describe("reconcileClosedIssues", () => {
