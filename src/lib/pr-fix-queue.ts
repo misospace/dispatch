@@ -221,9 +221,10 @@ function metadataPatch(input: EnqueuePrFixInput): Record<string, string | number
 
 /**
  * Bound on automatic fix attempts before a REVIEW_FEEDBACK/CI item is handed to
- * a human instead of re-queued. Distinct evidence keys count attempts (each
- * coder push draws a fresh automated review → a new key). Overridable via
- * PR_FIX_MAX_ATTEMPTS; defaults to 5.
+ * a human instead of re-queued. Counts dispatchable attempts (`fixAttempts`),
+ * not evidence keys: one review carries a key per inline comment, so counting
+ * keys blocked a PR on first sight of a 6-comment review (#1103). Overridable
+ * via PR_FIX_MAX_ATTEMPTS; defaults to 5.
  */
 export function maxPrFixAttempts(): number {
   const n = Number(process.env.PR_FIX_MAX_ATTEMPTS);
@@ -273,13 +274,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       // pr-reviewer-action #593/#595).
       const isTerminalStatus = existing.status === "STALE" || existing.status === "IGNORED";
 
-      // Bound the fix loop. Each coder push draws a fresh automated review with
-      // a new evidenceKey, so distinct keys count fix attempts. Past the cap,
-      // stop re-queuing and hand the PR to a human — otherwise a human
-      // CHANGES_REQUESTED that N automated fixes never satisfy loops forever
-      // (#1001).
       const nextEvidenceKeys = uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40);
-      const capExceeded = !isKnownEvidence && nextEvidenceKeys.length > maxPrFixAttempts();
 
       let resolvedStatus: PrFixStatus;
       let resolvedLane: PrFixLane = lane;
@@ -290,12 +285,25 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
       } else if (isKnownEvidence) {
         resolvedStatus = existing.status; // #25 anti-churn: repeat evidence never flips status
-      } else if (capExceeded) {
-        resolvedStatus = "BLOCKED";
-        resolvedLane = "NEEDS_HUMAN";
-        statusNote = `Bounded at ${nextEvidenceKeys.length} attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1001).`;
       } else {
         resolvedStatus = nextStatus;
+      }
+
+      // Bound the fix loop (#1001). Only a transition back to QUEUED opens a
+      // new attempt — more evidence on already-QUEUED work (the rest of one
+      // review's inline comments) is the same attempt and never counts
+      // (#1103). Past the cap, stop re-queuing and hand the PR to a human —
+      // otherwise a human CHANGES_REQUESTED that N automated fixes never
+      // satisfy loops forever.
+      const priorAttempts = existing.fixAttempts ?? 1;
+      if (
+        resolvedStatus === "QUEUED" &&
+        existing.status !== "QUEUED" &&
+        priorAttempts >= maxPrFixAttempts()
+      ) {
+        resolvedStatus = "BLOCKED";
+        resolvedLane = "NEEDS_HUMAN";
+        statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1001).`;
       }
 
       // A transition from a non-QUEUED status back to QUEUED is a fresh
@@ -315,11 +323,15 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
           evidenceKeys: nextEvidenceKeys,
           // A fresh attempt gets a fresh per-attempt head baseline (#1074):
-          // the head the sync observed in THIS enqueue. metadataPatch below
-          // keeps refreshing the mutable `headSha` as before — the two
-          // columns now mean different things.
+          // the head the sync observed in THIS enqueue, else the last one
+          // observed (#1104). metadataPatch below keeps refreshing the mutable
+          // `headSha` as before — the two columns now mean different things.
           ...(isFreshAttempt
-            ? { ...freshAttemptGeneration(), attemptHeadSha: input.headSha ?? null }
+            ? {
+                ...freshAttemptGeneration(),
+                fixAttempts: { increment: 1 },
+                attemptHeadSha: input.headSha ?? existing.headSha ?? null,
+              }
             : {}),
           ...metadataPatch(input),
         },
@@ -500,12 +512,12 @@ export async function markPrFixItem(
     // attempt (same semantics as requeuePrFixItem) — bump the generation
     // alongside the status flip so the work identity changes (#1044).
     if (existing.status !== "QUEUED") {
-      Object.assign(data, freshAttemptGeneration());
-      // A fresh attempt with no fresher head observation: reset the
-      // per-attempt baseline so the next FIXED guard re-baselines from the
-      // (newer) mutable headSha. A caller that DOES carry a fresh head
-      // (sync re-observation) passes it through here (#1074).
-      data.attemptHeadSha = input.attemptHeadSha ?? null;
+      Object.assign(data, freshAttemptGeneration(), { fixAttempts: { increment: 1 } });
+      // Baseline the fresh attempt NOW, from the caller's head or the last
+      // observed one. Leaving it null let the guard fall back to the mutable
+      // headSha, which the next sync overwrites with the worker's own push —
+      // refusing a real fix as "pushed nothing" (#1074, #1104).
+      data.attemptHeadSha = input.attemptHeadSha ?? existing.headSha ?? null;
     }
   }
 
@@ -521,12 +533,21 @@ export async function markPrFixItem(
       // attempt — bump the generation in the same update so the identity a
       // worker already consumed is not silently reused (#1044) — and audit
       // why we rejected. No FIXED row is ever written.
-      const refusalData: Record<string, unknown> = {
-        status: "QUEUED",
-        lane: "NORMAL",
-        ...freshAttemptGeneration(),
-        attemptHeadSha: input.attemptHeadSha ?? null,
-      };
+      //
+      // The refused run was a spent attempt, so it counts toward the cap;
+      // past it, hand the PR to a human instead of re-running a worker that
+      // keeps pushing nothing (#1103). The retry keeps the refused baseline:
+      // the head is unchanged, so it is still the newest observed (#1104).
+      const refusalCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
+      const refusalData: Record<string, unknown> = refusalCapped
+        ? { status: "BLOCKED", lane: "NEEDS_HUMAN" }
+        : {
+            status: "QUEUED",
+            lane: "NORMAL",
+            ...freshAttemptGeneration(),
+            fixAttempts: { increment: 1 },
+            attemptHeadSha: input.attemptHeadSha ?? baseline ?? null,
+          };
       const refusal = await client.$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
           where: {
@@ -536,18 +557,25 @@ export async function markPrFixItem(
           data: refusalData,
         });
         if (count !== 1) return null;
+        const refusedNote = `Refused FIXED: PR head unchanged since attempt baseline (recorded=${baseline ?? "null"}). Workload reported success but pushed nothing (#940, #1074).`;
         await tx.prFixHistory.create({
           data: {
             itemId: existing.id,
             action: "mark",
-            status: "QUEUED",
-            lane: "NORMAL",
-            note: `Refused FIXED: PR head unchanged since attempt baseline (recorded=${baseline ?? "null"}). Workload reported success but pushed nothing (#940, #1074).`,
+            status: refusalData.status,
+            lane: refusalData.lane,
+            note: refusalCapped
+              ? `${refusedNote} Bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1103).`
+              : refusedNote,
           },
         });
         return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
       });
       if (!refusal) return { mutated: false, reason: "generation-mismatch" };
+      if (refusalCapped && existing.status !== "BLOCKED") {
+        const context = await buildPrFixBlockedContext(client, refusal);
+        await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: refusal.reason, latestNote: input.note ?? null, context });
+      }
       return { mutated: true, item: refusal };
     }
   }
@@ -725,14 +753,16 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
       // Requeue hands the PR back to the worker loop as a fresh attempt —
       // bump the generation in the same update so consumers see a new work
       // identity rather than one they may already have deduplicated (#1044).
-      // Requeue observes no head, so the per-attempt baseline resets to null
-      // and the next FIXED guard re-baselines from the mutable headSha
-      // (#1074).
+      // It is an operator reset, so the attempt count starts over (#1103).
+      // Baseline the attempt from the last observed head: a null baseline
+      // made the guard fall back to the mutable headSha, which the next sync
+      // overwrites with the worker's own push (#1074, #1104).
       data: {
         status: "QUEUED",
         lane: "NORMAL",
         ...freshAttemptGeneration(),
-        attemptHeadSha: null,
+        fixAttempts: 1,
+        attemptHeadSha: existing.headSha ?? null,
       },
     });
     await tx.prFixHistory.create({
