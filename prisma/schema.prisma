@@ -84,6 +84,16 @@ model Issue {
   // monopolize the groomer. Targeted runs ignore it.
   groomingRetryAfter        DateTime?
 
+  // Explicit operator admission override (#1065). The override writes the
+  // freshness baseline above with groomedRunId = admissionOverrideId, so it
+  // goes stale under the same checks as a grooming result; it is current only
+  // while groomedRunId still equals admissionOverrideId.
+  admissionOverrideId       String?
+  admissionOverrideBy       String?
+  admissionOverrideAt       DateTime?
+  admissionOverrideReason   String?   @db.Text
+  admissionOverrideHeadSha  String?
+
   // Linked PR health (persisted by reconcile, refreshable on demand)
   linkedPrNumber          Int?
   linkedPrUrl             String?

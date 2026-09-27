@@ -662,7 +662,7 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
             </a>
           )}
         </div>
-        {(issue.notReadyReason || issue.blockedReason || issue.dependencyBlockReason || issue.needsInfoReason || issue.groomingSummary) && (
+        {(issue.notReadyReason || issue.blockedReason || issue.dependencyBlockReason || issue.admissionWithheldReason || issue.needsInfoReason || issue.groomingSummary) && (
           <div className="mt-2 space-y-1">
             {issue.notReadyReason && (
               <div className="flex items-start gap-1 text-xs text-amber-700">
@@ -680,6 +680,12 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCard
               <div className="flex items-start gap-1 text-xs text-red-700">
                 <Ban className="h-3 w-3 mt-0.5 shrink-0" />
                 <span>{issue.dependencyBlockReason}</span>
+              </div>
+            )}
+            {issue.admissionWithheldReason && (
+              <div className="flex items-start gap-1 text-xs text-amber-700" data-testid="admission-withheld-reason">
+                <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                <span>{issue.admissionWithheldReason}</span>
               </div>
             )}
             {issue.needsInfoReason && (

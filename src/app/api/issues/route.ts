@@ -15,6 +15,7 @@ import { parseExcludedLabels } from "@/lib/config";
 import { isValidLane, getLaneIds, resolveRequestLane, getLaneAliases } from "@/lib/lane-config";
 import { STATUS_LABELS } from "@/types";
 import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
+import { withAdmissionAnnotations } from "@/lib/queue-admission";
 
 export async function GET(request: Request) {
   if (!(await authorizeRequest(request)).authorized) {
@@ -92,7 +93,7 @@ export async function GET(request: Request) {
       orderBy: { updatedAt: "desc" },
     });
 
-    return NextResponse.json(await withDependencyBlockReasons(issues));
+    return NextResponse.json(await withAdmissionAnnotations(await withDependencyBlockReasons(issues)));
   } catch (error) {
     return handleApiError("fetch issues", error);
   }

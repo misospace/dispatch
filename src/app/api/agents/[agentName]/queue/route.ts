@@ -15,9 +15,13 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   const excludeDecomposed = searchParams.get("exclude_decomposed");
   const includeClaimed = searchParams.get("includeClaimed") === "true";
   const includeRenovate = searchParams.get("includeRenovate") === "true";
+  // Diagnostics: append issues withheld by grooming admission (enforce mode),
+  // each with claimable: false and its admission reasons. Off by default so
+  // queue consumers never see work they may not pick up.
+  const includeWithheld = searchParams.get("includeWithheld") === "true";
 
   try {
-    const { laneValid, rankedQueue, prFixItems, availableLanes } = await fetchAgentQueueData({
+    const { laneValid, rankedQueue, withheldQueue, prFixItems, availableLanes } = await fetchAgentQueueData({
       agentName,
       lane,
       excludeDecomposed: excludeDecomposed === "true",
@@ -29,7 +33,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       return errorResponse(`Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`, 400);
     }
 
-    return NextResponse.json([...prFixItems, ...rankedQueue]);
+    return NextResponse.json([...prFixItems, ...rankedQueue, ...(includeWithheld ? withheldQueue : [])]);
   } catch (error) {
     return handleApiError("fetch agent queue", error);
   }

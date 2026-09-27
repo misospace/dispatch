@@ -13,6 +13,7 @@ import {
   resolveOpenBlockers,
   formatDependencyBlockReason,
 } from "@/lib/issue-dependencies";
+import type { QueueAdmission } from "@/lib/queue-admission";
 
 export { isRenovateIssue } from "@/lib/issue-filters";
 
@@ -55,6 +56,11 @@ export interface RankedIssue {
   blockedBy?: number[];
   dependencyBlockReason?: string;
   linkedPrHealth?: QueueLinkedPrHealth | null;
+  /**
+   * Grooming freshness admission decision (#1065). Present only when
+   * DISPATCH_QUEUE_ADMISSION_MODE is audit or enforce; absent when off.
+   */
+  admission?: QueueAdmission;
 }
 
 // ─── Anti-starvation aging ──────────────────────────────────────────────────

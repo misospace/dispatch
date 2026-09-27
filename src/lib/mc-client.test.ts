@@ -830,6 +830,14 @@ describe("queue, issues, pr-fix, groomer clients", () => {
     expect(url).toContain("/api/agents/test-agent/queue");
     expect(url).toContain("lane=local");
     expect(url).toContain("includeClaimed=true");
+    expect(url).not.toContain("includeWithheld");
+  });
+
+  it("getQueue asks for withheld admission diagnostics only when requested", async () => {
+    const { getQueue } = await import("./mc-client");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
+    await getQueue("test-agent", { includeWithheld: true });
+    expect(String(fetchMock.mock.calls[0][0])).toContain("includeWithheld=true");
   });
 
   it("listIssues builds the filter query", async () => {

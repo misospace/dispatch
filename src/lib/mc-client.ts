@@ -251,6 +251,7 @@ export async function getQueue(
     excludeDecomposed?: boolean;
     includeClaimed?: boolean;
     includeRenovate?: boolean;
+    includeWithheld?: boolean;
   },
 ): Promise<unknown[]> {
   const params = new URLSearchParams();
@@ -258,6 +259,7 @@ export async function getQueue(
   if (options?.excludeDecomposed) params.set("exclude_decomposed", "true");
   if (options?.includeClaimed) params.set("includeClaimed", "true");
   if (options?.includeRenovate) params.set("includeRenovate", "true");
+  if (options?.includeWithheld) params.set("includeWithheld", "true");
   const qs = params.toString();
 
   return mcJson<unknown[]>(

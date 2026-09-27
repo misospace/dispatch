@@ -51,13 +51,14 @@ export async function GET(
       return NextResponse.json(task);
     }
 
-    const { laneValid, rankedQueue, prFixItems, availableLanes } = await fetchAgentQueueData({
-      agentName,
-      lane,
-      excludeDecomposed: excludeDecomposed === "true",
-      includeClaimed,
-      includeRenovate,
-    });
+    const { laneValid, rankedQueue, fullQueue, withheldQueue, admissionMode, prFixItems, availableLanes } =
+      await fetchAgentQueueData({
+        agentName,
+        lane,
+        excludeDecomposed: excludeDecomposed === "true",
+        includeClaimed,
+        includeRenovate,
+      });
 
     if (!laneValid) {
       return errorResponse(`Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`, 400);
@@ -88,9 +89,12 @@ export async function GET(
       return NextResponse.json(task);
     }
 
-    if (rankedQueue.length > 0) {
+    // Linked-PR follow-up is PR work, not implementation pickup, so it scans
+    // the queue before grooming admission (#1065); in off/audit mode the two
+    // queues are the same list.
+    if (fullQueue.length > 0) {
       // Scan for linked PR follow-up before returning implement task
-      const followupItem = rankedQueue.find(
+      const followupItem = fullQueue.find(
         (item) => item.linkedPrHealth?.needsFollowup && item.linkedPrHealth?.number,
       );
 
@@ -116,8 +120,15 @@ export async function GET(
         });
         return NextResponse.json(task);
       }
+    }
 
+    if (rankedQueue.length > 0) {
       const first = rankedQueue[0];
+      if (admissionMode === "audit" && first.admission && !first.admission.admitted) {
+        console.warn(
+          `[queue-admission] audit: ${agentName} handed ${first.repoFullName ?? ""}#${first.number}, which enforce mode would withhold: ${first.admission.summary}`,
+        );
+      }
       const task = createImplementTask({
         agentName,
         lane: first.lane ?? undefined,
@@ -129,6 +140,14 @@ export async function GET(
         },
       });
       return NextResponse.json(task);
+    }
+
+    if (withheldQueue.length > 0) {
+      return NextResponse.json(
+        createIdleTask(
+          `No work available (${withheldQueue.length} ready issue${withheldQueue.length === 1 ? "" : "s"} withheld by grooming admission)`,
+        ),
+      );
     }
 
     return NextResponse.json(createIdleTask("No work available"));

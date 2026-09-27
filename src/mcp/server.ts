@@ -148,6 +148,7 @@ export async function getQueueHandler(args: ExtraArgs): Promise<ToolResult> {
       excludeDecomposed: args.excludeDecomposed as boolean | undefined,
       includeClaimed: args.includeClaimed as boolean | undefined,
       includeRenovate: args.includeRenovate as boolean | undefined,
+      includeWithheld: args.includeWithheld as boolean | undefined,
     }),
   );
 }
@@ -326,6 +327,12 @@ export function createServer(): McpServerType {
         excludeDecomposed: z.boolean().optional().describe("Exclude issues already decomposed into sub-issues"),
         includeClaimed: z.boolean().optional().describe("Include issues already claimed by an agent (agent/* labels)"),
         includeRenovate: z.boolean().optional().describe("Include Renovate-authored issues (excluded by default)"),
+        includeWithheld: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also list ready issues withheld by grooming admission (DISPATCH_QUEUE_ADMISSION_MODE=enforce), with claimable: false and admission reasons. Diagnostics only: withheld issues must not be picked up.",
+          ),
       },
     },
     getQueueHandler,

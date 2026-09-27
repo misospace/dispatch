@@ -157,6 +157,7 @@ async function executeGroomerRun(
     repoFullName: options.repoFullName,
     issueNumber: options.issueNumber,
     freshnessBackfill: true,
+    admissionRegroom: true,
   });
   if (!candidate) return null;
 
@@ -1029,6 +1030,7 @@ function candidateSourceOf(candidate: { selectionReason?: string }): string {
   switch (candidate.selectionReason) {
     case "targeted":
     case "stale":
+    case "admission_withheld":
     case "freshness_unknown":
       return candidate.selectionReason;
     default:

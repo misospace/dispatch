@@ -170,6 +170,7 @@ echo "$TASK" | codex --one-shot
 2. **Idle before model startup:** The `next-task` endpoint is read-only and cheap. Call it before starting the model to avoid wasted compute.
 3. **No lease mutation:** Calling `next-task` does not claim or lock any issue. The agent claims the issue as part of executing the task.
 4. **Optional preflight sync:** `POST /api/sync` is optional and out-of-band. Sync failures should be logged as freshness warnings and must not block task execution.
+5. **Grooming admission (opt-in):** With `DISPATCH_QUEUE_ADMISSION_MODE=enforce`, `next-task` only returns `implement` tasks for ready issues with a current, applied, evidence-backed grooming decision or an explicit operator override; `audit` exposes the decision without filtering. PR-fix and linked-PR follow-up tasks are unaffected. See [Worker Admission](./hosted-groomer.md#worker-admission).
 
 ## Source Code
 

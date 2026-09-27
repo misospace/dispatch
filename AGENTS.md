@@ -46,6 +46,7 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DISPATCH_GROOMER_INTERVAL_MS` | No | Groomer run interval (default 600000 = 10m; `0` disables) |
 | `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | PR-followup sync interval (default 900000 = 15m; `0` disables) |
 | `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Closed-issue prune interval (default 86400000 = 24h; `0` disables) |
+| `DISPATCH_QUEUE_ADMISSION_MODE` | No | Grooming freshness admission for worker pickup: `off` (default, unchanged), `audit` (annotate queue items, filter nothing) or `enforce` (withhold ready issues without a current applied grooming decision or operator override). See [docs/hosted-groomer.md](./docs/hosted-groomer.md#worker-admission). |
 
 Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` for agent API bearer auth.
 
@@ -103,6 +104,7 @@ Each classification stores: `lane`, `confidence` (`high`/`medium`/`low`), `reaso
 **Agent queue integration:**
 - Agent queue endpoint (`GET /api/agents/[agentName]/queue`) accepts a `lane` query param to filter by lane.
 - By default, BACKLOG issues are excluded from the normal agent queue.
+- Grooming admission (`DISPATCH_QUEUE_ADMISSION_MODE`, #1065): in `audit`/`enforce` each issue item carries an `admission` decision with machine-readable reason codes; in `enforce` withheld ready issues are left out (`?includeWithheld=true` lists them with `claimable: false`). PR-fix items are never gated. Operators admit an issue explicitly with `POST /api/issues/[issueId]/admission-override` (`DELETE` clears it); operator auth only (OIDC, basic, or auth disabled), agent bearer tokens get 403. A bare `status/ready` label is not an override.
 
 **Sync integration:**
 - The sync pipeline can optionally classify lanes after syncing issues. Classification failures default to NORMAL and do not break the sync.
