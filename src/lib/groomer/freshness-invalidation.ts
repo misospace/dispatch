@@ -464,22 +464,49 @@ async function applyComparison(
   // The head commit timestamp is shared by every member of the comparison
   // (they compare against the same head), so it is fetched at most once and
   // costs one budget unit per comparison, not per issue (#1091 review).
+  // "exhausted" (budget ran out) defers within the defer limit like every
+  // other unverified case; "failed" (fetch errored / unusable date) is
+  // conservative and stales.
   let headCommittedAt: number | null = null;
-  let headDateResolved = false;
-  const resolveHeadDate = async (fetchCommitDate: NonNullable<FreshnessGitHub["fetchCommitDate"]>): Promise<number | null> => {
-    if (headDateResolved) return headCommittedAt;
-    headDateResolved = true;
-    if (remaining.searchCode <= 0) return null;
-    remaining.searchCode--;
-    result.githubCalls++;
-    try {
-      const date = await fetchCommitDate(repoFullName, head);
-      const parsed = date ? Date.parse(date) : Number.NaN;
-      headCommittedAt = Number.isNaN(parsed) ? null : parsed;
-    } catch {
-      headCommittedAt = null;
+  let headDateState: "unresolved" | "ok" | "failed" | "exhausted" = "unresolved";
+  const resolveHeadDate = async (
+    fetchCommitDate: NonNullable<FreshnessGitHub["fetchCommitDate"]>,
+  ): Promise<{ at: number | null; state: "ok" | "failed" | "exhausted" }> => {
+    if (headDateState === "unresolved") {
+      if (remaining.searchCode <= 0) {
+        headDateState = "exhausted";
+      } else {
+        remaining.searchCode--;
+        result.githubCalls++;
+        try {
+          const date = await fetchCommitDate(repoFullName, head);
+          const parsed = date ? Date.parse(date) : Number.NaN;
+          if (Number.isNaN(parsed)) {
+            headDateState = "failed";
+          } else {
+            headCommittedAt = parsed;
+            headDateState = "ok";
+          }
+        } catch {
+          headDateState = "failed";
+        }
+      }
     }
-    return headCommittedAt;
+    return { at: headCommittedAt, state: headDateState };
+  };
+
+  // A deferral is only safe while it is bounded: once the oldest unverified
+  // commit has waited past the limit, the code-search index cannot be
+  // trusted to ever confirm "still absent" for this range, so the result
+  // goes stale conservatively instead of starving forever (#1091 review).
+  const deferWithinBound = (evaluation: Evaluation): void => {
+    const firstAt = comparison.firstCommitDate ? Date.parse(comparison.firstCommitDate) : Number.NaN;
+    const firstAge = Number.isNaN(firstAt) ? Number.POSITIVE_INFINITY : now().getTime() - firstAt;
+    if (Number.isNaN(firstAt) || firstAge > SEARCH_RECHECK_DEFER_LIMIT_MS) {
+      stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
+      return;
+    }
+    evaluation.deferred = true;
   };
 
   for (const evaluation of members) {
@@ -496,23 +523,12 @@ async function applyComparison(
       }
       if (queries.length > 0 && github.searchCode && github.fetchCommitDate) {
         const fetchCommitDate = github.fetchCommitDate;
-        const headAt = await resolveHeadDate(fetchCommitDate);
-        const headAge = headAt === null ? Number.NaN : now().getTime() - headAt;
-        if (!Number.isNaN(headAge)) {
-          if (headAge < SEARCH_RECHECK_INDEX_GRACE_MS) {
+        const resolved = await resolveHeadDate(fetchCommitDate);
+        if (resolved.state === "ok" && resolved.at !== null) {
+          if (now().getTime() - resolved.at < SEARCH_RECHECK_INDEX_GRACE_MS) {
             // The head is too recent for the code-search index to have caught
-            // up; an empty recheck now would not mean "still absent". Defer,
-            // but only while the oldest unverified commit is young enough:
-            // code search indexes the branch as a whole, so once that commit
-            // has waited past the limit the index cannot be trusted and the
-            // result goes stale instead of starving forever (#1091 review).
-            const firstAt = comparison.firstCommitDate ? Date.parse(comparison.firstCommitDate) : Number.NaN;
-            const firstAge = Number.isNaN(firstAt) ? Number.POSITIVE_INFINITY : now().getTime() - firstAt;
-            if (Number.isNaN(firstAt) || firstAge > SEARCH_RECHECK_DEFER_LIMIT_MS) {
-              stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
-              continue;
-            }
-            evaluation.deferred = true;
+            // up; an empty recheck now would not mean "still absent".
+            deferWithinBound(evaluation);
             continue;
           }
           let matchedQuery: string | null = null;
@@ -539,16 +555,22 @@ async function applyComparison(
             stale(evaluation, "global_evidence_commit", `default branch moved ${range}; previously empty search query now matches: ${matchedQuery}`);
             continue;
           }
-          if (!failed) {
-            if (exhausted) {
-              // Out of budget, not evidence of change: leave unverified for a
-              // later pass rather than forcing a re-groom (#1091 review).
-              evaluation.deferred = true;
-              continue;
-            }
-            evaluation.advance.groomingVerifiedSha = head;
+          if (failed) {
+            stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
             continue;
           }
+          if (exhausted) {
+            // Out of budget, not evidence of change: leave unverified for a
+            // later pass, bounded by the defer limit like the young-head case.
+            deferWithinBound(evaluation);
+            continue;
+          }
+          evaluation.advance.groomingVerifiedSha = head;
+          continue;
+        }
+        if (resolved.state === "exhausted") {
+          deferWithinBound(evaluation);
+          continue;
         }
       }
       stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);

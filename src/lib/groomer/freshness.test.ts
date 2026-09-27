@@ -328,7 +328,7 @@ describe("buildGroomingFreshnessBaseline", () => {
     ).toEqual([{ name: "search_code", arguments: { query: "q" }, ok: true, bytes: 0 }]);
   });
 
-  it("bounds saved empty-search queries to twenty", async () => {
+  it("bounds saved empty-search queries to ten, below the pass search budget", async () => {
     const toolCalls = Array.from({ length: 25 }, (_, index) => ({
       name: "search_code",
       ok: true,
@@ -336,7 +336,7 @@ describe("buildGroomingFreshnessBaseline", () => {
       arguments: { query: `missing ${index}` },
     }));
     const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: toolCalls }));
-    expect(baseline.groomedSearchCodeQueries).toHaveLength(20);
+    expect(baseline.groomedSearchCodeQueries).toHaveLength(10);
   });
 });
 

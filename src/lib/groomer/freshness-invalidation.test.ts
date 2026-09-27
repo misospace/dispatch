@@ -314,6 +314,57 @@ describe("runGroomingFreshnessPass", () => {
       expect(github.searchCode).toHaveBeenCalledTimes(1);
     });
 
+    it("stales a persistently exhausted issue once the oldest unverified commit passes the defer limit", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({
+        ok: true,
+        status: "ahead",
+        files: [],
+        truncated: false,
+        firstCommitDate: new Date(Date.now() - 3 * 3_600_000).toISOString(),
+      });
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["first", "second"] }]);
+      await pass(store, github, { ...DEFAULT_FRESHNESS_BUDGET, maxSearchCodeRechecks: 2 });
+      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      expect(store.advanced).toEqual([]);
+    });
+
+    it("defers within the bound when the budget is exhausted before the date fetch", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({
+        ok: true,
+        status: "ahead",
+        files: [],
+        truncated: false,
+        firstCommitDate: new Date(Date.now() - 5 * 60_000).toISOString(),
+      });
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] }]);
+      const result = await pass(store, github, { ...DEFAULT_FRESHNESS_BUDGET, maxSearchCodeRechecks: 0 });
+      expect(store.stale.size).toBe(0);
+      expect(store.advanced).toEqual([]);
+      expect(github.searchCode).not.toHaveBeenCalled();
+      expect(result.deferred).toBe(1);
+    });
+
+    it("completes the recheck for an issue with the maximum saved queries", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({
+        ok: true,
+        status: "ahead",
+        files: [],
+        truncated: false,
+        firstCommitDate: new Date(Date.now() - 5 * 60_000).toISOString(),
+      });
+      const queries = Array.from({ length: 10 }, (_, index) => `missing ${index}`);
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: queries }]);
+      await pass(store, github);
+      // Commit-date fetch (1) plus all ten queries fit the default budget.
+      expect(store.stale.size).toBe(0);
+      expect(store.advanced).toEqual([{ id: "issue-1", data: { groomingVerifiedSha: "sha-2" } }]);
+      expect(github.searchCode).toHaveBeenCalledTimes(10);
+      expect(github.fetchCommitDate).toHaveBeenCalledTimes(1);
+    });
+
     it("defers the recheck while the new head is younger than the index grace window", async () => {
       github.fetchHeadSha.mockResolvedValue("sha-2");
       github.compareCommits.mockResolvedValue({

@@ -47,8 +47,13 @@ export const MAX_BASELINE_PATHS = 60;
 export const MAX_BASELINE_RELATED_WORK = 20;
 /** Dependency keys kept on the baseline. */
 export const MAX_BASELINE_DEPENDENCIES = 20;
-/** Empty code-search queries retained to recheck global evidence. */
-export const MAX_BASELINE_SEARCH_CODE_QUERIES = 20;
+/**
+ * Empty code-search queries retained to recheck global evidence. Capped well
+ * below the freshness pass's search budget (20) so a single issue can always
+ * complete its recheck — commit-date fetch plus every saved query — even
+ * when it is first in the pass (#1091 review).
+ */
+export const MAX_BASELINE_SEARCH_CODE_QUERIES = 10;
 export const MAX_BASELINE_SEARCH_CODE_QUERY_CHARS = 200;
 
 /**
