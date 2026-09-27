@@ -160,6 +160,24 @@ export async function fetchLatestCommit(repoFullName: string, branch: string): P
   return response.json();
 }
 
+/**
+ * Committer timestamp (ISO string) for an existing commit sha, or null when
+ * the ref does not resolve. Used by the grooming freshness pass to judge
+ * whether the code-search index has had time to catch up with a new head.
+ */
+export async function fetchCommitDate(repoFullName: string, ref: string): Promise<string | null> {
+  const response = await fetchWithRetry(`${GITHUB_API}/repos/${repoFullName}/commits/${encodeURIComponent(ref)}`, {
+    headers: await getHeadersAsync(),
+  });
+  if (!response.ok) {
+    if (response.status === 404) return null;
+    const text = await response.text();
+    throw new Error(`Failed to fetch commit ${ref} for ${repoFullName}: ${response.status} ${text}`);
+  }
+  const data = (await response.json()) as { commit?: { committer?: { date?: string }; author?: { date?: string } } };
+  return data.commit?.committer?.date ?? data.commit?.author?.date ?? null;
+}
+
 export function jobIdFromCheckRunUrl(url: string | undefined | null): string | null {
   const m = /\/job\/(\d+)/.exec(url ?? "");
   return m ? m[1] : null;

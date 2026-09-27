@@ -72,6 +72,7 @@ model Issue {
   groomedEvidenceCapturedAt DateTime?
   groomedEvidenceScope      String?
   groomedEvidencePaths      String[]  @default([])
+  groomedSearchCodeQueries  String[]  @default([])
   groomedDependencyKeys     String[]  @default([])
   groomedOpenBlockerKeys    String[]  @default([])
   groomedRelatedWork        Json?

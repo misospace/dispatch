@@ -676,7 +676,7 @@ async function executeGroomerRun(
         plan,
         repositoryQueries: repositoryContext.queries,
         explorationRan: exploration !== null,
-        explorationToolCalls: exploration?.toolCalls ?? [],
+        explorationToolCalls: exploration?.toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes })) ?? [],
       },
       reader,
     );
@@ -913,7 +913,7 @@ async function executeGroomerRun(
         evidenceWindowStart,
         repositoryQueries: repositoryContext.queries,
         explorationRan: exploration !== null,
-        explorationToolCalls: exploration?.toolCalls ?? [],
+        explorationToolCalls: exploration?.toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes })) ?? [],
         citations: plan.citations,
       }),
     );

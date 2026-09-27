@@ -16,8 +16,8 @@
 import { prisma } from "@/lib/prisma";
 import { fetchIssue, fetchIssueComments } from "@/lib/github-issues";
 import { fetchPullRequestState } from "@/lib/github-prs";
-import { fetchLatestCommit } from "@/lib/github-ci";
-import { compareCommits, type CommitComparison } from "@/lib/github-code-search";
+import { fetchLatestCommit, fetchCommitDate } from "@/lib/github-ci";
+import { compareCommits, searchRepositoryCode, type CommitComparison } from "@/lib/github-code-search";
 import { dependencyKey } from "@/lib/issue-dependencies";
 import { findOpenIssueKeys } from "@/lib/issue-dependency-annotation";
 import { isAutomationAuthor } from "./context";
@@ -52,6 +52,7 @@ export interface FreshnessIssueRow {
   groomedEvidenceCapturedAt: Date | null;
   groomedEvidenceScope: string | null;
   groomedEvidencePaths: string[];
+  groomedSearchCodeQueries: string[];
   groomedDependencyKeys: string[];
   groomedOpenBlockerKeys: string[];
   groomedRelatedWork: unknown;
@@ -79,6 +80,9 @@ export interface FreshnessStore {
 
 export interface FreshnessGitHub {
   fetchHeadSha(repoFullName: string, branch: string): Promise<string | null>;
+  searchCode?(repoFullName: string, query: string, limit: number): Promise<{ path: string }[]>;
+  /** Committer timestamp for a sha; used to judge code-search index catch-up. */
+  fetchCommitDate?(repoFullName: string, sha: string): Promise<string | null>;
   compareCommits(repoFullName: string, base: string, head: string): Promise<CommitComparison>;
   fetchRecentComments(
     repoFullName: string,
@@ -98,6 +102,8 @@ export interface FreshnessBudget {
   maxCommentFetches: number;
   /** Related issue/PR state reads per pass (tracked issues come from the cache, free). */
   maxRelatedFetches: number;
+  /** Saved negative code-search queries rechecked per pass. */
+  maxSearchCodeRechecks: number;
   /** Comments read per comment check. */
   commentWindow: number;
 }
@@ -107,8 +113,17 @@ export const DEFAULT_FRESHNESS_BUDGET: FreshnessBudget = {
   maxCompares: 10,
   maxCommentFetches: 10,
   maxRelatedFetches: 10,
+  maxSearchCodeRechecks: 20,
   commentWindow: 30,
 };
+
+/**
+ * GitHub code search runs against an index that can lag the default branch.
+ * A saved empty query only counts as "still absent" once the new head commit
+ * is at least this old; younger heads defer the recheck to a later pass
+ * (#1091). Failures and missing timestamps stay conservative instead.
+ */
+export const SEARCH_RECHECK_INDEX_GRACE_MS = 30 * 60 * 1000;
 
 export interface FreshnessPassResult {
   issuesChecked: number;
@@ -160,6 +175,7 @@ export async function runGroomingFreshnessPass(
     compares: budget.maxCompares,
     comments: budget.maxCommentFetches,
     related: budget.maxRelatedFetches,
+    searchCode: budget.maxSearchCodeRechecks,
   };
 
   for (const repo of repos) {
@@ -177,7 +193,7 @@ async function evaluateRepo(
   store: FreshnessStore,
   github: FreshnessGitHub,
   budget: FreshnessBudget,
-  remaining: { compares: number; comments: number; related: number },
+  remaining: { compares: number; comments: number; related: number; searchCode: number },
   result: FreshnessPassResult,
   now: () => Date,
 ): Promise<void> {
@@ -284,7 +300,7 @@ async function evaluateRepo(
   }
 
   // 5. Default-branch commits since the last verified SHA.
-  await evaluateCommits(repo.fullName, live(), github, remaining, result);
+  await evaluateCommits(repo.fullName, live(), github, remaining, result, now);
 
   // Persist.
   const at = now();
@@ -342,8 +358,9 @@ async function evaluateCommits(
   repoFullName: string,
   evaluations: Evaluation[],
   github: FreshnessGitHub,
-  remaining: { compares: number },
+  remaining: { compares: number; searchCode: number },
   result: FreshnessPassResult,
+  now: () => Date,
 ): Promise<void> {
   const sensitive = evaluations.filter(
     (evaluation) =>
@@ -399,19 +416,22 @@ async function evaluateCommits(
       remaining.compares--;
       result.githubCalls++;
       const comparison = await github.compareCommits(repoFullName, base, head);
-      applyComparison(members, comparison, base, head, repoFullName, result);
+      await applyComparison(members, comparison, base, head, repoFullName, github, remaining, result, now);
     }
   }
 }
 
-function applyComparison(
+async function applyComparison(
   members: Evaluation[],
   comparison: CommitComparison,
   base: string,
   head: string,
   repoFullName: string,
+  github: FreshnessGitHub,
+  remaining: { searchCode: number },
   result: FreshnessPassResult,
-): void {
+  now: () => Date,
+): Promise<void> {
   const range = `${base.slice(0, 12)}...${head.slice(0, 12)}`;
   if (!comparison.ok) {
     if (comparison.definitive) {
@@ -435,6 +455,72 @@ function applyComparison(
   }
   for (const evaluation of members) {
     if (evaluation.issue.groomedEvidenceScope === "global") {
+      const queries = evaluation.issue.groomedSearchCodeQueries ?? [];
+      // A commit that touches a relied-on read path invalidates the result
+      // regardless of what the saved searches say (#1091: other global
+      // evidence keeps the conservative behaviour).
+      const pathHits = intersectEvidencePaths(evaluation.issue.groomedEvidencePaths, comparison.files);
+      if (pathHits.length > 0) {
+        const shown = pathHits.slice(0, 5).join(", ") + (pathHits.length > 5 ? `, +${pathHits.length - 5} more` : "");
+        stale(evaluation, "global_evidence_commit", `default branch moved ${range}; commit touched relied-on evidence paths: ${shown}`);
+        continue;
+      }
+      if (queries.length > 0 && github.searchCode && github.fetchCommitDate) {
+        if (remaining.searchCode <= 0) {
+          stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
+          continue;
+        }
+        remaining.searchCode--;
+        result.githubCalls++;
+        let committedAt: string | null = null;
+        try {
+          committedAt = await github.fetchCommitDate(repoFullName, head);
+        } catch {
+          committedAt = null;
+        }
+        const at = committedAt ? Date.parse(committedAt) : Number.NaN;
+        if (Number.isNaN(at)) {
+          // No trustworthy timestamp: cannot confirm the index caught up, so
+          // stay conservative (stale), never fresh-and-verified.
+          stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
+          continue;
+        }
+        if (now().getTime() - at < SEARCH_RECHECK_INDEX_GRACE_MS) {
+          // The head is too recent for the code-search index to have caught
+          // up; an empty recheck now would not mean "still absent". Defer to
+          // a later pass without advancing or staling.
+          evaluation.deferred = true;
+          continue;
+        }
+        let matchedQuery: string | null = null;
+        let allEmpty = true;
+        for (const query of queries) {
+          if (remaining.searchCode <= 0) {
+            allEmpty = false;
+            break;
+          }
+          remaining.searchCode--;
+          result.githubCalls++;
+          try {
+            if ((await github.searchCode(repoFullName, query, 1)).length > 0) {
+              matchedQuery = query;
+              allEmpty = false;
+              break;
+            }
+          } catch {
+            allEmpty = false;
+            break;
+          }
+        }
+        if (matchedQuery) {
+          stale(evaluation, "global_evidence_commit", `default branch moved ${range}; previously empty search query now matches: ${matchedQuery}`);
+          continue;
+        }
+        if (allEmpty) {
+          evaluation.advance.groomingVerifiedSha = head;
+          continue;
+        }
+      }
       stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
       continue;
     }
@@ -562,6 +648,7 @@ const FRESHNESS_SELECT = {
   groomedEvidenceCapturedAt: true,
   groomedEvidenceScope: true,
   groomedEvidencePaths: true,
+  groomedSearchCodeQueries: true,
   groomedDependencyKeys: true,
   groomedOpenBlockerKeys: true,
   groomedRelatedWork: true,
@@ -634,6 +721,8 @@ export const defaultFreshnessGitHub: FreshnessGitHub = {
     return (await fetchLatestCommit(repoFullName, branch))?.sha ?? null;
   },
   compareCommits,
+  searchCode: searchRepositoryCode,
+  fetchCommitDate,
   async fetchRecentComments(repoFullName, issueNumber, max) {
     const comments = await fetchIssueComments(repoFullName, issueNumber, max, "desc");
     return comments.map((comment) => ({ author: comment.user?.login ?? "unknown", createdAt: comment.created_at ?? "" }));

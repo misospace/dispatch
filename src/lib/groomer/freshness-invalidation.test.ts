@@ -34,6 +34,7 @@ function row(overrides: Partial<FreshnessIssueRow> = {}): FreshnessIssueRow {
     groomedEvidenceCapturedAt: CAPTURED,
     groomedEvidenceScope: "paths",
     groomedEvidencePaths: ["src/a.ts"],
+    groomedSearchCodeQueries: [],
     groomedDependencyKeys: [],
     groomedOpenBlockerKeys: [],
     groomedRelatedWork: null,
@@ -86,9 +87,12 @@ function fakeStore(rows: FreshnessIssueRow[]): FakeStore {
 function fakeGitHub() {
   return {
     fetchHeadSha: vi.fn(async (): Promise<string | null> => "sha-1"),
+    searchCode: vi.fn(async (): Promise<{ path: string }[]> => []),
     compareCommits: vi.fn(
       async (): Promise<CommitComparison> => ({ ok: true, status: "ahead", files: [], truncated: false }),
     ),
+    // Old enough that the code-search index is assumed caught up (#1091).
+    fetchCommitDate: vi.fn(async (): Promise<string | null> => new Date(Date.now() - 3_600_000).toISOString()),
     fetchRecentComments: vi.fn(async (): Promise<Array<{ author: string; createdAt: string }>> => []),
     fetchIssueState: vi.fn(async (): Promise<"open" | "closed" | null> => "open"),
     fetchPullRequestState: vi.fn(async (): Promise<"open" | "closed" | "merged" | null> => "open"),
@@ -263,12 +267,99 @@ describe("runGroomingFreshnessPass", () => {
       expect(store.stale.get("issue-1")?.detail).toContain("src/a.ts");
     });
 
-    it("conservatively stales global (negative) evidence on any commit", async () => {
+    it("conservatively stales global evidence without saved search queries", async () => {
       github.fetchHeadSha.mockResolvedValue("sha-2");
       github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: ["docs/readme.md"], truncated: false });
       const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [] }]);
       await pass(store, github);
       expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      expect(github.searchCode).not.toHaveBeenCalled();
+    });
+
+    it("advances global evidence when saved empty queries remain empty", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: ["docs/readme.md"], truncated: false });
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["new symbol", "missing call"] }]);
+      await pass(store, github);
+      expect(store.stale.size).toBe(0);
+      expect(store.advanced).toEqual([{ id: "issue-1", data: { groomingVerifiedSha: "sha-2" } }]);
+      expect(github.searchCode).toHaveBeenCalledTimes(2);
+    });
+
+    it("stales global evidence when a saved query now matches", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      github.searchCode.mockResolvedValueOnce([]).mockResolvedValueOnce([{ path: "src/new.ts" }]);
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["first", "specific missing query"] }]);
+      await pass(store, github);
+      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      expect(store.stale.get("issue-1")?.detail).toContain("specific missing query");
+    });
+
+    it("falls back to global staleness when the search budget is exhausted", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["first", "second"] }]);
+      await pass(store, github, { ...DEFAULT_FRESHNESS_BUDGET, maxSearchCodeRechecks: 2 });
+      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      // One budget unit goes to the commit-date check, one to the first query.
+      expect(github.searchCode).toHaveBeenCalledTimes(1);
+    });
+
+    it("defers the recheck while the new head is younger than the index grace window", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      github.fetchCommitDate.mockResolvedValue(new Date(Date.now() - 60_000).toISOString());
+      const store = fakeStore([{ ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] }]);
+      const result = await pass(store, github);
+      expect(store.stale.size).toBe(0);
+      expect(store.advanced).toEqual([]);
+      expect(github.searchCode).not.toHaveBeenCalled();
+      expect(result.deferred).toBe(1);
+    });
+
+    it("falls back to global staleness when the commit date is missing or unavailable", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      const issue = { ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] };
+      github.fetchCommitDate.mockResolvedValue(null);
+      const missing = fakeStore([issue]);
+      await pass(missing, github);
+      expect(missing.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+
+      github.fetchCommitDate.mockRejectedValueOnce(new Error("boom"));
+      const failed = fakeStore([issue]);
+      await pass(failed, github);
+      expect(failed.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+    });
+
+    it("stales a global result whose relied-on read path the commit touched, without rechecking", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: ["src/a.ts"], truncated: false });
+      const store = fakeStore([
+        { ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: ["src/a.ts"], groomedSearchCodeQueries: ["query"] },
+      ]);
+      await pass(store, github);
+      expect(store.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      expect(store.stale.get("issue-1")?.detail).toContain("src/a.ts");
+      expect(github.searchCode).not.toHaveBeenCalled();
+    });
+
+    it("falls back to global staleness when search is missing or fails", async () => {
+      github.fetchHeadSha.mockResolvedValue("sha-2");
+      github.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+      const issue = { ...row(), groomedEvidenceScope: "global", groomedEvidencePaths: [], groomedSearchCodeQueries: ["query"] };
+      const missing = fakeStore([issue]);
+      const withoutSearch = { ...github } as { searchCode?: typeof github.searchCode } & Omit<ReturnType<typeof fakeGitHub>, "searchCode">;
+      delete withoutSearch.searchCode;
+      await pass(missing, withoutSearch as ReturnType<typeof fakeGitHub>);
+      expect(missing.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+
+      github.searchCode.mockRejectedValueOnce(new Error("rate limited"));
+      const failed = fakeStore([issue]);
+      await pass(failed, github);
+      expect(failed.stale.get("issue-1")?.reasons).toEqual(["global_evidence_commit"]);
+      expect(failed.stale.get("issue-1")?.detail).toBe("default branch moved sha-1...sha-2 and the result relied on repo-wide evidence");
     });
 
     it("ignores commits for a result that used no repository evidence", async () => {

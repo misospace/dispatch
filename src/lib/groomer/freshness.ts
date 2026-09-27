@@ -47,6 +47,9 @@ export const MAX_BASELINE_PATHS = 60;
 export const MAX_BASELINE_RELATED_WORK = 20;
 /** Dependency keys kept on the baseline. */
 export const MAX_BASELINE_DEPENDENCIES = 20;
+/** Empty code-search queries retained to recheck global evidence. */
+export const MAX_BASELINE_SEARCH_CODE_QUERIES = 20;
+export const MAX_BASELINE_SEARCH_CODE_QUERY_CHARS = 200;
 
 /**
  * Statuses a worker owns. The freshness pass does not evaluate these (a claim
@@ -95,6 +98,21 @@ export interface ExplorationToolCallLike {
   name: string;
   ok: boolean;
   bytes: number;
+  arguments?: Record<string, unknown>;
+}
+
+function emptySearchCodeQueries(toolCalls: ExplorationToolCallLike[]): string[] {
+  const queries: string[] = [];
+  for (const call of toolCalls) {
+    if (call.name !== "search_code" || !call.ok || call.bytes !== 0) continue;
+    const raw = call.arguments?.query;
+    if (typeof raw !== "string") continue;
+    const query = raw.trim().slice(0, MAX_BASELINE_SEARCH_CODE_QUERY_CHARS);
+    if (!query || queries.includes(query)) continue;
+    queries.push(query);
+    if (queries.length >= MAX_BASELINE_SEARCH_CODE_QUERIES) break;
+  }
+  return queries;
 }
 
 /**
@@ -320,6 +338,7 @@ export interface GroomingFreshnessBaseline {
   groomedEvidenceCapturedAt: Date;
   groomedEvidenceScope: GroomingEvidenceScope;
   groomedEvidencePaths: string[];
+  groomedSearchCodeQueries: string[];
   groomedDependencyKeys: string[];
   groomedOpenBlockerKeys: string[];
   groomedRelatedWork: RelatedWorkBaselineEntry[];
@@ -340,6 +359,7 @@ export const UNKNOWN_FRESHNESS: Record<string, unknown> = {
   groomedEvidenceCapturedAt: null,
   groomedEvidenceScope: null,
   groomedEvidencePaths: [],
+  groomedSearchCodeQueries: [],
   groomedDependencyKeys: [],
   groomedOpenBlockerKeys: [],
   groomedRelatedWork: null,
@@ -407,6 +427,12 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     groomedEvidenceCapturedAt: input.evidenceWindowStart,
     groomedEvidenceScope: scope,
     groomedEvidencePaths: reliance.repositoryPaths,
+    // Only negative-search globals may be rechecked later (#1091). The other
+    // global cases — a relied-on path that was only surfaced, or repository
+    // access with no read path — keep the conservative stale-on-commit
+    // behaviour even when an empty search also happened during the run.
+    groomedSearchCodeQueries:
+      scope === "global" && !reliance.reliesOnSurfacedPath ? emptySearchCodeQueries(input.explorationToolCalls) : [],
     groomedDependencyKeys: dependencyKeys,
     groomedOpenBlockerKeys: dependencyKeys.filter((key) => openKeys.has(key)).sort(),
     groomedRelatedWork: reliance.relatedWork,

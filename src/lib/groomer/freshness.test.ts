@@ -259,11 +259,49 @@ describe("buildGroomingFreshnessBaseline", () => {
     expect(baseline.groomedEvidencePaths).toEqual([]);
   });
 
-  it("marks a negative code search as global evidence", async () => {
+  it("records bounded, deduplicated empty-search queries only for global evidence", async () => {
+    const calls = [
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "  missing symbol  " } },
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } },
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "x".repeat(250) } },
+      { name: "search_code", ok: true, bytes: 0, arguments: { query: "  " } },
+      { name: "search_code", ok: false, bytes: 0, arguments: { query: "failed" } },
+    ];
+    const global = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: calls }));
+    expect(global.groomedEvidenceScope).toBe("global");
+    expect(global.groomedSearchCodeQueries).toEqual(["missing symbol", "x".repeat(200)]);
+
+    const paths = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [{ path: "src/a.ts", provenance: "repository", via: "read", ref: "sha-1" }] },
+        explorationToolCalls: [{ name: "search_code", ok: false, bytes: 0, arguments: { query: "missing symbol" } }],
+        citations: [{ id: "repo:src/a.ts", subject: "repository", state: null }],
+      }),
+    );
+    expect(paths.groomedEvidenceScope).toBe("paths");
+    expect(paths.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("does not save queries for a global scope caused by a surfaced path", async () => {
     const baseline = await buildGroomingFreshnessBaseline(
-      input({ explorationToolCalls: [{ name: "search_code", ok: true, bytes: 0 }] }),
+      input({
+        citations: [{ id: "repo:src/hit.ts", subject: "repository", state: null }],
+        explorationToolCalls: [{ name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } }],
+      }),
     );
     expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("bounds saved empty-search queries to twenty", async () => {
+    const toolCalls = Array.from({ length: 25 }, (_, index) => ({
+      name: "search_code",
+      ok: true,
+      bytes: 0,
+      arguments: { query: `missing ${index}` },
+    }));
+    const baseline = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: toolCalls }));
+    expect(baseline.groomedSearchCodeQueries).toHaveLength(20);
   });
 });
 

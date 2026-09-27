@@ -34,6 +34,7 @@ describe("github domain modules expose expected exports", () => {
   it("github-ci exports CI/workflows/runs/jobs/releases/packages/commits/logs symbols", () => {
     expect(Object.keys(Ci).sort()).toEqual([
       "extractLogExcerpt",
+      "fetchCommitDate",
       "fetchFailedJobLogExcerpt",
       "fetchLatestCommit",
       "fetchPackages",
