@@ -41,6 +41,7 @@ model Issue {
   agentWork     AgentWork[]
   leases        Lease[]
   groomingRuns  GroomingRun[]
+  groomingApplications GroomingApplication[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -513,16 +514,47 @@ model GroomingRun {
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
 
+  // Apply-time validation and idempotent application (#1063).
+  applicationKey       String?
+  applyOutcome         String?
+  preconditions        Json?
+  preconditionFailures String[]            @default([])
+  applications         GroomingApplication[]
+
   @@index([repoFullName])
   @@index([issueId])
   @@index([repoId])
   @@index([agentRunId])
+  @@index([applicationKey])
   @@index([status])
   @@index([dryRun])
   @@index([createdAt])
   @@index([issueId, createdAt])
   @@index([repoId, status, createdAt])
   @@index([issueId, status])
+}
+
+// One logical application of a grooming plan (#1063), keyed by
+// repo + issue + evidence digest + plan version + normalized mutation intent.
+// The unique key is the claim: a retried or duplicated run with the same key
+// replays the recorded steps instead of repeating GitHub side effects.
+model GroomingApplication {
+  id             String       @id @default(cuid())
+  applicationKey String       @unique
+  issueId        String
+  issue          Issue        @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  groomingRunId  String?
+  groomingRun    GroomingRun? @relation(fields: [groomingRunId], references: [id], onDelete: SetNull)
+  repoFullName   String
+  issueNumber    Int
+  status         String
+  steps          Json
+  attempts       Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([issueId])
+  @@index([groomingRunId])
 }
 
 // ---------------------------------------------------------------------------

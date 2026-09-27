@@ -175,7 +175,11 @@ export interface RelatedWorkBaselineEntry {
 
 const RELATED_KEY_PATTERN = /^github:(issue|pr):([^#\s]+\/[^#\s]+)#(\d+)$/;
 
-function relatedWorkEntry(key: string, state: string | null): RelatedWorkBaselineEntry | null {
+/**
+ * Parse a related-work evidence key (`github:issue|pr:owner/repo#N`) with the
+ * state it was observed in. Null for commits, unknown states and other keys.
+ */
+export function relatedWorkEntry(key: string, state: string | null): RelatedWorkBaselineEntry | null {
   if (state !== "open" && state !== "closed" && state !== "merged") return null;
   const match = RELATED_KEY_PATTERN.exec(key);
   if (!match) return null;

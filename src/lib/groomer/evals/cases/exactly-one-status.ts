@@ -81,8 +81,6 @@ export const exactlyOneStatusForeignLabel: GroomingCase = {
       name: "re-grooms to backlog",
       output: parked("backlog", { summary: "Needs a lease API field first.", evidence }),
       expect: { accepted: true, status: "status/backlog", ready: false },
-      knownBug:
-        "run.ts ensureSingleStatusLabel keeps the first status present for a non-ready plan, so status/needs-review survives and the derived status/backlog is dropped",
     },
   ],
 };

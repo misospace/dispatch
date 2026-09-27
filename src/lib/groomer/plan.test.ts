@@ -533,9 +533,9 @@ describe("GroomingPlan validation failures", () => {
       expectInvalid(done(), 'an already_done verdict requires a close with reason "already_done"');
     });
 
-    it("accepts already_done backed by pinned repository evidence or merged work", () => {
-      for (const ref of ["repo:src/auth/login.ts", "github:pr:org/repo#12", "comment:101"]) {
-        const plan = validPlan(done({ mutations: { close: { reason: "already_done", rationale: "fixed by #12", evidenceRefs: [ref] } } }));
+    it("accepts already_done backed by pinned repository evidence, with related work as corroboration", () => {
+      for (const refs of [["repo:src/auth/login.ts"], ["repo:src/auth/login.ts", "github:pr:org/repo#12", "comment:101"]]) {
+        const plan = validPlan(done({ mutations: { close: { reason: "already_done", rationale: "fixed by #12", evidenceRefs: refs } } }));
         expect(plan.mutations.status).toBe("status/done");
         expect(plan.readiness.ready).toBe(false);
       }
@@ -544,8 +544,29 @@ describe("GroomingPlan validation failures", () => {
     it("refuses to close on the issue itself or automation comments", () => {
       expectInvalid(
         done({ mutations: { close: { reason: "already_done", rationale: "r", evidenceRefs: ["issue", "comment:102"] } } }),
-        "already_done must cite pinned repository evidence, related GitHub work, or a human comment",
+        "already_done must cite pinned repository evidence",
       );
+    });
+
+    it("refuses to close on merged work or a human comment without current-revision evidence (dispatch#1063)", () => {
+      for (const ref of ["github:pr:org/repo#12", "comment:101"]) {
+        expectInvalid(
+          done({ mutations: { close: { reason: "already_done", rationale: "fixed by #12", evidenceRefs: [ref] } } }),
+          "related work or a human comment may corroborate but cannot close an issue alone",
+        );
+      }
+    });
+
+    it("refuses to close below high confidence (dispatch#1063)", () => {
+      for (const confidence of ["medium", "low"] as const) {
+        expectInvalid(
+          done({
+            verdict: { confidence },
+            mutations: { close: { reason: "already_done", rationale: "r", evidenceRefs: ["repo:src/auth/login.ts"] } },
+          }),
+          "requires high confidence",
+        );
+      }
     });
 
     it("refuses to close on unpinned repository reads", () => {
@@ -560,7 +581,7 @@ describe("GroomingPlan validation failures", () => {
       expectInvalid(
         done({
           verdict: { uncertainties: [{ kind: "unverified_premise", question: "Is #12 deployed?", material: true }] },
-          mutations: { close: { reason: "already_done", rationale: "r", evidenceRefs: ["github:pr:org/repo#12"] } },
+          mutations: { close: { reason: "already_done", rationale: "r", evidenceRefs: ["repo:src/auth/login.ts", "github:pr:org/repo#12"] } },
         }),
         "already_done cannot carry a material uncertainty",
       );

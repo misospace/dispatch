@@ -76,7 +76,7 @@ Evidence rules:
 Readiness rules (Dispatch rejects a "ready" plan that breaks any of these):
 - verdict.evidenceRefs cites at least one "repo:" id read at the pinned head SHA, and confidence is not low.
 - No material uncertainty remains.
-- For implementation work: implementationBrief is present, verifiedCurrentBehavior cites "repo:" evidence, at least one relevant path or file to create is named, inScope is not empty, and every acceptance criterion is deterministic: its verification is automated_test, command or code_inspection, never subjective.
+- For implementation work: implementationBrief is present, verifiedCurrentBehavior cites "repo:" evidence, at least one relevant path or file to create is named, every relevantPaths entry with change "modify" is a "repo:" id read at the pinned head SHA (a path only surfaced by search may have moved), inScope is not empty, and every acceptance criterion is deterministic: its verification is automated_test, command or code_inspection, never subjective.
 - decomposition.required is false. When an issue bundles several independently shippable changes, set decomposition.required with one childBrief per change; that issue is not implementation-ready.
 - mutations.close is null.
 If any rule fails, the issue is not ready: pick the actionability that says why and record what is missing.
@@ -126,8 +126,12 @@ Rules:
   resolved. Pick it when the file/symbol/situation the issue describes is
   gone or already correct on the default branch, and there is no follow-up
   work for a worker to do. Set mutations.close to reason "already_done" and
-  cite the evidence that shows it: a "repo:" id, a merged PR or commit, or a
-  human comment. Status becomes status/done and the runner closes the issue on
+  cite the evidence that shows it. Closing is the highest-impact change the
+  groomer makes, so Dispatch rejects an already_done plan unless
+  verdict.confidence is "high" and mutations.close.evidenceRefs includes a
+  "repo:" id read at the pinned head SHA: the code as it is now. A merged PR,
+  a commit or a human comment may corroborate it but cannot close an issue
+  alone. Status becomes status/done and the runner closes the issue on
   GitHub; you do not need to.
 - "duplicate" and "superseded" closes are recommendations only: they are
   recorded, never applied. Cite the matching relatedWork entry.
@@ -160,7 +164,7 @@ Body enrichment rules:
   in the issue itself — never guess a path. If you do not know which files are
   involved, say so plainly rather than inventing one
 - The enriched body should add structure: brief context, what's known, suggested approach based on labels/body/comments
-- Do NOT clobber existing body content — if there's any meaningful body, append rather than replace; if empty/missing, create from scratch
+- Do NOT clobber existing body content. Dispatch keeps the original body verbatim and writes proposedBody into one Dispatch-managed section below it, replacing that section on later grooms, so proposedBody holds only your additions: do not repeat the original text
 - Keep enriched body under 10000 characters
 
 Comment rules:

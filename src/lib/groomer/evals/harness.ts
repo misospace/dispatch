@@ -148,6 +148,7 @@ export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): P
     relatedWork: related,
   };
 
+  const applications = new Map<string, Record<string, unknown> & { applicationKey: string }>();
   const prisma = {
     automationRepo: { findUnique: async () => ({ id: "repo-1", fullName: c.repoFullName, enabled: true }) },
     groomingRun: {
@@ -165,6 +166,20 @@ export async function runCandidate(c: GroomingCase, candidate: CaseCandidate): P
     issueLane: { create: async () => ({ id: "lane-1" }) },
     agentRun: { create: async () => ({ id: "agent-run-1" }) },
     auditLog: { create: async () => ({ id: "audit-1" }) },
+    // Plan application claims (#1063), in memory for this run.
+    groomingApplication: {
+      findUnique: async ({ where }: { where: { applicationKey: string } }) => applications.get(where.applicationKey) ?? null,
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        const row = { ...data, applicationKey: String(data.applicationKey), attempts: 1 };
+        applications.set(row.applicationKey, row);
+        return row;
+      },
+      update: async ({ where, data }: { where: { applicationKey: string }; data: Record<string, unknown> }) => {
+        const row = applications.get(where.applicationKey)!;
+        Object.assign(row, "attempts" in data ? { attempts: Number(row.attempts) + 1 } : data);
+        return row;
+      },
+    },
   };
 
   const deps: GroomerDeps = {

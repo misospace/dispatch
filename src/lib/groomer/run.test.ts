@@ -37,9 +37,12 @@ const { mocks } = vi.hoisted(() => ({
     acquireGroomerLock: vi.fn(),
     heartbeatGroomerLock: vi.fn(),
     releaseGroomerLock: vi.fn(),
+    compareCommits: vi.fn(),
+    applications: new Map<string, Record<string, any>>(),
     prisma: {
       automationRepo: { findUnique: vi.fn() },
       groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
+      groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
@@ -56,10 +59,10 @@ vi.mock("./llm", () => ({
   callGroomerLLM: mocks.callGroomerLLM,
 }));
 
-vi.mock("./context", () => ({
-  fetchIssueComments: mocks.fetchIssueComments,
-  buildIssueContext: mocks.buildIssueContext,
-}));
+vi.mock("./context", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./context")>();
+  return { ...actual, fetchIssueComments: mocks.fetchIssueComments, buildIssueContext: mocks.buildIssueContext };
+});
 
 vi.mock("./config", () => ({
   getHostedGroomerConfig: mocks.getHostedGroomerConfig,
@@ -96,6 +99,10 @@ vi.mock("./explore", () => ({
 vi.mock("./evidence-snapshot", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./evidence-snapshot")>();
   return { ...actual, collectGroomingEvidenceSnapshot: mocks.collectGroomingEvidenceSnapshot };
+});
+vi.mock("@/lib/github-code-search", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/github-code-search")>();
+  return { ...actual, compareCommits: mocks.compareCommits };
 });
 vi.mock("./groomer-lock", () => ({
   acquireGroomerLock: mocks.acquireGroomerLock,
@@ -279,7 +286,36 @@ describe("runHostedGroomer", () => {
       bytes: 0,
       queries: [],
     });
-    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue(mockEvidence);
+    // The live issue defaults to the candidate this run selected, so the
+    // snapshot and the apply-time re-capture agree unless a test says not.
+    mocks.collectGroomingEvidenceSnapshot.mockImplementation(async () => {
+      const selected = mocks.selectGroomingCandidate.mock.results.at(-1);
+      const c: GroomingCandidate = (selected ? await selected.value : null) ?? mockCandidate;
+      return {
+        ...mockEvidence,
+        issue: { ...mockEvidence.issue, title: c.title, body: c.body, labels: [...c.labels].sort() },
+      };
+    });
+    mocks.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: [], truncated: false });
+    // In-memory GroomingApplication with the unique applicationKey claim.
+    mocks.applications.clear();
+    mocks.prisma.groomingApplication.findUnique.mockImplementation(
+      async ({ where }: { where: { applicationKey: string } }) => mocks.applications.get(where.applicationKey) ?? null,
+    );
+    mocks.prisma.groomingApplication.create.mockImplementation(async ({ data }: { data: Record<string, any> }) => {
+      if (mocks.applications.has(data.applicationKey)) throw Object.assign(new Error("Unique constraint"), { code: "P2002" });
+      const row = { ...data, attempts: 1 };
+      mocks.applications.set(data.applicationKey, row);
+      return row;
+    });
+    mocks.prisma.groomingApplication.update.mockImplementation(
+      async ({ where, data }: { where: { applicationKey: string }; data: Record<string, any> }) => {
+        const row = mocks.applications.get(where.applicationKey)!;
+        if (data.attempts?.increment) row.attempts += data.attempts.increment;
+        else Object.assign(row, JSON.parse(JSON.stringify(data)));
+        return row;
+      },
+    );
   });
 
   it("returns null when no grooming candidate available", async () => {
@@ -692,7 +728,9 @@ describe("runHostedGroomer", () => {
     expect(mocks.addIssueComment).toHaveBeenCalledWith(
       "org/repo",
       42,
-      "`@reviewer` This issue has been groomed and moved to **ready** status. Contact foo@bar.com with questions.",
+      expect.stringMatching(
+        /^`@reviewer` This issue has been groomed and moved to \*\*ready\*\* status\. Contact foo@bar\.com with questions\.\n\n<!-- dispatch-groomer:apply=[0-9a-f]{64} -->$/,
+      ),
     );
   });
 
@@ -781,10 +819,11 @@ describe("runHostedGroomer", () => {
 
     await runHostedGroomer();
 
+    expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
     expect(mocks.addIssueComment).toHaveBeenCalledWith(
       "org/repo",
       42,
-      "Likely root cause found.",
+      expect.stringMatching(/^Likely root cause found\.\n\n<!-- dispatch-groomer:apply=[0-9a-f]{64} -->$/),
     );
   });
 
@@ -976,11 +1015,10 @@ Investigate session handling in auth module.`;
     const result = await runHostedGroomer();
 
     expect(result!.mutationPlan?.bodyEnriched).toBe(true);
-    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledWith(
-      "org/repo",
-      42,
-      expect.objectContaining({ body: enrichedBody }),
-    );
+    // The human text is kept verbatim; the enrichment lands in one managed section.
+    expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledWith("org/repo", 42, {
+      body: `Broken.\n\n<!-- dispatch-groomer:managed:start -->\n${enrichedBody}\n<!-- dispatch-groomer:managed:end -->`,
+    });
     expect(result!.appliedMutations?.bodyUpdated).toBe(true);
   });
 
@@ -1013,7 +1051,7 @@ Investigate session handling in auth module.`;
       42,
       expect.objectContaining({
         title: "Fix SSO callback state mismatch",
-        body: enrichedBody,
+        body: expect.stringContaining(`Fix.\n\n<!-- dispatch-groomer:managed:start -->\n${enrichedBody}\n`),
       }),
     );
     expect(result!.appliedMutations?.titleUpdated).toBe(true);
@@ -1130,10 +1168,11 @@ Investigate session handling in auth module.`;
 
       const result = await runHostedGroomer();
 
-      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
-      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      // The issue already ends in the target state, so no label write is
+      // made at all (no thrash), and the post-condition still holds.
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      const statusLabels = result!.plannedLabels.filter((l) => l.startsWith("status/"));
       expect(statusLabels).toEqual(["status/backlog"]);
-      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/backlog"]));
     });
 
     it("restores status/ready when a ready re-groom drops the status label", async () => {
@@ -1156,10 +1195,11 @@ Investigate session handling in auth module.`;
 
       const result = await runHostedGroomer();
 
-      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
-      const statusLabels = written.filter((l) => l.startsWith("status/"));
+      // The issue already ends in the target state, so no label write is
+      // made at all (no thrash), and the post-condition still holds.
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      const statusLabels = result!.plannedLabels.filter((l) => l.startsWith("status/"));
       expect(statusLabels).toEqual(["status/backlog"]);
-      expect(result!.plannedLabels).toEqual(expect.arrayContaining(["status/backlog"]));
     });
 
     it("collapses multiple status labels to one", async () => {
@@ -1470,9 +1510,16 @@ Investigate session handling in auth module.`;
 
       expect(result).not.toBeNull();
       expect(result!.dryRun).toBe(false);
-      // The essential label mutation still applied even though close failed.
-      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+      // The explaining comment landed; status/done did not, because it is
+      // only written once the close succeeds. The issue stays open with its
+      // previous status, so the selector can retry it.
+      expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
       expect(result!.appliedMutations?.issueClosedError).toMatch(/502/);
+      expect(result!.appliedMutations?.outcome).toBe("partial");
+      expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: "partial", retryable: true }) }),
+      );
       // Local state is NOT flipped closed when GitHub didn't actually close it,
       // so the issue keeps the chance to be retried.
       expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
@@ -1606,6 +1653,331 @@ Investigate session handling in auth module.`;
           data: expect.objectContaining({ candidateSource: "stale", staleReasons: ["human_comment"] }),
         }),
       );
+    });
+  });
+
+  describe("apply-time validation and idempotent application (dispatch#1063)", () => {
+    const liveEvidence = (patch: Partial<GroomingEvidenceSnapshot> = {}, issue: Partial<GroomingEvidenceSnapshot["issue"]> = {}) => ({
+      ...mockEvidence,
+      ...patch,
+      issue: { ...mockEvidence.issue, ...issue },
+    });
+
+    /** The first capture is the snapshot; the second is the apply-time re-read. */
+    function liveStateChangesTo(patch: Partial<GroomingEvidenceSnapshot>, issue: Partial<GroomingEvidenceSnapshot["issue"]> = {}) {
+      mocks.collectGroomingEvidenceSnapshot
+        .mockResolvedValueOnce(liveEvidence())
+        .mockResolvedValueOnce(liveEvidence(patch, issue));
+    }
+
+    function expectNoGitHubWrites() {
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.updateIssueTitleAndBody).not.toHaveBeenCalled();
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+    }
+
+    function completedRun(): Record<string, any> {
+      const call = mocks.prisma.groomingRun.update.mock.calls.findLast((c) => "completedAt" in c[0].data);
+      expect(call).toBeDefined();
+      return call![0].data;
+    }
+
+    const withComment = planDraft({ mutations: { githubComment: "Ready: login.ts drops the return URL." } });
+
+    it("applies zero mutations when the issue is edited just before apply, and records which precondition changed", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(withComment);
+      liveStateChangesTo({}, { body: "Actually, this only happens on Safari." });
+
+      const result = await runHostedGroomer();
+
+      expectNoGitHubWrites();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+      expect(mocks.prisma.issueLane.create).not.toHaveBeenCalled();
+      expect(result!.appliedMutations).toMatchObject({ outcome: "stale" });
+      expect(completedRun()).toMatchObject({
+        status: "stale",
+        stage: "validated",
+        retryable: true,
+        applyOutcome: "stale",
+        preconditionFailures: ["issue: issue changed since the evidence snapshot: body"],
+        errorMessage: expect.stringContaining("Apply preconditions failed"),
+      });
+      expect(completedRun().preconditions.checks).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: "issue", status: "changed" })]),
+      );
+    });
+
+    it("applies zero mutations when a claim lands between analysis and apply", async () => {
+      liveStateChangesTo({}, { labels: ["agent/coder", "priority/p0", "status/in-progress"] });
+      await runHostedGroomer();
+      expectNoGitHubWrites();
+      expect(completedRun().preconditionFailures[0]).toMatch(/^issue: .*labels \(\+agent\/coder \+status\/in-progress\)/);
+    });
+
+    it("applies zero mutations when the branch head moves under the plan's evidence", async () => {
+      liveStateChangesTo({ headSha: "def456", pinnedRef: "def456" });
+      mocks.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: ["src/auth/login.ts"], truncated: false });
+
+      await runHostedGroomer();
+
+      expect(mocks.compareCommits).toHaveBeenCalledWith("org/repo", "abc123", "def456");
+      expectNoGitHubWrites();
+      expect(completedRun()).toMatchObject({ status: "stale" });
+      expect(completedRun().preconditionFailures).toEqual([
+        "head: head moved abc123...def456 and touched src/auth/login.ts",
+      ]);
+    });
+
+    it("applies when the head moved without touching the plan's evidence, and records it as verified at the new head", async () => {
+      liveStateChangesTo({ headSha: "def456", pinnedRef: "def456" });
+      mocks.compareCommits.mockResolvedValue({ ok: true, status: "ahead", files: ["docs/README.md"], truncated: false });
+
+      await runHostedGroomer();
+
+      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+      const data = mocks.prisma.issue.update.mock.calls.at(-1)![0].data;
+      expect(data).toMatchObject({ groomedHeadSha: "abc123", groomingVerifiedSha: "def456" });
+    });
+
+    it("applies zero mutations when the head cannot be re-read", async () => {
+      liveStateChangesTo({ headSha: null, pinnedRef: null, warnings: ["evidence: failed to resolve default-branch head SHA: 500"] });
+      await runHostedGroomer();
+      expectNoGitHubWrites();
+      expect(completedRun().preconditionFailures[0]).toMatch(/^head: .*500/);
+    });
+
+    it("applies zero mutations when a human comments after the evidence was captured", async () => {
+      mocks.fetchIssueComments.mockImplementation(async (_repo: string, _n: number, _max?: number, direction?: string) =>
+        direction === "desc" ? [{ id: 5, author: "alice", body: "Wait, not yet.", createdAt: new Date(Date.now() + 1000).toISOString() }] : [],
+      );
+      await runHostedGroomer();
+      expectNoGitHubWrites();
+      expect(completedRun().preconditionFailures[0]).toMatch(/^comments: new comment by alice/);
+    });
+
+    it("never applies a plan built on a snapshot that did not capture the issue", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValueOnce(new Error("boom"));
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { evidenceRefs: [] } }));
+      await runHostedGroomer();
+      warnSpy.mockRestore();
+      expectNoGitHubWrites();
+      expect(completedRun().preconditionFailures[0]).toMatch(/^issue: the evidence snapshot did not capture the live issue/);
+    });
+
+    it("keeps the issue eligible for a fresh groom after a stale abort", async () => {
+      liveStateChangesTo({}, { title: "Retitled by a human" });
+      await runHostedGroomer();
+      // No grooming field, cooldown stamp or freshness baseline is written.
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+      expect(mocks.prisma.agentRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ summary: "No mutations applied: preconditions failed (issue)" }) }),
+      );
+    });
+
+    it("an exact retry after the comment, body and status writes is a replay: one comment, one label write", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, body: "Broken." });
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ mutations: { githubComment: "Ready.", proposedBody: "## Context\nlogin.ts drops returnTo." } }),
+      );
+      let run = 0;
+      mocks.prisma.groomingRun.create.mockImplementation(async () => ({ id: `gr-${++run}`, stage: "selected" }));
+
+      const first = await runHostedGroomer();
+      const second = await runHostedGroomer();
+
+      expect(first!.appliedMutations).toMatchObject({ outcome: "applied" });
+      expect(second!.appliedMutations).toMatchObject({ outcome: "replayed", claimedByRunId: "gr-1" });
+      expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+      expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+      expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledTimes(1);
+      // The replay writes no lane history and only the local cooldown stamp.
+      expect(mocks.prisma.issueLane.create).toHaveBeenCalledTimes(1);
+      expect(Object.keys(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).sort()).toEqual(["groomedAt", "groomedBy"]);
+      expect(first!.mutationPlan!.applicationKey).toBe(second!.mutationPlan!.applicationKey);
+    });
+
+    it("a partial failure then an exact retry completes the application without repeating what landed", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.callGroomerLLM.mockResolvedValue(withComment);
+      mocks.addIssueComment.mockRejectedValue(new Error("GitHub API error adding comment: 504"));
+
+      const first = await runHostedGroomer();
+      expect(first!.appliedMutations).toMatchObject({ outcome: "partial", commentPosted: false });
+      expect(completedRun()).toMatchObject({ status: "partial", retryable: true, applyOutcome: "partial" });
+
+      mocks.addIssueComment.mockReset();
+      mocks.addIssueComment.mockResolvedValue({ url: "https://github.com/org/repo/issues/42#issuecomment-7" });
+      const second = await runHostedGroomer();
+      errSpy.mockRestore();
+
+      expect(second!.appliedMutations).toMatchObject({ outcome: "applied", commentUrl: "https://github.com/org/repo/issues/42#issuecomment-7" });
+      expect((second!.appliedMutations!.steps as Record<string, { status: string }>).labels.status).toBe("replayed");
+      expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+      expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a retry after a partial failure against fresh evidence diffs from current state: no label thrash, one comment", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.callGroomerLLM.mockResolvedValue(withComment);
+      mocks.addIssueComment.mockRejectedValueOnce(new Error("504")).mockRejectedValueOnce(new Error("504"));
+      await runHostedGroomer();
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+
+      // The next groom sees the labels the first one wrote: new evidence, so
+      // a new evidence digest and a new application key.
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: written });
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue(
+        liveEvidence({ evidenceDigest: "digest-after-labels" }, { labels: [...written].sort() }),
+      );
+      mocks.addIssueComment.mockResolvedValue({ url: "u" });
+      const second = await runHostedGroomer();
+      errSpy.mockRestore();
+
+      expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+      expect((second!.appliedMutations!.steps as Record<string, { status: string }>).labels.status).toBe("noop");
+      expect(mocks.addIssueComment).toHaveBeenCalledTimes(3);
+      expect(second!.appliedMutations).toMatchObject({ outcome: "applied", commentUrl: "u" });
+    });
+
+    it("a low-impact failure prevents the destructive step: no close after a failed comment", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.addIssueComment.mockRejectedValue(new Error("GitHub API error adding comment: 504"));
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("already_done", {
+          verdict: { lane: { id: "backlog", confidence: "high", reason: "gone" } },
+          mutations: {
+            githubComment: "Closing: already fixed on main.",
+            close: { reason: "already_done", rationale: "login.ts keeps returnTo", evidenceRefs: ["repo:src/auth/login.ts"] },
+          },
+        }),
+      );
+
+      // The pre-close labels already match, so the comment is the first
+      // write; it failed and nothing landed, so the run fails (retryable).
+      await expect(runHostedGroomer()).rejects.toThrow(/Grooming mutation failed at comment/);
+      errSpy.mockRestore();
+
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      // status/done is never written for an issue left open.
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ state: "closed" }) }),
+      );
+    });
+
+    it("a failed label write fails the run with nothing else attempted", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.updateIssueLabels.mockRejectedValue(new Error("GitHub API error: 422"));
+      mocks.callGroomerLLM.mockResolvedValue(withComment);
+
+      await expect(runHostedGroomer()).rejects.toThrow(/Grooming mutation failed at labels: GitHub API error: 422/);
+      errSpy.mockRestore();
+
+      expect(mocks.addIssueComment).not.toHaveBeenCalled();
+      expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ applyOutcome: "failed", appliedMutations: expect.objectContaining({ outcome: "failed" }) }) }),
+      );
+      expect(completedRun()).toMatchObject({ status: "failed", retryable: true });
+    });
+
+    describe("close gating", () => {
+      const close = (evidenceRefs: string[], confidence: "high" | "medium" = "high") =>
+        notReadyDraft("already_done", {
+          verdict: { confidence, lane: { id: "backlog", confidence: "high", reason: "gone" } },
+          mutations: { githubComment: "Closing.", close: { reason: "already_done", rationale: "fixed", evidenceRefs } },
+        });
+
+      it("rejects a medium-confidence already_done: nothing is closed or written", async () => {
+        mocks.callGroomerLLM.mockResolvedValue(close(["repo:src/auth/login.ts"], "medium"));
+        await expect(runHostedGroomer()).rejects.toThrow(/already_done closes the issue, which requires high confidence/);
+        expectNoGitHubWrites();
+      });
+
+      it("rejects an already_done close without current-revision evidence", async () => {
+        mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+          ...mockEvidence,
+          comments: [{ id: "c1", author: "alice", createdAt: "2026-09-20T00:00:00Z", body: "fixed", provenance: "human_comment", authoritative: true }],
+        });
+        mocks.callGroomerLLM.mockResolvedValue(close(["comment:c1"]));
+        await expect(runHostedGroomer()).rejects.toThrow(/already_done must cite pinned repository evidence/);
+        expectNoGitHubWrites();
+      });
+
+      it("closes on high-confidence pinned evidence, only after the comment, then lands status/done", async () => {
+        mocks.callGroomerLLM.mockResolvedValue(close(["repo:src/auth/login.ts"]));
+        const order: string[] = [];
+        mocks.addIssueComment.mockImplementation(async () => {
+          order.push("comment");
+          return { url: null };
+        });
+        mocks.closeIssue.mockImplementation(async () => {
+          order.push("close");
+        });
+        mocks.updateIssueLabels.mockImplementation(async (_r: string, _n: number, labels: string[]) => {
+          order.push(`labels:${labels.join(",")}`);
+        });
+        await runHostedGroomer();
+        expect(order).toEqual(["comment", "close", "labels:priority/p0,status/done"]);
+      });
+    });
+
+    describe("dry-run parity", () => {
+      beforeEach(() => {
+        mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      });
+
+      it("runs the same preconditions and records a stale plan without writing", async () => {
+        liveStateChangesTo({}, { title: "Retitled" });
+        const result = await runHostedGroomer();
+        expectNoGitHubWrites();
+        expect(result!.mutationPlan).toMatchObject({ applyOutcome: "stale", preconditions: { ok: false } });
+        expect(completedRun()).toMatchObject({
+          status: "dry_run_completed",
+          applyOutcome: "stale",
+          preconditionFailures: ["issue: issue changed since the evidence snapshot: title"],
+        });
+        expect(mocks.prisma.groomingApplication.create).not.toHaveBeenCalled();
+      });
+
+      it("reports the application key and whether it would replay, without claiming it", async () => {
+        const first = await runHostedGroomer();
+        expect(first!.mutationPlan).toMatchObject({ applyOutcome: "dry_run", preconditions: { ok: true } });
+
+        mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
+        await runHostedGroomer();
+        mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+        const third = await runHostedGroomer();
+
+        expect(third!.mutationPlan).toMatchObject({ applyOutcome: "would_replay", applicationKey: first!.mutationPlan!.applicationKey });
+        expect(mocks.prisma.groomingApplication.create).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("in-flight skip (dispatch#1090) is unchanged", () => {
+      it("skips when only the live snapshot shows the claim (Dispatch's cache has not synced it)", async () => {
+        mocks.collectGroomingEvidenceSnapshot.mockResolvedValue(liveEvidence({}, { labels: ["priority/p0", "status/in-progress"] }));
+        const result = await runHostedGroomer();
+        expectNoGitHubWrites();
+        expect(result!.mutationPlan).toMatchObject({ skippedReason: "in_flight_status", inFlightStatus: "status/in-progress" });
+        expect(completedRun()).toMatchObject({ status: "completed", stage: "skipped" });
+        expect(mocks.prisma.groomingApplication.create).not.toHaveBeenCalled();
+      });
+
+      it("does not run apply preconditions for an in-flight issue", async () => {
+        mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-review", "priority/p0"] });
+        await runHostedGroomer();
+        expect(mocks.collectGroomingEvidenceSnapshot).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it("strips a status the groomer does not own, so the derived status is the only one", async () => {
+      mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["priority/p0", "status/needs-review"] });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog"));
+      await runHostedGroomer();
+      const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
+      expect(written.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
     });
   });
 });

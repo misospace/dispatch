@@ -6,6 +6,7 @@ export interface IssueComment {
   author: string;
   body: string;
   createdAt: string;
+  url?: string | null;
 }
 
 export interface IssueContextInput {
@@ -31,17 +32,23 @@ export function isAutomationAuthor(author: string): boolean {
   return AUTOMATION_AUTHORS.has(a) || a.endsWith("[bot]");
 }
 
+/**
+ * Issue comments for grooming: the oldest `maxComments` by default (the
+ * prompt context), or the newest with direction "desc" (apply-time checks).
+ */
 export async function fetchIssueComments(
   repoFullName: string,
   issueNumber: number,
   maxComments = 5,
+  direction: "asc" | "desc" = "asc",
 ): Promise<IssueComment[]> {
-  const comments = await fetchGitHubIssueComments(repoFullName, issueNumber, maxComments);
+  const comments = await fetchGitHubIssueComments(repoFullName, issueNumber, maxComments, direction);
   return comments.slice(0, maxComments).map((comment) => ({
     id: comment.id ?? null,
     author: comment.user?.login ?? "unknown",
     body: comment.body ?? "",
     createdAt: comment.created_at ?? "",
+    ...(comment.html_url ? { url: comment.html_url } : {}),
   }));
 }
 
