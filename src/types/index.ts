@@ -52,7 +52,10 @@ export interface Issue {
   groomingSummary?: string | null;
   notReadyReason?: string | null;
   blockedReason?: string | null;
-  /** Reason string derived from open `depends on #N` blockers gating this issue. */
+  /**
+   * Open `depends on #N` blockers gating this issue, resolved server-side
+   * against every open issue in enabled repos (not the filtered board subset).
+   */
   dependencyBlockReason?: string | null;
   needsInfoReason?: string | null;
   nextGroomingAction?: string | null;

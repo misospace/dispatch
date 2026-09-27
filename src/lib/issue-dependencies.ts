@@ -153,8 +153,9 @@ export function parseIssueDependencies(body: string | null | undefined): Depende
  * Scope decisions (deliberate):
  * - Direct blockers only, non-transitive: openness is the blocker's raw GitHub
  *   state, not its queue eligibility. If A depends on B and B is itself gated,
- *   A becomes eligible as soon as B is open, even while B is withheld — this
- *   matches the issue's "direct blockers" acceptance criteria.
+ *   A stays withheld while B is open and becomes eligible as soon as B is
+ *   closed; B's own gating does not matter — this matches the issue's
+ *   "direct blockers" acceptance criteria.
  * - A blocker in an untracked / disabled repo is absent from the open set and
  *   therefore does not gate (preserve-visibility, consistent with the queue's
  *   unknown-lane policy).

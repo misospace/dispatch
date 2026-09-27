@@ -21,7 +21,6 @@ interface IssueCardProps {
   lanes?: LaneOption[];
   isDragging?: boolean;
   onIssueUpdate?: (updatedIssue: Issue) => void;
-  dependencyBlockReason?: string | null;
 }
 
 /** Turn a linked-PR-health follow-up reason code into human-readable text. */
@@ -43,7 +42,7 @@ function normalizeHexColor(color: string): string {
   return color.startsWith("#") ? color : `#${color}`;
 }
 
-export function IssueCard({ issue, lanes, isDragging, onIssueUpdate, dependencyBlockReason }: IssueCardProps) {
+export function IssueCard({ issue, lanes, isDragging, onIssueUpdate }: IssueCardProps) {
   const {
     attributes,
     listeners,
@@ -663,7 +662,7 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate, dependencyB
             </a>
           )}
         </div>
-        {(issue.notReadyReason || issue.blockedReason || dependencyBlockReason || issue.needsInfoReason || issue.groomingSummary) && (
+        {(issue.notReadyReason || issue.blockedReason || issue.dependencyBlockReason || issue.needsInfoReason || issue.groomingSummary) && (
           <div className="mt-2 space-y-1">
             {issue.notReadyReason && (
               <div className="flex items-start gap-1 text-xs text-amber-700">
@@ -677,10 +676,10 @@ export function IssueCard({ issue, lanes, isDragging, onIssueUpdate, dependencyB
                 <span>{issue.blockedReason}</span>
               </div>
             )}
-            {dependencyBlockReason && (
+            {issue.dependencyBlockReason && (
               <div className="flex items-start gap-1 text-xs text-red-700">
                 <Ban className="h-3 w-3 mt-0.5 shrink-0" />
-                <span>{dependencyBlockReason}</span>
+                <span>{issue.dependencyBlockReason}</span>
               </div>
             )}
             {issue.needsInfoReason && (

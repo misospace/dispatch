@@ -233,3 +233,20 @@ describe("IssueCard unclaim button (issue #564)", () => {
     expect(err).toHaveTextContent("Refusing: closed");
   });
 });
+describe("IssueCard dependency block reason", () => {
+  it("renders the server-derived dependencyBlockReason", () => {
+    const issue = makeIssue({ dependencyBlockReason: "Blocked by open bar/repo#20" });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.getByText("Blocked by open bar/repo#20")).toBeInTheDocument();
+  });
+
+  it("renders nothing when dependencyBlockReason is null", () => {
+    const issue = makeIssue({ dependencyBlockReason: null });
+
+    render(React.createElement(IssueCard, { issue }));
+
+    expect(screen.queryByText(/Blocked by open/)).not.toBeInTheDocument();
+  });
+});

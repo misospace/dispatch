@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardRef } from "react";
 import { cn } from "@/lib/utils";
 import {
   DndContext,
@@ -45,12 +45,6 @@ interface LaneOption {
 }
 import { getIssuesByStatus, getIssueStatus } from "@/lib/kanban";
 import { authedFetch } from "@/lib/client-auth";
-import {
-  dependencyKey,
-  parseIssueDependencies,
-  resolveOpenBlockers,
-  formatDependencyBlockReason,
-} from "@/lib/issue-dependencies";
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000; // 30 seconds
 // 10s debounce balances responsiveness with rate-limiting: long enough to batch
@@ -85,17 +79,6 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
   const issuesRef = useRef(issues);
   useEffect(() => {
     issuesRef.current = issues;
-  }, [issues]);
-
-  // Open-issue key set for dependency gating (dependencyBlockReason on cards)
-  const openIssueKeys = useMemo(() => {
-    const keys = new Set<string>();
-    for (const issue of issues) {
-      if (issue.state === "open") {
-        keys.add(dependencyKey(issue.repository.fullName, issue.number));
-      }
-    }
-    return keys;
   }, [issues]);
 
   const sensors = useSensors(
@@ -359,26 +342,14 @@ export const KanbanBoard = forwardRef<KanbanBoardRef, KanbanBoardProps>(function
                     strategy={verticalListSortingStrategy}
                   >
                     <div className="space-y-2">
-                      {columnIssues.map((issue) => {
-                        const dependencyBlockReason = formatDependencyBlockReason(
-                          resolveOpenBlockers(
-                            parseIssueDependencies(issue.body),
-                            openIssueKeys,
-                            issue.repository.fullName,
-                            { repo: issue.repository.fullName, number: issue.number },
-                          ),
-                          issue.repository.fullName,
-                        );
-                        return (
-                          <IssueCard
-                            key={issue.id}
-                            issue={issue}
-                            lanes={lanes}
-                            dependencyBlockReason={dependencyBlockReason}
-                            onIssueUpdate={() => doRefresh()}
-                          />
-                        );
-                      })}
+                      {columnIssues.map((issue) => (
+                        <IssueCard
+                          key={issue.id}
+                          issue={issue}
+                          lanes={lanes}
+                          onIssueUpdate={() => doRefresh()}
+                        />
+                      ))}
                     </div>
                   </SortableContext>
                 </KanbanColumn>
