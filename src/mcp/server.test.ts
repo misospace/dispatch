@@ -933,6 +933,13 @@ describe("queue / pr-fix / groomer handlers", () => {
     }
   });
 
+  it("getQueueHandler forwards includeWithheld to the queue API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([]));
+    const result = await getQueueHandler(makeArgs({ agentName: "a", includeWithheld: true }));
+    expect(result.isError).toBeUndefined();
+    expect(String(fetchMock.mock.calls[0][0])).toContain("includeWithheld=true");
+  });
+
   it("getQueueHandler errors without an agent name", async () => {
     const saved = process.env.DISPATCH_AGENT_NAME;
     delete process.env.DISPATCH_AGENT_NAME;

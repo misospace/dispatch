@@ -6,13 +6,27 @@ import {
   buildGroomingStateExclusionWhere,
   isRenovateIssue,
 } from "@/lib/issue-filters";
+import {
+  ADMISSION_ISSUE_SELECT,
+  evaluateQueueAdmission,
+  getQueueAdmissionMode,
+  loadAdmissionRuns,
+  type AdmissionIssueState,
+} from "@/lib/queue-admission";
 import { isFreshnessTrackedStatus } from "./freshness";
 
 /**
  * Why a candidate was chosen. "stale" and "freshness_unknown" are the
- * freshness paths (#1064); the rest is the pre-existing classification logic.
+ * freshness paths (#1064); "admission_withheld" is a fresh result the worker
+ * queue's admission gate (#1065) withholds; the rest is the pre-existing
+ * classification logic.
  */
-export type GroomingSelectionReason = "targeted" | "classification" | "stale" | "freshness_unknown";
+export type GroomingSelectionReason =
+  | "targeted"
+  | "classification"
+  | "stale"
+  | "admission_withheld"
+  | "freshness_unknown";
 
 export interface GroomingCandidate {
   id: string;
@@ -38,6 +52,12 @@ export const STALE_REGROOM_MIN_AGE_MINUTES = 30;
 const STALE_SCORE = 200;
 /** Score for a baseline-less fully classified issue: only when nothing else wants grooming. */
 const FRESHNESS_UNKNOWN_SCORE = 1;
+/**
+ * Score for ready work the admission gate withholds (#1065): below a stale
+ * result, above routine backlog re-grooming, because re-grooming is the only
+ * way withheld work is admitted again.
+ */
+const ADMISSION_WITHHELD_SCORE = 150;
 
 export interface SelectGroomingCandidateOptions {
   repoFullName?: string;
@@ -50,6 +70,15 @@ export interface SelectGroomingCandidateOptions {
    * these would re-groom every ready issue once per cooldown forever.
    */
   freshnessBackfill?: boolean;
+  /**
+   * When DISPATCH_QUEUE_ADMISSION_MODE is audit/enforce, keep ready work the
+   * admission gate withholds groomable (#1065): a fresh result it withholds
+   * (partial, unpinned, not ready, ...) becomes eligible after the normal
+   * cooldown, and a baseline-less ready issue is backfilled ahead of routine
+   * work instead of last. Hosted groomer only, for the freshnessBackfill
+   * reason: only it records the baseline that would admit the issue.
+   */
+  admissionRegroom?: boolean;
 }
 
 export async function selectGroomingCandidate(
@@ -103,6 +132,8 @@ export async function selectGroomingCandidate(
     }
   }
 
+  const admissionMode = options.admissionRegroom === true ? getQueueAdmissionMode() : "off";
+
   const issues = await prisma.issue.findMany({
     where: issueWhere,
     select: {
@@ -122,9 +153,21 @@ export async function selectGroomingCandidate(
       groomingStaleAt: true,
       groomingStaleReasons: true,
       repository: { select: { fullName: true } },
+      ...(admissionMode === "off" ? {} : ADMISSION_ISSUE_SELECT),
     },
     orderBy: { number: "asc" },
   });
+
+  // Admission (#1065) is evaluated only for fresh baselines: stale and
+  // unknown results already have their own paths below.
+  const admissionRuns =
+    admissionMode === "off"
+      ? null
+      : await loadAdmissionRuns(
+          (issues as unknown as AdmissionIssueState[]).filter(
+            (issue) => issue.groomedIssueFingerprint && issue.groomingStaleAt == null,
+          ),
+        );
 
   const candidates = issues
     .filter((issue) => !isRenovateIssue(issue))
@@ -155,15 +198,29 @@ export async function selectGroomingCandidate(
       const freshnessUnknown =
         options.freshnessBackfill === true && groomable && !issue.groomedIssueFingerprint && issue.blockedReason == null;
 
+      // Admission (#1065): ready work the worker queue withholds must stay
+      // groomable, or it is stranded (a fresh result is otherwise never
+      // re-selected once fully classified).
+      const isReady = issue.labels.includes("status/ready");
+      let admissionWithheld = false;
+      if (admissionMode !== "off" && admissionRuns && groomable && isReady && issue.groomedIssueFingerprint && issue.groomingStaleAt == null) {
+        const state = issue as unknown as AdmissionIssueState;
+        const run = state.groomedRunId ? admissionRuns.get(state.groomedRunId) : null;
+        admissionWithheld = !evaluateQueueAdmission(state, { mode: admissionMode, run }).admitted;
+      }
+      const admissionUnknown = admissionMode !== "off" && freshnessUnknown && isReady;
+
       // Targeted runs are an explicit operator request, so they must reach
       // fully classified issues as well as issues parked by grooming.
-      const eligible = options.issueNumber !== undefined || needsClassification || isStale || freshnessUnknown;
+      const eligible =
+        options.issueNumber !== undefined || needsClassification || isStale || admissionWithheld || freshnessUnknown;
 
       let score = 0;
       if (isUnlabeled) score += 1000;
       if (!hasStatus) score += 500;
       if (!hasPriority) score += 250;
       if (isStale) score += STALE_SCORE;
+      if (admissionWithheld || admissionUnknown) score += ADMISSION_WITHHELD_SCORE;
       if (isBacklog) score += 100;
       if (!hasAgent) score += 50;
       if (!hasLane && !isBacklog) score += 25;
@@ -176,7 +233,9 @@ export async function selectGroomingCandidate(
             ? "classification"
             : isStale
               ? "stale"
-              : "freshness_unknown";
+              : admissionWithheld
+                ? "admission_withheld"
+                : "freshness_unknown";
 
       return { issue, eligible, score, selectionReason, isStale };
     })

@@ -13,6 +13,7 @@ import {
 } from "@/lib/issue-filters";
 import { getConfiguredLanes, isValidLane } from "@/lib/lane-config";
 import { withDependencyBlockReasons } from "@/lib/issue-dependency-annotation";
+import { withAdmissionAnnotations } from "@/lib/queue-admission";
 
 export const dynamic = "force-dynamic";
 
@@ -37,7 +38,7 @@ async function getIssues(repo?: string, agent?: string, owner?: string, priority
     orderBy: { updatedAt: "desc" },
   });
 
-  return withDependencyBlockReasons(issues);
+  return withAdmissionAnnotations(await withDependencyBlockReasons(issues));
 }
 
 async function getRepos() {

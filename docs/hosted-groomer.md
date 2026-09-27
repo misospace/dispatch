@@ -252,7 +252,65 @@ How it runs:
 - Targeted runs (`issueNumber`) still force a re-evaluation regardless of freshness.
 - A run skipped because the issue is `status/in-progress` or `status/in-review` records no baseline and leaves any earlier one as it was.
 
-Freshness unknown: issues groomed before this existed, or through `POST /api/issues/groom` (which carries no evidence and resets any recorded baseline), have no fingerprint. The hosted groomer backfills them at the lowest priority, only when nothing else wants grooming and outside the usual 24h cooldown; deliberately blocked issues are not backfilled. External groomers polling `next-task?mode=groom` are not offered backfill work. Worker admission (#1065) decides how unknown and unverified results are treated.
+Freshness unknown: issues groomed before this existed, or through `POST /api/issues/groom` (which carries no evidence and resets any recorded baseline), have no fingerprint. The hosted groomer backfills them at the lowest priority, only when nothing else wants grooming and outside the usual 24h cooldown; deliberately blocked issues are not backfilled. External groomers polling `next-task?mode=groom` are not offered backfill work. [Worker admission](#worker-admission) decides how unknown and unverified results are treated.
+
+## Worker Admission
+
+Worker admission (#1065) decides whether a `status/ready` issue may be handed to an autonomous implementation worker, from persisted state only: no model call, no GitHub call, and nothing is written by `next-task` or `/queue`. It is opt-in via `DISPATCH_QUEUE_ADMISSION_MODE`:
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` (default) | Queue behaviour is exactly what it was: same query, same items, no `admission` field. Unset or unrecognised values mean `off` (an unrecognised value is logged once), so a typo can never starve the fleet. |
+| `audit` | Nothing is filtered. Every issue item in `/queue` and `get_queue` carries an `admission` decision, board cards show "Would be withheld from workers (audit): ...", and `next-task` logs a `[queue-admission] audit:` warning when it hands out an item enforce mode would withhold. |
+| `enforce` | Withheld issues are removed from implementation pickup. `next-task` never returns an `implement` task for them and goes idle with `No work available (N ready issues withheld by grooming admission)` when nothing else is left. `GET /api/agents/{name}/queue?includeWithheld=true` (MCP `get_queue` `includeWithheld`) appends them with `claimable: false` for diagnostics; board cards show "Withheld from workers: ...". |
+
+Roll out with `audit` first, check which ready issues would be withheld and why, then switch to `enforce`.
+
+### Admission rule
+
+Only `status/ready` issues are gated. A worker's `status/in-progress` work is never withheld (the freshness pass does not track worker-owned statuses, so gating them would only strand claimed work). A ready issue is admitted only when all of these hold:
+
+1. No open `depends on #N` blocker (#1038). The dependency gate still runs first and stays authoritative; admission never re-admits a blocked issue.
+2. The issue has a freshness baseline (not unknown) that is not marked stale.
+3. The cached issue still matches the baseline's fingerprint, so an edit the freshness pass has not recorded yet still withholds it. The groomer does not write its own title/body changes into Dispatch's cache, so right after a groom that rewrote them the issue reads as `grooming_issue_changed` until the next sync.
+4. A baseline whose evidence scope depends on the repository (`paths`, `global`) was pinned to a verified SHA (`groomingVerifiedSha`). Ongoing head verification is the freshness pass's job: it marks the result stale on a relevant commit.
+5. Either the baseline is a current operator override (below), or the grooming run it points at (`groomedRunId`) was fully applied (`stage: "applied"`, `status: "completed"`, not a dry run; `partial` is withheld until the retry lands) and its plan's readiness (#1062) is `ready`, bound to the same evidence digest the baseline records, with an `escalation` admission sitting on the escalation lane.
+
+Readiness is read only from the run the baseline points at. Skipped (in-flight), stale, unverifiable, failed and dry runs never write a baseline, so their stored readiness is never consulted.
+
+The decision on a queue item:
+
+```json
+"admission": {
+  "mode": "enforce",
+  "admitted": false,
+  "basis": "grooming",
+  "reasons": [{ "code": "grooming_stale", "message": "Grooming decision is stale (human_comment); awaiting re-grooming" }],
+  "summary": "Grooming decision is stale (human_comment); awaiting re-grooming",
+  "groomedRunId": "clx..."
+}
+```
+
+`basis` is `grooming`, `override`, or `not_gated` (not a ready issue). Reason codes: `dependency_blocked`, `grooming_unknown`, `grooming_stale`, `grooming_issue_changed`, `grooming_unverified`, `grooming_run_missing`, `grooming_not_applied`, `grooming_partial`, `grooming_readiness_missing`, `grooming_not_ready`, `grooming_evidence_mismatch`, `escalation_lane_mismatch`.
+
+Admission gates what the queue hands out (`next-task`, `/queue`, `get_queue`); it does not gate the claim APIs for an issue a caller names explicitly, the same as the dependency gate.
+
+PR-fix queue items are never subject to admission, and linked-PR follow-up routing in `next-task` scans the queue before admission, so a withheld issue's PR can still be followed up.
+
+Cost: the queue loads a few extra `Issue` columns and does one primary-key `GroomingRun` lookup for the ready issues' baselines, only when admission is on.
+
+### Withheld work stays groomable
+
+Re-grooming is the only way withheld work gets admitted, so with admission on the hosted groomer keeps it eligible: stale results take the existing stale path; a ready issue with no baseline is backfilled ahead of routine backlog re-grooming instead of last; and a fresh result the gate withholds (partial, unpinned, not ready, missing readiness, lane mismatch) is re-selected after the normal 24h cooldown with `candidateSource: "admission_withheld"`. External groomers are not offered this work, for the same reason as backfill.
+
+### Operator override
+
+A bare `status/ready` label is never an override. An operator records one explicitly:
+
+- `POST /api/issues/{issueId}/admission-override` with an optional body `{ "reason": "...", "headSha": "<40-hex>", "actor": "..." }`. The issue must be open and already `status/ready` in Dispatch's cache. Without `headSha`, the live default-branch head is resolved from GitHub.
+- `DELETE /api/issues/{issueId}/admission-override` clears it; if it was still the baseline, freshness returns to unknown.
+
+The override records the actor, time, reason and head SHA on the issue (`admissionOverride*` columns) and an `admission_override` `AuditLog` row. It is written as the freshness baseline itself, with `groomedRunId` set to the override id and evidence scope `global` (the override vouches for the whole repository at that SHA), so it goes stale under exactly the checks a grooming result does: an issue edit, a new human comment, a dependency change, or any default-branch commit. A later applied groom replaces the baseline and supersedes the override. It never bypasses a `depends on #N` blocker. It also sets `groomedAt`, so the periodic groomer does not replace it on its next tick. Any caller the API authorizes can record one, including bearer-token callers; the audit row records the auth type.
 
 ## Repository Context
 

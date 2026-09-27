@@ -1,5 +1,6 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { selectGroomingCandidate } from "./selector";
+import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockToken = "test-agent-token";
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -14,12 +15,14 @@ vi.mock("@/lib/dispatch-env", () => ({
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
+    groomingRunFindMany: vi.fn(),
   },
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findMany: mocks.issueFindMany },
+    groomingRun: { findMany: mocks.groomingRunFindMany },
   },
 }));
 
@@ -492,6 +495,86 @@ describe("selectGroomingCandidate", () => {
       mocks.issueFindMany.mockClear();
       await selectGroomingCandidate({ issueNumber: 5 });
       expect(JSON.stringify(mocks.issueFindMany.mock.calls[0][0].where)).not.toContain("groomingRetryAfter");
+    });
+  });
+
+  describe("admission-withheld work stays groomable (#1065)", () => {
+    const fingerprint = computeGroomingIssueFingerprint({
+      title: "Ready issue",
+      body: "Body",
+      state: "open",
+      labels: ["status/ready", "priority/p1", "agent/alice"],
+    });
+    const fresh = {
+      title: "Ready issue",
+      body: "Body",
+      state: "open",
+      url: "https://github.com/org/repo/issues/1",
+      labels: ["status/ready", "priority/p1", "agent/alice"],
+      currentLane: "local",
+      blockedReason: null,
+      groomedRunId: "run-1",
+      groomedIssueFingerprint: fingerprint,
+      groomedEvidenceDigest: "d",
+      groomedEvidenceScope: "paths",
+      groomingStaleAt: null,
+      groomingStaleReasons: [],
+      groomingVerifiedSha: "a".repeat(40),
+      admissionOverrideId: null,
+      commentsCount: 0,
+      repository: { fullName: "org/repo" },
+    };
+    const readyRun = (over: Record<string, unknown> = {}) => ({
+      id: "run-1",
+      status: "completed",
+      stage: "applied",
+      dryRun: false,
+      validatedOutput: { readiness: { ready: true, admission: "implementation", lane: "local", evidenceDigest: "d", reasons: [] } },
+      ...over,
+    });
+    const hosted = { freshnessBackfill: true, admissionRegroom: true };
+
+    afterEach(() => {
+      delete process.env.DISPATCH_QUEUE_ADMISSION_MODE;
+    });
+
+    it("off: a fresh fully classified ready issue is not re-selected, and no admission query runs", async () => {
+      mocks.issueFindMany.mockResolvedValue([{ ...fresh, id: "i1", number: 1 }]);
+      mocks.groomingRunFindMany.mockResolvedValue([readyRun({ status: "partial" })]);
+      expect(await selectGroomingCandidate(hosted)).toBeNull();
+      expect(mocks.groomingRunFindMany).not.toHaveBeenCalled();
+      expect(mocks.issueFindMany.mock.calls[0][0].select).not.toHaveProperty("admissionOverrideId");
+    });
+
+    it("re-selects a fresh result the gate withholds", async () => {
+      process.env.DISPATCH_QUEUE_ADMISSION_MODE = "enforce";
+      mocks.issueFindMany.mockResolvedValue([{ ...fresh, id: "i1", number: 1 }]);
+      mocks.groomingRunFindMany.mockResolvedValue([readyRun({ status: "partial" })]);
+      expect(await selectGroomingCandidate(hosted)).toMatchObject({ number: 1, selectionReason: "admission_withheld" });
+    });
+
+    it("leaves an admitted fresh result alone", async () => {
+      process.env.DISPATCH_QUEUE_ADMISSION_MODE = "audit";
+      mocks.issueFindMany.mockResolvedValue([{ ...fresh, id: "i1", number: 1 }]);
+      mocks.groomingRunFindMany.mockResolvedValue([readyRun()]);
+      expect(await selectGroomingCandidate(hosted)).toBeNull();
+    });
+
+    it("only for the hosted groomer (an external groomer records no baseline)", async () => {
+      process.env.DISPATCH_QUEUE_ADMISSION_MODE = "enforce";
+      mocks.issueFindMany.mockResolvedValue([{ ...fresh, id: "i1", number: 1 }]);
+      mocks.groomingRunFindMany.mockResolvedValue([readyRun({ status: "partial" })]);
+      expect(await selectGroomingCandidate()).toBeNull();
+    });
+
+    it("backfills a baseline-less ready issue ahead of routine backlog work", async () => {
+      process.env.DISPATCH_QUEUE_ADMISSION_MODE = "enforce";
+      mocks.issueFindMany.mockResolvedValue([
+        { ...fresh, id: "i2", number: 2, labels: ["status/backlog", "priority/p1", "agent/alice"], groomedIssueFingerprint: "x" },
+        { ...fresh, id: "i3", number: 3, groomedRunId: null, groomedIssueFingerprint: null },
+      ]);
+      mocks.groomingRunFindMany.mockResolvedValue([]);
+      expect(await selectGroomingCandidate(hosted)).toMatchObject({ number: 3, selectionReason: "freshness_unknown" });
     });
   });
 });

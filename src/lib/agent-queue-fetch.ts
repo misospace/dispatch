@@ -5,6 +5,14 @@ import { findLeasedIssueIds } from "@/lib/lease";
 import { parseExcludedLabels } from "@/lib/config";
 import { resolveRequestLane, getLaneIds, prFixLaneForRequest } from "@/lib/lane-config";
 import { dependencyKey } from "@/lib/issue-dependencies";
+import {
+  ADMISSION_ISSUE_SELECT,
+  evaluateQueueAdmission,
+  getQueueAdmissionMode,
+  loadAdmissionRuns,
+  type AdmissionIssueState,
+  type QueueAdmissionMode,
+} from "@/lib/queue-admission";
 import type { RankedIssue } from "@/lib/agent-queue";
 
 /**
@@ -31,8 +39,21 @@ export interface AgentQueueFetchResult {
   resolvedLane: string | null;
   /** Whether the lane is valid (false if an invalid lane was provided) */
   laneValid: boolean;
-  /** Ranked and filtered issue queue */
+  /**
+   * Ranked and filtered issue queue: what implementation pickup may take.
+   * In enforce mode, issues withheld by grooming admission (#1065) are not here.
+   */
   rankedQueue: RankedIssue[];
+  /**
+   * The ranked queue before admission filtering, in the same order. Equal to
+   * rankedQueue unless admission is enforced; linked-PR follow-up routing
+   * scans this so it is unaffected by issue admission.
+   */
+  fullQueue: RankedIssue[];
+  /** Issues withheld by admission (enforce mode only), each carrying `admission`. */
+  withheldQueue: RankedIssue[];
+  /** The grooming admission mode this fetch ran under. */
+  admissionMode: QueueAdmissionMode;
   /** PR fix queue items */
   prFixItems: ReturnType<typeof toAgentQueuePrFixItem>[];
   /** Available lane ids for error messages */
@@ -56,6 +77,7 @@ export async function fetchAgentQueueData(
   params: AgentQueueFetchParams,
 ): Promise<AgentQueueFetchResult> {
   const { agentName, lane, excludeDecomposed, includeClaimed, includeRenovate } = params;
+  const admissionMode = getQueueAdmissionMode();
   // Renovate exclusion is intentionally NOT applied at the DB level here.
   // `buildAgentQueue` owns that decision (via the `includeRenovate` option and
   // the shared `isRenovateIssue` criteria in issue-filters.ts), so filtering
@@ -75,7 +97,16 @@ export async function fetchAgentQueueData(
   const availableLanes = getLaneIds();
   // An invalid request must not run the unfiltered PR-fix lookup (or any queue fetch).
   if (lane && resolvedLane === null) {
-    return { resolvedLane, laneValid: false, rankedQueue: [], prFixItems: [], availableLanes };
+    return {
+      resolvedLane,
+      laneValid: false,
+      rankedQueue: [],
+      fullQueue: [],
+      withheldQueue: [],
+      admissionMode,
+      prFixItems: [],
+      availableLanes,
+    };
   }
   const prFixLane = prFixLaneForRequest(resolvedLane);
 
@@ -103,6 +134,9 @@ export async function fetchAgentQueueData(
         linkedPrReviewDecision: true,
         linkedPrMergeState: true,
         linkedPrHealthCheckedAt: true,
+        // Freshness/override columns, read only when admission is on so the
+        // off-mode query is unchanged.
+        ...(admissionMode === "off" ? {} : ADMISSION_ISSUE_SELECT),
       },
     }),
     // Find issues that have active leases from OTHER agents — exclude them
@@ -148,11 +182,65 @@ export async function fetchAgentQueueData(
     },
   );
 
+  const prFixItems = prFixItemsRaw.map(toAgentQueuePrFixItem);
+
+  if (admissionMode === "off") {
+    return {
+      resolvedLane,
+      laneValid: true,
+      rankedQueue,
+      fullQueue: rankedQueue,
+      withheldQueue: [],
+      admissionMode,
+      prFixItems,
+      availableLanes,
+    };
+  }
+
+  // Grooming freshness admission (#1065): evaluated after every existing
+  // filter (including #1038 dependency gating), from persisted state only.
+  // PR-fix items are never subject to it.
+  const issueById = new Map<string, AdmissionIssueState>(
+    filteredIssues.map((issue) => [issue.id, issue as unknown as AdmissionIssueState]),
+  );
+  const rankedStates = rankedQueue
+    .map((item) => (item.issueId ? issueById.get(item.issueId) : undefined))
+    .filter((state): state is AdmissionIssueState => state !== undefined);
+  const runs = await loadAdmissionRuns(rankedStates);
+
+  const fullQueue: RankedIssue[] = rankedQueue.map((item) => {
+    const state = item.issueId ? issueById.get(item.issueId) : undefined;
+    const admission = evaluateQueueAdmission(state ?? { labels: item.labels, title: item.title, body: null }, {
+      mode: admissionMode,
+      run: state?.groomedRunId ? runs.get(state.groomedRunId) : null,
+      dependencyBlockReason: item.dependencyBlockReason,
+    });
+    return { ...item, admission };
+  });
+
+  if (admissionMode === "audit") {
+    return {
+      resolvedLane,
+      laneValid: true,
+      rankedQueue: fullQueue,
+      fullQueue,
+      withheldQueue: [],
+      admissionMode,
+      prFixItems,
+      availableLanes,
+    };
+  }
+
   return {
     resolvedLane,
     laneValid: true,
-    rankedQueue,
-    prFixItems: prFixItemsRaw.map(toAgentQueuePrFixItem),
+    rankedQueue: fullQueue.filter((item) => item.admission?.admitted !== false),
+    fullQueue,
+    withheldQueue: fullQueue
+      .filter((item) => item.admission?.admitted === false)
+      .map((item) => ({ ...item, claimable: false })),
+    admissionMode,
+    prFixItems,
     availableLanes,
   };
 }

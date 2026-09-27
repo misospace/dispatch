@@ -57,6 +57,11 @@ export interface Issue {
    * against every open issue in enabled repos (not the filtered board subset).
    */
   dependencyBlockReason?: string | null;
+  /**
+   * Why grooming admission (#1065) withholds (enforce) or would withhold
+   * (audit) this ready issue from workers. Absent when admission is off.
+   */
+  admissionWithheldReason?: string | null;
   needsInfoReason?: string | null;
   nextGroomingAction?: string | null;
 

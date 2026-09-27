@@ -899,6 +899,7 @@ describe("runHostedGroomer", () => {
       repoFullName: "org/repo",
       issueNumber: 42,
       freshnessBackfill: true,
+      admissionRegroom: true,
     });
   });
 
@@ -1418,7 +1419,7 @@ Investigate session handling in auth module.`;
 
         const result = await runHostedGroomer({ repoFullName: "org/repo", issueNumber: 42 });
 
-        expect(mocks.selectGroomingCandidate).toHaveBeenCalledWith({ repoFullName: "org/repo", issueNumber: 42, freshnessBackfill: true });
+        expect(mocks.selectGroomingCandidate).toHaveBeenCalledWith({ repoFullName: "org/repo", issueNumber: 42, freshnessBackfill: true, admissionRegroom: true });
         expectNoGitHubMutation();
         expect(result!.plannedLabels).toEqual(["status/in-review", "priority/p1"]);
         expect(result!.mutationPlan).toMatchObject({ skippedReason: "in_flight_status", inFlightStatus: "status/in-review", willCloseIssue: false });
