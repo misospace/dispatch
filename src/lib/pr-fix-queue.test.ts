@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
@@ -59,6 +59,7 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
         const item = {
           id: `item-${++seq}`,
           generation: 1, // mirrors the column's @default(1)
+          fixAttempts: 1, // mirrors the column's @default(1)
           queuedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           updatedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           ...data,
@@ -245,15 +246,19 @@ describe("PR review-fix queue", () => {
     expect(await listQueuedPrFixItems(client, { includeBlocked: true })).toEqual([]);
   });
 
-  it("blocks a REVIEW_FEEDBACK item after PR_FIX_MAX_ATTEMPTS distinct attempts (#1001)", async () => {
+  it("blocks a REVIEW_FEEDBACK item after PR_FIX_MAX_ATTEMPTS fix attempts (#1001)", async () => {
     const prev = process.env.PR_FIX_MAX_ATTEMPTS;
     process.env.PR_FIX_MAX_ATTEMPTS = "3";
     try {
+      // Each loop is one attempt: the fix is marked FIXED, then a fresh
+      // review reopens it.
       for (let i = 1; i <= 3; i++) {
         const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: `f${i}`, evidenceKey: `review:${i}` });
         expect(item.status).toBe("QUEUED");
+        expect(item.fixAttempts).toBe(i);
+        await markPrFixItem(client, { repo: "org/repo", pr: 9, status: "fixed" });
       }
-      // The 4th distinct attempt exceeds the cap → hand to a human instead of
+      // The 4th attempt exceeds the cap → hand to a human instead of
       // re-queuing (the human-review-forever case).
       const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: "f4", evidenceKey: "review:4" });
       expect(blocked.status).toBe("BLOCKED");
@@ -1462,5 +1467,140 @@ describe("parseMarkPrFixInput generation (#1074)", () => {
     const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED" });
     if ("error" in input) throw new Error(input.error);
     expect(input.expectedGeneration).toBeUndefined();
+  });
+});
+
+describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
+  let client: ReturnType<typeof makeClient>;
+  let prev: string | undefined;
+
+  beforeEach(() => {
+    client = makeClient();
+    prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "2";
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
+  });
+
+  afterEach(() => {
+    if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+    else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+  });
+
+  it("keeps a first-sighting review with many inline comments QUEUED", async () => {
+    // One CHANGES_REQUESTED review: six inline comments plus the review
+    // itself, all at the same head (misospace/dispatch#1095).
+    const keys = [1, 2, 3, 4, 5, 6].map((n) => `review_comment:org/repo#1:${n}`).concat("review:org/repo#1:9");
+    let item: any;
+    for (const evidenceKey of keys) {
+      item = await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 1, lane: "NORMAL", type: "REVIEW_FEEDBACK",
+        reason: "review", feedback: evidenceKey, evidenceKey, headSha: "H1",
+      });
+    }
+    expect(item.status).toBe("QUEUED");
+    expect(item.lane).toBe("NORMAL");
+    expect(item.fixAttempts).toBe(1);
+    expect(item.evidenceKeys).toHaveLength(7);
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("requeue resets the attempt count so the item gets a full budget again", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
+    const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f3", evidenceKey: "review:3", headSha: "H3" });
+    expect(blocked.status).toBe("BLOCKED");
+
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 2 });
+    expect(requeued.fixAttempts).toBe(1);
+    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f4", evidenceKey: "review:4", headSha: "H4" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.fixAttempts).toBe(2);
+  });
+
+  it("counts refused no-push runs and hands the PR to a human past the cap", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 3, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+
+    const retried = await markPrFixItem(client, { repo: "org/repo", pr: 3, status: "FIXED", expectedGeneration: 1 });
+    expect(mutatedItem(retried).status).toBe("QUEUED");
+    expect(mutatedItem(retried).fixAttempts).toBe(2);
+
+    const capped = await markPrFixItem(client, { repo: "org/repo", pr: 3, status: "FIXED", expectedGeneration: 2 });
+    expect(mutatedItem(capped).status).toBe("BLOCKED");
+    expect(mutatedItem(capped).lane).toBe("NEEDS_HUMAN");
+    expect(mutatedItem(capped).generation).toBe(2);
+    expect(client.history.at(-1)).toMatchObject({ status: "BLOCKED", lane: "NEEDS_HUMAN" });
+    expect(client.history.at(-1).note).toContain("Refused FIXED");
+    expect(client.history.at(-1).note).toContain("Bounded at 2 fix attempts");
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("fresh attempts always get a head baseline (#1104)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+  });
+
+  // The worker pushes H2, then the sync re-observes the PR (known evidence,
+  // new head) before the worker's report lands.
+  async function workerPushesAndSyncObserves(pr: number) {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H2" });
+    expect(client.items[0].headSha).toBe("H2");
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+  }
+
+  it("requeue baselines from the last observed head, so a sync-observed push still settles FIXED", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "blocked" });
+
+    const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 4 });
+    expect(requeued.attemptHeadSha).toBe("H1");
+
+    await workerPushesAndSyncObserves(4);
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "FIXED", expectedGeneration: requeued.generation });
+    expect(mutatedItem(result).status).toBe("FIXED");
+  });
+
+  it("mark back to QUEUED baselines from the last observed head when the caller passes none", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 5, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "blocked" });
+
+    const queued = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "queued" }));
+    expect(queued.attemptHeadSha).toBe("H1");
+
+    await workerPushesAndSyncObserves(5);
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "FIXED", expectedGeneration: queued.generation });
+    expect(mutatedItem(result).status).toBe("FIXED");
+  });
+
+  it("a refused FIXED keeps its baseline, so the retry's sync-observed push settles FIXED", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 6, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+    const refused = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 6, status: "FIXED", expectedGeneration: 1 }));
+    expect(refused.status).toBe("QUEUED");
+    expect(refused.attemptHeadSha).toBe("H1");
+
+    await workerPushesAndSyncObserves(6);
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 6, status: "FIXED", expectedGeneration: refused.generation });
+    expect(mutatedItem(result).status).toBe("FIXED");
+  });
+
+  it("an enqueue reopen without a head observation keeps the last observed head", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 7, status: "blocked" });
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.attemptHeadSha).toBe("H1");
   });
 });
