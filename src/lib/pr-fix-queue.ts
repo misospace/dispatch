@@ -1,5 +1,5 @@
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
-import { surfacePrFixBlocked, surfacePrFixRequeued, extractUrlsFromText } from "./pr-fix-surfacing";
+import { surfacePrFixBlocked, surfacePrFixRequeued, surfacePrFixUnblocked, extractUrlsFromText, type PrFixUnblockOutcome } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
 import { fetchPullRequestMergeState, fetchPullRequestHeadSha } from "./github-prs";
 
@@ -377,8 +377,21 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
   if (previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
     const context = await buildPrFixBlockedContext(client, item);
     await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: null, context });
+  } else if (previousStatus === "BLOCKED" && item.status === "QUEUED") {
+    await retractNeedsHuman(input.repo, input.pr, "requeued", "New evidence reopened this item.");
   }
   return item;
+}
+
+/**
+ * Drop the needs-human label and fold the BLOCKED marker comment whenever an
+ * item leaves BLOCKED. Only requeue used to do this, so an item settled FIXED
+ * by a mark kept `needs-human` on an approved PR (#1105). Never throws.
+ */
+async function retractNeedsHuman(repo: string, pr: number, outcome: PrFixUnblockOutcome, note?: string | null) {
+  await surfacePrFixUnblocked(repo, pr, outcome, note ?? undefined).catch((error) => {
+    console.error(`pr-fix-queue needs-human cleanup error for ${repo}#${pr}:`, error);
+  });
 }
 
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
@@ -575,6 +588,8 @@ export async function markPrFixItem(
       if (refusalCapped && existing.status !== "BLOCKED") {
         const context = await buildPrFixBlockedContext(client, refusal);
         await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: refusal.reason, latestNote: input.note ?? null, context });
+      } else if (!refusalCapped && existing.status === "BLOCKED") {
+        await retractNeedsHuman(input.repo, input.pr, "requeued", input.note);
       }
       return { mutated: true, item: refusal };
     }
@@ -608,6 +623,8 @@ export async function markPrFixItem(
   if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
     const context = await buildPrFixBlockedContext(client, updated);
     await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: updated.reason, latestNote: input.note ?? null, context });
+  } else if (existing.status === "BLOCKED" && (nextStatus === "QUEUED" || nextStatus === "FIXED")) {
+    await retractNeedsHuman(input.repo, input.pr, nextStatus === "FIXED" ? "resolved" : "requeued", input.note);
   }
 
   return { mutated: true, item: updated };

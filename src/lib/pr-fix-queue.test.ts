@@ -10,6 +10,7 @@ const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
   surfacingMocks: {
     surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] }),
     surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] }),
+    surfacePrFixUnblocked: vi.fn().mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] }),
     extractUrlsFromText: vi.fn((text: string) => {
       const passed = text.matchAll(/https:\/\/[^\s"'<>]+/g);
       return Array.from(passed).map((m) => m[0]);
@@ -27,6 +28,7 @@ const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: surfacingMocks.surfacePrFixBlocked,
   surfacePrFixRequeued: surfacingMocks.surfacePrFixRequeued,
+  surfacePrFixUnblocked: surfacingMocks.surfacePrFixUnblocked,
   extractUrlsFromText: surfacingMocks.extractUrlsFromText,
 }));
 
@@ -1648,5 +1650,59 @@ describe("fresh attempts always get a head baseline (#1104)", () => {
     const result = await markPrFixItem(client, { repo: "org/repo", pr: 8, status: "FIXED", expectedGeneration: requeued.generation });
     expect(mutatedItem(result).status).toBe("FIXED");
     expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+});
+
+describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(async () => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixUnblocked.mockReset();
+    surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "blocked", note: "stuck" });
+    expect(client.items[0].status).toBe("BLOCKED");
+  });
+
+  it("folds to a resolved notice when a mark settles the item FIXED", async () => {
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", note: "fixed by hand" });
+    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "resolved", "fixed by hand");
+  });
+
+  it("folds to a requeued notice when a mark returns the item to QUEUED", async () => {
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "queued" });
+    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", undefined);
+  });
+
+  it("folds to a requeued notice when new evidence reopens the item", async () => {
+    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+    expect(reopened.status).toBe("QUEUED");
+    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", expect.stringContaining("New evidence"));
+  });
+
+  it("folds to a requeued notice when a FIXED mark is refused back to QUEUED", async () => {
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+    const refused = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" }));
+    expect(refused.status).toBe("QUEUED");
+    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", undefined);
+  });
+
+  it("leaves the surfacing alone while the item stays BLOCKED or never was", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "blocked" });
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
+    expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+  });
+
+  it("never lets a cleanup failure break the transition", async () => {
+    surfacingMocks.surfacePrFixUnblocked.mockRejectedValue(new Error("network down"));
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" });
+    expect(mutatedItem(result).status).toBe("FIXED");
   });
 });

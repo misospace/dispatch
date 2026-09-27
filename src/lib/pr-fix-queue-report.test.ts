@@ -38,6 +38,7 @@ vi.mock("./github-prs", () => ({
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn(async () => null),
   surfacePrFixRequeued: vi.fn(async () => null),
+  surfacePrFixUnblocked: vi.fn(async () => null),
   extractUrlsFromText: vi.fn(() => []),
 }));
 
