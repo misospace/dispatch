@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.5.65](https://github.com/misospace/dispatch/compare/v0.5.64...v0.5.65) (2026-09-27)
+
+
+### Features
+
+* **deps:** update dependency @types/node (24.13.6 → 24.19.0) ([#1075](https://github.com/misospace/dispatch/issues/1075)) ([8567c2e](https://github.com/misospace/dispatch/commit/8567c2ec9870a1a2cf401985bf32e75593ac3bb9))
+* **groomer:** add bounded related-work evidence tools ([#1061](https://github.com/misospace/dispatch/issues/1061)) ([#1077](https://github.com/misospace/dispatch/issues/1077)) ([f010c22](https://github.com/misospace/dispatch/commit/f010c22d5331d5e23ebf5768679b98302a6915cb))
+* **groomer:** capture revision-pinned evidence snapshot before analysis ([#1073](https://github.com/misospace/dispatch/issues/1073)) ([f6e966f](https://github.com/misospace/dispatch/commit/f6e966fa931b091b0398b471349e6bc06747fc0b))
+* **groomer:** persist grooming freshness and re-groom on evidence changes ([#1064](https://github.com/misospace/dispatch/issues/1064)) ([#1089](https://github.com/misospace/dispatch/issues/1089)) ([27259b4](https://github.com/misospace/dispatch/commit/27259b43ddad51aafe8a0b656698d819d465ca04))
+* **groomer:** structured evidence-backed GroomingPlan contract ([#1090](https://github.com/misospace/dispatch/issues/1090)) ([3fa3b22](https://github.com/misospace/dispatch/commit/3fa3b2242863e2026a207337532ef42ebf6ca894))
+* **groomer:** validate preconditions and apply grooming mutations idempotently ([#1093](https://github.com/misospace/dispatch/issues/1093)) ([aabd9b8](https://github.com/misospace/dispatch/commit/aabd9b8f7ae79d596aa942f0f7be92f4c000682c))
+* **mcp:** pass an optional generation through mark_pr_fix ([#1081](https://github.com/misospace/dispatch/issues/1081)) ([8bfca74](https://github.com/misospace/dispatch/commit/8bfca741d8ce5d81c6cfe3a2e3488e23ae25b1fe))
+* **queue:** gate claimability on open ‘depends on #N’ blockers ([#1038](https://github.com/misospace/dispatch/issues/1038)) ([#1057](https://github.com/misospace/dispatch/issues/1057)) ([f6bdfc1](https://github.com/misospace/dispatch/commit/f6bdfc19dd23520358922eb1d12523dd9891a5df))
+* **queue:** opt-in grooming freshness admission before worker pickup ([#1094](https://github.com/misospace/dispatch/issues/1094)) ([2191a25](https://github.com/misospace/dispatch/commit/2191a255d5e1f68d71b6007d7e940ab4ff6d75ea))
+
+
+### Bug Fixes
+
+* **ci:** drop unsupported labels permission from Label Sync ([#1082](https://github.com/misospace/dispatch/issues/1082)) ([8268938](https://github.com/misospace/dispatch/commit/826893841d9805a5c681b0a671a0524d541b0cea))
+* **deps:** update vitest monorepo (5.0.1 → 5.0.2) ([#1071](https://github.com/misospace/dispatch/issues/1071)) ([f68bfc1](https://github.com/misospace/dispatch/commit/f68bfc12a8b36585dbc63091da1d373a42090203))
+* **lanes:** derive classifyLaneFromSignals fallback instead of hardcoded "normal" ([#1080](https://github.com/misospace/dispatch/issues/1080)) ([d5db2f9](https://github.com/misospace/dispatch/commit/d5db2f99bed82a4d44412ada4449cc8909bf699c)), closes [#1049](https://github.com/misospace/dispatch/issues/1049)
+* **pr-followup-webhook:** read issue_comment and check_run from GitHub's real payload shapes ([#1088](https://github.com/misospace/dispatch/issues/1088)) ([5325163](https://github.com/misospace/dispatch/commit/53251636cd27b18f0451f38c1bb2aadfc0921b12))
+* **queue:** derive PR-fix lane from resolved request lane ([#1046](https://github.com/misospace/dispatch/issues/1046)) ([#1058](https://github.com/misospace/dispatch/issues/1058)) ([3725b27](https://github.com/misospace/dispatch/commit/3725b27327037a64d1e83dd69f3ff0e8c479f852))
+* **queue:** settle only the issued PR-fix attempt and start head ([#1074](https://github.com/misospace/dispatch/issues/1074)) ([#1079](https://github.com/misospace/dispatch/issues/1079)) ([bbf4234](https://github.com/misospace/dispatch/commit/bbf4234be0ae98e6c0a013f36ad30a7544126e99))
+
+
+### Chores
+
+* **env:** document missing env vars in .env.example and guard drift ([#1085](https://github.com/misospace/dispatch/issues/1085)) ([cbdd195](https://github.com/misospace/dispatch/commit/cbdd1953e276bc670b87664e0496fbc29ea7716f))
+
 ## [0.5.64](https://github.com/misospace/dispatch/compare/v0.5.63...v0.5.64) (2026-09-25)
 
 
