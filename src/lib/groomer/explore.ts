@@ -4,6 +4,7 @@ import {
   executeGroomerTool,
   type GroomerToolDeps,
 } from "./tools";
+import type { RelatedWorkObservation } from "./evidence-snapshot";
 
 export interface ExploreOptions {
   baseUrl: string;
@@ -41,10 +42,17 @@ export interface ExploreResult {
   files: string[];
   /** The model's statement of the ask in repo terms, if it called submit_findings. */
   ask: string | null;
+  /** Repository paths the exploration read or surfaced. Never related-work refs. */
   sources: string[];
   toolCalls: ExploreToolRecord[];
   bytes: number;
   warnings: string[];
+  /** search_related_work queries the model ran. */
+  relatedWorkQueries: string[];
+  /** Evidence keys of related work obtained, e.g. github:pr:org/repo#12. */
+  relatedWorkRefs: string[];
+  /** Structured GitHub state behind relatedWorkRefs, for the evidence snapshot. */
+  relatedWork: RelatedWorkObservation[];
 }
 
 export interface ExploreDeps {
@@ -68,7 +76,17 @@ Work like this:
 - When verifying whether the issue's premise still holds, read against the repository's default branch (pass the branch name in the \`ref\` parameter). The issue was filed against an older snapshot; what matters is what \`main\` looks like now. If the file the issue mentions no longer exists or the situation has already been resolved, that is the answer — say so in your findings.
 - Use list_directory when you are unsure what exists, rather than guessing paths.
 
+Related-work evidence (the repository's GitHub history) is read-only and bounded:
+- If the issue names specific issues, PRs, or commits, read them first with read_related_issue, read_related_pr, or read_related_commit.
+- Use search_related_work only as a fallback when the issue names no refs.
+- The state returned by read_related_issue / read_related_pr (open, closed, merged) is structured, authoritative evidence about that work — do not infer status from comment prose.
+- Bot comments (CI, dependency bots) and Dispatch's own grooming comments are not independent evidence.
+
 Call submit_findings once you can name the files a worker would change and state what the issue is asking for in this repository's own terms. Be concrete: real paths you have actually seen, never a guess.`;
+
+function relatedWorkRefsOf(observations: RelatedWorkObservation[]): string[] {
+  return [...new Set(observations.map((observation) => observation.key))];
+}
 
 /** Rounds remaining at which the model is told to wrap up. */
 export const ROUNDS_REMAINING_WARNING = 2;
@@ -80,6 +98,9 @@ const EMPTY: Omit<ExploreResult, "warnings"> = {
   sources: [],
   toolCalls: [],
   bytes: 0,
+  relatedWorkQueries: [],
+  relatedWorkRefs: [],
+  relatedWork: [],
 };
 
 interface ChatMessage {
@@ -149,6 +170,8 @@ export async function exploreRepository(
   const warnings: string[] = [];
   const records: ExploreToolRecord[] = [];
   const sources: string[] = [];
+  const relatedWorkQueries: string[] = [];
+  const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
 
   let roundsExhausted = false;
@@ -268,6 +291,12 @@ export async function exploreRepository(
 
         bytes += result.bytes;
         sources.push(...result.sources);
+        if (result.warnings?.length) warnings.push(...result.warnings);
+        if (result.relatedWork?.length) relatedWork.push(...result.relatedWork);
+        if (name === "search_related_work" && result.ok) {
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          if (query) relatedWorkQueries.push(query);
+        }
         records.push({
           name,
           arguments: args,
@@ -287,6 +316,9 @@ export async function exploreRepository(
           toolCalls: records,
           bytes,
           warnings,
+          relatedWorkQueries: [...new Set(relatedWorkQueries)],
+          relatedWorkRefs: relatedWorkRefsOf(relatedWork),
+          relatedWork,
         };
       }
     }
@@ -302,6 +334,9 @@ export async function exploreRepository(
       toolCalls: records,
       bytes,
       warnings,
+      relatedWorkQueries: [...new Set(relatedWorkQueries)],
+      relatedWorkRefs: relatedWorkRefsOf(relatedWork),
+      relatedWork,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -317,6 +352,9 @@ export async function exploreRepository(
       toolCalls: records,
       bytes,
       warnings,
+      relatedWorkQueries: [...new Set(relatedWorkQueries)],
+      relatedWorkRefs: relatedWorkRefsOf(relatedWork),
+      relatedWork,
     };
   } finally {
     clearTimeout(timeoutId);

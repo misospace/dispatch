@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { RelatedWorkNotFoundError } from "@/lib/github-related-work";
 import {
   buildGroomerToolDefinitions,
   executeGroomerTool,
@@ -18,16 +19,46 @@ function makeDeps(overrides: Partial<GroomerToolDeps> = {}): GroomerToolDeps {
     searchCode: vi.fn().mockResolvedValue([]),
     readFile: vi.fn().mockResolvedValue(""),
     listDir: vi.fn().mockResolvedValue([]),
+    fetchRelatedIssue: vi.fn().mockResolvedValue({}),
+    fetchRelatedPullRequest: vi.fn().mockResolvedValue({}),
+    fetchRelatedCommit: vi.fn().mockResolvedValue({}),
+    searchRelatedWork: vi.fn().mockResolvedValue([]),
     ...overrides,
   };
 }
 
+function notFound(
+  kind: "issue" | "pull_request" | "commit",
+  ref: string,
+): RelatedWorkNotFoundError {
+  return new RelatedWorkNotFoundError(kind, ref);
+}
+
 describe("buildGroomerToolDefinitions", () => {
-  it("exposes search, read, list and submit", () => {
+  it("exposes search, read, list, related-work and submit", () => {
     const names = buildGroomerToolDefinitions().map(
       (t) => (t.function as { name: string }).name,
     );
-    expect(names).toEqual(["search_code", "read_file", "list_directory", "submit_findings"]);
+    expect(names).toEqual([
+      "search_code",
+      "read_file",
+      "list_directory",
+      "search_related_work",
+      "read_related_issue",
+      "read_related_pr",
+      "read_related_commit",
+      "submit_findings",
+    ]);
+  });
+
+  it("does not let the model set maxResults on search_related_work", () => {
+    const def = buildGroomerToolDefinitions().find(
+      (t) => (t.function as { name: string }).name === "search_related_work",
+    ) as { function: { parameters: { properties: Record<string, unknown> } } };
+    expect(def.function.parameters.properties).not.toHaveProperty("maxResults");
+    expect(def.function.parameters.properties).toHaveProperty("query");
+    expect(def.function.parameters.properties).toHaveProperty("type");
+    expect(def.function.parameters.properties).toHaveProperty("state");
   });
 });
 
@@ -146,6 +177,309 @@ describe("executeGroomerTool", () => {
       makeDeps(),
     );
     expect(read.ok).toBe(false);
+  });
+});
+
+describe("executeGroomerTool related-work", () => {
+  it("search_related_work returns bounded hits and records the query", async () => {
+    const hits = [
+      {
+        kind: "issue",
+        state: "closed",
+        htmlUrl: "https://github.com/org/repo/issues/101",
+        evidenceKey: "github:issue:org/repo#101",
+        title: "Original sslmode report",
+      },
+      {
+        kind: "pull_request",
+        state: "merged",
+        htmlUrl: "https://github.com/org/repo/pull/102",
+        evidenceKey: "github:pr:org/repo#102",
+        title: "Attempted fix",
+      },
+    ];
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue(hits) });
+    const result = await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "sslmode" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toEqual(hits);
+    // Related work is GitHub state, not repository paths: it never enters
+    // `sources` (which the snapshot pins to the head SHA).
+    expect(result.sources).toEqual([]);
+    expect(result.relatedWork).toEqual([
+      {
+        key: "github:issue:org/repo#101",
+        kind: "issue",
+        state: "closed",
+        url: "https://github.com/org/repo/issues/101",
+        via: "search",
+        observedAt: expect.any(String),
+      },
+      {
+        key: "github:pr:org/repo#102",
+        kind: "pull_request",
+        state: "merged",
+        url: "https://github.com/org/repo/pull/102",
+        via: "search",
+        observedAt: expect.any(String),
+      },
+    ]);
+    expect(result.bytes).toBe(Buffer.byteLength(result.content, "utf8"));
+    expect(deps.searchRelatedWork).toHaveBeenCalledWith("org/repo", "sslmode", {
+      type: "all",
+      state: "all",
+      maxResults: 10,
+    });
+  });
+
+  it("passes type and state through to the search adapter", async () => {
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue([]) });
+    await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "sslmode", type: "pr", state: "open" } },
+      options,
+      deps,
+    );
+    expect(deps.searchRelatedWork).toHaveBeenCalledWith("org/repo", "sslmode", {
+      type: "pr",
+      state: "open",
+      maxResults: 10,
+    });
+  });
+
+  it("caps search_related_work at the configured maxResults", async () => {
+    const deps = makeDeps({ searchRelatedWork: vi.fn().mockResolvedValue([]) });
+    await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "sslmode" } },
+      { ...options, maxSearchResults: 5 },
+      deps,
+    );
+    expect(deps.searchRelatedWork).toHaveBeenCalledWith(
+      "org/repo",
+      "sslmode",
+      expect.objectContaining({ maxResults: 5 }),
+    );
+  });
+
+  it("read_related_issue returns the issue's structured state", async () => {
+    const deps = makeDeps({
+      fetchRelatedIssue: vi
+        .fn()
+        .mockResolvedValue({
+          kind: "issue",
+          number: 7,
+          title: "Dependency",
+          state: "closed",
+          htmlUrl: "https://github.com/org/repo/issues/7",
+          evidenceKey: "github:issue:org/repo#7",
+        }),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 7 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ number: 7, state: "closed" });
+    expect(result.sources).toEqual([]);
+    expect(result.relatedWork).toEqual([
+      {
+        key: "github:issue:org/repo#7",
+        kind: "issue",
+        state: "closed",
+        url: "https://github.com/org/repo/issues/7",
+        via: "read",
+        observedAt: expect.any(String),
+      },
+    ]);
+    expect(deps.fetchRelatedIssue).toHaveBeenCalledWith("org/repo", 7);
+  });
+
+  it("read_related_pr reports a merged PR as merged", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi
+        .fn()
+        .mockResolvedValue({
+          kind: "pull_request",
+          number: 42,
+          title: "Fix",
+          state: "merged",
+          htmlUrl: "https://github.com/org/repo/pull/42",
+          evidenceKey: "github:pr:org/repo#42",
+        }),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_pr", arguments: { number: 42 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ number: 42, state: "merged" });
+    expect(result.sources).toEqual([]);
+    expect(result.relatedWork).toEqual([
+      expect.objectContaining({ key: "github:pr:org/repo#42", kind: "pull_request", state: "merged", via: "read" }),
+    ]);
+  });
+
+  it("read_related_pr reports an open PR as open", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi
+        .fn()
+        .mockResolvedValue({
+          kind: "pull_request",
+          number: 43,
+          title: "WIP",
+          state: "open",
+          evidenceKey: "github:pr:org/repo#43",
+        }),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_pr", arguments: { number: 43 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ state: "open" });
+  });
+
+  it("read_related_commit returns the commit evidence", async () => {
+    const deps = makeDeps({
+      fetchRelatedCommit: vi
+        .fn()
+        .mockResolvedValue({
+          kind: "commit",
+          sha: "abc123",
+          message: "Fix the login bug",
+          htmlUrl: "https://github.com/org/repo/commit/abc123",
+          evidenceKey: "github:commit:org/repo@abc123",
+        }),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_commit", arguments: { ref: "abc123" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ sha: "abc123", message: "Fix the login bug" });
+    expect(result.sources).toEqual([]);
+    expect(result.relatedWork).toEqual([
+      expect.objectContaining({ key: "github:commit:org/repo@abc123", kind: "commit", state: null, via: "read" }),
+    ]);
+    expect(deps.fetchRelatedCommit).toHaveBeenCalledWith("org/repo", "abc123");
+  });
+
+  it("records a PR number read via read_related_issue as pull_request evidence", async () => {
+    const deps = makeDeps({
+      fetchRelatedIssue: vi.fn().mockResolvedValue({
+        kind: "pull_request",
+        number: 12,
+        state: "merged",
+        merged: true,
+        evidenceKey: "github:pr:org/repo#12",
+      }),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 12 } },
+      options,
+      deps,
+    );
+    expect(result.relatedWork).toEqual([
+      expect.objectContaining({ key: "github:pr:org/repo#12", kind: "pull_request", state: "merged" }),
+    ]);
+  });
+
+  it("rejects an unbounded or malformed commit ref without calling GitHub", async () => {
+    const deps = makeDeps();
+    for (const ref of ["a".repeat(101), "abc\u0000def", "abc def", "../../etc", "main..HEAD", "-rf"]) {
+      const result = await executeGroomerTool(
+        { name: "read_related_commit", arguments: { ref } },
+        options,
+        deps,
+      );
+      expect(result.ok, ref).toBe(false);
+    }
+    expect(deps.fetchRelatedCommit).not.toHaveBeenCalled();
+  });
+
+  it("degrades a not-found related-work ref to a warning, not a crash", async () => {
+    const deps = makeDeps({
+      fetchRelatedIssue: vi.fn().mockRejectedValue(notFound("issue", "org/repo#99")),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_issue", arguments: { number: 99 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toEqual({
+      found: false,
+      kind: "issue",
+      ref: "org/repo#99",
+    });
+    expect(result.warnings).toEqual(["related-work: not found issue org/repo#99"]);
+    expect(result.sources).toEqual([]);
+  });
+
+  it("degrades a not-found PR to a warning, not a crash", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi.fn().mockRejectedValue(notFound("pull_request", "org/repo#88")),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_pr", arguments: { number: 88 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(result.content)).toEqual({
+      found: false,
+      kind: "pull_request",
+      ref: "org/repo#88",
+    });
+    expect(result.warnings).toEqual(["related-work: not found pull_request org/repo#88"]);
+  });
+
+  it("degrades a thrown generic error to a warning plus an empty result", async () => {
+    const deps = makeDeps({
+      fetchRelatedPullRequest: vi
+        .fn()
+        .mockRejectedValue(new Error("GitHub API error for org/repo#42: 500 SENTINEL_UPSTREAM_BODY")),
+    });
+    const result = await executeGroomerTool(
+      { name: "read_related_pr", arguments: { number: 42 } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    expect(JSON.parse(result.content)).toEqual({ error: true });
+    expect(result.warnings).toEqual(["related-work: pull_request lookup failed"]);
+    expect(result.sources).toEqual([]);
+    expect(result.relatedWork).toBeUndefined();
+    // The upstream error text never reaches the model or the persisted warnings.
+    expect(result.content.includes("SENTINEL")).toBe(false);
+    expect(result.warnings!.join(" ").includes("SENTINEL")).toBe(false);
+  });
+
+  it("degrades a thrown search error without throwing", async () => {
+    const deps = makeDeps({
+      searchRelatedWork: vi
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            "GitHub API error: 502 SENTINEL_UPSTREAM_BODY_HTML <html>...</html>",
+          ),
+        ),
+    });
+    const result = await executeGroomerTool(
+      { name: "search_related_work", arguments: { query: "sslmode" } },
+      options,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("search_related_work failed");
+    expect(result.content.includes("SENTINEL_UPSTREAM_BODY_HTML")).toBe(false);
+    expect(result.content.includes("SENTINEL")).toBe(false);
   });
 });
 

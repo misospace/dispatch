@@ -6,7 +6,13 @@ import { fetchLatestCommit } from "@/lib/github-ci";
 import type { GitHubIssue } from "@/types";
 import { isAutomationAuthor } from "./context";
 
-export type EvidenceProvenance = "repository" | "github_issue" | "human_comment" | "automation_comment";
+export type EvidenceProvenance =
+  | "repository"
+  | "github_issue"
+  | "github_pull_request"
+  | "github_commit"
+  | "human_comment"
+  | "automation_comment";
 
 export interface EvidenceComment {
   id: string;
@@ -17,10 +23,37 @@ export interface EvidenceComment {
   authoritative: boolean; // human => true, automation => false
 }
 
-export interface EvidenceSource {
+export interface RepositoryEvidenceSource {
   path: string;
   provenance: "repository";
   ref: string | null; // the pinned head SHA this run read at
+}
+
+/**
+ * GitHub issue/PR/commit state the related-work tools observed. This is live
+ * forge state, not repository content, so it is never pinned to the run's
+ * head SHA: `ref` is always null and `observedAt` records when it was read.
+ */
+export interface RelatedWorkEvidenceSource {
+  key: string; // stable identity, e.g. github:pr:org/repo#12
+  provenance: "github_issue" | "github_pull_request" | "github_commit";
+  state: "open" | "closed" | "merged" | null; // null for commits
+  url: string | null;
+  via: "read" | "search"; // direct read, or a search-index hit (may lag)
+  observedAt: string;
+  ref: null;
+}
+
+export type EvidenceSource = RepositoryEvidenceSource | RelatedWorkEvidenceSource;
+
+/** A related-work observation as the exploration tools report it. */
+export interface RelatedWorkObservation {
+  key: string;
+  kind: "issue" | "pull_request" | "commit";
+  state: "open" | "closed" | "merged" | null;
+  url: string | null;
+  via: "read" | "search";
+  observedAt: string;
 }
 
 export interface EvidenceSnapshotIssue {
@@ -44,7 +77,7 @@ export interface GroomingEvidenceSnapshot {
   comments: EvidenceComment[];
   evidenceDigest: string; // sha256 over pinned inputs (headSha + defaultBranch + issueFingerprint + comment identity)
   warnings: string[]; // capture-time diagnostics (soft-failures land here)
-  sources: EvidenceSource[]; // repository evidence paths read/searched this run (appended after exploration)
+  sources: EvidenceSource[]; // repository paths and related-work refs read this run (appended after exploration)
 }
 
 export interface EvidenceSnapshotInput {
@@ -65,7 +98,7 @@ export const defaultEvidenceSnapshotDeps: EvidenceSnapshotDeps = {
   fetchLatestCommit,
 };
 
-/** Hard cap on repository evidence paths retained per snapshot. */
+/** Hard cap on evidence sources (repository paths + related-work refs) retained per snapshot. */
 const MAX_EVIDENCE_SOURCES = 60;
 /** Cap on comment provenance entries kept in the persisted summary. */
 const MAX_PERSISTED_COMMENTS = 50;
@@ -130,17 +163,67 @@ export function computeEvidenceDigest(parts: {
  * wins), and bounds the list so a runaway exploration cannot bloat it.
  * Each source is stamped with the run's pinned head SHA.
  */
+function sourceIdentity(source: EvidenceSource): string {
+  return source.provenance === "repository" ? `path:${source.path}` : `key:${source.key}`;
+}
+
 export function addEvidenceSources(
   snapshot: GroomingEvidenceSnapshot,
   paths: string[],
 ): GroomingEvidenceSnapshot {
-  const seen = new Set(snapshot.sources.map((source) => source.path));
+  const seen = new Set(snapshot.sources.map((source) => sourceIdentity(source)));
   const sources: EvidenceSource[] = [...snapshot.sources];
   for (const path of paths) {
     if (sources.length >= MAX_EVIDENCE_SOURCES) break;
-    if (seen.has(path)) continue;
-    seen.add(path);
+    const identity = `path:${path}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
     sources.push({ path, provenance: "repository", ref: snapshot.headSha });
+  }
+  return { ...snapshot, sources };
+}
+
+const RELATED_WORK_PROVENANCE: Record<RelatedWorkObservation["kind"], RelatedWorkEvidenceSource["provenance"]> = {
+  issue: "github_issue",
+  pull_request: "github_pull_request",
+  commit: "github_commit",
+};
+
+/**
+ * Append related-work observations (GitHub issue/PR/commit state) as
+ * provenanced evidence. Returns a NEW snapshot, dedupes by evidence key, and
+ * shares the source cap with repository paths. A direct read supersedes an
+ * earlier search hit for the same key, because search-index state can lag.
+ * These sources are deliberately unpinned (`ref: null`).
+ */
+export function addRelatedWorkEvidence(
+  snapshot: GroomingEvidenceSnapshot,
+  observations: RelatedWorkObservation[],
+): GroomingEvidenceSnapshot {
+  const sources: EvidenceSource[] = [...snapshot.sources];
+  const indexByKey = new Map<string, number>();
+  sources.forEach((source, index) => {
+    if (source.provenance !== "repository") indexByKey.set(source.key, index);
+  });
+  for (const observation of observations) {
+    const entry: RelatedWorkEvidenceSource = {
+      key: observation.key,
+      provenance: RELATED_WORK_PROVENANCE[observation.kind],
+      state: observation.state,
+      url: observation.url,
+      via: observation.via,
+      observedAt: observation.observedAt,
+      ref: null,
+    };
+    const existing = indexByKey.get(observation.key);
+    if (existing !== undefined) {
+      const current = sources[existing] as RelatedWorkEvidenceSource;
+      if (current.via === "search" && observation.via === "read") sources[existing] = entry;
+      continue;
+    }
+    if (sources.length >= MAX_EVIDENCE_SOURCES) continue;
+    indexByKey.set(observation.key, sources.length);
+    sources.push(entry);
   }
   return { ...snapshot, sources };
 }
@@ -169,11 +252,19 @@ export function summarizeEvidenceForPersistence(snapshot: GroomingEvidenceSnapsh
       provenance: comment.provenance,
     })),
     sourceCount: snapshot.sources.length,
-    sources: snapshot.sources.slice(0, MAX_PERSISTED_SOURCES).map((source) => ({
-      path: source.path,
-      provenance: source.provenance,
-      ref: source.ref,
-    })),
+    sources: snapshot.sources.slice(0, MAX_PERSISTED_SOURCES).map((source) =>
+      source.provenance === "repository"
+        ? { path: source.path, provenance: source.provenance, ref: source.ref }
+        : {
+            key: source.key,
+            provenance: source.provenance,
+            state: source.state,
+            url: source.url,
+            via: source.via,
+            observedAt: source.observedAt,
+            ref: source.ref,
+          },
+    ),
     warnings: snapshot.warnings.slice(0, MAX_PERSISTED_WARNINGS),
   };
 }
