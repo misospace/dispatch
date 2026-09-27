@@ -4,6 +4,7 @@ import {
   executeGroomerTool,
   type GroomerToolDeps,
 } from "./tools";
+import type { RelatedWorkObservation } from "./evidence-snapshot";
 
 export interface ExploreOptions {
   baseUrl: string;
@@ -41,14 +42,17 @@ export interface ExploreResult {
   files: string[];
   /** The model's statement of the ask in repo terms, if it called submit_findings. */
   ask: string | null;
+  /** Repository paths the exploration read or surfaced. Never related-work refs. */
   sources: string[];
   toolCalls: ExploreToolRecord[];
   bytes: number;
   warnings: string[];
   /** search_related_work queries the model ran. */
   relatedWorkQueries: string[];
-  /** issue/PR/commit refs the model looked up: issue:#n, pr:#n, commit:<sha>. */
+  /** Evidence keys of related work obtained, e.g. github:pr:org/repo#12. */
   relatedWorkRefs: string[];
+  /** Structured GitHub state behind relatedWorkRefs, for the evidence snapshot. */
+  relatedWork: RelatedWorkObservation[];
 }
 
 export interface ExploreDeps {
@@ -80,6 +84,10 @@ Related-work evidence (the repository's GitHub history) is read-only and bounded
 
 Call submit_findings once you can name the files a worker would change and state what the issue is asking for in this repository's own terms. Be concrete: real paths you have actually seen, never a guess.`;
 
+function relatedWorkRefsOf(observations: RelatedWorkObservation[]): string[] {
+  return [...new Set(observations.map((observation) => observation.key))];
+}
+
 /** Rounds remaining at which the model is told to wrap up. */
 export const ROUNDS_REMAINING_WARNING = 2;
 
@@ -92,6 +100,7 @@ const EMPTY: Omit<ExploreResult, "warnings"> = {
   bytes: 0,
   relatedWorkQueries: [],
   relatedWorkRefs: [],
+  relatedWork: [],
 };
 
 interface ChatMessage {
@@ -162,7 +171,7 @@ export async function exploreRepository(
   const records: ExploreToolRecord[] = [];
   const sources: string[] = [];
   const relatedWorkQueries: string[] = [];
-  const relatedWorkRefs: string[] = [];
+  const relatedWork: RelatedWorkObservation[] = [];
   let bytes = 0;
 
   let roundsExhausted = false;
@@ -283,32 +292,10 @@ export async function exploreRepository(
         bytes += result.bytes;
         sources.push(...result.sources);
         if (result.warnings?.length) warnings.push(...result.warnings);
-        if (name === "search_related_work") {
+        if (result.relatedWork?.length) relatedWork.push(...result.relatedWork);
+        if (name === "search_related_work" && result.ok) {
           const query = typeof args.query === "string" ? args.query.trim() : "";
-          if (result.ok) {
-            if (query) relatedWorkQueries.push(query);
-            try {
-              const parsed = JSON.parse(result.content);
-              if (Array.isArray(parsed)) {
-                for (const hit of parsed) {
-                  if (
-                    hit &&
-                    typeof hit === "object" &&
-                    typeof (hit as { evidenceKey?: unknown }).evidenceKey === "string"
-                  ) {
-                    relatedWorkRefs.push((hit as { evidenceKey: string }).evidenceKey);
-                  }
-                }
-              }
-            } catch {
-              // Non-JSON content: no hits to record.
-            }
-          }
-        } else if (
-          (name === "read_related_issue" || name === "read_related_pr" || name === "read_related_commit") &&
-          result.ok
-        ) {
-          for (const s of result.sources) relatedWorkRefs.push(s);
+          if (query) relatedWorkQueries.push(query);
         }
         records.push({
           name,
@@ -330,7 +317,8 @@ export async function exploreRepository(
           bytes,
           warnings,
           relatedWorkQueries: [...new Set(relatedWorkQueries)],
-          relatedWorkRefs: [...new Set(relatedWorkRefs)],
+          relatedWorkRefs: relatedWorkRefsOf(relatedWork),
+          relatedWork,
         };
       }
     }
@@ -347,7 +335,8 @@ export async function exploreRepository(
       bytes,
       warnings,
       relatedWorkQueries: [...new Set(relatedWorkQueries)],
-      relatedWorkRefs: [...new Set(relatedWorkRefs)],
+      relatedWorkRefs: relatedWorkRefsOf(relatedWork),
+      relatedWork,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -364,7 +353,8 @@ export async function exploreRepository(
       bytes,
       warnings,
       relatedWorkQueries: [...new Set(relatedWorkQueries)],
-      relatedWorkRefs: [...new Set(relatedWorkRefs)],
+      relatedWorkRefs: relatedWorkRefsOf(relatedWork),
+      relatedWork,
     };
   } finally {
     clearTimeout(timeoutId);

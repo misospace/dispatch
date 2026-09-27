@@ -13,6 +13,7 @@ import {
   searchRelatedWork,
   RelatedWorkNotFoundError,
 } from "@/lib/github-related-work";
+import type { RelatedWorkObservation } from "./evidence-snapshot";
 
 /**
  * Read-only repository tools the groomer drives itself.
@@ -52,6 +53,8 @@ export interface GroomerToolResult {
   bytes: number;
   /** Repo paths this call surfaced, for the run's source list. */
   sources: string[];
+  /** GitHub issue/PR/commit state a related-work call observed (not repo paths). */
+  relatedWork?: RelatedWorkObservation[];
   /** Warnings to surface on the exploration result, e.g. a failed lookup. */
   warnings?: string[];
 }
@@ -312,24 +315,48 @@ function asNumber(value: unknown): number | null {
  * an answer, not an error; anything else is a warning plus an empty result,
  * so a flaky lookup never ends the grooming run.
  */
+function toRelatedWorkObservation(
+  value: unknown,
+  fallbackKind: RelatedWorkObservation["kind"],
+  via: RelatedWorkObservation["via"],
+): RelatedWorkObservation | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.evidenceKey !== "string" || !v.evidenceKey) return null;
+  const kind =
+    v.kind === "issue" || v.kind === "pull_request" || v.kind === "commit" ? v.kind : fallbackKind;
+  const state =
+    kind !== "commit" && (v.state === "open" || v.state === "closed" || v.state === "merged")
+      ? v.state
+      : null;
+  return {
+    key: v.evidenceKey,
+    kind,
+    state,
+    url: typeof v.htmlUrl === "string" && v.htmlUrl ? v.htmlUrl : null,
+    via,
+    observedAt: new Date().toISOString(),
+  };
+}
+
+/** Commit refs the model may pass: a SHA, tag, or branch name, bounded. */
+const COMMIT_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const MAX_COMMIT_REF_LENGTH = 100;
+
 async function runRelatedWorkLookup(
-  kind: string,
+  kind: RelatedWorkObservation["kind"],
   invoke: () => Promise<unknown>,
 ): Promise<GroomerToolResult> {
   try {
     const evidence = await invoke();
     const content = JSON.stringify(evidence);
-    const key =
-      evidence &&
-      typeof evidence === "object" &&
-      typeof (evidence as { evidenceKey?: unknown }).evidenceKey === "string"
-        ? (evidence as { evidenceKey: string }).evidenceKey
-        : "";
+    const observation = toRelatedWorkObservation(evidence, kind, "read");
     return {
       ok: true,
       content,
       bytes: Buffer.byteLength(content, "utf8"),
-      sources: key ? [key] : [],
+      sources: [],
+      relatedWork: observation ? [observation] : [],
     };
   } catch (err) {
     if (err instanceof RelatedWorkNotFoundError) {
@@ -479,8 +506,18 @@ export async function executeGroomerTool(
           };
         }
         const content = JSON.stringify(hits);
-        const sources = hits.map((h) => h.evidenceKey).filter(Boolean);
-        return { ok: true, content, bytes: Buffer.byteLength(content, "utf8"), sources };
+        const relatedWork = hits
+          .map((hit) =>
+            toRelatedWorkObservation(hit, hit.kind === "pull_request" ? "pull_request" : "issue", "search"),
+          )
+          .filter((observation): observation is RelatedWorkObservation => observation !== null);
+        return {
+          ok: true,
+          content,
+          bytes: Buffer.byteLength(content, "utf8"),
+          sources: [],
+          relatedWork,
+        };
       }
 
       case "read_related_issue": {
@@ -494,7 +531,7 @@ export async function executeGroomerTool(
       case "read_related_pr": {
         const number = asNumber(call.arguments.number);
         if (!number) return fail("read_related_pr needs a positive integer pull request number.");
-        return runRelatedWorkLookup("pr", () =>
+        return runRelatedWorkLookup("pull_request", () =>
           deps.fetchRelatedPullRequest(options.repoFullName, number),
         );
       }
@@ -502,6 +539,9 @@ export async function executeGroomerTool(
       case "read_related_commit": {
         const ref = asString(call.arguments.ref).trim();
         if (!ref) return fail("read_related_commit needs a non-empty commit SHA.");
+        if (ref.length > MAX_COMMIT_REF_LENGTH || !COMMIT_REF_PATTERN.test(ref) || ref.includes("..")) {
+          return fail("read_related_commit needs a commit SHA (or tag/branch name) of letters, digits, '.', '_', '/', '-'.");
+        }
         return runRelatedWorkLookup("commit", () =>
           deps.fetchRelatedCommit(options.repoFullName, ref),
         );

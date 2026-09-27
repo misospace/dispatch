@@ -4,6 +4,7 @@ import type { GitHubIssue } from "@/types";
 
 import {
   addEvidenceSources,
+  addRelatedWorkEvidence,
   collectGroomingEvidenceSnapshot,
   computeEvidenceDigest,
   computeIssueFingerprint,
@@ -264,7 +265,54 @@ describe("addEvidenceSources", () => {
     const next = addEvidenceSources(baseSnapshot(), paths);
 
     expect(next.sources).toHaveLength(60);
-    expect(next.sources.map((source) => source.path)).toEqual(paths.slice(0, 60));
+    expect(next.sources.map((source) => (source.provenance === "repository" ? source.path : null))).toEqual(
+      paths.slice(0, 60),
+    );
+  });
+});
+
+describe("addRelatedWorkEvidence", () => {
+  const observedAt = "2026-09-25T00:00:00.000Z";
+
+  it("records GitHub state with its own provenance and no pinned ref, alongside repository paths", async () => {
+    const snapshot = addEvidenceSources(await collectGroomingEvidenceSnapshot(input, happyDeps()), ["src/a.ts"]);
+
+    const next = addRelatedWorkEvidence(snapshot, [
+      { key: "github:issue:org/repo#7", kind: "issue", state: "closed", url: "u7", via: "read", observedAt },
+      { key: "github:pr:org/repo#8", kind: "pull_request", state: "merged", url: "u8", via: "read", observedAt },
+      { key: "github:commit:org/repo@abc", kind: "commit", state: null, url: null, via: "read", observedAt },
+    ]);
+
+    expect(next.sources).toEqual([
+      { path: "src/a.ts", provenance: "repository", ref: HEAD_SHA },
+      { key: "github:issue:org/repo#7", provenance: "github_issue", state: "closed", url: "u7", via: "read", observedAt, ref: null },
+      { key: "github:pr:org/repo#8", provenance: "github_pull_request", state: "merged", url: "u8", via: "read", observedAt, ref: null },
+      { key: "github:commit:org/repo@abc", provenance: "github_commit", state: null, url: null, via: "read", observedAt, ref: null },
+    ]);
+    expect(snapshot.sources).toHaveLength(1);
+  });
+
+  it("dedupes by key and lets a direct read supersede a search hit, never the reverse", () => {
+    const next = addRelatedWorkEvidence(baseSnapshot(), [
+      { key: "github:pr:org/repo#8", kind: "pull_request", state: "closed", url: "u8", via: "search", observedAt },
+      { key: "github:pr:org/repo#8", kind: "pull_request", state: "merged", url: "u8", via: "read", observedAt },
+      { key: "github:pr:org/repo#8", kind: "pull_request", state: "open", url: "u8", via: "search", observedAt },
+    ]);
+
+    expect(next.sources).toEqual([
+      { key: "github:pr:org/repo#8", provenance: "github_pull_request", state: "merged", url: "u8", via: "read", observedAt, ref: null },
+    ]);
+  });
+
+  it("shares the source cap with repository paths", () => {
+    const paths = Array.from({ length: 59 }, (_, i) => `src/file-${i}.ts`);
+    const next = addRelatedWorkEvidence(addEvidenceSources(baseSnapshot(), paths), [
+      { key: "github:issue:org/repo#1", kind: "issue", state: "open", url: null, via: "read", observedAt },
+      { key: "github:issue:org/repo#2", kind: "issue", state: "open", url: null, via: "read", observedAt },
+    ]);
+
+    expect(next.sources).toHaveLength(60);
+    expect(next.sources[59]).toMatchObject({ key: "github:issue:org/repo#1" });
   });
 });
 

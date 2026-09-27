@@ -177,20 +177,21 @@ describe("exploreRepository", () => {
     const result = await exploreRepository(options, deps);
 
     expect(result.relatedWorkQueries).toEqual(["sslmode"]);
-    // Successful reads record the tool result's evidence keys (from
-    // result.sources), so a PR number read via read_related_pr is a
-    // pull_request ref, not an issue ref.
+    // Successful reads record the tool result's evidence keys, so a PR
+    // number read via read_related_pr is a pull_request ref, not an issue ref.
     expect(result.relatedWorkRefs).toEqual([
       "github:pr:org/repo#12",
       "github:commit:org/repo@abc123",
       "github:issue:org/repo#101",
     ]);
-    expect(result.sources).toEqual([
-      "github:pr:org/repo#12",
-      "github:commit:org/repo@abc123",
-      "github:issue:org/repo#101",
-      "src/lib/prisma.ts",
+    expect(result.relatedWork.map((o) => [o.key, o.kind, o.state, o.via])).toEqual([
+      ["github:pr:org/repo#12", "pull_request", "merged", "read"],
+      ["github:commit:org/repo@abc123", "commit", null, "read"],
+      ["github:issue:org/repo#101", "issue", null, "search"],
     ]);
+    // Related-work keys never leak into the repository source list, which the
+    // evidence snapshot pins to the run's head SHA.
+    expect(result.sources).toEqual(["src/lib/prisma.ts"]);
   });
 
   it("counts related-work bytes against the exploration byte budget", async () => {
@@ -236,6 +237,7 @@ describe("exploreRepository", () => {
     // A not-found lookup returns ok:true with {found:false} content and empty
     // sources, so it records no ref.
     expect(result.relatedWorkRefs).toEqual([]);
+    expect(result.relatedWork).toEqual([]);
   });
 
   it("stops at the tool-call budget and says so", async () => {

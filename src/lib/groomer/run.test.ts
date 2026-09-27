@@ -187,6 +187,7 @@ const mockExploration: ExploreResult = {
   warnings: [],
   relatedWorkQueries: [],
   relatedWorkRefs: [],
+  relatedWork: [],
 };
 
 describe("runHostedGroomer", () => {
@@ -325,12 +326,22 @@ describe("runHostedGroomer", () => {
       findings: "",
       files: [],
       ask: null,
-      sources: ["pr:org/repo#7"],
+      sources: ["src/lib/prisma.ts"],
       toolCalls: [],
       bytes: 0,
       warnings: [],
       relatedWorkQueries: ["sslmode"],
-      relatedWorkRefs: ["pr:#7"],
+      relatedWorkRefs: ["github:pr:org/repo#7"],
+      relatedWork: [
+        {
+          key: "github:pr:org/repo#7",
+          kind: "pull_request",
+          state: "merged",
+          url: "https://github.com/org/repo/pull/7",
+          via: "read",
+          observedAt: "2026-09-25T00:00:01.000Z",
+        },
+      ],
     });
 
     const result = await runHostedGroomer();
@@ -345,11 +356,49 @@ describe("runHostedGroomer", () => {
           contextSummary: expect.objectContaining({
             commentCount: 0,
             relatedWorkQueries: ["sslmode"],
-            relatedWorkRefs: ["pr:#7"],
+            relatedWorkRefs: ["github:pr:org/repo#7"],
           }),
         }),
       }),
     );
+  });
+
+  it("folds related-work into the evidence snapshot as unpinned GitHub provenance, separate from pinned repo paths", async () => {
+    mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+    mocks.exploreRepository.mockResolvedValue({
+      ...mockExploration,
+      sources: ["src/lib/prisma.ts"],
+      relatedWorkRefs: ["github:pr:org/repo#7"],
+      relatedWork: [
+        {
+          key: "github:pr:org/repo#7",
+          kind: "pull_request",
+          state: "merged",
+          url: "https://github.com/org/repo/pull/7",
+          via: "read",
+          observedAt: "2026-09-25T00:00:01.000Z",
+        },
+      ],
+    });
+
+    await runHostedGroomer();
+
+    const exploredCall = mocks.prisma.groomingRun.update.mock.calls.find(
+      (call) => call[0]?.data?.stage === "explored",
+    );
+    expect(exploredCall).toBeDefined();
+    expect(exploredCall![0].data.contextSummary.evidence.sources).toEqual([
+      { path: "src/lib/prisma.ts", provenance: "repository", ref: "abc123" },
+      {
+        key: "github:pr:org/repo#7",
+        provenance: "github_pull_request",
+        state: "merged",
+        url: "https://github.com/org/repo/pull/7",
+        via: "read",
+        observedAt: "2026-09-25T00:00:01.000Z",
+        ref: null,
+      },
+    ]);
   });
 
   it("repository context warnings are persisted and returned", async () => {

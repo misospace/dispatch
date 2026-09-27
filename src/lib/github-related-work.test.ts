@@ -423,6 +423,54 @@ describe("github-related-work", () => {
     });
   });
 
+  describe("non-404 errors", () => {
+    // 403 (e.g. a secondary rate limit) is not retried by fetchWithRetry, so
+    // it surfaces immediately as a generic error, never as "not found".
+    const forbidden = () =>
+      mockResponse({ message: "API rate limit exceeded" }, { status: 403 });
+
+    it("fetchRelatedIssue throws a generic error, not RelatedWorkNotFoundError", async () => {
+      fetchSpy.mockResolvedValue(forbidden());
+      const err = await fetchRelatedIssue("org/repo", 5).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(RelatedWorkNotFoundError);
+      expect(String(err.message)).toContain("403");
+    });
+
+    it("fetchRelatedPullRequest throws a generic error, not RelatedWorkNotFoundError", async () => {
+      fetchSpy.mockResolvedValue(forbidden());
+      const err = await fetchRelatedPullRequest("org/repo", 5).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(RelatedWorkNotFoundError);
+    });
+
+    it("fetchRelatedCommit throws a generic error, not RelatedWorkNotFoundError", async () => {
+      fetchSpy.mockResolvedValue(forbidden());
+      const err = await fetchRelatedCommit("org/repo", "abc123").catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(RelatedWorkNotFoundError);
+    });
+
+    it("fetchRelatedIssue throws when the comments request fails after the issue read", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(
+          mockResponse({
+            number: 6,
+            title: "t",
+            body: "b",
+            state: "open",
+            html_url: "https://github.com/org/repo/issues/6",
+            labels: [],
+            updated_at: null,
+          }),
+        )
+        .mockResolvedValueOnce(forbidden());
+      const err = await fetchRelatedIssue("org/repo", 6).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(RelatedWorkNotFoundError);
+    });
+  });
+
   describe("searchRelatedWork", () => {
     it("injects repo: scoping plus type and state qualifiers into the query", async () => {
       fetchSpy.mockResolvedValueOnce(mockResponse({ total_count: 0, items: [] }));

@@ -11,6 +11,7 @@ import { buildRepositoryContext } from "./repository-context";
 import { exploreRepository } from "./explore";
 import {
   addEvidenceSources,
+  addRelatedWorkEvidence,
   collectGroomingEvidenceSnapshot,
   summarizeEvidenceForPersistence,
   type GroomingEvidenceSnapshot,
@@ -288,8 +289,10 @@ async function executeGroomerRun(
       // Fold exploration sources into the snapshot, then persist so a bad
       // grooming run can be read back afterwards. Before this, the only
       // evidence of what the groomer saw was whatever comment it happened to
-      // leave on the issue.
+      // leave on the issue. Related-work refs are GitHub state, not repository
+      // content, so they enter as their own unpinned provenance.
       evidence = addEvidenceSources(evidence, exploration.sources);
+      evidence = addRelatedWorkEvidence(evidence, exploration.relatedWork);
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         stage: "explored",
         contextWarnings: [...contextWarnings, ...exploration.warnings],
