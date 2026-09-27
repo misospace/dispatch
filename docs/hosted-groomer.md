@@ -30,6 +30,8 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | `24` | Suppresses repeated hosted-groomer comments on the same issue. A comment is skipped (and recorded on the run) when a prior run posted a comment within this window, unless `force` is true. |
 | `DISPATCH_GROOMER_TOOL_LOOP_ENABLED` | `true` | Lets the groomer drive its own repository exploration with tools (`search_code`, `read_file`, `list_directory`, `submit_findings`) instead of one pre-computed context block. |
 | `DISPATCH_GROOMER_MAX_ROUNDS` | `12` | Model round-trips the exploration loop may make. One round can carry several tool calls, so this is not a cap on calls. `DISPATCH_GROOMER_MAX_TOOL_CALLS` is accepted as a deprecated alias. |
+| `DISPATCH_GROOMER_MAX_SEARCH_RESULTS` | `10` | Maximum code-search results returned to the model per `search_code` call. |
+| `DISPATCH_GROOMER_MAX_DIR_ENTRIES` | `60` | Maximum directory entries returned to the model per `list_directory` call. |
 | `DISPATCH_GROOMER_CONTEXT_MODE` | `medium` | Exploration budget preset: `small`, `medium`, `large`. See below. |
 | `DISPATCH_GROOMER_MODEL_CONTEXT_TOKENS` | unset | The model's real context window in tokens. When set, the exploration budget is derived from it and `DISPATCH_GROOMER_CONTEXT_MODE` is ignored, up to the 96 KB `large` preset cap. |
 | `DISPATCH_GROOMER_EXPLORE_MAX_BYTES` | from mode | Overrides the exploration byte budget. |
