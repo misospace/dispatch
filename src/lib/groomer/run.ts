@@ -55,6 +55,16 @@ export interface RunHostedGroomerOptions {
 
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Backoff after a groom that could not read GitHub state (dispatch#1063).
+ * Short enough that a transient GitHub failure delays grooming by an hour,
+ * not the 24h cooldown; long enough that a persistently unreadable issue
+ * (deleted upstream, say) costs one cheap capture an hour instead of
+ * monopolizing every scheduler tick. When the snapshot capture fails the
+ * model is never called, so a backed-off retry is only a few GitHub reads.
+ */
+export const UNVERIFIABLE_RETRY_BACKOFF_MINUTES = 60;
+
 export interface GroomerDeps {
   selectCandidate: typeof selectGroomingCandidate;
   fetchComments: typeof fetchIssueComments;
@@ -238,6 +248,70 @@ async function executeGroomerRun(
         evidenceDigest: "",
         warnings: ["evidence: snapshot collection failed"],
         sources: [],
+      };
+    }
+
+    // A snapshot that did not capture the live issue can never be applied
+    // (the apply preconditions refuse it, and it cannot be ready or close),
+    // so stop before any repository read or model call (dispatch#1063). The
+    // issue backs off instead of being re-selected, and re-billed, every tick.
+    if (evidence.issue.state === "unknown") {
+      const why = evidence.warnings.find((w) => w.includes("issue")) ?? evidence.warnings[0] ?? "the live issue could not be read";
+      const failures = [`issue: the evidence snapshot did not capture the live issue: ${why}`];
+      const unverifiable: Record<string, unknown> = { outcome: "unverifiable", preconditionFailures: failures };
+      const evidenceSummary = { evidence: summarizeEvidenceForPersistence(evidence) };
+      if (dryRun) {
+        await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+          status: "dry_run_completed",
+          stage: "selected",
+          contextSummary: evidenceSummary,
+          preconditionFailures: failures,
+          applyOutcome: "unverifiable",
+        });
+        return {
+          candidateNumber: candidate.number,
+          repoFullName: candidate.repoFullName,
+          dryRun: true,
+          output: null,
+          plannedLabels: candidate.labels,
+          groomingRunId: groomingRun.id,
+          contextWarnings: [],
+          appliedMutations: unverifiable,
+        };
+      }
+      unverifiable.retryAfter = (await backOffUnreadableIssue(deps, candidate.id)).toISOString();
+      const skippedRun = await deps.prisma.agentRun.create({
+        data: {
+          agentName: "hosted-groomer",
+          runType: "groom",
+          status: "completed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          summary: "No mutations applied: the live issue could not be read, so no plan was made",
+          issueId: candidate.id,
+          touchedIssueUrls: [candidate.url],
+        },
+      });
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "unverifiable",
+        stage: "selected",
+        contextSummary: evidenceSummary,
+        preconditionFailures: failures,
+        applyOutcome: "unverifiable",
+        appliedMutations: unverifiable,
+        errorMessage: `Evidence snapshot did not capture the live issue: ${why}`,
+        retryable: true,
+        agentRunId: skippedRun.id,
+      });
+      return {
+        candidateNumber: candidate.number,
+        repoFullName: candidate.repoFullName,
+        dryRun: false,
+        output: null,
+        plannedLabels: candidate.labels,
+        groomingRunId: groomingRun.id,
+        contextWarnings: [],
+        appliedMutations: unverifiable,
       };
     }
 
@@ -609,7 +683,14 @@ async function executeGroomerRun(
 
     if (dryRun) {
       const existing = preconditions.ok ? await store.find(applicationKey) : null;
-      const applyOutcome = !preconditions.ok ? "stale" : existing?.status === "applied" ? "would_replay" : "dry_run";
+      const unreadable = preconditions.checks.some((c) => c.status === "unverifiable");
+      const applyOutcome = !preconditions.ok
+        ? unreadable
+          ? "unverifiable"
+          : "stale"
+        : existing?.status === "applied"
+          ? "would_replay"
+          : "dry_run";
       mutationPlan.applyOutcome = applyOutcome;
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "dry_run_completed",
@@ -621,10 +702,17 @@ async function executeGroomerRun(
     }
 
     if (!preconditions.ok) {
-      // Stale or unverifiable evidence: apply zero grooming mutations. The
-      // issue's grooming fields are left untouched, so it stays exactly as
-      // eligible for a fresh groom as it was when this run selected it.
-      const stale: Record<string, unknown> = { outcome: "stale", preconditionFailures: preconditions.failures };
+      // Stale or unverifiable evidence: apply zero grooming mutations.
+      // - Stale (live state changed): the grooming fields are left untouched,
+      //   so the issue stays exactly as eligible as when this run selected it
+      //   and is re-groomed promptly on the fresh evidence.
+      // - Unverifiable (a live read failed, or could not be completed): the
+      //   issue also backs off, so an unreadable issue cannot win selection
+      //   every tick. A run with both counts as unverifiable.
+      const unreadable = preconditions.checks.some((c) => c.status === "unverifiable");
+      const outcome = unreadable ? "unverifiable" : "stale";
+      const stale: Record<string, unknown> = { outcome, preconditionFailures: preconditions.failures };
+      if (unreadable) stale.retryAfter = (await backOffUnreadableIssue(deps, candidate.id)).toISOString();
       const failed = preconditions.checks.filter((c) => c.status === "changed" || c.status === "unverifiable");
       const staleRun = await deps.prisma.agentRun.create({
         data: {
@@ -647,14 +735,14 @@ async function executeGroomerRun(
           beforeLabels: candidate.labels,
           afterLabels: candidate.labels,
           success: true,
-          notes: JSON.stringify({ outcome: "stale", preconditionFailures: preconditions.failures }),
+          notes: JSON.stringify({ outcome, preconditionFailures: preconditions.failures }),
         },
       });
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
-        status: "stale",
+        status: outcome,
         stage: "validated",
         ...validationFields,
-        applyOutcome: "stale",
+        applyOutcome: outcome,
         appliedMutations: stale,
         errorMessage: `Apply preconditions failed: ${preconditions.failures.join("; ")}`,
         retryable: true,
@@ -781,6 +869,7 @@ async function executeGroomerRun(
       groomedAt: new Date(),
       groomedBy: "hosted-groomer",
       currentLane: output.lane.id,
+      groomingRetryAfter: null,
     };
     if (output.summary) issueData.groomingSummary = output.summary;
     if (output.needsInfoReason) issueData.needsInfoReason = output.needsInfoReason;
@@ -974,4 +1063,15 @@ function describeApplication(applied: ApplyResult, withheld: Record<string, stri
   if (steps.close?.status === "applied" || steps.close?.status === "replayed") out.issueClosed = true;
   if (steps.close?.status === "failed") out.issueClosedError = steps.close.error;
   return out;
+}
+
+/**
+ * Back an issue off after its GitHub state could not be read (dispatch#1063).
+ * Only the backoff column is written: grooming fields, the cooldown stamp and
+ * any freshness baseline stay as they were.
+ */
+async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promise<Date> {
+  const retryAfter = new Date(Date.now() + UNVERIFIABLE_RETRY_BACKOFF_MINUTES * 60 * 1000);
+  await deps.prisma.issue.update({ where: { id: issueId }, data: { groomingRetryAfter: retryAfter } });
+  return retryAfter;
 }

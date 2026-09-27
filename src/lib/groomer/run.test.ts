@@ -614,10 +614,14 @@ describe("runHostedGroomer", () => {
         expect(result!.dryRun).toBe(true);
         // The defensive shell is persisted: no pinned ref, capture failure
         // recorded inside the evidence summary (never in contextWarnings).
+        // The run stops there (dispatch#1063): no plan can be applied to it.
         const contextBuiltCall = mocks.prisma.groomingRun.update.mock.calls.find(
-          (call) => call[0]?.data?.stage === "context_built",
+          (call) => call[0]?.data?.contextSummary !== undefined,
         );
+        expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
         expect(contextBuiltCall![0].data).toMatchObject({
+          status: "dry_run_completed",
+          applyOutcome: "unverifiable",
           contextSummary: expect.objectContaining({
             evidence: expect.objectContaining({
               headSha: null,
@@ -1303,13 +1307,15 @@ Investigate session handling in auth module.`;
       expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     });
 
-    it("rejects a ready claim when the snapshot could not be captured", async () => {
+    it("never asks the model for a plan when the snapshot could not be captured (dispatch#1063)", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       mocks.collectGroomingEvidenceSnapshot.mockRejectedValue(new Error("boom"));
 
-      // The fallback shell has no sources, so the repository refs a ready
-      // plan needs are not even citable.
-      await expect(runHostedGroomer()).rejects.toThrow(/unknown evidence reference "repo:src\/auth\/login.ts"/);
+      // A plan on an uncaptured snapshot could never be ready, close, or pass
+      // the apply preconditions, so no model or repository work is spent on it.
+      const result = await runHostedGroomer();
+      expect(result!.appliedMutations).toMatchObject({ outcome: "unverifiable" });
+      expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
       expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
       warnSpy.mockRestore();
     });
@@ -1757,6 +1763,7 @@ Investigate session handling in auth module.`;
       await runHostedGroomer();
       expectNoGitHubWrites();
       expect(completedRun().preconditionFailures[0]).toMatch(/^head: .*500/);
+      expect(completedRun()).toMatchObject({ status: "unverifiable" });
     });
 
     it("applies zero mutations when a human comments after the evidence was captured", async () => {
@@ -1768,20 +1775,68 @@ Investigate session handling in auth module.`;
       expect(completedRun().preconditionFailures[0]).toMatch(/^comments: new comment by alice/);
     });
 
-    it("never applies a plan built on a snapshot that did not capture the issue", async () => {
+    it("never applies a plan built on a snapshot that did not capture the issue, skips the model, and backs off", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true, repoContextEnabled: true });
       mocks.collectGroomingEvidenceSnapshot.mockRejectedValueOnce(new Error("boom"));
       mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { evidenceRefs: [] } }));
+      const before = Date.now();
       await runHostedGroomer();
       warnSpy.mockRestore();
       expectNoGitHubWrites();
+      expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+      expect(mocks.exploreRepository).not.toHaveBeenCalled();
+      expect(mocks.buildRepositoryContext).not.toHaveBeenCalled();
+      expect(completedRun()).toMatchObject({ status: "unverifiable", applyOutcome: "unverifiable", retryable: true });
       expect(completedRun().preconditionFailures[0]).toMatch(/^issue: the evidence snapshot did not capture the live issue/);
+      // Only the backoff is written: no grooming fields, cooldown stamp or baseline.
+      expect(mocks.prisma.issue.update).toHaveBeenCalledTimes(1);
+      const data = mocks.prisma.issue.update.mock.calls[0][0].data;
+      expect(Object.keys(data)).toEqual(["groomingRetryAfter"]);
+      expect((data.groomingRetryAfter as Date).getTime() - before).toBeGreaterThanOrEqual(59 * 60 * 1000);
+    });
+
+    it("a dry run on an uncaptured snapshot skips the model but writes no backoff", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValueOnce(new Error("boom"));
+      await runHostedGroomer();
+      warnSpy.mockRestore();
+      expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("backs off an issue whose live state cannot be re-read at apply time", async () => {
+      liveStateChangesTo({}, { state: "unknown" });
+      const before = Date.now();
+      const result = await runHostedGroomer();
+      expectNoGitHubWrites();
+      expect(result!.appliedMutations).toMatchObject({ outcome: "unverifiable", retryAfter: expect.any(String) });
+      expect(completedRun()).toMatchObject({ status: "unverifiable", applyOutcome: "unverifiable", retryable: true });
+      expect(mocks.prisma.issue.update).toHaveBeenCalledTimes(1);
+      const data = mocks.prisma.issue.update.mock.calls[0][0].data;
+      expect(Object.keys(data)).toEqual(["groomingRetryAfter"]);
+      expect((data.groomingRetryAfter as Date).getTime() - before).toBeGreaterThanOrEqual(59 * 60 * 1000);
+    });
+
+    it("backs off when a check is unverifiable even if another one also changed", async () => {
+      liveStateChangesTo({ headSha: null, pinnedRef: null }, { body: "edited" });
+      await runHostedGroomer();
+      expect(completedRun()).toMatchObject({ status: "unverifiable" });
+      expect(mocks.prisma.issue.update.mock.calls[0][0].data).toHaveProperty("groomingRetryAfter");
+    });
+
+    it("clears any earlier backoff once a groom applies", async () => {
+      await runHostedGroomer();
+      expect(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).toMatchObject({ groomingRetryAfter: null });
     });
 
     it("keeps the issue eligible for a fresh groom after a stale abort", async () => {
       liveStateChangesTo({}, { title: "Retitled by a human" });
       await runHostedGroomer();
-      // No grooming field, cooldown stamp or freshness baseline is written.
+      // No grooming field, cooldown stamp, backoff or freshness baseline is
+      // written: a changed issue is re-groomed promptly on the new evidence.
+      expect(completedRun()).toMatchObject({ status: "stale", applyOutcome: "stale" });
       expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
       expect(mocks.prisma.agentRun.create).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ summary: "No mutations applied: preconditions failed (issue)" }) }),

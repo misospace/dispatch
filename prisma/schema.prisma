@@ -79,6 +79,10 @@ model Issue {
   groomingStaleAt           DateTime?
   groomingStaleReasons      String[]  @default([])
   groomingStaleDetail       String?   @db.Text
+  // Backoff after a groom that could not read GitHub state (#1063): the
+  // selector skips the issue until then, so an unreadable issue cannot
+  // monopolize the groomer. Targeted runs ignore it.
+  groomingRetryAfter        DateTime?
 
   // Linked PR health (persisted by reconcile, refreshable on demand)
   linkedPrNumber          Int?
@@ -96,6 +100,7 @@ model Issue {
   @@index([labels])
   @@index([linkedPrNeedsFollowup])
   @@index([groomingStaleAt])
+  @@index([groomingRetryAfter])
 }
 
 enum PrFixLane {

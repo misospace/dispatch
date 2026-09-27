@@ -9,6 +9,11 @@ ALTER TABLE "GroomingRun"
 
 CREATE INDEX IF NOT EXISTS "GroomingRun_applicationKey_idx" ON "GroomingRun"("applicationKey");
 
+-- Backoff after a groom whose GitHub reads failed (snapshot capture or the
+-- apply-time re-read). Nullable, so every existing issue is selectable.
+ALTER TABLE "Issue" ADD COLUMN IF NOT EXISTS "groomingRetryAfter" TIMESTAMP(3);
+CREATE INDEX IF NOT EXISTS "Issue_groomingRetryAfter_idx" ON "Issue"("groomingRetryAfter");
+
 -- CreateTable: one row per logical plan application. The unique
 -- applicationKey is the claim; a retry with the same key replays the recorded
 -- steps. groomingRunId is the run that first claimed it; SetNull keeps the
