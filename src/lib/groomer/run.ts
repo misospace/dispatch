@@ -67,6 +67,18 @@ const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
  */
 export const UNVERIFIABLE_RETRY_BACKOFF_MINUTES = 60;
 
+/**
+ * Backoff after a failed model stage (dispatch#1125): the LLM call timed out,
+ * errored or returned unparseable JSON, or its plan failed validation. The
+ * failure is retryable, but without a backoff the issue kept winning
+ * selection and one bad issue held the groomer for hours. The first failure
+ * waits 30 minutes, each consecutive one doubles it, capped at 4 hours.
+ */
+export const MODEL_FAILURE_BACKOFF_BASE_MINUTES = 30;
+export const MODEL_FAILURE_BACKOFF_MAX_MINUTES = 240;
+/** Prior runs read to count the failure streak; enough to reach the cap. */
+const MODEL_FAILURE_HISTORY_WINDOW = 10;
+
 export interface GroomerDeps {
   selectCandidate: typeof selectGroomingCandidate;
   fetchComments: typeof fetchIssueComments;
@@ -202,6 +214,11 @@ async function executeGroomerRun(
 
   // Freshness (#1064): a human comment after this instant is new evidence.
   const evidenceWindowStart = new Date();
+
+  // True from the model call until its validated plan becomes a mutation
+  // plan, so the failure path backs off a model-stage failure and no other
+  // (#1125).
+  let inModelStage = false;
 
   try {
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
@@ -439,6 +456,7 @@ async function executeGroomerRun(
       ...(exploration?.readContents ?? []),
     ]);
     const evidenceCatalog = buildEvidenceCatalog(evidence, pinnedContent);
+    inModelStage = true;
 
     // Call LLM
     const rawOutput = await deps.callLLM({
@@ -573,6 +591,8 @@ async function executeGroomerRun(
       });
       delete mutationPlan.applicationKey;
     }
+
+    inModelStage = false;
 
     // Persist stage planned
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
@@ -1005,6 +1025,11 @@ async function executeGroomerRun(
       // Don't mask the original error
     }
 
+    // A dry run writes nothing to the issue, as with the unreadable backoff.
+    if (inModelStage && !dryRun) {
+      await backOffFailedModelStage(deps, candidate.id, groomingRun.id);
+    }
+
     await deps.prisma.agentRun.create({
       data: {
         agentName: "hosted-groomer",
@@ -1091,6 +1116,42 @@ async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promi
     // The error itself is logged, not persisted: driver text stays out of history.
     console.warn(`[groomer] failed to record the retry backoff for issue ${issueId}:`, error);
     return { retryAfterError: "the retry backoff could not be recorded" };
+  }
+}
+
+/** Backoff for the Nth consecutive model-stage failure: 30m, 60m, 120m, then 240m (#1125). */
+export function modelFailureBackoffMinutes(consecutiveFailures: number): number {
+  const doublings = Math.max(0, consecutiveFailures - 1);
+  return Math.min(MODEL_FAILURE_BACKOFF_BASE_MINUTES * 2 ** doublings, MODEL_FAILURE_BACKOFF_MAX_MINUTES);
+}
+
+/**
+ * Back an issue off after a failed model stage (dispatch#1125). The streak is
+ * this failure plus the failed runs immediately before it: any other outcome
+ * (applied, stale, unverifiable, ...) ends it, so a successful groom resets
+ * the backoff. A run still marked running was interrupted and recorded no
+ * outcome, so it neither counts nor ends the streak. Only the backoff column
+ * is written, and a failed write never masks the model error.
+ */
+async function backOffFailedModelStage(deps: GroomerDeps, issueId: string, groomingRunId: string): Promise<void> {
+  try {
+    const prior: Array<{ status: string }> = await deps.prisma.groomingRun.findMany({
+      where: { issueId, dryRun: false, id: { not: groomingRunId } },
+      orderBy: { createdAt: "desc" },
+      take: MODEL_FAILURE_HISTORY_WINDOW,
+      select: { status: true },
+    });
+    let consecutiveFailures = 1;
+    for (const run of prior) {
+      if (run.status === "running") continue;
+      if (run.status !== "failed") break;
+      consecutiveFailures++;
+    }
+    const minutes = modelFailureBackoffMinutes(consecutiveFailures);
+    const retryAfter = new Date(Date.now() + minutes * 60 * 1000);
+    await deps.prisma.issue.update({ where: { id: issueId }, data: { groomingRetryAfter: retryAfter } });
+  } catch (error) {
+    console.warn(`[groomer] failed to record the model-failure backoff for issue ${issueId}:`, error);
   }
 }
 
