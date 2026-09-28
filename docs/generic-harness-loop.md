@@ -74,6 +74,8 @@ def worker_heartbeat(agent_name, dispatch_url):
     # Stop
 ```
 
+Autonomous workers may authenticate the loop above with `DISPATCH_WORKER_TOKEN` (worker tier); operator and MCP-bridge agents keep the maintainer token (`DISPATCH_AGENT_TOKEN`).
+
 **Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
 
 ## Generic Groomer Loop

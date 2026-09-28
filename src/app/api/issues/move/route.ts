@@ -3,7 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { removeIssueLabel } from "@/lib/github";
 import { STATUS_LABELS, isStatusLabel } from "@/types";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { transitionIssueStatus } from "@/lib/issue-status";
 
@@ -14,7 +14,7 @@ const RATE_LIMIT = { limit: 60, windowMs: 60_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`issues/move:${auth.actor}`, RATE_LIMIT);

@@ -8,7 +8,15 @@ const mocks = vi.hoisted(() => ({
   sweepStaleWork: vi.fn(),
 }));
 
-vi.mock("@/lib/auth", () => ({ authorizeRequest: mocks.authorizeRequest }));
+vi.mock("@/lib/auth", () => ({
+  authorizeRequest: mocks.authorizeRequest,
+  authErrorResponse: vi.fn((auth: { forbidden?: boolean }) =>
+    new Response(JSON.stringify({ error: auth.forbidden ? "Forbidden" : "Unauthorized" }), {
+      status: auth.forbidden ? 403 : 401,
+      headers: { "content-type": "application/json" },
+    }),
+  ),
+}));
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 vi.mock("@/lib/prisma", () => ({ prisma: {} }));
 vi.mock("@/lib/sync-lock", () => ({

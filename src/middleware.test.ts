@@ -18,6 +18,8 @@ function clearAll() {
   delete process.env.DISPATCH_AUTH_USERNAME;
   delete process.env.DISPATCH_AUTH_PASSWORD;
   delete process.env.DISPATCH_AGENT_TOKEN;
+  delete process.env.DISPATCH_MAINTAINER_TOKEN;
+  delete process.env.DISPATCH_WORKER_TOKEN;
   delete process.env.AUTH_URL;
   delete process.env.NEXTAUTH_URL;
   delete process.env.NEXTAUTH_SECRET;
@@ -73,6 +75,79 @@ describe("middleware auth protection", () => {
     }));
 
     expect(res.status).toBe(200);
+  });
+});
+
+describe("bearer tier tokens in basic mode", () => {
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    mocks.getToken.mockReset();
+  });
+
+  afterEach(() => {
+    clearAll();
+    resetAuthCaches();
+  });
+
+  it("accepts a Bearer with the DISPATCH_AGENT_TOKEN (maintainer tier)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-token";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+
+    const res = await middleware(makeRequest("/api/issues/claim", {
+      Authorization: "Bearer agent-token",
+    }));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts a Bearer with the DISPATCH_WORKER_TOKEN (worker tier)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-token";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+
+    const res = await middleware(makeRequest("/api/issues/claim", {
+      Authorization: "Bearer worker-token",
+    }));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts a Bearer with the DISPATCH_MAINTAINER_TOKEN alias (maintainer tier)", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-token";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+
+    const res = await middleware(makeRequest("/api/issues/claim", {
+      Authorization: "Bearer maintainer-token",
+    }));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a Bearer with an unconfigured token", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-token";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+
+    const res = await middleware(makeRequest("/api/issues/claim", {
+      Authorization: "Bearer wrong-token",
+    }));
+
+    expect(res.status).toBe(401);
   });
 });
 

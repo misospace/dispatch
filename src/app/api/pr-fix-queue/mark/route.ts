@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -10,7 +10,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`pr-fix-mark:${auth.actor}`, RATE_LIMIT);
@@ -28,6 +28,29 @@ export async function POST(request: Request) {
 
     const input = parseMarkPrFixInput(body);
     if ("error" in input) return errorResponse(input.error, 400);
+
+    // Worker tokens may only settle attempts (FIXED/BLOCKED/STALE): moving
+    // an item back to QUEUED or IGNORED changes routing and requires a
+    // maintainer token (#1111).
+    if ((input.status === "QUEUED" || input.status === "IGNORED") && auth.type === "bearer" && auth.tier === "worker") {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor: auditActor,
+            action: "pr_fix_mark",
+            repoFullName: input.repo,
+            issueNumber: null,
+            success: false,
+            errorMessage: "Marking an item QUEUED or IGNORED requires a maintainer token",
+            beforeLabels: [],
+            afterLabels: [],
+          },
+        });
+      } catch {
+        // Audit log failure should not mask the 403
+      }
+      return errorResponse("Marking an item QUEUED or IGNORED requires a maintainer token", 403);
+    }
 
     // #1074: bearer (agent/bridge) marks must settle a specific attempt, so
     // the generation token is required. Operator paths (oidc session, basic,

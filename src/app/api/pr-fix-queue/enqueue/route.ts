@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { enqueuePrFixItem, parseEnqueuePrFixInput } from "@/lib/pr-fix-queue";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -10,7 +10,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`pr-fix-enqueue:${auth.actor}`, RATE_LIMIT);

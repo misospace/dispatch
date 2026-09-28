@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getConfiguredLanes } from "@/lib/lane-config";
 
 /**
@@ -19,8 +19,9 @@ import { getConfiguredLanes } from "@/lib/lane-config";
  * is a well-defined question.
  */
 export async function GET(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   try {

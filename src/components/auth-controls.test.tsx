@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthControls } from "./auth-controls";
 
 const getAuthModeMock = vi.fn();
-vi.mock("@/lib/auth", () => ({
+vi.mock("@/lib/auth-mode", () => ({
   getAuthMode: () => getAuthModeMock(),
 }));
 

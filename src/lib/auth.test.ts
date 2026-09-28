@@ -7,13 +7,22 @@ import {
   isAuthorizedBasicAuth,
   authenticateRequest,
   authorizeRequest,
+  requiredTierForRoute,
+  authErrorResponse,
   resetAuthCaches,
   validateOidcConfig,
+  authorizeGroomerRequest,
 } from "./auth";
+import { resetRateLimits, type RateLimitOptions, type RateLimitResult } from "./rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     auth: vi.fn(),
+    auditCreate: vi.fn(),
+    checkRateLimit: vi.fn(),
+    // Stashed by the vi.mock factory below so the tier describe's
+    // beforeEach can re-assert the real limiter as the mock's default.
+    realCheckRateLimit: null as unknown as (key: string, opts: RateLimitOptions) => RateLimitResult,
   },
 }));
 
@@ -21,11 +30,42 @@ vi.mock("@/lib/auth-next", () => ({
   auth: mocks.auth,
 }));
 
+// The tier-denial audit row is written through a lazy prisma import; mock it
+// so the denial path is testable without a database.
+vi.mock("./prisma", () => ({
+  prisma: {
+    auditLog: {
+      create: mocks.auditCreate,
+    },
+  },
+}));
+
+// The tier-denial audit path is throttled through ./rate-limit. Wrap the
+// real limiter in a vi.fn so individual tests can inject one-shot failures
+// (mocks.checkRateLimit.mockImplementationOnce). The real implementation is
+// stashed on mocks.realCheckRateLimit here and re-asserted as the mock's
+// default in the tier describe's beforeEach, immediately after a
+// mockReset() (which also flushes any queued one-shots) — a reset-proof
+// pattern, while a per-test mockImplementationOnce still wins (it is
+// queued ahead of the default).
+vi.mock("./rate-limit", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./rate-limit")>();
+  mocks.realCheckRateLimit = actual.checkRateLimit;
+  mocks.checkRateLimit.mockImplementation(actual.checkRateLimit);
+  return {
+    ...actual,
+    checkRateLimit: mocks.checkRateLimit,
+  };
+});
+
 function clearAll() {
   delete process.env.DISPATCH_AUTH_MODE;
   delete process.env.DISPATCH_AUTH_USERNAME;
   delete process.env.DISPATCH_AUTH_PASSWORD;
   delete process.env.DISPATCH_AGENT_TOKEN;
+  delete process.env.DISPATCH_MAINTAINER_TOKEN;
+  delete process.env.DISPATCH_WORKER_TOKEN;
+  delete process.env.DISPATCH_GROOMER_TOKEN;
 }
 
 describe("getAuthMode", () => {
@@ -250,7 +290,7 @@ describe("authenticateRequest (typed entry point)", () => {
   it('returns { authorized: true, type: "bearer" } in disabled mode', () => {
     process.env.DISPATCH_AUTH_MODE = "disabled";
     const request = new Request("http://localhost/api/test");
-    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer" });
+    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer", tier: "maintainer" });
   });
 
   it('returns { authorized: true, type: "basic", username } for valid Basic Auth', () => {
@@ -271,7 +311,7 @@ describe("authenticateRequest (typed entry point)", () => {
     const request = new Request("http://localhost/api/test", {
       headers: { Authorization: "Bearer agent-token" },
     });
-    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer" });
+    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer", tier: "maintainer" });
   });
 
   it("returns { authorized: false } for invalid Basic Auth", () => {
@@ -287,7 +327,7 @@ describe("authenticateRequest (typed entry point)", () => {
     const request = new Request("http://localhost/api/test", {
       headers: { Authorization: "Bearer agent-token" },
     });
-    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer" });
+    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer", tier: "maintainer" });
   });
 
   it("returns { authorized: false } for invalid Bearer in legacy mode", () => {
@@ -304,7 +344,7 @@ describe("authenticateRequest (typed entry point)", () => {
     const request = new Request("http://localhost/api/test", {
       headers: { Authorization: "Bearer agent-token" },
     });
-    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer" });
+    expect(authenticateRequest(request)).toEqual({ authorized: true, type: "bearer", tier: "maintainer" });
   });
 
   it("returns { authorized: false } for invalid Bearer in oidc mode", () => {
@@ -334,6 +374,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "disabled",
       actor: "operator",
+      tier: "maintainer",
     });
   });
 
@@ -349,6 +390,7 @@ describe("authorizeRequest (route helper)", () => {
       type: "basic",
       username: "operator",
       actor: "operator",
+      tier: "maintainer",
     });
   });
 
@@ -364,6 +406,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "bearer",
       actor: "worker-1",
+      tier: "maintainer",
     });
   });
 
@@ -375,6 +418,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "oidc",
       actor: "operator@example.com",
+      tier: "maintainer",
     });
   });
 
@@ -388,6 +432,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "bearer",
       actor: "agent",
+      tier: "maintainer",
     });
     expect(mocks.auth).not.toHaveBeenCalled();
   });
@@ -419,5 +464,346 @@ describe("resetAuthCaches", () => {
     process.env.DISPATCH_AGENT_TOKEN = "token2";
     expect(isAuthorizedBearerToken("token1")).toBe(false);
     expect(isAuthorizedBearerToken("token2")).toBe(true);
+  });
+});
+
+describe("bearer token tiers (#1111)", () => {
+  const WORKER_TOKEN = "worker-tier-token";
+
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    resetRateLimits();
+    mocks.auth.mockReset();
+    mocks.auditCreate.mockReset();
+    // Reset-proofing: mockReset() clears both the implementation and any
+    // queued mockImplementationOnce entries (so a one-shot left over from an
+    // earlier test cannot leak into this one), which is why the real limiter
+    // (stashed on mocks.realCheckRateLimit by the vi.mock factory) is
+    // re-asserted as the mock's default immediately after. Per-test
+    // mockImplementationOnce overrides (set in the test, after this) still
+    // win, as they are queued ahead of the default.
+    mocks.checkRateLimit.mockReset();
+    mocks.checkRateLimit.mockImplementation(mocks.realCheckRateLimit);
+    process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
+  });
+  afterEach(() => {
+    clearAll();
+  });
+
+  function workerRequest(pathname: string, method = "GET"): Request {
+    return new Request(`http://localhost${pathname}`, {
+      method,
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+  }
+
+  const workerAllowlistedRoutes: Array<[string, string]> = [
+    ["GET", "/api/agents/saffron/next-task"],
+    ["POST", "/api/agents/saffron/tasks/report"],
+    ["POST", "/api/agents/saffron/heartbeat"],
+    ["GET", "/api/agents/saffron/active-work"],
+    ["GET", "/api/agents/saffron/queue"],
+    ["GET", "/api/agents/saffron/work-summary"],
+    ["GET", "/api/agent-work"],
+    ["POST", "/api/agent-work/start"],
+    ["POST", "/api/agent-work/checkpoint"],
+    ["POST", "/api/agent-work/finish"],
+    ["POST", "/api/issues/claim"],
+    ["POST", "/api/issues/unclaim"],
+    ["GET", "/api/issues/state"],
+    ["POST", "/api/issues/status"],
+    ["GET", "/api/issues"],
+    ["GET", "/api/pr-fix-queue/queued"],
+    ["GET", "/api/pr-fix-queue/history"],
+    ["POST", "/api/pr-fix-queue/mark"],
+  ];
+
+  for (const [method, pathname] of workerAllowlistedRoutes) {
+    it(`accepts a worker token on ${method} ${pathname}`, async () => {
+      await expect(authorizeRequest(workerRequest(pathname, method))).resolves.toMatchObject({
+        authorized: true,
+        type: "bearer",
+        tier: "worker",
+      });
+    });
+  }
+
+  const maintainerOnlyRoutes: Array<[string, string]> = [
+    ["POST", "/api/agent-work"],
+    ["POST", "/api/agent-work/sweep"],
+    ["POST", "/api/pr-fix-queue/requeue"],
+    ["POST", "/api/sync"],
+    ["POST", "/api/issues/move"],
+    ["POST", "/api/issues/groom"],
+    ["POST", "/api/groomer/run"],
+    ["DELETE", "/api/automation/repos/foo/bar"],
+    ["POST", "/api/issues/unassign"],
+  ];
+
+  for (const [method, pathname] of maintainerOnlyRoutes) {
+    it(`forbids a worker token on ${method} ${pathname}`, async () => {
+      await expect(authorizeRequest(workerRequest(pathname, method))).resolves.toEqual({
+        authorized: false,
+        forbidden: true,
+        requiredTier: "maintainer",
+      });
+    });
+  }
+
+  it("records an auth_tier_denied audit row on a tier denial", async () => {
+    await authorizeRequest(workerRequest("/api/sync", "POST"));
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.action).toBe("auth_tier_denied");
+    expect(call.data.success).toBe(false);
+  });
+
+  it("a failing audit write never changes the tier-denial decision", async () => {
+    // The audit write is best-effort and sits inside a try/catch: a DB
+    // failure must not turn the 403 denial into a thrown/500 outcome.
+    mocks.auditCreate.mockRejectedValueOnce(new Error("db down"));
+    const forbidden: { authorized: false; forbidden: true; requiredTier: "maintainer" } = {
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    };
+    const result = await authorizeRequest(workerRequest("/api/sync", "POST"));
+    expect(result).toEqual(forbidden);
+    // The write was attempted (then failed) and the result still maps to 403.
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    expect(authErrorResponse(forbidden).status).toBe(403);
+  });
+
+  it("a throwing rate-limiter never changes the tier-denial decision", async () => {
+    // One-shot override on the wrapped limiter: the next checkRateLimit call
+    // throws. Everything after reverts to the real limiter (the mock's
+    // default implementation), so no restoration is needed in beforeEach.
+    mocks.checkRateLimit.mockImplementationOnce(() => {
+      throw new Error("limiter down");
+    });
+    const forbidden: { authorized: false; forbidden: true; requiredTier: "maintainer" } = {
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    };
+    const result = await authorizeRequest(workerRequest("/api/sync", "POST"));
+    expect(result).toEqual(forbidden);
+    // The throw short-circuits before the prisma import: no audit row.
+    expect(mocks.auditCreate).not.toHaveBeenCalled();
+    expect(authErrorResponse(forbidden).status).toBe(403);
+  });
+
+  it("writes no audit row when the worker token is accepted", async () => {
+    await authorizeRequest(workerRequest("/api/issues/claim", "POST"));
+    expect(mocks.auditCreate).not.toHaveBeenCalled();
+  });
+
+  it("throttles denial audit rows to one per actor/method/path per window", async () => {
+    vi.useFakeTimers();
+    try {
+      const forbidden = { authorized: false, forbidden: true, requiredTier: "maintainer" } as const;
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+
+      // A different path is a different per-path key — still denied, still audited.
+      await expect(authorizeRequest(workerRequest("/api/issues/move", "POST"))).resolves.toEqual(forbidden);
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(2);
+
+      // Advancing past the window re-opens auditing for the original path.
+      vi.setSystemTime(Date.now() + 61_000);
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps per-actor denial audits even across distinct paths", async () => {
+    for (let i = 0; i < 14; i += 1) {
+      await authorizeRequest(workerRequest(`/api/issues/${i}/lane`, "POST"));
+    }
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(10);
+  });
+
+  it("attributes denial audits to x-agent-name, never the bearer token", async () => {
+    const request = new Request("http://localhost/api/sync", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}`, "x-agent-name": "courier-1" },
+    });
+    await authorizeRequest(request);
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.actor).toBe("courier-1");
+    expect(JSON.stringify(call.data)).not.toContain(WORKER_TOKEN);
+  });
+
+  it("authorizeGroomerRequest preserves the worker-tier forbidden result", async () => {
+    // No dedicated groomer token configured.
+    await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+
+    // Groomer token configured but the caller presents the worker token.
+    process.env.DISPATCH_GROOMER_TOKEN = "groomer-token";
+    await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+
+    // The dedicated groomer token still authorizes at maintainer tier.
+    const groomerRequest = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer groomer-token" },
+    });
+    await expect(authorizeGroomerRequest(groomerRequest)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "maintainer",
+    });
+  });
+
+  it("does not escalate a groomer token that duplicates the worker token to maintainer", async () => {
+    // The groomer token value is also the configured worker token: the tier
+    // table resolves it to the lower worker tier, so the groomer route must
+    // stay forbidden (fail-closed) rather than grant maintainer.
+    process.env.DISPATCH_GROOMER_TOKEN = WORKER_TOKEN;
+    await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+  });
+
+  it("authErrorResponse maps a tier denial to 403 naming the maintainer tier", async () => {
+    const res = authErrorResponse({ authorized: false, forbidden: true, requiredTier: "maintainer" });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("maintainer");
+  });
+
+  it("authErrorResponse maps a plain unauthorized result to 401", async () => {
+    const res = authErrorResponse({ authorized: false });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("defaults unknown routes to maintainer for worker tokens", async () => {
+    await expect(authorizeRequest(workerRequest("/api/something/new", "PATCH"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+  });
+
+  it("does not match lookalike paths or wrong methods in the worker allowlist", () => {
+    expect(requiredTierForRoute("/api/agent-work-evil", "POST")).toBe("maintainer");
+    expect(requiredTierForRoute("/api/agent-work/sweep", "POST")).toBe("maintainer");
+    expect(requiredTierForRoute("/api/issues/claim", "GET")).toBe("maintainer");
+    expect(requiredTierForRoute("/api/agents/saffron/next-task", "GET")).toBe("worker");
+    expect(requiredTierForRoute("/api/issues/state", "GET")).toBe("worker");
+  });
+
+  it("keeps DISPATCH_AGENT_TOKEN at maintainer rights", async () => {
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const request = new Request("http://localhost/api/pr-fix-queue/requeue", {
+      method: "POST",
+      headers: { Authorization: "Bearer agent-token" },
+    });
+    await expect(authorizeRequest(request)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "maintainer",
+    });
+  });
+
+  it("fails closed on a cross-tier duplicate: a token in both tiers cannot authenticate as maintainer", async () => {
+    // Same value in the worker and maintainer env vars — must resolve to the
+    // LOWER worker tier, never escalate to maintainer.
+    process.env.DISPATCH_AGENT_TOKEN = WORKER_TOKEN;
+    const request = new Request("http://localhost/api/agent-work/sweep", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+    // The tier denial was audited once (fresh throttle window per test).
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+
+    // The same token still works at worker tier on an allowlisted route.
+    const workerRouteRequest = new Request("http://localhost/api/agents/saffron/next-task", {
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    await expect(authorizeRequest(workerRouteRequest)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+    });
+  });
+
+  it("resolves non-bearer modes to maintainer even with only a worker token configured", async () => {
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+    const request = new Request("http://localhost/api/sync", { method: "POST" });
+    await expect(authorizeRequest(request)).resolves.toMatchObject({
+      authorized: true,
+      tier: "maintainer",
+    });
+  });
+
+  it("enforces the worker allowlist in basic mode, not just legacy", async () => {
+    // basic mode: authenticateRequest parses the bearer and resolves its tier
+    // before the mode branch, so the tier table must apply identically here
+    // (regression lock — previously only legacy mode was covered).
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    // Maintainer-only route: worker token is forbidden, not silently rejected.
+    await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+
+    // Worker-allowlisted route: same token resolves at worker tier.
+    await expect(authorizeRequest(workerRequest("/api/agents/saffron/next-task"))).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+    });
+  });
+
+  it("enforces the worker allowlist in oidc mode, not just legacy", async () => {
+    // oidc mode: the bearer path is structurally identical to legacy — no
+    // OIDC env vars are needed for bearer resolution (validateOidcConfig is
+    // a startup-only check) and the NextAuth session lookup is only reached
+    // when header auth fails. The worker allowlist must still apply.
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+
+    // Maintainer-only route: worker token is forbidden, and the OIDC session
+    // fallback must not rescue it.
+    await expect(authorizeRequest(workerRequest("/api/agent-work/sweep", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+    expect(mocks.auth).not.toHaveBeenCalled();
+
+    // Worker-allowlisted route: same token resolves at worker tier.
+    await expect(authorizeRequest(workerRequest("/api/agents/saffron/next-task"))).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+    });
   });
 });

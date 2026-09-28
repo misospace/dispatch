@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const { agentName } = await params;
 
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   const { searchParams } = new URL(request.url);

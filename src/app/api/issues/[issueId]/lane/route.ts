@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { parseLaneClassification, classifyLaneByHeuristics, validateLaneRecord } from "@/lib/issue-lane";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 interface LaneRequestBody {
@@ -19,7 +19,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`lane:${auth.actor}`, RATE_LIMIT);
@@ -141,8 +141,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
  * GET /api/issues/[issueId]/lane — Get the current lane classification for an issue.
  */
 export async function GET(_request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
-  if (!(await authorizeRequest(_request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(_request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   try {

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
-import { authorizeGroomerRequest } from "@/lib/auth";
+import { authorizeGroomerRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { runHostedGroomer } from "@/lib/groomer/run";
 import { getHostedGroomerConfig } from "@/lib/groomer/config";
@@ -13,7 +13,7 @@ const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 export async function POST(request: Request) {
   const auth = await authorizeGroomerRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`groomer/run:${auth.actor}`, RATE_LIMIT);

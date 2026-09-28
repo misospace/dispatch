@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { isValidEscalatedOutcome, VALID_ESCALATED_OUTCOMES } from "@/types";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 // Generous per-actor rate limit — agents report runs frequently, so this is
@@ -15,8 +15,9 @@ const RATE_LIMIT = { limit: 120, windowMs: 60_000 };
 const TOUCHED_ISSUE_URL_PATTERN = /^https?:\/\//;
 
 export async function GET(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
   const { searchParams } = new URL(request.url);
   const limit = parseInt(searchParams.get("limit") || "50");
@@ -35,7 +36,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`agent-runs:${auth.actor}`, RATE_LIMIT);

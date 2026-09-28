@@ -13,7 +13,7 @@ import {
   ClosedIssueReconcileResponse,
 } from "@/lib/issue-sync";
 import { syncAutomationRepo } from "@/lib/automation-sync";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 import { runGroomingFreshnessPassBestEffort, type FreshnessPassResult } from "@/lib/groomer/freshness-invalidation";
 
@@ -23,8 +23,9 @@ import { runGroomingFreshnessPassBestEffort, type FreshnessPassResult } from "@/
 
 export async function POST(request: Request) {
   // Auth check — require Bearer token matching DISPATCH_AGENT_TOKEN
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   let body: unknown;

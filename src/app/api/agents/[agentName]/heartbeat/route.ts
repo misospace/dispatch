@@ -14,7 +14,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { runSyncBestEffort, runReconcileBestEffort } from "@/lib/heartbeat";
 
 export type AgentHeartbeatResponse = {
@@ -39,8 +39,9 @@ export async function POST(
   const { agentName } = await params;
 
   // Authenticate
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   const startedAt = new Date();

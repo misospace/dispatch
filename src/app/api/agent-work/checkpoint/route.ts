@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma, asAgentWorkClient } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { parseCheckpointAgentWorkInput, checkpointAgentWork } from "@/lib/agent-work";
 
 /**
@@ -52,8 +52,9 @@ import { parseCheckpointAgentWorkInput, checkpointAgentWork } from "@/lib/agent-
  * { "error": "Failed to checkpoint agent work" }
  */
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   try {

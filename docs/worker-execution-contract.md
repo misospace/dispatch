@@ -7,6 +7,7 @@ This document defines the generic execution contract for any agent worker consum
 
 ## Table of Contents
 
+- [Token Tiers](#token-tiers)
 - [One Item Per Run](#one-item-per-run)
 - [PR Fix Queue Precedence](#pr-fix-queue-precedence)
 - [Duplicate PR Avoidance](#duplicate-pr-avoidance)
@@ -15,6 +16,21 @@ This document defines the generic execution contract for any agent worker consum
 - [Hard Completion Gate](#hard-completion-gate)
 - [Failure Response Format](#failure-response-format)
 - [Queue Consumption Rules](#queue-consumption-rules)
+
+---
+
+## Token Tiers
+
+Dispatch bearer tokens have two tiers. A **worker** token (`DISPATCH_WORKER_TOKEN`) may call exactly:
+
+- `GET /api/agents/{agentName}/next-task`, `POST /api/agents/{agentName}/tasks/report`, `POST /api/agents/{agentName}/heartbeat`, `GET /api/agents/{agentName}/active-work`, `GET /api/agents/{agentName}/queue`, `GET /api/agents/{agentName}/work-summary`
+- `GET /api/agent-work`, `POST /api/agent-work/start`, `POST /api/agent-work/checkpoint`, `POST /api/agent-work/finish`
+- `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (bounded by the assignment check — the issue must be assigned to the `agentName` in the request body)
+- `GET /api/issues/state`, `POST /api/issues/status`
+- `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
+- `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
+
+The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
 
 ---
 
@@ -224,6 +240,7 @@ Workers using the canonical `next-task` endpoint automatically receive PR-fix it
 
 ## History
 
+- **2026-09-28** — Added Token Tiers section: worker-tier endpoint allowlist and maintainer-only actions (Issue #1111).
 - **2026-05-16** — Created to document generic worker execution contract and PR completion gates (Issue #65). Consolidates existing normal-worker behavior into a reusable, agent-agnostic specification.
 - **2026-06-19** — Updated Renovate issue exclusion: Renovate issues are filtered from Dispatch issue surfaces, including Board, Projects, lane summaries, grooming intake, and agent queues.
 - **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are excluded from agent queues by default (Issue #129).
