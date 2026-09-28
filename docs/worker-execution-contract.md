@@ -24,7 +24,7 @@ This document defines the generic execution contract for any agent worker consum
 Dispatch bearer tokens have two tiers. A **worker** token (`DISPATCH_WORKER_TOKEN`) may call exactly:
 
 - `GET /api/agents/{agentName}/next-task`, `POST /api/agents/{agentName}/tasks/report`, `POST /api/agents/{agentName}/heartbeat`, `GET /api/agents/{agentName}/active-work`, `GET /api/agents/{agentName}/queue`, `GET /api/agents/{agentName}/work-summary`
-- `POST /api/agent-work/start`, `POST /api/agent-work/checkpoint`, `POST /api/agent-work/finish`
+- `GET /api/agent-work`, `POST /api/agent-work/start`, `POST /api/agent-work/checkpoint`, `POST /api/agent-work/finish`
 - `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (own claim only)
 - `GET /api/issues/state`, `POST /api/issues/status`
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`

@@ -11,7 +11,9 @@ import {
   authErrorResponse,
   resetAuthCaches,
   validateOidcConfig,
+  authorizeGroomerRequest,
 } from "./auth";
+import { resetRateLimits } from "./rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -449,6 +451,7 @@ describe("bearer token tiers (#1111)", () => {
   beforeEach(() => {
     clearAll();
     resetAuthCaches();
+    resetRateLimits();
     mocks.auth.mockReset();
     mocks.auditCreate.mockReset();
     process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
@@ -528,6 +531,45 @@ describe("bearer token tiers (#1111)", () => {
   it("writes no audit row when the worker token is accepted", async () => {
     await authorizeRequest(workerRequest("/api/issues/claim", "POST"));
     expect(mocks.auditCreate).not.toHaveBeenCalled();
+  });
+
+  it("throttles denial audit rows to one per actor/method/path per window", async () => {
+    await authorizeRequest(workerRequest("/api/sync", "POST"));
+    await authorizeRequest(workerRequest("/api/sync", "POST"));
+    await authorizeRequest(workerRequest("/api/sync", "POST"));
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+
+    // A different path is a different throttle key — still denied, still audited.
+    await authorizeRequest(workerRequest("/api/issues/move", "POST"));
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(2);
+  });
+
+  it("authorizeGroomerRequest preserves the worker-tier forbidden result", async () => {
+    // No dedicated groomer token configured.
+    await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+
+    // Groomer token configured but the caller presents the worker token.
+    process.env.DISPATCH_GROOMER_TOKEN = "groomer-token";
+    await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+
+    // The dedicated groomer token still authorizes at maintainer tier.
+    const groomerRequest = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer groomer-token" },
+    });
+    await expect(authorizeGroomerRequest(groomerRequest)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "maintainer",
+    });
   });
 
   it("authErrorResponse maps a tier denial to 403 naming the maintainer tier", async () => {

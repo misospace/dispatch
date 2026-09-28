@@ -504,4 +504,13 @@ describe("POST /api/issues/claim — worker tier (#1111)", () => {
     expect(res.status).toBe(200);
     expect((await res.json()).success).toBe(true);
   });
+
+  it("does not let a truthy non-boolean force override another agent", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
+    const res = await POST(workerRequest({ force: "true" }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("Use force=true to override");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+  });
 });

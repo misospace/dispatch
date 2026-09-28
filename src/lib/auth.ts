@@ -281,15 +281,23 @@ function resolveSessionActor(user: { email?: string | null; name?: string | null
 
 /**
  * Record a best-effort audit row when a worker-tier token is denied on a
- * maintainer-tier route. The lazy prisma import keeps this module Edge-safe,
- * and the try/catch guarantees a DB failure can never change the auth
- * decision — the denial stands either way.
+ * maintainer-tier route. The lazy prisma import keeps the (otherwise
+ * client-import-free) module graph lean, and the try/catch guarantees a DB
+ * failure can never change the auth decision — the denial stands either way.
+ *
+ * Rows are throttled to one per (actor, method, pathname) per minute so a
+ * misconfigured worker hammering maintainer routes cannot write-amplify the
+ * audit table; the 403 response itself is never throttled.
  */
 async function recordTierDenialAudit(
   request: Request,
   pathname: string,
   method: string,
 ): Promise<void> {
+  const { checkRateLimit } = await import("./rate-limit");
+  const deniedKey = `auth_tier_denied:${resolveBearerActor(request)}:${method}:${pathname}`;
+  if (!checkRateLimit(deniedKey, { limit: 1, windowMs: 60_000 }).allowed) return;
+
   try {
     const { prisma } = await import("./prisma");
     await prisma.auditLog.create({
