@@ -169,11 +169,99 @@ describe("getBearerTokenTier", () => {
     expect(mod.getBearerTokenTier("any-token")).toBeNull();
   });
 
-  it("maintainer wins when the same value is configured for multiple tiers", async () => {
+  it("trims env values at table construction: a padded worker env duplicates the agent env and warns", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared";
+      process.env.DISPATCH_WORKER_TOKEN = " shared ";
+      const mod = await import("./dispatch-env");
+      expect(mod.getBearerTokenTier("shared")).toBe("worker");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_AGENT_TOKEN");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("treats a whitespace-only env value as unset", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_WORKER_TOKEN = "   ";
+    const mod = await import("./dispatch-env");
+    expect(mod.getAcceptedTokenTiers()).toEqual([{ token: "agent-token", tier: "maintainer" }]);
+    expect(mod.getBearerTokenTier("   ")).toBeNull();
+  });
+
+  it("trims the presented token before comparing it to table entries", async () => {
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier(" worker-token ")).toBe("worker");
+  });
+
+  it('resolves a value shared between DISPATCH_AGENT_TOKEN and DISPATCH_WORKER_TOKEN to "worker"', async () => {
     process.env.DISPATCH_AGENT_TOKEN = "shared-value";
     process.env.DISPATCH_WORKER_TOKEN = "shared-value";
     const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("shared-value")).toBe("worker");
+  });
+
+  it('resolves a value shared between DISPATCH_MAINTAINER_TOKEN and DISPATCH_WORKER_TOKEN to "worker"', async () => {
+    process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+    process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("shared-value")).toBe("worker");
+  });
+
+  it('keeps "maintainer" for a value shared only between the two maintainer aliases', async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+    const mod = await import("./dispatch-env");
     expect(mod.getBearerTokenTier("shared-value")).toBe("maintainer");
+  });
+
+  it("warns once (without token values) when the worker token duplicates a maintainer token", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+      process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+      const mod = await import("./dispatch-env");
+      mod.getAcceptedTokenTiers();
+      mod.getAcceptedTokenTiers();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).not.toContain("shared-value");
+      // The warning names the colliding env var, not just "a maintainer token".
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_AGENT_TOKEN");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("warns once (without token values) when the worker token duplicates DISPATCH_MAINTAINER_TOKEN", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+      process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+      const mod = await import("./dispatch-env");
+      mod.getAcceptedTokenTiers();
+      mod.getAcceptedTokenTiers();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).not.toContain("shared-value");
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_MAINTAINER_TOKEN");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not warn when the two maintainer aliases share a value", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+      process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+      const mod = await import("./dispatch-env");
+      mod.getAcceptedTokenTiers();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });
 

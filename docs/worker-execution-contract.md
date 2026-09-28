@@ -30,7 +30,7 @@ Dispatch bearer tokens have two tiers. A **worker** token (`DISPATCH_WORKER_TOKE
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
 - `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
 
-The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up.
+The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
 
 ---
 

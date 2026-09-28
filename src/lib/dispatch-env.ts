@@ -98,26 +98,54 @@ export type TokenTier = "worker" | "maintainer";
 let _tokenTiers: Array<{ token: string; tier: TokenTier }> | undefined;
 
 /**
- * Return the canonical token→tier table built from the environment:
+ * Return the canonical token→tier table built from the environment (values
+ * are trimmed; empty-after-trim is treated as unset):
  *   - DISPATCH_AGENT_TOKEN     → "maintainer"
  *   - DISPATCH_MAINTAINER_TOKEN → "maintainer"
  *   - DISPATCH_WORKER_TOKEN    → "worker"
  *
- * Entries are ordered maintainer-first, and the tier lookup
- * (`getBearerTokenTier`) resolves duplicates with maintainer winning.
+ * Entries are ordered maintainer-first. When the same value is configured in
+ * multiple tiers, the tier lookup (`getBearerTokenTier`) resolves it with the
+ * LOWER "worker" privilege winning (fail-closed). A one-time console warning
+ * is emitted here when the table is built in that misconfigured state; token
+ * values are never logged.
  */
 export function getAcceptedTokenTiers(): Array<{ token: string; tier: TokenTier }> {
   if (_tokenTiers !== undefined) return _tokenTiers;
 
   const tiers: Array<{ token: string; tier: TokenTier }> = [];
-  const agentToken = process.env.DISPATCH_AGENT_TOKEN;
+  // Trim env values at table construction: presented bearer tokens are
+  // trimmed before comparison, so a whitespace-padded value is the same
+  // token, and an empty-after-trim value is treated as unset.
+  const agentToken = process.env.DISPATCH_AGENT_TOKEN?.trim();
   if (agentToken) tiers.push({ token: agentToken, tier: "maintainer" });
 
-  const maintainerToken = process.env.DISPATCH_MAINTAINER_TOKEN;
+  const maintainerToken = process.env.DISPATCH_MAINTAINER_TOKEN?.trim();
   if (maintainerToken) tiers.push({ token: maintainerToken, tier: "maintainer" });
 
-  const workerToken = process.env.DISPATCH_WORKER_TOKEN;
-  if (workerToken) tiers.push({ token: workerToken, tier: "worker" });
+  const workerToken = process.env.DISPATCH_WORKER_TOKEN?.trim();
+  if (workerToken) {
+    tiers.push({ token: workerToken, tier: "worker" });
+    // Fail-closed misconfiguration check: a worker token value that is also
+    // configured as a maintainer token resolves to the LOWER worker tier.
+    // Surface that once (the table is cached, so this runs once per module
+    // instance) without ever logging a token value. A duplicate between the
+    // two maintainer aliases is fine and needs no warning.
+    const collidesWithAgent = agentToken !== undefined && safeEqual(workerToken, agentToken);
+    const collidesWithMaintainer =
+      maintainerToken !== undefined && safeEqual(workerToken, maintainerToken);
+    if (collidesWithAgent || collidesWithMaintainer) {
+      const collidingVars = [
+        collidesWithAgent ? "DISPATCH_AGENT_TOKEN" : null,
+        collidesWithMaintainer ? "DISPATCH_MAINTAINER_TOKEN" : null,
+      ]
+        .filter((v): v is string => v !== null)
+        .join(" and ");
+      console.warn(
+        `Token tier misconfiguration: DISPATCH_WORKER_TOKEN has the same value as ${collidingVars}; it will be treated as worker-tier only. Set DISPATCH_WORKER_TOKEN to a distinct value.`,
+      );
+    }
+  }
 
   _tokenTiers = tiers;
   return _tokenTiers;
@@ -141,19 +169,31 @@ export function getAcceptedAgentTokens(): string[] {
 
 /**
  * Resolve the tier of a bearer token using timing-safe comparison against each
- * configured token. Returns null when the token matches no configured token.
- * If the same value is configured for multiple tiers, "maintainer" wins.
+ * configured token. The presented token is trimmed before comparison (env
+ * values are trimmed at table construction); a whitespace-only token resolves
+ * to null. Returns null when the token matches no configured token.
+ * If the same value is configured for multiple tiers, "worker" wins
+ * (fail-closed): an ambiguous cross-tier token never resolves to the higher
+ * "maintainer" privilege. The misconfiguration is surfaced by a one-time
+ * console warning when the token table is built (token values are never
+ * logged).
  */
 export function getBearerTokenTier(token: string | null | undefined): TokenTier | null {
   if (!token) return null;
+  const trimmed = token.trim();
+  if (!trimmed) return null;
 
+  let maintainerMatch = false;
   let workerMatch = false;
   for (const { token: configured, tier } of getAcceptedTokenTiers()) {
-    if (!safeEqual(configured, token)) continue;
-    if (tier === "maintainer") return "maintainer";
-    workerMatch = true;
+    if (!safeEqual(configured, trimmed)) continue;
+    if (tier === "maintainer") maintainerMatch = true;
+    else workerMatch = true;
   }
-  return workerMatch ? "worker" : null;
+  // Worker is the lower privilege tier, so it wins any cross-tier duplicate.
+  if (workerMatch) return "worker";
+  if (maintainerMatch) return "maintainer";
+  return null;
 }
 
 /**

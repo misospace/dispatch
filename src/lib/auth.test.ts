@@ -602,6 +602,18 @@ describe("bearer token tiers (#1111)", () => {
     });
   });
 
+  it("does not escalate a groomer token that duplicates the worker token to maintainer", async () => {
+    // The groomer token value is also the configured worker token: the tier
+    // table resolves it to the lower worker tier, so the groomer route must
+    // stay forbidden (fail-closed) rather than grant maintainer.
+    process.env.DISPATCH_GROOMER_TOKEN = WORKER_TOKEN;
+    await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+  });
+
   it("authErrorResponse maps a tier denial to 403 naming the maintainer tier", async () => {
     const res = authErrorResponse({ authorized: false, forbidden: true, requiredTier: "maintainer" });
     expect(res.status).toBe(403);
@@ -643,6 +655,33 @@ describe("bearer token tiers (#1111)", () => {
       authorized: true,
       type: "bearer",
       tier: "maintainer",
+    });
+  });
+
+  it("fails closed on a cross-tier duplicate: a token in both tiers cannot authenticate as maintainer", async () => {
+    // Same value in the worker and maintainer env vars — must resolve to the
+    // LOWER worker tier, never escalate to maintainer.
+    process.env.DISPATCH_AGENT_TOKEN = WORKER_TOKEN;
+    const request = new Request("http://localhost/api/agent-work/sweep", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    await expect(authorizeRequest(request)).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+    // The tier denial was audited once (fresh throttle window per test).
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+
+    // The same token still works at worker tier on an allowlisted route.
+    const workerRouteRequest = new Request("http://localhost/api/agents/saffron/next-task", {
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    await expect(authorizeRequest(workerRouteRequest)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
     });
   });
 

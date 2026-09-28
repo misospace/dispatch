@@ -409,7 +409,11 @@ export function authErrorResponse(
 
 /**
  * Authorize a request for the hosted groomer route.
- * Accepts standard auth (agent token, basic, oidc) OR the dedicated groomer token.
+ * Accepts standard auth (agent token, basic, oidc) OR the dedicated groomer
+ * token. The groomer token must be distinct from DISPATCH_WORKER_TOKEN: a
+ * groomer token value that duplicates the worker token is denied here — the
+ * tier table resolves it to the lower "worker" tier (fail-closed) — and the
+ * standard result (including a worker-tier 403 `forbidden`) is returned.
  */
 export async function authorizeGroomerRequest(request: Request): Promise<AuthorizedRequest> {
   const standard = await authorizeRequest(request);
@@ -420,6 +424,10 @@ export async function authorizeGroomerRequest(request: Request): Promise<Authori
 
   const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
   if (parsed?.type === "bearer" && safeEqual(parsed.token, token)) {
+    // Fail-closed: if the presented groomer token value is also the
+    // configured worker token, the tier table resolves it to the lower
+    // "worker" tier — do not escalate it to maintainer here.
+    if (getBearerTokenTier(parsed.token) === "worker") return standard;
     return {
       authorized: true,
       type: "bearer",

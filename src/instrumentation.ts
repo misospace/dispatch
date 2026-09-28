@@ -16,6 +16,15 @@ export async function register() {
   // of as an opaque NextAuth error at first login. Node runtime only — the
   // edge runtime has no process to fail and the check is redundant there.
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  // Build the bearer token→tier table at boot so a cross-tier token
+  // misconfiguration (e.g. DISPATCH_WORKER_TOKEN duplicating a maintainer
+  // token) surfaces with its console warning at startup rather than on the
+  // first authenticated request. The warning fires once per module instance,
+  // so isolated chunk graphs (see the note above) may warn once per runtime.
+  const { getAcceptedTokenTiers } = await import("@/lib/dispatch-env");
+  getAcceptedTokenTiers();
+
   if (process.env.DISPATCH_AUTH_MODE === "oidc") {
     const { validateOidcConfig } = await import("@/lib/auth");
     validateOidcConfig();
