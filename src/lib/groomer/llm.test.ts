@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { callGroomerLLM, buildGroomerResponseSchema } from "./llm";
+import { callGroomerLLM, buildGroomerResponseSchema, GroomerOutputParseError, MAX_REPAIR_ECHO_BYTES } from "./llm";
 import { PLAN_LABELS } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { getLaneIds } from "@/lib/lane-config";
@@ -544,5 +544,71 @@ describe("callGroomerLLM findings cap", () => {
     expect(content).toContain("(findings truncated)");
     expect(content.length).toBeLessThan(2000);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("callGroomerLLM repair turn (dispatch#1126)", () => {
+  const baseOptions = {
+    baseUrl: "https://llm.example.com/v1",
+    apiKey: "sk-test",
+    model: "local-pool",
+    prompt: "Issue #1126: groomer plans fail on reference formats",
+    timeoutMs: 60_000,
+  };
+
+  function respondWith(content: string) {
+    return vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content } }] }),
+      text: async () => "",
+    });
+  }
+
+  it("keeps the whole answer on a parse failure, with the short message history already records", async () => {
+    const answer = `Let me read the key files first. <tool_call>{"name":"read_file"}</tool_call> ${"x".repeat(400)}`;
+    vi.stubGlobal("fetch", respondWith(answer));
+    const err = await callGroomerLLM(baseOptions).catch((e: unknown) => e);
+    vi.unstubAllGlobals();
+
+    expect(err).toBeInstanceOf(GroomerOutputParseError);
+    expect((err as GroomerOutputParseError).content).toBe(answer);
+    expect((err as Error).message).toBe(`Failed to parse LLM response as JSON: ${answer.slice(0, 200)}`);
+  });
+
+  it("sends the previous answer as an assistant turn and the errors as a user turn", async () => {
+    const fetchMock = respondWith("{}");
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({
+      ...baseOptions,
+      evidenceCatalog: catalog,
+      repair: {
+        previousResponse: '{"relatedWork":[{"ref":"comment:9"}]}',
+        errors: ['relatedWork[0].ref: "comment:9" must be a related-work evidence reference'],
+      },
+    });
+    vi.unstubAllGlobals();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.messages.map((m: { role: string }) => m.role)).toEqual(["system", "user", "assistant", "user"]);
+    expect(body.messages[1].content).toContain("Issue #1126");
+    expect(body.messages[2].content).toBe('{"relatedWork":[{"ref":"comment:9"}]}');
+    const repair = body.messages[3].content;
+    expect(repair).toContain('- relatedWork[0].ref: "comment:9" must be a related-work evidence reference');
+    expect(repair).toContain("No tools are available in this turn");
+    expect(repair).toContain('related-work ids ("github:...")');
+    // The repair is still schema-constrained to this run's catalog.
+    expect(body.response_format?.type).toBe("json_schema");
+  });
+
+  it("bounds a runaway previous answer", async () => {
+    const fetchMock = respondWith("{}");
+    vi.stubGlobal("fetch", fetchMock);
+    await callGroomerLLM({ ...baseOptions, repair: { previousResponse: "y".repeat(MAX_REPAIR_ECHO_BYTES * 2), errors: ["e"] } });
+    vi.unstubAllGlobals();
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.messages[2].content.length).toBeLessThan(MAX_REPAIR_ECHO_BYTES + 32);
+    expect(body.messages[2].content).toMatch(/… \(truncated\)$/);
   });
 });

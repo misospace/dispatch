@@ -5,6 +5,7 @@ import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerL
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
+import { runModelStage } from "./model-stage";
 import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
@@ -56,6 +57,13 @@ export interface RunHostedGroomerOptions {
 }
 
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Time the model stage leaves on the lease for the apply stage (dispatch#1126):
+ * the precondition re-reads and the GitHub writes. A repair turn only gets
+ * what remains of the lease after this, so it never runs the groom past it.
+ */
+const APPLY_RESERVE_MS = 60 * 1000;
 
 /**
  * Backoff after a groom that could not read GitHub state (dispatch#1063).
@@ -217,6 +225,7 @@ async function executeGroomerRun(
     checkpoint: "issue_claimed",
     ttlMs: GROOMER_LEASE_TTL_MS,
   });
+  const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
   // Freshness (#1064): a human comment after this instant is new evidence.
   const evidenceWindowStart = new Date();
@@ -468,22 +477,30 @@ async function executeGroomerRun(
     ]);
     const evidenceCatalog = buildEvidenceCatalog(evidence, pinnedContent);
 
-    // Call LLM
-    const rawOutput = await deps.callLLM({
-      baseUrl: config.llmBaseUrl!,
-      apiKey: config.apiKey!,
-      model: config.model,
-      responseFormat: config.responseFormat,
-      prompt: context,
-      timeoutMs: config.timeoutMs,
-      explorationFindings: exploration?.findings,
-      evidenceCatalog,
-    });
-
-    // Validate the GroomingPlan against this run's evidence (dispatch#1062).
+    // Call LLM and validate the GroomingPlan against this run's evidence
+    // (dispatch#1062). An answer that fails gets one repair turn, and one
+    // failing only on non-load-bearing fields is degraded (dispatch#1126).
     // A rejected plan applies no mutation; its output and deterministic
-    // errors are kept on the run so the rejection can be inspected.
-    const validation = deps.validateOutput(rawOutput, { catalog: evidenceCatalog });
+    // errors (every attempt's) are kept on the run so the rejection can be
+    // inspected.
+    const modelStage = await runModelStage({
+      callLLM: deps.callLLM,
+      validateOutput: deps.validateOutput,
+      llm: {
+        baseUrl: config.llmBaseUrl!,
+        apiKey: config.apiKey!,
+        model: config.model,
+        responseFormat: config.responseFormat,
+        prompt: context,
+        timeoutMs: config.timeoutMs,
+        explorationFindings: exploration?.findings,
+        evidenceCatalog,
+      },
+      catalog: evidenceCatalog,
+      deadline: leaseExpiresAt - APPLY_RESERVE_MS,
+    });
+    const { rawOutput, validation } = modelStage;
+    contextWarnings.push(...modelStage.warnings);
     if (!validation.valid) {
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         rawOutput,
@@ -602,10 +619,12 @@ async function executeGroomerRun(
       delete mutationPlan.applicationKey;
     }
 
-    // Persist stage planned
+    // Persist stage planned. contextWarnings is written again so the model
+    // stage's repair and degradation warnings (dispatch#1126) stay on the run.
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
       stage: "planned",
       rawOutput,
+      contextWarnings: [...contextWarnings, ...(exploration?.warnings ?? [])],
       validatedOutput: plan,
       labelsToAdd: inFlight ? [] : output.labelsToAdd,
       labelsToRemove: inFlight ? [] : output.labelsToRemove,

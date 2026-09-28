@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import type { GroomingCandidate } from "./selector";
 import type { GroomingPlanDraft } from "./plan";
 import type { HostedGroomerConfig } from "./config";
@@ -1305,11 +1305,15 @@ Investigate session handling in auth module.`;
 
       expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
       expect(mocks.closeIssue).not.toHaveBeenCalled();
+      // The repair turn (dispatch#1126) returned the same answer: both are kept.
       expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            rawOutput: raw,
-            validationErrors: [expect.stringContaining('unknown evidence reference "repo:src/invented.ts"')],
+            rawOutput: { firstAnswer: raw, repairAnswer: raw },
+            validationErrors: [
+              'first answer: verdict.evidenceRefs[0]: unknown evidence reference "repo:src/invented.ts"',
+              'repair: verdict.evidenceRefs[0]: unknown evidence reference "repo:src/invented.ts"',
+            ],
           }),
         }),
       );
@@ -1479,6 +1483,269 @@ Investigate session handling in auth module.`;
         planDraft({ verdict: { workType: "design", lane: { id: "local", confidence: "high", reason: "r" } }, implementationBrief: null }),
       );
       await expect(runHostedGroomer()).rejects.toThrow(/design work must route to the escalation lane/);
+    });
+  });
+
+  describe("model-stage repair turn and degradation (dispatch#1126)", () => {
+    const RELATED = "github:issue:org/repo#7";
+    const withRelatedWork = () =>
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [
+          ...mockEvidence.sources,
+          { key: RELATED, provenance: "github_issue", state: "open", url: null, via: "read", observedAt: "", ref: null },
+        ],
+      });
+    const badRef = () => planDraft({ relatedWork: [{ ref: "issue", relation: "related", note: "the issue itself" }] });
+    const badRefError = 'relatedWork[0].ref: "issue" must be a related-work evidence reference';
+    const parseError = (content: string) =>
+      Object.assign(new Error(`Failed to parse LLM response as JSON: ${content.slice(0, 200)}`), {
+        name: "GroomerOutputParseError",
+        content,
+      });
+
+    it("gives a plan whose only error is a bad ref one repair turn, and applies the repaired plan", async () => {
+      withRelatedWork();
+      const repaired = planDraft({ relatedWork: [{ ref: RELATED, relation: "related", note: "same area" }] });
+      mocks.callGroomerLLM.mockResolvedValueOnce(badRef()).mockResolvedValueOnce(repaired);
+
+      const result = await runHostedGroomer();
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      const repairCall = mocks.callGroomerLLM.mock.calls[1][0];
+      expect(repairCall.repair).toEqual({ previousResponse: JSON.stringify(badRef(), null, 2), errors: [badRefError] });
+      expect(repairCall.prompt).toBe("test context");
+      expect(repairCall.evidenceCatalog).toBe(mocks.callGroomerLLM.mock.calls[0][0].evidenceCatalog);
+      expect(repairCall.timeoutMs).toBe(mockConfig.timeoutMs);
+      expect(result!.plan!.relatedWork).toEqual([{ ref: RELATED, relation: "related", note: "same area" }]);
+      expect(result!.contextWarnings).toContain(`model: the repair turn fixed the first answer, which failed with: ${badRefError}`);
+      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+      const planned = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(planned![0].data.rawOutput).toEqual(repaired);
+      expect(planned![0].data.contextWarnings).toEqual(result!.contextWarnings);
+    });
+
+    it("fails the run with both error sets when the repair also fails", async () => {
+      const first = planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } });
+      const second = planDraft({ verdict: { lane: { id: "gpu2", confidence: "high", reason: "r" } } });
+      mocks.callGroomerLLM.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /Groomer output validation failed: first answer: verdict\.lane\.id: .*"gpu", repair: verdict\.lane\.id: .*"gpu2"/,
+      );
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      const failed = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.validationErrors);
+      expect(failed![0].data.rawOutput).toEqual({ firstAnswer: first, repairAnswer: second });
+      expect(failed![0].data.validationErrors).toEqual([
+        expect.stringMatching(/^first answer: verdict\.lane\.id: must be a configured lane .*"gpu"$/),
+        expect.stringMatching(/^repair: verdict\.lane\.id: must be a configured lane .*"gpu2"$/),
+      ]);
+    });
+
+    it("gives a final answer made of tool-call text a repair turn", async () => {
+      const answer = 'Let me read the key files first. <tool_call>{"name":"read_file","arguments":{"path":"src/auth/login.ts"}}</tool_call>';
+      mocks.callGroomerLLM.mockRejectedValueOnce(parseError(answer)).mockResolvedValueOnce(mockOutput);
+
+      const result = await runHostedGroomer();
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      expect(mocks.callGroomerLLM.mock.calls[1][0].repair).toEqual({
+        previousResponse: answer,
+        errors: [`Failed to parse LLM response as JSON: ${answer}`],
+      });
+      expect(result!.plan!.readiness.ready).toBe(true);
+    });
+
+    it("fails with both errors when the repair of a non-JSON answer is not JSON either", async () => {
+      mocks.callGroomerLLM.mockRejectedValueOnce(parseError("<tool_call>one</tool_call>")).mockRejectedValueOnce(parseError("<tool_call>two</tool_call>"));
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /first answer: Failed to parse LLM response as JSON: <tool_call>one.*repair: Failed to parse LLM response as JSON: <tool_call>two/,
+      );
+      const failed = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.validationErrors);
+      expect(failed![0].data.rawOutput).toEqual({ firstAnswer: "<tool_call>one</tool_call>", repairAnswer: "<tool_call>two</tool_call>" });
+    });
+
+    it("never repairs a failed model call: timeouts and API errors fail as before", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM API error 400: bad request"));
+
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM API error 400/);
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+    });
+
+    it("degrades non-load-bearing fields when the repair leaves only those errors", async () => {
+      withRelatedWork();
+      const longQuestion = `Should ${"the reset flow ".repeat(30)}also cover SSO?`;
+      const longReason = `clear implementation task ${"with a long explanation ".repeat(20)}`;
+      const draft = planDraft({
+        verdict: {
+          lane: { id: "local", confidence: "high", reason: longReason },
+          uncertainties: [{ kind: "scope", question: longQuestion, material: false }],
+        },
+        implementationBrief: {
+          ...mockOutput.implementationBrief!,
+          dependencies: [
+            { ref: "#7", state: "open", evidenceRef: "repo:src/auth/login.ts" },
+            { ref: "#7", state: "open", evidenceRef: RELATED },
+          ],
+        },
+        relatedWork: [
+          { ref: "issue", relation: "related", note: "the issue itself" },
+          { ref: RELATED, relation: "related", note: "same area" },
+          { ref: "comment:123", relation: "related", note: "an invented comment" },
+        ],
+      });
+      const original = structuredClone(draft);
+      mocks.callGroomerLLM.mockResolvedValue(draft);
+
+      const result = await runHostedGroomer();
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      const plan = result!.plan!;
+      expect(plan.relatedWork).toEqual([{ ref: RELATED, relation: "related", note: "same area" }]);
+      expect(plan.implementationBrief!.dependencies).toEqual([
+        { ref: "#7", state: "open", evidenceRef: null },
+        { ref: "#7", state: "open", evidenceRef: RELATED },
+      ]);
+      expect(plan.verdict.uncertainties[0].question).toHaveLength(300);
+      expect(plan.verdict.uncertainties[0].question.endsWith("…")).toBe(true);
+      expect(plan.verdict.uncertainties[0]).toMatchObject({ kind: "scope", material: false });
+      expect(plan.verdict.lane.reason).toHaveLength(300);
+      // Nothing that feeds a mutation moved.
+      expect(plan.verdict.lane.id).toBe("local");
+      expect(plan.readiness.ready).toBe(true);
+      expect(result!.contextWarnings).toEqual(
+        expect.arrayContaining([
+          "model: the repair turn did not fix every error; degraded the repaired answer",
+          'plan: dropped relatedWork[0] (ref "issue"): not a related-work evidence id',
+          'plan: dropped relatedWork[2] (ref "comment:123"): not a related-work evidence id',
+          'plan: cleared implementationBrief.dependencies[0].evidenceRef ("repo:src/auth/login.ts"): not a related-work evidence id',
+          "plan: truncated verdict.uncertainties[0].question to 300 characters",
+          "plan: truncated verdict.lane.reason to 300 characters",
+        ]),
+      );
+      // The model's own answer is persisted untouched.
+      expect(draft).toEqual(original);
+      const planned = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(planned![0].data.rawOutput).toEqual(original);
+      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+    });
+
+    it("keeps failing when a dropped repo: ref was the plan's only citation of that file", async () => {
+      // The freshness baseline tracks the files a plan cites; dropping the
+      // only citation of session.ts would stop re-grooming when it changes.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [...mockEvidence.sources, { path: "src/auth/session.ts", provenance: "repository", via: "read", ref: "abc123" }],
+      });
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ relatedWork: [{ ref: "repo:src/auth/session.ts", relation: "related", note: "session refresh" }] }),
+      );
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /after degrading: repo:src\/auth\/session\.ts is cited only in a field that takes related-work ids/,
+      );
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("drops a repo: ref from relatedWork when the plan cites that file elsewhere", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ relatedWork: [{ ref: "repo:src/auth/login.ts", relation: "related", note: "the file to fix" }] }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expect(result!.plan!.relatedWork).toEqual([]);
+      expect(result!.plan!.citations.map((c) => c.id)).toContain("repo:src/auth/login.ts");
+    });
+
+    it("still fails a plan whose bad ref comes with a mutation-affecting error", async () => {
+      const draft = planDraft({
+        mutations: { labelsToAdd: ["status/ready"] },
+        relatedWork: [{ ref: "issue", relation: "related", note: "the issue itself" }],
+      });
+      mocks.callGroomerLLM.mockResolvedValue(draft);
+
+      await expect(runHostedGroomer()).rejects.toThrow(/status is derived from verdict\.actionability/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("does not degrade an over-long text field that feeds a mutation", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { summary: "s".repeat(600) } }));
+
+      await expect(runHostedGroomer()).rejects.toThrow(/verdict\.summary: must be at most 500 characters/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("never lets a drop hide the related work a close recommendation relied on", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", {
+          mutations: { close: { reason: "duplicate", rationale: "same as this", evidenceRefs: ["issue"] } },
+          relatedWork: [{ ref: "issue", relation: "duplicate_of", note: "same bug" }],
+        }),
+      );
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /after degrading: mutations\.close\.evidenceRefs: a duplicate recommendation must cite a relatedWork entry/,
+      );
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    describe("the run's time budget", () => {
+      const start = Date.parse("2026-09-28T12:00:00.000Z");
+      let clock: ReturnType<typeof vi.spyOn>;
+      beforeEach(() => {
+        clock = vi.spyOn(Date, "now").mockReturnValue(start);
+      });
+      afterEach(() => {
+        clock.mockRestore();
+      });
+
+      it("gives the repair turn only what is left before the apply reserve", async () => {
+        mocks.callGroomerLLM
+          .mockImplementationOnce(async () => {
+            // The first call took 8.5 of the lease's 10 minutes; 1 is reserved for applying.
+            clock.mockReturnValue(start + 8.5 * 60_000);
+            return badRef();
+          })
+          .mockResolvedValueOnce(mockOutput);
+
+        await runHostedGroomer();
+
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+        expect(mocks.callGroomerLLM.mock.calls[1][0].timeoutMs).toBe(30_000);
+      });
+
+      it("skips the repair turn when too little is left, and fails as before", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        mocks.callGroomerLLM.mockImplementationOnce(async () => {
+          clock.mockReturnValue(start + 8.75 * 60_000);
+          return planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } });
+        });
+
+        await expect(runHostedGroomer()).rejects.toThrow(/^Groomer output validation failed: verdict\.lane\.id: must be a configured lane/);
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("skipped the repair turn"));
+        warn.mockRestore();
+      });
+
+      it("still degrades when the repair turn was skipped", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        mocks.callGroomerLLM.mockImplementationOnce(async () => {
+          clock.mockReturnValue(start + 9.5 * 60_000);
+          return badRef();
+        });
+
+        const result = await runHostedGroomer();
+
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+        expect(result!.plan!.relatedWork).toEqual([]);
+        expect(result!.contextWarnings).toContain('plan: dropped relatedWork[0] (ref "issue"): not a related-work evidence id');
+        warn.mockRestore();
+      });
     });
   });
 
