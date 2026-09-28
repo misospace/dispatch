@@ -534,14 +534,44 @@ describe("bearer token tiers (#1111)", () => {
   });
 
   it("throttles denial audit rows to one per actor/method/path per window", async () => {
-    await authorizeRequest(workerRequest("/api/sync", "POST"));
-    await authorizeRequest(workerRequest("/api/sync", "POST"));
-    await authorizeRequest(workerRequest("/api/sync", "POST"));
-    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+    try {
+      const forbidden = { authorized: false, forbidden: true, requiredTier: "maintainer" } as const;
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
 
-    // A different path is a different throttle key — still denied, still audited.
-    await authorizeRequest(workerRequest("/api/issues/move", "POST"));
-    expect(mocks.auditCreate).toHaveBeenCalledTimes(2);
+      // A different path is a different per-path key — still denied, still audited.
+      await expect(authorizeRequest(workerRequest("/api/issues/move", "POST"))).resolves.toEqual(forbidden);
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(2);
+
+      // Advancing past the window re-opens auditing for the original path.
+      vi.setSystemTime(Date.now() + 61_000);
+      await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual(forbidden);
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps per-actor denial audits even across distinct paths", async () => {
+    for (let i = 0; i < 14; i += 1) {
+      await authorizeRequest(workerRequest(`/api/issues/${i}/lane`, "POST"));
+    }
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(10);
+  });
+
+  it("attributes denial audits to x-agent-name, never the bearer token", async () => {
+    const request = new Request("http://localhost/api/sync", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}`, "x-agent-name": "courier-1" },
+    });
+    await authorizeRequest(request);
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.actor).toBe("courier-1");
+    expect(JSON.stringify(call.data)).not.toContain(WORKER_TOKEN);
   });
 
   it("authorizeGroomerRequest preserves the worker-tier forbidden result", async () => {

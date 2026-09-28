@@ -285,24 +285,28 @@ function resolveSessionActor(user: { email?: string | null; name?: string | null
  * client-import-free) module graph lean, and the try/catch guarantees a DB
  * failure can never change the auth decision — the denial stands either way.
  *
- * Rows are throttled to one per (actor, method, pathname) per minute so a
- * misconfigured worker hammering maintainer routes cannot write-amplify the
- * audit table; the 403 response itself is never throttled.
+ * Rows are throttled two ways so a misconfigured worker cannot write-amplify
+ * the audit table: one row per (actor, method, pathname) per minute, with an
+ * overall per-actor ceiling per minute (dynamic maintainer paths like
+ * /api/issues/{id}/lane would otherwise each open a fresh bucket). The 403
+ * response itself is never throttled — nothing here may change the auth
+ * decision, so every step sits inside a try/catch.
  */
 async function recordTierDenialAudit(
   request: Request,
   pathname: string,
   method: string,
 ): Promise<void> {
-  const { checkRateLimit } = await import("./rate-limit");
-  const deniedKey = `auth_tier_denied:${resolveBearerActor(request)}:${method}:${pathname}`;
-  if (!checkRateLimit(deniedKey, { limit: 1, windowMs: 60_000 }).allowed) return;
-
   try {
+    const actor = resolveBearerActor(request);
+    const { checkRateLimit } = await import("./rate-limit");
+    if (!checkRateLimit(`auth_tier_denied:${actor}`, { limit: 10, windowMs: 60_000 }).allowed) return;
+    if (!checkRateLimit(`auth_tier_denied:${actor}:${method}:${pathname}`, { limit: 1, windowMs: 60_000 }).allowed) return;
+
     const { prisma } = await import("./prisma");
     await prisma.auditLog.create({
       data: {
-        actor: resolveBearerActor(request),
+        actor,
         action: "auth_tier_denied",
         repoFullName: "unknown",
         success: false,
@@ -312,7 +316,8 @@ async function recordTierDenialAudit(
       },
     });
   } catch {
-    // Best-effort audit only — never let a DB failure affect the auth result.
+    // Best-effort audit only — never let a limiter or DB failure affect the
+    // auth result.
   }
 }
 
