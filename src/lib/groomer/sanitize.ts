@@ -67,3 +67,31 @@ function wrapMentions(run: string): string {
     return `${delimiter}\`@${name}\``;
   });
 }
+/**
+ * Model text on its way into Postgres (dispatch#1126). Postgres rejects
+ * U+0000 in text and jsonb, so one NUL byte in a model answer would make the
+ * GroomingRun write throw and turn a recoverable run into a database error.
+ * Strips NUL and the other C0 control characters except \n and \t, and caps
+ * the length. For what is stored or logged only: the repair turn echoes the
+ * model's answer back verbatim.
+ */
+export const MAX_STORED_TEXT_CHARS = 32_768;
+
+const STORAGE_UNSAFE_CONTROLS = /[\u0000-\u0008\u000B-\u001F]/g;
+
+export function sanitizeForStorage(text: string, maxChars: number = MAX_STORED_TEXT_CHARS): string {
+  const clean = text.replace(STORAGE_UNSAFE_CONTROLS, "");
+  return clean.length <= maxChars ? clean : `${clean.slice(0, maxChars - 1)}…`;
+}
+
+/** sanitizeForStorage applied to every string (and key) of a JSON value, on a copy. */
+export function sanitizeJsonForStorage(value: unknown): unknown {
+  if (typeof value === "string") return sanitizeForStorage(value);
+  if (Array.isArray(value)) return value.map(sanitizeJsonForStorage);
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [sanitizeForStorage(key), sanitizeJsonForStorage(item)]),
+    );
+  }
+  return value;
+}

@@ -65,12 +65,13 @@ Return ONLY valid JSON: a grooming plan with this shape (the response schema set
   "decomposition": { "required": false, "reason": null, "childBriefs": [] },
   "relatedWork": []
 }
-Use null for implementationBrief when you cannot write one honestly (for example needs_info or design work). "close" is null or { "reason": "already_done|duplicate|superseded", "rationale": "...", "evidenceRefs": [...], "criteria": [{ "criterion": "...", "evidenceRef": "repo:path/you/read.ts", "excerpt": "..." }] } (criteria is [] unless the reason is already_done). relatedWork entries are { "ref": "<related-work evidence id>", "relation": "duplicate_of|superseded_by|related", "note": "..." }. childBriefs entries are { "title": "...", "problem": "...", "acceptanceCriteria": ["..."] }.
+Use null for implementationBrief when you cannot write one honestly (for example needs_info or design work). "close" is null or { "reason": "already_done|duplicate|superseded", "rationale": "...", "evidenceRefs": [...], "criteria": [{ "criterion": "...", "evidenceRef": "repo:path/you/read.ts", "excerpt": "..." }] } (criteria is [] unless the reason is already_done). relatedWork entries are { "ref": "github:issue:owner/repo#12", "relation": "duplicate_of|superseded_by|related", "note": "..." }: the ref is always a "github:" id from the evidence list. childBriefs entries are { "title": "...", "problem": "...", "acceptanceCriteria": ["..."] }.
 
 Evidence rules:
 - The user message ends with "Evidence you can cite": the only valid evidence ids for this run. Cite ids exactly as listed wherever the plan asks for evidenceRefs or a ref. Never invent an id; an unknown id rejects the whole plan.
 - Provenance matters. "repo:" ids are repository content at the pinned head SHA. "github:" ids are GitHub issue/PR/commit state. A comment marked human is a person's statement. A comment marked automation is this system's own earlier output: you may cite it as context, but it never counts as support for any decision.
 - "issue" is the issue itself. It is the claim you are testing, so it cannot by itself support ready or already_done.
+- Two fields take ONLY a related-work id, a "github:" id naming other GitHub work: relatedWork[].ref and implementationBrief.dependencies[].evidenceRef. Related-work ids look like "github:issue:owner/repo#12", "github:pr:owner/repo#34" or "github:commit:owner/repo@<sha>". The other evidence ids are not related work and are rejected there: "issue" (this issue), "comment:<id>" (a comment on it) and "repo:<path>" (a file) belong in evidenceRefs. When no "github:" id in the list fits, leave relatedWork empty and set evidenceRef to null.
 - Unknown is an answer. When something material is not known, record it in uncertainties with material: true and choose needs_info or backlog. Do not paper over a gap with a confident guess.
 
 Readiness rules (Dispatch rejects a "ready" plan that breaks any of these):

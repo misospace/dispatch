@@ -5,6 +5,7 @@ import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerL
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
+import { runModelStage } from "./model-stage";
 import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
@@ -58,6 +59,14 @@ export interface RunHostedGroomerOptions {
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
 
 /**
+ * The tail of the run's lease-based deadline, reserved for the apply stage
+ * (dispatch#1126): the precondition re-reads and the GitHub writes. The
+ * model stage's deadline is the lease expiry minus this, so a repair turn
+ * only gets what is left before it and never runs the groom past the lease.
+ */
+const LEASE_APPLY_RESERVE_MS = 60 * 1000;
+
+/**
  * Backoff after a groom that could not read GitHub state (dispatch#1063).
  * Short enough that a transient GitHub failure delays grooming by an hour,
  * not the 24h cooldown; long enough that a persistently unreadable issue
@@ -66,6 +75,24 @@ const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
  * model is never called, so a backed-off retry is only a few GitHub reads.
  */
 export const UNVERIFIABLE_RETRY_BACKOFF_MINUTES = 60;
+
+/**
+ * Backoff after a failed write-mode run (dispatch#1125), whatever stage
+ * failed: an LLM or exploration timeout, unparseable output, a plan that
+ * failed validation, a GitHub write that did not land. The failure is
+ * retryable, but without a backoff the issue kept winning selection and one
+ * bad issue held the groomer for hours. The first failure waits 30 minutes,
+ * each consecutive one doubles it, capped at 4 hours.
+ */
+export const FAILED_RUN_BACKOFF_BASE_MINUTES = 30;
+export const FAILED_RUN_BACKOFF_MAX_MINUTES = 240;
+/**
+ * Prior failures that saturate the backoff: with this many before it, a
+ * failure already waits the cap, so the streak never needs more outcomes.
+ */
+export const FAILED_RUN_PRIOR_FAILURES_TO_CAP = Math.ceil(
+  Math.log2(FAILED_RUN_BACKOFF_MAX_MINUTES / FAILED_RUN_BACKOFF_BASE_MINUTES),
+);
 
 export interface GroomerDeps {
   selectCandidate: typeof selectGroomingCandidate;
@@ -199,9 +226,17 @@ async function executeGroomerRun(
     checkpoint: "issue_claimed",
     ttlMs: GROOMER_LEASE_TTL_MS,
   });
+  const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
   // Freshness (#1064): a human comment after this instant is new evidence.
   const evidenceWindowStart = new Date();
+
+  // The last stage this run reached, so a failure records where it failed
+  // rather than the "selected" the run was created with (#1125).
+  let stage = "selected";
+  // Set once the unreadable-issue backoff is written (#1063), so a later
+  // failure does not overwrite it with the failed-run backoff (#1125).
+  let unreadableBackoffWritten = false;
 
   try {
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
@@ -282,6 +317,7 @@ async function executeGroomerRun(
           appliedMutations: unverifiable,
         };
       }
+      unreadableBackoffWritten = true;
       Object.assign(unverifiable, await backOffUnreadableIssue(deps, candidate.id));
       const skippedRun = await deps.prisma.agentRun.create({
         data: {
@@ -361,6 +397,7 @@ async function executeGroomerRun(
         evidence: summarizeEvidenceForPersistence(evidence),
       },
     });
+    stage = "context_built";
 
     // Build context
     const context = await deps.buildContext({
@@ -427,6 +464,7 @@ async function executeGroomerRun(
           },
         },
       });
+      stage = "explored";
     }
 
     // The citable view of the snapshot: rendered into the prompt, used to
@@ -440,22 +478,30 @@ async function executeGroomerRun(
     ]);
     const evidenceCatalog = buildEvidenceCatalog(evidence, pinnedContent);
 
-    // Call LLM
-    const rawOutput = await deps.callLLM({
-      baseUrl: config.llmBaseUrl!,
-      apiKey: config.apiKey!,
-      model: config.model,
-      responseFormat: config.responseFormat,
-      prompt: context,
-      timeoutMs: config.timeoutMs,
-      explorationFindings: exploration?.findings,
-      evidenceCatalog,
-    });
-
-    // Validate the GroomingPlan against this run's evidence (dispatch#1062).
+    // Call LLM and validate the GroomingPlan against this run's evidence
+    // (dispatch#1062). An answer that fails gets one repair turn, and one
+    // failing only on non-load-bearing fields is degraded (dispatch#1126).
     // A rejected plan applies no mutation; its output and deterministic
-    // errors are kept on the run so the rejection can be inspected.
-    const validation = deps.validateOutput(rawOutput, { catalog: evidenceCatalog });
+    // errors (every attempt's) are kept on the run so the rejection can be
+    // inspected.
+    const modelStage = await runModelStage({
+      callLLM: deps.callLLM,
+      validateOutput: deps.validateOutput,
+      llm: {
+        baseUrl: config.llmBaseUrl!,
+        apiKey: config.apiKey!,
+        model: config.model,
+        responseFormat: config.responseFormat,
+        prompt: context,
+        timeoutMs: config.timeoutMs,
+        explorationFindings: exploration?.findings,
+        evidenceCatalog,
+      },
+      catalog: evidenceCatalog,
+      deadline: leaseExpiresAt - LEASE_APPLY_RESERVE_MS,
+    });
+    const { rawOutput, validation } = modelStage;
+    contextWarnings.push(...modelStage.warnings);
     if (!validation.valid) {
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         rawOutput,
@@ -574,10 +620,12 @@ async function executeGroomerRun(
       delete mutationPlan.applicationKey;
     }
 
-    // Persist stage planned
+    // Persist stage planned. contextWarnings is written again so the model
+    // stage's repair and degradation warnings (dispatch#1126) stay on the run.
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
       stage: "planned",
       rawOutput,
+      contextWarnings: [...contextWarnings, ...(exploration?.warnings ?? [])],
       validatedOutput: plan,
       labelsToAdd: inFlight ? [] : output.labelsToAdd,
       labelsToRemove: inFlight ? [] : output.labelsToRemove,
@@ -586,6 +634,7 @@ async function executeGroomerRun(
       mutationPlan,
       commentBodyPreview: inFlight ? null : (diff.comment?.slice(0, 500) ?? null),
     });
+    stage = "planned";
 
     const result = (extra: Partial<GroomerRunResult>): GroomerRunResult => ({
       candidateNumber: candidate.number,
@@ -722,7 +771,10 @@ async function executeGroomerRun(
       const unreadable = preconditions.checks.some((c) => c.status === "unverifiable");
       const outcome = unreadable ? "unverifiable" : "stale";
       const stale: Record<string, unknown> = { outcome, preconditionFailures: preconditions.failures };
-      if (unreadable) Object.assign(stale, await backOffUnreadableIssue(deps, candidate.id));
+      if (unreadable) {
+        unreadableBackoffWritten = true;
+        Object.assign(stale, await backOffUnreadableIssue(deps, candidate.id));
+      }
       const failed = preconditions.checks.filter((c) => c.status === "changed" || c.status === "unverifiable");
       const staleRun = await deps.prisma.agentRun.create({
         data: {
@@ -760,6 +812,8 @@ async function executeGroomerRun(
       });
       return result({ appliedMutations: stale });
     }
+
+    stage = "validated";
 
     // Write mode: apply the diff idempotently, lowest impact first.
     const github: ApplierGitHub = {
@@ -997,12 +1051,17 @@ async function executeGroomerRun(
     try {
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
         status: "failed",
-        stage: groomingRun.stage ?? "selected",
+        stage,
         errorMessage: message,
         retryable: true,
       });
     } catch {
       // Don't mask the original error
+    }
+
+    // A dry run writes nothing to the issue, as with the unreadable backoff.
+    if (!dryRun && !unreadableBackoffWritten) {
+      await backOffFailedRun(deps, candidate.id, groomingRun.id);
     }
 
     await deps.prisma.agentRun.create({
@@ -1091,6 +1150,43 @@ async function backOffUnreadableIssue(deps: GroomerDeps, issueId: string): Promi
     // The error itself is logged, not persisted: driver text stays out of history.
     console.warn(`[groomer] failed to record the retry backoff for issue ${issueId}:`, error);
     return { retryAfterError: "the retry backoff could not be recorded" };
+  }
+}
+
+/** Backoff for the Nth consecutive failed run: 30m, 60m, 120m, then 240m (#1125). */
+export function failedRunBackoffMinutes(consecutiveFailures: number): number {
+  const doublings = Math.max(0, consecutiveFailures - 1);
+  return Math.min(FAILED_RUN_BACKOFF_BASE_MINUTES * 2 ** doublings, FAILED_RUN_BACKOFF_MAX_MINUTES);
+}
+
+/**
+ * Back an issue off after a failed write-mode run (dispatch#1125). The streak is
+ * this failure plus the failed runs immediately before it: any other outcome
+ * (applied, stale, unverifiable, ...) ends it, so a successful groom resets
+ * the backoff. A run still marked running was interrupted and recorded no
+ * outcome, so the query leaves it out: it neither counts nor ends the streak,
+ * and any number of them cannot push a real outcome out of the rows read.
+ * Only the backoff column is written, and a failed write never masks the
+ * run's own error.
+ */
+async function backOffFailedRun(deps: GroomerDeps, issueId: string, groomingRunId: string): Promise<void> {
+  try {
+    const prior: Array<{ status: string }> = await deps.prisma.groomingRun.findMany({
+      where: { issueId, dryRun: false, id: { not: groomingRunId }, status: { not: "running" } },
+      orderBy: { createdAt: "desc" },
+      take: FAILED_RUN_PRIOR_FAILURES_TO_CAP,
+      select: { status: true },
+    });
+    let consecutiveFailures = 1;
+    for (const run of prior) {
+      if (run.status !== "failed") break;
+      consecutiveFailures++;
+    }
+    const minutes = failedRunBackoffMinutes(consecutiveFailures);
+    const retryAfter = new Date(Date.now() + minutes * 60 * 1000);
+    await deps.prisma.issue.update({ where: { id: issueId }, data: { groomingRetryAfter: retryAfter } });
+  } catch (error) {
+    console.warn(`[groomer] failed to record the failed-run backoff for issue ${issueId}:`, error);
   }
 }
 

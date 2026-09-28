@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { neutralizeMentions } from "./sanitize";
+import { MAX_STORED_TEXT_CHARS, neutralizeMentions, sanitizeForStorage, sanitizeJsonForStorage } from "./sanitize";
 
 describe("neutralizeMentions", () => {
   it("wraps a leading @-mention in backticks", () => {
@@ -52,3 +52,26 @@ describe("neutralizeMentions", () => {
     expect(neutralizeMentions("")).toBe("");
   });
 });
+
+describe("sanitizeForStorage (dispatch#1126)", () => {
+  it("strips NUL and other C0 control characters but keeps newlines and tabs", () => {
+    expect(sanitizeForStorage("a\u0000b\u0001c\u0007d\u001Be\u001Ff\rg\nh\ti")).toBe("abcdefg\nh\ti");
+  });
+
+  it("caps the length, ellipsis included", () => {
+    const capped = sanitizeForStorage(`repo:${"x".repeat(500)}`, 200);
+    expect(capped).toHaveLength(200);
+    expect(capped.endsWith("…")).toBe(true);
+    expect(sanitizeForStorage("x".repeat(200), 200)).toBe("x".repeat(200));
+    expect(sanitizeForStorage("y".repeat(MAX_STORED_TEXT_CHARS + 10))).toHaveLength(MAX_STORED_TEXT_CHARS);
+  });
+
+  it("cleans every string and key of a JSON value without touching the original", () => {
+    const raw = { "k\u0000ey": ["v\u0000", 1, null, { nested: "t\u0002ext\n" }], ok: true };
+    const clean = sanitizeJsonForStorage(raw);
+    expect(clean).toEqual({ key: ["v", 1, null, { nested: "text\n" }], ok: true });
+    expect(raw["k\u0000ey"][0]).toBe("v\u0000");
+    expect(JSON.stringify(clean)).not.toContain("\\u0000");
+  });
+});
+

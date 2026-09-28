@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import type { GroomingCandidate } from "./selector";
 import type { GroomingPlanDraft } from "./plan";
 import type { HostedGroomerConfig } from "./config";
@@ -41,7 +41,7 @@ const { mocks } = vi.hoisted(() => ({
     applications: new Map<string, Record<string, any>>(),
     prisma: {
       automationRepo: { findUnique: vi.fn() },
-      groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
+      groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn(), findMany: vi.fn() },
       groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
@@ -111,7 +111,14 @@ vi.mock("./groomer-lock", () => ({
   HEARTBEAT_MS: 30_000,
 }));
 
-import { captureFailureReason, runHostedGroomer, UNVERIFIABLE_RETRY_BACKOFF_MINUTES } from "./run";
+import {
+  captureFailureReason,
+  FAILED_RUN_BACKOFF_MAX_MINUTES,
+  FAILED_RUN_PRIOR_FAILURES_TO_CAP,
+  failedRunBackoffMinutes,
+  runHostedGroomer,
+  UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
+} from "./run";
 import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
@@ -282,6 +289,7 @@ describe("runHostedGroomer", () => {
     mocks.prisma.groomingRun.create.mockResolvedValue(mockGroomingRun);
     mocks.prisma.groomingRun.update.mockResolvedValue({ ...mockGroomingRun, stage: "planned" });
     mocks.prisma.groomingRun.findFirst.mockResolvedValue(null);
+    mocks.prisma.groomingRun.findMany.mockResolvedValue([]);
     mocks.prisma.issue.update.mockResolvedValue({ id: "issue-42" });
     mocks.prisma.issueLane.create.mockResolvedValue({ id: "lane-1" });
     mocks.prisma.agentRun.create.mockResolvedValue({ id: "run-1" });
@@ -1297,11 +1305,15 @@ Investigate session handling in auth module.`;
 
       expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
       expect(mocks.closeIssue).not.toHaveBeenCalled();
+      // The repair turn (dispatch#1126) returned the same answer: both are kept.
       expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            rawOutput: raw,
-            validationErrors: [expect.stringContaining('unknown evidence reference "repo:src/invented.ts"')],
+            rawOutput: { firstAnswer: raw, repairAnswer: raw },
+            validationErrors: [
+              'first answer: verdict.evidenceRefs[0]: unknown evidence reference "repo:src/invented.ts"',
+              'repair: verdict.evidenceRefs[0]: unknown evidence reference "repo:src/invented.ts"',
+            ],
           }),
         }),
       );
@@ -1471,6 +1483,328 @@ Investigate session handling in auth module.`;
         planDraft({ verdict: { workType: "design", lane: { id: "local", confidence: "high", reason: "r" } }, implementationBrief: null }),
       );
       await expect(runHostedGroomer()).rejects.toThrow(/design work must route to the escalation lane/);
+    });
+  });
+
+  describe("model-stage repair turn and degradation (dispatch#1126)", () => {
+    const RELATED = "github:issue:org/repo#7";
+    const withRelatedWork = () =>
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [
+          ...mockEvidence.sources,
+          { key: RELATED, provenance: "github_issue", state: "open", url: null, via: "read", observedAt: "", ref: null },
+        ],
+      });
+    const badRef = () => planDraft({ relatedWork: [{ ref: "issue", relation: "related", note: "the issue itself" }] });
+    const badRefError = 'relatedWork[0].ref: "issue" must be a related-work evidence reference';
+    const parseError = (content: string) =>
+      Object.assign(new Error(`Failed to parse LLM response as JSON: ${content.slice(0, 200)}`), {
+        name: "GroomerOutputParseError",
+        content,
+      });
+
+    it("gives a plan whose only error is a bad ref one repair turn, and applies the repaired plan", async () => {
+      withRelatedWork();
+      const repaired = planDraft({ relatedWork: [{ ref: RELATED, relation: "related", note: "same area" }] });
+      mocks.callGroomerLLM.mockResolvedValueOnce(badRef()).mockResolvedValueOnce(repaired);
+
+      const result = await runHostedGroomer();
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      const repairCall = mocks.callGroomerLLM.mock.calls[1][0];
+      expect(repairCall.repair).toEqual({ previousResponse: JSON.stringify(badRef(), null, 2), errors: [badRefError] });
+      expect(repairCall.prompt).toBe("test context");
+      expect(repairCall.evidenceCatalog).toBe(mocks.callGroomerLLM.mock.calls[0][0].evidenceCatalog);
+      expect(repairCall.timeoutMs).toBe(mockConfig.timeoutMs);
+      expect(result!.plan!.relatedWork).toEqual([{ ref: RELATED, relation: "related", note: "same area" }]);
+      expect(result!.contextWarnings).toContain(`model: the repair turn fixed the first answer, which failed with: ${badRefError}`);
+      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+      const planned = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(planned![0].data.rawOutput).toEqual(repaired);
+      expect(planned![0].data.contextWarnings).toEqual(result!.contextWarnings);
+    });
+
+    it("fails the run with both error sets when the repair also fails", async () => {
+      const first = planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } });
+      const second = planDraft({ verdict: { lane: { id: "gpu2", confidence: "high", reason: "r" } } });
+      mocks.callGroomerLLM.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /Groomer output validation failed: first answer: verdict\.lane\.id: .*"gpu", repair: verdict\.lane\.id: .*"gpu2"/,
+      );
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+      const failed = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.validationErrors);
+      expect(failed![0].data.rawOutput).toEqual({ firstAnswer: first, repairAnswer: second });
+      expect(failed![0].data.validationErrors).toEqual([
+        expect.stringMatching(/^first answer: verdict\.lane\.id: must be a configured lane .*"gpu"$/),
+        expect.stringMatching(/^repair: verdict\.lane\.id: must be a configured lane .*"gpu2"$/),
+      ]);
+    });
+
+    it("gives a final answer made of tool-call text a repair turn", async () => {
+      const answer = 'Let me read the key files first. <tool_call>{"name":"read_file","arguments":{"path":"src/auth/login.ts"}}</tool_call>';
+      mocks.callGroomerLLM.mockRejectedValueOnce(parseError(answer)).mockResolvedValueOnce(mockOutput);
+
+      const result = await runHostedGroomer();
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      expect(mocks.callGroomerLLM.mock.calls[1][0].repair).toEqual({
+        previousResponse: answer,
+        errors: [`Failed to parse LLM response as JSON: ${answer}`],
+      });
+      expect(result!.plan!.readiness.ready).toBe(true);
+    });
+
+    it("fails with both errors when the repair of a non-JSON answer is not JSON either", async () => {
+      mocks.callGroomerLLM.mockRejectedValueOnce(parseError("<tool_call>one</tool_call>")).mockRejectedValueOnce(parseError("<tool_call>two</tool_call>"));
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /first answer: Failed to parse LLM response as JSON: <tool_call>one.*repair: Failed to parse LLM response as JSON: <tool_call>two/,
+      );
+      const failed = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.validationErrors);
+      expect(failed![0].data.rawOutput).toEqual({ firstAnswer: "<tool_call>one</tool_call>", repairAnswer: "<tool_call>two</tool_call>" });
+    });
+
+    it("stores no NUL or control characters from a model answer (Postgres rejects them)", async () => {
+      const unsafe = /[\u0000-\u0008\u000B-\u001F]/;
+      mocks.callGroomerLLM
+        .mockRejectedValueOnce(parseError("one\u0000<tool_call>\u0007</tool_call>"))
+        .mockResolvedValueOnce(planDraft({ verdict: { lane: { id: "g\u0000pu", confidence: "high", reason: "r" } } }));
+
+      const err = await runHostedGroomer().catch((e: Error) => e);
+
+      expect((err as Error).message).not.toMatch(unsafe);
+      const failed = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.validationErrors);
+      expect(failed![0].data.rawOutput.firstAnswer).toBe("one<tool_call></tool_call>");
+      expect(failed![0].data.rawOutput.repairAnswer.verdict.lane.id).toBe("gpu");
+      expect(JSON.stringify(failed![0].data)).not.toContain("\\u0000");
+      for (const e of failed![0].data.validationErrors) expect(e).not.toMatch(unsafe);
+      // The repair turn still echoed the answer back verbatim.
+      expect(mocks.callGroomerLLM.mock.calls[1][0].repair.previousResponse).toBe("one\u0000<tool_call>\u0007</tool_call>");
+    });
+
+    it("stores a sanitized copy of an applied plan's raw output", async () => {
+      const raw = planDraft({ relatedWork: [{ ref: "iss\u0000ue", relation: "related", note: "n\u0000ote" }] });
+      mocks.callGroomerLLM.mockResolvedValue(raw);
+
+      const result = await runHostedGroomer();
+
+      const planned = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(planned![0].data.rawOutput.relatedWork).toEqual([{ ref: "issue", relation: "related", note: "note" }]);
+      expect(raw.relatedWork[0].ref).toBe("iss\u0000ue");
+      for (const w of result!.contextWarnings!) expect(w).not.toContain("\u0000");
+    });
+
+    it("never repairs a failed model call: timeouts and API errors fail as before", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM API error 400: bad request"));
+
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM API error 400/);
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+    });
+
+    it("degrades non-load-bearing fields when the repair leaves only those errors", async () => {
+      withRelatedWork();
+      const longQuestion = `Should ${"the reset flow ".repeat(30)}also cover SSO?`;
+      const longReason = `clear implementation task ${"with a long explanation ".repeat(20)}`;
+      const draft = planDraft({
+        verdict: {
+          lane: { id: "local", confidence: "high", reason: longReason },
+          uncertainties: [{ kind: "scope", question: longQuestion, material: false }],
+        },
+        implementationBrief: {
+          ...mockOutput.implementationBrief!,
+          dependencies: [
+            { ref: "#7", state: "open", evidenceRef: "repo:src/auth/login.ts" },
+            { ref: "#7", state: "open", evidenceRef: RELATED },
+          ],
+        },
+        relatedWork: [
+          { ref: "issue", relation: "related", note: "the issue itself" },
+          { ref: RELATED, relation: "related", note: "same area" },
+          { ref: "comment:123", relation: "related", note: "an invented comment" },
+        ],
+      });
+      const original = structuredClone(draft);
+      mocks.callGroomerLLM.mockResolvedValue(draft);
+
+      const result = await runHostedGroomer();
+
+      expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+      const plan = result!.plan!;
+      expect(plan.relatedWork).toEqual([{ ref: RELATED, relation: "related", note: "same area" }]);
+      expect(plan.implementationBrief!.dependencies).toEqual([
+        { ref: "#7", state: "open", evidenceRef: null },
+        { ref: "#7", state: "open", evidenceRef: RELATED },
+      ]);
+      expect(plan.verdict.uncertainties[0].question).toHaveLength(300);
+      expect(plan.verdict.uncertainties[0].question.endsWith("…")).toBe(true);
+      expect(plan.verdict.uncertainties[0]).toMatchObject({ kind: "scope", material: false });
+      expect(plan.verdict.lane.reason).toHaveLength(300);
+      // Nothing that feeds a mutation moved.
+      expect(plan.verdict.lane.id).toBe("local");
+      expect(plan.readiness.ready).toBe(true);
+      expect(result!.contextWarnings).toEqual(
+        expect.arrayContaining([
+          "model: the repair turn did not fix every error; degraded the repaired answer",
+          'plan: dropped relatedWork[0] (ref "issue"): not a related-work evidence id',
+          'plan: dropped relatedWork[2] (ref "comment:123"): not a related-work evidence id',
+          'plan: cleared implementationBrief.dependencies[0].evidenceRef ("repo:src/auth/login.ts"): not a related-work evidence id',
+          "plan: truncated verdict.uncertainties[0].question to 300 characters",
+          "plan: truncated verdict.lane.reason to 300 characters",
+        ]),
+      );
+      // The model's own answer is persisted untouched.
+      expect(draft).toEqual(original);
+      const planned = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(planned![0].data.rawOutput).toEqual(original);
+      expect(mocks.updateIssueLabels).toHaveBeenCalled();
+    });
+
+    it("keeps failing when a dropped repo: ref was the plan's only citation of that file", async () => {
+      // The freshness baseline tracks the files a plan cites; dropping the
+      // only citation of session.ts would stop re-grooming when it changes.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        sources: [...mockEvidence.sources, { path: "src/auth/session.ts", provenance: "repository", via: "read", ref: "abc123" }],
+      });
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ relatedWork: [{ ref: "repo:src/auth/session.ts", relation: "related", note: "session refresh" }] }),
+      );
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /after degrading: repo:src\/auth\/session\.ts is cited only in a field that takes related-work ids/,
+      );
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("drops a repo: ref from relatedWork when the plan cites that file elsewhere", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        planDraft({ relatedWork: [{ ref: "repo:src/auth/login.ts", relation: "related", note: "the file to fix" }] }),
+      );
+
+      const result = await runHostedGroomer();
+
+      expect(result!.plan!.relatedWork).toEqual([]);
+      expect(result!.plan!.citations.map((c) => c.id)).toContain("repo:src/auth/login.ts");
+    });
+
+    it("still fails a plan whose bad ref comes with a mutation-affecting error", async () => {
+      const draft = planDraft({
+        mutations: { labelsToAdd: ["status/ready"] },
+        relatedWork: [{ ref: "issue", relation: "related", note: "the issue itself" }],
+      });
+      mocks.callGroomerLLM.mockResolvedValue(draft);
+
+      await expect(runHostedGroomer()).rejects.toThrow(/status is derived from verdict\.actionability/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("does not degrade an over-long text field that feeds a mutation", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { summary: "s".repeat(600) } }));
+
+      await expect(runHostedGroomer()).rejects.toThrow(/verdict\.summary: must be at most 500 characters/);
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    it("never lets a drop hide the related work a close recommendation relied on", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(
+        notReadyDraft("backlog", {
+          mutations: { close: { reason: "duplicate", rationale: "same as this", evidenceRefs: ["issue"] } },
+          relatedWork: [{ ref: "issue", relation: "duplicate_of", note: "same bug" }],
+        }),
+      );
+
+      await expect(runHostedGroomer()).rejects.toThrow(
+        /after degrading: mutations\.close\.evidenceRefs: a duplicate recommendation must cite a relatedWork entry/,
+      );
+      expect(mocks.closeIssue).not.toHaveBeenCalled();
+      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    });
+
+    describe("the run's time budget", () => {
+      const start = Date.parse("2026-09-28T12:00:00.000Z");
+      let clock: ReturnType<typeof vi.spyOn>;
+      beforeEach(() => {
+        clock = vi.spyOn(Date, "now").mockReturnValue(start);
+      });
+      afterEach(() => {
+        clock.mockRestore();
+      });
+
+      it("gives the repair turn only what is left before the apply reserve", async () => {
+        mocks.callGroomerLLM
+          .mockImplementationOnce(async () => {
+            // The first call took 8.5 of the lease's 10 minutes; 1 is reserved for applying.
+            clock.mockReturnValue(start + 8.5 * 60_000);
+            return badRef();
+          })
+          .mockResolvedValueOnce(mockOutput);
+
+        await runHostedGroomer();
+
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(2);
+        expect(mocks.callGroomerLLM.mock.calls[1][0].timeoutMs).toBe(30_000);
+      });
+
+      it("skips the repair turn when too little is left, and fails as before", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        mocks.callGroomerLLM.mockImplementationOnce(async () => {
+          clock.mockReturnValue(start + 8.75 * 60_000);
+          return planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } });
+        });
+
+        await expect(runHostedGroomer()).rejects.toThrow(/^Groomer output validation failed: verdict\.lane\.id: must be a configured lane/);
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("skipped the repair turn"));
+        warn.mockRestore();
+      });
+
+      it("fails with the original parse error when the repair turn is skipped: no draft to degrade, nothing unsafe stored", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        // The real error class, so its storage-safe message is what is tested.
+        const { GroomerOutputParseError } = await vi.importActual<typeof import("./llm")>("./llm");
+        const original = new GroomerOutputParseError("Let me read the key files.\u0000 <tool_call>\u0007read_file</tool_call>");
+        mocks.callGroomerLLM.mockImplementationOnce(async () => {
+          clock.mockReturnValue(start + 9.5 * 60_000);
+          throw original;
+        });
+
+        const err = await runHostedGroomer().catch((e: unknown) => e);
+
+        expect(err).toBe(original);
+        expect(original.message).toBe("Failed to parse LLM response as JSON: Let me read the key files. <tool_call>read_file</tool_call>");
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("skipped the repair turn"));
+        // A parse failure leaves no parsed draft, so there is nothing to degrade
+        // and no rawOutput is written: the run fails exactly as before #1126.
+        const writes = mocks.prisma.groomingRun.update.mock.calls.map((call) => call[0].data);
+        expect(writes.some((data) => "rawOutput" in data || "validationErrors" in data)).toBe(false);
+        // What is persisted is the storage-safe message.
+        const unsafe = /[\u0000-\u0008\u000B-\u001F]/;
+        const failed = writes.find((data) => data.status === "failed");
+        expect(failed!.errorMessage).toBe(original.message);
+        expect(failed!.errorMessage).not.toMatch(unsafe);
+        expect(mocks.prisma.agentRun.create.mock.calls.at(-1)![0].data.errorMessage).not.toMatch(unsafe);
+        warn.mockRestore();
+      });
+
+      it("still degrades when the repair turn was skipped", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        mocks.callGroomerLLM.mockImplementationOnce(async () => {
+          clock.mockReturnValue(start + 9.5 * 60_000);
+          return badRef();
+        });
+
+        const result = await runHostedGroomer();
+
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+        expect(result!.plan!.relatedWork).toEqual([]);
+        expect(result!.contextWarnings).toContain('plan: dropped relatedWork[0] (ref "issue"): not a related-work evidence id');
+        warn.mockRestore();
+      });
     });
   });
 
@@ -2159,6 +2493,208 @@ Investigate session handling in auth module.`;
       await runHostedGroomer();
       const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
       expect(written.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
+    });
+  });
+
+  describe("backoff after a failed run (dispatch#1125)", () => {
+    const MINUTE = 60 * 1000;
+
+    function backoffWrites(): Array<Record<string, unknown>> {
+      return mocks.prisma.issue.update.mock.calls
+        .map((c) => c[0].data as Record<string, unknown>)
+        .filter((data) => "groomingRetryAfter" in data);
+    }
+
+    /** The backoff written by the run, in minutes from now (rounded). */
+    function backoffMinutes(): number {
+      const writes = backoffWrites();
+      expect(writes).toHaveLength(1);
+      return Math.round(((writes[0].groomingRetryAfter as Date).getTime() - Date.now()) / MINUTE);
+    }
+
+    /**
+     * Earlier runs for the issue, newest first. The mock applies the query's
+     * status filter and take, as the database would.
+     */
+    function history(...statuses: string[]) {
+      mocks.prisma.groomingRun.findMany.mockImplementation(
+        async ({ where, take }: { where: { status?: { not?: string } }; take?: number }) =>
+          statuses
+            .filter((status) => status !== where.status?.not)
+            .slice(0, take)
+            .map((status) => ({ status })),
+      );
+    }
+
+    /** The data the run was completed with. */
+    function completedRun(): Record<string, any> {
+      const call = mocks.prisma.groomingRun.update.mock.calls.findLast((c) => "completedAt" in c[0].data);
+      expect(call).toBeDefined();
+      return call![0].data;
+    }
+
+    it("backs the issue off after an LLM timeout, writing only the backoff", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+      expect(mocks.prisma.issue.update).toHaveBeenCalledTimes(1);
+      expect(Object.keys(mocks.prisma.issue.update.mock.calls[0][0].data)).toEqual(["groomingRetryAfter"]);
+      expect(mocks.prisma.issue.update.mock.calls[0][0].where).toEqual({ id: "issue-42" });
+      expect(backoffMinutes()).toBe(30);
+      // The streak is read from this issue's earlier write-mode runs.
+      expect(mocks.prisma.groomingRun.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { issueId: "issue-42", dryRun: false, id: { not: "gr-1" }, status: { not: "running" } },
+          orderBy: { createdAt: "desc" },
+          take: FAILED_RUN_PRIOR_FAILURES_TO_CAP,
+        }),
+      );
+    });
+
+    it("backs the issue off when the plan fails validation or the output is unparseable", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(backoffMinutes()).toBe(30);
+
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockRejectedValue(new Error("Failed to parse LLM response as JSON: {oops"));
+      await expect(runHostedGroomer()).rejects.toThrow(/Failed to parse LLM response as JSON/);
+      expect(backoffMinutes()).toBe(30);
+    });
+
+    it("lengthens the backoff with each consecutive failure, up to the cap", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      const cases: Array<[string[], number]> = [
+        [[], 30],
+        [["failed"], 60],
+        [["failed", "failed"], 120],
+        [["failed", "failed", "failed"], 240],
+        [Array(9).fill("failed"), FAILED_RUN_BACKOFF_MAX_MINUTES],
+      ];
+      for (const [statuses, minutes] of cases) {
+        mocks.prisma.issue.update.mockClear();
+        history(...statuses);
+        await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+        expect(backoffMinutes()).toBe(minutes);
+      }
+    });
+
+    it("restarts the streak after any non-failed outcome, and ignores runs interrupted mid-flight", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      history("completed", "failed", "failed", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(30);
+
+      mocks.prisma.issue.update.mockClear();
+      history("running", "failed", "partial", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(60);
+
+      mocks.prisma.issue.update.mockClear();
+      history("failed", "running", "running", "unverifiable", "failed", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(60);
+    });
+
+    it("does not let interrupted runs truncate the streak (more than 10 raw rows)", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      const interrupted = Array(4).fill("running");
+      history(...interrupted, "failed", ...interrupted, "failed", ...interrupted, "failed", "completed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      // The fourth consecutive failure once interrupted runs are skipped: the cap.
+      expect(backoffMinutes()).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
+      const query = mocks.prisma.groomingRun.findMany.mock.calls[0][0];
+      expect(query.where.status).toEqual({ not: "running" });
+    });
+
+    it("clears the backoff once a later groom applies", async () => {
+      mocks.callGroomerLLM.mockRejectedValueOnce(new Error("LLM timeout"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(30);
+
+      mocks.prisma.issue.update.mockClear();
+      await runHostedGroomer();
+      expect(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).toMatchObject({ groomingRetryAfter: null });
+    });
+
+    it("backs off a failure in any stage, and records the stage it failed in", async () => {
+      // Repository context, before anything is recorded past selection.
+      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
+      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "selected" });
+
+      // Exploration: a tool loop on the same model, which can time out too.
+      mocks.prisma.issue.update.mockClear();
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockRejectedValueOnce(new Error("exploration timed out"));
+      await expect(runHostedGroomer()).rejects.toThrow(/exploration timed out/);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "context_built" });
+
+      // Apply: the first GitHub write did not land.
+      mocks.prisma.issue.update.mockClear();
+      mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.updateIssueLabels.mockRejectedValue(new Error("GitHub API error: 422"));
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Groomed." } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Grooming mutation failed at labels/);
+      errSpy.mockRestore();
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "validated" });
+    });
+
+    it("records the stage a validation failure happened in, not \"selected\"", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "context_built" });
+
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue(mockExploration);
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "explored" });
+    });
+
+    it("keeps only the unreadable-issue backoff when that path then fails", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValueOnce(new Error("boom"));
+      mocks.prisma.agentRun.create.mockRejectedValueOnce(new Error("db blip"));
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      warnSpy.mockRestore();
+      expect(backoffMinutes()).toBe(UNVERIFIABLE_RETRY_BACKOFF_MINUTES);
+      expect(mocks.prisma.groomingRun.findMany).not.toHaveBeenCalled();
+    });
+
+    it("a dry run writes no backoff", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
+      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("still fails with the model error, recorded, when the backoff cannot be written", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      mocks.prisma.issue.update.mockRejectedValueOnce(new Error("db blip"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+      expect(mocks.prisma.agentRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: "failed", errorMessage: "LLM timeout" }) }),
+      );
+      expect(mocks.prisma.auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ success: false, errorMessage: "LLM timeout" }) }),
+      );
+    });
+
+    it("schedules 30m, 60m, 120m, then caps at 240m", () => {
+      expect([1, 2, 3, 4, 5, 20].map(failedRunBackoffMinutes)).toEqual([30, 60, 120, 240, 240, 240]);
+      // Reading this many prior outcomes is exactly enough to reach the cap.
+      expect(FAILED_RUN_PRIOR_FAILURES_TO_CAP).toBe(3);
+      expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP)).toBeLessThan(FAILED_RUN_BACKOFF_MAX_MINUTES);
+      expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP + 1)).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
     });
   });
 });
