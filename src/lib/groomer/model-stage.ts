@@ -18,6 +18,7 @@ import type { callGroomerLLM, CallLlmOptions } from "./llm";
 import type { GroomingPlanValidationResult, validateGroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import { degradePlanDraft } from "./plan-degrade";
+import { sanitizeForStorage, sanitizeJsonForStorage } from "./sanitize";
 
 /**
  * A repair turn left less than this (or less than the configured per-call
@@ -78,7 +79,23 @@ function summarizeErrors(errors: string[]): string {
   return errors.length > MAX_WARNING_ERRORS ? `${shown}; and ${errors.length - MAX_WARNING_ERRORS} more` : shown;
 }
 
+/**
+ * Run the model stage and make what it returns safe to persist: the raw
+ * output (parsed JSON, a non-JSON answer's text, or both attempts), the
+ * validation errors and the warnings all carry model text, and one NUL byte
+ * in any of them would fail the GroomingRun write (see sanitizeForStorage).
+ */
 export async function runModelStage(input: ModelStageInput): Promise<ModelStageResult> {
+  const result = await modelStage(input);
+  const { validation } = result;
+  return {
+    rawOutput: sanitizeJsonForStorage(result.rawOutput),
+    validation: validation.valid ? validation : { ...validation, errors: validation.errors?.map((e) => sanitizeForStorage(e)) },
+    warnings: result.warnings.map((w) => sanitizeForStorage(w)),
+  };
+}
+
+async function modelStage(input: ModelStageInput): Promise<ModelStageResult> {
   const { callLLM, validateOutput, llm, catalog } = input;
   const validate = (output: unknown) => validateOutput(output, { catalog });
 

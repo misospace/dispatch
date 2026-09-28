@@ -3,6 +3,7 @@ import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 import { buildGroomerSystemPrompt } from "./prompts/system-prompt";
 import { buildGroomingPlanResponseSchema } from "./plan-schema";
 import { renderEvidenceCatalog, type EvidenceCatalog } from "./plan-evidence";
+import { sanitizeForStorage } from "./sanitize";
 
 export interface CallLlmOptions {
   baseUrl: string;
@@ -46,7 +47,9 @@ export class GroomerOutputParseError extends Error {
   readonly content: string;
 
   constructor(content: string) {
-    super(`Failed to parse LLM response as JSON: ${content.slice(0, 200)}`);
+    // The message is persisted as the run's error (Postgres rejects NUL);
+    // `content` stays verbatim for the repair turn to echo back.
+    super(`Failed to parse LLM response as JSON: ${sanitizeForStorage(content.slice(0, 200))}`);
     this.name = "GroomerOutputParseError";
     this.content = content;
   }

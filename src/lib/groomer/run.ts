@@ -59,11 +59,12 @@ export interface RunHostedGroomerOptions {
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
 
 /**
- * Time the model stage leaves on the lease for the apply stage (dispatch#1126):
- * the precondition re-reads and the GitHub writes. A repair turn only gets
- * what remains of the lease after this, so it never runs the groom past it.
+ * The tail of the run's lease-based deadline, reserved for the apply stage
+ * (dispatch#1126): the precondition re-reads and the GitHub writes. The
+ * model stage's deadline is the lease expiry minus this, so a repair turn
+ * only gets what is left before it and never runs the groom past the lease.
  */
-const APPLY_RESERVE_MS = 60 * 1000;
+const LEASE_APPLY_RESERVE_MS = 60 * 1000;
 
 /**
  * Backoff after a groom that could not read GitHub state (dispatch#1063).
@@ -497,7 +498,7 @@ async function executeGroomerRun(
         evidenceCatalog,
       },
       catalog: evidenceCatalog,
-      deadline: leaseExpiresAt - APPLY_RESERVE_MS,
+      deadline: leaseExpiresAt - LEASE_APPLY_RESERVE_MS,
     });
     const { rawOutput, validation } = modelStage;
     contextWarnings.push(...modelStage.warnings);

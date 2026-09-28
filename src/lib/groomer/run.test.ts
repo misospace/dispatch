@@ -1568,6 +1568,36 @@ Investigate session handling in auth module.`;
       expect(failed![0].data.rawOutput).toEqual({ firstAnswer: "<tool_call>one</tool_call>", repairAnswer: "<tool_call>two</tool_call>" });
     });
 
+    it("stores no NUL or control characters from a model answer (Postgres rejects them)", async () => {
+      const unsafe = /[\u0000-\u0008\u000B-\u001F]/;
+      mocks.callGroomerLLM
+        .mockRejectedValueOnce(parseError("one\u0000<tool_call>\u0007</tool_call>"))
+        .mockResolvedValueOnce(planDraft({ verdict: { lane: { id: "g\u0000pu", confidence: "high", reason: "r" } } }));
+
+      const err = await runHostedGroomer().catch((e: Error) => e);
+
+      expect((err as Error).message).not.toMatch(unsafe);
+      const failed = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.validationErrors);
+      expect(failed![0].data.rawOutput.firstAnswer).toBe("one<tool_call></tool_call>");
+      expect(failed![0].data.rawOutput.repairAnswer.verdict.lane.id).toBe("gpu");
+      expect(JSON.stringify(failed![0].data)).not.toContain("\\u0000");
+      for (const e of failed![0].data.validationErrors) expect(e).not.toMatch(unsafe);
+      // The repair turn still echoed the answer back verbatim.
+      expect(mocks.callGroomerLLM.mock.calls[1][0].repair.previousResponse).toBe("one\u0000<tool_call>\u0007</tool_call>");
+    });
+
+    it("stores a sanitized copy of an applied plan's raw output", async () => {
+      const raw = planDraft({ relatedWork: [{ ref: "iss\u0000ue", relation: "related", note: "n\u0000ote" }] });
+      mocks.callGroomerLLM.mockResolvedValue(raw);
+
+      const result = await runHostedGroomer();
+
+      const planned = mocks.prisma.groomingRun.update.mock.calls.find((call) => call[0]?.data?.stage === "planned");
+      expect(planned![0].data.rawOutput.relatedWork).toEqual([{ ref: "issue", relation: "related", note: "note" }]);
+      expect(raw.relatedWork[0].ref).toBe("iss\u0000ue");
+      for (const w of result!.contextWarnings!) expect(w).not.toContain("\u0000");
+    });
+
     it("never repairs a failed model call: timeouts and API errors fail as before", async () => {
       mocks.callGroomerLLM.mockRejectedValue(new Error("LLM API error 400: bad request"));
 

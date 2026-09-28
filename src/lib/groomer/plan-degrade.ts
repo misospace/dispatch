@@ -34,7 +34,16 @@
  *   on this text.
  */
 
+import { sanitizeForStorage } from "./sanitize";
+
 type Obj = Record<string, unknown>;
+
+/** A model-supplied ref as it appears in a context warning: storage-safe and short. */
+const MAX_WARNING_REF_CHARS = 200;
+
+function quoteRef(ref: unknown): string {
+  return JSON.stringify(typeof ref === "string" ? sanitizeForStorage(ref, MAX_WARNING_REF_CHARS) : ref);
+}
 
 function isObj(value: unknown): value is Obj {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -73,27 +82,32 @@ export function degradePlanDraft(raw: unknown, errors: string[]): DegradedPlanDr
   const warnings: string[] = [];
   const removedRefs: string[] = [];
   const dropRelated = new Set<number>();
+  const clearedDependencies = new Set<number>();
 
   for (const error of errors) {
     const ref = BAD_RELATED_REF.exec(error);
     if (ref) {
       if (ref[1] !== undefined) {
         const i = Number(ref[1]);
+        // Several errors on one entry need one fix, and one warning.
+        if (dropRelated.has(i)) continue;
         const entry = Array.isArray(output.relatedWork) ? output.relatedWork[i] : undefined;
         if (!isObj(entry)) return null;
         dropRelated.add(i);
-        if (typeof entry.ref === "string") removedRefs.push(entry.ref.trim());
-        warnings.push(`plan: dropped relatedWork[${i}] (ref ${JSON.stringify(entry.ref)}): not a related-work evidence id`);
+        if (typeof entry.ref === "string") removedRefs.push(sanitizeForStorage(entry.ref.trim()));
+        warnings.push(`plan: dropped relatedWork[${i}] (ref ${quoteRef(entry.ref)}): not a related-work evidence id`);
       } else {
         const i = Number(ref[2]);
+        if (clearedDependencies.has(i)) continue;
         const brief = output.implementationBrief;
         const dependency = isObj(brief) && Array.isArray(brief.dependencies) ? brief.dependencies[i] : undefined;
         if (!isObj(dependency)) return null;
         warnings.push(
-          `plan: cleared implementationBrief.dependencies[${i}].evidenceRef (${JSON.stringify(dependency.evidenceRef)}): not a related-work evidence id`,
+          `plan: cleared implementationBrief.dependencies[${i}].evidenceRef (${quoteRef(dependency.evidenceRef)}): not a related-work evidence id`,
         );
-        if (typeof dependency.evidenceRef === "string") removedRefs.push(dependency.evidenceRef.trim());
+        if (typeof dependency.evidenceRef === "string") removedRefs.push(sanitizeForStorage(dependency.evidenceRef.trim()));
         dependency.evidenceRef = null;
+        clearedDependencies.add(i);
       }
       continue;
     }
