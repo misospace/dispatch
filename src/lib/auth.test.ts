@@ -19,6 +19,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     auth: vi.fn(),
     auditCreate: vi.fn(),
+    checkRateLimit: vi.fn(),
   },
 }));
 
@@ -35,6 +36,20 @@ vi.mock("./prisma", () => ({
     },
   },
 }));
+
+// The tier-denial audit path is throttled through ./rate-limit. Wrap the
+// real limiter in a vi.fn so individual tests can inject one-shot failures
+// (mocks.checkRateLimit.mockImplementationOnce). The real implementation
+// stays the default behavior, which the throttling tests below depend on —
+// so the block's beforeEach must NOT mockReset this one.
+vi.mock("./rate-limit", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./rate-limit")>();
+  mocks.checkRateLimit.mockImplementation(actual.checkRateLimit);
+  return {
+    ...actual,
+    checkRateLimit: mocks.checkRateLimit,
+  };
+});
 
 function clearAll() {
   delete process.env.DISPATCH_AUTH_MODE;
@@ -526,6 +541,41 @@ describe("bearer token tiers (#1111)", () => {
     const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
     expect(call.data.action).toBe("auth_tier_denied");
     expect(call.data.success).toBe(false);
+  });
+
+  it("a failing audit write never changes the tier-denial decision", async () => {
+    // The audit write is best-effort and sits inside a try/catch: a DB
+    // failure must not turn the 403 denial into a thrown/500 outcome.
+    mocks.auditCreate.mockRejectedValueOnce(new Error("db down"));
+    const forbidden: { authorized: false; forbidden: true; requiredTier: "maintainer" } = {
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    };
+    const result = await authorizeRequest(workerRequest("/api/sync", "POST"));
+    expect(result).toEqual(forbidden);
+    // The write was attempted (then failed) and the result still maps to 403.
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    expect(authErrorResponse(forbidden).status).toBe(403);
+  });
+
+  it("a throwing rate-limiter never changes the tier-denial decision", async () => {
+    // One-shot override on the wrapped limiter: the next checkRateLimit call
+    // throws. Everything after reverts to the real limiter (the mock's
+    // default implementation), so no restoration is needed in beforeEach.
+    mocks.checkRateLimit.mockImplementationOnce(() => {
+      throw new Error("limiter down");
+    });
+    const forbidden: { authorized: false; forbidden: true; requiredTier: "maintainer" } = {
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    };
+    const result = await authorizeRequest(workerRequest("/api/sync", "POST"));
+    expect(result).toEqual(forbidden);
+    // The throw short-circuits before the prisma import: no audit row.
+    expect(mocks.auditCreate).not.toHaveBeenCalled();
+    expect(authErrorResponse(forbidden).status).toBe(403);
   });
 
   it("writes no audit row when the worker token is accepted", async () => {
