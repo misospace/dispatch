@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.66](https://github.com/misospace/dispatch/compare/v0.5.65...v0.5.66) (2026-09-27)
+
+
+### Features
+
+* **groomer:** recheck saved empty searches for freshness ([#1114](https://github.com/misospace/dispatch/issues/1114)) ([ecddbec](https://github.com/misospace/dispatch/commit/ecddbeca4cab4880ae9e0bce1840cb2f4bbfac78))
+* **queue:** honor native GitHub blocked_by dependencies ([#1095](https://github.com/misospace/dispatch/issues/1095)) ([47c7353](https://github.com/misospace/dispatch/commit/47c7353956f336564b3f6ad6924768091e2cca22))
+
+
+### Bug Fixes
+
+* **groomer:** ground already_done closes in the issue's own acceptance ([#1100](https://github.com/misospace/dispatch/issues/1100)) ([124b5b2](https://github.com/misospace/dispatch/commit/124b5b21d46716456f1361650a71fae7c02430f3)), closes [#1099](https://github.com/misospace/dispatch/issues/1099)
+* **pr-fix:** cap fix attempts, not evidence, and always baseline fresh attempts ([#1107](https://github.com/misospace/dispatch/issues/1107)) ([babe44b](https://github.com/misospace/dispatch/commit/babe44be7f8defbad71647a46a4f645092d47e13))
+* **pr-fix:** keep the item URL as the PR URL when CI evidence re-enqueues it ([#1117](https://github.com/misospace/dispatch/issues/1117)) ([f94ba28](https://github.com/misospace/dispatch/commit/f94ba28bc2eceadafc24a3549906dea165397a4b))
+* **pr-fix:** retract needs-human on every exit from BLOCKED ([#1108](https://github.com/misospace/dispatch/issues/1108)) ([0bbdaf7](https://github.com/misospace/dispatch/commit/0bbdaf73d211818088a73793974386d9e0acd0f1)), closes [#1105](https://github.com/misospace/dispatch/issues/1105)
+* **pr-fix:** stale PR-fix items in archived repos and refuse requeuing them ([#1109](https://github.com/misospace/dispatch/issues/1109)) ([cadc05c](https://github.com/misospace/dispatch/commit/cadc05ca2045b71d0a410b3a25b75a6ab087dfef))
+
+
+### Documentation
+
+* **groomer:** define close proof policy ([#1112](https://github.com/misospace/dispatch/issues/1112)) ([7c0348e](https://github.com/misospace/dispatch/commit/7c0348ecb170529121d5974159fc8e43380d25f1))
+
 ## [0.5.65](https://github.com/misospace/dispatch/compare/v0.5.64...v0.5.65) (2026-09-27)
 
 
