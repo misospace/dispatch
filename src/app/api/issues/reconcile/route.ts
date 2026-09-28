@@ -12,7 +12,7 @@ import {
 } from "@/lib/issue-reconciliation";
 import { isBacklogLane } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { reconcileStalePrFixItems } from "@/lib/pr-fix-queue";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
@@ -34,7 +34,7 @@ const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`reconcile:${auth.actor}`, RATE_LIMIT);
@@ -338,8 +338,9 @@ export async function POST(request: Request) {
  * GET endpoint to check reconciliation status and last run time.
  */
 export async function GET(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   try {

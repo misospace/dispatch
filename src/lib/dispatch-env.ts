@@ -1,9 +1,16 @@
 /**
  * Dispatch environment variable resolution.
  *
- * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN, DISPATCH_AGENT_NAME,
- *                     DISPATCH_AUTH_MODE, DISPATCH_AUTH_USERNAME,
- *                     DISPATCH_AUTH_PASSWORD
+ * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN,
+ *                     DISPATCH_MAINTAINER_TOKEN, DISPATCH_WORKER_TOKEN,
+ *                     DISPATCH_AGENT_NAME, DISPATCH_AUTH_MODE,
+ *                     DISPATCH_AUTH_USERNAME, DISPATCH_AUTH_PASSWORD
+ *
+ * Bearer tokens carry a tier:
+ *   - "maintainer" : DISPATCH_AGENT_TOKEN and the optional
+ *                    DISPATCH_MAINTAINER_TOKEN alias — full rights.
+ *   - "worker"     : DISPATCH_WORKER_TOKEN — restricted allowlist of routes
+ *                    (see `requiredTierForRoute` in src/lib/auth.ts).
  *
  * NOTE: This module is imported by src/middleware.ts, which runs in the Edge
  * runtime. It must therefore stay free of Node-only APIs (node:crypto, Buffer,
@@ -78,36 +85,82 @@ export function getDispatchAgentName(): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Accepted tokens (for server-side auth)
+// Accepted tokens and tiers (for server-side auth)
 // ---------------------------------------------------------------------------
 
-let _acceptedTokens: string[] | undefined;
+/**
+ * Bearer token tiers:
+ *   - "maintainer" : full rights (DISPATCH_AGENT_TOKEN, DISPATCH_MAINTAINER_TOKEN)
+ *   - "worker"     : restricted allowlist (DISPATCH_WORKER_TOKEN)
+ */
+export type TokenTier = "worker" | "maintainer";
+
+let _tokenTiers: Array<{ token: string; tier: TokenTier }> | undefined;
 
 /**
- * Return all configured agent tokens that should be accepted for inbound auth.
+ * Return the canonical token→tier table built from the environment:
+ *   - DISPATCH_AGENT_TOKEN     → "maintainer"
+ *   - DISPATCH_MAINTAINER_TOKEN → "maintainer"
+ *   - DISPATCH_WORKER_TOKEN    → "worker"
+ *
+ * Entries are ordered maintainer-first, and the tier lookup
+ * (`getBearerTokenTier`) resolves duplicates with maintainer winning.
  */
-export function getAcceptedAgentTokens(): string[] {
-  if (_acceptedTokens !== undefined) return _acceptedTokens;
+export function getAcceptedTokenTiers(): Array<{ token: string; tier: TokenTier }> {
+  if (_tokenTiers !== undefined) return _tokenTiers;
 
-  const tokens: string[] = [];
-  const token = process.env.DISPATCH_AGENT_TOKEN;
-  if (token) tokens.push(token);
+  const tiers: Array<{ token: string; tier: TokenTier }> = [];
+  const agentToken = process.env.DISPATCH_AGENT_TOKEN;
+  if (agentToken) tiers.push({ token: agentToken, tier: "maintainer" });
 
-  _acceptedTokens = tokens;
-  return _acceptedTokens;
+  const maintainerToken = process.env.DISPATCH_MAINTAINER_TOKEN;
+  if (maintainerToken) tiers.push({ token: maintainerToken, tier: "maintainer" });
+
+  const workerToken = process.env.DISPATCH_WORKER_TOKEN;
+  if (workerToken) tiers.push({ token: workerToken, tier: "worker" });
+
+  _tokenTiers = tiers;
+  return _tokenTiers;
 }
 
 /**
- * Check if a bearer token is authorized. Uses timing-safe comparison.
+ * Return all configured bearer tokens that should be accepted for inbound auth,
+ * derived from the token→tier table (de-duplicated).
+ */
+export function getAcceptedAgentTokens(): string[] {
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const { token } of getAcceptedTokenTiers()) {
+    if (!seen.has(token)) {
+      seen.add(token);
+      tokens.push(token);
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Resolve the tier of a bearer token using timing-safe comparison against each
+ * configured token. Returns null when the token matches no configured token.
+ * If the same value is configured for multiple tiers, "maintainer" wins.
+ */
+export function getBearerTokenTier(token: string | null | undefined): TokenTier | null {
+  if (!token) return null;
+
+  let workerMatch = false;
+  for (const { token: configured, tier } of getAcceptedTokenTiers()) {
+    if (!safeEqual(configured, token)) continue;
+    if (tier === "maintainer") return "maintainer";
+    workerMatch = true;
+  }
+  return workerMatch ? "worker" : null;
+}
+
+/**
+ * Check if a bearer token is authorized (any tier). Uses timing-safe comparison.
  */
 export function isAuthorizedBearerToken(token: string | null | undefined): boolean {
-  if (!token) return false;
-  const accepted = getAcceptedAgentTokens();
-
-  for (const acceptedToken of accepted) {
-    if (safeEqual(acceptedToken, token)) return true;
-  }
-  return false;
+  return getBearerTokenTier(token) !== null;
 }
 
 /**
@@ -136,5 +189,5 @@ export function resetCaches(): void {
   _cachedUrl = undefined;
   _cachedToken = undefined;
   _cachedAgentName = undefined;
-  _acceptedTokens = undefined;
+  _tokenTiers = undefined;
 }

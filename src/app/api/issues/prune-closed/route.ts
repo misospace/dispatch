@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
@@ -9,7 +9,7 @@ const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`prune-closed:${auth.actor}`, RATE_LIMIT);

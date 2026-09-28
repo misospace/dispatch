@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -52,7 +52,7 @@ function toItem(w: any): AgentWorkItem {
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const { searchParams } = new URL(request.url);
@@ -129,7 +129,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`agent-work:${auth.actor}`, { limit: 30, windowMs: 10_000 });

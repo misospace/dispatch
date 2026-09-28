@@ -1,6 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
+const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn().mockResolvedValue(null),
@@ -16,6 +18,7 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -528,5 +531,55 @@ describe("POST /api/issues/unclaim — guards", () => {
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent"],
+    } as never);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
+  });
+
+  function workerPost(xAgentName: string) {
+    return POST(
+      authedRequest("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        body: makePayload(),
+        token: WORKER_TOKEN,
+        headers: { "x-agent-name": xAgentName },
+      }),
+    );
+  }
+
+  it("allows a worker to release its own claim (x-agent-name matches)", async () => {
+    const res = await workerPost("test-agent");
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+  });
+
+  it("returns 403 when a worker releases another agent's claim", async () => {
+    const res = await workerPost("other-agent");
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe("Releasing another agent's claim requires a maintainer token");
+    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "unclaim_issue",
+        success: false,
+        errorMessage: "Releasing another agent's claim requires a maintainer token",
+      }),
+    });
   });
 });

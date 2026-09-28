@@ -5,7 +5,7 @@ import { syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import { syncIssuesForRepos, makePrismaIssueStore, fetchAllStateIssues } from "@/lib/issue-sync";
 import { runGroomingFreshnessPassBestEffort } from "@/lib/groomer/freshness-invalidation";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 
@@ -16,7 +16,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 60_000 };
 export async function POST(request: NextRequest) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`sync:${auth.actor}`, RATE_LIMIT);

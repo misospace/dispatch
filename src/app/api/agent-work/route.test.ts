@@ -3,6 +3,12 @@ import { makeDispatchEnvMock } from "@/test/route-helpers";
 
 vi.mock("@/lib/auth", () => ({
   authorizeRequest: vi.fn(),
+  authErrorResponse: vi.fn((auth: { forbidden?: boolean }) =>
+    new Response(JSON.stringify({ error: auth.forbidden ? "Forbidden" : "Unauthorized" }), {
+      status: auth.forbidden ? 403 : 401,
+      headers: { "content-type": "application/json" },
+    }),
+  ),
 }));
 
 const mockAgentWork = {
@@ -108,7 +114,7 @@ function makeGetRequest(url: string) {
 describe("GET /api/agent-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
     agentWork.findMany.mockResolvedValue([]);
     lease.findMany.mockResolvedValue([]);
   });
@@ -727,7 +733,7 @@ describe("POST /api/agent-work", () => {
   describe("POST auth", () => {
     beforeEach(() => {
       vi.clearAllMocks();
-      mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+      mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
     });
 
     it("returns 401 when token is invalid", async () => {

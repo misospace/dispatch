@@ -10,6 +10,12 @@ const { mocks } = vi.hoisted(() => ({
 
 vi.mock("@/lib/auth", () => ({
   authorizeRequest: vi.fn(),
+  authErrorResponse: vi.fn((auth: { forbidden?: boolean }) =>
+    new Response(JSON.stringify({ error: auth.forbidden ? "Forbidden" : "Unauthorized" }), {
+      status: auth.forbidden ? 403 : 401,
+      headers: { "content-type": "application/json" },
+    }),
+  ),
 }));
 
 vi.mock("@/lib/prisma", () => ({
@@ -47,7 +53,7 @@ function makeActiveWorkRequest(agentName: string) {
 describe("GET /api/agents/:agentName/active-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
     // Default: return the same lease for both findFirst calls (resolveActiveWork and leaseId fetch)
     mocks.leaseFindFirst.mockResolvedValue({
       id: "l-1",

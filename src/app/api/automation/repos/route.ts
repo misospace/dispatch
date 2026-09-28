@@ -5,11 +5,12 @@ import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { isValidRepoName } from "@/lib/config";
 import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 
 export async function GET(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
   try {
     const repos = await prisma.automationRepo.findMany({
@@ -73,8 +74,9 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   let body: unknown;

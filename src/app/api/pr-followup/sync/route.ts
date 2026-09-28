@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems } from "@/lib/pr-fix-queue";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { fetchPullRequestCommitMessages } from "@/lib/github";
@@ -85,7 +85,7 @@ interface GithubCheckRun {
 export async function POST(request: NextRequest) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`pr-followup-sync:${auth.actor}`, { limit: 10, windowMs: 60_000 });

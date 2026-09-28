@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 
 interface RouteContext {
   params: Promise<{ repo: string[] }>;
@@ -85,7 +85,7 @@ export async function GET(request: Request, context: RouteContext) {
 export async function DELETE(request: Request, context: RouteContext) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
   const auditActor = getAuthorizedActor(auth, request);
 

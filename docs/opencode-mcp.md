@@ -25,7 +25,7 @@ npx prisma generate
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
 | `DISPATCH_AGENT_NAME` | No | Default agent identity used when MCP tools omit `agentName`. Set this to a stable operator identity such as `jory-opencode` for manual OpenCode usage. **Do not use generic identities like `Dispatch MCP`.** |
 
-The token is **never** printed or logged. Missing variables produce a clear error on startup.
+The token is **never** printed or logged. Missing variables produce a clear error on startup. The MCP bridge is an operator/bridge client, so it keeps the maintainer token; autonomous workers can use `DISPATCH_WORKER_TOKEN` (worker tier) for their own loop.
 
 ## Running the Server
 

@@ -5,7 +5,7 @@ import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 
 type ActionPayload = {
   issueId?: string;
@@ -19,7 +19,7 @@ type ActionPayload = {
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
   const auditActor = getAuthorizedActor(auth, request);
 

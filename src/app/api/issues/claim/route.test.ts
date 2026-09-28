@@ -1,6 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
+const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn(), updateIssue: vi.fn(), createAuditLog: vi.fn(),
@@ -21,6 +23,7 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -456,5 +459,49 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
     const res = await POST(makeRequest());
     expect(res.status).toBe(400);
     expect((await res.json()).error).toBe("Cannot claim a done issue");
+  });
+});
+
+describe("POST /api/issues/claim — worker tier (#1111)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseCreate.mockResolvedValue({ id: "l-1", agentName: "worker-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+  });
+
+  function workerRequest(overrides = {}) {
+    const payload = { ...makePayload({ agentName: "worker-agent" }), ...overrides };
+    return authedRequest("http://localhost/api/issues/claim", {
+      method: "POST",
+      body: payload,
+      token: WORKER_TOKEN,
+      headers: { "x-agent-name": "worker-agent" },
+    });
+  }
+
+  it("returns 403 when a worker force-claims", async () => {
+    const res = await POST(workerRequest({ force: true }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe("Force claim requires a maintainer token");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: false,
+        errorMessage: "Force claim requires a maintainer token",
+      }),
+    });
+  });
+
+  it("allows a worker to claim without force", async () => {
+    const res = await POST(workerRequest());
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
   });
 });

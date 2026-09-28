@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { resolvePrFixFromAgentReport, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr", "groom"] as const;
@@ -109,8 +109,9 @@ export async function POST(
   const { agentName } = await params;
 
   // Authenticate
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   let body: unknown;

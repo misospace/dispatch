@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import {
   releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue,
@@ -15,7 +15,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`unclaim:${auth.actor}`, RATE_LIMIT);
@@ -38,6 +38,30 @@ export async function POST(request: Request) {
     // Validate required fields
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
+    }
+
+    // Worker tokens may only release their own claim: releasing another
+    // agent's claim requires a maintainer token (#1111).
+    const callerIdentity = request.headers.get("x-agent-name")?.trim();
+    if (auth.type === "bearer" && auth.tier === "worker" && callerIdentity !== agentName) {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor: agentName as string,
+            action: "unclaim_issue",
+            repoFullName: repoFullName as string,
+            issueNumber: issueNumber as number,
+            issueId: issueId as string,
+            beforeLabels: [],
+            afterLabels: [],
+            success: false,
+            errorMessage: "Releasing another agent's claim requires a maintainer token",
+          },
+        });
+      } catch {
+        // Audit log failure should not mask the 403
+      }
+      return errorResponse("Releasing another agent's claim requires a maintainer token", 403);
     }
 
     const agentLabel = `${AGENT_PREFIX}${agentName}` as const;

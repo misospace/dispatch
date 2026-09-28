@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
@@ -12,7 +12,7 @@ const BATCH_SIZE = DEFAULT_STALE_WORK_BATCH_SIZE;
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const lock = await acquireLock("stale-work");

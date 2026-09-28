@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS } from "@/types";
 import { isRenovateIssue } from "@/lib/agent-queue";
 import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 
 /**
  * GET /api/issues/untriaged
@@ -32,8 +32,9 @@ interface UntriagedIssue {
 }
 
 export async function GET(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   try {

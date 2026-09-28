@@ -2,6 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@/lib/auth", () => ({
   authorizeRequest: vi.fn(),
+  authErrorResponse: vi.fn((auth: { forbidden?: boolean }) =>
+    new Response(JSON.stringify({ error: auth.forbidden ? "Forbidden" : "Unauthorized" }), {
+      status: auth.forbidden ? 403 : 401,
+      headers: { "content-type": "application/json" },
+    }),
+  ),
 }));
 
 vi.mock("@/lib/prisma", () => ({
@@ -22,7 +28,7 @@ const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 describe("GET /api/automation/workflows/[id]", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
   });
 
   it("returns 401 when not authenticated", async () => {

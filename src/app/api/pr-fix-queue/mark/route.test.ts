@@ -1,9 +1,13 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual, authedRequest } from "@/test/route-helpers";
 
+const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
+
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMockWithSafeEqual());
+vi.mock("@/lib/dispatch-env", () =>
+  makeDispatchEnvMockWithSafeEqual(mockToken, { [WORKER_TOKEN]: "worker" }),
+);
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -230,5 +234,77 @@ describe("POST /api/pr-fix-queue/mark", () => {
 
     expect(res.status).toBe(200);
     expect(mocks.isPrFixRepoArchived).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/pr-fix-queue/mark — worker tier (#1111)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.prFixQueueClient.mockReturnValue({});
+    mocks.auditLogCreate.mockResolvedValue({ id: "log-1" });
+    mocks.isPrFixRepoArchived.mockResolvedValue(false);
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "FIXED" } });
+  });
+
+  function workerPost(body: unknown) {
+    return POST(
+      authedRequest("http://localhost/api/pr-fix-queue/mark", {
+        method: "POST",
+        body,
+        token: WORKER_TOKEN,
+        headers: { "x-agent-name": "worker-agent" },
+      }),
+    );
+  }
+
+  it("allows a worker to mark an item FIXED with a generation", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "FIXED", expectedGeneration: 2 });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "FIXED" } });
+
+    const res = await workerPost({ repo: "org/repo", pr: 42, status: "FIXED", generation: 2 });
+
+    expect(res.status).toBe(200);
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ status: "FIXED", expectedGeneration: 2 }),
+    );
+  });
+
+  it("returns 403 when a worker marks an item QUEUED", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "QUEUED", expectedGeneration: 2 });
+
+    const res = await workerPost({ repo: "org/repo", pr: 42, status: "QUEUED", generation: 2 });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe("Marking an item QUEUED or IGNORED requires a maintainer token");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "pr_fix_mark",
+        success: false,
+        errorMessage: "Marking an item QUEUED or IGNORED requires a maintainer token",
+      }),
+    });
+  });
+
+  it("returns 403 when a worker marks an item IGNORED", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "IGNORED", expectedGeneration: 2 });
+
+    const res = await workerPost({ repo: "org/repo", pr: 42, status: "IGNORED", generation: 2 });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe("Marking an item QUEUED or IGNORED requires a maintainer token");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("allows a maintainer to mark an item QUEUED", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "QUEUED", expectedGeneration: 2 });
+    mocks.isPrFixRepoArchived.mockResolvedValue(false);
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "QUEUED" } });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, status: "QUEUED", generation: 2 });
+
+    expect(res.status).toBe(200);
+    expect(mocks.markPrFixItem).toHaveBeenCalled();
   });
 });

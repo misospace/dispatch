@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
 /** Statuses this endpoint will list. Kept narrow: it exists to find claimed work,
@@ -8,8 +8,9 @@ import { prisma } from "@/lib/prisma";
 const ALLOWED_CLAIMED_STATUSES = ["in-progress", "ready"];
 
 export async function GET(request: Request) {
-  if (!(await authorizeRequest(request)).authorized) {
-    return errorResponse("Unauthorized", 401);
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
   }
 
   const { searchParams } = new URL(request.url);
