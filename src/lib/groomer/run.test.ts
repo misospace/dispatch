@@ -41,7 +41,7 @@ const { mocks } = vi.hoisted(() => ({
     applications: new Map<string, Record<string, any>>(),
     prisma: {
       automationRepo: { findUnique: vi.fn() },
-      groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn() },
+      groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn(), findMany: vi.fn() },
       groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
@@ -111,7 +111,14 @@ vi.mock("./groomer-lock", () => ({
   HEARTBEAT_MS: 30_000,
 }));
 
-import { captureFailureReason, runHostedGroomer, UNVERIFIABLE_RETRY_BACKOFF_MINUTES } from "./run";
+import {
+  captureFailureReason,
+  FAILED_RUN_BACKOFF_MAX_MINUTES,
+  FAILED_RUN_PRIOR_FAILURES_TO_CAP,
+  failedRunBackoffMinutes,
+  runHostedGroomer,
+  UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
+} from "./run";
 import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
@@ -282,6 +289,7 @@ describe("runHostedGroomer", () => {
     mocks.prisma.groomingRun.create.mockResolvedValue(mockGroomingRun);
     mocks.prisma.groomingRun.update.mockResolvedValue({ ...mockGroomingRun, stage: "planned" });
     mocks.prisma.groomingRun.findFirst.mockResolvedValue(null);
+    mocks.prisma.groomingRun.findMany.mockResolvedValue([]);
     mocks.prisma.issue.update.mockResolvedValue({ id: "issue-42" });
     mocks.prisma.issueLane.create.mockResolvedValue({ id: "lane-1" });
     mocks.prisma.agentRun.create.mockResolvedValue({ id: "run-1" });
@@ -2159,6 +2167,208 @@ Investigate session handling in auth module.`;
       await runHostedGroomer();
       const written = mocks.updateIssueLabels.mock.calls[0][2] as string[];
       expect(written.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
+    });
+  });
+
+  describe("backoff after a failed run (dispatch#1125)", () => {
+    const MINUTE = 60 * 1000;
+
+    function backoffWrites(): Array<Record<string, unknown>> {
+      return mocks.prisma.issue.update.mock.calls
+        .map((c) => c[0].data as Record<string, unknown>)
+        .filter((data) => "groomingRetryAfter" in data);
+    }
+
+    /** The backoff written by the run, in minutes from now (rounded). */
+    function backoffMinutes(): number {
+      const writes = backoffWrites();
+      expect(writes).toHaveLength(1);
+      return Math.round(((writes[0].groomingRetryAfter as Date).getTime() - Date.now()) / MINUTE);
+    }
+
+    /**
+     * Earlier runs for the issue, newest first. The mock applies the query's
+     * status filter and take, as the database would.
+     */
+    function history(...statuses: string[]) {
+      mocks.prisma.groomingRun.findMany.mockImplementation(
+        async ({ where, take }: { where: { status?: { not?: string } }; take?: number }) =>
+          statuses
+            .filter((status) => status !== where.status?.not)
+            .slice(0, take)
+            .map((status) => ({ status })),
+      );
+    }
+
+    /** The data the run was completed with. */
+    function completedRun(): Record<string, any> {
+      const call = mocks.prisma.groomingRun.update.mock.calls.findLast((c) => "completedAt" in c[0].data);
+      expect(call).toBeDefined();
+      return call![0].data;
+    }
+
+    it("backs the issue off after an LLM timeout, writing only the backoff", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+      expect(mocks.prisma.issue.update).toHaveBeenCalledTimes(1);
+      expect(Object.keys(mocks.prisma.issue.update.mock.calls[0][0].data)).toEqual(["groomingRetryAfter"]);
+      expect(mocks.prisma.issue.update.mock.calls[0][0].where).toEqual({ id: "issue-42" });
+      expect(backoffMinutes()).toBe(30);
+      // The streak is read from this issue's earlier write-mode runs.
+      expect(mocks.prisma.groomingRun.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { issueId: "issue-42", dryRun: false, id: { not: "gr-1" }, status: { not: "running" } },
+          orderBy: { createdAt: "desc" },
+          take: FAILED_RUN_PRIOR_FAILURES_TO_CAP,
+        }),
+      );
+    });
+
+    it("backs the issue off when the plan fails validation or the output is unparseable", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(backoffMinutes()).toBe(30);
+
+      mocks.prisma.issue.update.mockClear();
+      mocks.callGroomerLLM.mockRejectedValue(new Error("Failed to parse LLM response as JSON: {oops"));
+      await expect(runHostedGroomer()).rejects.toThrow(/Failed to parse LLM response as JSON/);
+      expect(backoffMinutes()).toBe(30);
+    });
+
+    it("lengthens the backoff with each consecutive failure, up to the cap", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      const cases: Array<[string[], number]> = [
+        [[], 30],
+        [["failed"], 60],
+        [["failed", "failed"], 120],
+        [["failed", "failed", "failed"], 240],
+        [Array(9).fill("failed"), FAILED_RUN_BACKOFF_MAX_MINUTES],
+      ];
+      for (const [statuses, minutes] of cases) {
+        mocks.prisma.issue.update.mockClear();
+        history(...statuses);
+        await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+        expect(backoffMinutes()).toBe(minutes);
+      }
+    });
+
+    it("restarts the streak after any non-failed outcome, and ignores runs interrupted mid-flight", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      history("completed", "failed", "failed", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(30);
+
+      mocks.prisma.issue.update.mockClear();
+      history("running", "failed", "partial", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(60);
+
+      mocks.prisma.issue.update.mockClear();
+      history("failed", "running", "running", "unverifiable", "failed", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(60);
+    });
+
+    it("does not let interrupted runs truncate the streak (more than 10 raw rows)", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      const interrupted = Array(4).fill("running");
+      history(...interrupted, "failed", ...interrupted, "failed", ...interrupted, "failed", "completed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      // The fourth consecutive failure once interrupted runs are skipped: the cap.
+      expect(backoffMinutes()).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
+      const query = mocks.prisma.groomingRun.findMany.mock.calls[0][0];
+      expect(query.where.status).toEqual({ not: "running" });
+    });
+
+    it("clears the backoff once a later groom applies", async () => {
+      mocks.callGroomerLLM.mockRejectedValueOnce(new Error("LLM timeout"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(30);
+
+      mocks.prisma.issue.update.mockClear();
+      await runHostedGroomer();
+      expect(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).toMatchObject({ groomingRetryAfter: null });
+    });
+
+    it("backs off a failure in any stage, and records the stage it failed in", async () => {
+      // Repository context, before anything is recorded past selection.
+      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
+      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "selected" });
+
+      // Exploration: a tool loop on the same model, which can time out too.
+      mocks.prisma.issue.update.mockClear();
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockRejectedValueOnce(new Error("exploration timed out"));
+      await expect(runHostedGroomer()).rejects.toThrow(/exploration timed out/);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "context_built" });
+
+      // Apply: the first GitHub write did not land.
+      mocks.prisma.issue.update.mockClear();
+      mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mocks.updateIssueLabels.mockRejectedValue(new Error("GitHub API error: 422"));
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Groomed." } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Grooming mutation failed at labels/);
+      errSpy.mockRestore();
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "validated" });
+    });
+
+    it("records the stage a validation failure happened in, not \"selected\"", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "context_built" });
+
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue(mockExploration);
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "explored" });
+    });
+
+    it("keeps only the unreadable-issue backoff when that path then fails", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValueOnce(new Error("boom"));
+      mocks.prisma.agentRun.create.mockRejectedValueOnce(new Error("db blip"));
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      warnSpy.mockRestore();
+      expect(backoffMinutes()).toBe(UNVERIFIABLE_RETRY_BACKOFF_MINUTES);
+      expect(mocks.prisma.groomingRun.findMany).not.toHaveBeenCalled();
+    });
+
+    it("a dry run writes no backoff", async () => {
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
+      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
+      expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    });
+
+    it("still fails with the model error, recorded, when the backoff cannot be written", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      mocks.prisma.issue.update.mockRejectedValueOnce(new Error("db blip"));
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+      expect(mocks.prisma.agentRun.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: "failed", errorMessage: "LLM timeout" }) }),
+      );
+      expect(mocks.prisma.auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ success: false, errorMessage: "LLM timeout" }) }),
+      );
+    });
+
+    it("schedules 30m, 60m, 120m, then caps at 240m", () => {
+      expect([1, 2, 3, 4, 5, 20].map(failedRunBackoffMinutes)).toEqual([30, 60, 120, 240, 240, 240]);
+      // Reading this many prior outcomes is exactly enough to reach the cap.
+      expect(FAILED_RUN_PRIOR_FAILURES_TO_CAP).toBe(3);
+      expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP)).toBeLessThan(FAILED_RUN_BACKOFF_MAX_MINUTES);
+      expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP + 1)).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
     });
   });
 });
