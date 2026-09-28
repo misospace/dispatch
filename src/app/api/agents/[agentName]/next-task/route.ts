@@ -66,34 +66,45 @@ export async function GET(
 
     if (prFixItems.length > 0) {
       const first = prFixItems[0];
-      // Stamp the hand-out first, then re-read the row so evidence that
-      // enqueued in the gap ships in this payload or is flagged for a reopen
-      // rather than being swallowed (#1119). Best-effort: a failure here only
-      // loses freshness tracking, never the task.
+      // Stamp the hand-out on the FIRST hand-out of this generation only:
+      // the OR clause matches rows not yet stamped at `first.generation`.
+      // Re-hand-outs of a still-QUEUED generation (polling workers re-fetch
+      // every ~30s) must not re-stamp or clear postDispatchEvidenceKeys, so
+      // evidence enqueued mid-run survives for settlement to flag (#1119).
+      // The row is always re-read after the stamp so evidence enqueued in
+      // the gap ships in this payload or is flagged for a reopen rather than
+      // being swallowed. Best-effort: a failure here only loses freshness
+      // tracking, never the task.
       let dispatchReason = first.reason;
       let dispatchFeedback = first.feedback;
       try {
-        const { count } = await prisma.prFixQueueItem.updateMany({
-          where: { id: first.id, generation: first.generation },
+        await prisma.prFixQueueItem.updateMany({
+          where: {
+            id: first.id,
+            generation: first.generation,
+            OR: [
+              { dispatchedGeneration: null },
+              { dispatchedGeneration: { not: first.generation } },
+            ],
+          },
           data: {
             dispatchedAt: new Date(),
             dispatchedGeneration: first.generation,
-            postDispatchEvidence: false,
+            postDispatchEvidenceKeys: [],
           },
         });
-        if (count === 1) {
-          const fresh = await prisma.prFixQueueItem.findUnique({
-            where: { id: first.id },
-            select: { reason: true, feedback: true },
-          });
-          if (fresh) {
-            dispatchReason = fresh.reason;
-            dispatchFeedback = fresh.feedback ?? [];
+        const fresh = await prisma.prFixQueueItem.findUnique({
+          where: { id: first.id },
+          select: { reason: true, feedback: true, generation: true },
+        });
+        if (fresh) {
+          if (fresh.generation !== first.generation) {
+            // Generation moved between the queue read and the stamp: another
+            // attempt took over. Log so the race is visible (#1119).
+            console.warn(`next-task pr-fix hand-out re-read for ${first.repo}#${first.pr}: generation moved`);
           }
-        } else {
-          // Generation moved between the queue read and the stamp: another
-          // attempt took over. Log so the race is visible (#1119).
-          console.warn(`next-task pr-fix hand-out skipped for ${first.repo}#${first.pr}: generation moved`);
+          dispatchReason = fresh.reason;
+          dispatchFeedback = fresh.feedback ?? [];
         }
       } catch (error) {
         console.error(`next-task pr-fix dispatch tracking update failed for ${first.repo}#${first.pr}:`, error);

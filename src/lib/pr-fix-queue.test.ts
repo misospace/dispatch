@@ -41,13 +41,23 @@ vi.mock("./github-prs", () => ({
   fetchPullRequestHeadSha: githubPrsMocks.fetchPullRequestHeadSha,
 }));
 
-function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
+function makeClient(): PrFixQueueClient & {
+  items: any[];
+  history: any[];
+  hooks: { beforeUpdateMany: (() => void) | null };
+} {
   const items: any[] = [];
   const history: any[] = [];
   let seq = 0;
   const client: any = {
     items,
     history,
+    // One-shot gap hook (#1119): a test sets it to land a concurrent enqueue
+    // right before a conditional updateMany — i.e. inside the read→write gap
+    // the settlement guard is meant to catch. (A findUnique hook cannot hit
+    // that window: the mark's pre-check read is repo_pr-form and its post-write
+    // re-read is id-form, with no read between them.)
+    hooks: { beforeUpdateMany: null },
     $transaction: async (fn: any) => fn(client),
     prFixQueueItem: {
       findUnique: async ({ where }: any) => {
@@ -65,7 +75,7 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
           // #1119 dispatch-tracking columns: default to their schema values so a
           // freshly created row reads back as "never dispatched, no post-dispatch
           // evidence".
-          postDispatchEvidence: false, // mirrors the column's @default(false)
+          postDispatchEvidenceKeys: [], // mirrors the column's @default([])
           dispatchedGeneration: null, // Int? — no hand-out recorded yet
           dispatchedAt: null, // DateTime? — no hand-out recorded yet
           queuedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
@@ -89,12 +99,21 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
         return items[idx];
       },
       updateMany: async ({ where, data }: any) => {
+        if (client.hooks.beforeUpdateMany) {
+          const hook = client.hooks.beforeUpdateMany;
+          client.hooks.beforeUpdateMany = null;
+          hook();
+        }
         // Generation-conditional (and/or id-scoped) bulk write — mirrors the
-        // real client's commit-time revalidation semantics for #1074.
+        // real client's commit-time revalidation semantics for #1074, plus
+        // the post-dispatch evidence guard ({ equals: [...] }) for #1119.
         const matches = items.filter(
           (i) =>
             (where.id === undefined || i.id === where.id) &&
-            (where.generation === undefined || i.generation === where.generation),
+            (where.generation === undefined || i.generation === where.generation) &&
+            (where.postDispatchEvidenceKeys === undefined ||
+              JSON.stringify(i.postDispatchEvidenceKeys ?? []) ===
+                JSON.stringify(where.postDispatchEvidenceKeys.equals ?? [])),
         );
         for (const match of matches) {
           const idx = items.findIndex((i) => i.id === match.id);
@@ -1861,10 +1880,10 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     });
 
     // Pre-hand-out new evidence joins the same in-flight attempt: no
-    // generation bump, and the post-dispatch flag stays false.
+    // generation bump, and the post-dispatch key list stays empty.
     expect(after.status).toBe("QUEUED");
     expect(after.generation).toBe(1);
-    expect(after.postDispatchEvidence).toBe(false);
+    expect(after.postDispatchEvidenceKeys).toEqual([]);
     expect(client.items[0].evidenceKeys).toEqual(["review:1", "review:2"]);
   });
 
@@ -1880,10 +1899,10 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
       repo: "org/repo", pr: 22, lane: "NORMAL", reason: "r", feedback: "f2",
       evidenceKey: "review:2", headSha: "H1",
     });
-    // New evidence lands on a dispatched QUEUED item: flagged, same attempt.
+    // New evidence lands on a dispatched QUEUED item: recorded, same attempt.
     expect(after.status).toBe("QUEUED");
     expect(after.generation).toBe(1);
-    expect(after.postDispatchEvidence).toBe(true);
+    expect(after.postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 22, status: "BLOCKED",
@@ -1896,7 +1915,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(reopened.generation).toBe(2);
     expect(reopened.fixAttempts).toBe(2);
     expect(reopened.lane).toBe("NORMAL");
-    expect(reopened.postDispatchEvidence).toBe(false);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
   });
 
   it("evidence after hand-out turns a FIXED settlement into a fresh QUEUED attempt (regardless of head movement)", async () => {
@@ -1910,7 +1929,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
       repo: "org/repo", pr: 23, lane: "NORMAL", reason: "r", feedback: "f2",
       evidenceKey: "review:2", headSha: "H1",
     });
-    expect(after.postDispatchEvidence).toBe(true);
+    expect(after.postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
 
     // Head has NOT moved — a plain FIXED would trip the #940 guard. The
     // #1119 redirect must fire first, before the guard even runs.
@@ -1926,7 +1945,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(reopened.status).toBe("QUEUED");
     expect(reopened.generation).toBe(2);
     expect(reopened.fixAttempts).toBe(2);
-    expect(reopened.postDispatchEvidence).toBe(false);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
     // The #1119 reopen note (not a #940 refusal) proves the redirect won.
     expect(client.history.at(-1).note).toContain("1119");
     // The #940 guard never ran: no GitHub head round-trip.
@@ -1940,12 +1959,12 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     });
     client.items[0].dispatchedGeneration = client.items[0].generation;
 
-    // No new evidence: re-observing a known key leaves the flag false.
+    // No new evidence: re-observing a known key leaves the key list empty.
     const after = await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 24, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
     });
-    expect(after.postDispatchEvidence).toBe(false);
+    expect(after.postDispatchEvidenceKeys).toEqual([]);
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 24, status: "BLOCKED",
@@ -1956,7 +1975,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     const marked = mutatedItem(result);
     expect(marked.status).toBe("BLOCKED");
     expect(marked.lane).toBe("NEEDS_HUMAN");
-    expect(marked.postDispatchEvidence).toBe(false);
+    expect(marked.postDispatchEvidenceKeys).toEqual([]);
     // No reopen: generation and attempt count are untouched.
     expect(marked.generation).toBe(1);
     expect(marked.fixAttempts).toBe(1);
@@ -1969,12 +1988,12 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     });
     client.items[0].dispatchedGeneration = client.items[0].generation;
 
-    // No new evidence: re-observing a known key leaves the flag false.
+    // No new evidence: re-observing a known key leaves the key list empty.
     const after = await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 25, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
     });
-    expect(after.postDispatchEvidence).toBe(false);
+    expect(after.postDispatchEvidenceKeys).toEqual([]);
 
     // Head HAS moved relative to the baseline, so the #940 guard passes and
     // the FIXED is accepted (reusing the #940/#1074 "head moved" pattern).
@@ -1989,7 +2008,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     const marked = mutatedItem(result);
     expect(marked.status).toBe("FIXED");
     expect(marked.generation).toBe(1); // not reopened
-    expect(marked.postDispatchEvidence).toBe(false);
+    expect(marked.postDispatchEvidenceKeys).toEqual([]);
   });
 
   it("post-dispatch evidence past the attempt cap gives up to a human", async () => {
@@ -2003,7 +2022,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
       repo: "org/repo", pr: 26, lane: "NORMAL", reason: "r", feedback: "f2",
       evidenceKey: "review:2", headSha: "H1",
     });
-    expect(after.postDispatchEvidence).toBe(true);
+    expect(after.postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
 
     // Push the item to the attempt cap (maxPrFixAttempts defaults to 5).
     client.items[0].fixAttempts = 5;
@@ -2017,7 +2036,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     const capped = mutatedItem(result);
     expect(capped.status).toBe("BLOCKED");
     expect(capped.lane).toBe("NEEDS_HUMAN");
-    expect(capped.postDispatchEvidence).toBe(false);
+    expect(capped.postDispatchEvidenceKeys).toEqual([]);
     // Gave up: no generation bump, no attempt increment.
     expect(capped.generation).toBe(1);
     expect(capped.fixAttempts).toBe(5);
@@ -2034,7 +2053,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
       repo: "org/repo", pr: 27, lane: "NORMAL", reason: "r", feedback: "f2",
       evidenceKey: "review:2", headSha: "H1",
     });
-    expect(after.postDispatchEvidence).toBe(true);
+    expect(after.postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
     expect(after.generation).toBe(1);
 
     // The report carries a stale generation token (G+1, G is 1).
@@ -2044,9 +2063,238 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     });
 
     expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
-    // The item is untouched: still QUEUED at generation 1, flag still set.
+    // The item is untouched: still QUEUED at generation 1, keys still set.
     expect(client.items[0].status).toBe("QUEUED");
     expect(client.items[0].generation).toBe(1);
-    expect(client.items[0].postDispatchEvidence).toBe(true);
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
+  });
+
+  it("a post-dispatch check on a SUPERSEDED head does NOT reopen: the FIXED settles and the keys are cleared", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 28, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // A failing check recorded at head H1 lands after the hand-out.
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 28, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#28:42", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#28:42@H1"]);
+
+    // The PR head has moved past H1: the recorded check is stale (the worker
+    // already pushed past it), so the settlement is not actionable.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 28, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const marked = mutatedItem(result);
+    expect(marked.status).toBe("FIXED");
+    expect(marked.generation).toBe(1); // not reopened
+    expect(marked.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("a post-dispatch check whose recorded head IS still the PR head reopens as a fresh attempt", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 29, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 29, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#29:43", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#29:43@H1"]);
+
+    // The PR head is STILL H1: the failing check is current, so it is
+    // actionable and the settlement reopens.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 29, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.fixAttempts).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    // The #1119 reopen note proves the check entry drove the reopen.
+    expect(client.history.at(-1).note).toContain("1119");
+  });
+
+  it("a post-dispatch check recorded without a head (unknown) reopens without any head fetch", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 30, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // Enqueued without a head observation: the entry records "unknown".
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 30, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#30:77",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#30:77@unknown"]);
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 30, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    // An "unknown" head is actionable as-is: no GitHub round-trip.
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("mixed entries (stale check + review) reopen via the review without any head fetch", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 31, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // Two post-dispatch entries: a check (listed first) and a review.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 31, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#31:88", headSha: "H1",
+    });
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 31, lane: "NORMAL", reason: "r", feedback: "f3",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual([
+      "check_run:org/repo#31:88@H1",
+      "review:2@H1",
+    ]);
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 31, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    // The review entry short-circuits: the check's head is never fetched.
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("evidence landing in the read→write gap reopens instead of being swallowed (#1119)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 32, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // A review lands between markPrFixItem's pre-check read and its
+    // conditional settlement write: the one-shot updateMany hook applies it
+    // right before the write, so the guard's { equals: [] } predicate no-ops
+    // the settlement and the gap logic re-decides on the fresh row.
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].postDispatchEvidenceKeys = ["review:2@H1"];
+    };
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 32, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.fixAttempts).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    // The gap-reopen note says the evidence landed mid-settlement.
+    expect(client.history.at(-1).note).toContain("in flight");
+  });
+
+  it("a post-dispatch check with an unavailable head (fetch resolves null) reopens instead of absorbing", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 33, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 33, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#33:55", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#33:55@H1"]);
+
+    // fetchPullRequestHeadSha swallows network errors and RESOLVES null —
+    // the conservative rule must treat that as actionable, not absorb.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 33, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("a post-dispatch check whose head fetch throws reopens instead of absorbing", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 34, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 34, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#34:66", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#34:66@H1"]);
+
+    githubPrsMocks.fetchPullRequestHeadSha.mockRejectedValue(new Error("unexpected throw"));
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 34, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("a STALE mark clears the recorded post-dispatch keys (terminal, moot)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 35, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 35, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["review:2@H1"]);
+
+    const marked = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 35, status: "stale" }));
+    expect(marked.status).toBe("STALE");
+    expect(marked.postDispatchEvidenceKeys).toEqual([]);
   });
 });

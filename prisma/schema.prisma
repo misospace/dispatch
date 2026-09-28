@@ -177,8 +177,12 @@ model PrFixQueueItem {
   dispatchedAt       DateTime?
   // New (previously-unrecorded) evidence arrived AFTER the current generation
   // was handed out (#1119): the in-flight worker cannot see it, so settlement
-  // must reopen a fresh attempt instead of absorbing it.
-  postDispatchEvidence Boolean @default(false)
+  // must reopen a fresh attempt instead of absorbing it. Records the evidence
+  // keys that arrived after the hand-out, each encoded as
+  // `<evidenceKey>@<head>` where <head> is the enqueue's observed headSha
+  // (trimmed) or the literal "unknown" when none was recorded. Empty list =
+  // nothing to act on; cleared on every fresh attempt and settlement.
+  postDispatchEvidenceKeys String[] @default([])
   author       String?
   history      PrFixHistory[]
 

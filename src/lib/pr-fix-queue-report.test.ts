@@ -329,7 +329,16 @@ describe("resolvePrFixFromAgentReport", () => {
   // re-issue bumps the row before the conditional write, so the
   // generation-qualified updateMany matches nothing.
   it("skips settlement when the conditional write matches nothing (concurrent re-issue between read and commit)", async () => {
-    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FIXTURE_ITEM });
+    // Faithful re-issue mock (#1119): the token lookup and markPrFixItem's
+    // pre-read see generation 1; the in-transaction re-read after the guarded
+    // write no-ops sees the row re-issued at a newer generation. A guarded
+    // write that misses while the row still reads back at the SAME generation
+    // with empty keys is impossible — the keys guard is exactly what turns a
+    // miss at unchanged generation into a re-issue signal.
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM })
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM })
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM, generation: 2 });
     (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
     fetchPullRequestMergeStateMock.mockResolvedValue({ mergeable: true, mergeableState: "clean" });
 
@@ -348,7 +357,13 @@ describe("resolvePrFixFromAgentReport", () => {
   });
 
   it("writes no BLOCKED state when a blocked report hits a concurrent re-issue at commit time", async () => {
-    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FIXTURE_ITEM });
+    // Same faithful re-issue chain as the FIXED case above (#1119): the
+    // guarded BLOCKED write must not retry once the re-read shows the row
+    // moved — exactly one updateMany call.
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM })
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM })
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM, generation: 2 });
     (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
 
     const result = await resolvePrFixFromAgentReport(baseInput({
@@ -359,9 +374,12 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(result.matched).toBe(true);
     expect(result.action).toBe("skipped");
     expect(result.reason).toContain("generation-mismatch");
-    // The BLOCKED write was generation-conditional and matched nothing.
+    // The BLOCKED write was generation-conditional (and, for a settlement,
+    // guarded on the post-dispatch evidence list being empty, #1119) and
+    // matched nothing.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith({
-      where: { id: "item-42", generation: 1 },
+      where: { id: "item-42", generation: 1, postDispatchEvidenceKeys: { equals: [] } },
       data: expect.objectContaining({ status: "BLOCKED" }),
     });
     expect(prisma.prFixQueueItem.update).not.toHaveBeenCalled();
