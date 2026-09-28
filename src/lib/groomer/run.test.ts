@@ -1762,6 +1762,35 @@ Investigate session handling in auth module.`;
         warn.mockRestore();
       });
 
+      it("fails with the original parse error when the repair turn is skipped: no draft to degrade, nothing unsafe stored", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        // The real error class, so its storage-safe message is what is tested.
+        const { GroomerOutputParseError } = await vi.importActual<typeof import("./llm")>("./llm");
+        const original = new GroomerOutputParseError("Let me read the key files.\u0000 <tool_call>\u0007read_file</tool_call>");
+        mocks.callGroomerLLM.mockImplementationOnce(async () => {
+          clock.mockReturnValue(start + 9.5 * 60_000);
+          throw original;
+        });
+
+        const err = await runHostedGroomer().catch((e: unknown) => e);
+
+        expect(err).toBe(original);
+        expect(original.message).toBe("Failed to parse LLM response as JSON: Let me read the key files. <tool_call>read_file</tool_call>");
+        expect(mocks.callGroomerLLM).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("skipped the repair turn"));
+        // A parse failure leaves no parsed draft, so there is nothing to degrade
+        // and no rawOutput is written: the run fails exactly as before #1126.
+        const writes = mocks.prisma.groomingRun.update.mock.calls.map((call) => call[0].data);
+        expect(writes.some((data) => "rawOutput" in data || "validationErrors" in data)).toBe(false);
+        // What is persisted is the storage-safe message.
+        const unsafe = /[\u0000-\u0008\u000B-\u001F]/;
+        const failed = writes.find((data) => data.status === "failed");
+        expect(failed!.errorMessage).toBe(original.message);
+        expect(failed!.errorMessage).not.toMatch(unsafe);
+        expect(mocks.prisma.agentRun.create.mock.calls.at(-1)![0].data.errorMessage).not.toMatch(unsafe);
+        warn.mockRestore();
+      });
+
       it("still degrades when the repair turn was skipped", async () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         mocks.callGroomerLLM.mockImplementationOnce(async () => {
