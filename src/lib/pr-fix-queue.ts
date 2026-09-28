@@ -334,6 +334,19 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       // must keep the identity stable.
       const isFreshAttempt = resolvedStatus === "QUEUED" && existing.status !== "QUEUED";
 
+      // Evidence that arrives AFTER this generation was handed to a worker cannot
+      // reach the worker already running on it, so flag it: settlement must open a
+      // fresh attempt instead of absorbing it into the in-flight one (#1119).
+      // Evidence arriving before hand-out (dispatchedGeneration !== generation, or
+      // never dispatched) still joins the same attempt, as before.
+      const dispatchedThisGeneration =
+        existing.dispatchedGeneration != null && existing.dispatchedGeneration === existing.generation;
+      const isPostDispatchNewEvidence =
+        !isTerminalStatus &&
+        !isKnownEvidence &&
+        existing.status === "QUEUED" &&
+        dispatchedThisGeneration;
+
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
@@ -362,6 +375,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
                 attemptHeadSha: input.headSha ?? existing.headSha ?? null,
               }
             : {}),
+          // Post-dispatch evidence flag (#1119): set when new evidence lands on
+          // a dispatched QUEUED item; cleared on any fresh attempt. Mutually
+          // exclusive with isFreshAttempt (one requires QUEUED, the other not).
+          ...(isPostDispatchNewEvidence ? { postDispatchEvidence: true } : {}),
+          ...(isFreshAttempt ? { postDispatchEvidence: false } : {}),
           ...metadataPatch(input),
         },
       });
@@ -549,6 +567,62 @@ export async function markPrFixItem(
   // badge actually means something and so the bridge's ACTIONABLE_LANES
   // filter continues to skip them. See bridge/prfix.py ACTIONABLE_LANES.
   const data: Record<string, unknown> = { status: nextStatus };
+  // Every mark clears the post-dispatch evidence flag (#1119) so a stale flag
+  // cannot linger and retrigger a reopen on a later mark.
+  data.postDispatchEvidence = false;
+
+  // A settlement (FIXED/BLOCKED) on an item that received new evidence after its
+  // current generation was handed out must NOT absorb that evidence: reopen as a
+  // fresh dispatchable attempt so a worker actually runs on it (#1119). A capped
+  // item still gives up to a human, matching the other fresh-attempt caps.
+  const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED";
+  const reopenOnPostDispatch = settlesAttempt && existing.postDispatchEvidence === true;
+  if (reopenOnPostDispatch) {
+    const reopenCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
+    const reopenData: Record<string, unknown> = reopenCapped
+      ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidence: false }
+      : {
+          status: "QUEUED",
+          lane: "NORMAL",
+          ...freshAttemptGeneration(),
+          fixAttempts: { increment: 1 },
+          attemptHeadSha: existing.headSha ?? existing.attemptHeadSha ?? null,
+          postDispatchEvidence: false,
+        };
+    const reopened = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: {
+          id: existing.id,
+          ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        },
+        data: reopenData,
+      });
+      if (count !== 1) return null;
+      await tx.prFixHistory.create({
+        data: {
+          itemId: existing.id,
+          action: "mark",
+          status: reopenData.status,
+          lane: reopenData.lane,
+          note: reopenCapped
+            ? `New evidence arrived after this attempt was handed out, but bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+            : `New evidence arrived after this attempt was handed out; reopened as a fresh attempt at the current head (#1119).`,
+        },
+      });
+      return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    });
+    if (!reopened) return { mutated: false, reason: "generation-mismatch" };
+    if (reopenCapped && existing.status !== "BLOCKED") {
+      const context = await buildPrFixBlockedContext(client, reopened);
+      await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: reopened.reason, latestNote: input.note ?? null, context });
+    } else if (!reopenCapped) {
+      // Leaving (a would-be) settlement back to a live QUEUED attempt: make sure a
+      // needs-human marker is not left behind and surface the new attempt (#1119).
+      await retractNeedsHuman(input.repo, input.pr, "requeued", input.note);
+    }
+    return { mutated: true, item: reopened };
+  }
+
   if (nextStatus === "BLOCKED") {
     data.lane = "NEEDS_HUMAN";
   } else if (nextStatus === "QUEUED") {
@@ -875,6 +949,9 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
         ...freshAttemptGeneration(),
         fixAttempts: 1,
         attemptHeadSha: existing.headSha ?? null,
+        // A fresh operator requeue must not carry a stale post-dispatch flag
+        // from a prior attempt (#1119).
+        postDispatchEvidence: false,
       },
     });
     await tx.prFixHistory.create({

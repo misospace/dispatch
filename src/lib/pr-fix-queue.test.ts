@@ -62,6 +62,12 @@ function makeClient(): PrFixQueueClient & { items: any[]; history: any[] } {
           id: `item-${++seq}`,
           generation: 1, // mirrors the column's @default(1)
           fixAttempts: 1, // mirrors the column's @default(1)
+          // #1119 dispatch-tracking columns: default to their schema values so a
+          // freshly created row reads back as "never dispatched, no post-dispatch
+          // evidence".
+          postDispatchEvidence: false, // mirrors the column's @default(false)
+          dispatchedGeneration: null, // Int? — no hand-out recorded yet
+          dispatchedAt: null, // DateTime? — no hand-out recorded yet
           queuedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           updatedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           ...data,
@@ -1825,5 +1831,222 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
     surfacingMocks.surfacePrFixUnblocked.mockRejectedValue(new Error("network down"));
     const result = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" });
     expect(mutatedItem(result).status).toBe("FIXED");
+  });
+});
+
+describe("post-dispatch evidence reopens the attempt (#1119)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixUnblocked.mockReset();
+    surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+  });
+
+  it("evidence arriving before hand-out stays the same attempt", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 21, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    // Never handed out: dispatchedGeneration stays null.
+    expect(client.items[0].dispatchedGeneration).toBeNull();
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 21, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+
+    // Pre-hand-out new evidence joins the same in-flight attempt: no
+    // generation bump, and the post-dispatch flag stays false.
+    expect(after.status).toBe("QUEUED");
+    expect(after.generation).toBe(1);
+    expect(after.postDispatchEvidence).toBe(false);
+    expect(client.items[0].evidenceKeys).toEqual(["review:1", "review:2"]);
+  });
+
+  it("evidence after hand-out turns a BLOCKED settlement into a fresh QUEUED attempt", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 22, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    // Simulate next-task handing the attempt out.
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 22, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    // New evidence lands on a dispatched QUEUED item: flagged, same attempt.
+    expect(after.status).toBe("QUEUED");
+    expect(after.generation).toBe(1);
+    expect(after.postDispatchEvidence).toBe(true);
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 22, status: "BLOCKED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.fixAttempts).toBe(2);
+    expect(reopened.lane).toBe("NORMAL");
+    expect(reopened.postDispatchEvidence).toBe(false);
+  });
+
+  it("evidence after hand-out turns a FIXED settlement into a fresh QUEUED attempt (regardless of head movement)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 23, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 23, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    expect(after.postDispatchEvidence).toBe(true);
+
+    // Head has NOT moved — a plain FIXED would trip the #940 guard. The
+    // #1119 redirect must fire first, before the guard even runs.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 23, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.fixAttempts).toBe(2);
+    expect(reopened.postDispatchEvidence).toBe(false);
+    // The #1119 reopen note (not a #940 refusal) proves the redirect won.
+    expect(client.history.at(-1).note).toContain("1119");
+    // The #940 guard never ran: no GitHub head round-trip.
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("no post-dispatch evidence settles BLOCKED as today", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 24, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // No new evidence: re-observing a known key leaves the flag false.
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 24, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    expect(after.postDispatchEvidence).toBe(false);
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 24, status: "BLOCKED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const marked = mutatedItem(result);
+    expect(marked.status).toBe("BLOCKED");
+    expect(marked.lane).toBe("NEEDS_HUMAN");
+    expect(marked.postDispatchEvidence).toBe(false);
+    // No reopen: generation and attempt count are untouched.
+    expect(marked.generation).toBe(1);
+    expect(marked.fixAttempts).toBe(1);
+  });
+
+  it("no post-dispatch evidence settles FIXED as today", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 25, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // No new evidence: re-observing a known key leaves the flag false.
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 25, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    expect(after.postDispatchEvidence).toBe(false);
+
+    // Head HAS moved relative to the baseline, so the #940 guard passes and
+    // the FIXED is accepted (reusing the #940/#1074 "head moved" pattern).
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H-moved");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 25, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const marked = mutatedItem(result);
+    expect(marked.status).toBe("FIXED");
+    expect(marked.generation).toBe(1); // not reopened
+    expect(marked.postDispatchEvidence).toBe(false);
+  });
+
+  it("post-dispatch evidence past the attempt cap gives up to a human", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 26, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 26, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    expect(after.postDispatchEvidence).toBe(true);
+
+    // Push the item to the attempt cap (maxPrFixAttempts defaults to 5).
+    client.items[0].fixAttempts = 5;
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 26, status: "BLOCKED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const capped = mutatedItem(result);
+    expect(capped.status).toBe("BLOCKED");
+    expect(capped.lane).toBe("NEEDS_HUMAN");
+    expect(capped.postDispatchEvidence).toBe(false);
+    // Gave up: no generation bump, no attempt increment.
+    expect(capped.generation).toBe(1);
+    expect(capped.fixAttempts).toBe(5);
+  });
+
+  it("a stale settlement token cannot reopen on post-dispatch evidence", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 27, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 27, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    expect(after.postDispatchEvidence).toBe(true);
+    expect(after.generation).toBe(1);
+
+    // The report carries a stale generation token (G+1, G is 1).
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 27, status: "FIXED",
+      expectedGeneration: 2,
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    // The item is untouched: still QUEUED at generation 1, flag still set.
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(1);
+    expect(client.items[0].postDispatchEvidence).toBe(true);
   });
 });

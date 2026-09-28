@@ -170,6 +170,15 @@ model PrFixQueueItem {
   // (#1103): 1 on creation, +1 per fresh attempt. PR_FIX_MAX_ATTEMPTS bounds
   // this, not evidence keys — one review can carry many comment keys.
   fixAttempts  Int            @default(1)
+  // Last next-task hand-out of this item (#1119): the generation handed to
+  // the worker (NULL = never dispatched in its current life) and the
+  // wall-clock of that hand-out.
+  dispatchedGeneration Int?
+  dispatchedAt       DateTime?
+  // New (previously-unrecorded) evidence arrived AFTER the current generation
+  // was handed out (#1119): the in-flight worker cannot see it, so settlement
+  // must reopen a fresh attempt instead of absorbing it.
+  postDispatchEvidence Boolean @default(false)
   author       String?
   history      PrFixHistory[]
 

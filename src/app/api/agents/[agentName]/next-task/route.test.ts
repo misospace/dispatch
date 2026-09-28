@@ -9,6 +9,8 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
     prFixFindMany: vi.fn(),
+    prFixFindUnique: vi.fn(),
+    prFixUpdateMany: vi.fn(),
     findLeasedIssueIds: vi.fn(),
   },
 }));
@@ -16,7 +18,11 @@ const { mocks } = vi.hoisted(() => ({
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findMany: mocks.issueFindMany },
-    prFixQueueItem: { findMany: mocks.prFixFindMany },
+    prFixQueueItem: {
+      findMany: mocks.prFixFindMany,
+      findUnique: mocks.prFixFindUnique,
+      updateMany: mocks.prFixUpdateMany,
+    },
   },
   asPrFixQueueClient: (client: any) => client,
 }));
@@ -119,6 +125,8 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
+    mocks.prFixFindUnique.mockResolvedValue(null);
+    mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
   });
@@ -344,6 +352,89 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const secondBody = await second.json();
     expect(secondBody.type).toBe("followup-pr");
     expect(secondBody.prFixItem).toEqual({ id: itemId, generation: 2 });
+  });
+
+  it("stamps the hand-out with a generation-conditional update (#1119)", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-1",
+        repo: "org/repo",
+        pr: 12,
+        issue: null,
+        branch: "fix/something",
+        url: "https://github.com/org/repo/pull/12",
+        title: "Fix something",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "CI failure on main",
+        feedback: ["update tests"],
+        evidenceKeys: ["ci:1"],
+        author: "bot",
+        generation: 2,
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(mocks.prFixUpdateMany).toHaveBeenCalledWith({
+      where: { id: "prfix-1", generation: 2 },
+      data: expect.objectContaining({
+        dispatchedAt: expect.any(Date),
+        dispatchedGeneration: 2,
+        postDispatchEvidence: false,
+      }),
+    });
+  });
+
+  it("feeds the re-read row's fresh feedback into the task payload (#1119)", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-1",
+        repo: "org/repo",
+        pr: 12,
+        issue: null,
+        branch: "fix/something",
+        url: "https://github.com/org/repo/pull/12",
+        title: "Fix something",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "CI failure on main",
+        feedback: ["update tests"],
+        evidenceKeys: ["ci:1"],
+        author: "bot",
+        generation: 2,
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+    mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.prFixFindUnique.mockResolvedValue({
+      reason: "CI failure on main",
+      feedback: ["update tests", "fix lint (enqueued after the hand-out read)"],
+    });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(body.reasons).toContain("CI failure on main");
+    expect(body.reasons).toContain("update tests");
+    // Only present in the re-read row — proves the payload reasons come from
+    // the fresh row, not the stale queue snapshot.
+    expect(body.reasons).toContain("fix lint (enqueued after the hand-out read)");
   });
 
   it("includes linked issue context when PR-fix has an issue number", async () => {
