@@ -506,8 +506,19 @@ describe("POST /api/issues/claim — worker tier (#1111)", () => {
     const res = await POST(workerRequest({ force: true }));
     expect(res.status).toBe(403);
     expect((await res.json()).error).toBe("Force claim requires a maintainer token");
-    // The write was attempted (then failed); nothing else was touched.
+    // The write was attempted (then failed) with the denial payload;
+    // nothing else was touched.
     expect(mocks.createAuditLog).toHaveBeenCalledTimes(1);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: false,
+        errorMessage: "Force claim requires a maintainer token",
+        actor: "worker-agent",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+      }),
+    });
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
     expect(mocks.updateIssue).not.toHaveBeenCalled();

@@ -297,8 +297,19 @@ describe("POST /api/pr-fix-queue/mark — worker tier (#1111)", () => {
 
     expect(res.status).toBe(403);
     expect((await res.json()).error).toBe("Marking an item QUEUED or IGNORED requires a maintainer token");
-    // The write was attempted (then failed); the queue item is untouched.
+    // The write was attempted (then failed) with the denial payload; the
+    // queue item is untouched.
     expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.auditLogCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "pr_fix_mark",
+        success: false,
+        errorMessage: "Marking an item QUEUED or IGNORED requires a maintainer token",
+        actor: "worker-agent",
+        repoFullName: "org/repo",
+        issueNumber: null,
+      }),
+    });
     expect(mocks.markPrFixItem).not.toHaveBeenCalled();
   });
 

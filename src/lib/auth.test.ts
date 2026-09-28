@@ -44,10 +44,10 @@ vi.mock("./prisma", () => ({
 // real limiter in a vi.fn so individual tests can inject one-shot failures
 // (mocks.checkRateLimit.mockImplementationOnce). The real implementation is
 // stashed on mocks.realCheckRateLimit here and re-asserted as the mock's
-// default in the tier describe's beforeEach — a reset-proof pattern: a
-// mockReset() in that beforeEach can never strip the default the
-// throttling tests depend on, while a per-test mockImplementationOnce
-// still wins (it is queued ahead of the default).
+// default in the tier describe's beforeEach, immediately after a
+// mockReset() (which also flushes any queued one-shots) — a reset-proof
+// pattern, while a per-test mockImplementationOnce still wins (it is
+// queued ahead of the default).
 vi.mock("./rate-limit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./rate-limit")>();
   mocks.realCheckRateLimit = actual.checkRateLimit;
@@ -476,11 +476,14 @@ describe("bearer token tiers (#1111)", () => {
     resetRateLimits();
     mocks.auth.mockReset();
     mocks.auditCreate.mockReset();
-    // Reset-proofing: re-assert the real limiter (stashed on
-    // mocks.realCheckRateLimit by the vi.mock factory) as the mock's
-    // default implementation on every test, so a mockReset() here can
-    // never strip it. Per-test mockImplementationOnce overrides still
+    // Reset-proofing: mockReset() clears both the implementation and any
+    // queued mockImplementationOnce entries (so a one-shot left over from an
+    // earlier test cannot leak into this one), which is why the real limiter
+    // (stashed on mocks.realCheckRateLimit by the vi.mock factory) is
+    // re-asserted as the mock's default immediately after. Per-test
+    // mockImplementationOnce overrides (set in the test, after this) still
     // win, as they are queued ahead of the default.
+    mocks.checkRateLimit.mockReset();
     mocks.checkRateLimit.mockImplementation(mocks.realCheckRateLimit);
     process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
   });
