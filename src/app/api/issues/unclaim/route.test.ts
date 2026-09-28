@@ -551,35 +551,27 @@ describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
     mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
   });
 
-  function workerPost(xAgentName: string) {
+  function workerPost(payload = makePayload()) {
     return POST(
       authedRequest("http://localhost/api/issues/unclaim", {
         method: "POST",
-        body: makePayload(),
+        body: payload,
         token: WORKER_TOKEN,
-        headers: { "x-agent-name": xAgentName },
       }),
     );
   }
 
-  it("allows a worker to release its own claim (x-agent-name matches)", async () => {
-    const res = await workerPost("test-agent");
+  it("allows a worker to release its own claim without an x-agent-name header", async () => {
+    const res = await workerPost();
     expect(res.status).toBe(200);
     expect((await res.json()).success).toBe(true);
     expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
   });
 
-  it("returns 403 when a worker releases another agent's claim", async () => {
-    const res = await workerPost("other-agent");
-    expect(res.status).toBe(403);
-    expect((await res.json()).error).toBe("Releasing another agent's claim requires a maintainer token");
+  it("returns 400 when a worker's body agentName is not assigned to the issue", async () => {
+    const res = await workerPost(makePayload({ agentName: "other-agent" }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Issue is not assigned to other-agent");
     expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
-    expect(mocks.createAuditLog).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        action: "unclaim_issue",
-        success: false,
-        errorMessage: "Releasing another agent's claim requires a maintainer token",
-      }),
-    });
   });
 });

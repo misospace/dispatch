@@ -40,30 +40,6 @@ export async function POST(request: Request) {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
 
-    // Worker tokens may only release their own claim: releasing another
-    // agent's claim requires a maintainer token (#1111).
-    const callerIdentity = request.headers.get("x-agent-name")?.trim();
-    if (auth.type === "bearer" && auth.tier === "worker" && callerIdentity !== agentName) {
-      try {
-        await prisma.auditLog.create({
-          data: {
-            actor: agentName as string,
-            action: "unclaim_issue",
-            repoFullName: repoFullName as string,
-            issueNumber: issueNumber as number,
-            issueId: issueId as string,
-            beforeLabels: [],
-            afterLabels: [],
-            success: false,
-            errorMessage: "Releasing another agent's claim requires a maintainer token",
-          },
-        });
-      } catch {
-        // Audit log failure should not mask the 403
-      }
-      return errorResponse("Releasing another agent's claim requires a maintainer token", 403);
-    }
-
     const agentLabel = `${AGENT_PREFIX}${agentName}` as const;
     const actor = getAuthorizedActor(auth, request, agentName as string);
     const isAgentSelfUnclaim = auth.type === "bearer" && actor === agentName;

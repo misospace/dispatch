@@ -25,12 +25,12 @@ Dispatch bearer tokens have two tiers. A **worker** token (`DISPATCH_WORKER_TOKE
 
 - `GET /api/agents/{agentName}/next-task`, `POST /api/agents/{agentName}/tasks/report`, `POST /api/agents/{agentName}/heartbeat`, `GET /api/agents/{agentName}/active-work`, `GET /api/agents/{agentName}/queue`, `GET /api/agents/{agentName}/work-summary`
 - `GET /api/agent-work`, `POST /api/agent-work/start`, `POST /api/agent-work/checkpoint`, `POST /api/agent-work/finish`
-- `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (own claim only)
+- `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (bounded by the assignment check — the issue must be assigned to the `agentName` in the request body)
 - `GET /api/issues/state`, `POST /api/issues/status`
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
 - `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
 
-The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, releasing another agent's claim, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only.
+The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up.
 
 ---
 

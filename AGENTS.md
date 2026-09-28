@@ -37,7 +37,7 @@ npm run db:deploy    # Deploy migrations (prod)
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token |
 | `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API (maintainer tier — full rights) |
 | `DISPATCH_MAINTAINER_TOKEN` | No | Optional alias for the maintainer-tier bearer token (same rights as `DISPATCH_AGENT_TOKEN`) |
-| `DISPATCH_WORKER_TOKEN` | No | Worker-tier bearer token for autonomous executors (explicit allowlist: next-task, tasks/report, heartbeat, active-work, queue, work-summary, agent-work start/checkpoint/finish + GET listing, non-force claim / own-claim unclaim, issue state/status, PR-fix queue reads + FIXED/BLOCKED/STALE marks); agent-work operator release/reassign and sweep stay maintainer-only; other routes return 403 |
+| `DISPATCH_WORKER_TOKEN` | No | Worker-tier bearer token for autonomous executors (explicit allowlist: next-task, tasks/report, heartbeat, active-work, queue, work-summary, agent-work start/checkpoint/finish + GET listing, non-force claim / unclaim (assignment-scoped), issue state/status, PR-fix queue reads + FIXED/BLOCKED/STALE marks); agent-work operator release/reassign and sweep stay maintainer-only; other routes return 403 |
 | `GITHUB_REPOSITORIES` | Yes | **One-time** bootstrap seed for tracked repos (comma or newline separated). Read only when `AutomationRepo` is empty. After first seed, manage via `/automation` UI or `POST /api/repos` / `POST /api/automation/repos`. Seeded repos carry `source: "env"`; UI-added repos carry `source: "user"`. |
 | `DISPATCH_URL` | No | Base URL of your Dispatch instance (used by outbound clients and MCP bridge) |
 | `DISPATCH_DATABASE_URL` | No | Alternative database URL alias — used if `DATABASE_URL` is not set |
