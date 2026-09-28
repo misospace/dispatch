@@ -3,6 +3,7 @@ import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 import { buildGroomerSystemPrompt } from "./prompts/system-prompt";
 import { buildGroomingPlanResponseSchema } from "./plan-schema";
 import { renderEvidenceCatalog, type EvidenceCatalog } from "./plan-evidence";
+import { sanitizeForStorage } from "./sanitize";
 
 export interface CallLlmOptions {
   baseUrl: string;
@@ -28,6 +29,30 @@ export interface CallLlmOptions {
    * enum-constrain every evidence id in the response schema.
    */
   evidenceCatalog?: EvidenceCatalog;
+  /**
+   * The repair turn (dispatch#1126): the model's previous answer and the
+   * exact errors it failed with. Sent as an assistant turn plus a user turn
+   * after the original prompt, so the model corrects its own plan with the
+   * full context it was produced from.
+   */
+  repair?: { previousResponse: string; errors: string[] };
+}
+
+/**
+ * The model answered, but not with JSON (dispatch#1126). Carries the full
+ * answer so the repair turn can show the model exactly what it sent; the
+ * message keeps the short prefix the run history has always recorded.
+ */
+export class GroomerOutputParseError extends Error {
+  readonly content: string;
+
+  constructor(content: string) {
+    // The message is persisted as the run's error (Postgres rejects NUL);
+    // `content` stays verbatim for the repair turn to echo back.
+    super(`Failed to parse LLM response as JSON: ${sanitizeForStorage(content.slice(0, 200))}`);
+    this.name = "GroomerOutputParseError";
+    this.content = content;
+  }
 }
 
 const VALID_TYPE_LABELS = ["type/bug", "type/feature", "type/chore", "type/research", "type/security"];
@@ -97,6 +122,51 @@ function buildUserContent(options: CallLlmOptions): string {
   return `${content}\n\n${renderEvidenceCatalog(options.evidenceCatalog)}`;
 }
 
+/**
+ * Cap on the previous answer echoed back in the repair turn. A valid plan
+ * is well under it; the cap only bites on a runaway non-JSON answer.
+ */
+export const MAX_REPAIR_ECHO_BYTES = 32_768;
+
+function clipUtf8(text: string, limit: number): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.byteLength <= limit) return text;
+  const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+  return `${decoder.decode(buf.subarray(0, limit)).replace(/\uFFFD$/, "")}\n… (truncated)`;
+}
+
+/**
+ * The user turn that asks for a corrected plan (dispatch#1126). It informs
+ * rather than constrains: the exact errors, what an evidence-reference error
+ * means, and that this turn has no tools, which is what a final answer made
+ * of <tool_call> text got wrong.
+ */
+export function buildRepairPrompt(errors: string[]): string {
+  return [
+    "Your previous answer could not be used as a grooming plan. Dispatch rejected it with these errors:",
+    "",
+    ...errors.map((error) => `- ${error}`),
+    "",
+    "Return the complete corrected grooming plan as a single JSON object. Fix what the errors name and keep the rest of your analysis unless a fix requires changing it.",
+    'An evidence-reference error means the id is not in "Evidence you can cite", or is the wrong kind of id for that field. relatedWork[].ref and implementationBrief.dependencies[].evidenceRef take only related-work ids ("github:..."); when none fits, drop the relatedWork entry or set evidenceRef to null rather than citing another kind of id.',
+    "No tools are available in this turn. Do not emit tool calls, <tool_call> tags or prose: answer with the JSON object only.",
+  ].join("\n");
+}
+
+function buildMessages(options: CallLlmOptions): Array<{ role: string; content: string }> {
+  const messages = [
+    { role: "system", content: buildSystemPrompt() },
+    { role: "user", content: buildUserContent(options) },
+  ];
+  if (options.repair) {
+    messages.push(
+      { role: "assistant", content: clipUtf8(options.repair.previousResponse, MAX_REPAIR_ECHO_BYTES) },
+      { role: "user", content: buildRepairPrompt(options.repair.errors) },
+    );
+  }
+  return messages;
+}
+
 function postChatCompletion(
   url: string,
   options: CallLlmOptions,
@@ -111,10 +181,7 @@ function postChatCompletion(
     },
     body: JSON.stringify({
       model: options.model,
-      messages: [
-        { role: "system", content: buildSystemPrompt() },
-        { role: "user", content: buildUserContent(options) },
-      ],
+      messages: buildMessages(options),
       response_format: responseFormat,
       temperature: 0.1,
     }),
@@ -266,7 +333,7 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<unknown> 
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      throw new Error(`Failed to parse LLM response as JSON: ${trimmed.slice(0, 200)}`);
+      throw new GroomerOutputParseError(trimmed);
     }
 
     return parsed;

@@ -110,6 +110,11 @@ export interface CaseCandidate {
   name: string;
   /** The raw model output, exactly as the LLM call would return it. */
   output: unknown;
+  /**
+   * The model's answer to the repair turn (dispatch#1126), when `output` is
+   * rejected. Absent, the model repeats `output`.
+   */
+  repair?: unknown;
   expect: CandidateExpectation;
   /**
    * Set when the expected behavior depends on a child issue that has not
