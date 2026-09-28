@@ -77,8 +77,13 @@ export const UNVERIFIABLE_RETRY_BACKOFF_MINUTES = 60;
  */
 export const FAILED_RUN_BACKOFF_BASE_MINUTES = 30;
 export const FAILED_RUN_BACKOFF_MAX_MINUTES = 240;
-/** Prior runs read to count the failure streak; enough to reach the cap. */
-const FAILED_RUN_HISTORY_WINDOW = 10;
+/**
+ * Prior failures that saturate the backoff: with this many before it, a
+ * failure already waits the cap, so the streak never needs more outcomes.
+ */
+export const FAILED_RUN_PRIOR_FAILURES_TO_CAP = Math.ceil(
+  Math.log2(FAILED_RUN_BACKOFF_MAX_MINUTES / FAILED_RUN_BACKOFF_BASE_MINUTES),
+);
 
 export interface GroomerDeps {
   selectCandidate: typeof selectGroomingCandidate;
@@ -1139,20 +1144,21 @@ export function failedRunBackoffMinutes(consecutiveFailures: number): number {
  * this failure plus the failed runs immediately before it: any other outcome
  * (applied, stale, unverifiable, ...) ends it, so a successful groom resets
  * the backoff. A run still marked running was interrupted and recorded no
- * outcome, so it neither counts nor ends the streak. Only the backoff column
- * is written, and a failed write never masks the run's own error.
+ * outcome, so the query leaves it out: it neither counts nor ends the streak,
+ * and any number of them cannot push a real outcome out of the rows read.
+ * Only the backoff column is written, and a failed write never masks the
+ * run's own error.
  */
 async function backOffFailedRun(deps: GroomerDeps, issueId: string, groomingRunId: string): Promise<void> {
   try {
     const prior: Array<{ status: string }> = await deps.prisma.groomingRun.findMany({
-      where: { issueId, dryRun: false, id: { not: groomingRunId } },
+      where: { issueId, dryRun: false, id: { not: groomingRunId }, status: { not: "running" } },
       orderBy: { createdAt: "desc" },
-      take: FAILED_RUN_HISTORY_WINDOW,
+      take: FAILED_RUN_PRIOR_FAILURES_TO_CAP,
       select: { status: true },
     });
     let consecutiveFailures = 1;
     for (const run of prior) {
-      if (run.status === "running") continue;
       if (run.status !== "failed") break;
       consecutiveFailures++;
     }

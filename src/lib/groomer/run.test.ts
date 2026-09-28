@@ -114,6 +114,7 @@ vi.mock("./groomer-lock", () => ({
 import {
   captureFailureReason,
   FAILED_RUN_BACKOFF_MAX_MINUTES,
+  FAILED_RUN_PRIOR_FAILURES_TO_CAP,
   failedRunBackoffMinutes,
   runHostedGroomer,
   UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
@@ -2185,7 +2186,19 @@ Investigate session handling in auth module.`;
       return Math.round(((writes[0].groomingRetryAfter as Date).getTime() - Date.now()) / MINUTE);
     }
 
-    const priorRuns = (...statuses: string[]) => statuses.map((status) => ({ status }));
+    /**
+     * Earlier runs for the issue, newest first. The mock applies the query's
+     * status filter and take, as the database would.
+     */
+    function history(...statuses: string[]) {
+      mocks.prisma.groomingRun.findMany.mockImplementation(
+        async ({ where, take }: { where: { status?: { not?: string } }; take?: number }) =>
+          statuses
+            .filter((status) => status !== where.status?.not)
+            .slice(0, take)
+            .map((status) => ({ status })),
+      );
+    }
 
     /** The data the run was completed with. */
     function completedRun(): Record<string, any> {
@@ -2205,8 +2218,9 @@ Investigate session handling in auth module.`;
       // The streak is read from this issue's earlier write-mode runs.
       expect(mocks.prisma.groomingRun.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { issueId: "issue-42", dryRun: false, id: { not: "gr-1" } },
+          where: { issueId: "issue-42", dryRun: false, id: { not: "gr-1" }, status: { not: "running" } },
           orderBy: { createdAt: "desc" },
+          take: FAILED_RUN_PRIOR_FAILURES_TO_CAP,
         }),
       );
     });
@@ -2233,22 +2247,38 @@ Investigate session handling in auth module.`;
       ];
       for (const [statuses, minutes] of cases) {
         mocks.prisma.issue.update.mockClear();
-        mocks.prisma.groomingRun.findMany.mockResolvedValue(priorRuns(...statuses));
+        history(...statuses);
         await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
         expect(backoffMinutes()).toBe(minutes);
       }
     });
 
-    it("restarts the streak after a success, and ignores runs interrupted mid-flight", async () => {
+    it("restarts the streak after any non-failed outcome, and ignores runs interrupted mid-flight", async () => {
       mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
-      mocks.prisma.groomingRun.findMany.mockResolvedValue(priorRuns("completed", "failed", "failed", "failed"));
+      history("completed", "failed", "failed", "failed");
       await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
       expect(backoffMinutes()).toBe(30);
 
       mocks.prisma.issue.update.mockClear();
-      mocks.prisma.groomingRun.findMany.mockResolvedValue(priorRuns("running", "failed", "partial", "failed"));
+      history("running", "failed", "partial", "failed");
       await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
       expect(backoffMinutes()).toBe(60);
+
+      mocks.prisma.issue.update.mockClear();
+      history("failed", "running", "running", "unverifiable", "failed", "failed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      expect(backoffMinutes()).toBe(60);
+    });
+
+    it("does not let interrupted runs truncate the streak (more than 10 raw rows)", async () => {
+      mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+      const interrupted = Array(4).fill("running");
+      history(...interrupted, "failed", ...interrupted, "failed", ...interrupted, "failed", "completed");
+      await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      // The fourth consecutive failure once interrupted runs are skipped: the cap.
+      expect(backoffMinutes()).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
+      const query = mocks.prisma.groomingRun.findMany.mock.calls[0][0];
+      expect(query.where.status).toEqual({ not: "running" });
     });
 
     it("clears the backoff once a later groom applies", async () => {
@@ -2335,6 +2365,10 @@ Investigate session handling in auth module.`;
 
     it("schedules 30m, 60m, 120m, then caps at 240m", () => {
       expect([1, 2, 3, 4, 5, 20].map(failedRunBackoffMinutes)).toEqual([30, 60, 120, 240, 240, 240]);
+      // Reading this many prior outcomes is exactly enough to reach the cap.
+      expect(FAILED_RUN_PRIOR_FAILURES_TO_CAP).toBe(3);
+      expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP)).toBeLessThan(FAILED_RUN_BACKOFF_MAX_MINUTES);
+      expect(failedRunBackoffMinutes(FAILED_RUN_PRIOR_FAILURES_TO_CAP + 1)).toBe(FAILED_RUN_BACKOFF_MAX_MINUTES);
     });
   });
 });
