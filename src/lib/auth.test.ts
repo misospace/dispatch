@@ -693,4 +693,51 @@ describe("bearer token tiers (#1111)", () => {
       tier: "maintainer",
     });
   });
+
+  it("enforces the worker allowlist in basic mode, not just legacy", async () => {
+    // basic mode: authenticateRequest parses the bearer and resolves its tier
+    // before the mode branch, so the tier table must apply identically here
+    // (regression lock — previously only legacy mode was covered).
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "operator";
+    process.env.DISPATCH_AUTH_PASSWORD = "s3cret";
+
+    // Maintainer-only route: worker token is forbidden, not silently rejected.
+    await expect(authorizeRequest(workerRequest("/api/sync", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+
+    // Worker-allowlisted route: same token resolves at worker tier.
+    await expect(authorizeRequest(workerRequest("/api/agents/saffron/next-task"))).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+    });
+  });
+
+  it("enforces the worker allowlist in oidc mode, not just legacy", async () => {
+    // oidc mode: the bearer path is structurally identical to legacy — no
+    // OIDC env vars are needed for bearer resolution (validateOidcConfig is
+    // a startup-only check) and the NextAuth session lookup is only reached
+    // when header auth fails. The worker allowlist must still apply.
+    process.env.DISPATCH_AUTH_MODE = "oidc";
+
+    // Maintainer-only route: worker token is forbidden, and the OIDC session
+    // fallback must not rescue it.
+    await expect(authorizeRequest(workerRequest("/api/agent-work/sweep", "POST"))).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+    expect(mocks.auth).not.toHaveBeenCalled();
+
+    // Worker-allowlisted route: same token resolves at worker tier.
+    await expect(authorizeRequest(workerRequest("/api/agents/saffron/next-task"))).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+    });
+  });
 });
