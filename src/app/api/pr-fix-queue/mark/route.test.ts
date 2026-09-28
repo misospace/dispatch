@@ -287,6 +287,21 @@ describe("POST /api/pr-fix-queue/mark — worker tier (#1111)", () => {
     });
   });
 
+  it("still returns 403 when the worker denial audit write fails", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "QUEUED", expectedGeneration: 2 });
+    // The 403 path's audit row is best-effort: a failing write must not
+    // mask the denial or settle the queue item.
+    mocks.auditLogCreate.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await workerPost({ repo: "org/repo", pr: 42, status: "QUEUED", generation: 2 });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe("Marking an item QUEUED or IGNORED requires a maintainer token");
+    // The write was attempted (then failed); the queue item is untouched.
+    expect(mocks.auditLogCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
   it("returns 403 when a worker marks an item IGNORED", async () => {
     mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "IGNORED", expectedGeneration: 2 });
 

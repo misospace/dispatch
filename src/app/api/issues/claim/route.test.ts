@@ -499,6 +499,21 @@ describe("POST /api/issues/claim — worker tier (#1111)", () => {
     });
   });
 
+  it("still returns 403 when the worker denial audit write fails", async () => {
+    // The 403 path's audit row is best-effort: a failing write must not
+    // mask the denial or leak into label/lease state.
+    mocks.createAuditLog.mockRejectedValueOnce(new Error("db down"));
+    const res = await POST(workerRequest({ force: true }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe("Force claim requires a maintainer token");
+    // The write was attempted (then failed); nothing else was touched.
+    expect(mocks.createAuditLog).toHaveBeenCalledTimes(1);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+  });
+
   it("allows a worker to claim without force", async () => {
     const res = await POST(workerRequest());
     expect(res.status).toBe(200);

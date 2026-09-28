@@ -13,13 +13,16 @@ import {
   validateOidcConfig,
   authorizeGroomerRequest,
 } from "./auth";
-import { resetRateLimits } from "./rate-limit";
+import { resetRateLimits, type RateLimitOptions, type RateLimitResult } from "./rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     auth: vi.fn(),
     auditCreate: vi.fn(),
     checkRateLimit: vi.fn(),
+    // Stashed by the vi.mock factory below so the tier describe's
+    // beforeEach can re-assert the real limiter as the mock's default.
+    realCheckRateLimit: null as unknown as (key: string, opts: RateLimitOptions) => RateLimitResult,
   },
 }));
 
@@ -39,11 +42,15 @@ vi.mock("./prisma", () => ({
 
 // The tier-denial audit path is throttled through ./rate-limit. Wrap the
 // real limiter in a vi.fn so individual tests can inject one-shot failures
-// (mocks.checkRateLimit.mockImplementationOnce). The real implementation
-// stays the default behavior, which the throttling tests below depend on —
-// so the block's beforeEach must NOT mockReset this one.
+// (mocks.checkRateLimit.mockImplementationOnce). The real implementation is
+// stashed on mocks.realCheckRateLimit here and re-asserted as the mock's
+// default in the tier describe's beforeEach — a reset-proof pattern: a
+// mockReset() in that beforeEach can never strip the default the
+// throttling tests depend on, while a per-test mockImplementationOnce
+// still wins (it is queued ahead of the default).
 vi.mock("./rate-limit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./rate-limit")>();
+  mocks.realCheckRateLimit = actual.checkRateLimit;
   mocks.checkRateLimit.mockImplementation(actual.checkRateLimit);
   return {
     ...actual,
@@ -469,6 +476,12 @@ describe("bearer token tiers (#1111)", () => {
     resetRateLimits();
     mocks.auth.mockReset();
     mocks.auditCreate.mockReset();
+    // Reset-proofing: re-assert the real limiter (stashed on
+    // mocks.realCheckRateLimit by the vi.mock factory) as the mock's
+    // default implementation on every test, so a mockReset() here can
+    // never strip it. Per-test mockImplementationOnce overrides still
+    // win, as they are queued ahead of the default.
+    mocks.checkRateLimit.mockImplementation(mocks.realCheckRateLimit);
     process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
   });
   afterEach(() => {
