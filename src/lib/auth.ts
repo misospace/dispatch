@@ -29,6 +29,7 @@
 
 import { NextResponse } from "next/server";
 import { errorResponse } from "./api-errors";
+import { getAuthMode, resetAuthModeCache } from "./auth-mode";
 import {
   getBearerTokenTier,
   isAuthorizedBearerToken as _isAuthed,
@@ -38,35 +39,12 @@ import {
 } from "./dispatch-env";
 
 // ---------------------------------------------------------------------------
-// Auth mode resolution
+// Auth mode resolution (delegates to the client-safe auth-mode module; the
+// full auth module lazily imports Prisma for tier-denial audits and must not
+// be pulled into client bundles)
 // ---------------------------------------------------------------------------
 
-let _cachedAuthMode: "basic" | "oidc" | "disabled" | undefined;
-
-/**
- * Resolve the authentication mode.
- *
- * - "basic"    : Require HTTP Basic Auth for all requests
- * - "oidc"     : OIDC session-based auth (enforced by NextAuth, not middleware)
- * - "disabled" : No auth enforcement (open access)
- * - undefined  : Legacy mode — no middleware enforcement; routes use Bearer token checks
- */
-export function getAuthMode(): "basic" | "oidc" | "disabled" | undefined {
-  if (_cachedAuthMode !== undefined) return _cachedAuthMode;
-
-  const mode = process.env.DISPATCH_AUTH_MODE;
-  if (mode === "basic") {
-    _cachedAuthMode = "basic";
-  } else if (mode === "oidc") {
-    _cachedAuthMode = "oidc";
-  } else if (mode === "disabled") {
-    _cachedAuthMode = "disabled";
-  } else {
-    _cachedAuthMode = undefined;
-  }
-
-  return _cachedAuthMode;
-}
+export { getAuthMode };
 
 // ---------------------------------------------------------------------------
 // OIDC config validation (fail-fast startup check)
@@ -449,7 +427,7 @@ export async function authorizeGroomerRequest(request: Request): Promise<Authori
  * Reset all internal auth caches. Intended for test isolation — call in beforeEach.
  */
 export function resetAuthCaches(): void {
-  _cachedAuthMode = undefined;
+  resetAuthModeCache();
   // Also reset dispatch-env token cache since auth delegates to it
   _resetEnvCaches();
 }
