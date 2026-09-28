@@ -113,8 +113,8 @@ vi.mock("./groomer-lock", () => ({
 
 import {
   captureFailureReason,
-  MODEL_FAILURE_BACKOFF_MAX_MINUTES,
-  modelFailureBackoffMinutes,
+  FAILED_RUN_BACKOFF_MAX_MINUTES,
+  failedRunBackoffMinutes,
   runHostedGroomer,
   UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
 } from "./run";
@@ -2169,7 +2169,7 @@ Investigate session handling in auth module.`;
     });
   });
 
-  describe("backoff after a failed model stage (dispatch#1125)", () => {
+  describe("backoff after a failed run (dispatch#1125)", () => {
     const MINUTE = 60 * 1000;
 
     function backoffWrites(): Array<Record<string, unknown>> {
@@ -2186,6 +2186,13 @@ Investigate session handling in auth module.`;
     }
 
     const priorRuns = (...statuses: string[]) => statuses.map((status) => ({ status }));
+
+    /** The data the run was completed with. */
+    function completedRun(): Record<string, any> {
+      const call = mocks.prisma.groomingRun.update.mock.calls.findLast((c) => "completedAt" in c[0].data);
+      expect(call).toBeDefined();
+      return call![0].data;
+    }
 
     it("backs the issue off after an LLM timeout, writing only the backoff", async () => {
       mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
@@ -2222,7 +2229,7 @@ Investigate session handling in auth module.`;
         [["failed"], 60],
         [["failed", "failed"], 120],
         [["failed", "failed", "failed"], 240],
-        [Array(9).fill("failed"), MODEL_FAILURE_BACKOFF_MAX_MINUTES],
+        [Array(9).fill("failed"), FAILED_RUN_BACKOFF_MAX_MINUTES],
       ];
       for (const [statuses, minutes] of cases) {
         mocks.prisma.issue.update.mockClear();
@@ -2254,17 +2261,51 @@ Investigate session handling in auth module.`;
       expect(mocks.prisma.issue.update.mock.calls.at(-1)![0].data).toMatchObject({ groomingRetryAfter: null });
     });
 
-    it("does not back off failures outside the model stage", async () => {
+    it("backs off a failure in any stage, and records the stage it failed in", async () => {
+      // Repository context, before anything is recorded past selection.
+      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
+      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "selected" });
+
+      // Exploration: a tool loop on the same model, which can time out too.
+      mocks.prisma.issue.update.mockClear();
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockRejectedValueOnce(new Error("exploration timed out"));
+      await expect(runHostedGroomer()).rejects.toThrow(/exploration timed out/);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "context_built" });
+
+      // Apply: the first GitHub write did not land.
+      mocks.prisma.issue.update.mockClear();
+      mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       mocks.updateIssueLabels.mockRejectedValue(new Error("GitHub API error: 422"));
       mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Groomed." } }));
       await expect(runHostedGroomer()).rejects.toThrow(/Grooming mutation failed at labels/);
       errSpy.mockRestore();
-      expect(backoffWrites()).toEqual([]);
+      expect(backoffMinutes()).toBe(30);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "validated" });
+    });
 
-      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
-      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
-      expect(backoffWrites()).toEqual([]);
+    it("records the stage a validation failure happened in, not \"selected\"", async () => {
+      mocks.callGroomerLLM.mockResolvedValue(planDraft({ verdict: { lane: { id: "gpu", confidence: "high", reason: "r" } } }));
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "context_built" });
+
+      mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+      mocks.exploreRepository.mockResolvedValue(mockExploration);
+      await expect(runHostedGroomer()).rejects.toThrow(/Groomer output validation failed/);
+      expect(completedRun()).toMatchObject({ status: "failed", stage: "explored" });
+    });
+
+    it("keeps only the unreadable-issue backoff when that path then fails", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      mocks.collectGroomingEvidenceSnapshot.mockRejectedValueOnce(new Error("boom"));
+      mocks.prisma.agentRun.create.mockRejectedValueOnce(new Error("db blip"));
+      await expect(runHostedGroomer()).rejects.toThrow(/db blip/);
+      warnSpy.mockRestore();
+      expect(backoffMinutes()).toBe(UNVERIFIABLE_RETRY_BACKOFF_MINUTES);
       expect(mocks.prisma.groomingRun.findMany).not.toHaveBeenCalled();
     });
 
@@ -2272,6 +2313,8 @@ Investigate session handling in auth module.`;
       mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
       mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
       await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+      mocks.buildRepositoryContext.mockRejectedValueOnce(new Error("code search down"));
+      await expect(runHostedGroomer()).rejects.toThrow(/code search down/);
       expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
     });
 
@@ -2291,7 +2334,7 @@ Investigate session handling in auth module.`;
     });
 
     it("schedules 30m, 60m, 120m, then caps at 240m", () => {
-      expect([1, 2, 3, 4, 5, 20].map(modelFailureBackoffMinutes)).toEqual([30, 60, 120, 240, 240, 240]);
+      expect([1, 2, 3, 4, 5, 20].map(failedRunBackoffMinutes)).toEqual([30, 60, 120, 240, 240, 240]);
     });
   });
 });

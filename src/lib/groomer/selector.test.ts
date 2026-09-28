@@ -486,8 +486,8 @@ describe("selectGroomingCandidate", () => {
       expect((await selectGroomingCandidate())!.number).toBe(5);
     });
 
-    it("skips an issue backed off after a failed model stage until the backoff expires (dispatch#1125)", async () => {
-      // The first model-stage failure backs off 30 minutes (run.ts).
+    it("skips an issue backed off after a failed run until the backoff expires (dispatch#1125)", async () => {
+      // The first failed run backs off 30 minutes (run.ts).
       const failed = unlabeled(5, { groomingRetryAfter: new Date(Date.now() + 30 * 60 * 1000) });
       withBackoffApplied([failed, unlabeled(7)]);
       expect((await selectGroomingCandidate())!.number).toBe(7);

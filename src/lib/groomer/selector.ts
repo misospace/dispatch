@@ -119,7 +119,7 @@ export async function selectGroomingCandidate(
     };
     const clause = { OR: [{ AND: groomingStateWhere.AND }, staleWhere] };
     // An issue backed off after unreadable GitHub state (dispatch#1063) or a
-    // failed model stage (dispatch#1125) waits out its backoff on every path,
+    // failed run (dispatch#1125) waits out its backoff on every path,
     // including the stale one (both are set by run.ts).
     const backoff = { OR: [{ groomingRetryAfter: null }, { groomingRetryAfter: { lte: new Date() } }] };
     const existing = issueWhere.AND;
