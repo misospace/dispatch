@@ -2,12 +2,12 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { resolveActiveWork } from "@/lib/lease";
 import type { ActiveWorkResult } from "@/lib/next-action";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const { agentName } = await params;

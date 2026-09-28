@@ -27,12 +27,24 @@ export const TEST_AGENT_TOKEN = "test-agent-token";
 /**
  * Builds the mock module shape for `@/lib/dispatch-env`, matching the
  * common pattern of comparing an incoming token against a fixed test token.
+ * The test token resolves to the "maintainer" tier so existing suites keep
+ * exercising the full-rights path. Pass `tierMap` to accept extra tokens at
+ * a specific tier (e.g. a worker token for tier-gate tests).
  */
-export function makeDispatchEnvMock(token: string = TEST_AGENT_TOKEN) {
+export function makeDispatchEnvMock(
+  token: string = TEST_AGENT_TOKEN,
+  tierMap: Record<string, "worker" | "maintainer"> = {},
+) {
+  const accepted = [token, ...Object.keys(tierMap)];
   return {
-    isAuthorizedAgentToken: vi.fn((t: string | null | undefined) => t === token),
-    isAuthorizedBearerToken: vi.fn((t: string | null | undefined) => t === token),
-    getAcceptedAgentTokens: vi.fn(() => [token]),
+    isAuthorizedAgentToken: vi.fn((t: string | null | undefined) => (t !== null && t !== undefined ? accepted.includes(t) : false)),
+    isAuthorizedBearerToken: vi.fn((t: string | null | undefined) => (t !== null && t !== undefined ? accepted.includes(t) : false)),
+    getAcceptedAgentTokens: vi.fn(() => accepted),
+    getBearerTokenTier: vi.fn((t: string | null | undefined) => {
+      if (t === null || t === undefined) return null;
+      if (t === token) return tierMap[token] ?? "maintainer";
+      return tierMap[t] ?? null;
+    }),
     resetCaches: vi.fn(),
   };
 }
@@ -41,9 +53,12 @@ export function makeDispatchEnvMock(token: string = TEST_AGENT_TOKEN) {
  * Same as {@link makeDispatchEnvMock}, plus a `safeEqual` stub for routes
  * that use constant-time comparisons directly (e.g. webhook signature checks).
  */
-export function makeDispatchEnvMockWithSafeEqual(token: string = TEST_AGENT_TOKEN) {
+export function makeDispatchEnvMockWithSafeEqual(
+  token: string = TEST_AGENT_TOKEN,
+  tierMap: Record<string, "worker" | "maintainer"> = {},
+) {
   return {
-    ...makeDispatchEnvMock(token),
+    ...makeDispatchEnvMock(token, tierMap),
     safeEqual: vi.fn((a: string, b: string) => a === b),
   };
 }

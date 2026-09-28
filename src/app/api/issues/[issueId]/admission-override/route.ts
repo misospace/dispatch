@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
-import { authorizeRequest, getAuthorizedActor, type AuthorizedRequest } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, type AuthorizedRequest, authErrorResponse } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { fetchLatestCommit } from "@/lib/github-ci";
@@ -60,7 +60,7 @@ async function readBody(request: Request): Promise<Record<string, unknown> | nul
  */
 export async function POST(request: Request, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
-  if (!auth.authorized) return errorResponse("Unauthorized", 401);
+  if (!auth.authorized) return authErrorResponse(auth);
   const forbidden = rejectAgentCaller(auth);
   if (forbidden) return forbidden;
 
@@ -175,7 +175,7 @@ export async function POST(request: Request, context: { params: Promise<{ issueI
  */
 export async function DELETE(request: Request, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
-  if (!auth.authorized) return errorResponse("Unauthorized", 401);
+  if (!auth.authorized) return authErrorResponse(auth);
   const forbidden = rejectAgentCaller(auth);
   if (forbidden) return forbidden;
 

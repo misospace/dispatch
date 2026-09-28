@@ -1,4 +1,4 @@
-import { getAuthMode } from "@/lib/auth";
+import { getAuthMode } from "@/lib/auth-mode";
 import { getSession } from "@/lib/session";
 import { LogoutButton } from "./logout-button";
 

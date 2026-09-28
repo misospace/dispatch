@@ -22,6 +22,12 @@ import { resetRateLimits } from "@/lib/rate-limit";
 vi.mock("@/lib/auth", () => ({
   authorizeRequest: vi.fn(),
   getAuthorizedActor: vi.fn(),
+  authErrorResponse: vi.fn((auth: { forbidden?: boolean }) =>
+    new Response(JSON.stringify({ error: auth.forbidden ? "Forbidden" : "Unauthorized" }), {
+      status: auth.forbidden ? 403 : 401,
+      headers: { "content-type": "application/json" },
+    }),
+  ),
 }));
 
 vi.mock("@/lib/prisma", () => ({

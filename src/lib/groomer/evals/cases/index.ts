@@ -6,6 +6,7 @@ import { automationCommentFalseClaim } from "./automation-comment-false-claim";
 import { broadNeedsDecomposition } from "./broad-needs-decomposition";
 import { dependencyAlreadyMerged } from "./dependency-already-merged";
 import { duplicateCandidate } from "./duplicate-candidate";
+import { evidenceIdAsRelatedWork } from "./evidence-id-as-related-work";
 import { exactlyOneStatus, exactlyOneStatusForeignLabel } from "./exactly-one-status";
 import { inFlightUntouched } from "./in-flight-untouched";
 import { movedCodeReference } from "./moved-code-reference";
@@ -32,6 +33,7 @@ export const CASES: GroomingCase[] = [
   exactlyOneStatusForeignLabel,
   siblingShippedNotThisIssue,
   alreadyDoneGrounded,
+  evidenceIdAsRelatedWork,
   // Safety edges.
   inFlightUntouched,
   unpinnedSnapshot,

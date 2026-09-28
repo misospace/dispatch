@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 import { getSyncRepos } from "@/lib/config";
 import { refreshSingleIssue, defaultCurrentLane } from "@/lib/issue-sync";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 } as const;
@@ -12,7 +12,7 @@ const RATE_LIMIT = { limit: 10, windowMs: 60_000 } as const;
 export async function POST(request: NextRequest) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`route:issues/refresh:${auth.actor}`, RATE_LIMIT);

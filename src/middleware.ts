@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { getToken } from "next-auth/jwt";
-import { safeEqual } from "@/lib/dispatch-env";
+import { isAuthorizedBearerToken, safeEqual } from "@/lib/dispatch-env";
 import { enforceRateLimit, resetRateLimitKey } from "@/lib/rate-limit";
 
 type AuthMode = "basic" | "oidc" | "disabled" | undefined;
@@ -121,11 +121,8 @@ function shouldUseSecureAuthCookie(request: NextRequest): boolean {
 
 
 function isBearerAuthorized(authHeader: string | null): boolean {
-  const token = process.env.DISPATCH_AGENT_TOKEN;
-  if (!token) return false;
-
   const match = /^Bearer\s+(.+)$/i.exec(authHeader ?? "");
-  return match ? safeEqual(match[1].trim(), token) : false;
+  return match ? isAuthorizedBearerToken(match[1].trim()) : false;
 }
 
 function parseBasicCredentials(authHeader: string | null): { username: string; password: string } | null {
@@ -210,7 +207,8 @@ function isBasicAttempt(authHeader: string | null): boolean {
  *
  * Auth mode behavior:
  * - "basic"    : HTTP Basic Auth required for UI routes. API routes also allow
- *                DISPATCH_AGENT_TOKEN Bearer auth for agents and workers.
+ *                Bearer auth with any configured tier token for agents and
+ *                workers; the middleware gates, the route handler enforces tier.
  * - "oidc"     : OIDC session required for UI routes. API routes authorize via
  *                route handlers so Bearer auth and session cookies both work.
  * - "disabled" : No auth enforcement at all.
@@ -308,8 +306,10 @@ export async function middleware(request: NextRequest) {
   // a successful password authentication resets the rate-limit counter on any
   // route (UI or API), and so that a syntactically valid Basic attempt with
   // a wrong password is the only thing counted toward the lockout. Bearer is
-  // retained as the API-route credential (DISPATCH_AGENT_TOKEN) for agents
-  // and workers that do not speak Basic.
+  // retained as the API-route credential for agents and workers that do not
+  // speak Basic. The gate accepts any configured tier token
+  // (DISPATCH_AGENT_TOKEN, DISPATCH_MAINTAINER_TOKEN, DISPATCH_WORKER_TOKEN);
+  // enforcing the tier itself is the route handler's job.
   if (isBasicAuthorized(authHeader)) {
     resetRateLimitKey(`basic-auth:${clientIp(request)}`);
     const response = NextResponse.next();

@@ -220,6 +220,7 @@ export async function runCandidate(
     },
     callLLM: async (args) => {
       catalog = args.evidenceCatalog ?? null;
+      if (args.repair && candidate.repair !== undefined) return candidate.repair as Record<string, unknown>;
       return candidate.output as Record<string, unknown>;
     },
     validateOutput: (raw, ctx) => {

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { fetchPullRequests, fetchLinkedPrHealthInput } from "@/lib/github";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth } from "@/lib/linked-pr-health";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -22,7 +22,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`pr-health-refresh:${auth.actor}`, RATE_LIMIT);

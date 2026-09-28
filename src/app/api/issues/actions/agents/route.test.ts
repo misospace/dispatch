@@ -12,6 +12,12 @@ const { mocks } = vi.hoisted(() => ({
 
 vi.mock("@/lib/auth", () => ({
   authorizeRequest: vi.fn(),
+  authErrorResponse: vi.fn((auth: { forbidden?: boolean }) =>
+    new Response(JSON.stringify({ error: auth.forbidden ? "Forbidden" : "Unauthorized" }), {
+      status: auth.forbidden ? 403 : 401,
+      headers: { "content-type": "application/json" },
+    }),
+  ),
 }));
 
 vi.mock("@/lib/config", () => ({
@@ -33,7 +39,7 @@ const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 describe("GET /api/issues/actions/agents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
     mocks.parseAgentList.mockReturnValue(["worker", "reviewer"]);
     mocks.findMany.mockResolvedValue([
       { labels: ["status/backlog", "agent/handler", "type/feature"] },

@@ -5,7 +5,7 @@ import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX } from "@/types";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 import { transitionIssueStatus } from "@/lib/issue-status";
@@ -17,7 +17,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`claim:${auth.actor}`, RATE_LIMIT);
@@ -40,6 +40,29 @@ export async function POST(request: Request) {
     // Validate required fields
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
+    }
+
+    // Worker tokens may only claim normally: force-claiming over another
+    // agent's lease/assignment requires a maintainer token (#1111).
+    if (force === true && auth.type === "bearer" && auth.tier === "worker") {
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor: agentName as string,
+            action: "claim_issue",
+            repoFullName: repoFullName as string,
+            issueNumber: issueNumber as number,
+            issueId: issueId as string,
+            beforeLabels: [],
+            afterLabels: [],
+            success: false,
+            errorMessage: "Force claim requires a maintainer token",
+          },
+        });
+      } catch {
+        // Audit log failure should not mask the 403
+      }
+      return errorResponse("Force claim requires a maintainer token", 403);
     }
 
     // Fetch the issue from the local database to check its state and current labels

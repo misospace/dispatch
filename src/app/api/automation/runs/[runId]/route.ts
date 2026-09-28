@@ -2,12 +2,12 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { rerunWorkflow, triggerWorkflowDispatch } from "@/lib/github";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 
 export async function POST(request: Request, { params }: { params: Promise<{ runId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
   const auditActor = getAuthorizedActor(auth, request);
 

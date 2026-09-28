@@ -7,6 +7,8 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 function clearAll() {
   delete process.env.DISPATCH_URL;
   delete process.env.DISPATCH_AGENT_TOKEN;
+  delete process.env.DISPATCH_MAINTAINER_TOKEN;
+  delete process.env.DISPATCH_WORKER_TOKEN;
 }
 
 describe("getDispatchUrl", () => {
@@ -112,5 +114,226 @@ describe("isAuthorizedBearerToken", () => {
     process.env.MISSION_CONTROL_AGENT_TOKEN = "legacy-token";
     const mod = await import("./dispatch-env");
     expect(mod.isAuthorizedBearerToken("legacy-token")).toBe(false);
+  });
+
+  it("returns true for a worker-tier token", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "maintainer-token";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.isAuthorizedBearerToken("worker-token")).toBe(true);
+  });
+});
+
+describe("getBearerTokenTier", () => {
+  beforeEach(() => {
+    clearAll();
+    vi.resetModules();
+  });
+  afterEach(() => { clearAll(); });
+
+  it('resolves DISPATCH_WORKER_TOKEN to "worker"', async () => {
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("worker-token")).toBe("worker");
+  });
+
+  it('resolves DISPATCH_AGENT_TOKEN to "maintainer"', async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("agent-token")).toBe("maintainer");
+  });
+
+  it('resolves DISPATCH_MAINTAINER_TOKEN to "maintainer"', async () => {
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-alias";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("maintainer-alias")).toBe("maintainer");
+  });
+
+  it("returns null for an unknown token", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("unknown-token")).toBeNull();
+  });
+
+  it("returns null for null/undefined/empty tokens", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier(null)).toBeNull();
+    expect(mod.getBearerTokenTier(undefined)).toBeNull();
+    expect(mod.getBearerTokenTier("")).toBeNull();
+  });
+
+  it("returns null when no tokens are configured", async () => {
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("any-token")).toBeNull();
+  });
+
+  it("trims env values at table construction: a padded worker env duplicates the agent env and warns", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared";
+      process.env.DISPATCH_WORKER_TOKEN = " shared ";
+      const mod = await import("./dispatch-env");
+      expect(mod.getBearerTokenTier("shared")).toBe("worker");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_AGENT_TOKEN");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("treats a whitespace-only env value as unset", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_WORKER_TOKEN = "   ";
+    const mod = await import("./dispatch-env");
+    expect(mod.getAcceptedTokenTiers()).toEqual([{ token: "agent-token", tier: "maintainer" }]);
+    expect(mod.getBearerTokenTier("   ")).toBeNull();
+  });
+
+  it("trims the presented token before comparing it to table entries", async () => {
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier(" worker-token ")).toBe("worker");
+  });
+
+  it('resolves a value shared between DISPATCH_AGENT_TOKEN and DISPATCH_WORKER_TOKEN to "worker"', async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+    process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("shared-value")).toBe("worker");
+  });
+
+  it('resolves a value shared between DISPATCH_MAINTAINER_TOKEN and DISPATCH_WORKER_TOKEN to "worker"', async () => {
+    process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+    process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("shared-value")).toBe("worker");
+  });
+
+  it('keeps "maintainer" for a value shared only between the two maintainer aliases', async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("shared-value")).toBe("maintainer");
+  });
+
+  it("warns once (without token values) when the worker token duplicates a maintainer token", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+      process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+      const mod = await import("./dispatch-env");
+      mod.getAcceptedTokenTiers();
+      mod.getAcceptedTokenTiers();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).not.toContain("shared-value");
+      // The warning names the colliding env var, not just "a maintainer token".
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_AGENT_TOKEN");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("warns once (without token values) when the worker token duplicates DISPATCH_MAINTAINER_TOKEN", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+      process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+      const mod = await import("./dispatch-env");
+      mod.getAcceptedTokenTiers();
+      mod.getAcceptedTokenTiers();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).not.toContain("shared-value");
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_MAINTAINER_TOKEN");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not warn when the two maintainer aliases share a value", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+      process.env.DISPATCH_MAINTAINER_TOKEN = "shared-value";
+      const mod = await import("./dispatch-env");
+      mod.getAcceptedTokenTiers();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe("getAcceptedTokenTiers", () => {
+  beforeEach(() => {
+    clearAll();
+    vi.resetModules();
+  });
+  afterEach(() => { clearAll(); });
+
+  it("returns the token→tier table for all configured tokens", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-alias";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getAcceptedTokenTiers()).toEqual([
+      { token: "agent-token", tier: "maintainer" },
+      { token: "maintainer-alias", tier: "maintainer" },
+      { token: "worker-token", tier: "worker" },
+    ]);
+  });
+
+  it("returns an empty array when nothing is configured", async () => {
+    const mod = await import("./dispatch-env");
+    expect(mod.getAcceptedTokenTiers()).toEqual([]);
+  });
+});
+
+describe("getAcceptedAgentTokens (tier-derived)", () => {
+  beforeEach(() => {
+    clearAll();
+    vi.resetModules();
+  });
+  afterEach(() => { clearAll(); });
+
+  it("includes every configured token (all tiers)", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "agent-token";
+    process.env.DISPATCH_MAINTAINER_TOKEN = "maintainer-alias";
+    process.env.DISPATCH_WORKER_TOKEN = "worker-token";
+    const mod = await import("./dispatch-env");
+    expect(mod.getAcceptedAgentTokens()).toEqual([
+      "agent-token",
+      "maintainer-alias",
+      "worker-token",
+    ]);
+  });
+
+  it("de-duplicates a value configured in multiple tiers", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = "shared-value";
+    process.env.DISPATCH_WORKER_TOKEN = "shared-value";
+    const mod = await import("./dispatch-env");
+    expect(mod.getAcceptedAgentTokens()).toEqual(["shared-value"]);
+  });
+});
+
+describe("token tier cache reset", () => {
+  beforeEach(() => {
+    clearAll();
+    vi.resetModules();
+  });
+  afterEach(() => { clearAll(); });
+
+  it("picks up new env values after resetCaches", async () => {
+    process.env.DISPATCH_WORKER_TOKEN = "worker-1";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenTier("worker-1")).toBe("worker");
+
+    mod.resetCaches();
+    process.env.DISPATCH_WORKER_TOKEN = "worker-2";
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    expect(mod.getBearerTokenTier("worker-1")).toBeNull();
+    expect(mod.getBearerTokenTier("worker-2")).toBe("worker");
+    expect(mod.getAcceptedTokenTiers()).toEqual([{ token: "worker-2", tier: "worker" }]);
   });
 });

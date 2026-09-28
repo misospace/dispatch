@@ -1,6 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
+const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
+
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn().mockResolvedValue(null),
@@ -16,6 +18,7 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -528,5 +531,47 @@ describe("POST /api/issues/unclaim — guards", () => {
     expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/test-agent"],
+    } as never);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
+  });
+
+  function workerPost(payload = makePayload()) {
+    return POST(
+      authedRequest("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        body: payload,
+        token: WORKER_TOKEN,
+      }),
+    );
+  }
+
+  it("allows a worker to release its own claim without an x-agent-name header", async () => {
+    const res = await workerPost();
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+  });
+
+  it("returns 400 when a worker's body agentName is not assigned to the issue", async () => {
+    const res = await workerPost(makePayload({ agentName: "other-agent" }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Issue is not assigned to other-agent");
+    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
   });
 });

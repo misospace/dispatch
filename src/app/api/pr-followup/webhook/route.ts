@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
-import { authorizeRequest } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { processPrFollowupEvents, extractLinkedIssue, PrFollowupEvent } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -213,7 +213,7 @@ export async function POST(request: Request) {
     if (sigMode !== "verify") {
       const auth = await authorizeRequest(request);
       if (!auth.authorized) {
-        return errorResponse("Unauthorized", 401);
+        return authErrorResponse(auth);
       }
       actor = auth.actor ?? "webhook";
     }

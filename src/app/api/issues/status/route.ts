@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { STATUS_LABELS, StatusLabel, isStatusLabel } from "@/types";
-import { authorizeRequest, getAuthorizedActor } from "@/lib/auth";
+import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -12,7 +12,7 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
-    return errorResponse("Unauthorized", 401);
+    return authErrorResponse(auth);
   }
 
   const limited = enforceRateLimit(`status:${auth.actor}`, RATE_LIMIT);
