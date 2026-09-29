@@ -144,7 +144,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
-    mocks.prFixFindUnique.mockResolvedValue(null);
+    // Default re-read mirrors production: the row read back after the stamp
+    // is the same live row listQueuedPrFixItems served. Stateful tests
+    // override this with their own implementation.
+    mocks.prFixFindUnique.mockImplementation(async () => {
+      const items = await mocks.prFixFindMany();
+      const first = items[0];
+      return first
+        ? { reason: first.reason, feedback: first.feedback, generation: first.generation }
+        : null;
+    });
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
     mocks.issueFindMany.mockResolvedValue([]);
     mocks.findLeasedIssueIds.mockResolvedValue([]);
@@ -603,6 +612,152 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.reasons).toContain("fix lint");
     // The row is stamped at the generation the token names.
     expect(row.dispatchedGeneration).toBe(3);
+  });
+
+  it("does not hand out an unconfirmed token when the generation moves on both retry passes (#1119)", async () => {
+    // A concurrent re-issue keeps winning the race: every successful stamp
+    // is immediately followed by another generation bump, so neither pass
+    // can confirm the generation it stamped. The route must not ship a
+    // token for a generation it never confirmed — mid-run evidence would be
+    // classified as pre-dispatch and absorbed, the exact #1119 loss.
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    let stampCount = 0;
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      stampCount += 1;
+      if (!matchesFirstHandOut(row, where)) return { count: 0 };
+      Object.assign(row, data);
+      row.generation = (where.generation as number) + 1;
+      row.reason = `re-issued at generation ${row.generation}`;
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      id: row.id,
+      reason: row.reason,
+      feedback: row.feedback,
+      generation: row.generation,
+    }));
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 99,
+        title: "Regular issue",
+        url: "https://github.com/org/repo/issues/99",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "local",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // The bounded retry ran both passes, then gave up.
+    expect(stampCount).toBe(2);
+    // No pr-fix token ships: the last observed generation (4) was never
+    // stamped or confirmed. The request falls through to issue work.
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(body.prFixItem).toBeUndefined();
+    // The last confirmed stamp (generation 3) stays on the row, so a later
+    // poll confirms and hands it out against the then-live row.
+    expect(row.dispatchedGeneration).toBe(3);
+  });
+
+  it("does not hand out a stale token when the second pass throws after a move was observed (#1119)", async () => {
+    // Pass 1 observes the generation move; pass 2 then fails. Falling back
+    // to first.generation would hand out a stale token whose settle report
+    // is rejected as a generation mismatch — the move was already observed,
+    // so no unconfirmed token may ship.
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    let stampCount = 0;
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      stampCount += 1;
+      if (stampCount === 2) throw new Error("db down");
+      if (!matchesFirstHandOut(row, where)) return { count: 0 };
+      Object.assign(row, data);
+      // A concurrent re-issue moves the row in the read→stamp gap.
+      row.generation = 3;
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      id: row.id,
+      reason: row.reason,
+      feedback: row.feedback,
+      generation: row.generation,
+    }));
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 99,
+        title: "Regular issue",
+        url: "https://github.com/org/repo/issues/99",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "local",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(stampCount).toBe(2);
+    // Neither the stale generation 2 nor the un-stamped generation 3 ships;
+    // the request falls through to issue work instead.
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(body.prFixItem).toBeUndefined();
   });
 
   it("still serves the pre-stamp token when the dispatch tracking stamp throws (#1119)", async () => {
