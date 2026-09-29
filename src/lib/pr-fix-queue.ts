@@ -127,9 +127,20 @@ function uniqueAppend(values: string[], value: string, maxItems: number): string
 
 /**
  * Encode one post-dispatch evidence entry as `<evidenceKey>@<head>` (#1119):
- * `head` is the enqueue input's headSha (trimmed) when present, else the
- * literal "unknown", so a check_run entry can later be revalidated against
- * the PR's current head at settlement time.
+ * `head` is the enqueue input's headSha (trimmed, verbatim) when present,
+ * else the literal "unknown", so a check_run entry can later be revalidated
+ * against the PR's current head at settlement time.
+ *
+ * Exact contract, honored by `parsePostDispatchEvidenceEntry`:
+ * - the entry is split on the FIRST "@": an `@` inside the headSha (an
+ *   unvalidated caller string) is part of the head half, not a separator;
+ * - a head that is not git-shape (4-64 hex chars) reads back as "unknown" —
+ *   so an `@`-bearing headSha degrades to an unknown head, whose entry stays
+ *   actionable (conservative) instead of being revalidated against a
+ *   fragment of the real head;
+ * - the evidenceKey namespace is internal: an `@`-bearing key is not forged
+ *   into an actionable check entry, because the event type comes from the
+ *   part before the FIRST "@".
  */
 function encodePostDispatchEvidenceKey(evidenceKey: string, headSha: string | null | undefined): string {
   const head = typeof headSha === "string" && headSha.trim() ? headSha.trim() : "unknown";
@@ -138,17 +149,22 @@ function encodePostDispatchEvidenceKey(evidenceKey: string, headSha: string | nu
 
 /**
  * Parse one post-dispatch evidence entry back into { eventType, head }
- * (#1119): `head` is the substring after the LAST "@" (an absent/empty head
- * reads back as "unknown" — it was never recorded), and `eventType` is the
- * substring before the FIRST ":" of the evidenceKey half.
+ * (#1119): the entry is split on the FIRST "@" — `eventType` is the
+ * substring before the FIRST ":" of the part before it, and `head` is the
+ * substring after it. `head` is then sanitized to "unknown" unless it is
+ * git-shape (`/^[0-9a-fA-F]{4,64}$/`): an invalid-shape head cannot be
+ * revalidated, and "unknown" counts as actionable. An absent head reads
+ * back as "unknown" — it was never recorded. Unknown event types are
+ * non-actionable (fail-closed) in `hasActionablePostDispatchEvidence`.
  */
 function parsePostDispatchEvidenceEntry(entry: string): { eventType: string; head: string } {
-  const at = entry.lastIndexOf("@");
+  const at = entry.indexOf("@");
   const keyPart = at >= 0 ? entry.slice(0, at) : entry;
   const headPart = at >= 0 ? entry.slice(at + 1) : "";
   const colon = keyPart.indexOf(":");
   const eventType = colon >= 0 ? keyPart.slice(0, colon) : keyPart;
-  return { eventType, head: headPart || "unknown" };
+  const head = /^[0-9a-fA-F]{4,64}$/.test(headPart) ? headPart : "unknown";
+  return { eventType, head };
 }
 
 /**
@@ -837,8 +853,9 @@ export async function markPrFixItem(
     }
   }
 
-  // Shared tail for every successful settlement write.
-  const finishSettled = async (row: any): Promise<MarkPrFixResult> => {
+  // Shared tail for every successful mark write — settlement and non-settle
+  // marks alike.
+  const finishMarked = async (row: any): Promise<MarkPrFixResult> => {
     // Only surface a blocked notification when THIS mark is what first puts
     // the item into BLOCKED (from a non-BLOCKED status).
     if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
@@ -879,8 +896,15 @@ export async function markPrFixItem(
       });
       return row;
     });
-    if (settledRow) return finishSettled(settledRow);
-    if (!settlesAttempt) return { mutated: false, reason: "generation-mismatch" };
+    if (settledRow) return finishMarked(settledRow);
+    // Rare miss on a non-settle mark: the row was deleted, or its generation
+    // moved between the decision read and the write. Re-read to distinguish —
+    // a gone row is not-found (mirrors the forced tail's labeling a few lines
+    // below); a surviving row is a generation-mismatch.
+    if (!settlesAttempt) {
+      const remaining = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      return { mutated: false, reason: remaining ? "generation-mismatch" : "not-found" };
+    }
   }
 
   // The guarded write no-oped (or the initial reopen missed its pin): the row
@@ -945,7 +969,7 @@ export async function markPrFixItem(
       });
       return row;
     });
-    if (clearedRow) return finishSettled(clearedRow);
+    if (clearedRow) return finishMarked(clearedRow);
   }
 
   // The loop exhausted: the pinned writes kept losing the race to evidence
@@ -982,9 +1006,16 @@ export async function markPrFixItem(
         action: "mark",
         status: forceData.status,
         lane: forceData.lane,
-        note: forceCapped
-          ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
-          : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1119).`,
+        // Preserve the caller's note alongside the canned forced-fallback text
+        // (same join style as the stale-clear settle branch).
+        note: [
+          input.note,
+          forceCapped
+            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+            : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1119).`,
+        ]
+          .filter(Boolean)
+          .join(" "),
       },
     });
     return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });

@@ -1166,6 +1166,23 @@ describe("requeuePrFixItem surface cleanup", () => {
 
     expect(item?.status).toBe("QUEUED");
   });
+
+  it("requeue clears the recorded post-dispatch evidence keys and bumps the generation (#1119)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 74, lane: "NORMAL", reason: "blocked", feedback: "f", evidenceKey: "k1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 74, status: "BLOCKED" });
+    // Post-dispatch evidence stamped on the row (a stale check that did not
+    // actionably reopen the BLOCKED settlement) must not carry into the
+    // fresh operator-requeued attempt.
+    client.items[0].postDispatchEvidenceKeys = ["check_run:org/repo#74:5@aaaa1111"];
+
+    const item = await requeuePrFixItem(client, { repo: "org/repo", pr: 74, note: "try again" });
+
+    expect(item?.status).toBe("QUEUED");
+    expect(item?.generation).toBe(2);
+    expect(item?.postDispatchEvidenceKeys).toEqual([]);
+  });
 });
 
 describe("markPrFixItem head SHA guard (#940)", () => {
@@ -2094,16 +2111,18 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     });
     client.items[0].dispatchedGeneration = client.items[0].generation;
 
-    // A failing check recorded at head H1 lands after the hand-out.
+    // A failing check recorded at head aaaa1111 lands after the hand-out.
+    // The head is git-shape: a non-git-shape head would sanitize to
+    // "unknown" (always actionable) and could not demonstrate staleness.
     const after = await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 28, lane: "NORMAL", reason: "r", feedback: "f2",
-      evidenceKey: "check_run:org/repo#28:42", headSha: "H1",
+      evidenceKey: "check_run:org/repo#28:42", headSha: "aaaa1111",
     });
-    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#28:42@H1"]);
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#28:42@aaaa1111"]);
 
-    // The PR head has moved past H1: the recorded check is stale (the worker
-    // already pushed past it), so the settlement is not actionable.
-    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+    // The PR head has moved past aaaa1111: the recorded check is stale (the
+    // worker already pushed past it), so the settlement is not actionable.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("bbbb2222");
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 28, status: "FIXED",
@@ -2126,13 +2145,13 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const after = await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 29, lane: "NORMAL", reason: "r", feedback: "f2",
-      evidenceKey: "check_run:org/repo#29:43", headSha: "H1",
+      evidenceKey: "check_run:org/repo#29:43", headSha: "cccc3333",
     });
-    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#29:43@H1"]);
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#29:43@cccc3333"]);
 
-    // The PR head is STILL H1: the failing check is current, so it is
+    // The PR head is STILL cccc3333: the failing check is current, so it is
     // actionable and the settlement reopens.
-    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("cccc3333");
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 29, status: "FIXED",
@@ -2328,7 +2347,9 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     // the re-decision loop must classify the check — which REQUIRES a head
     // fetch. (review entries would short-circuit without any fetch.)
     client.hooks.beforeUpdateMany = () => {
-      client.items[0].postDispatchEvidenceKeys = ["check_run:org/repo#36:90@H1"];
+      // Git-shape head: the check is NOT an "unknown" short-circuit, so the
+      // re-decision genuinely has to fetch the head to classify it.
+      client.items[0].postDispatchEvidenceKeys = ["check_run:org/repo#36:90@dddd4444"];
     };
     let headFetchInsideTx = false;
     githubPrsMocks.fetchPullRequestHeadSha.mockImplementation(async () => {
@@ -2393,6 +2414,51 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(client.history.at(-1).note).toContain("forced a fresh attempt");
   });
 
+  it("a stale-clear settle that keeps losing the race never strands the item (#1124)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 48, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "aaaa1111",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    // A post-dispatch check recorded at head aaaa1111 — now superseded. The
+    // baseline (attemptHeadSha/headSha) is aaaa1111 from the enqueue, and the
+    // PR head has moved to bbbb2222: the SAME mock feeds both the #940
+    // head-moved guard (baseline aaaa1111 ≠ bbbb2222 → PASSES) and the
+    // actionability check (recorded aaaa1111 ≠ bbbb2222 → superseded →
+    // NON-actionable), so no reopen — only the clear-settle path.
+    client.items[0].postDispatchEvidenceKeys = ["check_run:org/repo#48:70@aaaa1111"];
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("bbbb2222");
+
+    // A NON-actionable entry (merge_state) lands before EVERY updateMany, with
+    // a unique suffix, so the keys-pinned clear-settle write misses on all 3
+    // loop iterations.
+    let landCount = 0;
+    client.hooks.beforeUpdateManyEvery = () => {
+      landCount += 1;
+      const row = client.items[0];
+      row.postDispatchEvidenceKeys = [
+        ...(row.postDispatchEvidenceKeys ?? []),
+        `merge_state:xyz${landCount}@unknown`,
+      ];
+    };
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 48, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const item = client.items[0];
+    // Not stranded QUEUED at the generation the worker already consumed:
+    // the forced fallback (pinned without the keys predicate) moved it.
+    expect(item.status).toBe("QUEUED");
+    expect(item.generation).toBe(2);
+    expect(item.fixAttempts).toBe(2);
+    expect(item.postDispatchEvidenceKeys).toEqual([]);
+    // The forced-fallback history row explains the outcome.
+    expect(client.history.at(-1).note).toContain("forced a fresh attempt");
+  });
+
   it("the forced fallback gives up to a human when the item is at the cap (#1124)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 38, lane: "NORMAL", reason: "r", feedback: "f1",
@@ -2426,5 +2492,217 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(item.fixAttempts).toBe(5);
     expect(item.postDispatchEvidenceKeys).toEqual([]);
     expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalled();
+    // Evidence landed on the fast path, every loop iteration, AND the forced
+    // fallback write — strictly more than the 3-iteration loop allows.
+    expect(landCount).toBeGreaterThan(3);
+    // The capped forced-fallback history row names the human hand-off.
+    expect(client.history.at(-1).note).toContain("routed to a human (#1119)");
+  });
+
+  it("a post-dispatch check encoded from an `@`-bearing headSha degrades to an unknown head and still reopens", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 40, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // Unvalidated caller string with an "@" in it. Encoding is a plain trim,
+    // so the raw entry is stored as-is; the FIRST-@ split must not read back
+    // the bogus fragment "def" a LAST-@ split would produce.
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 40, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#40:71", headSha: "abc@def",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["check_run:org/repo#40:71@abc@def"]);
+
+    // The fetch mock resolves the fragment the old parser would have
+    // revalidated against — the sanitized "unknown" head must short-circuit
+    // before any comparison, so no head fetch may happen.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("def");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 40, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("an `@`-bearing evidenceKey parses its event type from the pre-first-`@` half and stays actionable", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 41, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // The evidenceKey namespace is internal: "review@x:1" encodes to
+    // "review@x:1@H1". The first-@ split yields keyPart "review" (no ":"),
+    // so the event type is "review" — actionable by the review short-circuit
+    // — and the head half "x:1@H1" is not git-shape, so it reads back as
+    // "unknown". The documented contract: it acts as a review entry.
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 41, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review@x:1", headSha: "H1",
+    });
+    expect(after.postDispatchEvidenceKeys).toEqual(["review@x:1@H1"]);
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 41, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    // The review entry short-circuits: no head fetch.
+    expect(githubPrsMocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+  });
+
+  it("a normal git-shape head still revalidates: exact match reopens, a moved head settles", async () => {
+    // PR 42: recorded head == current head → the check is current.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 42, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "aaaa1111",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 42, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#42:10", headSha: "aaaa1111",
+    });
+
+    // PR 43: recorded head != current head → the check is superseded.
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 43, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "bbbb2222",
+    });
+    client.items[1].dispatchedGeneration = client.items[1].generation;
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 43, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#43:11", headSha: "bbbb2222",
+    });
+
+    githubPrsMocks.fetchPullRequestHeadSha.mockImplementation(async (_repo: string, pr: number) =>
+      pr === 42 ? "aaaa1111" : "cccc3333");
+
+    const reopened = mutatedItem(await markPrFixItem(client, {
+      repo: "org/repo", pr: 42, status: "FIXED", expectedGeneration: 1,
+    }));
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+
+    const settled = mutatedItem(await markPrFixItem(client, {
+      repo: "org/repo", pr: 43, status: "FIXED", expectedGeneration: 1,
+    }));
+    expect(settled.status).toBe("FIXED");
+    expect(settled.generation).toBe(1); // not reopened
+    expect(settled.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("a post-dispatch reopen retracts the needs-human marker (surfacePrFixUnblocked)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 44, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 44, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    surfacingMocks.surfacePrFixUnblocked.mockClear();
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 44, status: "BLOCKED",
+      expectedGeneration: 1,
+    });
+
+    // The initial post-dispatch reopen leaves the would-be settlement: the
+    // needs-human marker must be folded back into a requeued notice.
+    expect(mutatedItem(result).status).toBe("QUEUED");
+    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 44, "requeued", undefined);
+  });
+
+  it("a gap-loop post-dispatch reopen retracts the needs-human marker too", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 45, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // Evidence lands in the read→write gap: the fast-path settle no-ops and
+    // the re-decision loop takes the reopen.
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].postDispatchEvidenceKeys = ["review:2@H1"];
+    };
+    surfacingMocks.surfacePrFixUnblocked.mockClear();
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 45, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(mutatedItem(result).status).toBe("QUEUED");
+    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 45, "requeued", undefined);
+  });
+
+  it("a capped post-dispatch reopen surfaces the block when the item was not already BLOCKED", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 46, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 46, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H1",
+    });
+    // At the attempt cap (maxPrFixAttempts defaults to 5).
+    client.items[0].fixAttempts = 5;
+    surfacingMocks.surfacePrFixBlocked.mockClear();
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 46, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    // The give-up routes to a human; the item was QUEUED (not BLOCKED), so
+    // the block must be surfaced.
+    const capped = mutatedItem(result);
+    expect(capped.status).toBe("BLOCKED");
+    expect(capped.lane).toBe("NEEDS_HUMAN");
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+  });
+
+  it("a stale post-dispatch check settles with the 'no longer applies' history note", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 47, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 47, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#47:60", headSha: "aaaa5555",
+    });
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual(["check_run:org/repo#47:60@aaaa5555"]);
+
+    // The head moved past the recorded one: the check is stale, so the
+    // settle goes through the re-decision loop, which records WHY the
+    // entries were cleared.
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("bbbb6666");
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 47, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(mutatedItem(result).status).toBe("FIXED");
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual([]);
+    expect(client.history.at(-1).note ?? "").toContain("no longer applies (intermediate head); cleared (#1119)");
   });
 });
