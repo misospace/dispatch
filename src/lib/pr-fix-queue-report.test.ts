@@ -244,7 +244,7 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalled();
   });
 
-  it("leaves a QUEUED item alone on a `failed` outcome (let bridge reconcile decide)", async () => {
+  it("reopens a fresh attempt on a `failed` outcome (#1133)", async () => {
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FIXTURE_ITEM,
     });
@@ -254,10 +254,67 @@ describe("resolvePrFixFromAgentReport", () => {
       attempt: ATTEMPT,
     }));
     expect(result.matched).toBe(true);
-    expect(result.action).toBe("skipped");
-    expect(result.reason).toContain("bridge reconcile");
-    expect(prisma.prFixQueueItem.update).not.toHaveBeenCalled();
+    expect(result.action).toBe("requeued");
+    expect(result.reason).toContain("fresh attempt");
+    // The consumed generation must not stay QUEUED: the settlement write is
+    // generation- and status-conditional and opens a fresh attempt counted
+    // toward the cap, clearing post-dispatch evidence and hand-out records.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "item-42", status: "QUEUED", generation: 1 },
+        data: expect.objectContaining({
+          status: "QUEUED",
+          generation: { increment: 1 },
+          fixAttempts: { increment: 1 },
+          postDispatchEvidenceKeys: [],
+          agentHandouts: [],
+        }),
+      }),
+    );
+    // A failure needs no PR state check — the agent hit a wall regardless.
     expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
+  });
+
+  it("routes a `failed` outcome to a human past the fix-attempt cap (#1133)", async () => {
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FIXTURE_ITEM,
+      fixAttempts: 5,
+    });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "failed",
+      attempt: ATTEMPT,
+    }));
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("blocked");
+    expect(result.reason).toContain("cap");
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "item-42", status: "QUEUED", generation: 1 },
+        data: expect.objectContaining({
+          status: "BLOCKED",
+          lane: "NEEDS_HUMAN",
+        }),
+      }),
+    );
+  });
+
+  it("skips the `failed` settlement when the pinned write no-ops (#1133)", async () => {
+    // A concurrent transition (requeue/reopen, or a settle at the same
+    // generation) owned the row between the read and the write.
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FIXTURE_ITEM,
+    });
+    // One-shot: the following tests rely on the default count-1 write.
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ count: 0 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "failed",
+      attempt: ATTEMPT,
+    }));
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toContain("no longer QUEUED at the reported generation");
   });
 
   it("a repeated report is idempotent for the second `done` report after FIXED", async () => {

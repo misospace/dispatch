@@ -513,7 +513,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
                 ),
               }
             : {}),
-          ...(isFreshAttempt ? { postDispatchEvidenceKeys: [] } : {}),
+          // A fresh attempt resets the post-dispatch list AND the per-agent
+          // hand-out records: the prior generation's records are dead either
+          // way, and the skip check must match only the current identity
+          // (#1119, #1133).
+          ...(isFreshAttempt ? { postDispatchEvidenceKeys: [], agentHandouts: [] } : {}),
           ...metadataPatch(input),
         },
       });
@@ -723,6 +727,9 @@ export async function markPrFixItem(
           fixAttempts: { increment: 1 },
           attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
           postDispatchEvidenceKeys: [],
+          // Fresh attempt: per-agent hand-out records for the consumed
+          // generation must not suppress its re-dispatch (#1133).
+          agentHandouts: [],
         };
     const { count } = await tx.prFixQueueItem.updateMany({
       where: {
@@ -801,8 +808,10 @@ export async function markPrFixItem(
       // refusing a real fix as "pushed nothing" (#1074, #1104).
       data.attemptHeadSha = input.attemptHeadSha ?? existing.headSha ?? null;
       // A fresh attempt must not carry post-dispatch evidence recorded for a
-      // prior generation (#1119).
+      // prior generation (#1119), nor per-agent hand-out records whose skip
+      // match must not survive the identity change (#1133).
       data.postDispatchEvidenceKeys = [];
+      data.agentHandouts = [];
     }
     // QUEUED → QUEUED: leave the key list untouched — the entries still refer
     // to the current generation and must survive the mark.
@@ -840,6 +849,8 @@ export async function markPrFixItem(
             // The generation bump invalidates any recorded entries and proves
             // no stale post-dispatch list on the fresh attempt (#1119).
             postDispatchEvidenceKeys: [],
+            // Same for the per-agent hand-out records (#1133).
+            agentHandouts: [],
           };
       const refusal = await client.$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
@@ -1012,6 +1023,9 @@ export async function markPrFixItem(
         fixAttempts: { increment: 1 },
         attemptHeadSha: lastFresh.headSha ?? lastFresh.attemptHeadSha ?? null,
         postDispatchEvidenceKeys: [],
+        // Fresh attempt: per-agent hand-out records for the consumed
+        // generation must not suppress its re-dispatch (#1133).
+        agentHandouts: [],
       };
   const forced = await client.$transaction(async (tx) => {
     const { count } = await tx.prFixQueueItem.updateMany({
@@ -1191,6 +1205,46 @@ export function freshAttemptGeneration(): { generation: { increment: number } } 
   return { generation: { increment: 1 } };
 }
 
+/**
+ * A per-agent hand-out record (#1133): `<agentName>@<generation>`. next-task
+ * records one when it ships a task token; `agentAlreadyHanded` then skips
+ * the item for that agent until the generation moves. Parsing splits on the
+ * LAST `@` so an agent name containing `@` survives, and a non-integer
+ * generation makes the entry inert (fail-open toward re-handing, never
+ * toward an indefinite skip).
+ */
+export function agentHandoutToken(agentName: string, generation: number): string {
+  return `${agentName}@${generation}`;
+}
+
+export function parseAgentHandoutToken(entry: unknown): { agentName: string; generation: number } | null {
+  if (typeof entry !== "string") return null;
+  const idx = entry.lastIndexOf("@");
+  if (idx <= 0) return null;
+  const generation = Number(entry.slice(idx + 1));
+  if (!Number.isInteger(generation) || generation < 1) return null;
+  return { agentName: entry.slice(0, idx), generation };
+}
+
+/**
+ * Whether this item was already handed to `agentName` at its CURRENT
+ * generation (#1133). Entries for older generations and malformed entries
+ * never match — the skip must only ever suppress a re-hand of the exact
+ * work identity the agent already received.
+ */
+export function agentAlreadyHanded(
+  item: { agentHandouts?: unknown; generation?: unknown },
+  agentName: string,
+): boolean {
+  const entries = Array.isArray(item.agentHandouts) ? item.agentHandouts : [];
+  const generation = typeof item.generation === "number" ? item.generation : null;
+  if (generation === null) return false;
+  return entries.some((entry) => {
+    const parsed = parseAgentHandoutToken(entry);
+    return parsed !== null && parsed.agentName === agentName && parsed.generation === generation;
+  });
+}
+
 export function toAgentQueuePrFixItem(item: any) {
   const fixType = normalizePrFixType(item.type);
   return {
@@ -1214,6 +1268,9 @@ export function toAgentQueuePrFixItem(item: any) {
     attemptHeadSha: item.attemptHeadSha,
     author: item.author,
     generation: item.generation,
+    // Per-agent hand-out records for the current generation (#1133); the
+    // next-task route reads these to skip items this agent already has.
+    agentHandouts: item.agentHandouts ?? [],
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,
@@ -1267,8 +1324,10 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
         fixAttempts: 1,
         attemptHeadSha: existing.headSha ?? null,
         // A fresh operator requeue must not carry post-dispatch evidence
-        // recorded for a prior attempt (#1119).
+        // recorded for a prior attempt (#1119), nor hand-out records that
+        // would suppress the item's re-dispatch (#1133).
         postDispatchEvidenceKeys: [],
+        agentHandouts: [],
       },
     });
     await tx.prFixHistory.create({
@@ -1345,7 +1404,7 @@ export interface ResolvePrFixFromAgentReportInput {
 
 export interface ResolvePrFixFromAgentReportResult {
   matched: boolean;
-  action: "none" | "blocked" | "fixed" | "deferred" | "skipped";
+  action: "none" | "blocked" | "fixed" | "deferred" | "requeued" | "skipped";
   itemId?: number | null;
   reason: string;
   // Echoes the attempt generation the report carried (null when the report
@@ -1380,8 +1439,11 @@ export interface ResolvePrFixFromAgentReportResult {
  *   through untouched).
  * - Outcome `blocked` → mark BLOCKED immediately. Doesn't need PR state; the
  *   agent hit a wall.
- * - Outcome `failed` → no-op. We don't synthesize BLOCKED off a generic
- *   failure — the bridge's reconcile pass still owns that decision.
+ * - Outcome `failed` → settle the consumed generation (#1133): reopen a
+ *   fresh attempt (counted toward PR_FIX_MAX_ATTEMPTS, #1107), or BLOCKED +
+ *   NEEDS_HUMAN past the cap. The bridge reconcile pass that used to own
+ *   this decision is retired; leaving the item QUEUED at a generation the
+ *   worker already consumed starves the lane behind the deduping worker.
  * - Anything else (pr_opened/pr_updated/issue_closed/issue_updated/
  *   no_changes_needed) is "done"-like. Verify PR merge state before marking
  *   FIXED so a red PR isn't marked fixed off unverified success — that is
@@ -1501,13 +1563,82 @@ export async function resolvePrFixFromAgentReport(
   }
 
   if (input.outcome === "failed") {
-    // Don't second-guess a failure — leave the item queued for the bridge
-    // reconcile pass (see reconcileStalePrFixItems / markPrFixItem callers).
+    // A failed report must not leave the item QUEUED at the generation this
+    // worker already consumed (#1133): the bridge reconcile pass that used
+    // to own that cleanup is retired, so a consumed generation would sit
+    // QUEUED forever and starve the lane behind the deduping worker.
+    // Settle the failure into a fresh dispatchable attempt — counted toward
+    // PR_FIX_MAX_ATTEMPTS (#1107) — or, past the cap, hand the PR to a
+    // human. No PR-state check and no post-dispatch keys pin: a fresh
+    // attempt absorbs late evidence by construction (the bump makes it new
+    // work), so only the still-QUEUED status and the generation need
+    // revalidating at commit time — a concurrent BLOCKED/FIXED at the same
+    // generation (neither bumps) must not be clobbered.
+    const failedCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
+    const failedData: Record<string, unknown> = failedCapped
+      ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
+      : {
+          status: "QUEUED",
+          lane: "NORMAL",
+          ...freshAttemptGeneration(),
+          fixAttempts: { increment: 1 },
+          attemptHeadSha: existing.headSha ?? existing.attemptHeadSha ?? null,
+          postDispatchEvidenceKeys: [],
+          // Fresh attempt: the consumed generation's hand-out records must
+          // not suppress the item's re-dispatch (#1133).
+          agentHandouts: [],
+        };
+    const failedRow = await (client as PrFixQueueClient).$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: {
+          id: existing.id,
+          status: "QUEUED",
+          ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        },
+        data: failedData,
+      });
+      if (count !== 1) return null;
+      const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      await tx.prFixHistory.create({
+        data: {
+          itemId: existing.id,
+          action: "mark",
+          status: failedData.status,
+          lane: failedData.lane,
+          note: [
+            input.summary ?? null,
+            failedCapped
+              ? `Agent reported failed; bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), routed to a human instead of re-queuing (#1133).`
+              : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
+          ]
+            .filter(Boolean)
+            .join(" "),
+        },
+      });
+      return row;
+    });
+    if (!failedRow) {
+      // The row is gone, its generation moved (the attempt was re-issued),
+      // or it was already settled at the same generation: nothing to do.
+      return {
+        matched: true,
+        action: "skipped",
+        itemId: existing.id ?? null,
+        reason: "failed settlement skipped: item no longer QUEUED at the reported generation",
+        attemptGeneration: attempt?.generation ?? null,
+      };
+    }
+    if (failedCapped && existing.status !== "BLOCKED") {
+      const context = await buildPrFixBlockedContext(client, failedRow);
+      await surfacePrFixBlocked({ repo, pr, reason: failedRow.reason, latestNote: input.summary ?? null, context });
+    }
     return {
       matched: true,
-      action: "skipped",
+      action: failedCapped ? "blocked" : "requeued",
       itemId: existing.id ?? null,
-      reason: "agent reported failed; leaving for bridge reconcile",
+      reason: failedCapped
+        ? "agent reported failed; past the fix-attempt cap, routed to a human"
+        : "agent reported failed; reopened as a fresh attempt at the next generation",
       attemptGeneration: attempt?.generation ?? null,
     };
   }

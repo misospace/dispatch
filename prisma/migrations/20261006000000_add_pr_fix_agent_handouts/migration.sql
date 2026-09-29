@@ -1,0 +1,12 @@
+-- AlterTable: per-agent hand-out records for PR-fix queue items (#1133).
+-- next-task must not re-hand an agent a QUEUED item it already received at
+-- the item's current generation: a polling worker drops the re-hand (it
+-- already has a run for that work identity), and an item left QUEUED at a
+-- consumed generation otherwise starves the whole lane — neither issues nor
+-- other PR-fix items get served. Each entry is `<agentName>@<generation>`;
+-- another agent still gets the item, and the same agent gets it again when
+-- a fresh attempt bumps the generation. Entries for older generations are
+-- inert (the skip check compares against the item's current generation) and
+-- every fresh attempt clears the list. No backfill: a row that was never
+-- dispatched is simply empty.
+ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "agentHandouts" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
