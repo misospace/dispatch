@@ -1582,11 +1582,14 @@ export async function resolvePrFixFromAgentReport(
     // re-reads the row, derives the baseline from it, and pins the write to
     // the head snapshot that decision was made on; a miss (the head moved
     // again between the re-read and the write) retries on a newer snapshot.
-    // The bounded forced fallback drops the head pin so the
-    // strand-prevention guarantee survives evidence that races every pass —
-    // never clobbering a concurrent settle at the same generation (neither
-    // BLOCKED nor FIXED bumps), which the status+generation pins still
-    // reject.
+    // Every fresh-attempt pass keeps that pin — settling with a stale
+    // baseline defeats the #940 guard no matter how rare the race — so if
+    // every pass loses, the report returns the bounded skip below. That
+    // skip does not starve the lane (#1133): the per-agent hand-out records
+    // make next-task skip the consumed generation for THIS agent while the
+    // item stays available to other agents and to any generation-moving
+    // transition. The status+generation pins still reject concurrent
+    // settles at the same generation (neither BLOCKED nor FIXED bumps).
     const maxFailedRedecisions = 3;
     let settled: { row: any; capped: boolean } | null = null;
     for (let pass = 0; pass < maxFailedRedecisions && !settled; pass++) {
@@ -1608,16 +1611,16 @@ export async function resolvePrFixFromAgentReport(
             // not suppress the item's re-dispatch (#1133).
             agentHandouts: [],
           };
-      // Only the fresh-attempt branch carries a baseline, so only it needs
-      // the head-snapshot pin.
-      const forced = pass === maxFailedRedecisions - 1;
+      // The head-snapshot pin guards the fresh-attempt branch's baseline on
+      // EVERY pass; the capped BLOCKED branch carries no baseline, so it
+      // pins on id + status + generation only.
       const row = await (client as PrFixQueueClient).$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
           where: {
             id: existing.id,
             status: "QUEUED",
             ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-            ...(!capped && !forced ? { headSha: fresh.headSha ?? null } : {}),
+            ...(!capped ? { headSha: fresh.headSha ?? null } : {}),
           },
           data,
         });
@@ -1633,9 +1636,7 @@ export async function resolvePrFixFromAgentReport(
               input.summary ?? null,
               capped
                 ? `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), routed to a human instead of re-queuing (#1133).`
-                : forced
-                  ? `Agent reported failed while evidence kept landing at the same generation; forced a fresh attempt baselined at the latest observed head (#1133).`
-                  : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
+                : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
             ]
               .filter(Boolean)
               .join(" "),
@@ -1647,7 +1648,10 @@ export async function resolvePrFixFromAgentReport(
     }
     if (!settled) {
       // The row is gone, its generation moved (the attempt was re-issued),
-      // or it was already settled at the same generation: nothing to do.
+      // it was already settled at the same generation, or every pass's
+      // head-snapshot pin lost the race: nothing to do. The per-agent
+      // hand-out records keep the skipped consumed generation from
+      // starving this agent's lane (#1133).
       return {
         matched: true,
         action: "skipped",
