@@ -665,10 +665,15 @@ export async function markPrFixItem(
   const data: Record<string, unknown> = { status: nextStatus };
 
   // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
-  // the generation-conditional write, the cap give-up, and the history row,
-  // all inside the caller's transaction. Returns the fresh row, or null when
-  // the conditional write no-ops (generation moved). `noteSuffix` is appended
-  // to the note when the reopen is taken from the settle-gap retry below.
+  // the guarded write, the cap give-up, and the history row, all inside one
+  // tiny transaction the caller passes in. Pinned on the row's id, its
+  // expected generation (#1074), AND the exact post-dispatch evidence
+  // snapshot the actionability decision was made on — evidence recorded
+  // between the actionability read and this write no-ops the reopen instead
+  // of being silently cleared (#1124 review). Returns the fresh row, or null
+  // when the pin misses; the caller then feeds the miss into the bounded
+  // re-decision loop below. `noteSuffix` is appended to the note when the
+  // reopen is taken from the settle-gap retry.
   const writeReopen = async (tx: any, row: any, noteSuffix = ""): Promise<any | null> => {
     const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
     const reopenData: Record<string, unknown> = reopenCapped
@@ -685,6 +690,7 @@ export async function markPrFixItem(
       where: {
         id: row.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        postDispatchEvidenceKeys: { equals: row.postDispatchEvidenceKeys ?? [] },
       },
       data: reopenData,
     });
@@ -721,16 +727,25 @@ export async function markPrFixItem(
   // fresh dispatchable attempt so a worker actually runs on it (#1119).
   // Evaluated only for settlements, so a non-settle mark never triggers a head
   // fetch. A capped item still gives up to a human, matching the other
-  // fresh-attempt caps.
+  // fresh-attempt caps. The head fetch inside the actionability check always
+  // runs OUTSIDE any transaction: Prisma's ~5s interactive-transaction
+  // timeout must never have to span a GitHub round-trip (#1124 review).
   const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED";
   const reopenOnPostDispatch =
     settlesAttempt &&
     (await hasActionablePostDispatchEvidence(existing.postDispatchEvidenceKeys ?? [], input.repo, input.pr));
+  // The initial reopen attempt can miss its keys/generation pin when evidence
+  // is recorded between the check above and the write. That is not a
+  // generation-mismatch: fall into the bounded re-decision loop below rather
+  // than returning no-mutation (#1124 review).
+  let reopenPinnedMissed = false;
   if (reopenOnPostDispatch) {
     const reopened = await client.$transaction(async (tx) => writeReopen(tx, existing));
-    if (!reopened) return { mutated: false, reason: "generation-mismatch" };
-    await surfaceReopen(existing, reopened);
-    return { mutated: true, item: reopened };
+    if (reopened) {
+      await surfaceReopen(existing, reopened);
+      return { mutated: true, item: reopened };
+    }
+    reopenPinnedMissed = true;
   }
 
   if (nextStatus === "BLOCKED") {
@@ -822,113 +837,167 @@ export async function markPrFixItem(
     }
   }
 
-  // Known bounded trade-off: the gap re-decision below can await
-  // fetchPullRequestHeadSha INSIDE this interactive transaction, holding a
-  // pool connection and risking Prisma's ~5s interactive-transaction timeout
-  // on a slow GitHub (rollback → mark fails). Accepted because the window is
-  // narrow: it requires a gap-hit (the guarded write no-oped) AND only
-  // check_run entries (review/comment short-circuit without any fetch).
-  const settled = await client.$transaction(async (tx) => {
-    // #1074: with an expected generation, the status write is conditional on
-    // the row still being at that generation — commit-time revalidation. A
-    // concurrent re-issue (new evidence, requeue) moves the generation and
-    // makes this write a no-op; the history row is skipped too.
-    // #1119: for a settlement the write additionally requires the
-    // post-dispatch evidence list to be empty — evidence landing in the
-    // read→write gap no-ops the settlement (count !== 1) instead of being
-    // silently absorbed into it. The keys-clear is deliberately NOT in
-    // `data`: it would let a stale write clobber a concurrently recorded
-    // entry. Unqualified marks take the same guarded updateMany path (no
-    // generation clause) so the settle-gap guard applies to them too.
-    const settleWhere: Record<string, unknown> = {
-      id: existing.id,
-      ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-      ...(settlesAttempt ? { postDispatchEvidenceKeys: { equals: [] } } : {}),
-    };
-    const { count } = await tx.prFixQueueItem.updateMany({ where: settleWhere, data });
-    if (count === 1) {
+  // Shared tail for every successful settlement write.
+  const finishSettled = async (row: any): Promise<MarkPrFixResult> => {
+    // Only surface a blocked notification when THIS mark is what first puts
+    // the item into BLOCKED (from a non-BLOCKED status).
+    if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
+      const context = await buildPrFixBlockedContext(client, row);
+      await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: row.reason, latestNote: input.note ?? null, context });
+    } else if (existing.status === "BLOCKED" && (nextStatus === "QUEUED" || nextStatus === "FIXED")) {
+      await retractNeedsHuman(input.repo, input.pr, nextStatus === "FIXED" ? "resolved" : "requeued", input.note);
+    }
+    return { mutated: true, item: row };
+  };
+
+  // Fast path: one tiny transaction holding ONLY the guarded settlement
+  // write, its history row, and the post-write read — no network call may
+  // run in here (#1124 review).
+  // #1074: with an expected generation, the status write is conditional on
+  // the row still being at that generation — commit-time revalidation. A
+  // concurrent re-issue (new evidence, requeue) moves the generation and
+  // makes this write a no-op; the history row is skipped too.
+  // #1119: for a settlement the write additionally requires the
+  // post-dispatch evidence list to be empty — evidence landing in the
+  // read→write gap no-ops the settlement (count !== 1) instead of being
+  // silently absorbed into it. The keys-clear is deliberately NOT in
+  // `data`: it would let a stale write clobber a concurrently recorded
+  // entry. Unqualified marks take the same guarded updateMany path (no
+  // generation clause) so the settle-gap guard applies to them too.
+  if (!reopenPinnedMissed) {
+    const settledRow = await client.$transaction(async (tx) => {
+      const settleWhere: Record<string, unknown> = {
+        id: existing.id,
+        ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        ...(settlesAttempt ? { postDispatchEvidenceKeys: { equals: [] } } : {}),
+      };
+      const { count } = await tx.prFixQueueItem.updateMany({ where: settleWhere, data });
+      if (count !== 1) return null;
       const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
       await tx.prFixHistory.create({
         data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.note ?? undefined },
       });
-      return { kind: "settled" as const, row };
-    }
+      return row;
+    });
+    if (settledRow) return finishSettled(settledRow);
+    if (!settlesAttempt) return { mutated: false, reason: "generation-mismatch" };
+  }
 
-    // The conditional write no-oped: the row moved between the read above and
-    // the write. Re-read and re-decide (at most one retry — the writes below
-    // are generation- and keys-snapshot-pinned, so this cannot loop).
-    const fresh = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
-    if (!fresh) return { kind: "no-mutation" as const };
+  // The guarded write no-oped (or the initial reopen missed its pin): the row
+  // moved between the decision read and the write. Bounded re-decision loop
+  // (#1124 review): re-read and re-check actionability OUTSIDE any
+  // transaction — the head fetch inside hasActionablePostDispatchEvidence
+  // must never run while a transaction holds a pool connection — then
+  // attempt a keys-pinned reopen or settle write in a tiny transaction. A
+  // pinned write that misses means evidence landed AGAIN during the head
+  // fetch; loop (bounded) and retry against the fresh row.
+  const maxSettleRedecisions = 3;
+  let lastFresh = existing;
+  for (let i = 0; i < maxSettleRedecisions; i++) {
+    const fresh = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    if (!fresh) return { mutated: false, reason: "not-found" };
     if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) {
-      return { kind: "no-mutation" as const };
+      // A genuine stale token: the attempt was re-issued (new evidence,
+      // requeue) and owns the row now — skipping is correct, not a strand.
+      return { mutated: false, reason: "generation-mismatch" };
     }
-    if (!settlesAttempt) return { kind: "no-mutation" as const };
-    // Post-dispatch evidence landed in the gap. Re-decide on the fresh row.
-    const gapActionable = await hasActionablePostDispatchEvidence(
-      fresh.postDispatchEvidenceKeys ?? [],
-      input.repo,
-      input.pr,
-    );
-    if (gapActionable) {
-      const reopened = await writeReopen(
-        tx,
-        fresh,
-        " Post-dispatch evidence landed while this settlement was in flight.",
+    lastFresh = fresh;
+    const freshKeys: string[] = fresh.postDispatchEvidenceKeys ?? [];
+    if (await hasActionablePostDispatchEvidence(freshKeys, input.repo, input.pr)) {
+      const reopened = await client.$transaction(async (tx) =>
+        writeReopen(tx, fresh, " Post-dispatch evidence landed while this settlement was in flight."),
       );
-      if (!reopened) return { kind: "no-mutation" as const };
-      return { kind: "reopened" as const, row: reopened, from: fresh };
+      if (reopened) {
+        await surfaceReopen(fresh, reopened);
+        return { mutated: true, item: reopened };
+      }
+      continue;
     }
     // The recorded entries no longer apply (intermediate head): settle
     // normally, clear them, and say so in the history (#1119). The write is
     // pinned to the exact keys snapshot this no-reopen decision was made on,
-    // so an entry landing during the head fetch above no-ops the write (the
-    // settlement simply does not happen this mark; the next mark re-decides)
+    // so an entry landing during the head fetch above no-ops the write
     // instead of being cleared and absorbed.
-    const { count: retryCount } = await tx.prFixQueueItem.updateMany({
-      where: {
-        id: fresh.id,
-        ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-        postDispatchEvidenceKeys: { equals: fresh.postDispatchEvidenceKeys ?? [] },
-      },
-      data: { ...data, postDispatchEvidenceKeys: [] },
+    const clearedRow = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: {
+          id: fresh.id,
+          ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+          postDispatchEvidenceKeys: { equals: freshKeys },
+        },
+        data: { ...data, postDispatchEvidenceKeys: [] },
+      });
+      if (count !== 1) return null;
+      const row = await tx.prFixQueueItem.findUnique({ where: { id: fresh.id } });
+      await tx.prFixHistory.create({
+        data: {
+          itemId: row.id,
+          action: "mark",
+          status: nextStatus,
+          lane: row.lane,
+          note: [
+            input.note,
+            "Recorded post-dispatch evidence no longer applies (intermediate head); cleared (#1119).",
+          ]
+            .filter(Boolean)
+            .join(" "),
+        },
+      });
+      return row;
     });
-    if (retryCount !== 1) return { kind: "no-mutation" as const };
-    const row = await tx.prFixQueueItem.findUnique({ where: { id: fresh.id } });
+    if (clearedRow) return finishSettled(clearedRow);
+  }
+
+  // The loop exhausted: the pinned writes kept losing the race to evidence
+  // that keeps landing. Never return no-mutation for a settle mark merely
+  // because of that — the item would stay QUEUED at the generation the
+  // worker already consumed, next-task would keep handing the spent
+  // generation first to the deduping worker, and the lane would starve
+  // (#1124 review). Force a fresh attempt (or, past the cap, a human
+  // hand-off): pinned on id (+ the generation when the token defines one)
+  // WITHOUT the keys pin, so racing evidence cannot block it.
+  const forceCapped = (lastFresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+  const forceData: Record<string, unknown> = forceCapped
+    ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
+    : {
+        status: "QUEUED",
+        lane: "NORMAL",
+        ...freshAttemptGeneration(),
+        fixAttempts: { increment: 1 },
+        attemptHeadSha: lastFresh.headSha ?? lastFresh.attemptHeadSha ?? null,
+        postDispatchEvidenceKeys: [],
+      };
+  const forced = await client.$transaction(async (tx) => {
+    const { count } = await tx.prFixQueueItem.updateMany({
+      where: {
+        id: existing.id,
+        ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+      },
+      data: forceData,
+    });
+    if (count !== 1) return null;
     await tx.prFixHistory.create({
       data: {
-        itemId: row.id,
+        itemId: existing.id,
         action: "mark",
-        status: nextStatus,
-        lane: row.lane,
-        note: [
-          input.note,
-          "Recorded post-dispatch evidence no longer applies (intermediate head); cleared (#1119).",
-        ]
-          .filter(Boolean)
-          .join(" "),
+        status: forceData.status,
+        lane: forceData.lane,
+        note: forceCapped
+          ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+          : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1119).`,
       },
     });
-    return { kind: "settled" as const, row };
+    return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
   });
-
-  if (settled.kind === "no-mutation") return { mutated: false, reason: "generation-mismatch" };
-  if (settled.kind === "reopened") {
-    await surfaceReopen(settled.from, settled.row);
-    return { mutated: true, item: settled.row };
+  if (!forced) {
+    // The row is gone or its generation moved even against the unkeyed pin:
+    // a concurrent re-issue (or delete) owns the item now — the
+    // stale-token skip applies.
+    const remaining = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    return { mutated: false, reason: remaining ? "generation-mismatch" : "not-found" };
   }
-
-  const updated = settled.row;
-
-  // Only surface a blocked notification when THIS mark is what first puts the
-  // item into BLOCKED (from a non-BLOCKED status).
-  if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
-    const context = await buildPrFixBlockedContext(client, updated);
-    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: updated.reason, latestNote: input.note ?? null, context });
-  } else if (existing.status === "BLOCKED" && (nextStatus === "QUEUED" || nextStatus === "FIXED")) {
-    await retractNeedsHuman(input.repo, input.pr, nextStatus === "FIXED" ? "resolved" : "requeued", input.note);
-  }
-
-  return { mutated: true, item: updated };
+  await surfaceReopen(lastFresh, forced);
+  return { mutated: true, item: forced };
 }
 
 /**

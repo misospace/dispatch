@@ -44,7 +44,11 @@ vi.mock("./github-prs", () => ({
 function makeClient(): PrFixQueueClient & {
   items: any[];
   history: any[];
-  hooks: { beforeUpdateMany: (() => void) | null };
+  inTransaction: boolean;
+  hooks: {
+    beforeUpdateMany: (() => void) | null;
+    beforeUpdateManyEvery: (() => void) | null;
+  };
 } {
   const items: any[] = [];
   const history: any[] = [];
@@ -52,13 +56,24 @@ function makeClient(): PrFixQueueClient & {
   const client: any = {
     items,
     history,
+    // #1124: true while a $transaction callback is executing. Tests use it to
+    // prove no network call (e.g. the post-dispatch head fetch) runs inside a
+    // transaction.
+    inTransaction: false,
     // One-shot gap hook (#1119): a test sets it to land a concurrent enqueue
     // right before a conditional updateMany — i.e. inside the read→write gap
     // the settlement guard is meant to catch. (A findUnique hook cannot hit
     // that window: the mark's pre-check read is repo_pr-form and its post-write
     // re-read is id-form, with no read between them.)
-    hooks: { beforeUpdateMany: null },
-    $transaction: async (fn: any) => fn(client),
+    hooks: { beforeUpdateMany: null, beforeUpdateManyEvery: null },
+    $transaction: async (fn: any) => {
+      client.inTransaction = true;
+      try {
+        return await fn(client);
+      } finally {
+        client.inTransaction = false;
+      }
+    },
     prFixQueueItem: {
       findUnique: async ({ where }: any) => {
         // Support both lookup shapes: composite repo_pr and primary id.
@@ -104,6 +119,9 @@ function makeClient(): PrFixQueueClient & {
           client.hooks.beforeUpdateMany = null;
           hook();
         }
+        // Persistent variant (#1124): fires before EVERY updateMany, so a test
+        // can model evidence that keeps landing on each pinned write.
+        client.hooks.beforeUpdateManyEvery?.();
         // Generation-conditional (and/or id-scoped) bulk write — mirrors the
         // real client's commit-time revalidation semantics for #1074, plus
         // the post-dispatch evidence guard ({ equals: [...] }) for #1119.
@@ -2296,5 +2314,117 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     const marked = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 35, status: "stale" }));
     expect(marked.status).toBe("STALE");
     expect(marked.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("the gap re-decision head fetch never runs inside a transaction (#1124)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 36, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // A check_run lands in the read→write gap: the one-shot hook records it
+    // right before the guarded settlement write, so the settlement no-ops and
+    // the re-decision loop must classify the check — which REQUIRES a head
+    // fetch. (review entries would short-circuit without any fetch.)
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].postDispatchEvidenceKeys = ["check_run:org/repo#36:90@H1"];
+    };
+    let headFetchInsideTx = false;
+    githubPrsMocks.fetchPullRequestHeadSha.mockImplementation(async () => {
+      if (client.inTransaction) {
+        headFetchInsideTx = true;
+        throw new Error("head fetch called inside a transaction");
+      }
+      return null;
+    });
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 36, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(headFetchInsideTx).toBe(false);
+    // The gap re-decision landed the reopen, outside any transaction.
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("a pinned-retry-loses-race settle mark never strands the item at the consumed generation (#1124)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 37, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // Concurrent evidence keeps landing on EVERY pinned write — more times
+    // than the bounded re-decision loop permits — so every keys-pinned
+    // reopen/settle write no-ops. The mark must still mutate the row.
+    let landCount = 0;
+    client.hooks.beforeUpdateManyEvery = () => {
+      landCount += 1;
+      const row = client.items[0];
+      row.postDispatchEvidenceKeys = [
+        ...(row.postDispatchEvidenceKeys ?? []),
+        `check_run:org/repo#37:${landCount}@unknown`,
+      ];
+    };
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 37, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    // Evidence landed on the fast path, every loop iteration, AND the forced
+    // fallback write — strictly more than the 3-iteration loop allows.
+    expect(landCount).toBeGreaterThan(3);
+    const item = client.items[0];
+    // Not stranded QUEUED at the generation the worker already consumed:
+    // the forced fallback (pinned without the keys predicate) moved it.
+    expect(item.status).toBe("QUEUED");
+    expect(item.generation).toBe(2);
+    expect(item.fixAttempts).toBe(2);
+    expect(item.postDispatchEvidenceKeys).toEqual([]);
+    // The forced-fallback history row explains the outcome.
+    expect(client.history.at(-1).note).toContain("forced a fresh attempt");
+  });
+
+  it("the forced fallback gives up to a human when the item is at the cap (#1124)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 38, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    // At the attempt cap (maxPrFixAttempts defaults to 5).
+    client.items[0].fixAttempts = 5;
+
+    let landCount = 0;
+    client.hooks.beforeUpdateManyEvery = () => {
+      landCount += 1;
+      const row = client.items[0];
+      row.postDispatchEvidenceKeys = [
+        ...(row.postDispatchEvidenceKeys ?? []),
+        `check_run:org/repo#38:${landCount}@unknown`,
+      ];
+    };
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 38, status: "FIXED",
+      expectedGeneration: 1,
+    });
+
+    expect(result.mutated).toBe(true);
+    const item = client.items[0];
+    // Capped: the forced fallback routes to a human instead of a fresh run.
+    expect(item.status).toBe("BLOCKED");
+    expect(item.lane).toBe("NEEDS_HUMAN");
+    expect(item.generation).toBe(1);
+    expect(item.fixAttempts).toBe(5);
+    expect(item.postDispatchEvidenceKeys).toEqual([]);
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalled();
   });
 });
