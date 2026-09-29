@@ -261,7 +261,7 @@ describe("resolvePrFixFromAgentReport", () => {
     // toward the cap, clearing post-dispatch evidence and hand-out records.
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "item-42", status: "QUEUED", generation: 1 },
+        where: expect.objectContaining({ id: "item-42", status: "QUEUED", generation: 1 }),
         data: expect.objectContaining({
           status: "QUEUED",
           generation: { increment: 1 },
@@ -299,14 +299,14 @@ describe("resolvePrFixFromAgentReport", () => {
     );
   });
 
-  it("skips the `failed` settlement when the pinned write no-ops (#1133)", async () => {
+  it("skips the `failed` settlement when every pinned write no-ops (#1133)", async () => {
     // A concurrent transition (requeue/reopen, or a settle at the same
-    // generation) owned the row between the read and the write.
+    // generation) owned the row across every re-decision pass: the bounded
+    // retry never settles and the report is a skip.
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FIXTURE_ITEM,
     });
-    // One-shot: the following tests rely on the default count-1 write.
-    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ count: 0 });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async () => ({ count: 0 }));
 
     const result = await resolvePrFixFromAgentReport(baseInput({
       outcome: "failed",
@@ -315,6 +315,69 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(result.matched).toBe(true);
     expect(result.action).toBe("skipped");
     expect(result.reason).toContain("no longer QUEUED at the reported generation");
+    // Bounded: three re-decision passes, no unbounded retry.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(3);
+    // Restore the default write for the following tests.
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async () => ({ count: 1 }));
+  });
+
+  it("baselines the failed fresh attempt from a same-generation headSha update (#1133)", async () => {
+    // A same-generation enqueue (new evidence) updates the mutable headSha
+    // without moving status or generation: the settlement must re-read the
+    // row and baseline the fresh attempt from the UPDATED head — a stale
+    // baseline would let the #940 guard mistake pre-attempt head movement
+    // for worker progress (#1074/#1104).
+    const headBefore = "a".repeat(40);
+    const headAfter = "b".repeat(40);
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>)
+      // The resolver's initial read still sees the old head.
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM, headSha: headBefore })
+      // The settlement's re-read observes the same-generation enqueue.
+      .mockResolvedValue({ ...FIXTURE_ITEM, headSha: headAfter });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "failed",
+      attempt: ATTEMPT,
+    }));
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("requeued");
+    // The write is pinned to the head snapshot the baseline was derived
+    // from, and that baseline is the updated head.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ headSha: headAfter }),
+        data: expect.objectContaining({ attemptHeadSha: headAfter }),
+      }),
+    );
+  });
+
+  it("retries the failed settlement against the newer head when the pinned write loses the race (#1133)", async () => {
+    const head1 = "c".repeat(40);
+    const head2 = "d".repeat(40);
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM, headSha: head1 })
+      .mockResolvedValueOnce({ ...FIXTURE_ITEM, headSha: head1 })
+      // The re-decision pass after the miss observes the newer head.
+      .mockResolvedValue({ ...FIXTURE_ITEM, headSha: head2 });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>)
+      // Pass 0's head pin misses: the row's headSha moved to head2.
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "failed",
+      attempt: ATTEMPT,
+    }));
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("requeued");
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(2);
+    // The retry baselines from — and pins — the newer head snapshot.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ headSha: head2 }),
+        data: expect.objectContaining({ attemptHeadSha: head2 }),
+      }),
+    );
   });
 
   it("a repeated report is idempotent for the second `done` report after FIXED", async () => {

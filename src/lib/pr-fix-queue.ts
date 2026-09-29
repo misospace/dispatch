@@ -1569,55 +1569,83 @@ export async function resolvePrFixFromAgentReport(
     // QUEUED forever and starve the lane behind the deduping worker.
     // Settle the failure into a fresh dispatchable attempt — counted toward
     // PR_FIX_MAX_ATTEMPTS (#1107) — or, past the cap, hand the PR to a
-    // human. No PR-state check and no post-dispatch keys pin: a fresh
-    // attempt absorbs late evidence by construction (the bump makes it new
-    // work), so only the still-QUEUED status and the generation need
-    // revalidating at commit time — a concurrent BLOCKED/FIXED at the same
-    // generation (neither bumps) must not be clobbered.
-    const failedCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
-    const failedData: Record<string, unknown> = failedCapped
-      ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
-      : {
-          status: "QUEUED",
-          lane: "NORMAL",
-          ...freshAttemptGeneration(),
-          fixAttempts: { increment: 1 },
-          attemptHeadSha: existing.headSha ?? existing.attemptHeadSha ?? null,
-          postDispatchEvidenceKeys: [],
-          // Fresh attempt: the consumed generation's hand-out records must
-          // not suppress the item's re-dispatch (#1133).
-          agentHandouts: [],
-        };
-    const failedRow = await (client as PrFixQueueClient).$transaction(async (tx) => {
-      const { count } = await tx.prFixQueueItem.updateMany({
-        where: {
-          id: existing.id,
-          status: "QUEUED",
-          ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-        },
-        data: failedData,
+    // human. No PR-state check: a fresh attempt absorbs late evidence by
+    // construction (the bump makes it new work).
+    //
+    // The fresh attempt's per-attempt baseline must be derived from a row
+    // read at settlement time, NOT from the caller's pre-read snapshot: a
+    // same-generation enqueue (new evidence) updates the mutable headSha
+    // without moving status or generation, so the snapshot's head can be
+    // stale even though the generation/status pins all still match — and
+    // baselining from it would let the #940 guard mistake pre-attempt head
+    // movement for worker progress (#1074/#1104). Each pass therefore
+    // re-reads the row, derives the baseline from it, and pins the write to
+    // the head snapshot that decision was made on; a miss (the head moved
+    // again between the re-read and the write) retries on a newer snapshot.
+    // The bounded forced fallback drops the head pin so the
+    // strand-prevention guarantee survives evidence that races every pass —
+    // never clobbering a concurrent settle at the same generation (neither
+    // BLOCKED nor FIXED bumps), which the status+generation pins still
+    // reject.
+    const maxFailedRedecisions = 3;
+    let settled: { row: any; capped: boolean } | null = null;
+    for (let pass = 0; pass < maxFailedRedecisions && !settled; pass++) {
+      const fresh = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      if (!fresh) break;
+      if (fresh.status !== "QUEUED") break;
+      if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) break;
+      const capped = (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+      const data: Record<string, unknown> = capped
+        ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
+        : {
+            status: "QUEUED",
+            lane: "NORMAL",
+            ...freshAttemptGeneration(),
+            fixAttempts: { increment: 1 },
+            attemptHeadSha: fresh.headSha ?? fresh.attemptHeadSha ?? null,
+            postDispatchEvidenceKeys: [],
+            // Fresh attempt: the consumed generation's hand-out records must
+            // not suppress the item's re-dispatch (#1133).
+            agentHandouts: [],
+          };
+      // Only the fresh-attempt branch carries a baseline, so only it needs
+      // the head-snapshot pin.
+      const forced = pass === maxFailedRedecisions - 1;
+      const row = await (client as PrFixQueueClient).$transaction(async (tx) => {
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: {
+            id: existing.id,
+            status: "QUEUED",
+            ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+            ...(!capped && !forced ? { headSha: fresh.headSha ?? null } : {}),
+          },
+          data,
+        });
+        if (count !== 1) return null;
+        const freshRow = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+        await tx.prFixHistory.create({
+          data: {
+            itemId: existing.id,
+            action: "mark",
+            status: data.status,
+            lane: data.lane,
+            note: [
+              input.summary ?? null,
+              capped
+                ? `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), routed to a human instead of re-queuing (#1133).`
+                : forced
+                  ? `Agent reported failed while evidence kept landing at the same generation; forced a fresh attempt baselined at the latest observed head (#1133).`
+                  : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
+            ]
+              .filter(Boolean)
+              .join(" "),
+          },
+        });
+        return freshRow;
       });
-      if (count !== 1) return null;
-      const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
-      await tx.prFixHistory.create({
-        data: {
-          itemId: existing.id,
-          action: "mark",
-          status: failedData.status,
-          lane: failedData.lane,
-          note: [
-            input.summary ?? null,
-            failedCapped
-              ? `Agent reported failed; bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), routed to a human instead of re-queuing (#1133).`
-              : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
-          ]
-            .filter(Boolean)
-            .join(" "),
-        },
-      });
-      return row;
-    });
-    if (!failedRow) {
+      if (row) settled = { row, capped };
+    }
+    if (!settled) {
       // The row is gone, its generation moved (the attempt was re-issued),
       // or it was already settled at the same generation: nothing to do.
       return {
@@ -1628,15 +1656,15 @@ export async function resolvePrFixFromAgentReport(
         attemptGeneration: attempt?.generation ?? null,
       };
     }
-    if (failedCapped && existing.status !== "BLOCKED") {
-      const context = await buildPrFixBlockedContext(client, failedRow);
-      await surfacePrFixBlocked({ repo, pr, reason: failedRow.reason, latestNote: input.summary ?? null, context });
+    if (settled.capped && existing.status !== "BLOCKED") {
+      const context = await buildPrFixBlockedContext(client, settled.row);
+      await surfacePrFixBlocked({ repo, pr, reason: settled.row.reason, latestNote: input.summary ?? null, context });
     }
     return {
       matched: true,
-      action: failedCapped ? "blocked" : "requeued",
+      action: settled.capped ? "blocked" : "requeued",
       itemId: existing.id ?? null,
-      reason: failedCapped
+      reason: settled.capped
         ? "agent reported failed; past the fix-attempt cap, routed to a human"
         : "agent reported failed; reopened as a fresh attempt at the next generation",
       attemptGeneration: attempt?.generation ?? null,
