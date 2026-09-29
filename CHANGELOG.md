@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.67](https://github.com/misospace/dispatch/compare/v0.5.66...v0.5.67) (2026-09-29)
+
+
+### Features
+
+* **auth:** split bearer auth into worker and maintainer token tiers ([#1122](https://github.com/misospace/dispatch/issues/1122)) ([12328f8](https://github.com/misospace/dispatch/commit/12328f82e790379f17bffa5041ff36a3591290e3))
+* **deps:** update dependency @modelcontextprotocol/sdk (1.30.1 → 1.31.0) ([#1132](https://github.com/misospace/dispatch/issues/1132)) ([6147a2e](https://github.com/misospace/dispatch/commit/6147a2ea588f1f772a2577a37c4812c9069ed99c))
+
+
+### Bug Fixes
+
+* **groomer:** back off after failed runs ([#1125](https://github.com/misospace/dispatch/issues/1125)) ([#1127](https://github.com/misospace/dispatch/issues/1127)) ([22d3a7d](https://github.com/misospace/dispatch/commit/22d3a7d98fd1daaafddebccd3089a6b8361677da))
+* **groomer:** repair or degrade on evidence-reference validation errors ([#1126](https://github.com/misospace/dispatch/issues/1126)) ([#1128](https://github.com/misospace/dispatch/issues/1128)) ([3ee30a1](https://github.com/misospace/dispatch/commit/3ee30a10a3e6555a7ca08419c63ce811bc57fe1b))
+* **pr-fix:** deliver post-dispatch evidence as a fresh attempt ([#1119](https://github.com/misospace/dispatch/issues/1119)) ([#1124](https://github.com/misospace/dispatch/issues/1124)) ([3a5ecd7](https://github.com/misospace/dispatch/commit/3a5ecd71b1df6cbc14fda093e6a3c6c3995a5723))
+* **pr-fix:** stop re-handing consumed pr-fix generations and settle failed reports ([#1133](https://github.com/misospace/dispatch/issues/1133)) ([#1135](https://github.com/misospace/dispatch/issues/1135)) ([add7d54](https://github.com/misospace/dispatch/commit/add7d54155f11fac04c6c02b324b2d68f7526605))
+
 ## [0.5.66](https://github.com/misospace/dispatch/compare/v0.5.65...v0.5.66) (2026-09-27)
 
 
