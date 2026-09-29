@@ -245,7 +245,7 @@ export async function runCandidate(
     upsertLease: async () => ({ created: true, lease: { id: "lease-1" } }),
     releaseLease: async () => ({ id: "lease-1" }),
     prisma: prisma as unknown as GroomerDeps["prisma"],
-    buildRepositoryContext: async () => ({ text: "", sources: [], warnings: [], bytes: 0, queries: [] }),
+    buildRepositoryContext: async () => ({ text: "", sources: [], warnings: [], bytes: 0, queries: [], emptyQueries: [] }),
     exploreRepository: async () => exploration,
     collectEvidence: (input) =>
       collectGroomingEvidenceSnapshot(input, {

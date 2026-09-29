@@ -455,4 +455,88 @@ describe("buildRepositoryContext", () => {
       expect(result.sources).not.toContain("empty.ts");
     });
   });
+
+  describe("emptyQueries (repo-wide negative evidence, dispatch#1115)", () => {
+    it("records every derived query when all searches return zero results", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockResolvedValue([]);
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.queries).not.toHaveLength(0);
+      expect(result.emptyQueries).toEqual(result.queries);
+    });
+
+    it("records only the zero-result query, in derived-query order", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockImplementation(async (_repo, query) =>
+        query === "authentication"
+          ? [{ path: "src/auth.ts", url: "1" }]
+          : [],
+      );
+      deps.fetchFile.mockResolvedValue("export const auth = true;");
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.sources).toContain("src/auth.ts");
+      // The hit-bearing query is excluded; the rest are recorded in order
+      expect(result.emptyQueries).toEqual(["timeout", "handling", "users", "auth"]);
+      expect(result.emptyQueries).toEqual(result.queries.filter((q) => q !== "authentication"));
+    });
+
+    it("does not record a failing search, still pushes a warning, and records the other zero-result queries", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockImplementation(async (_repo, query) => {
+        if (query === "timeout") throw new Error("rate limited");
+        return [];
+      });
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.warnings.some((w) => w.includes('Code search failed for "timeout"'))).toBe(true);
+      expect(result.emptyQueries).not.toContain("timeout");
+      // The zero-result queries alongside the failing one are recorded
+      expect(result.emptyQueries).toEqual(["authentication", "handling", "users", "auth"]);
+    });
+
+    it("returns an empty emptyQueries when the feature is disabled", async () => {
+      const result = await buildRepositoryContext(
+        defaultInput,
+        { ...defaultConfig, enabled: false },
+        deps,
+      );
+
+      expect(result.emptyQueries).toEqual([]);
+    });
+
+    it("returns an empty emptyQueries on the metadata-only early return", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+
+      const result = await buildRepositoryContext(
+        { ...defaultInput, issueTitle: "A it", issueBody: "is the and we" },
+        defaultConfig,
+        deps,
+      );
+
+      expect(result.queries).toEqual([]);
+      expect(result.emptyQueries).toEqual([]);
+      expect(deps.searchCode).not.toHaveBeenCalled();
+    });
+  });
 });

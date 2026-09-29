@@ -350,6 +350,140 @@ describe("buildGroomingFreshnessBaseline", () => {
     const unreadable = await buildGroomingFreshnessBaseline(input({ explorationToolCalls: emptySearches(["short", 42]) }));
     expect(unreadable.groomedSearchCodeQueries).toEqual([]);
   });
+
+  it("saves repository-context empties for a dispatcher-only global run", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["alpha", "beta"],
+        repositoryEmptyQueries: ["alpha", "beta"],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual(["alpha", "beta"]);
+  });
+
+  it("saves none when only some repository-context searches came back empty", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["alpha", "beta", "gamma"],
+        repositoryEmptyQueries: ["alpha", "beta"],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when the run did not capture the repository-context empties", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["alpha"],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when the repository-context capture is empty but searches ran", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: [],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("merges exploration and repository-context empties, deduplicating shared queries", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        explorationToolCalls: emptySearches(["shared"]),
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha", "shared"],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual(["shared", "alpha"]);
+  });
+
+  it("saves none when the merged count exceeds the cap", async () => {
+    const exploration = Array.from({ length: 6 }, (_, index) => `missing ${index}`);
+    const repository = Array.from({ length: 6 }, (_, index) => `repo ${index}`);
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        explorationToolCalls: emptySearches(exploration),
+        repositoryQueries: repository,
+        repositoryEmptyQueries: repository,
+      }),
+    );
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when a repository-context query is too long to save", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["x".repeat(201)],
+        repositoryEmptyQueries: ["x".repeat(201)],
+      }),
+    );
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when the repository-context capture is not a usable string array", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha", 42] as any,
+      }),
+    );
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("merges repository-context empties into a read-path global's saved set", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        explorationToolCalls: emptySearches(["missing symbol"]),
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha"],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual(["missing symbol", "alpha"]);
+  });
+
+  it("saves none for a no-read-path global with list_directory, even when every repository search is accounted", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationToolCalls: [
+          { name: "list_directory", ok: true, bytes: 50, arguments: { path: "src" } },
+          { name: "search_code", ok: true, bytes: 0, arguments: { query: "missing symbol" } },
+        ],
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha"],
+      }),
+    );
+    expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
 });
 
 describe("deriveGroomingFreshness", () => {

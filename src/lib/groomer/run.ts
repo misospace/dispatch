@@ -967,6 +967,7 @@ async function executeGroomerRun(
         closed: applied.closed,
         evidenceWindowStart,
         repositoryQueries: repositoryContext.queries,
+        repositoryEmptyQueries: repositoryContext.emptyQueries,
         explorationRan: exploration !== null,
         explorationToolCalls: exploration ? explorationCallsForFreshness(exploration.toolCalls) : [],
         citations: plan.citations,
