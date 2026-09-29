@@ -134,6 +134,25 @@ function matchesFirstHandOut(row: any, where: any): boolean {
   });
 }
 
+/**
+ * Apply a Prisma update patch to a fake row, resolving the array-mutation
+ * shapes the route writes: `{ push: [...] }` for the per-agent hand-out
+ * record (#1133) and `{ increment: n }` for counters. A plain value is
+ * assigned as-is.
+ */
+function applyUpdate(row: any, data: any): void {
+  const patch: Record<string, any> = { ...data };
+  for (const key of Object.keys(patch)) {
+    const value = patch[key];
+    if (value && typeof value === "object" && Array.isArray(value.push)) {
+      patch[key] = [...(Array.isArray(row[key]) ? row[key] : []), ...value.push];
+    } else if (value && typeof value === "object" && typeof value.increment === "number") {
+      patch[key] = (row[key] ?? 0) + value.increment;
+    }
+  }
+  Object.assign(row, patch);
+}
+
 function request(url: string, agentName = "example-agent", includeAuth = true) {
   return authedRequest(`http://localhost${url}`, { includeAuth });
 }
@@ -429,10 +448,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     });
   });
 
-  it("re-hand-out of a still-queued generation preserves post-dispatch evidence (#1119)", async () => {
+  it("another agent's hand-out of a stamped generation preserves post-dispatch evidence (#1119, #1133)", async () => {
     // Stateful fake row: the updateMany mock honors the first-hand-out-only
-    // where clause, so the polling re-fetch genuinely no-ops instead of
-    // re-stamping and clearing the post-dispatch keys.
+    // where clause, so a hand-out of an already-stamped generation genuinely
+    // no-ops instead of re-stamping and clearing the post-dispatch keys.
     const row: any = {
       id: "prfix-1",
       repo: "org/repo",
@@ -453,11 +472,12 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       dispatchedAt: null,
       dispatchedGeneration: null,
       postDispatchEvidenceKeys: [],
+      agentHandouts: [],
     };
     mocks.prFixFindMany.mockResolvedValue([row]);
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
       if (!matchesFirstHandOut(row, where)) return { count: 0 };
-      Object.assign(row, data);
+      applyUpdate(row, data);
       return { count: 1 };
     });
     mocks.prFixFindUnique.mockImplementation(async () => ({
@@ -467,7 +487,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       generation: row.generation,
     }));
 
-    // (a) First hand-out of generation 2: stamps and clears the keys.
+    // (a) First hand-out of generation 2, by agent A: stamps and clears the keys.
     const first = await GET(
       request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
@@ -476,25 +496,233 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(row.dispatchedGeneration).toBe(2);
     expect(row.dispatchedAt).toBeInstanceOf(Date);
     expect(row.postDispatchEvidenceKeys).toEqual([]);
+    expect(row.agentHandouts).toEqual(["example-agent@2"]);
     const stampedAt = row.dispatchedAt;
 
     // (b) New evidence enqueues mid-run, after the dispatch.
     row.postDispatchEvidenceKeys = ["review:o/r#7:r2@H1"];
 
-    // (c) Polling re-fetch ~30s later: same item, still QUEUED at gen 2.
+    // (c) Agent B's FIRST hand-out of the same still-QUEUED generation: the
+    // stamp no-ops (dispatchedGeneration already == 2), so the post-dispatch
+    // keys survive, and B receives the item (per-agent records, #1133).
+    const second = await GET(
+      request("/api/agents/other-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "other-agent" }) },
+    );
+    const secondBody = await second.json();
+    expect(secondBody.type).toBe("followup-pr");
+    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(row.postDispatchEvidenceKeys).toEqual(["review:o/r#7:r2@H1"]);
+    expect(row.dispatchedGeneration).toBe(2);
+    expect(row.dispatchedAt).toBe(stampedAt);
+    expect(row.agentHandouts).toEqual(["example-agent@2", "other-agent@2"]);
+
+    // (d) Agent A re-polling at the same generation is SKIPPED (#1133): it
+    // already has a run for this work identity, so re-handing would only
+    // starve the lane. The request falls through to issue work.
+    mocks.issueFindMany.mockResolvedValue([
+      {
+        id: "issue-1",
+        number: 99,
+        title: "Regular issue",
+        url: "https://github.com/org/repo/issues/99",
+        labels: ["priority/p0", "status/ready"],
+        currentLane: "local",
+        decomposed: false,
+        repository: { fullName: "org/repo" },
+      },
+    ]);
+    const third = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const thirdBody = await third.json();
+    expect(thirdBody.type).toBe("implement");
+    expect(thirdBody.prFixItem).toBeUndefined();
+    // The skip left the row untouched: the stamp and the recorded keys are
+    // exactly as the in-flight worker needs them.
+    expect(row.postDispatchEvidenceKeys).toEqual(["review:o/r#7:r2@H1"]);
+    expect(row.dispatchedGeneration).toBe(2);
+    expect(row.agentHandouts).toEqual(["example-agent@2", "other-agent@2"]);
+  });
+
+  it("serves the next pr-fix item when the first was already handed to this agent (#1133)", async () => {
+    const handed: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: new Date("2026-01-01T00:05:00Z"),
+      dispatchedGeneration: 2,
+      postDispatchEvidenceKeys: [],
+      agentHandouts: ["example-agent@2"],
+    };
+    const fresh: any = {
+      id: "prfix-2",
+      repo: "org/other",
+      pr: 9,
+      issue: null,
+      branch: "fix/y",
+      url: "https://github.com/org/other/pull/9",
+      title: "Fix something else",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "review changes requested",
+      feedback: ["address comments"],
+      evidenceKeys: ["review:2"],
+      author: "bot",
+      generation: 1,
+      queuedAt: new Date("2026-01-01T00:06:00Z"),
+      updatedAt: new Date("2026-01-01T00:06:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+      agentHandouts: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([handed, fresh]);
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      const target = handed.id === where.id ? handed : fresh.id === where.id ? fresh : null;
+      if (!target || !matchesFirstHandOut(target, where)) return { count: 0 };
+      applyUpdate(target, data);
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => {
+      const target = handed.id === where.id ? handed : fresh;
+      return { id: target.id, reason: target.reason, feedback: target.feedback, generation: target.generation };
+    });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    // The already-handed item is skipped; the NEXT pr-fix item ships.
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toEqual({ id: "prfix-2", generation: 1 });
+    expect(handed.agentHandouts).toEqual(["example-agent@2"]);
+    expect(fresh.agentHandouts).toEqual(["example-agent@1"]);
+  });
+
+  it("hands the item to the same agent again after its generation moves (#1133)", async () => {
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+      agentHandouts: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      if (!matchesFirstHandOut(row, where)) return { count: 0 };
+      applyUpdate(row, data);
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      id: row.id,
+      reason: row.reason,
+      feedback: row.feedback,
+      generation: row.generation,
+    }));
+    mocks.issueFindMany.mockResolvedValue([]);
+
+    const first = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect((await first.json()).prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(row.agentHandouts).toEqual(["example-agent@2"]);
+
+    // The item is re-issued as a fresh attempt (requeue/reopen): generation
+    // bumps, and the fresh attempt cleared the hand-out records.
+    row.generation = 3;
+    row.dispatchedGeneration = null;
+    row.agentHandouts = [];
+
     const second = await GET(
       request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
     const secondBody = await second.json();
     expect(secondBody.type).toBe("followup-pr");
-    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
-    // The post-dispatch flag survives the re-hand-out (the invariant that
-    // enables settlement to reopen), and the first hand-out's stamp is
-    // untouched.
-    expect(row.postDispatchEvidenceKeys).toEqual(["review:o/r#7:r2@H1"]);
-    expect(row.dispatchedGeneration).toBe(2);
-    expect(row.dispatchedAt).toBe(stampedAt);
+    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 3 });
+    expect(row.agentHandouts).toEqual(["example-agent@3"]);
+  });
+
+  it("still hands out a pr-fix item to an agent with no recorded hand-out (#1133)", async () => {
+    // An item handed to another agent is still dispatchable to this one:
+    // the records are per-agent, keyed by the receiving agent's name.
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: new Date("2026-01-01T00:05:00Z"),
+      dispatchedGeneration: 2,
+      postDispatchEvidenceKeys: [],
+      agentHandouts: ["some-other-agent@2"],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      if (!matchesFirstHandOut(row, where)) return { count: 0 };
+      applyUpdate(row, data);
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      id: row.id,
+      reason: row.reason,
+      feedback: row.feedback,
+      generation: row.generation,
+    }));
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(row.agentHandouts).toEqual(["some-other-agent@2", "example-agent@2"]);
   });
 
   it("first hand-out of a new generation re-stamps and clears stale evidence keys", async () => {
@@ -524,7 +752,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.prFixFindMany.mockResolvedValue([row]);
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
       if (!matchesFirstHandOut(row, where)) return { count: 0 };
-      Object.assign(row, data);
+      applyUpdate(row, data);
       return { count: 1 };
     });
     mocks.prFixFindUnique.mockImplementation(async () => ({
@@ -573,10 +801,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     let stampCount = 0;
     const stamps: any[] = [];
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      if (!where.OR) {
+        // The per-agent hand-out record push (#1133) is not a stamp.
+        const recorded = matchesFirstHandOut(row, where);
+        if (recorded) applyUpdate(row, data);
+        return { count: recorded ? 1 : 0 };
+      }
       stampCount += 1;
       stamps.push(where);
       if (!matchesFirstHandOut(row, where)) return { count: 0 };
-      Object.assign(row, data);
+      applyUpdate(row, data);
       if (stampCount === 1) {
         // A concurrent re-issue moves the row in the read→stamp gap.
         row.generation = 3;
@@ -646,7 +880,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
       stampCount += 1;
       if (!matchesFirstHandOut(row, where)) return { count: 0 };
-      Object.assign(row, data);
+      applyUpdate(row, data);
       row.generation = (where.generation as number) + 1;
       row.reason = `re-issued at generation ${row.generation}`;
       return { count: 1 };
@@ -721,7 +955,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       stampCount += 1;
       if (stampCount === 2) throw new Error("db down");
       if (!matchesFirstHandOut(row, where)) return { count: 0 };
-      Object.assign(row, data);
+      applyUpdate(row, data);
       // A concurrent re-issue moves the row in the read→stamp gap.
       row.generation = 3;
       return { count: 1 };

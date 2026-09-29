@@ -183,6 +183,15 @@ model PrFixQueueItem {
   // (trimmed) or the literal "unknown" when none was recorded. Empty list =
   // nothing to act on; cleared on every fresh attempt and settlement.
   postDispatchEvidenceKeys String[] @default([])
+  // Agents this item was already handed to, per generation (#1133): each
+  // entry is `<agentName>@<generation>`. next-task skips an item for an
+  // agent that already received its CURRENT generation — a polling worker
+  // drops the re-hand (it already has a run for that work identity), so
+  // re-handing it only starves the lane behind it. Another agent still gets
+  // the item, and the same agent gets it again when a fresh attempt bumps
+  // the generation; entries for older generations are inert, and every
+  // fresh attempt clears the list.
+  agentHandouts String[] @default([])
   author       String?
   history      PrFixHistory[]
 
