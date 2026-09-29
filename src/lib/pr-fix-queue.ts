@@ -126,6 +126,127 @@ function uniqueAppend(values: string[], value: string, maxItems: number): string
 }
 
 /**
+ * Append one post-dispatch evidence entry, evicting the OLDEST NON-PRIORITY
+ * entry when the list would exceed `maxItems` (#1119). Priority = parsed
+ * eventType is `review` / `review_comment` / `comment`: a human asking for
+ * changes is actionable no matter what the PR head is, so an actionable
+ * review must not be silently evicted in favor of a stale check — the exact
+ * loss class #1119 exists to prevent. If every entry is priority, the
+ * oldest priority entry is evicted (nothing better to drop).
+ */
+function appendPostDispatchEvidenceEntry(values: string[], entry: string, maxItems: number): string[] {
+  const next = values.includes(entry) ? values : [...values, entry];
+  if (next.length <= maxItems) return next;
+  const isPriority = (value: string) => {
+    const { eventType } = parsePostDispatchEvidenceEntry(value);
+    return eventType === "review" || eventType === "review_comment" || eventType === "comment";
+  };
+  const firstNonPriority = next.findIndex((value) => !isPriority(value));
+  const evictIndex = firstNonPriority === -1 ? 0 : firstNonPriority;
+  return [...next.slice(0, evictIndex), ...next.slice(evictIndex + 1)];
+}
+
+/**
+ * Encode one post-dispatch evidence entry as `<evidenceKey>@<head>` (#1119):
+ * `head` is the enqueue input's headSha (trimmed, verbatim) when present,
+ * else the literal "unknown", so a check_run entry can later be revalidated
+ * against the PR's current head at settlement time.
+ *
+ * Exact contract, honored by `parsePostDispatchEvidenceEntry`:
+ * - the entry is split on the FIRST "@": an `@` inside the headSha (an
+ *   unvalidated caller string) is part of the head half, not a separator;
+ * - a head that is not git-shape (4-64 hex chars) reads back as "unknown" —
+ *   so an `@`-bearing headSha degrades to an unknown head, whose entry stays
+ *   actionable (conservative) instead of being revalidated against a
+ *   fragment of the real head;
+ * - the evidenceKey namespace is internal: an `@`-bearing key is not forged
+ *   into an actionable check entry, because the event type comes from the
+ *   part before the FIRST "@".
+ */
+function encodePostDispatchEvidenceKey(evidenceKey: string, headSha: string | null | undefined): string {
+  const head = typeof headSha === "string" && headSha.trim() ? headSha.trim() : "unknown";
+  return `${evidenceKey}@${head}`;
+}
+
+/**
+ * Parse one post-dispatch evidence entry back into { eventType, head }
+ * (#1119): the entry is split on the FIRST "@" — `eventType` is the
+ * substring before the FIRST ":" of the part before it, and `head` is the
+ * substring after it. `head` is then sanitized to "unknown" unless it is
+ * git-shape (`/^[0-9a-fA-F]{4,64}$/`): an invalid-shape head cannot be
+ * revalidated, and "unknown" counts as actionable. An absent head reads
+ * back as "unknown" — it was never recorded. Unknown event types are
+ * non-actionable (fail-closed) in `hasActionablePostDispatchEvidence`.
+ */
+function parsePostDispatchEvidenceEntry(entry: string): { eventType: string; head: string } {
+  const at = entry.indexOf("@");
+  const keyPart = at >= 0 ? entry.slice(0, at) : entry;
+  const headPart = at >= 0 ? entry.slice(at + 1) : "";
+  const colon = keyPart.indexOf(":");
+  const eventType = colon >= 0 ? keyPart.slice(0, colon) : keyPart;
+  const head = /^[0-9a-fA-F]{4,64}$/.test(headPart) ? headPart : "unknown";
+  return { eventType, head };
+}
+
+/**
+ * Whether any recorded post-dispatch evidence entry is ACTIONABLE for the
+ * current PR state, i.e. would justify reopening a settlement as a fresh
+ * attempt (#1119, per the #1124 review):
+ *
+ * - review / review_comment / comment entries are actionable as-is: a human
+ *   asking for changes is actionable no matter what the PR head is, so this
+ *   is a short-circuit with NO GitHub call (checked first, so a mixed list
+ *   with a check entry listed before the review still skips the fetch).
+ * - a check_run entry is actionable only when its recorded head is "unknown"
+ *   (the check ran on a head we never recorded) or equals the PR's current
+ *   head (fetched ONCE, shared by all check entries). A failing check on a
+ *   superseded head is stale — the worker already pushed past it. An
+ *   unavailable head (fetchPullRequestHeadSha RETURNS null on unreachable
+ *   GitHub / unknown shape / deleted PR, and THROWS only in genuinely
+ *   unexpected cases) counts the entry as ACTIONABLE (conservative): missing
+ *   a reopen silently absorbs the evidence — the exact #1119 bug class —
+ *   while a false reopen is cheap, because a merged/deleted PR is reaped to
+ *   STALE by the reconcile pass before a worker wastes a run on it.
+ * - anything else (merge_state, merge_conflict, unknown) is not actionable.
+ *
+ * Empty list → false.
+ */
+async function hasActionablePostDispatchEvidence(
+  entries: string[],
+  repo: string,
+  pr: number,
+): Promise<boolean> {
+  if (entries.length === 0) return false;
+
+  for (const entry of entries) {
+    const { eventType } = parsePostDispatchEvidenceEntry(entry);
+    if (eventType === "review" || eventType === "review_comment" || eventType === "comment") {
+      return true;
+    }
+  }
+
+  let currentHead: string | null | undefined;
+  for (const entry of entries) {
+    const { eventType, head } = parsePostDispatchEvidenceEntry(entry);
+    if (eventType !== "check_run") continue;
+    if (head === "unknown") return true;
+    if (currentHead === undefined) {
+      try {
+        currentHead = await fetchPullRequestHeadSha(repo, pr);
+      } catch (error) {
+        console.warn(`[pr-fix-queue] post-dispatch head check failed for ${repo}#${pr}:`, error instanceof Error ? error.message : error);
+        return true;
+      }
+    }
+    // null = GitHub unreachable / shape unknown / PR deleted: cannot prove
+    // the recorded head is superseded, so treat as actionable (#1119).
+    if (currentHead === null) return true;
+    if (head === currentHead) return true;
+  }
+  return false;
+}
+
+/**
  * Build a Prisma update patch from enqueue input.
  * `issue` maps to Prisma PrFixQueueItem.issue (Int?) which stores the linked GitHub issue number.
  */
@@ -334,6 +455,20 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       // must keep the identity stable.
       const isFreshAttempt = resolvedStatus === "QUEUED" && existing.status !== "QUEUED";
 
+      // Evidence that arrives AFTER this generation was handed to a worker cannot
+      // reach the worker already running on it, so record it in
+      // postDispatchEvidenceKeys: settlement must open a fresh attempt instead
+      // of absorbing it into the in-flight one (#1119).
+      // Evidence arriving before hand-out (dispatchedGeneration !== generation, or
+      // never dispatched) still joins the same attempt, as before.
+      const dispatchedThisGeneration =
+        existing.dispatchedGeneration != null && existing.dispatchedGeneration === existing.generation;
+      const isPostDispatchNewEvidence =
+        !isTerminalStatus &&
+        !isKnownEvidence &&
+        existing.status === "QUEUED" &&
+        dispatchedThisGeneration;
+
       const updated = await tx.prFixQueueItem.update({
         where: { id: existing.id },
         data: {
@@ -362,6 +497,23 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
                 attemptHeadSha: input.headSha ?? existing.headSha ?? null,
               }
             : {}),
+          // Post-dispatch evidence (#1119): record the key that landed on a
+          // dispatched QUEUED item, encoded with the enqueue's observed head
+          // (or "unknown") so a check entry can be revalidated at settle time.
+// A fresh attempt resets the list. Mutually exclusive with
+          // isFreshAttempt (one requires QUEUED, the other not). Past 20
+          // entries appendPostDispatchEvidenceEntry evicts the oldest
+          // NON-actionable entry (review/comment entries survive eviction).
+          ...(isPostDispatchNewEvidence
+            ? {
+                postDispatchEvidenceKeys: appendPostDispatchEvidenceEntry(
+                  existing.postDispatchEvidenceKeys ?? [],
+                  encodePostDispatchEvidenceKey(input.evidenceKey, input.headSha),
+                  20,
+                ),
+              }
+            : {}),
+          ...(isFreshAttempt ? { postDispatchEvidenceKeys: [] } : {}),
           ...metadataPatch(input),
         },
       });
@@ -549,6 +701,91 @@ export async function markPrFixItem(
   // badge actually means something and so the bridge's ACTIONABLE_LANES
   // filter continues to skip them. See bridge/prfix.py ACTIONABLE_LANES.
   const data: Record<string, unknown> = { status: nextStatus };
+
+  // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
+  // the guarded write, the cap give-up, and the history row, all inside one
+  // tiny transaction the caller passes in. Pinned on the row's id, its
+  // expected generation (#1074), AND the exact post-dispatch evidence
+  // snapshot the actionability decision was made on — evidence recorded
+  // between the actionability read and this write no-ops the reopen instead
+  // of being silently cleared (#1124 review). Returns the fresh row, or null
+  // when the pin misses; the caller then feeds the miss into the bounded
+  // re-decision loop below. `noteSuffix` is appended to the note when the
+  // reopen is taken from the settle-gap retry.
+  const writeReopen = async (tx: any, row: any, noteSuffix = ""): Promise<any | null> => {
+    const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
+    const reopenData: Record<string, unknown> = reopenCapped
+      ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
+      : {
+          status: "QUEUED",
+          lane: "NORMAL",
+          ...freshAttemptGeneration(),
+          fixAttempts: { increment: 1 },
+          attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
+          postDispatchEvidenceKeys: [],
+        };
+    const { count } = await tx.prFixQueueItem.updateMany({
+      where: {
+        id: row.id,
+        ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        postDispatchEvidenceKeys: { equals: row.postDispatchEvidenceKeys ?? [] },
+      },
+      data: reopenData,
+    });
+    if (count !== 1) return null;
+    await tx.prFixHistory.create({
+      data: {
+        itemId: row.id,
+        action: "mark",
+        status: reopenData.status,
+        lane: reopenData.lane,
+        note:
+          (reopenCapped
+            ? `New evidence arrived after this attempt was handed out, but bounded at ${row.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+            : `New evidence arrived after this attempt was handed out; reopened as a fresh attempt at the current head (#1119).`) + noteSuffix,
+      },
+    });
+    return tx.prFixQueueItem.findUnique({ where: { id: row.id } });
+  };
+
+  const surfaceReopen = async (before: any, reopened: any) => {
+    const reopenCapped = (before.fixAttempts ?? 1) >= maxPrFixAttempts();
+    if (reopenCapped && before.status !== "BLOCKED") {
+      const context = await buildPrFixBlockedContext(client, reopened);
+      await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: reopened.reason, latestNote: input.note ?? null, context });
+    } else if (!reopenCapped) {
+      // Leaving (a would-be) settlement back to a live QUEUED attempt: make sure a
+      // needs-human marker is not left behind and surface the new attempt (#1119).
+      await retractNeedsHuman(input.repo, input.pr, "requeued", input.note);
+    }
+  };
+
+  // A settlement (FIXED/BLOCKED) on an item whose post-dispatch evidence list
+  // still holds an actionable entry must NOT absorb that evidence: reopen as a
+  // fresh dispatchable attempt so a worker actually runs on it (#1119).
+  // Evaluated only for settlements, so a non-settle mark never triggers a head
+  // fetch. A capped item still gives up to a human, matching the other
+  // fresh-attempt caps. The head fetch inside the actionability check always
+  // runs OUTSIDE any transaction: Prisma's ~5s interactive-transaction
+  // timeout must never have to span a GitHub round-trip (#1124 review).
+  const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED";
+  const reopenOnPostDispatch =
+    settlesAttempt &&
+    (await hasActionablePostDispatchEvidence(existing.postDispatchEvidenceKeys ?? [], input.repo, input.pr));
+  // The initial reopen attempt can miss its keys/generation pin when evidence
+  // is recorded between the check above and the write. That is not a
+  // generation-mismatch: fall into the bounded re-decision loop below rather
+  // than returning no-mutation (#1124 review).
+  let reopenPinnedMissed = false;
+  if (reopenOnPostDispatch) {
+    const reopened = await client.$transaction(async (tx) => writeReopen(tx, existing));
+    if (reopened) {
+      await surfaceReopen(existing, reopened);
+      return { mutated: true, item: reopened };
+    }
+    reopenPinnedMissed = true;
+  }
+
   if (nextStatus === "BLOCKED") {
     data.lane = "NEEDS_HUMAN";
   } else if (nextStatus === "QUEUED") {
@@ -563,7 +800,15 @@ export async function markPrFixItem(
       // headSha, which the next sync overwrites with the worker's own push —
       // refusing a real fix as "pushed nothing" (#1074, #1104).
       data.attemptHeadSha = input.attemptHeadSha ?? existing.headSha ?? null;
+      // A fresh attempt must not carry post-dispatch evidence recorded for a
+      // prior generation (#1119).
+      data.postDispatchEvidenceKeys = [];
     }
+    // QUEUED → QUEUED: leave the key list untouched — the entries still refer
+    // to the current generation and must survive the mark.
+  } else if (nextStatus === "STALE" || nextStatus === "IGNORED") {
+    // Terminal: the recorded entries are moot; clear them (#1119).
+    data.postDispatchEvidenceKeys = [];
   }
 
   // No-progress guard (#940, rebuilt in #1074): run it BEFORE any write,
@@ -585,13 +830,16 @@ export async function markPrFixItem(
       // the head is unchanged, so it is still the newest observed (#1104).
       const refusalCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
       const refusalData: Record<string, unknown> = refusalCapped
-        ? { status: "BLOCKED", lane: "NEEDS_HUMAN" }
+        ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
         : {
             status: "QUEUED",
             lane: "NORMAL",
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: input.attemptHeadSha ?? baseline ?? null,
+            // The generation bump invalidates any recorded entries and proves
+            // no stale post-dispatch list on the fresh attempt (#1119).
+            postDispatchEvidenceKeys: [],
           };
       const refusal = await client.$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
@@ -627,39 +875,182 @@ export async function markPrFixItem(
     }
   }
 
-  const updated = await client.$transaction(async (tx) => {
-    // #1074: with an expected generation, the status write is conditional on
-    // the row still being at that generation — commit-time revalidation. A
-    // concurrent re-issue (new evidence, requeue) moves the generation and
-    // makes this write a no-op; the history row is skipped too.
-    if (expectedGeneration !== undefined) {
-      const { count } = await tx.prFixQueueItem.updateMany({
-        where: { id: existing.id, generation: expectedGeneration },
-        data,
-      });
-      if (count !== 1) return null;
-    } else {
-      await tx.prFixQueueItem.update({ where: { id: existing.id }, data });
+  // Shared tail for every successful mark write — settlement and non-settle
+  // marks alike.
+  const finishMarked = async (row: any): Promise<MarkPrFixResult> => {
+    // Only surface a blocked notification when THIS mark is what first puts
+    // the item into BLOCKED (from a non-BLOCKED status).
+    if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
+      const context = await buildPrFixBlockedContext(client, row);
+      await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: row.reason, latestNote: input.note ?? null, context });
+    } else if (existing.status === "BLOCKED" && (nextStatus === "QUEUED" || nextStatus === "FIXED")) {
+      await retractNeedsHuman(input.repo, input.pr, nextStatus === "FIXED" ? "resolved" : "requeued", input.note);
     }
-    const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
-    await tx.prFixHistory.create({
-      data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.note ?? undefined },
+    return { mutated: true, item: row };
+  };
+
+  // Fast path: one tiny transaction holding ONLY the guarded settlement
+  // write, its history row, and the post-write read — no network call may
+  // run in here (#1124 review).
+  // #1074: with an expected generation, the status write is conditional on
+  // the row still being at that generation — commit-time revalidation. A
+  // concurrent re-issue (new evidence, requeue) moves the generation and
+  // makes this write a no-op; the history row is skipped too.
+  // #1119: for a settlement the write additionally requires the
+  // post-dispatch evidence list to be empty — evidence landing in the
+  // read→write gap no-ops the settlement (count !== 1) instead of being
+  // silently absorbed into it. The keys-clear is deliberately NOT in
+  // `data`: it would let a stale write clobber a concurrently recorded
+  // entry. Unqualified marks take the same guarded updateMany path (no
+  // generation clause) so the settle-gap guard applies to them too.
+  if (!reopenPinnedMissed) {
+    const settledRow = await client.$transaction(async (tx) => {
+      const settleWhere: Record<string, unknown> = {
+        id: existing.id,
+        ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        ...(settlesAttempt ? { postDispatchEvidenceKeys: { equals: [] } } : {}),
+      };
+      const { count } = await tx.prFixQueueItem.updateMany({ where: settleWhere, data });
+      if (count !== 1) return null;
+      const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      await tx.prFixHistory.create({
+        data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.note ?? undefined },
+      });
+      return row;
     });
-    return row;
-  });
-
-  if (!updated) return { mutated: false, reason: "generation-mismatch" };
-
-  // Only surface a blocked notification when THIS mark is what first puts the
-  // item into BLOCKED (from a non-BLOCKED status).
-  if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
-    const context = await buildPrFixBlockedContext(client, updated);
-    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: updated.reason, latestNote: input.note ?? null, context });
-  } else if (existing.status === "BLOCKED" && (nextStatus === "QUEUED" || nextStatus === "FIXED")) {
-    await retractNeedsHuman(input.repo, input.pr, nextStatus === "FIXED" ? "resolved" : "requeued", input.note);
+    if (settledRow) return finishMarked(settledRow);
+    // Rare miss on a non-settle mark: the row was deleted, or its generation
+    // moved between the decision read and the write. Re-read to distinguish —
+    // a gone row is not-found (mirrors the forced tail's labeling a few lines
+    // below); a surviving row is a generation-mismatch.
+    if (!settlesAttempt) {
+      const remaining = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      return { mutated: false, reason: remaining ? "generation-mismatch" : "not-found" };
+    }
   }
 
-  return { mutated: true, item: updated };
+  // The guarded write no-oped (or the initial reopen missed its pin): the row
+  // moved between the decision read and the write. Bounded re-decision loop
+  // (#1124 review): re-read and re-check actionability OUTSIDE any
+  // transaction — the head fetch inside hasActionablePostDispatchEvidence
+  // must never run while a transaction holds a pool connection — then
+  // attempt a keys-pinned reopen or settle write in a tiny transaction. A
+  // pinned write that misses means evidence landed AGAIN during the head
+  // fetch; loop (bounded) and retry against the fresh row.
+  const maxSettleRedecisions = 3;
+  let lastFresh = existing;
+  for (let i = 0; i < maxSettleRedecisions; i++) {
+    const fresh = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    if (!fresh) return { mutated: false, reason: "not-found" };
+    if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) {
+      // A genuine stale token: the attempt was re-issued (new evidence,
+      // requeue) and owns the row now — skipping is correct, not a strand.
+      return { mutated: false, reason: "generation-mismatch" };
+    }
+    lastFresh = fresh;
+    const freshKeys: string[] = fresh.postDispatchEvidenceKeys ?? [];
+    if (await hasActionablePostDispatchEvidence(freshKeys, input.repo, input.pr)) {
+      const reopened = await client.$transaction(async (tx) =>
+        writeReopen(tx, fresh, " Post-dispatch evidence landed while this settlement was in flight."),
+      );
+      if (reopened) {
+        await surfaceReopen(fresh, reopened);
+        return { mutated: true, item: reopened };
+      }
+      continue;
+    }
+    // The recorded entries no longer apply (intermediate head): settle
+    // normally, clear them, and say so in the history (#1119). The write is
+    // pinned to the exact keys snapshot this no-reopen decision was made on,
+    // so an entry landing during the head fetch above no-ops the write
+    // instead of being cleared and absorbed.
+    const clearedRow = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: {
+          id: fresh.id,
+          ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+          postDispatchEvidenceKeys: { equals: freshKeys },
+        },
+        data: { ...data, postDispatchEvidenceKeys: [] },
+      });
+      if (count !== 1) return null;
+      const row = await tx.prFixQueueItem.findUnique({ where: { id: fresh.id } });
+      await tx.prFixHistory.create({
+        data: {
+          itemId: row.id,
+          action: "mark",
+          status: nextStatus,
+          lane: row.lane,
+          note: [
+            input.note,
+            "Recorded post-dispatch evidence no longer applies (intermediate head); cleared (#1119).",
+          ]
+            .filter(Boolean)
+            .join(" "),
+        },
+      });
+      return row;
+    });
+    if (clearedRow) return finishMarked(clearedRow);
+  }
+
+  // The loop exhausted: the pinned writes kept losing the race to evidence
+  // that keeps landing. Never return no-mutation for a settle mark merely
+  // because of that — the item would stay QUEUED at the generation the
+  // worker already consumed, next-task would keep handing the spent
+  // generation first to the deduping worker, and the lane would starve
+  // (#1124 review). Force a fresh attempt (or, past the cap, a human
+  // hand-off): pinned on id (+ the generation when the token defines one)
+  // WITHOUT the keys pin, so racing evidence cannot block it.
+  const forceCapped = (lastFresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+  const forceData: Record<string, unknown> = forceCapped
+    ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [] }
+    : {
+        status: "QUEUED",
+        lane: "NORMAL",
+        ...freshAttemptGeneration(),
+        fixAttempts: { increment: 1 },
+        attemptHeadSha: lastFresh.headSha ?? lastFresh.attemptHeadSha ?? null,
+        postDispatchEvidenceKeys: [],
+      };
+  const forced = await client.$transaction(async (tx) => {
+    const { count } = await tx.prFixQueueItem.updateMany({
+      where: {
+        id: existing.id,
+        ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+      },
+      data: forceData,
+    });
+    if (count !== 1) return null;
+    await tx.prFixHistory.create({
+      data: {
+        itemId: existing.id,
+        action: "mark",
+        status: forceData.status,
+        lane: forceData.lane,
+        // Preserve the caller's note alongside the canned forced-fallback text
+        // (same join style as the stale-clear settle branch).
+        note: [
+          input.note,
+          forceCapped
+            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+            : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1119).`,
+        ]
+          .filter(Boolean)
+          .join(" "),
+      },
+    });
+    return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+  });
+  if (!forced) {
+    // The row is gone or its generation moved even against the unkeyed pin:
+    // a concurrent re-issue (or delete) owns the item now — the
+    // stale-token skip applies.
+    const remaining = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    return { mutated: false, reason: remaining ? "generation-mismatch" : "not-found" };
+  }
+  await surfaceReopen(lastFresh, forced);
+  return { mutated: true, item: forced };
 }
 
 /**
@@ -875,6 +1266,9 @@ export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeueP
         ...freshAttemptGeneration(),
         fixAttempts: 1,
         attemptHeadSha: existing.headSha ?? null,
+        // A fresh operator requeue must not carry post-dispatch evidence
+        // recorded for a prior attempt (#1119).
+        postDispatchEvidenceKeys: [],
       },
     });
     await tx.prFixHistory.create({
