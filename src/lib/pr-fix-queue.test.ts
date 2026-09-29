@@ -2705,4 +2705,113 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(client.items[0].postDispatchEvidenceKeys).toEqual([]);
     expect(client.history.at(-1).note ?? "").toContain("no longer applies (intermediate head); cleared (#1119)");
   });
+
+  it("evicts the oldest non-priority entry, never an actionable review (#1119)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 51, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:org/repo#51:r1", headSha: "H1",
+    });
+    const row = client.items[0];
+    // Dispatched: new evidence now lands post-dispatch.
+    row.dispatchedGeneration = row.generation;
+    // 20 recorded entries: a leading actionable review plus 19 stale checks.
+    row.postDispatchEvidenceKeys = [
+      "review:org/repo#51:r1@H1",
+      ...Array.from({ length: 19 }, (_, i) => `check_run:org/repo#51:${i + 1}@H1`),
+    ];
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 51, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#51:20", headSha: "H1",
+    });
+
+    expect(after.postDispatchEvidenceKeys).toHaveLength(20);
+    // The actionable review survived the eviction.
+    expect(after.postDispatchEvidenceKeys[0]).toBe("review:org/repo#51:r1@H1");
+    // The oldest NON-priority entry was evicted, not the review.
+    expect(after.postDispatchEvidenceKeys).not.toContain("check_run:org/repo#51:1@H1");
+    // The new entry is present.
+    expect(after.postDispatchEvidenceKeys.at(-1)).toBe("check_run:org/repo#51:20@H1");
+  });
+
+  it("evicts the oldest priority entry when every entry is priority (#1119)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 52, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:org/repo#52:r1", headSha: "H1",
+    });
+    const row = client.items[0];
+    row.dispatchedGeneration = row.generation;
+    row.postDispatchEvidenceKeys = Array.from(
+      { length: 20 },
+      (_, i) => `review:org/repo#52:r${i + 1}@H1`,
+    );
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 52, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:org/repo#52:r21", headSha: "H1",
+    });
+
+    expect(after.postDispatchEvidenceKeys).toHaveLength(20);
+    // Every entry is priority: the oldest review is evicted.
+    expect(after.postDispatchEvidenceKeys).not.toContain("review:org/repo#52:r1@H1");
+    expect(after.postDispatchEvidenceKeys[0]).toBe("review:org/repo#52:r2@H1");
+    expect(after.postDispatchEvidenceKeys.at(-1)).toBe("review:org/repo#52:r21@H1");
+  });
+
+  it("an unqualified FIXED settle settles a stamped row with empty post-dispatch keys", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 53, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:org/repo#53:r1", headSha: "aaaa1111",
+    });
+    const row = client.items[0];
+    // Dispatched (stamped), with no post-dispatch evidence recorded.
+    row.dispatchedGeneration = row.generation;
+    row.postDispatchEvidenceKeys = [];
+
+    // No expectedGeneration: the settleWhere is guarded only by the
+    // { equals: [] } keys predicate, which matches the stamped row.
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 53, status: "FIXED",
+    });
+
+    expect(result.mutated).toBe(true);
+    const marked = mutatedItem(result);
+    expect(marked.status).toBe("FIXED");
+    expect(marked.generation).toBe(1);
+    expect(marked.postDispatchEvidenceKeys).toEqual([]);
+    // The settlement history row landed.
+    expect(client.history.at(-1)).toMatchObject({ action: "mark", status: "FIXED" });
+  });
+
+  it("an unqualified settle whose keys guard no-ops on a gap review reopens at generation+1 (#1119)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 54, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:org/repo#54:r1", headSha: "H1",
+    });
+    const row = client.items[0];
+    row.dispatchedGeneration = row.generation;
+    row.postDispatchEvidenceKeys = [];
+
+    // A review lands between the pre-check read and the guarded settlement
+    // write: the one-shot hook applies it right before the write, so the
+    // { equals: [] } keys guard no-ops the unqualified settle and the gap
+    // re-decision reopens the attempt.
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].postDispatchEvidenceKeys = ["review:org/repo#54:r2@H1"];
+    };
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 54, status: "FIXED",
+    });
+
+    expect(result.mutated).toBe(true);
+    const reopened = mutatedItem(result);
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+  });
 });

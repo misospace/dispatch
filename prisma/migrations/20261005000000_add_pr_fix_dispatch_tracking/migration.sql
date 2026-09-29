@@ -11,3 +11,8 @@
 ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "dispatchedGeneration" INTEGER;
 ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "dispatchedAt" TIMESTAMP(3);
 ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "postDispatchEvidenceKeys" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+-- Self-heal: an earlier in-place revision of this migration added a boolean
+-- "postDispatchEvidence" column, and ADD COLUMN IF NOT EXISTS never drops it,
+-- so dev databases that applied that revision would drift from the schema.
+-- The column is unused; drop it idempotently.
+ALTER TABLE "PrFixQueueItem" DROP COLUMN IF EXISTS "postDispatchEvidence";

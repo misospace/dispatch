@@ -538,6 +538,113 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(row.dispatchedAt).not.toEqual(new Date("2026-01-02T00:00:00Z"));
   });
 
+  it("hands out a token for the NEW generation when the re-read shows generation moved (#1119)", async () => {
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    let stampCount = 0;
+    const stamps: any[] = [];
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      stampCount += 1;
+      stamps.push(where);
+      if (!matchesFirstHandOut(row, where)) return { count: 0 };
+      Object.assign(row, data);
+      if (stampCount === 1) {
+        // A concurrent re-issue moves the row in the read→stamp gap.
+        row.generation = 3;
+        row.reason = "CI failure on main (re-issued)";
+        row.feedback = ["update tests", "fix lint"];
+      }
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      id: row.id,
+      reason: row.reason,
+      feedback: row.feedback,
+      generation: row.generation,
+    }));
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    // The first stamp targeted 2; the retry targeted the NEW generation.
+    expect(stampCount).toBe(2);
+    expect(stamps[0].generation).toBe(2);
+    expect(stamps[1].generation).toBe(3);
+    // The handed-out token is the NEW generation, so the worker's settle
+    // report matches the live row instead of being rejected as a mismatch.
+    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 3 });
+    // The payload reasons come from the latest read, not the queue snapshot.
+    expect(body.reasons).toContain("CI failure on main (re-issued)");
+    expect(body.reasons).toContain("fix lint");
+    // The row is stamped at the generation the token names.
+    expect(row.dispatchedGeneration).toBe(3);
+  });
+
+  it("still serves the pre-stamp token when the dispatch tracking stamp throws (#1119)", async () => {
+    const item: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 7,
+      issue: null,
+      branch: "fix/x",
+      url: "https://github.com/org/repo/pull/7",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["ci:1"],
+      author: "bot",
+      generation: 2,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([item]);
+    mocks.prFixUpdateMany.mockRejectedValue(new Error("db down"));
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    // Best-effort: the task is served with the pre-stamp snapshot's
+    // generation and reasons.
+    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(body.reasons).toContain("CI failure on main");
+    expect(body.reasons).toContain("update tests");
+  });
+
   it("feeds the re-read row's fresh feedback into the task payload (#1119)", async () => {
     mocks.prFixFindMany.mockResolvedValue([
       {

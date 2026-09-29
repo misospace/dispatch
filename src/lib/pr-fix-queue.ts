@@ -126,6 +126,27 @@ function uniqueAppend(values: string[], value: string, maxItems: number): string
 }
 
 /**
+ * Append one post-dispatch evidence entry, evicting the OLDEST NON-PRIORITY
+ * entry when the list would exceed `maxItems` (#1119). Priority = parsed
+ * eventType is `review` / `review_comment` / `comment`: a human asking for
+ * changes is actionable no matter what the PR head is, so an actionable
+ * review must not be silently evicted in favor of a stale check — the exact
+ * loss class #1119 exists to prevent. If every entry is priority, the
+ * oldest priority entry is evicted (nothing better to drop).
+ */
+function appendPostDispatchEvidenceEntry(values: string[], entry: string, maxItems: number): string[] {
+  const next = values.includes(entry) ? values : [...values, entry];
+  if (next.length <= maxItems) return next;
+  const isPriority = (value: string) => {
+    const { eventType } = parsePostDispatchEvidenceEntry(value);
+    return eventType === "review" || eventType === "review_comment" || eventType === "comment";
+  };
+  const firstNonPriority = next.findIndex((value) => !isPriority(value));
+  const evictIndex = firstNonPriority === -1 ? 0 : firstNonPriority;
+  return [...next.slice(0, evictIndex), ...next.slice(evictIndex + 1)];
+}
+
+/**
  * Encode one post-dispatch evidence entry as `<evidenceKey>@<head>` (#1119):
  * `head` is the enqueue input's headSha (trimmed, verbatim) when present,
  * else the literal "unknown", so a check_run entry can later be revalidated
@@ -479,12 +500,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           // Post-dispatch evidence (#1119): record the key that landed on a
           // dispatched QUEUED item, encoded with the enqueue's observed head
           // (or "unknown") so a check entry can be revalidated at settle time.
-          // A fresh attempt resets the list. Mutually exclusive with
+// A fresh attempt resets the list. Mutually exclusive with
           // isFreshAttempt (one requires QUEUED, the other not). Past 20
-          // entries uniqueAppend evicts the oldest (keeps the newest).
+          // entries appendPostDispatchEvidenceEntry evicts the oldest
+          // NON-actionable entry (review/comment entries survive eviction).
           ...(isPostDispatchNewEvidence
             ? {
-                postDispatchEvidenceKeys: uniqueAppend(
+                postDispatchEvidenceKeys: appendPostDispatchEvidenceEntry(
                   existing.postDispatchEvidenceKeys ?? [],
                   encodePostDispatchEvidenceKey(input.evidenceKey, input.headSha),
                   20,

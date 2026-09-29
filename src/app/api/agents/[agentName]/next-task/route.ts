@@ -68,47 +68,72 @@ export async function GET(
     if (prFixItems.length > 0) {
       const first = prFixItems[0];
       // Stamp the hand-out on the FIRST hand-out of this generation only:
-      // the OR clause matches rows not yet stamped at `first.generation`.
-      // Re-hand-outs of a still-QUEUED generation (polling workers re-fetch
-      // every ~30s) must not re-stamp or clear postDispatchEvidenceKeys, so
-      // evidence enqueued mid-run survives for settlement to flag (#1119).
-      // The row is always re-read after the stamp so evidence enqueued in
-      // the gap ships in this payload or is flagged for a reopen rather than
-      // being swallowed. Best-effort: a failure here only loses freshness
-      // tracking, never the task.
+      // the OR clause matches rows not yet stamped at the stamped
+      // generation. Re-hand-outs of a still-QUEUED generation (polling
+      // workers re-fetch every ~30s) must not re-stamp or clear
+      // postDispatchEvidenceKeys, so evidence enqueued mid-run survives for
+      // settlement to flag (#1119). The row is always re-read after the
+      // stamp so evidence enqueued in the gap ships in this payload or is
+      // flagged for a reopen rather than being swallowed.
+      //
+      // Bounded retry: if the re-read shows the row's generation moved
+      // between the queue read and the stamp (another path took over the
+      // item), the stamp+re-read runs once more against the NEW
+      // generation, so the handed-out token matches the live row: the race
+      // costs nothing rather than a wasted run whose settle report would be
+      // rejected as a generation mismatch (#1119).
+      //
+      // Best-effort: a failure here only loses freshness tracking, never
+      // the task.
       let dispatchReason = first.reason;
       let dispatchFeedback = first.feedback;
+      // The generation the task token is handed out on: the last
+      // successfully read generation, so the worker's settle token matches
+      // the live row.
+      let handOutGeneration = first.generation;
       try {
-        await prisma.prFixQueueItem.updateMany({
-          where: {
-            id: first.id,
-            generation: first.generation,
-            OR: [
-              { dispatchedGeneration: null },
-              { dispatchedGeneration: { not: first.generation } },
-            ],
-          },
-          data: {
-            dispatchedAt: new Date(),
-            dispatchedGeneration: first.generation,
-            postDispatchEvidenceKeys: [],
-          },
-        });
-        const fresh = await prisma.prFixQueueItem.findUnique({
-          where: { id: first.id },
-          select: { reason: true, feedback: true, generation: true },
-        });
-        if (fresh) {
-          if (fresh.generation !== first.generation) {
-            // Generation moved between the queue read and the stamp: another
-            // attempt took over. Log so the race is visible (#1119).
-            console.warn(`next-task pr-fix hand-out re-read for ${first.repo}#${first.pr}: generation moved`);
-          }
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const stampGeneration = handOutGeneration;
+          await prisma.prFixQueueItem.updateMany({
+            where: {
+              id: first.id,
+              generation: stampGeneration,
+              OR: [
+                { dispatchedGeneration: null },
+                { dispatchedGeneration: { not: stampGeneration } },
+              ],
+            },
+            data: {
+              dispatchedAt: new Date(),
+              dispatchedGeneration: stampGeneration,
+              postDispatchEvidenceKeys: [],
+            },
+          });
+          const fresh = await prisma.prFixQueueItem.findUnique({
+            where: { id: first.id },
+            select: { reason: true, feedback: true, generation: true },
+          });
+          if (!fresh) break;
           dispatchReason = fresh.reason;
           dispatchFeedback = fresh.feedback ?? [];
+          // A re-read generation that is a number and not the one we just
+          // stamped means the row moved under us: log the race (#1119) and
+          // retry the stamp+re-read against the new generation.
+          if (typeof fresh.generation === "number" && fresh.generation !== stampGeneration) {
+            console.warn(`next-task pr-fix hand-out re-read for ${first.repo}#${first.pr}: generation moved`);
+            handOutGeneration = fresh.generation;
+            continue;
+          }
+          handOutGeneration = fresh.generation ?? handOutGeneration;
+          break;
         }
       } catch (error) {
         console.error(`next-task pr-fix dispatch tracking update failed for ${first.repo}#${first.pr}:`, error);
+        // Best-effort: fall back to the pre-stamp snapshot, exactly as
+        // before the retry existed.
+        dispatchReason = first.reason;
+        dispatchFeedback = first.feedback;
+        handOutGeneration = first.generation;
       }
       const reasons = [...new Set([dispatchReason, ...dispatchFeedback].filter(Boolean))];
       const task = createFollowupPrTask({
@@ -124,7 +149,7 @@ export async function GET(
           : undefined,
         prFixItem: {
           id: first.id,
-          generation: first.generation,
+          generation: handOutGeneration,
         },
         reasons,
       });
