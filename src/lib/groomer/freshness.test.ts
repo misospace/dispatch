@@ -293,6 +293,32 @@ describe("buildGroomingFreshnessBaseline", () => {
     expect(baseline.groomedSearchCodeQueries).toEqual([]);
   });
 
+  it("saves none for a surfaced-path global even when every repository-context search is accounted", async () => {
+    const surfaced = await buildGroomingFreshnessBaseline(
+      input({
+        citations: [{ id: "repo:src/hit.ts", subject: "repository", state: null }],
+        explorationToolCalls: emptySearches(["missing symbol"]),
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha"],
+      }),
+    );
+    expect(surfaced.groomedEvidenceScope).toBe("global");
+    expect(surfaced.groomedSearchCodeQueries).toEqual([]);
+
+    // Citing the read path instead keeps the scope global (negative search)
+    // and saves: the surfaced-path branch, not the accounting, blocks it.
+    const readPath = await buildGroomingFreshnessBaseline(
+      input({
+        citations: [{ id: "repo:src/a.ts", subject: "repository", state: null }],
+        explorationToolCalls: emptySearches(["missing symbol"]),
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha"],
+      }),
+    );
+    expect(readPath.groomedEvidenceScope).toBe("global");
+    expect(readPath.groomedSearchCodeQueries).toEqual(["missing symbol", "alpha"]);
+  });
+
   it("does not save queries for a no-read-path global when repository-context queries ran", async () => {
     const baseline = await buildGroomingFreshnessBaseline(
       input({

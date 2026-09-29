@@ -1987,6 +1987,35 @@ Investigate session handling in auth module.`;
       });
     });
 
+    it("saves the repository-context empty queries in the freshness baseline for a dispatcher-only run (#1115)", async () => {
+      // Dispatcher-only: the repository context searched and came back empty,
+      // and the exploration tool loop does not run, so the run read no files
+      // and has no negative exploration search. With no read path the scope is
+      // a no-read-path global, so the repository-context empty queries are the
+      // saved, recheckable negative evidence.
+      mocks.buildRepositoryContext.mockResolvedValue({
+        text: "",
+        sources: [],
+        warnings: [],
+        bytes: 0,
+        queries: ["alpha", "beta"],
+        emptyQueries: ["alpha", "beta"],
+        files: [],
+      });
+      // No evidence source adds a repository read path: the snapshot carries
+      // no sources, so the (not-ready) plan cites only the issue itself.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({ ...mockEvidence, sources: [] });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { evidenceRefs: ["issue"] } }));
+
+      await runHostedGroomer();
+
+      const data = issueUpdateData();
+      expect(data).toMatchObject({
+        groomedEvidenceScope: "global",
+        groomedSearchCodeQueries: ["alpha", "beta"],
+      });
+    });
+
     it("does not record a baseline for a skipped in-flight run, leaving the prior one untouched", async () => {
       mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-progress", "priority/p0"] });
       await runHostedGroomer();
