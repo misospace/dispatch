@@ -488,16 +488,20 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
   const repositoryQueries = repositoryContextEmptyQueries(input.repositoryEmptyQueries);
   // A no-read-path global may recheck its negatives only when every
   // repository-context search is accounted for: either none ran, or every
-  // derived search is known to have returned empty. Searches that hit,
-  // failed, or were never run keep the conservative stale-on-commit
-  // behaviour (#1115).
+  // derived search is known to have returned empty. A captured empty must be
+  // a member of the run's derived queries — counting alone would let a
+  // producer persist a query it never observed. Searches that hit, failed,
+  // or were never run keep the conservative stale-on-commit behaviour
+  // (#1115).
+  const repositoryNegativesObserved =
+    repositoryQueries !== null && repositoryQueries.every((query) => input.repositoryQueries.includes(query));
   const repositoryNegativesAccountedFor =
-    repositoryQueries !== null &&
+    repositoryNegativesObserved &&
     (input.repositoryQueries.length === 0 || repositoryQueries.length === input.repositoryQueries.length);
   const canRecheckNegativeEvidence =
     scope === "global" &&
     explorationQueries !== null &&
-    repositoryQueries !== null &&
+    repositoryNegativesObserved &&
     !reliance.reliesOnSurfacedPath &&
     (reliance.repositoryPaths.length > 0 ||
       (repositoryNegativesAccountedFor &&

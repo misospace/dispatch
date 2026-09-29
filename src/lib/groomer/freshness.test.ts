@@ -410,7 +410,7 @@ describe("buildGroomingFreshnessBaseline", () => {
     const baseline = await buildGroomingFreshnessBaseline(
       input({
         explorationToolCalls: emptySearches(["shared"]),
-        repositoryQueries: ["alpha"],
+        repositoryQueries: ["alpha", "shared"],
         repositoryEmptyQueries: ["alpha", "shared"],
       }),
     );
@@ -482,6 +482,41 @@ describe("buildGroomingFreshnessBaseline", () => {
       }),
     );
     expect(baseline.groomedEvidenceScope).toBe("global");
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("saves none when a captured repository-context empty was not one of the run's searches", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        evidence: { ...evidence, sources: [] },
+        explorationRan: false,
+        explorationToolCalls: [],
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["beta"],
+      }),
+    );
+    expect(baseline.groomedSearchCodeQueries).toEqual([]);
+  });
+
+  it("keeps accurate repository-context empties on a read-path global even when they do not account for every search", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        explorationToolCalls: emptySearches(["missing symbol"]),
+        repositoryQueries: ["alpha", "beta"],
+        repositoryEmptyQueries: ["alpha"],
+      }),
+    );
+    expect(baseline.groomedSearchCodeQueries).toEqual(["missing symbol", "alpha"]);
+  });
+
+  it("saves none when an exploration empty query cannot be saved, even when the repository capture is accounted", async () => {
+    const baseline = await buildGroomingFreshnessBaseline(
+      input({
+        explorationToolCalls: emptySearches(["short", 42]),
+        repositoryQueries: ["alpha"],
+        repositoryEmptyQueries: ["alpha"],
+      }),
+    );
     expect(baseline.groomedSearchCodeQueries).toEqual([]);
   });
 });

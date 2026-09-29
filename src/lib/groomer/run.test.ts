@@ -300,6 +300,7 @@ describe("runHostedGroomer", () => {
       warnings: [],
       bytes: 0,
       queries: [],
+      emptyQueries: [],
       // What the run read at the pinned head: the content close excerpts are
       // checked against (dispatch#1099).
       files: [{ path: "src/auth/login.ts", ref: "abc123", content: LOGIN_TS }],
@@ -551,6 +552,7 @@ describe("runHostedGroomer", () => {
       warnings: ["Failed to fetch repo metadata: timeout"],
       bytes: 0,
       queries: [],
+      emptyQueries: [],
     });
     mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
 

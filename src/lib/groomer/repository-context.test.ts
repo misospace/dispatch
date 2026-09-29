@@ -511,6 +511,32 @@ describe("buildRepositoryContext", () => {
       expect(result.emptyQueries).toEqual(["authentication", "handling", "users", "auth"]);
     });
 
+    it("records no emptyQueries for queries never run once maxFiles is reached", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockImplementation(async (_repo, query) =>
+        query === "authentication"
+          ? [
+              { path: "src/auth.ts", url: "1" },
+              ...Array.from({ length: 9 }, (_, i) => ({ path: `src/extra-${i}.ts`, url: "2" })),
+            ]
+          : [],
+      );
+      deps.fetchFile.mockResolvedValue("export const auth = true;");
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.sources).toContain("src/auth.ts");
+      // The loop breaks once the file budget is full, so the later zero-result
+      // queries were never searched and their emptiness is unknown.
+      expect(result.emptyQueries).toEqual([]);
+      expect(result.queries).toEqual(["authentication", "timeout", "handling", "users", "auth"]);
+      expect(deps.searchCode).toHaveBeenCalledTimes(1);
+    });
+
     it("returns an empty emptyQueries when the feature is disabled", async () => {
       const result = await buildRepositoryContext(
         defaultInput,
