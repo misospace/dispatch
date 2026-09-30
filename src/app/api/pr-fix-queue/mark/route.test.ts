@@ -372,6 +372,7 @@ describe("POST /api/pr-fix-queue/mark — alreadyAddressed merge gate (#1121)", 
     expect(res.status).toBe(409);
     expect((await res.json()).error).toContain("not mergeable");
     expect(mergeStateMock).toHaveBeenCalledWith("o/r", 42);
+    expect(mergeStateMock).toHaveBeenCalledTimes(1);
     expect(mocks.markPrFixItem).not.toHaveBeenCalled();
   });
 
@@ -386,6 +387,7 @@ describe("POST /api/pr-fix-queue/mark — alreadyAddressed merge gate (#1121)", 
 
     expect(res.status).toBe(200);
     expect(mergeStateMock).toHaveBeenCalledWith("o/r", 42);
+    expect(mergeStateMock).toHaveBeenCalledTimes(1);
     expect(mocks.markPrFixItem).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ status: "FIXED", alreadyAddressed: true }),
@@ -418,6 +420,7 @@ describe("POST /api/pr-fix-queue/mark — alreadyAddressed merge gate (#1121)", 
     expect(res.status).toBe(503);
     expect((await res.json()).error).toContain("retry later");
     expect(mergeStateMock).toHaveBeenCalledWith("o/r", 42);
+    expect(mergeStateMock).toHaveBeenCalledTimes(1);
     expect(mocks.markPrFixItem).not.toHaveBeenCalled();
   });
 
