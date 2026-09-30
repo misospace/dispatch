@@ -1297,6 +1297,113 @@ describe("markPrFixItem head SHA guard (#940)", () => {
   });
 });
 
+describe("#1121 already_addressed settlement", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixRequeued.mockReset();
+    surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+  });
+
+  it("settles to FIXED without the #940 head guard and records the evidence", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "abc1234",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("abc1234");
+
+    const result = await markPrFixItem(client, {
+      repo: "acme/widgets", pr: 1121, status: "FIXED",
+      alreadyAddressed: true, evidence: "addressed in commit abc1234",
+    });
+
+    expect(result.mutated).toBe(true);
+    expect(mutatedItem(result)?.status).toBe("FIXED");
+    const last = client.history.at(-1);
+    expect(last).toMatchObject({ action: "mark" });
+    expect(last.note ?? "").toContain("already_addressed");
+    expect(last.note ?? "").toContain("1121");
+    expect(last.note ?? "").toContain("addressed in commit abc1234");
+  });
+
+  it("a plain FIXED with an unmoved head is STILL refused by the #940 guard (invariant)", async () => {
+    const fresh = makeClient();
+    await enqueuePrFixItem(fresh, {
+      repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "abc1234",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("abc1234");
+
+    const result = await markPrFixItem(fresh, {
+      repo: "acme/widgets", pr: 1121, status: "FIXED",
+    });
+
+    expect(mutatedItem(result)?.status).toBe("QUEUED");
+    const last = fresh.history.at(-1);
+    expect(last.note ?? "").toContain("Refused FIXED");
+    expect(last.note ?? "").toContain("940");
+  });
+
+  it("new evidence reopens an already_addressed item as a fresh attempt", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k1", headSha: "abc1234",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("abc1234");
+    const fixed = await markPrFixItem(client, {
+      repo: "acme/widgets", pr: 1121, status: "FIXED",
+      alreadyAddressed: true, evidence: "done already",
+    });
+    expect(mutatedItem(fixed)?.status).toBe("FIXED");
+
+    const reopened = await enqueuePrFixItem(client, {
+      repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "new review",
+      evidenceKey: "k2", headSha: "abc1234",
+    });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.fixAttempts).toBe(2);
+  });
+
+  it("a repeated already_addressed disagreement with an unchanged head is bounded to BLOCKED at the cap", async () => {
+    const prevCap = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "3";
+    try {
+      const fresh = makeClient();
+      await enqueuePrFixItem(fresh, {
+        repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "f",
+        evidenceKey: "k1", headSha: "h",
+      });
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("h");
+
+      let enq: any;
+      for (let i = 0; i < 12; i += 1) {
+        enq = await enqueuePrFixItem(fresh, {
+          repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "f",
+          evidenceKey: "k1", headSha: "h",
+        });
+        if (enq.status === "BLOCKED") break;
+        await markPrFixItem(fresh, {
+          repo: "acme/widgets", pr: 1121, status: "FIXED", alreadyAddressed: true,
+        });
+      }
+
+      expect(enq.status).toBe("BLOCKED");
+      const row = await fresh.prFixQueueItem.findUnique({ where: { repo_pr: { repo: "acme/widgets", pr: 1121 } } });
+      expect(row.status).toBe("BLOCKED");
+      expect(row.lane).toBe("NEEDS_HUMAN");
+    } finally {
+      if (prevCap === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prevCap;
+    }
+  });
+});
+
 describe("attempt baseline + generation-conditional writes (#1074)", () => {
   let client: ReturnType<typeof makeClient>;
 
@@ -1651,6 +1758,27 @@ describe("parseMarkPrFixInput generation (#1074)", () => {
     const input = parseMarkPrFixInput({ repo: "org/repo", pr: 1, status: "FIXED" });
     if ("error" in input) throw new Error(input.error);
     expect(input.expectedGeneration).toBeUndefined();
+  });
+});
+
+describe("parseMarkPrFixInput #1121", () => {
+  it("passes through alreadyAddressed and trims the evidence", () => {
+    const input = parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "FIXED", alreadyAddressed: true, evidence: "  sha123  " });
+    if ("error" in input) throw new Error(input.error);
+    expect(input.alreadyAddressed).toBe(true);
+    expect(input.evidence).toBe("sha123");
+  });
+
+  it("rejects alreadyAddressed on a non-FIXED status", () => {
+    expect(parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "QUEUED", alreadyAddressed: true })).toEqual({ error: expect.stringContaining("FIXED") });
+  });
+
+  it("rejects a non-boolean alreadyAddressed", () => {
+    expect(parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "FIXED", alreadyAddressed: "yes" })).toEqual({ error: expect.any(String) });
+  });
+
+  it("rejects a non-string evidence", () => {
+    expect(parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "FIXED", evidence: 123 })).toEqual({ error: expect.any(String) });
   });
 });
 
