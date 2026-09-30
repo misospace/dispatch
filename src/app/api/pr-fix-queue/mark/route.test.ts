@@ -392,15 +392,32 @@ describe("POST /api/pr-fix-queue/mark — alreadyAddressed merge gate (#1121)", 
     );
   });
 
-  it("defers with 502 when the merge-state check throws", async () => {
+  it("defers with 503 retry-later when the merge-state check throws", async () => {
     mocks.parseMarkPrFixInput.mockReturnValue({
       repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, expectedGeneration: 2,
     });
-    mergeStateMock.mockRejectedValue(new Error("github unreachable"));
+    mergeStateMock.mockRejectedValue(new Error("token header build failed"));
 
     const res = await workerMark({ repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, generation: 2 });
 
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toContain("retry later");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("defers with 503 retry-later when merge state is unknown (null), not a terminal verdict", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, expectedGeneration: 2,
+    });
+    // fetchPullRequestMergeState returns { mergeable: null } (never throws) for
+    // both "GitHub still computing" and "GitHub unreachable".
+    mergeStateMock.mockResolvedValue({ mergeable: null, mergeableState: null });
+
+    const res = await workerMark({ repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, generation: 2 });
+
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toContain("retry later");
+    expect(mergeStateMock).toHaveBeenCalledWith("o/r", 42);
     expect(mocks.markPrFixItem).not.toHaveBeenCalled();
   });
 

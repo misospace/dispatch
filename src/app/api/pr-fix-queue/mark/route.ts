@@ -85,13 +85,26 @@ export async function POST(request: Request) {
           `pr-fix-queue mark: merge state check failed for ${input.repo}#${input.pr}:`,
           error instanceof Error ? error.message : error,
         );
-        // Defer rather than guess: the bridge reconcile pass re-verifies later.
+        // Defer rather than guess, matching the tasks/report resolver, which
+        // leaves the item queued for a later reconcile instead of tombstoning
+        // a PR whose state it could not read.
         return errorResponse(
-          "Cannot settle already_addressed: PR merge state could not be verified",
-          502,
+          "Cannot settle already_addressed: PR merge state could not be verified; retry later",
+          503,
+        );
+      }
+      if (mergeable === null) {
+        // GitHub has not computed merge state yet, or is unreachable (the
+        // helper returns null for both). Defer with a retry-later signal so a
+        // transient unknown never reads as a terminal verdict on this route;
+        // only a genuinely unmergeable PR below gets a terminal 409.
+        return errorResponse(
+          "Cannot settle already_addressed: PR merge state not yet available; retry later",
+          503,
         );
       }
       if (mergeable !== true) {
+        // Genuinely unmergeable (CONFLICTING, DIRTY, BLOCKED, ...): refuse.
         return errorResponse(
           `Cannot settle already_addressed: PR is not mergeable (mergeable_state=${mergeableState ?? "unknown"})`,
           409,
