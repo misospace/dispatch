@@ -4,6 +4,7 @@ import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { markPrFixItem, parseMarkPrFixInput, isPrFixRepoArchived } from "@/lib/pr-fix-queue";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { fetchPullRequestMergeState } from "@/lib/github-prs";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 
@@ -63,6 +64,39 @@ export async function POST(request: Request) {
     // repo, which no worker can push to (#1106).
     if (input.status === "QUEUED" && (await isPrFixRepoArchived(input.repo))) {
       return errorResponse("Cannot requeue: repository is archived", 409);
+    }
+
+    // #1121: an already-addressed settlement asserts the feedback was handled
+    // with no push. The tasks/report path only settles it once the PR is
+    // verified mergeable; enforce the same gate here so the two documented
+    // entry points cannot give the same settlement different safety
+    // properties — a red/conflicting PR must never be tombstoned off an
+    // already_addressed assertion. Scope is narrow: only already-addressed
+    // FIXED marks; plain FIXED marks keep the #940 head-moved guard as before.
+    if (input.status === "FIXED" && input.alreadyAddressed) {
+      let mergeable: boolean | null;
+      let mergeableState: string | null;
+      try {
+        const state = await fetchPullRequestMergeState(input.repo, input.pr);
+        mergeable = state.mergeable;
+        mergeableState = state.mergeableState;
+      } catch (error) {
+        console.error(
+          `pr-fix-queue mark: merge state check failed for ${input.repo}#${input.pr}:`,
+          error instanceof Error ? error.message : error,
+        );
+        // Defer rather than guess: the bridge reconcile pass re-verifies later.
+        return errorResponse(
+          "Cannot settle already_addressed: PR merge state could not be verified",
+          502,
+        );
+      }
+      if (mergeable !== true) {
+        return errorResponse(
+          `Cannot settle already_addressed: PR is not mergeable (mergeable_state=${mergeableState ?? "unknown"})`,
+          409,
+        );
+      }
     }
 
     const result = await markPrFixItem(asPrFixQueueClient(prisma), input);

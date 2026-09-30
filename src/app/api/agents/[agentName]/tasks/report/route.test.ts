@@ -85,6 +85,7 @@ vi.mock("@prisma/client", () => ({
 
 vi.mock("@/lib/pr-fix-queue", () => ({
   resolvePrFixFromAgentReport: prFixResolveMock,
+  MAX_EVIDENCE_LENGTH: 2000,
 }));
 
 import { POST } from "./route";
@@ -308,6 +309,7 @@ describe("POST /api/agents/[agentName]/tasks/report — validation", () => {
       "blocked",
       "failed",
       "no_changes_needed",
+      "already_addressed",
     ];
 
     for (const outcome of validOutcomes) {
@@ -401,6 +403,68 @@ describe("POST /api/agents/[agentName]/tasks/report — validation", () => {
     const body = await res.json();
     expect("harness" in body).toBe(false);
     expect("workflowRepo" in body).toBe(false);
+  });
+
+  it("forwards trimmed evidence to the pr-fix resolver for an already_addressed report", async () => {
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "already_addressed",
+      repoFullName: "o/r",
+      pullRequestNumber: 5,
+      evidence: "  already addressed in commit abc123  ",
+      prFixItem: { id: "item-1", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: "already_addressed",
+        evidence: "already addressed in commit abc123",
+      }),
+    );
+  });
+
+  it("ignores evidence on a non-already_addressed outcome so it stays out of the payload", async () => {
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "pr_updated",
+      repoFullName: "o/r",
+      pullRequestNumber: 5,
+      evidence: "should be ignored",
+      prFixItem: { id: "item-1", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Evidence is scoped to already_addressed before the resolver sees it and
+    // before the idempotency hash is computed, so it must be absent here.
+    expect(body.report.evidence).toBeUndefined();
+    const arg = prFixResolveMock.mock.calls.at(-1)?.[0];
+    expect(arg.evidence).toBeUndefined();
+  });
+
+  it("returns 400 when evidence exceeds MAX_EVIDENCE_LENGTH for an already_addressed report", async () => {
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "already_addressed",
+      repoFullName: "o/r",
+      pullRequestNumber: 5,
+      evidence: "x".repeat(2001),
+      prFixItem: { id: "item-1", generation: 1 },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/2000/);
+  });
+
+  it("returns 400 when evidence is present but not a string", async () => {
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "already_addressed",
+      repoFullName: "o/r",
+      pullRequestNumber: 5,
+      evidence: 123,
+      prFixItem: { id: "item-1", generation: 1 },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/evidence must be a string/);
   });
 });
 

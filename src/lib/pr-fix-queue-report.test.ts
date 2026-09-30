@@ -608,5 +608,8 @@ describe("resolvePrFixFromAgentReport", () => {
     const histCall = (prisma.prFixHistory.create as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
     expect(histCall?.data?.note ?? "").toContain("f7f8c5a");
     expect(histCall?.data?.note ?? "").toContain("1121");
+    // The already_addressed settlement is gated on the PR merge state before
+    // it settles (a red PR is never marked FIXED off an unverified report).
+    expect(fetchPullRequestMergeStateMock).toHaveBeenCalledWith("acme/widgets", 1234);
   });
 });

@@ -19,6 +19,11 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
+const mergeStateMock = vi.fn();
+vi.mock("@/lib/github-prs", () => ({
+  fetchPullRequestMergeState: (...args: unknown[]) => mergeStateMock(...args),
+}));
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     auditLog: { create: mocks.auditLogCreate },
@@ -331,6 +336,82 @@ describe("POST /api/pr-fix-queue/mark — worker tier (#1111)", () => {
     const res = await postRequest({ repo: "org/repo", pr: 42, status: "QUEUED", generation: 2 });
 
     expect(res.status).toBe(200);
+    expect(mocks.markPrFixItem).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/pr-fix-queue/mark — alreadyAddressed merge gate (#1121)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.prFixQueueClient.mockReturnValue({});
+    mocks.isPrFixRepoArchived.mockResolvedValue(false);
+    mocks.auditLogCreate.mockResolvedValue({ id: "log-1" });
+  });
+
+  function workerMark(body: unknown) {
+    return POST(
+      authedRequest("http://localhost/api/pr-fix-queue/mark", {
+        method: "POST",
+        body,
+        token: WORKER_TOKEN,
+        headers: { "x-agent-name": "worker-agent" },
+      }),
+    );
+  }
+
+  it("refuses a worker already-addressed mark on a non-mergeable PR and does not settle", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, evidence: "sha", expectedGeneration: 2,
+    });
+    mergeStateMock.mockResolvedValue({ mergeable: false, mergeableState: "CONFLICTING" });
+
+    const res = await workerMark({ repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, evidence: "sha", generation: 2 });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("not mergeable");
+    expect(mergeStateMock).toHaveBeenCalledWith("o/r", 42);
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("settles a worker already-addressed mark when the PR is mergeable (unchanged head allowed)", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, evidence: "sha", expectedGeneration: 2,
+    });
+    mergeStateMock.mockResolvedValue({ mergeable: true, mergeableState: "clean" });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "FIXED" } });
+
+    const res = await workerMark({ repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, evidence: "sha", generation: 2 });
+
+    expect(res.status).toBe(200);
+    expect(mergeStateMock).toHaveBeenCalledWith("o/r", 42);
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ status: "FIXED", alreadyAddressed: true }),
+    );
+  });
+
+  it("defers with 502 when the merge-state check throws", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({
+      repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, expectedGeneration: 2,
+    });
+    mergeStateMock.mockRejectedValue(new Error("github unreachable"));
+
+    const res = await workerMark({ repo: "o/r", pr: 42, status: "FIXED", alreadyAddressed: true, generation: 2 });
+
+    expect(res.status).toBe(502);
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
+  it("does NOT run the merge gate for a plain FIXED mark (no alreadyAddressed)", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "o/r", pr: 42, status: "FIXED", expectedGeneration: 2 });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "FIXED" } });
+
+    const res = await postRequest({ repo: "o/r", pr: 42, status: "FIXED", generation: 2 });
+
+    expect(res.status).toBe(200);
+    expect(mergeStateMock).not.toHaveBeenCalled();
     expect(mocks.markPrFixItem).toHaveBeenCalled();
   });
 });

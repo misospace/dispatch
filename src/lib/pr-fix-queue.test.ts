@@ -1780,6 +1780,13 @@ describe("parseMarkPrFixInput #1121", () => {
   it("rejects a non-string evidence", () => {
     expect(parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "FIXED", evidence: 123 })).toEqual({ error: expect.any(String) });
   });
+
+  it("rejects evidence longer than MAX_EVIDENCE_LENGTH", () => {
+    const result = parseMarkPrFixInput({
+      repo: "o/r", pr: 1, status: "FIXED", evidence: "a".repeat(2001),
+    });
+    expect(result).toEqual({ error: expect.stringContaining("2000") });
+  });
 });
 
 describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
