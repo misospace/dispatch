@@ -116,16 +116,57 @@ export function explorationCallsForFreshness(
   return toolCalls.map(({ name, arguments: args, ok, bytes }) => ({ name, arguments: args, ok, bytes }));
 }
 
-function emptySearchCodeQueries(toolCalls: ExplorationToolCallLike[]): string[] {
+/**
+ * The exploration loop's empty `search_code` queries — the negative evidence
+ * (#1091). Null means the negatives cannot be saved whole (a query is
+ * unreadable, too long, past the cap, or empty after trimming) and the
+ * conservative stale-on-commit behaviour applies.
+ */
+function emptySearchCodeQueries(toolCalls: ExplorationToolCallLike[]): string[] | null {
   const queries: string[] = [];
   for (const call of toolCalls) {
     if (call.name !== "search_code" || !call.ok || call.bytes !== 0) continue;
     // Every empty search is part of the negative evidence. One that can't be
-    // saved whole (unreadable, too long, or past the cap) would leave the
-    // recheck verifying the result on a subset, so save none and keep the
-    // conservative stale-on-commit behaviour instead.
+    // saved whole would leave the recheck verifying the result on a subset,
+    // so save none and keep the conservative stale-on-commit behaviour
+    // instead.
     const raw = call.arguments?.query;
-    if (typeof raw !== "string") return [];
+    if (typeof raw !== "string") return null;
+    const query = raw.trim();
+    if (!query) return null;
+    if (queries.includes(query)) continue;
+    if (query.length > MAX_BASELINE_SEARCH_CODE_QUERY_CHARS || queries.length >= MAX_BASELINE_SEARCH_CODE_QUERIES) return null;
+    queries.push(query);
+  }
+  return queries;
+}
+
+/**
+ * The dispatcher's repository-context empty-search capture (#1115). Validated
+ * for usability: null means the capture is unusable (a non-string entry, or
+ * one that trims to empty) and the conservative behaviour applies.
+ */
+function repositoryContextEmptyQueries(queries: string[] | undefined): string[] | null {
+  if (!queries || queries.length === 0) return [];
+  const out: string[] = [];
+  for (const raw of queries) {
+    if (typeof raw !== "string") return null;
+    const query = raw.trim();
+    if (!query) return null;
+    if (!out.includes(query)) out.push(query);
+  }
+  return out;
+}
+
+/**
+ * Merge exploration and repository-context empty queries under the same bounds
+ * as emptySearchCodeQueries — trim, dedupe, max count/length. All-or-nothing:
+ * one query that can't be saved whole would leave the recheck verifying a
+ * subset, so save none.
+ */
+function mergeEmptySearchQueries(sources: string[][]): string[] {
+  const queries: string[] = [];
+  for (const raw of sources.flat()) {
     const query = raw.trim();
     if (!query) return [];
     if (queries.includes(query)) continue;
@@ -406,6 +447,12 @@ export interface GroomingFreshnessInput {
   /** Before the run fetched comments: a human comment after this is new evidence. */
   evidenceWindowStart: Date;
   repositoryQueries: string[];
+  /**
+   * Repository-context searches that completed with zero results (#1115).
+   * Undefined means the run did not capture them: a no-read-path global then
+   * keeps the conservative stale-on-commit behaviour.
+   */
+  repositoryEmptyQueries?: string[];
   explorationRan: boolean;
   explorationToolCalls: ExplorationToolCallLike[];
   /** The validated plan's citations (#1062), when there is a plan. */
@@ -437,6 +484,29 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
   const dependencyKeys = dependencyKeysForIssue(body, input.repoFullName, input.issueNumber);
   const openKeys = dependencyKeys.length > 0 ? await input.resolveOpenKeys(dependencyKeys) : new Set<string>();
 
+  const explorationQueries = emptySearchCodeQueries(input.explorationToolCalls);
+  const repositoryQueries = repositoryContextEmptyQueries(input.repositoryEmptyQueries);
+  // A no-read-path global may recheck its negatives only when every
+  // repository-context search is accounted for: either none ran, or every
+  // derived search is known to have returned empty. A captured empty must be
+  // a member of the run's derived queries — counting alone would let a
+  // producer persist a query it never observed. Searches that hit, failed,
+  // or were never run keep the conservative stale-on-commit behaviour
+  // (#1115).
+  const repositoryNegativesObserved =
+    repositoryQueries !== null && repositoryQueries.every((query) => input.repositoryQueries.includes(query));
+  const repositoryNegativesAccountedFor =
+    repositoryNegativesObserved &&
+    (input.repositoryQueries.length === 0 || repositoryQueries.length === input.repositoryQueries.length);
+  const canRecheckNegativeEvidence =
+    scope === "global" &&
+    explorationQueries !== null &&
+    repositoryNegativesObserved &&
+    !reliance.reliesOnSurfacedPath &&
+    (reliance.repositoryPaths.length > 0 ||
+      (repositoryNegativesAccountedFor &&
+        !input.explorationToolCalls.some((call) => call.name === "list_directory")));
+
   return {
     groomedRunId: input.groomingRunId,
     groomedHeadSha: evidence.headSha,
@@ -447,21 +517,10 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     groomedEvidenceCapturedAt: input.evidenceWindowStart,
     groomedEvidenceScope: scope,
     groomedEvidencePaths: reliance.repositoryPaths,
-    // Only negative-search globals may be rechecked later (#1091). The other
-    // global cases — a relied-on path that was only surfaced, or repository
-    // access with no read path — keep the conservative stale-on-commit
-    // behaviour even when an empty search also happened during the run.
-    // A no-read-path global may still save its queries when exploration
-    // searches were its ONLY repository evidence: no repository-context
-    // queries ran and nothing else (e.g. list_directory) surfaced paths.
-    groomedSearchCodeQueries:
-      scope === "global" &&
-      !reliance.reliesOnSurfacedPath &&
-      (reliance.repositoryPaths.length > 0 ||
-        (input.repositoryQueries.length === 0 &&
-          !input.explorationToolCalls.some((call) => call.name === "list_directory")))
-        ? emptySearchCodeQueries(input.explorationToolCalls)
-        : [],
+    // Negatives from both exploration and repository context are saved only
+    // when each is fully accounted for; globals resting on a surfaced path or
+    // unread accounting keep the conservative stale-on-commit behaviour.
+    groomedSearchCodeQueries: canRecheckNegativeEvidence ? mergeEmptySearchQueries([explorationQueries ?? [], repositoryQueries ?? []]) : [],
     groomedDependencyKeys: dependencyKeys,
     groomedOpenBlockerKeys: dependencyKeys.filter((key) => openKeys.has(key)).sort(),
     groomedRelatedWork: reliance.relatedWork,

@@ -300,6 +300,7 @@ describe("runHostedGroomer", () => {
       warnings: [],
       bytes: 0,
       queries: [],
+      emptyQueries: [],
       // What the run read at the pinned head: the content close excerpts are
       // checked against (dispatch#1099).
       files: [{ path: "src/auth/login.ts", ref: "abc123", content: LOGIN_TS }],
@@ -551,6 +552,7 @@ describe("runHostedGroomer", () => {
       warnings: ["Failed to fetch repo metadata: timeout"],
       bytes: 0,
       queries: [],
+      emptyQueries: [],
     });
     mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, dryRun: true });
 
@@ -1982,6 +1984,35 @@ Investigate session handling in auth module.`;
       expect(issueUpdateData()).toMatchObject({
         groomedEvidenceScope: "global",
         groomedSearchCodeQueries: ["missing symbol", "also missing"],
+      });
+    });
+
+    it("saves the repository-context empty queries in the freshness baseline for a dispatcher-only run (#1115)", async () => {
+      // Dispatcher-only: the repository context searched and came back empty,
+      // and the exploration tool loop does not run, so the run read no files
+      // and has no negative exploration search. With no read path the scope is
+      // a no-read-path global, so the repository-context empty queries are the
+      // saved, recheckable negative evidence.
+      mocks.buildRepositoryContext.mockResolvedValue({
+        text: "",
+        sources: [],
+        warnings: [],
+        bytes: 0,
+        queries: ["alpha", "beta"],
+        emptyQueries: ["alpha", "beta"],
+        files: [],
+      });
+      // No evidence source adds a repository read path: the snapshot carries
+      // no sources, so the (not-ready) plan cites only the issue itself.
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({ ...mockEvidence, sources: [] });
+      mocks.callGroomerLLM.mockResolvedValue(notReadyDraft("backlog", { verdict: { evidenceRefs: ["issue"] } }));
+
+      await runHostedGroomer();
+
+      const data = issueUpdateData();
+      expect(data).toMatchObject({
+        groomedEvidenceScope: "global",
+        groomedSearchCodeQueries: ["alpha", "beta"],
       });
     });
 

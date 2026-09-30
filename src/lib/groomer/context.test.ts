@@ -105,6 +105,7 @@ describe("buildIssueContext", () => {
         warnings: ["one search failed"],
         bytes: 64,
         queries: ["login"],
+        emptyQueries: [],
       },
     });
     expect(result).toContain("Repository context:");
