@@ -35,6 +35,13 @@ export interface RepositoryContextResult {
    * for the default branch), for close-excerpt checks (dispatch#1099).
    */
   files?: PinnedRead[];
+  /**
+   * The queries in `queries` whose code search completed successfully with
+   * zero results — repo-wide negative evidence a freshness baseline can
+   * recheck (dispatch#1115). Searches that failed are excluded (their
+   * emptiness is undetermined), as are queries that were never run.
+   */
+  emptyQueries: string[];
 }
 
 /** Default extensions considered text-like for repository context. */
@@ -111,6 +118,7 @@ export async function buildRepositoryContext(
     warnings: [],
     bytes: 0,
     queries: [],
+    emptyQueries: [],
   };
 
   if (!config.enabled) {
@@ -151,12 +159,14 @@ export async function buildRepositoryContext(
       warnings,
       bytes: Buffer.byteLength(lines.join("\n"), "utf8"),
       queries,
+      emptyQueries: [],
     };
   }
 
   const fetchedPaths = new Set<string>();
   const fileLines: string[] = [];
   const files: PinnedRead[] = [];
+  const emptyQueries: string[] = [];
 
   for (const query of queries) {
     if (fetchedPaths.size >= config.maxFiles) break;
@@ -167,6 +177,10 @@ export async function buildRepositoryContext(
     } catch (err) {
       warnings.push(`Code search failed for "${query}": ${err instanceof Error ? err.message : String(err)}`);
       continue;
+    }
+
+    if (results.length === 0) {
+      emptyQueries.push(query);
     }
 
     for (const result of results) {
@@ -222,5 +236,6 @@ export async function buildRepositoryContext(
     bytes: Buffer.byteLength(text, "utf8"),
     queries,
     files,
+    emptyQueries,
   };
 }
