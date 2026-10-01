@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
-import { resolvePrFixFromAgentReport, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
+import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr", "groom"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -17,6 +17,7 @@ const VALID_OUTCOMES = [
   "blocked",
   "failed",
   "no_changes_needed",
+  "already_addressed",
 ] as const;
 type ValidOutcome = (typeof VALID_OUTCOMES)[number];
 
@@ -29,6 +30,8 @@ export interface TaskReportBody {
   pullRequestUrl?: string;
   summary?: string;
   error?: string;
+  // #1121: evidence string (commit SHAs / paths) carried by an already_addressed report; recorded in settlement history.
+  evidence?: string;
   // The (id, generation) attempt token next-task issued on this followup-pr
   // task, echoed back by the worker (#1074). Required for PR-fix queue
   // settlement; part of the report's payload identity (idempotency hash).
@@ -145,11 +148,22 @@ export async function POST(
     return errorResponse("pullRequestNumber must be an integer", 400);
   }
 
-  const stringFields: readonly string[] = ["repoFullName", "pullRequestUrl", "summary", "error"];
+  const stringFields: readonly string[] = ["repoFullName", "pullRequestUrl", "summary", "error", "evidence"];
   for (const field of stringFields) {
     if (raw[field] !== undefined && typeof raw[field] !== "string") {
       return errorResponse(`${field} must be a string`, 400);
     }
+  }
+
+  // #1121: evidence is only meaningful for an already_addressed settlement — it
+  // is trimmed, bounded, and recorded in the PR-fix settlement history. On any
+  // other outcome it is ignored (never hashed, never persisted). A non-string
+  // evidence is rejected above by the stringFields validation.
+  const isAlreadyAddressed = (outcome as ValidOutcome) === "already_addressed";
+  const evidence =
+    isAlreadyAddressed && typeof raw.evidence === "string" ? raw.evidence.trim() : undefined;
+  if (evidence && evidence.length > MAX_EVIDENCE_LENGTH) {
+    return errorResponse(`evidence must be at most ${MAX_EVIDENCE_LENGTH} characters`, 400);
   }
 
   // Optional attempt token for PR-fix queue settlement (#1074). The worker
@@ -202,6 +216,7 @@ export async function POST(
     pullRequestUrl: raw.pullRequestUrl as string | undefined,
     summary: raw.summary as string | undefined,
     error: raw.error as string | undefined,
+    evidence,
     prFixItem,
   };
 
@@ -296,6 +311,7 @@ export async function POST(
         pullRequestUrl: report.pullRequestUrl,
         outcome: report.outcome,
         summary: report.summary,
+        evidence: report.evidence,
         // #1074: settlement is authorized by the attempt token the worker was
         // issued; a report without one never mutates the queue.
         attempt: prFixItem ? { itemId: prFixItem.id, generation: prFixItem.generation } : null,

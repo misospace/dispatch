@@ -22,6 +22,23 @@ export type PrFixQueueClient = {
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
 };
 
+// #1121: upper bound on an already_addressed evidence string, shared by the
+// tasks/report route and the pr-fix-queue/mark parser.
+export const MAX_EVIDENCE_LENGTH = 2000;
+
+function alreadyAddressedHistoryNote(input: MarkPrFixInput): string {
+  const evidence = input.evidence?.trim();
+  return [
+    input.note ?? null,
+    evidence ? `Evidence: ${evidence}` : null,
+    evidence
+      ? "Settled as already_addressed: the PR head may be unchanged; the evidence is recorded for the next review (#1121)."
+      : "Settled as already_addressed: the PR head may be unchanged; no new push was expected (#1121).",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export interface EnqueuePrFixInput {
   repo: string;
   pr: number;
@@ -52,6 +69,13 @@ export interface MarkPrFixInput {
   // Fresh per-attempt head baseline carried into the row when this mark bumps
   // the item back to QUEUED as a new attempt (#1074).
   attemptHeadSha?: string | null;
+  // #1121: an explicit "already addressed" settlement. When true (and status is
+  // FIXED), the #940 no-progress head-moved guard is bypassed and `evidence` is
+  // recorded in the settlement history: the worker asserts the feedback was
+  // already handled, so no new push is expected. New evidence still reopens the
+  // item; a repeated disagreement reopens via #940 and counts toward fixAttempts.
+  alreadyAddressed?: boolean;
+  evidence?: string | null;
 }
 
 export interface RequeuePrFixInput {
@@ -109,6 +133,20 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
       return { error: "Invalid attemptHeadSha" };
     }
   }
+  if (input.alreadyAddressed !== undefined && typeof input.alreadyAddressed !== "boolean") {
+    return { error: "alreadyAddressed must be a boolean" };
+  }
+  const alreadyAddressed = input.alreadyAddressed === true;
+  if (alreadyAddressed && normalizePrFixStatus(input.status) !== "FIXED") {
+    return { error: "alreadyAddressed requires status FIXED" };
+  }
+  if (input.evidence !== undefined && input.evidence !== null && typeof input.evidence !== "string") {
+    return { error: "evidence must be a string" };
+  }
+  const evidence = typeof input.evidence === "string" ? input.evidence.trim() : null;
+  if (evidence && evidence.length > MAX_EVIDENCE_LENGTH) {
+    return { error: `evidence must be at most ${MAX_EVIDENCE_LENGTH} characters` };
+  }
   return {
     repo: input.repo.trim(),
     pr: Number(input.pr),
@@ -117,6 +155,8 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
     expectedGeneration:
       typeof input.generation === "number" && input.generation !== null ? input.generation : undefined,
     attemptHeadSha: typeof input.attemptHeadSha === "string" ? input.attemptHeadSha.trim() : null,
+    ...(alreadyAddressed ? { alreadyAddressed: true } : {}),
+    ...(evidence ? { evidence } : {}),
   };
 }
 
@@ -824,7 +864,9 @@ export async function markPrFixItem(
   // against the immutable per-attempt baseline, so a refused FIXED never
   // transiently exists. Compare `attemptHeadSha` (this attempt's baseline)
   // with a fallback to the mutable `headSha` for legacy rows.
-  if (nextStatus === "FIXED" && existing.status !== "FIXED") {
+  // #1121: an explicit already-addressed settlement bypasses the guard — the
+  // worker asserts the feedback was already handled, so no push is expected.
+  if (nextStatus === "FIXED" && existing.status !== "FIXED" && !input.alreadyAddressed) {
     const baseline = existing.attemptHeadSha ?? existing.headSha;
     const headShaGuard = await assertPrHeadMovedForFix(client, input.repo, input.pr, baseline, input.note ?? null);
     if (headShaGuard === "head-unchanged") {
@@ -925,7 +967,7 @@ export async function markPrFixItem(
       if (count !== 1) return null;
       const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
       await tx.prFixHistory.create({
-        data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.note ?? undefined },
+        data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.alreadyAddressed ? alreadyAddressedHistoryNote(input) : input.note ?? undefined },
       });
       return row;
     });
@@ -993,7 +1035,7 @@ export async function markPrFixItem(
           status: nextStatus,
           lane: row.lane,
           note: [
-            input.note,
+            input.alreadyAddressed ? alreadyAddressedHistoryNote(input) : input.note,
             "Recorded post-dispatch evidence no longer applies (intermediate head); cleared (#1119).",
           ]
             .filter(Boolean)
@@ -1378,7 +1420,8 @@ export type AgentReportOutcome =
   | "issue_closed"
   | "no_changes_needed"
   | "blocked"
-  | "failed";
+  | "failed"
+  | "already_addressed";
 
 /**
  * The (id, generation) attempt token `next-task` issues on a followup-pr
@@ -1395,6 +1438,8 @@ export interface ResolvePrFixFromAgentReportInput {
   pullRequestUrl?: string | null;
   outcome: AgentReportOutcome;
   summary?: string | null;
+  // #1121 evidence string (commit SHAs/paths) carried by an `already_addressed` report.
+  evidence?: string | null;
   client?: PrFixQueueClient;
   // #1074: required for queue settlement. When present, the report settles
   // exactly the item + generation the token identifies; when absent (legacy
@@ -1704,6 +1749,7 @@ export async function resolvePrFixFromAgentReport(
     };
   }
 
+  const alreadyAddressed = input.outcome === "already_addressed";
   // The FIXED baseline is the item's immutable per-attempt `attemptHeadSha`
   // (fallback: mutable `headSha`), re-read inside markPrFixItem BEFORE any
   // write, so a refused FIXED never transiently exists (#1074).
@@ -1713,6 +1759,8 @@ export async function resolvePrFixFromAgentReport(
     status: "FIXED",
     note: input.summary ?? null,
     expectedGeneration,
+    ...(alreadyAddressed ? { alreadyAddressed: true } : {}),
+    ...(input.evidence ? { evidence: input.evidence } : {}),
   });
   if (!markResult.mutated) {
     return {
@@ -1727,7 +1775,9 @@ export async function resolvePrFixFromAgentReport(
     matched: true,
     action: "fixed",
     itemId: existing.id ?? null,
-    reason: "pr merge state verified",
+    reason: alreadyAddressed
+      ? `already_addressed: settled without the head-moved guard${input.evidence ? " (evidence recorded)" : ""}`
+      : "pr merge state verified",
     attemptGeneration: attempt?.generation ?? null,
   };
 }
