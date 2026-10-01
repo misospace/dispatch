@@ -246,3 +246,25 @@ Workers using the canonical `next-task` endpoint automatically receive PR-fix it
 - **2026-05-19** — Added Renovate issue exclusion section: Renovate issues are excluded from agent queues by default (Issue #129).
 - **2026-05-19** — Added five-column workflow with Ready status (Issue #140): Backlog → Ready → In Progress → In Review → Done. Agents pick from Ready by default; Backlog excluded unless explicitly requested.
 - **2026-05-20** — Marked `lane=gpt` as deprecated compatibility alias in canonical docs; linked openclaw-agent-mc-workflow.md as historical (Issue #117).
+
+## `already_addressed` settlement (#1121)
+
+A fix-pr run that concludes the review feedback was already handled reports
+`tasks/report` with `outcome: "already_addressed"` and an optional `evidence`
+string (commit SHAs / file paths), echoing the `prFixItem.{id, generation}`
+token it was issued. Dispatch settles the PR-fix queue item to FIXED WITHOUT
+the #940 "PR head must have moved" guard (the run pushed nothing on purpose)
+and records the evidence in the item's settlement history.
+
+Behavioral notes:
+- The PR merge-state gate is deliberately KEPT: a non-mergeable PR defers the
+  settlement for the bridge reconcile pass rather than tombstoning a red PR.
+- New review evidence reopens the item as a fresh attempt, as usual.
+- The SAME evidence re-observed with the head unchanged reopens through the
+  #940 no-progress path and counts toward `fixAttempts`; a worker and reviewer
+  that keep disagreeing end BLOCKED / NEEDS_HUMAN at `PR_FIX_MAX_ATTEMPTS`
+  (#1107), which is a real human decision.
+- `pr-fix-queue/mark` accepts the same settlement via
+  `status: "FIXED"` + `alreadyAddressed: true` + optional `evidence` (bearer
+  marks still require a generation; the QUEUED/IGNORED maintainer-only gate is
+  unchanged).

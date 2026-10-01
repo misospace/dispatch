@@ -41,6 +41,7 @@ The report endpoint accepts these outcomes:
 | `blocked` | Work cannot proceed without external input |
 | `failed` | The task failed unexpectedly |
 | `no_changes_needed` | No action was required |
+| `already_addressed` | PR-fix feedback was already handled; settles with optional evidence and no push (#1121) |
 
 ## Generic Worker Loop
 
