@@ -14,6 +14,8 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
+const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
+
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     automationRepo: {
@@ -33,9 +35,10 @@ vi.mock("@/lib/prisma", () => ({
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { [WORKER_TOKEN]: "worker" }));
 
 import { GET, DELETE } from "./route";
+import { resetAuthCaches } from "@/lib/auth";
 
 function deleteRequest(repoSegments: string[], includeAuth = true) {
   return DELETE(
@@ -48,12 +51,19 @@ function deleteRequest(repoSegments: string[], includeAuth = true) {
 }
 
 
-function getRequest(repoSegments: string[], searchParams?: Record<string, string>) {
+function getRequest(
+  repoSegments: string[],
+  searchParams?: Record<string, string>,
+  options?: { token?: string; includeAuth?: boolean },
+) {
   const url = new URL(`http://localhost/api/automation/repos/${repoSegments.join("/")}`);
   if (searchParams) {
     Object.entries(searchParams).forEach(([k, v]) => url.searchParams.set(k, v));
   }
-  return GET(new Request(url.toString()), { params: Promise.resolve({ repo: repoSegments }) });
+  return GET(
+    authedRequest(url.toString(), { method: "GET", ...options }),
+    { params: Promise.resolve({ repo: repoSegments }) },
+  );
 }
 
 describe("GET /api/automation/repos/[...repo]", () => {
@@ -116,6 +126,38 @@ describe("GET /api/automation/repos/[...repo]", () => {
         where: { fullName: "myorg/my repo" },
       }),
     );
+  });
+});
+
+describe("GET /api/automation/repos/[...repo] — auth", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.resetAllMocks();
+  });
+
+  it("returns 401 when no authorization header is provided", async () => {
+    const res = await getRequest(["myorg", "myrepo"], undefined, { includeAuth: false });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+    expect(mocks.findUniqueAutomationRepo).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when token is incorrect", async () => {
+    const res = await getRequest(["myorg", "myrepo"], undefined, { token: "wrong-token" });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+    expect(mocks.findUniqueAutomationRepo).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 for a worker-tier token", async () => {
+    const res = await getRequest(["myorg", "myrepo"], undefined, { token: WORKER_TOKEN });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toContain("maintainer");
+    expect(mocks.findUniqueAutomationRepo).not.toHaveBeenCalled();
   });
 });
 
