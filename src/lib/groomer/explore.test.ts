@@ -53,6 +53,38 @@ function makeDeps(overrides: Partial<ExploreDeps["tools"]> = {}, fetchImpl?: typ
 }
 
 describe("exploreRepository", () => {
+  it("strips NUL and C0 control characters from model-authored tool arguments (dispatch#1130)", async () => {
+    // Tool-call arguments are model-authored and flow into persisted columns:
+    // submitted findings into contextSummary (jsonb) and the search query behind
+    // Issue.groomedSearchCodeQueries (text[]). A NUL must not reach either, so
+    // they are stripped at the single ingestion point (parseArguments).
+    const CONTROL = /[\u0000-\u0008\u000B-\u001F]/;
+    const fetchImpl = fetchReturning(
+      { content: null, tool_calls: [toolCall("1", "search_code", { query: "missing\u0000 symbol\u0007" })] },
+      {
+        content: null,
+        tool_calls: [
+          toolCall("2", "submit_findings", {
+            files: ["src/auth/login.ts\u0000"],
+            ask: "why\u0000 does login drop the return URL?",
+            notes: "seen\u0001 already",
+          }),
+        ],
+      },
+    );
+    const deps = makeDeps({ searchCode: vi.fn().mockResolvedValue([]) }, fetchImpl);
+
+    const result = await exploreRepository(options, deps);
+
+    expect(result.ask).toBe("why does login drop the return URL?");
+    expect(result.files).toEqual(["src/auth/login.ts"]);
+    const searchCall = result.toolCalls.find((c) => c.name === "search_code");
+    expect(searchCall?.arguments).toEqual({ query: "missing symbol" });
+    expect(result.ask).not.toMatch(CONTROL);
+    expect(result.files.every((f) => !CONTROL.test(f))).toBe(true);
+    expect(result.findings).not.toMatch(CONTROL);
+  });
+
   it("runs the tools the model asks for, then returns its submitted findings", async () => {
     const fetchImpl = fetchReturning(
       { content: null, tool_calls: [toolCall("1", "search_code", { query: "PrismaPg" })] },

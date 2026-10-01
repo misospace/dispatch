@@ -18,7 +18,7 @@ import type { callGroomerLLM, CallLlmOptions } from "./llm";
 import type { GroomingPlanValidationResult, validateGroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import { degradePlanDraft } from "./plan-degrade";
-import { sanitizeForStorage, sanitizeJsonForStorage } from "./sanitize";
+import { sanitizeForStorage, sanitizeJsonForStorage, sanitizeModelJson } from "./sanitize";
 
 /**
  * A repair turn left less than this (or less than the configured per-call
@@ -99,7 +99,19 @@ async function modelStage(input: ModelStageInput): Promise<ModelStageResult> {
   const { callLLM, validateOutput, llm, catalog } = input;
   const validate = (output: unknown) => validateOutput(output, { catalog });
 
-  const judge = (output: unknown): Attempt => {
+  // Strip NUL and the other C0 control characters from the model's answer once,
+  // before validation (dispatch#1130). This is the single point where model text
+  // becomes safe, so the validated plan is exactly what later reaches storage
+  // (GroomingRun.validatedOutput) and the mutation applier (Issue.groomingSummary,
+  // IssueLane.reason, the GitHub comment body). It does not truncate: field length
+  // limits stay the validator's, so a plan that is only too long is still rejected
+  // for length instead of being silently shortened. The parse-failure responses
+  // below keep echoing the model's own text verbatim because they are built from
+  // the raw content, not from this sanitized object. A field that is only
+  // control characters strips to empty and then fails its minimum, routing it
+  // to the repair turn rather than persisting garbage.
+  const judge = (rawAnswer: unknown): Attempt => {
+    const output = sanitizeModelJson(rawAnswer);
     const validation = validate(output);
     return { output, response: responseText(output), errors: validation.valid ? [] : (validation.errors ?? []), validation };
   };
