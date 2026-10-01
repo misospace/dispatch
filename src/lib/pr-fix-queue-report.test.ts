@@ -585,4 +585,31 @@ describe("resolvePrFixFromAgentReport", () => {
       expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
     }
   });
+
+  it("routes an already_addressed report to an unguarded FIXED settlement and records the evidence", async () => {
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FIXTURE_ITEM });
+    // Set the settlement write explicitly: an earlier test in this file leaves
+    // updateMany returning count 0 and clearAllMocks() does not reset it.
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+    fetchPullRequestMergeStateMock.mockResolvedValue({ mergeable: true, mergeableState: "clean" });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "already_addressed",
+      attempt: ATTEMPT,
+      evidence: "already addressed in commit f7f8c5a",
+    }));
+
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("fixed");
+    expect(result.reason).toContain("already_addressed");
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "FIXED" }) }),
+    );
+    const histCall = (prisma.prFixHistory.create as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(histCall?.data?.note ?? "").toContain("f7f8c5a");
+    expect(histCall?.data?.note ?? "").toContain("1121");
+    // The already_addressed settlement is gated on the PR merge state before
+    // it settles (a red PR is never marked FIXED off an unverified report).
+    expect(fetchPullRequestMergeStateMock).toHaveBeenCalledWith("acme/widgets", 1234);
+  });
 });
