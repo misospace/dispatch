@@ -28,9 +28,13 @@ import {
   isFreshnessTrackedStatus,
   parseDependencyKey,
   readRelatedWorkBaseline,
+  recheckNegativeSearches,
+  SEARCH_RECHECK_DEFER_LIMIT_MS,
+  SEARCH_RECHECK_INDEX_GRACE_MS,
   UNKNOWN_FRESHNESS,
   type GroomingFreshnessInput,
   type GroomingStaleReason,
+  type HeadDateResolution,
   type RelatedWorkBaselineEntry,
 } from "./freshness";
 
@@ -116,22 +120,6 @@ export const DEFAULT_FRESHNESS_BUDGET: FreshnessBudget = {
   maxSearchCodeRechecks: 20,
   commentWindow: 30,
 };
-
-/**
- * GitHub code search runs against an index that can lag the default branch.
- * A saved empty query only counts as "still absent" once the new head commit
- * is at least this old; younger heads defer the recheck to a later pass
- * (#1091). Failures and missing timestamps stay conservative instead.
- */
-export const SEARCH_RECHECK_INDEX_GRACE_MS = 30 * 60 * 1000;
-
-/**
- * How long a recheck may stay deferred because the code-search index has not
- * demonstrably caught up. Once the oldest unverified commit in base...head is
- * older than this, the deferral is bounded and the result goes stale
- * conservatively instead of starving forever in a busy repo (#1091 review).
- */
-export const SEARCH_RECHECK_DEFER_LIMIT_MS = 2 * 60 * 60 * 1000;
 
 export interface FreshnessPassResult {
   issuesChecked: number;
@@ -467,32 +455,25 @@ async function applyComparison(
   // "exhausted" (budget ran out) defers within the defer limit like every
   // other unverified case; "failed" (fetch errored / unusable date) is
   // conservative and stales.
-  let headCommittedAt: number | null = null;
-  let headDateState: "unresolved" | "ok" | "failed" | "exhausted" = "unresolved";
+  let headDateMemo: HeadDateResolution | null = null;
   const resolveHeadDate = async (
     fetchCommitDate: NonNullable<FreshnessGitHub["fetchCommitDate"]>,
-  ): Promise<{ at: number | null; state: "ok" | "failed" | "exhausted" }> => {
-    if (headDateState === "unresolved") {
-      if (remaining.searchCode <= 0) {
-        headDateState = "exhausted";
-      } else {
-        remaining.searchCode--;
-        result.githubCalls++;
-        try {
-          const date = await fetchCommitDate(repoFullName, head);
-          const parsed = date ? Date.parse(date) : Number.NaN;
-          if (Number.isNaN(parsed)) {
-            headDateState = "failed";
-          } else {
-            headCommittedAt = parsed;
-            headDateState = "ok";
-          }
-        } catch {
-          headDateState = "failed";
-        }
+  ): Promise<HeadDateResolution> => {
+    if (headDateMemo) return headDateMemo;
+    if (remaining.searchCode <= 0) {
+      headDateMemo = { state: "exhausted" };
+    } else {
+      remaining.searchCode--;
+      result.githubCalls++;
+      try {
+        const date = await fetchCommitDate(repoFullName, head);
+        const parsed = date ? Date.parse(date) : Number.NaN;
+        headDateMemo = Number.isNaN(parsed) ? { state: "failed" } : { state: "ok", at: parsed };
+      } catch {
+        headDateMemo = { state: "failed" };
       }
     }
-    return { at: headCommittedAt, state: headDateState };
+    return headDateMemo;
   };
 
   // A deferral is only safe while it is bounded: once the oldest unverified
@@ -521,59 +502,44 @@ async function applyComparison(
         stale(evaluation, "global_evidence_commit", `default branch moved ${range}; commit touched relied-on evidence paths: ${shown}`);
         continue;
       }
-      if (queries.length > 0 && github.searchCode && github.fetchCommitDate) {
-        const fetchCommitDate = github.fetchCommitDate;
-        const resolved = await resolveHeadDate(fetchCommitDate);
-        if (resolved.state === "ok" && resolved.at !== null) {
-          if (now().getTime() - resolved.at < SEARCH_RECHECK_INDEX_GRACE_MS) {
-            // The head is too recent for the code-search index to have caught
-            // up; an empty recheck now would not mean "still absent".
-            deferWithinBound(evaluation);
-            continue;
-          }
-          let matchedQuery: string | null = null;
-          let exhausted = false;
-          let failed = false;
-          for (const query of queries) {
-            if (remaining.searchCode <= 0) {
-              exhausted = true;
-              break;
-            }
-            remaining.searchCode--;
-            result.githubCalls++;
-            try {
-              if ((await github.searchCode(repoFullName, query, 1)).length > 0) {
-                matchedQuery = query;
-                break;
-              }
-            } catch {
-              failed = true;
-              break;
-            }
-          }
-          if (matchedQuery) {
-            stale(evaluation, "global_evidence_commit", `default branch moved ${range}; previously empty search query now matches: ${matchedQuery}`);
-            continue;
-          }
-          if (failed) {
-            stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
-            continue;
-          }
-          if (exhausted) {
-            // Out of budget, not evidence of change: leave unverified for a
-            // later pass, bounded by the defer limit like the young-head case.
-            deferWithinBound(evaluation);
-            continue;
-          }
+      const fetchCommitDate = github.fetchCommitDate;
+      // Re-run the saved empty queries against the new head and map the
+      // outcome back onto the same stale/advance/defer behaviour as before:
+      // a confirmed-absent recheck advances, a match or an unusable recheck
+      // stales, and a young head or an exhausted budget defers within the
+      // bound. Missing probes or empty saved queries are the conservative
+      // stale. (#1091)
+      const recheck = await recheckNegativeSearches({
+        repoFullName,
+        queries,
+        probe: github.searchCode && fetchCommitDate ? { searchCode: github.searchCode, fetchCommitDate } : null,
+        resolveHeadDate: () => resolveHeadDate(fetchCommitDate!),
+        trySpend: () => {
+          if (remaining.searchCode <= 0) return false;
+          remaining.searchCode--;
+          result.githubCalls++;
+          return true;
+        },
+        now,
+      });
+      switch (recheck.kind) {
+        case "confirmed_absent":
           evaluation.advance.groomingVerifiedSha = head;
-          continue;
-        }
-        if (resolved.state === "exhausted") {
+          break;
+        case "matched":
+          stale(evaluation, "global_evidence_commit", `default branch moved ${range}; previously empty search query now matches: ${recheck.query}`);
+          break;
+        case "recheck_failed":
+          stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
+          break;
+        case "head_too_recent":
+        case "budget_exhausted":
           deferWithinBound(evaluation);
-          continue;
-        }
+          break;
+        case "unavailable":
+          stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
+          break;
       }
-      stale(evaluation, "global_evidence_commit", `default branch moved ${range} and the result relied on repo-wide evidence`);
       continue;
     }
     const hits = intersectEvidencePaths(evaluation.issue.groomedEvidencePaths, comparison.files);
