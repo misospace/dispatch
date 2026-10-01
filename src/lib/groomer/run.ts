@@ -23,7 +23,8 @@ import type { RepositoryContextInput, RepositoryContextConfig } from "./reposito
 import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRecord } from "./history";
 import { explorationCallsForFreshness } from "./freshness";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
-import { compareCommits } from "@/lib/github-code-search";
+import { compareCommits, searchRepositoryCode } from "@/lib/github-code-search";
+import { fetchCommitDate } from "@/lib/github-ci";
 import { validateApplyPreconditions, type LiveComment, type PreconditionReader } from "./mutation-validator";
 import {
   applyGroomingMutations,
@@ -117,6 +118,10 @@ export interface GroomerDeps {
   releaseGroomerLock: typeof releaseGroomerLock;
   /** Apply-time head comparison (#1063); defaults to the GitHub compare API. */
   compareCommits?: typeof compareCommits;
+  /** Apply-time recheck of saved empty searches (#1116); defaults to the GitHub code search. */
+  searchCode?: typeof searchRepositoryCode;
+  /** Apply-time head-date read for the search-index grace window (#1116); defaults to the GitHub commits API. */
+  fetchCommitDate?: typeof fetchCommitDate;
   /** Plan application claims (#1063); defaults to GroomingApplication via `prisma`. */
   applicationStore?: ApplicationStore;
 }
@@ -716,6 +721,8 @@ async function executeGroomerRun(
           }),
         ),
       compareCommits: (base, head) => (deps.compareCommits ?? compareCommits)(candidate.repoFullName, base, head),
+      searchCode: (repo, query, limit) => (deps.searchCode ?? searchRepositoryCode)(repo, query, limit),
+      fetchCommitDate: (repo, sha) => (deps.fetchCommitDate ?? fetchCommitDate)(repo, sha),
     };
     const preconditions = await validateApplyPreconditions(
       {
@@ -725,6 +732,7 @@ async function executeGroomerRun(
         evidenceWindowStart,
         plan,
         repositoryQueries: repositoryContext.queries,
+        repositoryEmptyQueries: repositoryContext.emptyQueries,
         explorationRan: exploration !== null,
         explorationToolCalls: exploration ? explorationCallsForFreshness(exploration.toolCalls) : [],
       },

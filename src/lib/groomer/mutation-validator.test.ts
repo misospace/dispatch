@@ -120,6 +120,12 @@ function planFor(draft: GroomingPlanDraft, snap = snapshot()): GroomingPlan {
 }
 
 const WINDOW_START = new Date("2026-09-26T00:00:00.000Z");
+// Fixed clock for the search-index grace window tests (#1116).
+const NOW = new Date("2026-09-26T02:00:00.000Z");
+// 2h before NOW: older than the 30m index grace, so a recheck may run.
+const OLD_HEAD_DATE = "2026-09-26T00:00:00.000Z";
+// 15m before NOW: inside the 30m index grace, so the recheck defers.
+const YOUNG_HEAD_DATE = "2026-09-26T01:45:00.000Z";
 
 function input(overrides: Partial<PreconditionInput> = {}): PreconditionInput {
   return {
@@ -295,6 +301,84 @@ describe("validateApplyPreconditions", () => {
       );
       expect(check(result, "head")).toMatchObject({ status: "changed", detail: expect.stringContaining("repo-wide") });
       expect(compareCommits).not.toHaveBeenCalled();
+    });
+
+    // #1116: a global result whose negatives are saved can be re-verified
+    // against the moved head, agreeing with the freshness pass's recheck.
+    // The default snapshot reads src/auth/login.ts and the ready draft cites
+    // repo:src/auth/login.ts, so the evidence scope is "global" (the empty
+    // search) with a non-empty saved-query set and a consistent repository basis.
+    const globalSavedInput = () =>
+      input({
+        explorationToolCalls: [{ name: "search_code", ok: true, bytes: 0, arguments: { query: "nonexistent symbol" } }],
+        repositoryEmptyQueries: [],
+        now: () => NOW,
+      });
+
+    it("re-apply succeeds after the freshness pass advanced a saved empty search", async () => {
+      const compareCommits = vi.fn(async () => ({ ok: true as const, status: "ahead", files: ["README.md"], truncated: false }));
+      const result = await validateApplyPreconditions(
+        globalSavedInput(),
+        reader({
+          fresh: { headSha: NEW_HEAD },
+          compareCommits,
+          searchCode: vi.fn(async (): Promise<unknown[]> => []),
+          fetchCommitDate: vi.fn(async (): Promise<string | null> => OLD_HEAD_DATE),
+        }),
+      );
+      expect(check(result, "head").status).toBe("passed");
+      expect(check(result, "head").detail).toContain("re-checked saved empty searches");
+      expect(result.ok).toBe(true);
+      expect(compareCommits).toHaveBeenCalledWith(HEAD, NEW_HEAD);
+    });
+
+    it("head moved within the grace window then re-apply is stale", async () => {
+      const compareCommits = vi.fn(async () => ({ ok: true as const, status: "ahead", files: ["README.md"], truncated: false }));
+      const result = await validateApplyPreconditions(
+        globalSavedInput(),
+        reader({
+          fresh: { headSha: NEW_HEAD },
+          compareCommits,
+          searchCode: vi.fn(async (): Promise<unknown[]> => []),
+          fetchCommitDate: vi.fn(async (): Promise<string | null> => YOUNG_HEAD_DATE),
+        }),
+      );
+      expect(check(result, "head").status).toBe("changed");
+      expect(check(result, "head").detail).toContain("grace window");
+      expect(result.ok).toBe(false);
+      expect(compareCommits).toHaveBeenCalledWith(HEAD, NEW_HEAD);
+    });
+
+    it("goes stale when a move touches a relied-on read path even if saved searches stay empty", async () => {
+      const compareCommits = vi.fn(async () => ({ ok: true as const, status: "ahead", files: ["src/auth/login.ts"], truncated: false }));
+      const result = await validateApplyPreconditions(
+        globalSavedInput(),
+        reader({
+          fresh: { headSha: NEW_HEAD },
+          compareCommits,
+          searchCode: vi.fn(async (): Promise<unknown[]> => []),
+          fetchCommitDate: vi.fn(async (): Promise<string | null> => OLD_HEAD_DATE),
+        }),
+      );
+      expect(check(result, "head").status).toBe("changed");
+      expect(check(result, "head").detail).toContain("touched src/auth/login.ts");
+      expect(result.ok).toBe(false);
+    });
+
+    it("a saved empty search that now matches makes re-apply stale", async () => {
+      const compareCommits = vi.fn(async () => ({ ok: true as const, status: "ahead", files: ["README.md"], truncated: false }));
+      const result = await validateApplyPreconditions(
+        globalSavedInput(),
+        reader({
+          fresh: { headSha: NEW_HEAD },
+          compareCommits,
+          searchCode: vi.fn(async (): Promise<unknown[]> => [{ path: "src/new.ts" }]),
+          fetchCommitDate: vi.fn(async (): Promise<string | null> => OLD_HEAD_DATE),
+        }),
+      );
+      expect(check(result, "head").status).toBe("changed");
+      expect(check(result, "head").detail).toContain("nonexistent symbol");
+      expect(result.ok).toBe(false);
     });
 
     it("passes a move when the plan used no repository evidence", async () => {

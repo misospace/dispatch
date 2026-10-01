@@ -20,7 +20,10 @@ import {
   deriveEvidenceScope,
   hasNegativeSearchResult,
   intersectEvidencePaths,
+  recheckNegativeSearches,
+  savedNegativeSearchQueries,
   type ExplorationToolCallLike,
+  type NegativeSearchRecheckProbe,
 } from "./freshness";
 import { evaluateReadiness, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
@@ -90,6 +93,15 @@ export interface PreconditionReader {
   /** Most recent comments, newest first. */
   fetchRecentComments(max: number): Promise<LiveComment[]>;
   compareCommits(base: string, head: string): Promise<CommitComparison>;
+  /**
+   * Re-run a saved empty code-search query against the live head (#1116).
+   * Optional: a global result with saved queries falls back to the
+   * conservative stale-on-move behaviour when this (and `fetchCommitDate`)
+   * is absent, because the negative evidence cannot be re-confirmed.
+   */
+  searchCode?(repoFullName: string, query: string, limit: number): Promise<unknown[]>;
+  /** Read a commit's date for the search-index grace window (#1116). Optional, see `searchCode`. */
+  fetchCommitDate?(repoFullName: string, sha: string): Promise<string | null>;
 }
 
 /** Comments re-read before apply: new-human-comment check and marker dedupe. */
@@ -104,8 +116,12 @@ export interface PreconditionInput {
   plan: GroomingPlan;
   /** What the run consulted, so a head move is judged against the plan's evidence scope. */
   repositoryQueries: string[];
+  /** Repository-context searches that completed with zero results (#1115). */
+  repositoryEmptyQueries?: string[];
   explorationRan: boolean;
   explorationToolCalls: ExplorationToolCallLike[];
+  /** Clock for the search-index grace window; defaults to the real clock (#1116). */
+  now?: () => Date;
 }
 
 function errorMessage(err: unknown): string {
@@ -256,7 +272,22 @@ async function checkHead(
       liveHeadSha,
     };
   }
-  if (scope === "global") {
+  const savedQueries = savedNegativeSearchQueries({
+    explorationToolCalls: input.explorationToolCalls,
+    repositoryQueries: input.repositoryQueries,
+    repositoryEmptyQueries: input.repositoryEmptyQueries,
+    reliesOnSurfacedPath: reliance.reliesOnSurfacedPath,
+    repositoryPaths: reliance.repositoryPaths,
+  });
+  const probe: NegativeSearchRecheckProbe | null =
+    reader.searchCode && reader.fetchCommitDate
+      ? { searchCode: reader.searchCode, fetchCommitDate: reader.fetchCommitDate }
+      : null;
+  if (scope === "global" && (savedQueries.length === 0 || probe === null)) {
+    // No saved empty searches to re-run, or no way to re-run them: keep the
+    // conservative stale-on-move behaviour, and do not spend a compare
+    // (there is nothing to reconfirm against). This matches the pre-#1116
+    // behaviour and the case where the freshness pass could not recheck.
     return {
       check: { name: "head", status: "changed", detail: `head moved ${range} and the plan relies on repo-wide evidence` },
       liveHeadSha,
@@ -290,6 +321,52 @@ async function checkHead(
   if (hits.length > 0) {
     const shown = hits.slice(0, 5).join(", ") + (hits.length > 5 ? `, +${hits.length - 5} more` : "");
     return { check: { name: "head", status: "changed", detail: `head moved ${range} and touched ${shown}` }, liveHeadSha };
+  }
+  if (scope === "global") {
+    // A global result whose relied-on read paths the move did NOT touch: its
+    // saved empty searches decide, reusing the shared recheck so the apply-time
+    // precondition agrees with the freshness pass's applyComparison recheck
+    // (#1116). probe is non-null here: step 2 returned when it was null.
+    const recheck = await recheckNegativeSearches({
+      repoFullName: input.repoFullName,
+      queries: savedQueries,
+      probe: probe as NegativeSearchRecheckProbe,
+      resolveHeadDate: async () => {
+        try {
+          const at = await reader.fetchCommitDate!(input.repoFullName, liveHeadSha);
+          const parsed = at ? Date.parse(at) : Number.NaN;
+          return Number.isNaN(parsed) ? { state: "failed" as const } : { state: "ok" as const, at: parsed };
+        } catch {
+          return { state: "failed" as const };
+        }
+      },
+      trySpend: () => true,
+      now: input.now ?? (() => new Date()),
+    });
+    switch (recheck.kind) {
+      case "confirmed_absent":
+        return {
+          check: { name: "head", status: "passed", detail: `head moved ${range}; re-checked saved empty searches confirm the negative evidence` },
+          liveHeadSha,
+        };
+      case "matched":
+        return {
+          check: { name: "head", status: "changed", detail: `head moved ${range}; a previously empty search now matches: ${recheck.query}` },
+          liveHeadSha,
+        };
+      case "head_too_recent":
+        return {
+          check: { name: "head", status: "changed", detail: `head moved ${range} within the search-index grace window; negative evidence not re-confirmed` },
+          liveHeadSha,
+        };
+      case "recheck_failed":
+      case "budget_exhausted":
+      case "unavailable":
+        return {
+          check: { name: "head", status: "changed", detail: `head moved ${range} and the plan relies on repo-wide evidence` },
+          liveHeadSha,
+        };
+    }
   }
   return {
     check: { name: "head", status: "passed", detail: `head moved ${range} without touching the plan's evidence paths` },

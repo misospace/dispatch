@@ -57,6 +57,22 @@ export const MAX_BASELINE_SEARCH_CODE_QUERIES = 10;
 export const MAX_BASELINE_SEARCH_CODE_QUERY_CHARS = 200;
 
 /**
+ * GitHub code search runs against an index that can lag the default branch.
+ * A saved empty query only counts as "still absent" once the new head commit
+ * is at least this old; younger heads defer the recheck to a later pass
+ * (#1091). Failures and missing timestamps stay conservative instead.
+ */
+export const SEARCH_RECHECK_INDEX_GRACE_MS = 30 * 60 * 1000;
+
+/**
+ * How long a recheck may stay deferred because the code-search index has not
+ * demonstrably caught up. Once the oldest unverified commit in base...head is
+ * older than this, the deferral is bounded and the result goes stale
+ * conservatively instead of starving forever in a busy repo (#1091 review).
+ */
+export const SEARCH_RECHECK_DEFER_LIMIT_MS = 2 * 60 * 60 * 1000;
+
+/**
  * Statuses a worker owns. The freshness pass does not evaluate these (a claim
  * rewrites the status label, and that is not a grooming-relevant edit), and
  * the selector never re-grooms them.
@@ -174,6 +190,116 @@ function mergeEmptySearchQueries(sources: string[][]): string[] {
     queries.push(query);
   }
   return queries;
+}
+
+/**
+ * Saved negative (empty) search queries for a global result: the
+ * exploration-loop captures merged with the dispatcher's repository-context
+ * capture, under the same all-or-nothing bounds as emptySearchCodeQueries.
+ * The "scope is global" gate stays at the caller.
+ */
+export function savedNegativeSearchQueries(input: {
+  explorationToolCalls: ExplorationToolCallLike[];
+  repositoryQueries: string[];
+  repositoryEmptyQueries?: string[];
+  reliesOnSurfacedPath: boolean;
+  repositoryPaths: string[];
+}): string[] {
+  const explorationQueries = emptySearchCodeQueries(input.explorationToolCalls);
+  const repositoryQueries = repositoryContextEmptyQueries(input.repositoryEmptyQueries);
+  // A no-read-path global may recheck its negatives only when every
+  // repository-context search is accounted for: either none ran, or every
+  // derived search is known to have returned empty. A captured empty must be
+  // a member of the run's derived queries — counting alone would let a
+  // producer persist a query it never observed. Searches that hit, failed,
+  // or were never run keep the conservative stale-on-commit behaviour
+  // (#1115).
+  const repositoryNegativesObserved =
+    repositoryQueries !== null && repositoryQueries.every((query) => input.repositoryQueries.includes(query));
+  const repositoryNegativesAccountedFor =
+    repositoryNegativesObserved &&
+    (input.repositoryQueries.length === 0 || repositoryQueries.length === input.repositoryQueries.length);
+  const canRecheck =
+    explorationQueries !== null &&
+    repositoryNegativesObserved &&
+    !input.reliesOnSurfacedPath &&
+    (input.repositoryPaths.length > 0 ||
+      (repositoryNegativesAccountedFor &&
+        !input.explorationToolCalls.some((call) => call.name === "list_directory")));
+  return canRecheck ? mergeEmptySearchQueries([explorationQueries ?? [], repositoryQueries ?? []]) : [];
+}
+
+/**
+ * Minimal GitHub surface needed to recheck a saved set of empty code-search
+ * queries: re-run each query and read a commit's date. Kept structural so the
+ * recheck logic stays testable without a real client.
+ */
+export interface NegativeSearchRecheckProbe {
+  searchCode(repoFullName: string, query: string, limit: number): Promise<unknown[]>;
+  fetchCommitDate(repoFullName: string, sha: string): Promise<string | null>;
+}
+
+/**
+ * How a recheck resolved the new head's commit date:
+ * - "ok": the date was read and is usable.
+ * - "failed": the read threw or the date was missing/unparseable — the
+ *   recheck cannot confirm "still absent", so it stays conservative.
+ * - "exhausted": the search budget was spent before the date could be read.
+ */
+export type HeadDateResolution =
+  | { state: "ok"; at: number }
+  | { state: "failed" }
+  | { state: "exhausted" };
+
+/**
+ * The outcome of rechecking a saved set of empty code-search queries against
+ * a moved default branch. "matched" names the query that now returns results;
+ * the rest are reasons the recheck did not confirm "still absent" (and how
+ * the caller should treat them).
+ */
+export type NegativeSearchRecheck =
+  | { kind: "unavailable" }        // no saved queries or no probe capability
+  | { kind: "confirmed_absent" }   // every saved query still returns nothing
+  | { kind: "matched"; query: string }
+  | { kind: "recheck_failed" }     // a search threw or the head date was unusable ("failed")
+  | { kind: "head_too_recent" }    // head younger than the index grace window
+  | { kind: "budget_exhausted" };  // a budget spend was refused
+
+/**
+ * Re-run the saved empty code-search queries against the new head and decide
+ * whether the negative evidence still holds. This is the applyComparison
+ * recheck, factored out so the apply-time head precondition (#1116) shares the
+ * same rules. The head-date resolution and the per-query budget spend are
+ * injected so the caller controls both (one fetch per comparison group, one
+ * budget unit per search) and the logic stays testable.
+ */
+export async function recheckNegativeSearches(input: {
+  repoFullName: string;
+  queries: string[];
+  probe: NegativeSearchRecheckProbe | null | undefined;
+  resolveHeadDate: () => Promise<HeadDateResolution>;
+  trySpend: () => boolean;
+  now: () => Date;
+  graceMs?: number;
+}): Promise<NegativeSearchRecheck> {
+  if (!input.probe || input.queries.length === 0) return { kind: "unavailable" };
+  const probe = input.probe;
+  const resolved = await input.resolveHeadDate();
+  if (resolved.state === "exhausted") return { kind: "budget_exhausted" };
+  if (resolved.state !== "ok") return { kind: "recheck_failed" };
+  if (input.now().getTime() - resolved.at < (input.graceMs ?? SEARCH_RECHECK_INDEX_GRACE_MS)) {
+    return { kind: "head_too_recent" };
+  }
+  for (const query of input.queries) {
+    if (!input.trySpend()) return { kind: "budget_exhausted" };
+    try {
+      const results = await probe.searchCode(input.repoFullName, query, 1);
+      if (results.length > 0) return { kind: "matched", query };
+    } catch {
+      return { kind: "recheck_failed" };
+    }
+  }
+  return { kind: "confirmed_absent" };
 }
 
 /**
@@ -484,29 +610,6 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
   const dependencyKeys = dependencyKeysForIssue(body, input.repoFullName, input.issueNumber);
   const openKeys = dependencyKeys.length > 0 ? await input.resolveOpenKeys(dependencyKeys) : new Set<string>();
 
-  const explorationQueries = emptySearchCodeQueries(input.explorationToolCalls);
-  const repositoryQueries = repositoryContextEmptyQueries(input.repositoryEmptyQueries);
-  // A no-read-path global may recheck its negatives only when every
-  // repository-context search is accounted for: either none ran, or every
-  // derived search is known to have returned empty. A captured empty must be
-  // a member of the run's derived queries — counting alone would let a
-  // producer persist a query it never observed. Searches that hit, failed,
-  // or were never run keep the conservative stale-on-commit behaviour
-  // (#1115).
-  const repositoryNegativesObserved =
-    repositoryQueries !== null && repositoryQueries.every((query) => input.repositoryQueries.includes(query));
-  const repositoryNegativesAccountedFor =
-    repositoryNegativesObserved &&
-    (input.repositoryQueries.length === 0 || repositoryQueries.length === input.repositoryQueries.length);
-  const canRecheckNegativeEvidence =
-    scope === "global" &&
-    explorationQueries !== null &&
-    repositoryNegativesObserved &&
-    !reliance.reliesOnSurfacedPath &&
-    (reliance.repositoryPaths.length > 0 ||
-      (repositoryNegativesAccountedFor &&
-        !input.explorationToolCalls.some((call) => call.name === "list_directory")));
-
   return {
     groomedRunId: input.groomingRunId,
     groomedHeadSha: evidence.headSha,
@@ -520,7 +623,16 @@ export async function buildGroomingFreshnessBaseline(input: GroomingFreshnessInp
     // Negatives from both exploration and repository context are saved only
     // when each is fully accounted for; globals resting on a surfaced path or
     // unread accounting keep the conservative stale-on-commit behaviour.
-    groomedSearchCodeQueries: canRecheckNegativeEvidence ? mergeEmptySearchQueries([explorationQueries ?? [], repositoryQueries ?? []]) : [],
+    groomedSearchCodeQueries:
+      scope === "global"
+        ? savedNegativeSearchQueries({
+            explorationToolCalls: input.explorationToolCalls,
+            repositoryQueries: input.repositoryQueries,
+            repositoryEmptyQueries: input.repositoryEmptyQueries,
+            reliesOnSurfacedPath: reliance.reliesOnSurfacedPath,
+            repositoryPaths: reliance.repositoryPaths,
+          })
+        : [],
     groomedDependencyKeys: dependencyKeys,
     groomedOpenBlockerKeys: dependencyKeys.filter((key) => openKeys.has(key)).sort(),
     groomedRelatedWork: reliance.relatedWork,
