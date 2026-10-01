@@ -538,6 +538,7 @@ describe("bearer token tiers (#1111)", () => {
     ["POST", "/api/issues/groom"],
     ["POST", "/api/groomer/run"],
     ["DELETE", "/api/automation/repos/foo/bar"],
+    ["GET", "/api/automation/repos/foo/bar"],
     ["POST", "/api/issues/unassign"],
   ];
 

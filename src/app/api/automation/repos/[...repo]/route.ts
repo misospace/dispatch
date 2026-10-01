@@ -9,6 +9,11 @@ interface RouteContext {
 }
 
 export async function GET(request: Request, context: RouteContext) {
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) {
+    return authErrorResponse(auth);
+  }
+
   const { searchParams } = new URL(request.url);
   const queryRepo = searchParams.get("repo");
   const { repo: pathRepo } = await context.params;
