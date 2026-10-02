@@ -6,6 +6,7 @@ import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
 import { callGroomerLLM } from "./llm";
 import { runModelStage } from "./model-stage";
+import { sanitizeModelJson } from "./sanitize";
 import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
@@ -451,7 +452,11 @@ async function executeGroomerRun(
       await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
         stage: "explored",
         contextWarnings: [...contextWarnings, ...exploration.warnings],
-        contextSummary: {
+        // The exploration findings are model-authored (ask, files, notes and the
+        // recorded tool-call arguments) and are persisted here, before the plan
+        // stage, so they bypass model-stage sanitization: strip NUL and the other
+        // C0 controls on the way into the contextSummary jsonb (dispatch#1130).
+        contextSummary: sanitizeModelJson({
           commentCount: comments.length,
           repositorySources: repositoryContext.sources,
           repositoryQueries: repositoryContext.queries,
@@ -467,7 +472,7 @@ async function executeGroomerRun(
             bytes: exploration.bytes,
             toolCalls: exploration.toolCalls,
           },
-        },
+        }),
       });
       stage = "explored";
     }

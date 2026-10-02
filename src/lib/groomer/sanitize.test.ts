@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 
-import { MAX_STORED_TEXT_CHARS, neutralizeMentions, sanitizeForStorage, sanitizeJsonForStorage } from "./sanitize";
+import {
+  MAX_STORED_TEXT_CHARS,
+  neutralizeMentions,
+  sanitizeForStorage,
+  sanitizeJsonForStorage,
+  sanitizeModelJson,
+  sanitizeModelText,
+} from "./sanitize";
 
 describe("neutralizeMentions", () => {
   it("wraps a leading @-mention in backticks", () => {
@@ -71,6 +78,29 @@ describe("sanitizeForStorage (dispatch#1126)", () => {
     const clean = sanitizeJsonForStorage(raw);
     expect(clean).toEqual({ key: ["v", 1, null, { nested: "text\n" }], ok: true });
     expect(raw["k\u0000ey"][0]).toBe("v\u0000");
+    expect(JSON.stringify(clean)).not.toContain("\\u0000");
+  });
+});
+
+describe("sanitizeModelText / sanitizeModelJson (dispatch#1130)", () => {
+  it("strips NUL and C0 controls but keeps newlines and tabs", () => {
+    expect(sanitizeModelText("a\u0000b\u0001c\u0007d\u001Be\u001Ff\rg\nh\ti")).toBe("abcdefg\nh\ti");
+  });
+
+  it("does not truncate past MAX_STORED_TEXT_CHARS", () => {
+    const long = "x".repeat(MAX_STORED_TEXT_CHARS + 10);
+    const clean = sanitizeModelText(long);
+    expect(clean).toHaveLength(MAX_STORED_TEXT_CHARS + 10);
+    expect(clean.endsWith("\u2026")).toBe(false);
+  });
+
+  it("deep-cleans nested strings and keys on a copy without truncating", () => {
+    const long = "z".repeat(MAX_STORED_TEXT_CHARS + 10);
+    const raw = { "k\u0000ey": ["v\u0000", 1, null, { nested: "t\u0002ext\n" }], big: long };
+    const clean = sanitizeModelJson(raw) as typeof raw;
+    expect(clean).toEqual({ key: ["v", 1, null, { nested: "text\n" }], big: long });
+    expect(raw["k\u0000ey"][0]).toBe("v\u0000");
+    expect(clean.big).toHaveLength(MAX_STORED_TEXT_CHARS + 10);
     expect(JSON.stringify(clean)).not.toContain("\\u0000");
   });
 });

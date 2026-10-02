@@ -6,6 +6,7 @@ import {
 } from "./tools";
 import type { RelatedWorkObservation } from "./evidence-snapshot";
 import type { PinnedRead } from "./close-grounding";
+import { sanitizeModelJson, sanitizeModelText } from "./sanitize";
 
 export interface ExploreOptions {
   baseUrl: string;
@@ -126,15 +127,24 @@ interface ChatMessage {
 }
 
 function parseArguments(raw: unknown): Record<string, unknown> {
+  let value: Record<string, unknown>;
   if (typeof raw !== "string") {
-    return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    value = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  } else {
+    try {
+      const parsed = JSON.parse(raw);
+      value = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      value = {};
+    }
   }
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
+  // Tool-call arguments are model-authored. Strip NUL and the other C0 controls
+  // (keeping newline and tab) once, at this single ingestion point, before they
+  // are clamped, rendered into the prompt, recorded on the tool-call, or
+  // persisted (dispatch#1130): submitted findings, the recorded query behind the
+  // groomer's empty search_code evidence (Issue.groomedSearchCodeQueries, a
+  // Postgres text[] that rejects NUL), and related-work queries all descend here.
+  return sanitizeModelJson(value) as Record<string, unknown>;
 }
 
 const MAX_FILES = 20;
@@ -237,7 +247,7 @@ export async function exploreRepository(
       if (!response.ok) {
         const text = await response.text();
         warnings.push(
-          `repository exploration unavailable (${response.status}); grooming without it: ${text.slice(0, 200)}`,
+          `repository exploration unavailable (${response.status}); grooming without it: ${sanitizeModelText(text.slice(0, 200))}`,
         );
         break;
       }

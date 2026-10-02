@@ -68,19 +68,37 @@ function wrapMentions(run: string): string {
   });
 }
 /**
- * Model text on its way into Postgres (dispatch#1126). Postgres rejects
- * U+0000 in text and jsonb, so one NUL byte in a model answer would make the
- * GroomingRun write throw and turn a recoverable run into a database error.
- * Strips NUL and the other C0 control characters except \n and \t, and caps
- * the length. For what is stored or logged only: the repair turn echoes the
- * model's answer back verbatim.
+ * Model text on its way into Postgres (dispatch#1126, #1130). Postgres rejects
+ * U+0000 in text and jsonb, so a stray NUL in a model answer would make a write
+ * throw and turn a recoverable run into a database error.
+ *
+ * Two tiers share one control-strip (NUL and the C0 controls except \n and \t):
+ *   - sanitizeModelText / sanitizeModelJson strip only, never truncating: run on
+ *     the draft plan before validation so what is validated is what is stored
+ *     and applied, leaving field length to the validator.
+ *   - sanitizeForStorage / sanitizeJsonForStorage strip and cap length, for text
+ *     that is only stored or logged (raw output, errors, warnings), where the
+ *     model may send anything and no downstream validator bounds it.
+ * Neither rewrites what the model is shown on a repair: a parse failure hands
+ * the model its raw text back (see model-stage.ts) so it can fix the format.
  */
 export const MAX_STORED_TEXT_CHARS = 32_768;
 
-const STORAGE_UNSAFE_CONTROLS = /[\u0000-\u0008\u000B-\u001F]/g;
+const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F]/g;
+
+/**
+ * Strip NUL (U+0000) and the other C0 control characters except \n (U+000A)
+ * and \t (U+0009), without truncating (dispatch#1130). Applied to the draft
+ * plan as it leaves the model and before validation, so what is validated is
+ * what is stored and applied; length limits stay the validator's job, so this
+ * never caps length the way sanitizeForStorage does for stored/logged text.
+ */
+export function sanitizeModelText(text: string): string {
+  return text.replace(CONTROL_CHARS, "");
+}
 
 export function sanitizeForStorage(text: string, maxChars: number = MAX_STORED_TEXT_CHARS): string {
-  const clean = text.replace(STORAGE_UNSAFE_CONTROLS, "");
+  const clean = sanitizeModelText(text);
   return clean.length <= maxChars ? clean : `${clean.slice(0, maxChars - 1)}…`;
 }
 
@@ -91,6 +109,23 @@ export function sanitizeJsonForStorage(value: unknown): unknown {
   if (typeof value === "object" && value !== null) {
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [sanitizeForStorage(key), sanitizeJsonForStorage(item)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * `sanitizeModelText` applied to every string (and key) of a JSON value, on a
+ * copy, without truncating (dispatch#1130). The draft plan runs through this
+ * before validation so every downstream use — validated output, storage, the
+ * mutation applier's GitHub writes — sees the same control-free strings.
+ */
+export function sanitizeModelJson(value: unknown): unknown {
+  if (typeof value === "string") return sanitizeModelText(value);
+  if (Array.isArray(value)) return value.map(sanitizeModelJson);
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [sanitizeModelText(key), sanitizeModelJson(item)]),
     );
   }
   return value;

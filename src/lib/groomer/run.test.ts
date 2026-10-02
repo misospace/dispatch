@@ -267,6 +267,17 @@ const mockExploration: ExploreResult = {
   relatedWork: [],
 };
 
+// True if any string leaf (or key) of a value carries a NUL or other C0 control
+// character except newline/tab. Used to assert stored blobs are control-free
+// (JSON.stringify would escape them, so a serialized check proves nothing).
+function hasControlChars(value: unknown): boolean {
+  if (typeof value === "string") return /[\u0000-\u0008\u000B-\u001F]/.test(value);
+  if (Array.isArray(value)) return value.some(hasControlChars);
+  if (value && typeof value === "object")
+    return Object.entries(value).some(([k, v]) => /[\u0000-\u0008\u000B-\u001F]/.test(k) || hasControlChars(v));
+  return false;
+}
+
 describe("runHostedGroomer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -696,6 +707,78 @@ describe("runHostedGroomer", () => {
         }),
       }),
     );
+  });
+
+  it("strips NUL and C0 control characters from model text before any write (dispatch#1130)", async () => {
+    // A draft whose model-authored text carries NUL and other C0 controls must
+    // still validate and apply with those characters removed, so the stored
+    // validatedOutput, the issue's groomingSummary, the IssueLane reason and the
+    // GitHub comment body all carry the same control-free strings.
+    const CONTROL = /[\u0000-\u0008\u000B-\u001F]/;
+    mocks.callGroomerLLM.mockResolvedValue(
+      planDraft({
+        verdict: {
+          summary: "Ready\u0000 for\u0007 work.",
+          lane: { id: "local", confidence: "high", reason: "clear\u0000 implementation\u0001 task" },
+        },
+        mutations: { githubComment: "Fixed\u0000 already\u0007 on main." },
+      }),
+    );
+
+    await runHostedGroomer();
+
+    // validatedOutput: every GroomingRun write of the validated plan is control-free.
+    const withOutput = mocks.prisma.groomingRun.update.mock.calls.filter(
+      (call) => (call[0] as { data?: { validatedOutput?: unknown } })?.data?.validatedOutput !== undefined,
+    );
+    expect(withOutput.length).toBeGreaterThan(0);
+    for (const call of withOutput) {
+      const validated = (call[0] as { data: { validatedOutput: unknown } }).data.validatedOutput;
+      expect(hasControlChars(validated)).toBe(false);
+      const serialized = JSON.stringify(validated);
+      expect(serialized).toContain("Ready for work.");
+      expect(serialized).toContain("clear implementation task");
+    }
+
+    // The issue's groomingSummary.
+    expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ groomingSummary: "Ready for work." }) }),
+    );
+
+    // The IssueLane reason.
+    expect(mocks.prisma.issueLane.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ reason: "clear implementation task" }) }),
+    );
+
+    // The GitHub comment body (sanitized before neutralizeMentions + the marker).
+    expect(mocks.addIssueComment).toHaveBeenCalled();
+    const commentBody = mocks.addIssueComment.mock.calls.at(-1)![2] as string;
+    expect(commentBody).not.toMatch(CONTROL);
+    expect(commentBody).toContain("Fixed already on main.");
+  });
+
+  it("strips NUL and C0 controls from model-authored exploration findings before the contextSummary write (dispatch#1130)", async () => {
+    // Exploration runs before the model plan stage and persists the model's
+    // submit_findings (ask/files) and tool-call arguments into contextSummary;
+    // a NUL there must not reach the jsonb column either.
+    mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, toolLoopEnabled: true });
+    mocks.exploreRepository.mockResolvedValue({
+      ...mockExploration,
+      ask: "why\u0000 does login\u0007 drop the return URL?",
+      files: ["src/auth/login.ts\u0000"],
+      toolCalls: [{ name: "submit_findings", arguments: { notes: "already\u0001 seen" }, ok: true, bytes: 0, preview: "" }],
+    });
+
+    await runHostedGroomer();
+
+    const exploredCall = mocks.prisma.groomingRun.update.mock.calls.find(
+      (call) => call[0]?.data?.stage === "explored",
+    );
+    expect(exploredCall).toBeDefined();
+    const summary = exploredCall![0].data.contextSummary;
+    expect(hasControlChars(summary)).toBe(false);
+    expect(summary.exploration.ask).toBe("why does login drop the return URL?");
+    expect(summary.exploration.files).toEqual(["src/auth/login.ts"]);
   });
 
   it("write mode creates AgentRun row", async () => {
