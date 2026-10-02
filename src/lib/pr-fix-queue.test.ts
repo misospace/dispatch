@@ -102,6 +102,12 @@ function makeClient(): PrFixQueueClient & {
       },
       update: async ({ where, data }: any) => {
         const idx = items.findIndex((i) => i.id === where.id);
+        // mirror Prisma P2025 for a missing row (#1134 deleted-row coverage)
+        if (idx === -1) {
+          const err = new Error("An operation failed because it depends on one or more records that were required but not found. Record to update does not exist.");
+          (err as any).code = "P2025";
+          throw err;
+        }
         // Interpret Prisma atomic operations ({ increment }) like the real client.
         const patch: Record<string, any> = { ...data };
         for (const key of Object.keys(patch)) {
@@ -3069,5 +3075,33 @@ describe("enqueue post-dispatch append pinning (#1134)", () => {
     expect(after.postDispatchEvidenceKeys).toEqual([]);
     expect(after.status).toBe("QUEUED");
     expect(after.generation).toBe(1);
+  });
+
+  it("a row deleted mid-loop surfaces a P2025 from the fallback write (#1134)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 58, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    // Simulate next-task handing the attempt out.
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+    const historyRowsAfterSeed = client.history.length;
+
+    // The row is deleted inside the read→write gap, right before the pinned
+    // write: the pin no-ops, the in-transaction re-read finds nothing, the
+    // loop breaks, and the exhausted-loop fallback plain `update` must
+    // surface P2025 — exactly like the pre-#1134 path did for a deleted row.
+    client.hooks.beforeUpdateMany = () => {
+      client.items.length = 0;
+    };
+
+    await expect(enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 58, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#1134:58", headSha: "aaaa1111",
+    })).rejects.toMatchObject({ code: "P2025" });
+
+    // The row is gone and the failed attempt wrote nothing: no new
+    // `enqueue` history row beyond the seed's.
+    expect(client.items).toHaveLength(0);
+    expect(client.history).toHaveLength(historyRowsAfterSeed);
   });
 });
