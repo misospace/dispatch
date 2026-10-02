@@ -438,92 +438,111 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       // a workload reported success without pushing a fix. This is the safety
       // net for the case where markPrFixItem's head-SHA guard ran with
       // missing data or before this re-detection loop kicked in.
-      const isKnownEvidence =
-        !!input.evidenceKey && (existing.evidenceKeys ?? []).includes(input.evidenceKey);
-      const headShaUnchanged =
-        existing.status === "FIXED" &&
-        !!existing.headSha &&
-        typeof input.headSha === "string" &&
-        existing.headSha === input.headSha;
-      const reopenFixStale = isKnownEvidence && headShaUnchanged;
+      // buildUpdate: the per-snapshot decision + write payload. Everything the
+      // write and the history row depend on is derived from ONE row snapshot,
+      // so the #1134 pinned-write loop below can re-derive it from a fresh
+      // read instead of replaying a stale decision.
+      const buildUpdate = (snapshot: any) => {
+        // Evidence this item has already recorded must not move it back to
+        // QUEUED. The sync re-reads every open PR each sweep, so an event that
+        // never goes away — an undismissed CHANGES_REQUESTED review, a comment
+        // — otherwise resurrects the item after every resolution and dispatches
+        // a coder again 15 minutes later. Observed on misospace/pinchflat#25.
+        //
+        // The enqueue is still recorded in history: knowing the sync re-observed
+        // the evidence is useful, and it is the status flip that causes the
+        // churn. New evidence flows through normally.
+        //
+        // One exception (#940): a `FIXED` item whose PR head hasn't moved since
+        // enqueue must be reopened, because the FIXED tombstone is untrusted —
+        // a workload reported success without pushing a fix. This is the safety
+        // net for the case where markPrFixItem's head-SHA guard ran with
+        // missing data or before this re-detection loop kicked in.
+        const isKnownEvidence =
+          !!input.evidenceKey && (snapshot.evidenceKeys ?? []).includes(input.evidenceKey);
+        const headShaUnchanged =
+          snapshot.status === "FIXED" &&
+          !!snapshot.headSha &&
+          typeof input.headSha === "string" &&
+          snapshot.headSha === input.headSha;
+        const reopenFixStale = isKnownEvidence && headShaUnchanged;
 
-      // Terminal states are sticky. Once an item is STALE (its PR merged or
-      // closed) or IGNORED, re-observed evidence must NOT resurrect it to
-      // QUEUED — the only way back is an explicit requeue, which refuses
-      // merged/closed PRs. Without this the per-sync reap that stales a merged
-      // PR is immediately undone by the next fresh review/check event, looping
-      // a coder forever on a PR that no longer exists (#1000; observed on
-      // pr-reviewer-action #593/#595).
-      const isTerminalStatus = existing.status === "STALE" || existing.status === "IGNORED";
+        // Terminal states are sticky. Once an item is STALE (its PR merged or
+        // closed) or IGNORED, re-observed evidence must NOT resurrect it to
+        // QUEUED — the only way back is an explicit requeue, which refuses
+        // merged/closed PRs. Without this the per-sync reap that stales a
+        // merged PR is immediately undone by the next fresh review/check event,
+        // looping a coder forever on a PR that no longer exists (#1000;
+        // observed on pr-reviewer-action #593/#595).
+        const isTerminalStatus = snapshot.status === "STALE" || snapshot.status === "IGNORED";
 
-      const nextEvidenceKeys = uniqueAppend(existing.evidenceKeys ?? [], input.evidenceKey, 40);
+        const nextEvidenceKeys = uniqueAppend(snapshot.evidenceKeys ?? [], input.evidenceKey, 40);
 
-      let resolvedStatus: PrFixStatus;
-      let resolvedLane: PrFixLane = lane;
-      let statusNote: string | null = null;
-      if (isTerminalStatus) {
-        resolvedStatus = existing.status; // sticky — never resurrect a gone PR
-      } else if (reopenFixStale) {
-        resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
-      } else if (isKnownEvidence) {
-        resolvedStatus = existing.status; // #25 anti-churn: repeat evidence never flips status
-      } else {
-        resolvedStatus = nextStatus;
-      }
+        let resolvedStatus: PrFixStatus;
+        let resolvedLane: PrFixLane = lane;
+        let statusNote: string | null = null;
+        if (isTerminalStatus) {
+          resolvedStatus = snapshot.status; // sticky — never resurrect a gone PR
+        } else if (reopenFixStale) {
+          resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
+        } else if (isKnownEvidence) {
+          resolvedStatus = snapshot.status; // #25 anti-churn: repeat evidence never flips status
+        } else {
+          resolvedStatus = nextStatus;
+        }
 
-      // Bound the fix loop (#1001). Only a transition back to QUEUED opens a
-      // new attempt — more evidence on already-QUEUED work (the rest of one
-      // review's inline comments) is the same attempt and never counts
-      // (#1103). Past the cap, stop re-queuing and hand the PR to a human —
-      // otherwise a human CHANGES_REQUESTED that N automated fixes never
-      // satisfy loops forever.
-      const priorAttempts = existing.fixAttempts ?? 1;
-      if (
-        resolvedStatus === "QUEUED" &&
-        existing.status !== "QUEUED" &&
-        priorAttempts >= maxPrFixAttempts()
-      ) {
-        resolvedStatus = "BLOCKED";
-        resolvedLane = "NEEDS_HUMAN";
-        statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1001).`;
-      }
+        // Bound the fix loop (#1001). Only a transition back to QUEUED opens a
+        // new attempt — more evidence on already-QUEUED work (the rest of one
+        // review's inline comments) is the same attempt and never counts
+        // (#1103). Past the cap, stop re-queuing and hand the PR to a human —
+        // otherwise a human CHANGES_REQUESTED that N automated fixes never
+        // satisfy loops forever.
+        const priorAttempts = snapshot.fixAttempts ?? 1;
+        if (
+          resolvedStatus === "QUEUED" &&
+          snapshot.status !== "QUEUED" &&
+          priorAttempts >= maxPrFixAttempts()
+        ) {
+          resolvedStatus = "BLOCKED";
+          resolvedLane = "NEEDS_HUMAN";
+          statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1001).`;
+        }
 
-      // A transition from a non-QUEUED status back to QUEUED is a fresh
-      // dispatchable attempt — new work a worker should run — so the item's
-      // work-generation identity must change (#1044). Staying QUEUED (e.g.
-      // additional evidence on already-pending work) is the same attempt and
-      // must keep the identity stable.
-      const isFreshAttempt = resolvedStatus === "QUEUED" && existing.status !== "QUEUED";
+        // A transition from a non-QUEUED status back to QUEUED is a fresh
+        // dispatchable attempt — new work a worker should run — so the item's
+        // work-generation identity must change (#1044). Staying QUEUED (e.g.
+        // additional evidence on already-pending work) is the same attempt and
+        // must keep the identity stable.
+        const isFreshAttempt = resolvedStatus === "QUEUED" && snapshot.status !== "QUEUED";
 
-      // Evidence that arrives AFTER this generation was handed to a worker cannot
-      // reach the worker already running on it, so record it in
-      // postDispatchEvidenceKeys: settlement must open a fresh attempt instead
-      // of absorbing it into the in-flight one (#1119).
-      // Evidence arriving before hand-out (dispatchedGeneration !== generation, or
-      // never dispatched) still joins the same attempt, as before.
-      const dispatchedThisGeneration =
-        existing.dispatchedGeneration != null && existing.dispatchedGeneration === existing.generation;
-      const isPostDispatchNewEvidence =
-        !isTerminalStatus &&
-        !isKnownEvidence &&
-        existing.status === "QUEUED" &&
-        dispatchedThisGeneration;
+        // Evidence that arrives AFTER this generation was handed to a worker
+        // cannot reach the worker already running on it, so record it in
+        // postDispatchEvidenceKeys: settlement must open a fresh attempt
+        // instead of absorbing it into the in-flight one (#1119).
+        // Evidence arriving before hand-out (dispatchedGeneration !==
+        // generation, or never dispatched) still joins the same attempt, as
+        // before.
+        const dispatchedThisGeneration =
+          snapshot.dispatchedGeneration != null && snapshot.dispatchedGeneration === snapshot.generation;
+        const isPostDispatchNewEvidence =
+          !isTerminalStatus &&
+          !isKnownEvidence &&
+          snapshot.status === "QUEUED" &&
+          dispatchedThisGeneration;
 
-      const updated = await tx.prFixQueueItem.update({
-        where: { id: existing.id },
-        data: {
+        const data = {
           lane: resolvedLane,
           type,
           status: resolvedStatus,
           reason: input.reason,
-          feedback: uniqueAppend(existing.feedback ?? [], input.feedback, 12),
+          feedback: uniqueAppend(snapshot.feedback ?? [], input.feedback, 12),
           evidenceKeys: nextEvidenceKeys,
           // #1098: the item URL is identity — write-once. Backfill it only
-          // while empty; never overwrite an existing URL with a
-          // re-enqueue's value (e.g. a CI job URL). A stored CI job URL left
-          // by the pre-#1098 ingestion counts as empty, so it heals on the
-          // next enqueue instead of being frozen by the guard (#1118).
-          ...((!existing.url || isActionsRunUrl(existing.url)) && itemUrlFromInput(input)
+          // while empty; never overwrite an existing URL with a re-enqueue's
+          // value (e.g. a CI job URL). A stored CI job URL left by the
+          // pre-#1098 ingestion counts as empty, so it heals on the next
+          // enqueue instead of being frozen by the guard (#1118).
+          ...((!snapshot.url || isActionsRunUrl(snapshot.url)) && itemUrlFromInput(input)
             ? { url: itemUrlFromInput(input) }
             : {}),
           // A fresh attempt gets a fresh per-attempt head baseline (#1074):
@@ -534,20 +553,20 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
             ? {
                 ...freshAttemptGeneration(),
                 fixAttempts: { increment: 1 },
-                attemptHeadSha: input.headSha ?? existing.headSha ?? null,
+                attemptHeadSha: input.headSha ?? snapshot.headSha ?? null,
               }
             : {}),
           // Post-dispatch evidence (#1119): record the key that landed on a
           // dispatched QUEUED item, encoded with the enqueue's observed head
           // (or "unknown") so a check entry can be revalidated at settle time.
-// A fresh attempt resets the list. Mutually exclusive with
+          // A fresh attempt resets the list. Mutually exclusive with
           // isFreshAttempt (one requires QUEUED, the other not). Past 20
           // entries appendPostDispatchEvidenceEntry evicts the oldest
           // NON-actionable entry (review/comment entries survive eviction).
           ...(isPostDispatchNewEvidence
             ? {
                 postDispatchEvidenceKeys: appendPostDispatchEvidenceEntry(
-                  existing.postDispatchEvidenceKeys ?? [],
+                  snapshot.postDispatchEvidenceKeys ?? [],
                   encodePostDispatchEvidenceKey(input.evidenceKey, input.headSha),
                   20,
                 ),
@@ -559,8 +578,74 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           // (#1119, #1133).
           ...(isFreshAttempt ? { postDispatchEvidenceKeys: [], agentHandouts: [] } : {}),
           ...metadataPatch(input),
-        },
-      });
+        };
+
+        return {
+          data,
+          statusNote,
+          reopenFixStale,
+          isFreshAttempt,
+          isPostDispatchNewEvidence,
+          // #1134: the append above is computed from THIS snapshot's key list,
+          // so the write must be pinned on exactly that list. The
+          // isFreshAttempt reset-to-[] is mutually exclusive with the append
+          // and is deliberately NOT pinned.
+          pinnedKeys: isPostDispatchNewEvidence ? (snapshot.postDispatchEvidenceKeys ?? []) : null,
+        };
+      };
+
+      // #1134: a plain `update` computed from the read at the top of this
+      // branch would clobber a concurrent post-dispatch append that commits in
+      // the read→write gap — one entry escapes flagging. So when the write
+      // appends post-dispatch evidence, it is pinned on the exact
+      // `postDispatchEvidenceKeys` snapshot it read (mirroring markPrFixItem's
+      // settle-side pin): a concurrent append in the gap misses the pin, and a
+      // bounded in-transaction re-decide re-reads and re-derives EVERY decision
+      // (status/lane/attempts/postDispatch) from the fresh row instead of
+      // dropping the entry. No network call runs in this loop, so the #1124
+      // transaction-timeout hazard does not apply.
+      const maxEnqueueRedecides = 3;
+      let snapshot = existing;
+      let decided = buildUpdate(snapshot);
+      let updated: any;
+      if (decided.pinnedKeys !== null) {
+        let pinnedKeys: string[] = decided.pinnedKeys;
+        for (let i = 0; i < maxEnqueueRedecides; i += 1) {
+          const { count } = await tx.prFixQueueItem.updateMany({
+            where: { id: existing.id, postDispatchEvidenceKeys: { equals: pinnedKeys } },
+            data: decided.data,
+          });
+          if (count === 1) {
+            updated = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+            break;
+          }
+          // The pin missed: a concurrent append landed in the read→write gap (or
+          // the row was deleted). Re-read in-transaction and re-decide from the
+          // fresh snapshot — no decision is reused from the stale read.
+          const fresh = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+          if (!fresh) throw new Error("PR fix item disappeared during enqueue");
+          snapshot = fresh;
+          decided = buildUpdate(fresh);
+          // Pin the retry against the FRESH key list the new write was computed
+          // from, so a further gap append no-ops it the same way.
+          pinnedKeys = fresh.postDispatchEvidenceKeys ?? [];
+        }
+        if (updated === undefined) {
+          // The pin kept missing under sustained contention: fall back to ONE
+          // plain unpinned write from the last recomputed snapshot. This
+          // degrades to the pre-#1134 worst case (a concurrent entry in the
+          // final gap can still be clobbered) only when the gap loses 3 writes
+          // in a row; no network call runs in here, so the #1124
+          // transaction-timeout hazard does not apply.
+          await tx.prFixQueueItem.update({ where: { id: existing.id }, data: decided.data });
+          updated = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+        }
+      } else {
+        // No post-dispatch append: the write does not touch the key list, so it
+        // stays a plain update, exactly as before #1134.
+        updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data: decided.data });
+      }
+
       const historyData: Record<string, unknown> = {
         itemId: updated.id,
         action: "enqueue",
@@ -568,10 +653,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
         reason: input.reason,
         evidenceKey: input.evidenceKey,
       };
-      if (reopenFixStale) {
-        historyData.note = `Reopened: PR head SHA unchanged since FIXED (${existing.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
-      } else if (statusNote) {
-        historyData.note = statusNote;
+      if (decided.reopenFixStale) {
+        historyData.note = `Reopened: PR head SHA unchanged since FIXED (${snapshot.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
+      } else if (decided.statusNote) {
+        historyData.note = decided.statusNote;
       }
       await tx.prFixHistory.create({ data: historyData });
       return updated;

@@ -2950,3 +2950,124 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(reopened.postDispatchEvidenceKeys).toEqual([]);
   });
 });
+
+describe("enqueue post-dispatch append pinning (#1134)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixUnblocked.mockReset();
+    surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+  });
+
+  it("a concurrent append landing in the enqueue read→write gap is re-decided, not lost (#1134)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 55, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    // Simulate next-task handing the attempt out.
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // A concurrent enqueue's entry commits right before the pinned write —
+    // i.e. inside the read→write gap the keys pin is meant to catch — so the
+    // { equals: [] } predicate no-ops and the re-decision loop must re-read.
+    client.hooks.beforeUpdateMany = () => {
+      const row = client.items[0];
+      row.postDispatchEvidenceKeys = [
+        ...(row.postDispatchEvidenceKeys ?? []),
+        "review:2@CONCURRENT",
+      ];
+    };
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 55, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#1134:5", headSha: "aaaa1111",
+    });
+
+    // The pin missed exactly once: the in-transaction re-read re-decided from
+    // the fresh row and the retry pinned the FRESH key list, so the
+    // concurrent entry is kept (concurrent first, the new entry last) and
+    // nothing was clobbered.
+    expect(after.postDispatchEvidenceKeys).toEqual([
+      "review:2@CONCURRENT",
+      "check_run:org/repo#1134:5@aaaa1111",
+    ]);
+    // Same attempt: a post-dispatch append never opens a fresh attempt.
+    expect(after.status).toBe("QUEUED");
+    expect(after.generation).toBe(1);
+    expect(after.evidenceKeys).toEqual(["review:1", "check_run:org/repo#1134:5"]);
+  });
+
+  it("sustained contention on the enqueue append still records the enqueue (#1134 fallback)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 56, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // Concurrent evidence keeps landing on EVERY pinned write — more times
+    // than the bounded re-decision loop permits — so every keys-pinned
+    // append write no-ops. The enqueue must still mutate the row.
+    let landCount = 0;
+    client.hooks.beforeUpdateManyEvery = () => {
+      landCount += 1;
+      const row = client.items[0];
+      row.postDispatchEvidenceKeys = [
+        ...(row.postDispatchEvidenceKeys ?? []),
+        `check_run:org/repo#56:${landCount}@unknown`,
+      ];
+    };
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 56, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "check_run:org/repo#56:71", headSha: "H1",
+    });
+
+    // All 3 pinned attempts lost the race (one landing per attempt). The
+    // unpinned fallback is a plain `update` — no updateMany hook — so its
+    // exhaustion is exactly these 3 lands (unlike the mark flow, whose
+    // forced fallback is itself a pinned updateMany and lands a 4th+).
+    expect(landCount).toBe(3);
+    // The enqueue is never dropped: the fallback write recorded it.
+    const item = client.items[0];
+    expect(after.status).toBe("QUEUED");
+    expect(item.evidenceKeys).toContain("check_run:org/repo#56:71");
+    // Every gap entry that landed AND the new one are all present.
+    expect(item.postDispatchEvidenceKeys).toEqual([
+      "check_run:org/repo#56:1@unknown",
+      "check_run:org/repo#56:2@unknown",
+      "check_run:org/repo#56:3@unknown",
+      "check_run:org/repo#56:71@H1",
+    ]);
+  });
+
+  it("non-append enqueue writes are unchanged by the pin (#1134 guard)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 57, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    client.items[0].dispatchedGeneration = client.items[0].generation;
+
+    // A known-evidence re-observation takes the plain-update path: no
+    // updateMany may fire at all, and the post-dispatch key list is
+    // untouched, exactly as before #1134.
+    let updateManyFired = false;
+    client.hooks.beforeUpdateMany = () => {
+      updateManyFired = true;
+    };
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 57, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+
+    expect(updateManyFired).toBe(false);
+    expect(after.postDispatchEvidenceKeys).toEqual([]);
+    expect(after.status).toBe("QUEUED");
+    expect(after.generation).toBe(1);
+  });
+});
