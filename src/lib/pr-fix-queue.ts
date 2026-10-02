@@ -421,23 +421,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
   let previousStatus: PrFixStatus | undefined;
   const item = await client.$transaction(async (tx) => {
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
+    // Deliberately the FIRST-read status: the #1134 pinned loop may re-decide
+    // from fresher snapshots, and the post-transaction BLOCKED-surfacing
+    // comparison keeps its pre-#1134 meaning.
     previousStatus = existing?.status;
     if (existing) {
-      // Evidence this item has already recorded must not move it back to QUEUED.
-      // The sync re-reads every open PR each sweep, so an event that never goes
-      // away — an undismissed CHANGES_REQUESTED review, a comment — otherwise
-      // resurrects the item after every resolution and dispatches a coder again
-      // 15 minutes later. Observed on misospace/pinchflat#25.
-      //
-      // The enqueue is still recorded in history: knowing the sync re-observed
-      // the evidence is useful, and it is the status flip that causes the churn.
-      // New evidence flows through normally.
-      //
-      // One exception (#940): a `FIXED` item whose PR head hasn't moved since
-      // enqueue must be reopened, because the FIXED tombstone is untrusted —
-      // a workload reported success without pushing a fix. This is the safety
-      // net for the case where markPrFixItem's head-SHA guard ran with
-      // missing data or before this re-detection loop kicked in.
       // buildUpdate: the per-snapshot decision + write payload. Everything the
       // write and the history row depend on is derived from ONE row snapshot,
       // so the #1134 pinned-write loop below can re-derive it from a fresh
@@ -584,8 +572,6 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           data,
           statusNote,
           reopenFixStale,
-          isFreshAttempt,
-          isPostDispatchNewEvidence,
           // #1134: the append above is computed from THIS snapshot's key list,
           // so the write must be pinned on exactly that list. The
           // isFreshAttempt reset-to-[] is mutually exclusive with the append
@@ -604,13 +590,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
       // (status/lane/attempts/postDispatch) from the fresh row instead of
       // dropping the entry. No network call runs in this loop, so the #1124
       // transaction-timeout hazard does not apply.
-      const maxEnqueueRedecides = 3;
+      const maxPinnedEnqueueWrites = 3;
       let snapshot = existing;
       let decided = buildUpdate(snapshot);
       let updated: any;
       if (decided.pinnedKeys !== null) {
         let pinnedKeys: string[] = decided.pinnedKeys;
-        for (let i = 0; i < maxEnqueueRedecides; i += 1) {
+        for (let i = 0; i < maxPinnedEnqueueWrites; i += 1) {
           const { count } = await tx.prFixQueueItem.updateMany({
             where: { id: existing.id, postDispatchEvidenceKeys: { equals: pinnedKeys } },
             data: decided.data,
@@ -623,7 +609,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           // the row was deleted). Re-read in-transaction and re-decide from the
           // fresh snapshot — no decision is reused from the stale read.
           const fresh = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
-          if (!fresh) throw new Error("PR fix item disappeared during enqueue");
+          // Row deleted mid-loop: stop re-deciding; the exhausted-loop fallback
+          // below runs its plain `update`, which surfaces Prisma's P2025 exactly
+          // like the pre-#1134 path did for a deleted row.
+          if (!fresh) break;
           snapshot = fresh;
           decided = buildUpdate(fresh);
           // Pin the retry against the FRESH key list the new write was computed
@@ -631,12 +620,14 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueueP
           pinnedKeys = fresh.postDispatchEvidenceKeys ?? [];
         }
         if (updated === undefined) {
-          // The pin kept missing under sustained contention: fall back to ONE
-          // plain unpinned write from the last recomputed snapshot. This
-          // degrades to the pre-#1134 worst case (a concurrent entry in the
-          // final gap can still be clobbered) only when the gap loses 3 writes
-          // in a row; no network call runs in here, so the #1124
-          // transaction-timeout hazard does not apply.
+          // The pin kept missing under sustained contention, or the row was
+          // deleted mid-loop (then this plain `update` throws P2025, as the
+          // pre-#1134 path did). Otherwise: fall back to ONE plain unpinned
+          // write from the last recomputed snapshot. This degrades to the
+          // pre-#1134 worst case (a concurrent entry in the final gap can
+          // still be clobbered) only when the gap loses 3 writes in a row; no
+          // network call runs in here, so the #1124 transaction-timeout hazard
+          // does not apply.
           await tx.prFixQueueItem.update({ where: { id: existing.id }, data: decided.data });
           updated = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
         }
