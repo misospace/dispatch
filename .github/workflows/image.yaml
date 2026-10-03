@@ -210,9 +210,9 @@ jobs:
             # Advisory chain from SECURITY-ACCEPTED-RISKS (#1166):
             # eslint-config-next -> @next/eslint-plugin-next -> fast-glob ->
             # micromatch -> braces. Scan one nesting level too -- a duplicate
-            # can hide under a host package.
+            # can hide under a host package, scoped hosts included.
             for pkg in eslint eslint-config-next @next/eslint-plugin-next fast-glob micromatch braces; do
-              for dir in "node_modules/$pkg" node_modules/*/node_modules/"$pkg"; do
+              for dir in "node_modules/$pkg" node_modules/*/node_modules/"$pkg" node_modules/@*/*/node_modules/"$pkg"; do
                 if [ -e "$dir" ]; then
                   echo "dev dependency present in MCP image: $dir"
                   rc=1

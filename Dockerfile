@@ -19,6 +19,9 @@ RUN npm ci --omit=dev
 FROM base AS mcp-deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
+# Do not COPY .npmrc into this stage: the repo .npmrc sets include=dev,
+# which overrides --omit=dev and would re-admit the dev tree (#1166 proved
+# the override; the CI assert would catch it, but fail at build here).
 RUN npm ci --omit=dev
 # Both direct npm install shapes are unusable here: installing "tsx@range"
 # without --omit=dev reifies the whole tree and reinstalls every devDependency,
@@ -30,7 +33,7 @@ RUN npm ci --omit=dev
 # dev-flagged stragglers this lock leaks into --omit=dev (typescript et al.);
 # the "Assert MCP image ships no dev toolchain" step in .github/workflows/
 # image.yaml is the guard if npm's behavior drifts.
-RUN node -e 'const f="./package.json",p=require(f);p.dependencies.tsx=p.devDependencies.tsx;delete p.devDependencies;require("fs").writeFileSync(f,JSON.stringify(p,null,2))' \
+RUN node -e 'const f="./package.json",p=require(f);const range=p.devDependencies&&p.devDependencies.tsx;if(!range)throw new Error("tsx missing from devDependencies (#1173)");p.dependencies.tsx=range;delete p.devDependencies;require("fs").writeFileSync(f,JSON.stringify(p,null,2)+"\n")' \
     && npm install --no-save --no-audit --no-fund
 
 FROM base AS builder
