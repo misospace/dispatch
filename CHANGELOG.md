@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.5.68](https://github.com/misospace/dispatch/compare/v0.5.67...v0.5.68) (2026-10-03)
+
+
+### Features
+
+* **deps:** update dependency @modelcontextprotocol/sdk (1.31.0 → 1.32.0) ([#1160](https://github.com/misospace/dispatch/issues/1160)) ([05039a6](https://github.com/misospace/dispatch/commit/05039a6f119cedd240d479f22e72921cb78e54a3))
+* **deps:** update dependency eslint (10.11.0 → 10.12.0) ([#1161](https://github.com/misospace/dispatch/issues/1161)) ([ba8217f](https://github.com/misospace/dispatch/commit/ba8217faa880ef4f6e2455132d21bde9e789a1ff))
+* **deps:** update dependency lucide-react (1.48.0 → 1.49.0) ([#1139](https://github.com/misospace/dispatch/issues/1139)) ([278135c](https://github.com/misospace/dispatch/commit/278135cf2e23ece1e8051d714c27818bdd22c48f))
+* **deps:** update dependency lucide-react (1.49.0 → 1.50.0) ([#1159](https://github.com/misospace/dispatch/issues/1159)) ([049cf41](https://github.com/misospace/dispatch/commit/049cf4116bc5d88d66bae4778f97bcc50dde28b2))
+* **pr-fix:** accept an explicit already_addressed settlement without a push ([#1142](https://github.com/misospace/dispatch/issues/1142)) ([889e451](https://github.com/misospace/dispatch/commit/889e4513da5c43e7c575e337dd496e2cd4664610))
+
+
+### Bug Fixes
+
+* **auth:** guard GET /api/automation/repos/[...repo] with authorizeRequest ([#1151](https://github.com/misospace/dispatch/issues/1151)) ([6a9c552](https://github.com/misospace/dispatch/commit/6a9c552a1cab5f563406f89adf112c848fe74c4c))
+* **deps:** update dependency @types/node (24.19.0 → 24.19.1) ([#1155](https://github.com/misospace/dispatch/issues/1155)) ([b593d4f](https://github.com/misospace/dispatch/commit/b593d4f356e557f11c1c011d0d250113c91e1eeb))
+* **deps:** update nextjs monorepo (16.3.6 → 16.3.7) ([#1136](https://github.com/misospace/dispatch/issues/1136)) ([edc1afb](https://github.com/misospace/dispatch/commit/edc1afbe6eaab4db302c028dfc388b44608d9e73))
+* **deps:** update nextjs monorepo (16.3.7 → 16.3.8) ([#1146](https://github.com/misospace/dispatch/issues/1146)) ([d6d4db3](https://github.com/misospace/dispatch/commit/d6d4db34dfbbf9b0b30984de9fdfa4e2851e3fa4))
+* **deps:** update vitest monorepo (5.0.2 → 5.0.3) ([#1144](https://github.com/misospace/dispatch/issues/1144)) ([e1e657e](https://github.com/misospace/dispatch/commit/e1e657e695b1c1e3ce56dfd1b08c03d285f72151))
+* **groomer:** align apply-time head precondition with search-rechecked freshness ([#1153](https://github.com/misospace/dispatch/issues/1153)) ([ba5f607](https://github.com/misospace/dispatch/commit/ba5f607f52709eb2dab0a38d5c95ce7619ec56b1)), closes [#1116](https://github.com/misospace/dispatch/issues/1116)
+* **groomer:** capture repository-context empty searches in the freshness baseline ([#1138](https://github.com/misospace/dispatch/issues/1138)) ([f22dae4](https://github.com/misospace/dispatch/commit/f22dae468a590a4db1132c21c169c94eb3a22796))
+* **groomer:** sanitize provider error text before it reaches GroomingRun.errorMessage ([#1157](https://github.com/misospace/dispatch/issues/1157)) ([#1163](https://github.com/misospace/dispatch/issues/1163)) ([34f0162](https://github.com/misospace/dispatch/commit/34f016231ed849dbce001582598db22577b80e1a))
+* **groomer:** strip NUL and C0 control chars from model text before validation and persistence ([#1156](https://github.com/misospace/dispatch/issues/1156)) ([05db272](https://github.com/misospace/dispatch/commit/05db272ad2bdf161ee13364ae90e1c312f02ab82))
+* **pr-fix-queue:** pin enqueue post-dispatch append to its keys snapshot ([#1134](https://github.com/misospace/dispatch/issues/1134)) ([#1158](https://github.com/misospace/dispatch/issues/1158)) ([c9dd382](https://github.com/misospace/dispatch/commit/c9dd3826b0d685d0ec3aa8c27c02453ff30a4741))
+
+
+### Chores
+
+* **ai-review:** upgrade reviewer to v3.2.0 ([#1165](https://github.com/misospace/dispatch/issues/1165)) ([b0863de](https://github.com/misospace/dispatch/commit/b0863de9a4d2fec17fc5d38110955d7df69d818c))
+
 ## [0.5.67](https://github.com/misospace/dispatch/compare/v0.5.66...v0.5.67) (2026-09-29)
 
 
