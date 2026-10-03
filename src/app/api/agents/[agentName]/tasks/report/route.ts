@@ -32,6 +32,11 @@ export interface TaskReportBody {
   error?: string;
   // #1121: evidence string (commit SHAs / paths) carried by an already_addressed report; recorded in settlement history.
   evidence?: string;
+  // #1120: worker-reported task start time (ISO 8601). Accepted only when
+  // parseable, not in the future, and within 24h of the report; otherwise
+  // omitted and the report time is used. It participates in the idempotency
+  // payload hash like the other fields.
+  startedAt?: string;
   // The (id, generation) attempt token next-task issued on this followup-pr
   // task, echoed back by the worker (#1074). Required for PR-fix queue
   // settlement; part of the report's payload identity (idempotency hash).
@@ -42,6 +47,30 @@ function deriveStatus(outcome: ValidOutcome): string {
   if (outcome === "failed") return "failed";
   if (outcome === "blocked") return "blocked";
   return "completed";
+}
+
+// #1120: optional worker-reported start time. Accepted only when it is a
+// string that parses to a real date, is not in the future, and is no more
+// than MAX_STARTED_AT_AGE_MS before the report; anything else silently falls
+// back to the report time so a clock-skewed or bogus value can never produce
+// a negative or absurd duration.
+const MAX_STARTED_AT_AGE_MS = 24 * 60 * 60 * 1000;
+
+// Require a full ISO 8601 timestamp with timezone (Z or ±HH:MM), e.g.
+// 2026-10-03T04:20:58Z or 2026-10-03T04:20:58.123456+00:00 (Python isoformat).
+// Date-only, bare-year, and locale-ambiguous strings are malformed → fallback.
+const ISO_8601_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+function resolveReportedStartedAt(rawStartedAt: unknown, now: Date): string | undefined {
+  if (typeof rawStartedAt !== "string") return undefined;
+  if (!ISO_8601_TIMESTAMP_PATTERN.test(rawStartedAt)) return undefined;
+  const parsed = new Date(rawStartedAt);
+  const time = parsed.getTime();
+  if (Number.isNaN(time)) return undefined;
+  if (time > now.getTime()) return undefined;
+  if (now.getTime() - time > MAX_STARTED_AT_AGE_MS) return undefined;
+  return parsed.toISOString();
 }
 
 async function resolveIssueId(
@@ -207,6 +236,10 @@ export async function POST(
         }
       : undefined;
 
+  // #1120: computed once before the report so the same instant is used for
+  // startedAt validation and finishedAt.
+  const now = new Date();
+
   const report: TaskReportBody = {
     taskType: taskType as ValidTaskType,
     outcome: outcome as ValidOutcome,
@@ -217,6 +250,8 @@ export async function POST(
     summary: raw.summary as string | undefined,
     error: raw.error as string | undefined,
     evidence,
+    // #1120: normalized worker start time; undefined → report time (now).
+    startedAt: resolveReportedStartedAt(raw.startedAt, now),
     prFixItem,
   };
 
@@ -228,12 +263,12 @@ export async function POST(
     const touchedIssueUrls = buildTouchedUrls(report);
 
     // Persist AgentRun
-    const now = new Date();
     const runData = {
       agentName,
       runType: report.taskType,
       status: deriveStatus(report.outcome),
-      startedAt: now,
+      // #1120: worker-reported start time when valid, else the report time.
+      startedAt: report.startedAt ? new Date(report.startedAt) : now,
       finishedAt: now,
       summary: report.summary,
       errorMessage: report.error,
@@ -251,7 +286,10 @@ export async function POST(
       // concurrent or retried report with the same (agentName, idempotencyKey)
       // loses the unique-index race (P2002) and replays the stored result
       // instead of re-running the report or its side effects.
-      const payloadHash = reportPayloadHash(report);
+      // #1120/#1044: hash the RAW body value, not the time-validated one, so an
+      // identical-body retry keeps the same payload identity even when
+      // startedAt's acceptance flips across the 24h boundary between attempts.
+      const payloadHash = reportPayloadHash({ ...report, startedAt: raw.startedAt as string | undefined });
       try {
         run = await prisma.$transaction(async (tx) => {
           const claim = await tx.agentReportDedupe.create({
