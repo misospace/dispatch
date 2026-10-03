@@ -1,6 +1,6 @@
 # Accepted Security Risks
 
-**Last updated: 2026-08-15**
+**Last updated: 2026-10-03**
 
 There are currently no accepted npm runtime advisories.
 
@@ -60,3 +60,4 @@ The following previously accepted risks have been retired:
 |---|---|---|
 | Trivy action pinned to SHA | ✅ Resolved | `aquasecurity/trivy-action@ed142fd` (v0.36.0). The SHA pin is intentional: trivy is the release gate, so a floating tag must not reach a release build. Renovate's `github-tags` datasource cannot resolve a bare SHA pin (it only produced a `no-result` lookup failure on the dashboard), so the action is excluded from Renovate in `renovate.json` (`matchPackageNames: ["aquasecurity/trivy-action"]`, `enabled: false`) and is bumped manually, with the version comment, after reviewing an upstream release. |
 | `.npmrc` invalid omit config | ✅ Resolved | Fixed `omit=` → `omit=dev` |
+| Dev-only advisory chain `eslint-config-next` -> `@next/eslint-plugin-next` -> `fast-glob` -> `micromatch` -> `braces` (GHSA-vfj7-8cjw-p6xm) | ✅ Resolved (image scope) | #1173: the `-mcp` image is now built from a production-only install plus a tsx layer, so the chain ships in no published image. It remains in dev installs only; `.github/workflows/image.yaml` asserts its absence from the `-mcp` image on every build. |

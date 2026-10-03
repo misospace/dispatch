@@ -190,3 +190,42 @@ jobs:
             | docker run --rm -i --env DISPATCH_URL=http://localhost --env DISPATCH_AGENT_TOKEN=ci "$IMAGE" \
             | tee /dev/stderr \
             | grep -q '"serverInfo"'
+
+      # #1173 regression guard: the MCP image must carry only the production
+      # closure plus tsx. The dev toolchain and its accepted dev-only advisory
+      # chain (eslint-config-next -> @next/eslint-plugin-next -> fast-glob ->
+      # micromatch -> braces, GHSA-vfj7-8cjw-p6xm) must never ship in it again.
+      - name: Assert MCP image ships no dev toolchain
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          IMAGE="$(printf '%s\n' "$TAGS" | head -n1)"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            docker pull "$IMAGE"
+          fi
+          echo "Asserting no dev toolchain in image: $IMAGE"
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            rc=0
+            # Advisory chain from SECURITY-ACCEPTED-RISKS (#1166):
+            # eslint-config-next -> @next/eslint-plugin-next -> fast-glob ->
+            # micromatch -> braces. Scan one nesting level too -- a duplicate
+            # can hide under a host package.
+            for pkg in eslint eslint-config-next @next/eslint-plugin-next fast-glob micromatch braces; do
+              for dir in "node_modules/$pkg" node_modules/*/node_modules/"$pkg"; do
+                if [ -e "$dir" ]; then
+                  echo "dev dependency present in MCP image: $dir"
+                  rc=1
+                fi
+              done
+            done
+            # Broader dev-tool smoke list, hoisted top level only (nested
+            # duplicates of these can be legitimate transitive prod content).
+            for pkg in vitest typescript ts-node; do
+              if [ -e "node_modules/$pkg" ]; then
+                echo "dev dependency present in MCP image: node_modules/$pkg"
+                rc=1
+              fi
+            done
+            exit "$rc"
+          '
