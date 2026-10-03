@@ -319,9 +319,10 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<unknown> 
 
     if (!response.ok) {
       const text = await response.text();
-      // The provider's error body becomes the run's errorMessage, and Postgres
-      // rejects NUL/C0 controls in text; strip them (sanitizeModelText, no
-      // length cap — length is not a DB constraint).
+      // This body lands verbatim in the run's errorMessage columns; Postgres
+      // rejects NUL in text and repo policy strips the other C0 controls, so
+      // sanitize at the source (#1157 names the strip tier; the columns are
+      // unbounded text, so no length cap).
       throw new Error(`LLM API error ${response.status}: ${sanitizeModelText(text)}`);
     }
 

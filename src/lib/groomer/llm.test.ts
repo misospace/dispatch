@@ -95,7 +95,7 @@ describe("callGroomerLLM", () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 404,
-      text: async () => "provider exploded\u0000\u0001\u001F",
+      text: async () => "provider exploded\u0000\n\u0001\t\u001F",
     });
 
     const err = await callGroomerLLM({
@@ -107,7 +107,7 @@ describe("callGroomerLLM", () => {
     }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toBe("LLM API error 404: provider exploded");
+    expect((err as Error).message).toBe("LLM API error 404: provider exploded\n\t");
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
