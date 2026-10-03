@@ -3,7 +3,7 @@ import { STATUS_LABELS, PRIORITY_LABELS } from "@/types";
 import { buildGroomerSystemPrompt } from "./prompts/system-prompt";
 import { buildGroomingPlanResponseSchema } from "./plan-schema";
 import { renderEvidenceCatalog, type EvidenceCatalog } from "./plan-evidence";
-import { sanitizeForStorage } from "./sanitize";
+import { sanitizeForStorage, sanitizeModelText } from "./sanitize";
 
 export interface CallLlmOptions {
   baseUrl: string;
@@ -319,7 +319,11 @@ export async function callGroomerLLM(options: CallLlmOptions): Promise<unknown> 
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`LLM API error ${response.status}: ${text}`);
+      // This body lands verbatim in the run's errorMessage columns; Postgres
+      // rejects NUL in text and repo policy strips the other C0 controls, so
+      // sanitize at the source (#1157 names the strip tier; the columns are
+      // unbounded text, so no length cap).
+      throw new Error(`LLM API error ${response.status}: ${sanitizeModelText(text)}`);
     }
 
     const data = await response.json();
