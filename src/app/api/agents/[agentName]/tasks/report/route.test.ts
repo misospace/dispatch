@@ -945,6 +945,50 @@ describe("POST /api/agents/[agentName]/tasks/report — startedAt (#1120)", () =
     expect(call.startedAt.getTime()).toBe(startInstant.getTime());
   });
 
+  it("accepts a non-zero UTC offset (+05:30) and stores the normalized UTC instant", async () => {
+    const startInstant = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    // Same instant rendered in a +05:30 zone: shift the UTC clock by the
+    // offset and tag the reading with it.
+    const shifted = new Date(startInstant.getTime() + 5.5 * 60 * 60 * 1000);
+    const startedAt = shifted.toISOString().replace("Z", "+05:30");
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt).toBeInstanceOf(Date);
+    // Proves TZ conversion, not just acceptance: the stored instant equals
+    // the UTC reading, not the +05:30 clock reading.
+    expect(call.startedAt.toISOString()).toBe(startInstant.toISOString());
+  });
+
+  it("accepts a startedAt exactly 24h old (24h bound is inclusive)", async () => {
+    const T0 = new Date("2026-10-03T12:00:00Z").getTime();
+    const startedAtIso = new Date(T0 - 24 * 60 * 60 * 1000).toISOString();
+
+    vi.useFakeTimers({ now: T0 });
+    try {
+      const res = await postRequest({
+        taskType: "implement",
+        outcome: "pr_opened",
+        startedAt: startedAtIso,
+      });
+
+      expect(res.status).toBe(200);
+      const call = mockAgentRun.create.mock.calls[0][0].data;
+      expect(call.startedAt).toBeInstanceOf(Date);
+      expect(call.startedAt.getTime()).toBe(T0 - 24 * 60 * 60 * 1000);
+      // Accepted: the run kept the worker-reported start, not the report
+      // time (a fallback would collapse startedAt onto finishedAt).
+      expect(call.startedAt.getTime()).not.toBe(call.finishedAt.getTime());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("an identical-body retry keeps the same payload hash across the 24h boundary (duplicate, not 409)", async () => {
     const T0 = new Date("2026-10-03T12:00:00Z").getTime();
     const startedAtIso = new Date(T0 - 23 * 60 * 60 * 1000).toISOString();

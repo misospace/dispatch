@@ -126,8 +126,10 @@ function canonicalJson(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
 }
 
-function reportPayloadHash(report: TaskReportBody): string {
-  return createHash("sha256").update(canonicalJson(report)).digest("hex");
+function reportPayloadHash(
+  payload: Omit<TaskReportBody, "startedAt"> & { startedAt?: unknown },
+): string {
+  return createHash("sha256").update(canonicalJson(payload)).digest("hex");
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -289,7 +291,7 @@ export async function POST(
       // #1120/#1044: hash the RAW body value, not the time-validated one, so an
       // identical-body retry keeps the same payload identity even when
       // startedAt's acceptance flips across the 24h boundary between attempts.
-      const payloadHash = reportPayloadHash({ ...report, startedAt: raw.startedAt as string | undefined });
+      const payloadHash = reportPayloadHash({ ...report, startedAt: raw.startedAt });
       try {
         run = await prisma.$transaction(async (tx) => {
           const claim = await tx.agentReportDedupe.create({
