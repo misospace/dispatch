@@ -14,4 +14,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-node
       - run: npm ci
+      # Blocking gate: production + optional dependencies only (#1166). The
+      # .npmrc include=dev would otherwise cancel --omit=dev, so the script
+      # passes an explicit --include=prod; see the "//".audit note in package.json.
       - run: npm run audit
+      # Non-blocking visibility: dev-inclusive audit so dev-only advisories
+      # (e.g. GHSA-vfj7-8cjw-p6xm in the lint chain) stay reported without
+      # turning main red again.
+      - name: npm audit (dev dependencies, informational)
+        continue-on-error: true
+        run: npm audit --include=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
