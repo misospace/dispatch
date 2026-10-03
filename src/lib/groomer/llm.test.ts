@@ -89,6 +89,28 @@ describe("callGroomerLLM", () => {
     ).rejects.toThrow(/500/);
   });
 
+  it("strips NUL/C0 control chars from provider error bodies before they reach the Error message (dispatch#1157)", async () => {
+    // 404 is not retryable and not the 400 fallback trigger, so exactly one
+    // fetch and no backoff sleep.
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: async () => "provider exploded\u0000\u0001\u001F",
+    });
+
+    const err = await callGroomerLLM({
+      baseUrl: "https://llm.example.com",
+      apiKey: "sk-test",
+      model: "gpt-4o-mini",
+      prompt: "test",
+      timeoutMs: 10000,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("LLM API error 404: provider exploded");
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("throws on invalid JSON in response", async () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
