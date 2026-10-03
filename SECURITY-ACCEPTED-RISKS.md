@@ -1,10 +1,10 @@
 # Accepted Security Risks
 
-**Last updated: 2026-08-15**
+**Last updated: 2026-10-03**
 
 There are currently no accepted npm runtime advisories.
 
-`npm audit --omit=dev` reports **0 vulnerabilities** across 17 production dependencies.
+`npm run audit` (`npm audit --omit=dev --include=optional`, plus fetch-retry flags; see Previous Resolution History for why `--include=optional` is required) reports **0 vulnerabilities** across 17 production dependencies.
 
 ## Non-NPM Risks
 
@@ -29,7 +29,7 @@ The following risks are tracked beyond npm advisories:
 
 - The project uses 17 production dependencies with transitive chains managed by npm.
 - Key deep-chain dependencies: `next` (framework), `@modelcontextprotocol/sdk` (MCP protocol), `prisma` / `@prisma/client` (ORM).
-- **Mitigation:** Renovate keeps dependencies updated; `npm audit --omit=dev --audit-level=high` runs on every push to `main` and every pull request via `.github/workflows/security-audit.yaml` (separate from the main CI workflow) and fails the build on high/critical vulnerabilities.
+- **Mitigation:** Renovate keeps dependencies updated; `npm run audit` (`npm audit --omit=dev --include=optional --audit-level=high`) runs on every push to `main` and every pull request via `.github/workflows/security-audit.yaml` (separate from the main CI workflow) and fails the build on high/critical vulnerabilities.
 
 ### Groomer Autonomous Issue Rewrites (accepted risk)
 
@@ -60,3 +60,4 @@ The following previously accepted risks have been retired:
 |---|---|---|
 | Trivy action pinned to SHA | ✅ Resolved | `aquasecurity/trivy-action@ed142fd` (v0.36.0). The SHA pin is intentional: trivy is the release gate, so a floating tag must not reach a release build. Renovate's `github-tags` datasource cannot resolve a bare SHA pin (it only produced a `no-result` lookup failure on the dashboard), so the action is excluded from Renovate in `renovate.json` (`matchPackageNames: ["aquasecurity/trivy-action"]`, `enabled: false`) and is bumped manually, with the version comment, after reviewing an upstream release. |
 | `.npmrc` invalid omit config | ✅ Resolved | Fixed `omit=` → `omit=dev` |
+| `.npmrc` `include=dev` neutralized `npm audit --omit=dev` (CI Security Audit red, #1162) | ✅ Resolved | `scripts.audit` now passes `--include=optional`, replacing the project-level include list on the CLI so the audit covers prod + optional deps only. The `braces *` advisory (GHSA-vfj7-8cjw-p6xm) is dev-only (`eslint-config-next` chain), has no patched version, and is intentionally out of scope for the production audit. Do NOT revert `.npmrc` to `omit=`: npm 11 flags the empty value with an invalid-config warning on every command. |
