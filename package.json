@@ -9,7 +9,7 @@
     "dev": "next dev",
     "build": "NODE_ENV=production next build",
     "start": "next start",
-    "audit": "npm audit --omit=dev --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000",
+    "audit": "npm audit --omit=dev --include=optional --audit-level=high --fetch-retries=5 --fetch-timeout=120000 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000",
     "lint": "NODE_ENV=development eslint .",
     "test": "NODE_ENV=development vitest run",
     "test:watch": "NODE_ENV=development vitest",
@@ -63,7 +63,8 @@
     "vitest": "^5.0.0"
   },
   "//": {
-    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory), sharp ^0.35.0 (libvips CVE-2026-33327/33328/35590/35591, #675 — already satisfied transitively by next@16.3.0's optional dep `sharp: ^0.35.3`, but the override survives any future `next` downgrade), deepmerge-ts ^8.0.0 (GHSA-ggr8-5vv4-36mx stack-exhaustion — pulled in by @prisma/config <=6.13.0-dev.1 and the transitive prisma <=7.10.0-integration-fix-prisma-publish-token.1, #761), mysql2 ^3.22.0 (GHSA-3f6p-5ww8-9rcr plaintext-credential leak via mysql_clear_password auth-plugin downgrade — pulled in by the transitive prisma >=6.20.0-dev.1 / <=7.10.0, #897). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block."
+    "overrides": "These pins exist to remediate npm advisories (originally added in #350). DO NOT remove without verifying the originating transitive deps have shipped patched versions: postcss ^8.5.10 (XSS-class advisory), sharp ^0.35.0 (libvips CVE-2026-33327/33328/35590/35591, #675 — already satisfied transitively by next@16.3.0's optional dep `sharp: ^0.35.3`, but the override survives any future `next` downgrade), deepmerge-ts ^8.0.0 (GHSA-ggr8-5vv4-36mx stack-exhaustion — pulled in by @prisma/config <=6.13.0-dev.1 and the transitive prisma <=7.10.0-integration-fix-prisma-publish-token.1, #761), mysql2 ^3.22.0 (GHSA-3f6p-5ww8-9rcr plaintext-credential leak via mysql_clear_password auth-plugin downgrade — pulled in by the transitive prisma >=6.20.0-dev.1 / <=7.10.0, #897). npm validates every entry of `overrides` strictly, so this rationale lives at the top level rather than inside the `overrides` block.",
+    "audit": "The --include=optional flag exists because .npmrc sets include=dev (so npm ci installs devDependencies even when a developer's global npm config omits them), and npm gives include=dev precedence over --omit=dev even on the command line. Without this flag, npm run audit evaluated the dev tree and failed on the dev-only, unfixable braces * advisory GHSA-vfj7-8cjw-p6xm (eslint-config-next -> @next/eslint-plugin-next -> fast-glob -> micromatch -> braces, issue #1162). Passing --include=optional on the CLI replaces the project-level include list, restoring a prod+optional-only audit with no invalid-config warnings."
   },
   "overrides": {
     "postcss": "^8.5.10",
