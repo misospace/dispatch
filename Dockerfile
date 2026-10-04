@@ -30,10 +30,11 @@ RUN npm ci --omit=dev
 # dependencies, drop devDependencies; the range is still read from
 # devDependencies so Renovate stays the source of truth) and let a plain
 # --no-save install add only tsx + esbuild. The install pass also prunes
-# dev-flagged stragglers this lock leaks into --omit=dev (typescript et al.);
+# stragglers this lock reifies even under --omit=dev (typescript et al.:
+# dev:false in the lock via optional-peer refs);
 # the "Assert MCP image ships no dev toolchain" step in .github/workflows/
 # image.yaml is the guard if npm's behavior drifts.
-RUN node -e 'const f="./package.json",p=require(f);const range=p.devDependencies&&p.devDependencies.tsx;if(!range)throw new Error("tsx missing from devDependencies (#1173)");p.dependencies.tsx=range;delete p.devDependencies;require("fs").writeFileSync(f,JSON.stringify(p,null,2)+"\n")' \
+RUN node -e 'const f="./package.json",p=require(f);const range=p.devDependencies&&p.devDependencies.tsx;if(!range)throw new Error("tsx missing from devDependencies (#1173)");p.dependencies=p.dependencies||{};p.dependencies.tsx=range;delete p.devDependencies;require("fs").writeFileSync(f,JSON.stringify(p,null,2)+"\n")' \
     && npm install --no-save --no-audit --no-fund
 
 FROM base AS builder

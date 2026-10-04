@@ -107,6 +107,14 @@ describe("Dockerfile MCP image wiring", () => {
     expect(mcpDeps).toContain("npm ci --omit=dev");
     expect(
       mcpDeps,
+      "mcp-deps must add tsx via the layer-local manifest rewrite (reads the range from devDependencies)",
+    ).toContain("devDependencies.tsx");
+    expect(
+      mcpDeps,
+      "mcp-deps must install the tsx layer with --no-save (no manifest/lock writes)",
+    ).toContain("npm install --no-save");
+    expect(
+      mcpDeps,
       "mcp-deps stage must not set ENV DATABASE_URL (belt for issue #533)",
     ).not.toMatch(/^ENV\s+DATABASE_URL\b/m);
   });
