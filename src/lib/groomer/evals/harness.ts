@@ -113,8 +113,12 @@ function openTrackedIssues(c: GroomingCase, args: unknown) {
 /** GroomingApplication rows (#1063); share one between runs to exercise replay. */
 export type ApplicationRows = Map<string, Record<string, unknown> & { applicationKey: string }>;
 
+/** GroomingChildClaim rows (#1066); share one between runs to exercise child-creation idempotency. */
+export type ChildClaimRows = Map<string, Record<string, unknown> & { childKey: string }>;
+
 export interface RunCandidateOptions {
   applications?: ApplicationRows;
+  childClaims?: ChildClaimRows;
   /** Distinguishes GroomingRun ids when one case is run more than once. */
   runId?: string;
 }
@@ -168,6 +172,7 @@ export async function runCandidate(
   };
 
   const applications: ApplicationRows = options.applications ?? new Map();
+  const childClaims: ChildClaimRows = options.childClaims ?? new Map();
   const runId = options.runId ?? `run-${c.id}`;
   const prisma = {
     automationRepo: { findUnique: async () => ({ id: "repo-1", fullName: c.repoFullName, enabled: true }) },
@@ -208,6 +213,24 @@ export async function runCandidate(
         if (where.attempts !== undefined && Number(row.attempts) !== where.attempts) return { count: 0 };
         row.attempts = Number(row.attempts) + 1;
         return { count: 1 };
+      },
+    },
+    // Child-issue creation claims (#1066), in memory for this run.
+    groomingChildClaim: {
+      findUnique: async ({ where }: { where: { childKey: string } }) => childClaims.get(where.childKey) ?? null,
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        const key = String(data.childKey);
+        // The unique childKey, as Postgres enforces it.
+        if (childClaims.has(key)) throw Object.assign(new Error("Unique constraint failed on childKey"), { code: "P2002" });
+        // A created row has no childNumber/childUrl until the creation is recorded.
+        const row = { ...structuredClone(data), childKey: key, childNumber: null, childUrl: null };
+        childClaims.set(key, row);
+        return row;
+      },
+      update: async ({ where, data }: { where: { childKey: string }; data: Record<string, unknown> }) => {
+        const row = childClaims.get(where.childKey)!;
+        Object.assign(row, structuredClone(data));
+        return row;
       },
     },
   };

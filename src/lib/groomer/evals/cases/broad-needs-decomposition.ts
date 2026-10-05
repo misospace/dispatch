@@ -74,5 +74,5 @@ export const broadNeedsDecomposition: GroomingCase = {
       },
     },
   ],
-  pending: [{ name: "accepted child briefs are created once, idempotently", on: "#1066" }],
+  expectsChildCreation: true,
 };

@@ -194,6 +194,26 @@ describe("grooming corpus", () => {
         });
       }
 
+      if (c.expectsChildCreation) {
+        it("creates accepted child briefs once, idempotently (dispatch#1066)", async () => {
+          const candidate = c.candidates.find(
+            (x) =>
+              x.expect.accepted === true &&
+              (x.output as GroomingPlanDraft)?.decomposition?.required === true &&
+              (((x.output as GroomingPlanDraft)?.decomposition?.childBriefs.length ?? 0) > 0),
+          );
+          expect(candidate, `[${c.id}] no accepted decomposing candidate to check child creation`).toBeTruthy();
+          const briefCount = (candidate!.output as GroomingPlanDraft).decomposition.childBriefs.length;
+          const applications = new Map();
+          const childClaims = new Map();
+          const first = await runCandidate(c, candidate!, { applications, childClaims, runId: "run-1" });
+          const second = await runCandidate(c, candidate!, { applications, childClaims, runId: "run-2" });
+          expect(first.writes.children, `[${c.id}] first run should create one child per brief`).toHaveLength(briefCount);
+          expect(second.writes.children, `[${c.id}] replay should create no new child`).toHaveLength(0);
+          expect(childClaims.size, `[${c.id}] one child claim per brief`).toBe(briefCount);
+        });
+      }
+
       for (const pending of c.pending ?? []) {
         it.todo(`${pending.name} [pending ${pending.on}]`);
       }
