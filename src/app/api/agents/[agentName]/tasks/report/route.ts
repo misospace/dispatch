@@ -56,7 +56,7 @@ function deriveStatus(outcome: ValidOutcome): string {
 // a negative or absurd duration.
 const MAX_STARTED_AT_AGE_MS = 24 * 60 * 60 * 1000;
 
-// Require a full ISO 8601 timestamp with timezone (Z or ±HH:MM), e.g.
+// Require an extended ISO 8601 timestamp with timezone (Z or ±HH:MM), e.g.
 // 2026-10-03T04:20:58Z or 2026-10-03T04:20:58.123456+00:00 (Python isoformat).
 // Date-only, bare-year, and locale-ambiguous strings are malformed → fallback.
 const ISO_8601_TIMESTAMP_PATTERN =
