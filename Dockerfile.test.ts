@@ -81,3 +81,41 @@ describe("Dockerfile builder stage DATABASE_URL", () => {
     }
   });
 });
+
+/**
+ * Regression tests for issue #1173: the MCP image must be assembled from the
+ * production-only mcp-deps tree, never from the dev-inclusive `deps` stage,
+ * and mcp-deps itself must stay a production-only install.
+ */
+describe("Dockerfile MCP image wiring", () => {
+  it("ships the MCP image from the production-only mcp-deps tree", () => {
+    const stages = splitIntoStages(readDockerfile());
+    const mcp = stages.get("mcp");
+    expect(mcp, "expected a `mcp` stage in the Dockerfile").toBeDefined();
+    expect(mcp).toContain("COPY --from=mcp-deps /app/node_modules ./node_modules");
+    expect(mcp).toContain("COPY --from=mcp-deps /app/package.json ./package.json");
+    expect(
+      mcp,
+      "mcp stage must not copy from the dev-inclusive deps stage",
+    ).not.toContain("COPY --from=deps ");
+  });
+
+  it("installs mcp-deps without dev dependencies", () => {
+    const stages = splitIntoStages(readDockerfile());
+    const mcpDeps = stages.get("mcp-deps");
+    expect(mcpDeps, "expected an `mcp-deps` stage in the Dockerfile").toBeDefined();
+    expect(mcpDeps).toContain("npm ci --omit=dev");
+    expect(
+      mcpDeps,
+      "mcp-deps must add tsx via the layer-local manifest rewrite (reads the range from devDependencies)",
+    ).toContain("devDependencies.tsx");
+    expect(
+      mcpDeps,
+      "mcp-deps must install the tsx layer with --no-save (no manifest/lock writes)",
+    ).toContain("npm install --no-save");
+    expect(
+      mcpDeps,
+      "mcp-deps stage must not set ENV DATABASE_URL (belt for issue #533)",
+    ).not.toMatch(/^ENV\s+DATABASE_URL\b/m);
+  });
+});
