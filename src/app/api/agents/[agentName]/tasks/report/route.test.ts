@@ -730,6 +730,314 @@ describe("POST /api/agents/[agentName]/tasks/report — AgentRun persistence", (
   });
 });
 
+describe("POST /api/agents/[agentName]/tasks/report — startedAt (#1120)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  it("stores a valid worker-reported startedAt as the run start (duration > 0)", async () => {
+    const startInstant = new Date(Date.now() - 60 * 60 * 1000);
+    const startedAtIso = startInstant.toISOString();
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: startedAtIso,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt).toBeInstanceOf(Date);
+    expect(call.startedAt.getTime()).toBe(startInstant.getTime());
+    expect(call.finishedAt).toBeInstanceOf(Date);
+    expect(call.finishedAt.getTime()).toBeGreaterThanOrEqual(call.startedAt.getTime());
+    expect(call.finishedAt.getTime() - call.startedAt.getTime()).toBeGreaterThan(0);
+  });
+
+  it("falls back to the report time when startedAt is missing (startedAt ≈ finishedAt)", async () => {
+    const before = Date.now();
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+    });
+    const after = Date.now();
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt).toBeInstanceOf(Date);
+    expect(call.finishedAt).toBeInstanceOf(Date);
+    // Same instant: both collapse to the report time.
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+    expect(call.finishedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(call.finishedAt.getTime()).toBeLessThanOrEqual(after);
+  });
+
+  it("falls back to the report time when startedAt is a malformed string", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: "not-a-date",
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+  });
+
+  it("falls back to the report time when startedAt is a number (no 400)", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: 123,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+  });
+
+  it("falls back to the report time when startedAt is an object (no 400)", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: {},
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+  });
+
+  it("falls back to the report time when startedAt is an empty string", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: "",
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+  });
+
+  it("falls back to the report time when startedAt is in the future", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+  });
+
+  it("falls back to the report time when startedAt is older than 24h", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(call.finishedAt.getTime());
+  });
+
+  it("accepts a startedAt ~23h old (24h bound is not over-eager)", async () => {
+    const startInstant = new Date(Date.now() - 23 * 60 * 60 * 1000);
+    const startedAtIso = startInstant.toISOString();
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: startedAtIso,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt.getTime()).toBe(startInstant.getTime());
+    expect(call.finishedAt.getTime() - call.startedAt.getTime()).toBeGreaterThan(0);
+  });
+
+  it("echoes the normalized startedAt in the response for a valid value", async () => {
+    const startInstant = new Date(Date.now() - 60 * 60 * 1000);
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: startInstant.toISOString(),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.report.startedAt).toBe(startInstant.toISOString());
+  });
+
+  it("omits startedAt from the response when the value is invalid", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: "not-a-date",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.report.startedAt).toBeUndefined();
+  });
+
+  it("reports differing only by startedAt hash to distinct idempotency payload hashes", async () => {
+    const base = {
+      taskType: "implement",
+      outcome: "pr_opened",
+      idempotencyKey: "worker-run-1:report",
+    };
+    const first = await postRequest({
+      ...base,
+      startedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    });
+    const second = await postRequest({
+      ...base,
+      startedAt: new Date(Date.now() - 120 * 60 * 60 * 1000).toISOString(),
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(mockDedupe.create).toHaveBeenCalledTimes(2);
+    const hashA = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+    const hashB = mockDedupe.create.mock.calls[1][0].data.payloadHash;
+    expect(hashA).not.toBe(hashB);
+  });
+
+  it("falls back to the report time for malformed formats (bare-year, date-only, locale string)", async () => {
+    const malformedFormats = ["2026", "2026-10-02", "10/02/2026 12:00"];
+
+    for (const startedAt of malformedFormats) {
+      const res = await postRequest({
+        taskType: "implement",
+        outcome: "pr_opened",
+        startedAt,
+      });
+
+      expect(res.status).toBe(200);
+      const call = mockAgentRun.create.mock.calls.at(-1)![0].data;
+      expect(call.startedAt).toBeInstanceOf(Date);
+      expect(call.finishedAt).toBeInstanceOf(Date);
+      // Malformed → collapsed to the report time: within ~2s of finishedAt.
+      expect(Math.abs(call.startedAt.getTime() - call.finishedAt.getTime())).toBeLessThan(2000);
+      // And the response must not echo the malformed value.
+      const body = await res.json();
+      expect(body.report.startedAt).toBeUndefined();
+    }
+  });
+
+  it("accepts a python-isoformat offset (+00:00) as a valid startedAt", async () => {
+    const startInstant = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const pythonIso = startInstant.toISOString().replace("Z", "+00:00");
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt: pythonIso,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt).toBeInstanceOf(Date);
+    expect(call.startedAt.getTime()).toBe(startInstant.getTime());
+  });
+
+  it("accepts a non-zero UTC offset (+05:30) and stores the normalized UTC instant", async () => {
+    const startInstant = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    // Same instant rendered in a +05:30 zone: shift the UTC clock by the
+    // offset and tag the reading with it.
+    const shifted = new Date(startInstant.getTime() + 5.5 * 60 * 60 * 1000);
+    const startedAt = shifted.toISOString().replace("Z", "+05:30");
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      startedAt,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.startedAt).toBeInstanceOf(Date);
+    // Proves TZ conversion, not just acceptance: the stored instant equals
+    // the UTC reading, not the +05:30 clock reading.
+    expect(call.startedAt.toISOString()).toBe(startInstant.toISOString());
+  });
+
+  it("accepts a startedAt exactly 24h old (24h bound is inclusive)", async () => {
+    const T0 = new Date("2026-10-03T12:00:00Z").getTime();
+    const startedAtIso = new Date(T0 - 24 * 60 * 60 * 1000).toISOString();
+
+    vi.useFakeTimers({ now: T0 });
+    try {
+      const res = await postRequest({
+        taskType: "implement",
+        outcome: "pr_opened",
+        startedAt: startedAtIso,
+      });
+
+      expect(res.status).toBe(200);
+      const call = mockAgentRun.create.mock.calls[0][0].data;
+      expect(call.startedAt).toBeInstanceOf(Date);
+      expect(call.startedAt.getTime()).toBe(T0 - 24 * 60 * 60 * 1000);
+      // Accepted: the run kept the worker-reported start, not the report
+      // time (a fallback would collapse startedAt onto finishedAt).
+      expect(call.startedAt.getTime()).not.toBe(call.finishedAt.getTime());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an identical-body retry keeps the same payload hash across the 24h boundary (duplicate, not 409)", async () => {
+    const T0 = new Date("2026-10-03T12:00:00Z").getTime();
+    const startedAtIso = new Date(T0 - 23 * 60 * 60 * 1000).toISOString();
+    const body = {
+      taskType: "implement",
+      outcome: "issue_updated",
+      idempotencyKey: "key-stability",
+      startedAt: startedAtIso,
+    };
+
+    vi.useFakeTimers({ now: T0 });
+    try {
+      const first = await postRequest(body);
+      expect(first.status).toBe(200);
+      const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+      // 25h later: the same startedAt string is now 48h old and no longer
+      // accepted, so the validated report changes — but the RAW-body hash
+      // must stay the same, so the retry dedupes instead of 409ing.
+      vi.setSystemTime(T0 + 25 * 60 * 60 * 1000);
+
+      mockDedupe.create.mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+          code: "P2002",
+          clientVersion: "test",
+        }),
+      );
+      mockDedupe.findUnique.mockResolvedValueOnce({
+        id: "claim-1",
+        agentName: "test-agent",
+        idempotencyKey: "key-stability",
+        payloadHash,
+        agentRunId: "run-1",
+        prFixResolution: null,
+      });
+
+      const retry = await postRequest(body);
+
+      expect(retry.status).toBe(200);
+      expect(retry.status).not.toBe(409);
+      const retryBody = await retry.json();
+      expect(retryBody.duplicate).toBe(true);
+      expect(retryBody.agentRunId).toBe("run-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
