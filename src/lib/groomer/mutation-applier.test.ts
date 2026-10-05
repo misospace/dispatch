@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { childBriefKey } from "@/lib/decomposition";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
@@ -21,6 +22,7 @@ import {
   type ApplierGitHub,
   type ApplyInput,
   type ApplySteps,
+  type ChildClaimRecord,
   type GroomingMutationDiff,
 } from "./mutation-applier";
 
@@ -127,6 +129,46 @@ function planFor(d: GroomingPlanDraft, snap = snapshot()): GroomingPlan {
   return result.plan!;
 }
 
+/** A plan that splits the issue into two bounded children (dispatch#1066). */
+function decomposeDraft(): GroomingPlanDraft {
+  // A ready `implementation` plan may not decompose, so the split lands as a
+  // non-ready (backlog) verdict.
+  return {
+    ...draft({ actionability: "backlog", lane: { id: "backlog", confidence: "high", reason: "bounded" } }),
+    implementationBrief: null,
+    decomposition: {
+      required: true,
+      reason: "splits into two bounded children",
+      childBriefs: [
+        {
+          title: "Child issue A",
+          problem: "Child A problem",
+          designDecision: null,
+          verifiedCurrentBehavior: null,
+          relevantPaths: [],
+          inScope: ["A"],
+          outOfScope: [],
+          dependencies: [],
+          acceptanceCriteria: ["A works"],
+          tests: [],
+        },
+        {
+          title: "Child issue B",
+          problem: "Child B problem",
+          designDecision: null,
+          verifiedCurrentBehavior: null,
+          relevantPaths: [],
+          inScope: ["B"],
+          outOfScope: [],
+          dependencies: [],
+          acceptanceCriteria: ["B works"],
+          tests: [],
+        },
+      ],
+    },
+  };
+}
+
 function live(snap = snapshot()): LiveIssueState {
   return { title: snap.issue.title, body: snap.issue.body, labels: snap.issue.labels, state: snap.issue.state };
 }
@@ -199,6 +241,17 @@ describe("computeMutationDiff", () => {
     const diff = diffFor(alreadyDone(), snap);
     expect(diff.labelsStep.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
     expect(diff.labelsAfter.filter((l) => l.startsWith("status/"))).toEqual(["status/done"]);
+  });
+
+  it("keeps a non-status label in the labels step on the done (close) branch", () => {
+    // The umbrella is a non-status label; `umbrella` itself is not a model-usable
+    // label, so a representative allowed non-status label (type/bug) proves the
+    // done branch preserves non-status labels — the same derivation that keeps
+    // the umbrella once the decomposition adds it to labelsAfter.
+    const diff = diffFor(alreadyDone({ labelsToAdd: ["type/bug"] }));
+    expect(diff.close).toBe(true);
+    expect(diff.labelsAfter).toContain("type/bug");
+    expect(diff.labelsStep).toContain("type/bug");
   });
 
   it("neutralizes @-mentions in a rewritten title and in the managed body section", () => {
@@ -288,11 +341,16 @@ describe("computeApplicationKey", () => {
 
 // ─── applyGroomingMutations ──────────────────────────────────────────────────
 
-function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Map<string, ApplicationRecord> } {
+function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
+  rows: Map<string, ApplicationRecord>;
+  children: Map<string, ChildClaimRecord>;
+} {
   const rows = new Map<string, ApplicationRecord>();
+  const children = new Map<string, ChildClaimRecord>();
   if (initial) rows.set(initial.applicationKey, initial);
   return {
     rows,
+    children,
     find: async (key) => rows.get(key) ?? null,
     claim: async (input) => {
       const existing = rows.get(input.applicationKey) ?? null;
@@ -320,6 +378,21 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Ma
       row.updatedAt = new Date();
       return true;
     },
+    claimChild: async (input) => {
+      const existing = children.get(input.childKey) ?? null;
+      if (!existing) {
+        children.set(input.childKey, { childKey: input.childKey, childNumber: null, childUrl: null });
+      }
+      return { existing: existing ? { ...existing } : null };
+    },
+    saveChild: async (childKey, data) => {
+      const row = children.get(childKey)!;
+      row.childNumber = data.childNumber;
+      row.childUrl = data.childUrl;
+    },
+    // The shared helper's persistence is exercised by the route and
+    // integration tests; the in-memory fake records nothing.
+    setDecompositionState: async () => {},
   };
 }
 
@@ -339,6 +412,10 @@ function fakeGitHub(overrides: Partial<ApplierGitHub> = {}) {
     closeIssue: vi.fn(async () => {
       calls.push("close");
     }),
+    createIssue: vi.fn(async (_r, input) => {
+      calls.push(`child:${input.title}`);
+      return { number: 43, url: "https://github.com/org/repo/issues/43" };
+    }),
     fetchRecentComments: vi.fn(async () => []),
     ...overrides,
   };
@@ -350,6 +427,7 @@ function applyInput(diff: GroomingMutationDiff, overrides: Partial<ApplyInput> =
     repoFullName: "org/repo",
     issueNumber: 42,
     issueId: "issue-42",
+    parentUrl: "https://github.com/org/repo/issues/42",
     groomingRunId: "run-1",
     applicationKey: KEY,
     diff,
@@ -604,6 +682,85 @@ describe("applyGroomingMutations", () => {
   });
 });
 
+describe("applyGroomingMutations → decomposition", () => {
+  it("creates each child issue, rides the umbrella on the labels step, and records the child links", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    expect(diff.children).not.toBeNull();
+    // The umbrella decoration rides the labels step, not a second write.
+    expect(diff.labelsAfter).toContain("umbrella");
+    expect(diff.labelsStep).toContain("umbrella");
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    expect(store.children.size).toBe(2);
+    // The single labels write carries the umbrella; the children step makes none.
+    expect(github.updateLabels).toHaveBeenCalledTimes(1);
+    expect(github.updateLabels).toHaveBeenCalledWith("org/repo", 42, expect.arrayContaining(["umbrella"]));
+    // The children step carries the created child LINKS (key/number/url), not counts.
+    const step = result.steps.children!;
+    expect(step.status).toBe("applied");
+    expect(step.children?.created).toHaveLength(2);
+    expect(step.children?.reused).toHaveLength(0);
+    for (const link of step.children!.created) {
+      expect(link.key).toBeTypeOf("string");
+      expect(link.number).toBeTypeOf("number");
+      expect(link.url).toBeTypeOf("string");
+    }
+    // ApplyResult.labels (freshness baseline / audit) includes the umbrella.
+    expect(result.labels).toContain("umbrella");
+    // ApplyResult.children carries the created links in brief order.
+    expect(result.children).toHaveLength(2);
+  });
+
+  it("reuses a child an earlier attempt already created, creating only the missing one", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const briefs = diff.children!.briefs;
+    // Simulate the first child having been created by an earlier attempt.
+    const firstKey = childBriefKey("org/repo", 42, briefs[0]);
+    store.children.set(firstKey, { childKey: firstKey, childNumber: 99, childUrl: "https://github.com/org/repo/issues/99" });
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(github.createIssue).toHaveBeenCalledTimes(1);
+    const step = result.steps.children!;
+    expect(step.children?.created).toHaveLength(1);
+    expect(step.children?.reused).toEqual([{ key: firstKey, number: 99, url: "https://github.com/org/repo/issues/99" }]);
+    // ApplyResult.children is in brief order: the reused first child, then the created one.
+    expect(result.children.map((l) => l.number)).toEqual([99, 43]);
+  });
+
+  it("surfaces the created child links again on a replay, without re-creating them", async () => {
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const first = fakeGitHub();
+    const applied = await applyGroomingMutations(applyInput(diff), first.github, store);
+    expect(applied.outcome).toBe("applied");
+    expect(applied.children).toHaveLength(2);
+    // A replay of the same applied key re-surfaces the links and writes nothing.
+    const second = fakeGitHub();
+    const replayed = await applyGroomingMutations(applyInput(diff), second.github, store);
+    expect(replayed.outcome).toBe("replayed");
+    expect(second.github.createIssue).not.toHaveBeenCalled();
+    expect(replayed.children).toEqual(applied.children);
+  });
+
+  it("creates no children when the decomposition is withheld by policy", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    // A low-confidence split is withheld; no children land.
+    const base = decomposeDraft();
+    const diff = diffFor({ ...base, verdict: { ...base.verdict, confidence: "low" } });
+    expect(diff.children).toBeNull();
+    expect(diff.withheld.decomposition).toBeDefined();
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(github.createIssue).not.toHaveBeenCalled();
+    expect(store.children.size).toBe(0);
+    expect(result.steps.children).toMatchObject({ status: "noop" });
+  });
+});
+
 function addCommentBody(github: ApplierGitHub): string {
   return (github.addComment as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
 }
@@ -631,6 +788,13 @@ describe("makePrismaApplicationStore", () => {
         updateMany: vi.fn(async () => ({ count: 1 })),
       },
       groomingRun: { findFirst: vi.fn(async () => null) },
+      groomingChildClaim: {
+        findUnique: vi.fn(async (): Promise<ChildClaimRecord | null> => null),
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+        update: vi.fn(async () => ({})),
+      },
+      issue: { update: vi.fn(async () => ({})) },
+      auditLog: { create: vi.fn(async () => ({})) },
     };
   }
 

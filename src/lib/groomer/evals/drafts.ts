@@ -146,6 +146,13 @@ export function children(titles: string[]): ChildBrief[] {
   return titles.map((title) => ({
     title,
     problem: `${title}, as its own bounded change.`,
+    designDecision: null,
+    verifiedCurrentBehavior: null,
+    relevantPaths: [],
+    inScope: [title.toLowerCase()],
+    outOfScope: [],
+    dependencies: [],
     acceptanceCriteria: [`${title} works end to end`],
+    tests: [],
   }));
 }

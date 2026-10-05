@@ -170,10 +170,30 @@ export interface GroomingMutationIntent {
   close: CloseRecommendation | null;
 }
 
+/**
+ * One bounded child brief (dispatch#1066). Rich enough that a fresh worker
+ * with no other context can implement the child: problem/motivation, the
+ * current behavior the parent's analysis verified, the relevant code paths,
+ * the settled design decision, explicit scope, dependencies, deterministic
+ * acceptance criteria and tests. The child still gets its own evidence-backed
+ * grooming pass before worker admission; the brief orients, it does not
+ * certify.
+ */
 export interface ChildBrief {
   title: string;
   problem: string;
+  /** The settled design decision this child implements; null when there is no decision left. */
+  designDecision: string | null;
+  /** Current behavior verified by the parent's analysis; null when not verified. */
+  verifiedCurrentBehavior: string | null;
+  /** Current relevant code paths the child touches or reads. */
+  relevantPaths: string[];
+  inScope: string[];
+  outOfScope: string[];
+  /** Descriptive only: dependencies between siblings or on external work. */
+  dependencies: string[];
   acceptanceCriteria: string[];
+  tests: string[];
 }
 
 export interface GroomingDecomposition {
@@ -448,7 +468,14 @@ function parseDraft(data: Obj, r: Reader): GroomingPlanDraft {
         return {
           title: r.text(c.title, `${path}.title`, L.titleMax, L.titleMin),
           problem: r.text(c.problem, `${path}.problem`, L.text),
+          designDecision: r.optionalText(c.designDecision, `${path}.designDecision`, L.text),
+          verifiedCurrentBehavior: r.optionalText(c.verifiedCurrentBehavior, `${path}.verifiedCurrentBehavior`, L.text),
+          relevantPaths: r.textList(c.relevantPaths, `${path}.relevantPaths`, L.listItems, L.shortText),
+          inScope: r.textList(c.inScope, `${path}.inScope`, L.listItems, L.shortText),
+          outOfScope: r.textList(c.outOfScope, `${path}.outOfScope`, L.listItems, L.shortText),
+          dependencies: r.textList(c.dependencies, `${path}.dependencies`, L.listItems, L.shortText),
           acceptanceCriteria: r.textList(c.acceptanceCriteria, `${path}.acceptanceCriteria`, L.childCriteria, L.shortText),
+          tests: r.textList(c.tests, `${path}.tests`, L.listItems, L.shortText),
         };
       }),
     };

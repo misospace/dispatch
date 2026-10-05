@@ -136,6 +136,26 @@ describe("buildGroomerSystemPrompt", () => {
       expect(prompt).toContain("decomposition.required is false");
     });
 
+    it("describes the full child brief shape and when children may be emitted (dispatch#1066)", () => {
+      const prompt = buildGroomerSystemPrompt(baseParams);
+      for (const field of [
+        "designDecision",
+        "verifiedCurrentBehavior",
+        "relevantPaths",
+        "inScope",
+        "outOfScope",
+        "dependencies",
+        "acceptanceCriteria",
+        "tests",
+      ]) {
+        expect(prompt, field).toContain(field);
+      }
+      expect(prompt).toContain("complete bounded implementation brief");
+      expect(prompt).toContain("never emit child briefs while a material design question remains unresolved");
+      expect(prompt).toContain("that work goes to the escalation lane instead");
+      expect(prompt).toContain("start as `status/backlog`");
+    });
+
     it("lets unknowns be recorded instead of guessed", () => {
       const prompt = buildGroomerSystemPrompt(baseParams);
       expect(prompt).toContain("Unknown is an answer.");

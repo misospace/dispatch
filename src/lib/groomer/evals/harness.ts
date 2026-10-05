@@ -35,6 +35,7 @@ export interface GitHubWrites {
   titleBody: Array<{ title?: string; body?: string | null }>;
   comments: string[];
   closes: number;
+  children: Array<{ number: number; url: string }>;
 }
 
 export interface GroomingOutcome {
@@ -123,7 +124,7 @@ export async function runCandidate(
   candidate: CaseCandidate,
   options: RunCandidateOptions = {},
 ): Promise<GroomingOutcome> {
-  const writes: GitHubWrites = { labels: [], titleBody: [], comments: [], closes: 0 };
+  const writes: GitHubWrites = { labels: [], titleBody: [], comments: [], closes: 0, children: [] };
   let validation: GroomingPlanValidationResult | null = null;
   let catalog: EvidenceCatalog | null = null;
   let context = "";
@@ -240,6 +241,12 @@ export async function runCandidate(
     },
     closeIssue: async () => {
       writes.closes++;
+    },
+    createIssue: async (repoFullName, input) => {
+      const number = 1000 + writes.children.length;
+      const url = `https://github.com/${repoFullName}/issues/${number}`;
+      writes.children.push({ number, url });
+      return { number, html_url: url };
     },
     findActiveLeases: async () => [],
     upsertLease: async () => ({ created: true, lease: { id: "lease-1" } }),

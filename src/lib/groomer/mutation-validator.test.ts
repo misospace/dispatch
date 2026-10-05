@@ -5,6 +5,7 @@ import { collectPinnedReadContent } from "./close-grounding";
 import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
 import {
   evaluateClosePolicy,
+  evaluateDecompositionPolicy,
   evaluateReadyPolicy,
   validateApplyPreconditions,
   type LiveComment,
@@ -109,6 +110,35 @@ function alreadyDoneDraft(evidenceRefs: string[] = ["repo:src/auth/login.ts"]): 
           { criterion: "login redirects to the saved return URL", evidenceRef: "repo:src/auth/login.ts", excerpt: 'return session.returnTo ?? "/";' },
         ],
       },
+    },
+  };
+}
+
+/** A plan that splits the issue into one bounded child (dispatch#1066). */
+function decomposeDraft(): GroomingPlanDraft {
+  return {
+    ...readyDraft(),
+    // A ready `implementation` plan may not decompose, so the split lands as
+    // a non-ready (backlog) verdict.
+    verdict: { ...readyDraft().verdict, actionability: "backlog", lane: { id: "backlog", confidence: "high", reason: "bounded" } },
+    implementationBrief: null,
+    decomposition: {
+      required: true,
+      reason: "splits into two bounded children",
+      childBriefs: [
+        {
+          title: "Child issue A",
+          problem: "Child A problem",
+          designDecision: null,
+          verifiedCurrentBehavior: null,
+          relevantPaths: [],
+          inScope: ["A"],
+          outOfScope: [],
+          dependencies: [],
+          acceptanceCriteria: ["A works"],
+          tests: [],
+        },
+      ],
     },
   };
 }
@@ -501,5 +531,51 @@ describe("evaluateReadyPolicy", () => {
     const plan = planFor(readyDraft());
     const forged: GroomingPlan = { ...plan, readiness: { ...plan.readiness, ready: false } };
     expect(evaluateReadyPolicy(forged, catalogFor(snapshot()))).toContain("the plan's derived readiness is not ready");
+  });
+});
+
+describe("evaluateDecompositionPolicy", () => {
+  const plan = planFor(decomposeDraft());
+
+  it("allows a decisive decomposition with no close and no material uncertainty", () => {
+    expect(evaluateDecompositionPolicy(plan)).toEqual([]);
+  });
+
+  it("refuses a decomposition the plan also recommends closing for", () => {
+    const forged: GroomingPlan = {
+      ...plan,
+      mutations: {
+        ...plan.mutations,
+        close: { reason: "already_done", rationale: "done", evidenceRefs: ["repo:src/auth/login.ts"] },
+      },
+    };
+    expect(evaluateDecompositionPolicy(forged)).toContain(
+      "the plan recommends closing the issue; a decomposed parent is not closed",
+    );
+  });
+
+  it("refuses a decomposition whose confidence is low", () => {
+    const forged: GroomingPlan = { ...plan, verdict: { ...plan.verdict, confidence: "low" } };
+    expect(evaluateDecompositionPolicy(forged)).toContain(
+      "verdict confidence is low; decomposition requires at least medium confidence",
+    );
+  });
+
+  it("refuses a decomposition with a material uncertainty", () => {
+    const forged: GroomingPlan = {
+      ...plan,
+      verdict: { ...plan.verdict, uncertainties: [{ kind: "scope", question: "Which child owns the migration?", material: true }] },
+    };
+    expect(evaluateDecompositionPolicy(forged)).toContain(
+      "material uncertainty remains (verdict.uncertainties[0]): Which child owns the migration?",
+    );
+  });
+
+  it("ignores a non-material uncertainty", () => {
+    const forged: GroomingPlan = {
+      ...plan,
+      verdict: { ...plan.verdict, uncertainties: [{ kind: "scope", question: "Nice to know", material: false }] },
+    };
+    expect(evaluateDecompositionPolicy(forged)).toEqual([]);
   });
 });

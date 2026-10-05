@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { addIssueComment, closeIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
+import { addIssueComment, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
@@ -107,6 +107,8 @@ export interface GroomerDeps {
   addComment: typeof addIssueComment;
   updateTitleAndBody: typeof updateIssueTitleAndBody;
   closeIssue: typeof closeIssue;
+  /** Open a decomposition child issue (dispatch#1066). */
+  createIssue: typeof createIssue;
   findActiveLeases: typeof findActiveLeasesForIssue;
   upsertLease: typeof upsertLease;
   releaseLease: typeof releaseLease;
@@ -138,6 +140,7 @@ const defaultDeps: GroomerDeps = {
   addComment: addIssueComment,
   updateTitleAndBody: updateIssueTitleAndBody,
   closeIssue,
+  createIssue,
   findActiveLeases: findActiveLeasesForIssue,
   upsertLease,
   releaseLease,
@@ -581,7 +584,9 @@ async function executeGroomerRun(
     }
 
     for (const [what, reasons] of Object.entries(diff.withheld)) {
-      contextWarnings.push(`apply: withheld ${what === "close" ? "the already_done close" : "the ready promotion"}: ${reasons!.join("; ")}`);
+      const withheldName =
+        what === "close" ? "the already_done close" : what === "ready" ? "the ready promotion" : "the decomposition";
+      contextWarnings.push(`apply: withheld ${withheldName}: ${reasons!.join("; ")}`);
     }
 
     // Post-condition invariant (dispatch#941): exactly one status/* label.
@@ -597,6 +602,7 @@ async function executeGroomerRun(
       notReadyReason: notReadyReason ?? null,
       willComment: diff.comment !== null,
       willCloseIssue: diff.close,
+      willCreateChildren: diff.children !== null,
       titleRewritten: diff.title !== null,
       originalTitle: diff.title !== null ? analyzed.title : undefined,
       proposedTitle: diff.title ?? undefined,
@@ -624,6 +630,7 @@ async function executeGroomerRun(
         inFlightStatus: inFlight,
         willComment: false,
         willCloseIssue: false,
+        willCreateChildren: false,
         titleRewritten: false,
         bodyEnriched: false,
       });
@@ -834,6 +841,11 @@ async function executeGroomerRun(
       addComment: deps.addComment,
       updateTitleAndBody: deps.updateTitleAndBody,
       closeIssue: deps.closeIssue,
+      // The GitHub client returns `html_url`; the applier wants `url`.
+      createIssue: async (repoFullName, input) => {
+        const created = await deps.createIssue(repoFullName, input);
+        return { number: created.number, url: created.html_url };
+      },
       fetchRecentComments: (_repo, _number, max) => reader.fetchRecentComments(max),
     };
     const applied = await applyGroomingMutations(
@@ -841,6 +853,7 @@ async function executeGroomerRun(
         repoFullName: candidate.repoFullName,
         issueNumber: candidate.number,
         issueId: candidate.id,
+        parentUrl: candidate.url,
         groomingRunId: groomingRun.id,
         applicationKey,
         diff,
@@ -1136,6 +1149,14 @@ function describeApplication(applied: ApplyResult, withheld: Record<string, stri
   if (steps.content?.status === "applied" || steps.content?.status === "replayed") {
     out.titleUpdated = applied.title !== null;
     out.bodyUpdated = applied.body !== null;
+  }
+  const childrenStep = steps.children;
+  if (childrenStep) {
+    if (childrenStep.children) {
+      if (childrenStep.children.created.length > 0) out.childrenCreated = childrenStep.children.created;
+      if (childrenStep.children.reused.length > 0) out.childrenReused = childrenStep.children.reused;
+    }
+    if (childrenStep.status === "failed") out.childrenError = childrenStep.error;
   }
   const comment = steps.comment;
   if (comment && comment.status !== "noop") {

@@ -26,6 +26,7 @@ const { mocks } = vi.hoisted(() => ({
     addIssueComment: vi.fn(),
     updateIssueTitleAndBody: vi.fn(),
     closeIssue: vi.fn(),
+    createIssue: vi.fn(),
     findActiveLeasesForIssue: vi.fn(),
     upsertLease: vi.fn(),
     releaseLease: vi.fn(),
@@ -43,6 +44,7 @@ const { mocks } = vi.hoisted(() => ({
       automationRepo: { findUnique: vi.fn() },
       groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn(), findMany: vi.fn() },
       groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
+      groomingChildClaim: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
@@ -73,6 +75,7 @@ vi.mock("@/lib/github", () => ({
   addIssueComment: mocks.addIssueComment,
   updateIssueTitleAndBody: mocks.updateIssueTitleAndBody,
   closeIssue: mocks.closeIssue,
+  createIssue: mocks.createIssue,
   addIssueLabel: mocks.addIssueLabel,
   removeIssueLabel: mocks.removeIssueLabel,
 }));

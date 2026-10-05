@@ -161,7 +161,7 @@ describe("grooming corpus", () => {
       expect(first.writes.closes).toBe(1);
       expect(first.writes.comments).toHaveLength(1);
       expect(replay.mutationPlan?.applicationKey).toBe(first.mutationPlan?.applicationKey);
-      expect(replay.writes).toEqual({ labels: [], titleBody: [], comments: [], closes: 0 });
+      expect(replay.writes).toEqual({ labels: [], titleBody: [], comments: [], closes: 0, children: [] });
     });
   });
 

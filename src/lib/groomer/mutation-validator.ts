@@ -484,3 +484,29 @@ export function evaluateReadyPolicy(plan: GroomingPlan, catalog: EvidenceCatalog
   reasons.push(...evaluateReadiness(plan, catalog));
   return reasons;
 }
+
+/**
+ * Decomposition re-checked at apply time (dispatch#1066). Returns every
+ * reason the plan's children may not be created; empty means they may.
+ *
+ * A decomposition splits one issue into bounded children, so it is only
+ * applied when the parent's analysis is decisive enough to trust the split:
+ * - the plan does not also recommend closing the issue (a closed parent has
+ *   no children to carry its work);
+ * - the verdict confidence is not low;
+ * - no material uncertainty of any kind remains.
+ * The apply preconditions separately guarantee the issue is still open.
+ */
+export function evaluateDecompositionPolicy(plan: GroomingPlan): string[] {
+  const reasons: string[] = [];
+  if (plan.mutations.close) {
+    reasons.push("the plan recommends closing the issue; a decomposed parent is not closed");
+  }
+  if (plan.verdict.confidence === "low") {
+    reasons.push("verdict confidence is low; decomposition requires at least medium confidence");
+  }
+  plan.verdict.uncertainties.forEach((u, i) => {
+    if (u.material) reasons.push(`material uncertainty remains (verdict.uncertainties[${i}]): ${u.question}`);
+  });
+  return reasons;
+}

@@ -42,6 +42,7 @@ model Issue {
   leases        Lease[]
   groomingRuns  GroomingRun[]
   groomingApplications GroomingApplication[]
+  groomingChildClaims  GroomingChildClaim[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -602,6 +603,28 @@ model GroomingApplication {
 
   @@index([issueId])
   @@index([groomingRunId])
+}
+
+/// One row per child brief the hosted groomer intends for a decomposed parent
+/// (#1066). The unique childKey (parent issue + normalized child brief) is
+/// the claim: creation is idempotent, so a retry after partial failure reuses
+/// children whose rows already carry their URLs and creates only the missing
+/// ones.
+model GroomingChildClaim {
+  id            String   @id @default(cuid())
+  childKey      String   @unique
+  parentIssueId String
+  repoFullName  String
+  parentNumber  Int
+  title         String   @db.Text
+  childNumber   Int?
+  childUrl      String?  @db.Text
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  parentIssue Issue @relation(fields: [parentIssueId], references: [id], onDelete: Cascade)
+
+  @@index([parentIssueId])
 }
 
 // ---------------------------------------------------------------------------

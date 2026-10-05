@@ -173,6 +173,18 @@ The content excerpts are checked against is what the run's repository-context fe
 
 A close that fails any rule is a validation error and applies nothing. The applier re-checks the whole policy, grounding included, against the run's catalog before closing (see [What is applied, and in which order](#what-is-applied-and-in-which-order)); a close that fails there is withheld and the plan lands as backlog.
 
+### Decomposition
+
+A plan may also split the issue into bounded children instead of (or alongside) promoting it. This is an independent decision from the close and ready promotions: a plan that decomposes is withheld only when its own decomposition policy fails, never because the close or ready policy did. The policy requires, all at once:
+
+- no close in the same plan — a decomposed parent is not closed;
+- verdict confidence of at least `medium` (a low-confidence split is too speculative to fan out);
+- no material uncertainty remaining (the same `verdict.uncertainties[].material` flag the close policy keys on).
+
+When it holds, each bounded child brief in `decomposition.childBriefs` becomes its own GitHub issue, created with the child labels (`status/backlog`). Child creation is idempotent: every child is keyed by a stable `childBriefKey` (repository, parent issue number, and the child brief) recorded in the `GroomingChildClaim` table, so a retried attempt reuses a child an earlier attempt already created and opens only the ones still missing. The parent is then decorated as an `umbrella` (a separate label write) and recorded as decomposed — `decomposed`, `decomposedAt`, `decomposedBy: "hosted-groomer"`, the decomposition reason as the note, and the created child URLs as its `followUpUrls` — through the same `setDecompositionState` helper the operator `POST /api/issues/actions/decompose` route uses, so both paths write the state and its audit entry identically.
+
+A decomposition that fails any rule is withheld: no child is created and the parent is not decorated, and `withheld.decomposition` records why.
+
 ### Compatibility
 
 `GroomingRun.validatedOutput` stores the full plan. `mutationPlan` keeps its existing fields and adds `planSchemaVersion`, `evidenceDigest`, `readiness`, `closeRecommendation`, `applicationKey`, `preconditions` and, when a policy withheld something, `withheld`. The run path applies mutations through `toGroomerOutput`, the legacy view that `POST /api/groomer/run` still returns as `output` (with the plan alongside as `plan`). A rejected plan's raw output and `validationErrors` are kept on the run. Runs recorded before the plan contract still render on `/automation/groomer`, marked `legacy`, with no readiness claim.
@@ -207,8 +219,9 @@ The diff is computed against the live issue, never Dispatch's cache, and only wh
 1. **labels**: priority/type changes and the derived status. For an `already_done` plan the status stays as it was here.
 2. **comment**: at most one, with `@` mentions neutralized and a hidden `<!-- dispatch-groomer:apply=<key> -->` marker at its end. Any marker the model wrote into its own text is stripped, and a marker only counts on a comment by an automation author, so nobody else can forge one to suppress or impersonate a groomer comment.
 3. **title/body**: one write. A title is rewritten only when the current one is bad (the existing guard). The body is never replaced: enrichment goes into one Dispatch-managed section between `<!-- dispatch-groomer:managed:start -->` and `<!-- dispatch-groomer:managed:end -->` markers, appended after the human text on first write and replaced in place afterwards. Text outside the section is kept byte for byte. Enrichment still applies only when the human-authored text is sparse, and a body whose markers are unpaired or repeated is left alone.
-4. **close**, only for an `already_done` plan that still satisfies the close policy.
-5. **status/done**, only once the close has landed, so a failed close leaves the issue open in its previous (groomable) status rather than open with `status/done`, which the selector would skip forever.
+4. **children**, only for a plan that decomposes and still satisfies the decomposition policy (no close in the same plan, at least medium confidence, and no material uncertainty). Each bounded child brief becomes its own issue (created with the child labels), an already-created child is reused rather than re-opened, and the parent is decorated as an `umbrella` and recorded as decomposed with the child URLs as its follow-ups (see [Decomposition](#decomposition)).
+5. **close**, only for an `already_done` plan that still satisfies the close policy.
+6. **status/done**, only once the close has landed, so a failed close leaves the issue open in its previous (groomable) status rather than open with `status/done`, which the selector would skip forever.
 
 Each step is recorded as `applied`, `replayed`, `noop`, `skipped` (comment cooldown), `failed` or `not_attempted` in `appliedMutations.steps`, alongside the existing `labelsUpdated`, `titleUpdated`, `bodyUpdated`, `commentUrl`, `commentSkippedReason`, `commentError`, `issueClosed` and `issueClosedError` fields. A run where a later step failed after earlier ones landed ends with `status: "partial"`, `retryable: true` and an `errorMessage` naming the failed step; the grooming fields and freshness baseline record only what actually landed. A run whose first needed write failed (nothing landed) fails as before.
 
