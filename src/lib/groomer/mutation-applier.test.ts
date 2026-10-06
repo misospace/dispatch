@@ -944,6 +944,28 @@ describe("applyGroomingMutations → decomposition", () => {
     expect(retry.github.addLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
   });
 
+  it("surfaces the child links again when a resumed partial application replays its landed children step", async () => {
+    const created = [{ key: "k-a", number: 43, url: "https://github.com/org/repo/issues/43" }];
+    const reused = [{ key: "k-b", number: 44, url: "https://github.com/org/repo/issues/44" }];
+    // The children step landed in the prior attempt (with its links recorded)
+    // but the application never finished: the resume replays the step instead
+    // of re-creating the children, and the result still carries the links.
+    const store = memoryStore({
+      applicationKey: KEY,
+      groomingRunId: "run-0",
+      status: "partial",
+      steps: { children: { status: "applied", children: { created, reused } } },
+      attempts: 1,
+      updatedAt: new Date(Date.now() - 11 * 60 * 1000),
+    });
+    const { github } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(diffFor(decomposeDraft())), github, store);
+    expect(result.outcome).not.toBe("busy");
+    expect(result.steps.children).toMatchObject({ status: "replayed" });
+    expect(github.createIssue).not.toHaveBeenCalled();
+    expect(result.children).toEqual([...created, ...reused]);
+  });
+
   it("reuses every child under a different application key, creating no duplicates", async () => {
     const first = fakeGitHub();
     const store = memoryStore();
@@ -1083,12 +1105,51 @@ describe("makePrismaApplicationStore", () => {
     expect(claimed.existing).toEqual(winner);
   });
 
+  it("reads the winner when it loses a concurrent child claim (P2002)", async () => {
+    const c = client();
+    const winner: ChildClaimRecord = {
+      childKey: "child-key",
+      childNumber: 43,
+      childUrl: "https://github.com/org/repo/issues/43",
+      applicationKey: KEY,
+    };
+    c.groomingChildClaim.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(winner);
+    c.groomingChildClaim.create.mockRejectedValueOnce(Object.assign(new Error("Unique constraint failed"), { code: "P2002" }));
+    const store = makePrismaApplicationStore(c);
+    const claimed = await store.claimChild({
+      childKey: "child-key",
+      parentIssueId: "issue-42",
+      repoFullName: "org/repo",
+      parentNumber: 42,
+      title: "Child issue A",
+      applicationKey: KEY,
+    });
+    expect(claimed.existing).toEqual(winner);
+  });
+
   it("propagates other database errors, so nothing is applied unclaimed", async () => {
     const c = client();
     c.groomingApplication.create.mockRejectedValueOnce(new Error("connection refused"));
     const store = makePrismaApplicationStore(c);
     await expect(
       store.claim({ applicationKey: KEY, issueId: "i", groomingRunId: "r1", repoFullName: "org/repo", issueNumber: 42 }),
+    ).rejects.toThrow("connection refused");
+  });
+
+  it("propagates other database errors from a child-claim create, so nothing is claimed unrecorded", async () => {
+    const c = client();
+    c.groomingChildClaim.findUnique.mockResolvedValueOnce(null);
+    c.groomingChildClaim.create.mockRejectedValueOnce(new Error("connection refused"));
+    const store = makePrismaApplicationStore(c);
+    await expect(
+      store.claimChild({
+        childKey: "child-key",
+        parentIssueId: "issue-42",
+        repoFullName: "org/repo",
+        parentNumber: 42,
+        title: "Child issue A",
+        applicationKey: KEY,
+      }),
     ).rejects.toThrow("connection refused");
   });
 });

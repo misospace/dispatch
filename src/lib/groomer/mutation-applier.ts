@@ -501,10 +501,11 @@ export interface ChildClaimRecord {
   childUrl: string | null;
   /**
    * The application that claimed this child (dispatch#1066); null for rows
-   * written before the column existed (none in any deployed env). A same-key
-   * retry is provably exclusive — the GroomingApplication claim/resume CAS
-   * lets exactly one attempt per application key proceed — so a null claim
-   * under MY key is my own abandoned create, not a concurrent holder.
+   * written before the column existed (none in any deployed env). The resume
+   * CAS (which serializes attempts while the prior application claim is fresh)
+   * plus the single-replica confinement of the groomer make concurrent
+   * same-key application attempts not expected, so a null claim under MY key
+   * is my own abandoned create, not a concurrent holder.
    */
   applicationKey: string | null;
   /** When the claim row was last written; the prisma store returns it. */
@@ -702,6 +703,7 @@ export async function applyGroomingMutations(
   let failure: ApplyResult["failure"] = null;
   let commentUrl: string | null = null;
   let labels = diff.labelsBefore;
+  let appliedChildren: ChildIssueLink[] = [];
 
   const persist = async (status: string) => {
     try {
@@ -720,6 +722,11 @@ export async function applyGroomingMutations(
     if (landed(prior[step])) {
       steps[step] = { ...prior[step]!, status: "replayed" };
       if (step === "comment") commentUrl = prior.comment?.commentUrl ?? null;
+      // A replayed children step surfaces its links in the result, the same
+      // as the full-replay path.
+      if (step === "children" && prior.children?.children) {
+        appliedChildren = [...prior.children.children.created, ...prior.children.children.reused];
+      }
       return;
     }
     if (failure) {
@@ -836,7 +843,6 @@ export async function applyGroomingMutations(
   //    before the close, so a close is never applied on top of a decomposition
   //    that failed to land.
   const children = diff.children;
-  let appliedChildren: ChildIssueLink[] = [];
   await run(
     "children",
     children !== null,
@@ -867,9 +873,11 @@ export async function applyGroomingMutations(
             // updatedAt is held by another in-flight attempt claiming the same
             // child; do not create a duplicate on top of it. A null claim under
             // THIS key is my own abandoned create: the GroomingApplication
-            // resume CAS already excludes a concurrent same-key attempt, so
-            // creating on top of it is how an immediate same-key retry
-            // converges. A row with no applicationKey (none exists in any
+            // resume CAS (which serializes attempts only while the prior
+            // application claim is fresh) plus the single-replica confinement
+            // of the groomer make concurrent same-key application attempts not
+            // expected, so creating on top of it is how an immediate same-key
+            // retry converges. A row with no applicationKey (none exists in any
             // deployed env; the migration ships with the feature) is not mine,
             // so a fresh one is a foreign holder.
             const heldAt = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : NaN;

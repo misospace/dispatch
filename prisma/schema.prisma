@@ -619,10 +619,11 @@ model GroomingChildClaim {
   title         String   @db.Text
   childNumber   Int?
   childUrl      String?  @db.Text
-  /// The application that claimed this child. Same-key retries are serialized
-  /// by the GroomingApplication resume CAS, so a null claim under my key is an
-  /// abandoned create, not a concurrent holder. No FK: the application row
-  /// may be deleted later.
+  /// The application that claimed this child. Same-key attempts are not
+  /// expected to run concurrently (the GroomingApplication resume CAS
+  /// serializes fresh claims, and the groomer is confined to a single
+  /// replica), so a null claim under my key is my own abandoned create.
+  /// No FK: the application row may be deleted later.
   applicationKey String? @db.Text
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
