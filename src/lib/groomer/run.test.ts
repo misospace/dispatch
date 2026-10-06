@@ -361,14 +361,16 @@ describe("runHostedGroomer", () => {
     );
     // In-memory GroomingChildClaim with the unique childKey claim (dispatch#1066).
     // A created row has no childNumber/childUrl until the creation is recorded,
-    // matching the nullable columns the reuse check reads.
+    // matching the nullable columns the reuse check reads; updatedAt is stamped
+    // at create, mirroring @updatedAt, and applicationKey is carried from the
+    // claim input.
     mocks.childClaims.clear();
     mocks.prisma.groomingChildClaim.findUnique.mockImplementation(
       async ({ where }: { where: { childKey: string } }) => mocks.childClaims.get(where.childKey) ?? null,
     );
     mocks.prisma.groomingChildClaim.create.mockImplementation(async ({ data }: { data: Record<string, any> }) => {
       if (mocks.childClaims.has(data.childKey)) throw Object.assign(new Error("Unique constraint"), { code: "P2002" });
-      const row = { ...data, childNumber: null, childUrl: null };
+      const row = { ...data, childNumber: null, childUrl: null, updatedAt: new Date() };
       mocks.childClaims.set(data.childKey, row);
       return row;
     });

@@ -499,6 +499,14 @@ export interface ChildClaimRecord {
   childKey: string;
   childNumber: number | null;
   childUrl: string | null;
+  /**
+   * The application that claimed this child (dispatch#1066); null for rows
+   * written before the column existed (none in any deployed env). A same-key
+   * retry is provably exclusive — the GroomingApplication claim/resume CAS
+   * lets exactly one attempt per application key proceed — so a null claim
+   * under MY key is my own abandoned create, not a concurrent holder.
+   */
+  applicationKey: string | null;
   /** When the claim row was last written; the prisma store returns it. */
   updatedAt?: Date | string | null;
 }
@@ -526,7 +534,9 @@ export interface ApplicationStore {
   /**
    * Claim a child key, atomically (dispatch#1066). `existing` is the prior
    * claim when the child was already created, so a retry reuses it rather than
-   * creating a second child.
+   * creating a second child. `applicationKey` is recorded on a new claim so a
+   * same-key retry can tell its own abandoned create apart from a fresh
+   * claim held by a DIFFERENT application.
    */
   claimChild(input: {
     childKey: string;
@@ -534,6 +544,7 @@ export interface ApplicationStore {
     repoFullName: string;
     parentNumber: number;
     title: string;
+    applicationKey: string;
   }): Promise<{ existing: ChildClaimRecord | null }>;
   /** Record the created child's number and URL on its claim. */
   saveChild(childKey: string, data: { childNumber: number; childUrl: string }): Promise<void>;
@@ -816,13 +827,14 @@ export async function applyGroomingMutations(
   // 4. Children (dispatch#1066): one bounded child issue per brief. Creation
   //    is idempotent through the GroomingChildClaim keyed by the childBriefKey
   //    (a retry reuses a created child and creates only the missing ones). Only
-  //    after every child exists or is reused does this step add the umbrella
-  //    label (an additive write) and record the parent's decomposition state
-  //    with the child URLs as the follow-ups. The umbrella lands last so a
-  //    decomposition that fails mid-create leaves the parent still
-  //    re-selectable (the selector excludes umbrella issues) and converges on
-  //    retry. It lands before the close, so a close is never applied on top of
-  //    a decomposition that failed to land.
+  //    after every child exists or is reused does this step record the parent's
+  //    decomposition state with the child URLs as the follow-ups, and only then
+  //    add the umbrella label (an additive write) last. The umbrella lands last
+  //    — after the state write — so a decomposition that fails mid-create, or
+  //    whose state write fails, leaves the parent still re-selectable (the
+  //    selector excludes umbrella issues) and converges on retry. It lands
+  //    before the close, so a close is never applied on top of a decomposition
+  //    that failed to land.
   const children = diff.children;
   let appliedChildren: ChildIssueLink[] = [];
   await run(
@@ -843,6 +855,7 @@ export async function applyGroomingMutations(
             repoFullName,
             parentNumber: issueNumber,
             title: brief.title,
+            applicationKey: input.applicationKey,
           });
           if (existing && existing.childNumber !== null && existing.childUrl !== null) {
             // An earlier attempt already created this child.
@@ -850,11 +863,23 @@ export async function applyGroomingMutations(
             reused.push(link);
             links.push(link);
           } else {
-            // A claim with no recorded child and a fresh updatedAt is held by
-            // another in-flight attempt (a different application key claiming
-            // the same child); do not create a duplicate on top of it.
+            // A null claim under a DIFFERENT application key with a fresh
+            // updatedAt is held by another in-flight attempt claiming the same
+            // child; do not create a duplicate on top of it. A null claim under
+            // THIS key is my own abandoned create: the GroomingApplication
+            // resume CAS already excludes a concurrent same-key attempt, so
+            // creating on top of it is how an immediate same-key retry
+            // converges. A row with no applicationKey (none exists in any
+            // deployed env; the migration ships with the feature) is not mine,
+            // so a fresh one is a foreign holder.
             const heldAt = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : NaN;
-            if (existing && existing.childNumber === null && Number.isFinite(heldAt) && now().getTime() - heldAt < ACTIVE_CLAIM_MS) {
+            if (
+              existing &&
+              existing.childNumber === null &&
+              existing.applicationKey !== input.applicationKey &&
+              Number.isFinite(heldAt) &&
+              now().getTime() - heldAt < ACTIVE_CLAIM_MS
+            ) {
               throw new Error(`child claim ${childKey} is held by another in-flight attempt`);
             }
             const body = renderChildIssueBody({
@@ -875,12 +900,11 @@ export async function applyGroomingMutations(
           }
         }
         appliedChildren = links;
-        // Add the umbrella only now that every child exists or is reused; a
-        // failed create above throws before this line, so a partial
-        // decomposition never lands the umbrella.
-        await github.addLabel(repoFullName, issueNumber, UMBRELLA_LABEL);
-        // Record the decomposition state with the final label set (which
-        // includes the umbrella just written) and the child URLs.
+        // Record the decomposition state with the final label set (labelsAfter
+        // plus the umbrella this step lands next) and the child URLs, BEFORE
+        // the umbrella: a failure here — like a failed child create above —
+        // must leave the parent still re-selectable, so the umbrella, which
+        // removes it from every selection path, is the step's final write.
         await store.setDecompositionState({
           issue: { id: input.issueId, labels: [...new Set([...diff.labelsAfter, UMBRELLA_LABEL])] },
           repoFullName,
@@ -890,6 +914,11 @@ export async function applyGroomingMutations(
           note: children.reason,
           followUpUrls: links.map((child) => child.url),
         });
+        // The umbrella lands last, now that every child exists or is reused and
+        // the decomposition state is recorded; a failed create or a failed
+        // state write throws before this line, so a partial decomposition never
+        // lands the umbrella.
+        await github.addLabel(repoFullName, issueNumber, UMBRELLA_LABEL);
         return { children: { created, reused }, detail: `${created.length} created, ${reused.length} reused` };
       } catch (err) {
         // Carry what completed so far so the failed step record (and a retry)
@@ -1028,7 +1057,10 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
     async claimChild(input) {
       // The unique childKey makes the claim atomic: a concurrent creator for
       // the same child loses with P2002 and reads the winner's row, so two
-      // attempts never create the same child twice.
+      // attempts never create the same child twice. The create records
+      // applicationKey (and findUnique selects it back), so a same-key retry
+      // can tell its own abandoned create apart from a foreign in-flight
+      // holder.
       const child = client.groomingChildClaim;
       const existing = await child.findUnique({ where: { childKey: input.childKey } });
       if (existing) return { existing };
@@ -1040,6 +1072,7 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
             repoFullName: input.repoFullName,
             parentNumber: input.parentNumber,
             title: input.title,
+            applicationKey: input.applicationKey,
           },
         });
         return { existing: null };

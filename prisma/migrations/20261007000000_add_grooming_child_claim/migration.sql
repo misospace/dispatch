@@ -2,7 +2,9 @@
 -- (#1066). The unique childKey (parent issue + normalized child brief) is
 -- the claim: creation is idempotent, so a retry after partial failure reuses
 -- children whose rows already carry their URLs and creates only the missing
--- ones.
+-- ones. applicationKey records the claiming application: same-key retries are
+-- serialized by the GroomingApplication resume CAS, so a fresh null claim
+-- under the retry's own key is an abandoned create, not a concurrent holder.
 CREATE TABLE "GroomingChildClaim" (
     "id" TEXT NOT NULL,
     "childKey" TEXT NOT NULL,
@@ -12,6 +14,7 @@ CREATE TABLE "GroomingChildClaim" (
     "title" TEXT NOT NULL,
     "childNumber" INTEGER,
     "childUrl" TEXT,
+    "applicationKey" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 

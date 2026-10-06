@@ -375,7 +375,15 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
     claimChild: async (input) => {
       const existing = children.get(input.childKey) ?? null;
       if (!existing) {
-        children.set(input.childKey, { childKey: input.childKey, childNumber: null, childUrl: null });
+        // Mirrors @updatedAt: the row is stamped at create, so a claim left by
+        // a crashed attempt is "fresh" until it ages out.
+        children.set(input.childKey, {
+          childKey: input.childKey,
+          childNumber: null,
+          childUrl: null,
+          applicationKey: input.applicationKey,
+          updatedAt: new Date(),
+        });
       }
       return { existing: existing ? { ...existing } : null };
     },
@@ -728,6 +736,25 @@ describe("applyGroomingMutations → decomposition", () => {
     expect(result.children).toHaveLength(2);
   });
 
+  it("records the decomposition state before adding the umbrella label (step ordering)", async () => {
+    const { github, calls } = fakeGitHub();
+    const store = memoryStore();
+    const recordState = store.setDecompositionState;
+    store.setDecompositionState = async (input) => {
+      calls.push("decompositionState");
+      return recordState(input);
+    };
+    const diff = diffFor(decomposeDraft());
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    // The umbrella, which removes the parent from every selection path, must
+    // be the children step's final write: the state lands before it.
+    const stateIdx = calls.indexOf("decompositionState");
+    const addLabelIdx = calls.indexOf("addLabel:umbrella");
+    expect(stateIdx).toBeGreaterThan(-1);
+    expect(addLabelIdx).toBeGreaterThan(stateIdx);
+  });
+
   it("reuses a child an earlier attempt already created, creating only the missing one", async () => {
     const { github } = fakeGitHub();
     const store = memoryStore();
@@ -735,7 +762,12 @@ describe("applyGroomingMutations → decomposition", () => {
     const briefs = diff.children!.briefs;
     // Simulate the first child having been created by an earlier attempt.
     const firstKey = childBriefKey("org/repo", 42, briefs[0]);
-    store.children.set(firstKey, { childKey: firstKey, childNumber: 99, childUrl: "https://github.com/org/repo/issues/99" });
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: 99,
+      childUrl: "https://github.com/org/repo/issues/99",
+      applicationKey: KEY,
+    });
     const result = await applyGroomingMutations(applyInput(diff), github, store);
     expect(github.createIssue).toHaveBeenCalledTimes(1);
     const step = result.steps.children!;
@@ -803,9 +835,16 @@ describe("applyGroomingMutations → decomposition", () => {
     const diff = diffFor(decomposeDraft());
     const briefs = diff.children!.briefs;
     const firstKey = childBriefKey("org/repo", 42, briefs[0]);
-    // A claim with no recorded child, written moments ago: another attempt is
-    // in flight on it. Do not create a duplicate on top of it.
-    store.children.set(firstKey, { childKey: firstKey, childNumber: null, childUrl: null, updatedAt: new Date() });
+    // A claim with no recorded child under a DIFFERENT application key,
+    // written moments ago: another attempt is in flight on it. Do not create a
+    // duplicate on top of it.
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: null,
+      childUrl: null,
+      applicationKey: "b".repeat(64),
+      updatedAt: new Date(),
+    });
     const result = await applyGroomingMutations(applyInput(diff), github, store);
     expect(result.outcome).toBe("partial"); // the labels step landed, children failed
     expect(result.failure).toMatchObject({ step: "children", error: expect.stringContaining(`child claim ${firstKey} is held by another in-flight attempt`) });
@@ -816,18 +855,45 @@ describe("applyGroomingMutations → decomposition", () => {
     expect(result.labels).not.toContain("umbrella");
   });
 
+  it("creates a child whose fresh null claim is its own (same application key)", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const briefs = diff.children!.briefs;
+    const firstKey = childBriefKey("org/repo", 42, briefs[0]);
+    // A claim with no recorded child under THIS application's own key, written
+    // moments ago: the GroomingApplication resume CAS already excludes a
+    // concurrent same-key attempt, so this is my own abandoned create from a
+    // crashed attempt — create on top of it (the immediate same-key retry).
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: null,
+      childUrl: null,
+      applicationKey: KEY,
+      updatedAt: new Date(),
+    });
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    // The abandoned claim is overwritten with the newly created child.
+    expect(store.children.get(firstKey)).toMatchObject({ childNumber: 43, childUrl: "https://github.com/org/repo/issues/43" });
+    expect(github.addLabel).toHaveBeenCalledTimes(1);
+  });
+
   it("creates a child whose null claim has aged out (no in-flight attempt)", async () => {
     const { github } = fakeGitHub();
     const store = memoryStore();
     const diff = diffFor(decomposeDraft());
     const briefs = diff.children!.briefs;
     const firstKey = childBriefKey("org/repo", 42, briefs[0]);
-    // A claim with no recorded child, written more than 2×ACTIVE_CLAIM_MS ago:
-    // the attempt that took it is long gone, so create proceeds.
+    // A claim with no recorded child and no applicationKey (a row shape no
+    // deployed env has), written more than 2×ACTIVE_CLAIM_MS ago: the attempt
+    // that took it is long gone, so create proceeds.
     store.children.set(firstKey, {
       childKey: firstKey,
       childNumber: null,
       childUrl: null,
+      applicationKey: null,
       updatedAt: new Date(Date.now() - 2 * ACTIVE_CLAIM_MS),
     });
     const result = await applyGroomingMutations(applyInput(diff), github, store);
@@ -859,8 +925,11 @@ describe("applyGroomingMutations → decomposition", () => {
     // A partial decomposition never lands the umbrella.
     expect(first.github.addLabel).not.toHaveBeenCalled();
 
-    // A retry under the same application key: child A is reused, only the
-    // missing children are created, and the umbrella lands at that point.
+    // A retry under the same application key (no hand-seeded rows): child A
+    // is reused; child B's fresh null claim carries THIS key, which the
+    // GroomingApplication resume CAS proves is not a concurrent holder, so the
+    // held-claim guard does not fire and only the missing children are created,
+    // and the umbrella lands at that point.
     const retry = fakeGitHub();
     const converged = await applyGroomingMutations(applyInput(diff), retry.github, store);
     expect(converged.outcome).toBe("applied");

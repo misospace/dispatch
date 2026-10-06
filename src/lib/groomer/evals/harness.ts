@@ -222,8 +222,9 @@ export async function runCandidate(
         const key = String(data.childKey);
         // The unique childKey, as Postgres enforces it.
         if (childClaims.has(key)) throw Object.assign(new Error("Unique constraint failed on childKey"), { code: "P2002" });
-        // A created row has no childNumber/childUrl until the creation is recorded.
-        const row = { ...structuredClone(data), childKey: key, childNumber: null, childUrl: null };
+        // A created row has no childNumber/childUrl until the creation is
+        // recorded; updatedAt is stamped at create, mirroring @updatedAt.
+        const row = { ...structuredClone(data), childKey: key, childNumber: null, childUrl: null, updatedAt: new Date() };
         childClaims.set(key, row);
         return row;
       },
