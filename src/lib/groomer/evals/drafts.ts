@@ -141,18 +141,22 @@ export function alreadyDone(
   return draft;
 }
 
-/** Child briefs for decomposition fixtures. */
+/**
+ * Child briefs for decomposition fixtures. Every field the apply-time
+ * decomposition policy requires a complete bounded brief to carry is filled in
+ * (a brief left incomplete would withhold the split, not create children).
+ */
 export function children(titles: string[]): ChildBrief[] {
   return titles.map((title) => ({
     title,
     problem: `${title}, as its own bounded change.`,
-    designDecision: null,
-    verifiedCurrentBehavior: null,
-    relevantPaths: [],
+    designDecision: `${title} follows the existing pattern; no design choice is left open.`,
+    verifiedCurrentBehavior: `${title} is not implemented yet; the current code does not cover it.`,
+    relevantPaths: ["src/admin/Dashboard.tsx"],
     inScope: [title.toLowerCase()],
-    outOfScope: [],
+    outOfScope: [`${title} does not change unrelated areas`],
     dependencies: [],
     acceptanceCriteria: [`${title} works end to end`],
-    tests: [],
+    tests: [`${title} is covered by an automated test`],
   }));
 }

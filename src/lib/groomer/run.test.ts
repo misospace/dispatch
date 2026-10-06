@@ -2637,14 +2637,16 @@ Investigate session handling in auth module.`;
       const childBrief = (n: number) => ({
         title: `Bounded child ${n}`,
         problem: `Child ${n} problem, as its own bounded change.`,
-        designDecision: null,
-        verifiedCurrentBehavior: null,
-        relevantPaths: [],
+        // Every field the apply-time decomposition policy requires a complete
+        // bounded brief to carry: an incomplete brief withholds the split.
+        designDecision: `Child ${n} follows the existing pattern; no design choice is left open.`,
+        verifiedCurrentBehavior: `Child ${n} is not implemented yet; login.ts drops the return URL.`,
+        relevantPaths: ["src/auth/login.ts"],
         inScope: [`child ${n}`],
-        outOfScope: [],
+        outOfScope: [`Child ${n} does not touch authentication`],
         dependencies: [],
         acceptanceCriteria: [`Child ${n} works end to end`],
-        tests: [],
+        tests: [`Child ${n} is covered by an automated test`],
       });
 
       /** A non-ready (backlog) verdict that splits the issue into `count` bounded children. */
@@ -2684,6 +2686,18 @@ Investigate session handling in auth module.`;
         );
         // The run records the created child links, in brief order.
         expect(result!.appliedMutations!.childrenCreated).toHaveLength(2);
+        // The children step writes a managed decomposition section into the
+        // parent body: the marker pair plus one `- #<n>: <url>` line per
+        // created child. The content step wrote nothing (no title/body in the
+        // plan), so this is the only body write.
+        expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledTimes(1);
+        const written = mocks.updateIssueTitleAndBody.mock.calls[0][2] as { body?: string | null };
+        expect(written.body).toContain("<!-- dispatch-groomer:decomposition:start -->");
+        expect(written.body).toContain("<!-- dispatch-groomer:decomposition:end -->");
+        const created = result!.appliedMutations!.childrenCreated as { number: number; url: string }[];
+        for (const child of created) {
+          expect(written.body).toContain(`- #${child.number}: ${child.url}`);
+        }
       });
 
       it("an exact retry is a replay: it creates no new child and re-surfaces the created links", async () => {
@@ -2772,6 +2786,43 @@ Investigate session handling in auth module.`;
         expect(mocks.createIssue).not.toHaveBeenCalled();
         expect(mocks.addIssueLabel).not.toHaveBeenCalled();
         expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
+      });
+
+      it("withholds the decomposition end to end when a child brief is not a complete bounded implementation brief", async () => {
+        // Everything complete except the settled design decision: a child that
+        // leaves a design choice open is not bounded, so the split is withheld.
+        mocks.callGroomerLLM.mockResolvedValue(
+          notReadyDraft("backlog", {
+            decomposition: {
+              required: true,
+              reason: "split it",
+              childBriefs: [{ ...childBrief(1), designDecision: null }],
+            },
+          }),
+        );
+        const result = await runHostedGroomer();
+
+        // The plan still lands (as backlog); only the decomposition is withheld.
+        expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
+        // The run records exactly which child and which field is short.
+        const withheld = result!.appliedMutations!.withheld as { decomposition: string[] };
+        expect(withheld.decomposition).toEqual([
+          "child brief[0] is not a complete bounded implementation brief (missing: designDecision)",
+        ]);
+        // No child is created, no umbrella lands, and the parent is not decomposed.
+        expect(mocks.createIssue).not.toHaveBeenCalled();
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+        expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
+        expect(
+          (mocks.prisma.issue.update.mock.calls.map((c) => c[0].data as Record<string, unknown>) ?? []).some(
+            (data) => data.decomposed === true,
+          ),
+        ).toBe(false);
+        expect(
+          (mocks.prisma.auditLog.create.mock.calls.map((c) => c[0].data as Record<string, unknown>) ?? []).some(
+            (data) => data.action === "issue_decomposed",
+          ),
+        ).toBe(false);
       });
     });
 

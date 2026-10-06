@@ -43,6 +43,13 @@ import {
 
 export const APPLICATION_KEY_VERSION = 1;
 export const MAX_GITHUB_COMMENT_CHARS = 4096;
+/**
+ * The largest body the applier will write to GitHub. GitHub's issue body cap
+ * is ~125k characters; a write at or over it fails, so a section render that
+ * would cross this cap is refused (like a malformed marker) rather than
+ * failing on every retry and never landing the umbrella.
+ */
+export const MAX_GITHUB_BODY_CHARS = 120_000;
 
 // ─── Label helpers (moved from run.ts) ───────────────────────────────────────
 
@@ -151,6 +158,77 @@ export function renderManagedBody(parsed: Extract<ManagedBody, { ok: true }>, co
   return `${human}${separator}${section}`;
 }
 
+// ─── Managed decomposition section ─────────────────────────────────────────────
+
+export const DECOMPOSITION_BODY_START = "<!-- dispatch-groomer:decomposition:start -->";
+export const DECOMPOSITION_BODY_END = "<!-- dispatch-groomer:decomposition:end -->";
+
+export type DecompositionBody =
+  | { ok: true; human: string; before: string; after: string; decomposition: string | null }
+  | { ok: false; reason: string };
+
+/**
+ * Split an issue body around its one managed decomposition section, if
+ * present. The section the children step writes after a decomposition (the
+ * children the issue was split into): the same marker discipline as the
+ * managed section — malformed markers (unpaired, repeated, or out of order)
+ * are reported rather than guessed at, so a human edit that broke them never
+ * makes the groomer rewrite text it does not own.
+ */
+export function parseDecompositionBody(body: string | null): DecompositionBody {
+  const text = body ?? "";
+  const starts = text.split(DECOMPOSITION_BODY_START).length - 1;
+  const ends = text.split(DECOMPOSITION_BODY_END).length - 1;
+  if (starts === 0 && ends === 0) return { ok: true, human: text, before: text, after: "", decomposition: null };
+  if (starts !== 1 || ends !== 1) return { ok: false, reason: "the decomposition section markers are unpaired or repeated" };
+  const start = text.indexOf(DECOMPOSITION_BODY_START);
+  const end = text.indexOf(DECOMPOSITION_BODY_END);
+  if (end < start) return { ok: false, reason: "the decomposition section end marker precedes its start" };
+  const before = text.slice(0, start);
+  const after = text.slice(end + DECOMPOSITION_BODY_END.length);
+  const decomposition = text.slice(start + DECOMPOSITION_BODY_START.length, end).trim();
+  const human = [before.trim(), after.trim()].filter((part) => part.length > 0).join("\n\n");
+  return { ok: true, human, before, after, decomposition };
+}
+
+function decompositionSection(content: string): string {
+  const cleaned = content.split(DECOMPOSITION_BODY_START).join("").split(DECOMPOSITION_BODY_END).join("").trim();
+  return `${DECOMPOSITION_BODY_START}\n${cleaned}\n${DECOMPOSITION_BODY_END}`;
+}
+
+/**
+ * The body with `content` as its one managed decomposition section. An
+ * existing section is replaced in place; otherwise the section is appended
+ * after the text that precedes it. Everything outside the section — including
+ * the managed enrichment section — is kept byte for byte, so re-rendering the
+ * same content is a fixed point.
+ */
+export function renderDecompositionBody(parsed: Extract<DecompositionBody, { ok: true }>, content: string): string {
+  const section = decompositionSection(content);
+  if (parsed.decomposition !== null) return `${parsed.before}${section}${parsed.after}`;
+  const human = parsed.before;
+  if (human.trim().length === 0) return section;
+  const separator = human.endsWith("\n\n") ? "" : human.endsWith("\n") ? "\n" : "\n\n";
+  return `${human}${separator}${section}`;
+}
+
+/**
+ * The section content: a human-readable heading and the one sentence that
+ * says what the section is, then one line per created-or-reused child link,
+ * in brief order. Deterministic — no timestamps, no digests — so re-rendering
+ * the same children is a fixed point.
+ */
+export function renderDecompositionSection(children: ChildIssueLink[]): string {
+  const bullets = children.map((child) => `- #${child.number}: ${child.url}`).join("\n");
+  return [
+    "## Decomposition",
+    "",
+    "Created from this parent's grooming decomposition plan. Each child starts `status/backlog` and needs its own grooming pass before pickup.",
+    "",
+    bullets,
+  ].join("\n");
+}
+
 // ─── Comment marker ───────────────────────────────────────────────────────────
 
 /** Only the marker Dispatch appends counts: it must end the comment. */
@@ -205,6 +283,16 @@ export interface GroomingMutationDiff {
   title: string | null;
   /** New full body; null when unchanged. */
   body: string | null;
+  /**
+   * The live body the diff was computed from, before any of this diff's
+   * writes; null when the issue has no body. The children step renders its
+   * managed section into the body as it stands after the content step — the
+   * post-content body when that step has a write, this live body otherwise.
+   * The apply preconditions verify the live body equals the evidence
+   * snapshot's, so this is exactly the body the children step starts from
+   * when the content step writes nothing.
+   */
+  bodyBefore: string | null;
   /** Why proposed body enrichment was not applied, when it was not. */
   bodySkippedReason: string | null;
   close: boolean;
@@ -344,7 +432,13 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     } else if (!shouldEnrichBody(parsed.human)) {
       bodySkippedReason = "the human-authored body is not sparse";
     } else {
-      const rendered = renderManagedBody(parsed, neutralizeMentions(output.proposedBody));
+      // A marker the model wrote into its enrichment is stripped before it
+      // lands (like the comment's, below): a decomposition marker in
+      // particular would otherwise be parsed as the children step's own
+      // section — an embedded pair would have the model's text between it
+      // replaced, an unpaired one would poison the body into a refusal.
+      const enrichment = neutralizeMentions(output.proposedBody.replace(ANY_GROOMER_MARKER, ""));
+      const rendered = renderManagedBody(parsed, enrichment);
       if (rendered !== (live.body ?? "")) body = rendered;
       else bodySkippedReason = "the managed section already holds this content";
     }
@@ -364,6 +458,7 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     comment,
     title,
     body,
+    bodyBefore: live.body,
     bodySkippedReason,
     close: done && live.state === "open" && inFlightStatus(live.labels) === null,
     children,
@@ -843,6 +938,15 @@ export async function applyGroomingMutations(
   //    before the close, so a close is never applied on top of a decomposition
   //    that failed to land.
   const children = diff.children;
+  // The body the children step starts from: the post-content body when the
+  // content step has a write (the managed enrichment section, if it lands),
+  // the live body as diffed otherwise. `childrenFinalBody` records what the
+  // step's section write leaves the body as (the unchanged body when the
+  // write is refused or a no-op), so the result can report the real
+  // post-apply body for the freshness baseline.
+  const baseBody = diff.body !== null ? diff.body : (diff.bodyBefore ?? "");
+  const liveUnchangedBody = diff.body !== null ? diff.body : diff.bodyBefore;
+  let childrenFinalBody: string | null = null;
   await run(
     "children",
     children !== null,
@@ -927,12 +1031,50 @@ export async function applyGroomingMutations(
           note: children.reason,
           followUpUrls: links.map((child) => child.url),
         });
-        // The umbrella lands last, now that every child exists or is reused and
-        // the decomposition state is recorded; a failed create or a failed
-        // state write throws before this line, so a partial decomposition never
+        // The managed decomposition section: one section in the parent's body
+        // listing the children this decomposition created or reused. It
+        // renders into the body as it stands after the content step, so the
+        // managed enrichment section and this one coexist, each parsed and
+        // rendered independently. A failed write here throws like a failed
+        // child create above, so the umbrella never lands on a decomposition
+        // whose section write failed, and a retry converges; a body whose
+        // markers a human edit broke is refused, not guessed at, and a
+        // rendered body that would exceed GitHub's body cap is refused
+        // likewise (the write would fail on every retry, and the umbrella
+        // would never land) — in either case the children, the state and the
+        // umbrella still land.
+        // The step's detail carries the created/reused counts plus the
+        // section outcome (written, unchanged, or refused with the reason),
+        // so the run record shows what the body write did without re-reading
+        // the issue.
+        let detail = `${created.length} created, ${reused.length} reused`;
+        const parsedSection = parseDecompositionBody(baseBody);
+        if (!parsedSection.ok) {
+          detail += `; decomposition section write refused: ${parsedSection.reason}`;
+          childrenFinalBody = liveUnchangedBody;
+        } else {
+          const rendered = renderDecompositionBody(parsedSection, renderDecompositionSection(links));
+          if (rendered !== baseBody) {
+            if (rendered.length > MAX_GITHUB_BODY_CHARS) {
+              detail += `; decomposition section write refused: body would exceed ${MAX_GITHUB_BODY_CHARS} characters`;
+              childrenFinalBody = liveUnchangedBody;
+            } else {
+              await github.updateTitleAndBody(repoFullName, issueNumber, { body: rendered });
+              childrenFinalBody = rendered;
+              detail += "; decomposition section written";
+            }
+          } else {
+            childrenFinalBody = liveUnchangedBody;
+            detail += "; decomposition section unchanged";
+          }
+        }
+        // The umbrella lands last, now that every child exists or is reused,
+        // the decomposition state is recorded and the section is written or
+        // refused; a failed create, a failed state write or a failed section
+        // write throws before this line, so a partial decomposition never
         // lands the umbrella.
         await github.addLabel(repoFullName, issueNumber, UMBRELLA_LABEL);
-        return { children: { created, reused }, detail: `${created.length} created, ${reused.length} reused` };
+        return { children: { created, reused }, detail };
       } catch (err) {
         // Carry what completed so far so the failed step record (and a retry)
         // can see the children that did land.
@@ -970,6 +1112,19 @@ export async function applyGroomingMutations(
   const outcome: ApplyOutcome = failure ? (wrote ? "partial" : "failed") : wrote ? "applied" : "noop";
   await persist(failure ? (wrote ? "partial" : "failed") : "applied");
 
+  // The real post-apply body, for the freshness baseline (run.ts): the
+  // children step's section write is the last word on the body, so what it
+  // left behind wins whenever it was reached (even if the step then failed at
+  // the umbrella — the write itself landed); otherwise the content step's
+  // write; otherwise null (nothing written, the baseline falls back to the
+  // snapshot).
+  const finalBody =
+    childrenFinalBody !== null
+      ? childrenFinalBody
+      : landed(steps.content) && diff.body !== null
+        ? diff.body
+        : null;
+
   return {
     outcome,
     steps,
@@ -978,7 +1133,7 @@ export async function applyGroomingMutations(
     labels,
     children: appliedChildren,
     title: landed(steps.content) && diff.title !== null ? diff.title : null,
-    body: landed(steps.content) && diff.body !== null ? diff.body : null,
+    body: finalBody,
     closed,
     failure,
   };

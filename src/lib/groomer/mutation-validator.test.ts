@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
-import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
+import { validateGroomingPlan, type ChildBrief, type GroomingPlan, type GroomingPlanDraft } from "./plan";
 import {
+  childBriefCompletenessGaps,
   evaluateClosePolicy,
   evaluateDecompositionPolicy,
   evaluateReadyPolicy,
@@ -129,14 +130,14 @@ function decomposeDraft(): GroomingPlanDraft {
         {
           title: "Child issue A",
           problem: "Child A problem",
-          designDecision: null,
-          verifiedCurrentBehavior: null,
-          relevantPaths: [],
+          designDecision: "No design choice; follow the existing returnTo handling",
+          verifiedCurrentBehavior: "redirectAfterLogin drops session.returnTo",
+          relevantPaths: ["src/auth/login.ts"],
           inScope: ["A"],
-          outOfScope: [],
-          dependencies: [],
+          outOfScope: ["B"],
+          dependencies: ["child B: the migration"],
           acceptanceCriteria: ["A works"],
-          tests: [],
+          tests: ["reset-then-login test"],
         },
       ],
     },
@@ -147,6 +148,17 @@ function planFor(draft: GroomingPlanDraft, snap = snapshot()): GroomingPlan {
   const result = validateGroomingPlan(draft, { catalog: catalogFor(snap) });
   if (!result.valid) throw new Error(result.errors!.join("; "));
   return result.plan!;
+}
+
+/** The plan with its first child brief overridden, built as if valid. */
+function withChildBrief(base: GroomingPlan, brief: Partial<ChildBrief>): GroomingPlan {
+  return {
+    ...base,
+    decomposition: {
+      ...base.decomposition,
+      childBriefs: base.decomposition.childBriefs.map((b, i) => (i === 0 ? { ...b, ...brief } : b)),
+    },
+  };
 }
 
 const WINDOW_START = new Date("2026-09-26T00:00:00.000Z");
@@ -537,7 +549,7 @@ describe("evaluateReadyPolicy", () => {
 describe("evaluateDecompositionPolicy", () => {
   const plan = planFor(decomposeDraft());
 
-  it("allows a decisive decomposition with no close and no material uncertainty", () => {
+  it("allows a complete bounded child brief with no close and no material uncertainty", () => {
     expect(evaluateDecompositionPolicy(plan)).toEqual([]);
   });
 
@@ -577,5 +589,105 @@ describe("evaluateDecompositionPolicy", () => {
       verdict: { ...plan.verdict, uncertainties: [{ kind: "scope", question: "Nice to know", material: false }] },
     };
     expect(evaluateDecompositionPolicy(forged)).toEqual([]);
+  });
+
+  const fieldCases: Array<[string, Partial<ChildBrief>, string]> = [
+    ["problem", { problem: "   " }, "problem"],
+    ["designDecision", { designDecision: null }, "designDecision"],
+    ["verifiedCurrentBehavior", { verifiedCurrentBehavior: null }, "verifiedCurrentBehavior"],
+    ["relevantPaths", { relevantPaths: [] }, "relevantPaths"],
+    ["inScope", { inScope: [] }, "inScope"],
+    ["outOfScope", { outOfScope: [] }, "outOfScope"],
+    ["acceptanceCriteria", { acceptanceCriteria: [] }, "acceptanceCriteria"],
+    ["tests", { tests: [] }, "tests"],
+  ];
+
+  it.each(fieldCases)("rejects a child brief missing %s", (_field, patch, missing) => {
+    const forged = withChildBrief(plan, patch);
+    expect(evaluateDecompositionPolicy(forged)).toEqual([
+      `child brief[0] is not a complete bounded implementation brief (missing: ${missing})`,
+    ]);
+  });
+
+  it("does not treat empty dependencies as a gap", () => {
+    const forged = withChildBrief(plan, { dependencies: [] });
+    expect(evaluateDecompositionPolicy(forged)).toEqual([]);
+  });
+
+  it("treats whitespace-only entries as absent", () => {
+    const forged = withChildBrief(plan, {
+      designDecision: "   ",
+      verifiedCurrentBehavior: "  ",
+      relevantPaths: ["\t"],
+      inScope: ["  "],
+      outOfScope: ["\n"],
+      acceptanceCriteria: ["  "],
+      tests: ["   "],
+    });
+    expect(evaluateDecompositionPolicy(forged)).toEqual([
+      "child brief[0] is not a complete bounded implementation brief (missing: designDecision, verifiedCurrentBehavior, relevantPaths, inScope, outOfScope, acceptanceCriteria, tests)",
+    ]);
+  });
+
+  it("reports every incomplete child in its own reason, in brief order", () => {
+    const full = plan.decomposition.childBriefs[0];
+    const forged: GroomingPlan = {
+      ...plan,
+      decomposition: {
+        ...plan.decomposition,
+        childBriefs: [
+          { ...full, designDecision: null, tests: [] },
+          { ...full, verifiedCurrentBehavior: null, outOfScope: [] },
+        ],
+      },
+    };
+    expect(evaluateDecompositionPolicy(forged)).toEqual([
+      "child brief[0] is not a complete bounded implementation brief (missing: designDecision, tests)",
+      "child brief[1] is not a complete bounded implementation brief (missing: verifiedCurrentBehavior, outOfScope)",
+    ]);
+  });
+});
+
+describe("childBriefCompletenessGaps", () => {
+  const full: ChildBrief = {
+    title: "Child",
+    problem: "Child problem",
+    designDecision: "follow the existing pattern",
+    verifiedCurrentBehavior: "redirectAfterLogin drops session.returnTo",
+    relevantPaths: ["src/auth/login.ts"],
+    inScope: ["A"],
+    outOfScope: ["B"],
+    dependencies: [],
+    acceptanceCriteria: ["A works"],
+    tests: ["reset-then-login test"],
+  };
+
+  it("lists no gaps for a complete brief, whatever its dependencies are", () => {
+    expect(childBriefCompletenessGaps(full)).toEqual([]);
+  });
+
+  it("lists the missing fields in field order and never reports dependencies", () => {
+    const brief: ChildBrief = {
+      ...full,
+      problem: "   ",
+      designDecision: null,
+      verifiedCurrentBehavior: null,
+      relevantPaths: [],
+      inScope: [],
+      outOfScope: [],
+      dependencies: [],
+      acceptanceCriteria: [],
+      tests: [],
+    };
+    expect(childBriefCompletenessGaps(brief)).toEqual([
+      "problem",
+      "designDecision",
+      "verifiedCurrentBehavior",
+      "relevantPaths",
+      "inScope",
+      "outOfScope",
+      "acceptanceCriteria",
+      "tests",
+    ]);
   });
 });
