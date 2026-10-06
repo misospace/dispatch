@@ -291,6 +291,7 @@ describe("runHostedGroomer", () => {
     mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
     mocks.callGroomerLLM.mockResolvedValue(mockOutput);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.updateIssueTitleAndBody.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
     mocks.closeIssue.mockResolvedValue(undefined);
@@ -2665,9 +2666,11 @@ Investigate session handling in auth module.`;
           "org/repo",
           expect.objectContaining({ labels: ["status/backlog"] }),
         );
-        // The umbrella rides the single labels write; the children step makes none.
+        // The umbrella is an additive write by the children step, not part of the labels write.
         expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
-        expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, expect.arrayContaining(["umbrella"]));
+        expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, expect.not.arrayContaining(["umbrella"]));
+        expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+        expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
         // The parent's decomposition state is persisted with the child URLs as follow-ups.
         expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -2693,6 +2696,9 @@ Investigate session handling in auth module.`;
         expect(mocks.createIssue).toHaveBeenCalledTimes(2);
         expect(first!.appliedMutations!.childrenCreated).toHaveLength(2);
         expect(second!.appliedMutations!.childrenCreated).toHaveLength(2);
+        // The umbrella is added once, on the first attempt; the replay adds none.
+        expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+        expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
         // Same application key, so the replay is attributable to the first run.
         expect(first!.mutationPlan!.applicationKey).toBe(second!.mutationPlan!.applicationKey);
       });
@@ -2711,6 +2717,8 @@ Investigate session handling in auth module.`;
         const first = await runHostedGroomer();
         expect(first!.appliedMutations).toMatchObject({ outcome: "partial" });
         expect(first!.appliedMutations!.childrenError).toMatch(/502/);
+        // A partial decomposition never lands the umbrella.
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
 
         // The retry: the failing creation now succeeds.
         mocks.createIssue.mockImplementation(async () => {
@@ -2725,6 +2733,9 @@ Investigate session handling in auth module.`;
         // The child that landed before the failure is reused; only the missing ones are created.
         expect(second!.appliedMutations!.childrenCreated).toHaveLength(2);
         expect(second!.appliedMutations!.childrenReused).toHaveLength(1);
+        // The umbrella lands once the decomposition fully converges.
+        expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+        expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
         // One claim per distinct child, across both attempts (idempotent child identity).
         expect(mocks.prisma.groomingChildClaim.create).toHaveBeenCalledTimes(3);
       });
@@ -2741,6 +2752,7 @@ Investigate session handling in auth module.`;
         expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
         expect(result!.appliedMutations!.withheld).toMatchObject({ decomposition: expect.any(Array) });
         expect(mocks.createIssue).not.toHaveBeenCalled();
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
         expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
       });
 
@@ -2756,6 +2768,7 @@ Investigate session handling in auth module.`;
         expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
         expect(result!.appliedMutations!.withheld).toMatchObject({ decomposition: expect.any(Array) });
         expect(mocks.createIssue).not.toHaveBeenCalled();
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
         expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
       });
     });

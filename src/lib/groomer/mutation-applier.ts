@@ -308,13 +308,15 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     effective.mutations.status,
   );
 
-  // A policy-passing decomposition decorates the parent as an umbrella. That
-  // label rides the labels step (not a second write in the children step) so
-  // the application key, ApplyResult.labels and the freshness baseline all
-  // include it — otherwise the next snapshot would read the groomer's own
-  // umbrella as an external change.
-  if (children !== null && !labelsAfter.includes(UMBRELLA_LABEL)) labelsAfter.push(UMBRELLA_LABEL);
-
+  // The umbrella label is deliberately NOT part of labelsAfter (and so not of
+  // the labels step): it is added by the children step, and only after every
+  // child exists or is reused. The groomer selector excludes umbrella-labeled
+  // issues from selection on every path — including a targeted re-groom by
+  // issueNumber (which bypasses only the grooming-state exclusion, not the
+  // umbrella one) — so landing the umbrella first would make a decomposition
+  // that fails halfway un-reselectable, breaking "a partial create converges on
+  // retry". The label we write is still folded into ApplyResult.labels below so
+  // the freshness baseline and audit record it.
   // status/done lands only after the close succeeds, so a failed close
   // leaves the issue open with its previous status (still groomable),
   // never open with status/done (which the selector skips forever). An issue
@@ -395,9 +397,10 @@ export function computeApplicationKey(input: {
       close: diff.close,
       // The decomposition is part of the intent: its children are the stable
       // childBriefKeys, so a change to the split (or its withholding) changes
-      // the application key.
+      // the application key. Sorted, because the brief order is not identity —
+      // the same set of children in a different order is the same application.
       children: diff.children
-        ? diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief))
+        ? diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief)).sort()
         : null,
     },
   };
@@ -405,6 +408,18 @@ export function computeApplicationKey(input: {
 }
 
 // ─── Application ──────────────────────────────────────────────────────────────
+
+/**
+ * A step write that failed partway, carrying the partial result that did
+ * complete (e.g. the children created before a later child's create threw) so
+ * the failed step record — and a retry — can see and reuse it.
+ */
+export class PartialStepError extends Error {
+  constructor(message: string, readonly partial: Partial<ApplyStepResult>) {
+    super(message);
+    this.name = "PartialStepError";
+  }
+}
 
 export const APPLY_STEPS = ["labels", "comment", "content", "children", "close", "done_label"] as const;
 export type ApplyStep = (typeof APPLY_STEPS)[number];
@@ -484,6 +499,8 @@ export interface ChildClaimRecord {
   childKey: string;
   childNumber: number | null;
   childUrl: string | null;
+  /** When the claim row was last written; the prisma store returns it. */
+  updatedAt?: Date | string | null;
 }
 
 export interface ApplicationStore {
@@ -544,6 +561,8 @@ export interface ApplierGitHub {
   fetchRecentComments(repoFullName: string, issueNumber: number, max: number): Promise<LiveComment[]>;
   /** Open a new issue (a decomposition child); returns its number and URL. */
   createIssue(repoFullName: string, input: { title: string; body: string; labels?: string[] }): Promise<{ number: number; url: string }>;
+  /** Add a single label to the issue (the children step's umbrella). */
+  addLabel(repoFullName: string, issueNumber: number, label: string): Promise<void>;
 }
 
 export interface ApplyInput {
@@ -705,7 +724,15 @@ export async function applyGroomingMutations(
       steps[step] = { status: "applied", ...(result ?? {}), at: now().toISOString() };
     } catch (err) {
       const error = errorMessage(err);
-      steps[step] = { status: "failed", error, at: now().toISOString() };
+      // A PartialStepError carries the partial result that completed (e.g. the
+      // children created before a later create threw), so the failed step
+      // record — and a retry — can see and reuse it.
+      steps[step] = {
+        status: "failed",
+        error,
+        ...(err instanceof PartialStepError ? err.partial : {}),
+        at: now().toISOString(),
+      };
       failure = { step, error };
       console.error(`[groomer] ${repoFullName}#${issueNumber}: ${step} failed; later steps not attempted:`, err);
     }
@@ -788,11 +815,14 @@ export async function applyGroomingMutations(
 
   // 4. Children (dispatch#1066): one bounded child issue per brief. Creation
   //    is idempotent through the GroomingChildClaim keyed by the childBriefKey
-  //    (a retry reuses a created child and creates only the missing ones). The
-  //    umbrella label rides the labels step above, so this step only creates
-  //    the children and records the parent's decomposition state with their
-  //    URLs as the follow-ups. It lands before the close, so a close is never
-  //    applied on top of a decomposition that failed to land.
+  //    (a retry reuses a created child and creates only the missing ones). Only
+  //    after every child exists or is reused does this step add the umbrella
+  //    label (an additive write) and record the parent's decomposition state
+  //    with the child URLs as the follow-ups. The umbrella lands last so a
+  //    decomposition that fails mid-create leaves the parent still
+  //    re-selectable (the selector excludes umbrella issues) and converges on
+  //    retry. It lands before the close, so a close is never applied on top of
+  //    a decomposition that failed to land.
   const children = diff.children;
   let appliedChildren: ChildIssueLink[] = [];
   await run(
@@ -804,51 +834,68 @@ export async function applyGroomingMutations(
       const created: ChildIssueLink[] = [];
       const reused: ChildIssueLink[] = [];
       const links: ChildIssueLink[] = [];
-      for (const brief of children.briefs) {
-        const childKey = childBriefKey(repoFullName, issueNumber, brief);
-        const { existing } = await store.claimChild({
-          childKey,
-          parentIssueId: input.issueId,
-          repoFullName,
-          parentNumber: issueNumber,
-          title: brief.title,
-        });
-        if (existing && existing.childNumber !== null && existing.childUrl !== null) {
-          // An earlier attempt of this application already created this child.
-          const link: ChildIssueLink = { key: childKey, number: existing.childNumber, url: existing.childUrl };
-          reused.push(link);
-          links.push(link);
-        } else {
-          const body = renderChildIssueBody({
-            brief,
-            parent: parentTarget,
-            decompositionReason: children.reason,
+      try {
+        for (const brief of children.briefs) {
+          const childKey = childBriefKey(repoFullName, issueNumber, brief);
+          const { existing } = await store.claimChild({
             childKey,
-          });
-          const issue = await github.createIssue(repoFullName, {
+            parentIssueId: input.issueId,
+            repoFullName,
+            parentNumber: issueNumber,
             title: brief.title,
-            body,
-            labels: [...CHILD_ISSUE_LABELS],
           });
-          await store.saveChild(childKey, { childNumber: issue.number, childUrl: issue.url });
-          const link: ChildIssueLink = { key: childKey, number: issue.number, url: issue.url };
-          created.push(link);
-          links.push(link);
+          if (existing && existing.childNumber !== null && existing.childUrl !== null) {
+            // An earlier attempt already created this child.
+            const link: ChildIssueLink = { key: childKey, number: existing.childNumber, url: existing.childUrl };
+            reused.push(link);
+            links.push(link);
+          } else {
+            // A claim with no recorded child and a fresh updatedAt is held by
+            // another in-flight attempt (a different application key claiming
+            // the same child); do not create a duplicate on top of it.
+            const heldAt = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : NaN;
+            if (existing && existing.childNumber === null && Number.isFinite(heldAt) && now().getTime() - heldAt < ACTIVE_CLAIM_MS) {
+              throw new Error(`child claim ${childKey} is held by another in-flight attempt`);
+            }
+            const body = renderChildIssueBody({
+              brief,
+              parent: parentTarget,
+              decompositionReason: children.reason,
+              childKey,
+            });
+            const issue = await github.createIssue(repoFullName, {
+              title: brief.title,
+              body,
+              labels: [...CHILD_ISSUE_LABELS],
+            });
+            await store.saveChild(childKey, { childNumber: issue.number, childUrl: issue.url });
+            const link: ChildIssueLink = { key: childKey, number: issue.number, url: issue.url };
+            created.push(link);
+            links.push(link);
+          }
         }
+        appliedChildren = links;
+        // Add the umbrella only now that every child exists or is reused; a
+        // failed create above throws before this line, so a partial
+        // decomposition never lands the umbrella.
+        await github.addLabel(repoFullName, issueNumber, UMBRELLA_LABEL);
+        // Record the decomposition state with the final label set (which
+        // includes the umbrella just written) and the child URLs.
+        await store.setDecompositionState({
+          issue: { id: input.issueId, labels: [...new Set([...diff.labelsAfter, UMBRELLA_LABEL])] },
+          repoFullName,
+          issueNumber,
+          actor: "hosted-groomer",
+          decomposed: true,
+          note: children.reason,
+          followUpUrls: links.map((child) => child.url),
+        });
+        return { children: { created, reused }, detail: `${created.length} created, ${reused.length} reused` };
+      } catch (err) {
+        // Carry what completed so far so the failed step record (and a retry)
+        // can see the children that did land.
+        throw new PartialStepError(errorMessage(err), { children: { created, reused } });
       }
-      appliedChildren = links;
-      // The umbrella label is already on GitHub from the labels step; record
-      // the decomposition state with the final label set and the child URLs.
-      await store.setDecompositionState({
-        issue: { id: input.issueId, labels: diff.labelsAfter },
-        repoFullName,
-        issueNumber,
-        actor: "hosted-groomer",
-        decomposed: true,
-        note: children.reason,
-        followUpUrls: links.map((child) => child.url),
-      });
-      return { children: { created, reused }, detail: `${created.length} created, ${reused.length} reused` };
     },
     "no decomposition in the plan",
   );
@@ -871,6 +918,11 @@ export async function applyGroomingMutations(
 
   if (landed(steps.labels)) labels = diff.labelsStep;
   if (landed(steps.done_label)) labels = diff.labelsAfter;
+  // The children step writes the umbrella additively (it is not part of
+  // diff.labelsAfter), so fold in the label we actually wrote. A union with the
+  // current set (not a reset to diff.labelsAfter) keeps whatever the labels /
+  // done-label step landed while adding the umbrella the children step wrote.
+  if (landed(steps.children)) labels = [...new Set([...labels, UMBRELLA_LABEL])];
 
   const wrote = APPLY_STEPS.some((step) => steps[step]?.status === "applied" || steps[step]?.status === "replayed");
   const outcome: ApplyOutcome = failure ? (wrote ? "partial" : "failed") : wrote ? "applied" : "noop";

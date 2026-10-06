@@ -271,6 +271,9 @@ export async function runCandidate(
       writes.children.push({ number, url });
       return { number, html_url: url };
     },
+    // The children step's umbrella: a separate additive write, not part of the
+    // labels-step writes.labels.
+    addLabel: async () => {},
     findActiveLeases: async () => [],
     upsertLease: async () => ({ created: true, lease: { id: "lease-1" } }),
     releaseLease: async () => ({ id: "lease-1" }),

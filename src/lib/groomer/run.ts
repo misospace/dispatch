@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { addIssueComment, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
+import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
@@ -109,6 +109,8 @@ export interface GroomerDeps {
   closeIssue: typeof closeIssue;
   /** Open a decomposition child issue (dispatch#1066). */
   createIssue: typeof createIssue;
+  /** Add a single label (the children step's umbrella, dispatch#1066). */
+  addLabel: typeof addIssueLabel;
   findActiveLeases: typeof findActiveLeasesForIssue;
   upsertLease: typeof upsertLease;
   releaseLease: typeof releaseLease;
@@ -141,6 +143,7 @@ const defaultDeps: GroomerDeps = {
   updateTitleAndBody: updateIssueTitleAndBody,
   closeIssue,
   createIssue,
+  addLabel: addIssueLabel,
   findActiveLeases: findActiveLeasesForIssue,
   upsertLease,
   releaseLease,
@@ -841,6 +844,7 @@ async function executeGroomerRun(
       addComment: deps.addComment,
       updateTitleAndBody: deps.updateTitleAndBody,
       closeIssue: deps.closeIssue,
+      addLabel: deps.addLabel,
       // The GitHub client returns `html_url`; the applier wants `url`.
       createIssue: async (repoFullName, input) => {
         const created = await deps.createIssue(repoFullName, input);
