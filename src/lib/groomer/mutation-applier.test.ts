@@ -725,10 +725,12 @@ describe("applyGroomingMutations → decomposition", () => {
       expect(link.number).toBeTypeOf("number");
       expect(link.url).toBeTypeOf("string");
     }
-    // The parent's decomposition state is recorded with the final label set
-    // (labelsAfter + umbrella) and the child URLs as the follow-ups.
+    // The parent's decomposition state is recorded with the label set at
+    // state-write time (labelsAfter — the umbrella add lands afterwards, so it
+    // is not claimed yet) and the child URLs as the follow-ups.
     expect(store.decompositionStates).toHaveLength(1);
-    expect(store.decompositionStates[0].labels).toContain("umbrella");
+    expect(store.decompositionStates[0].labels).toEqual(diff.labelsAfter);
+    expect(store.decompositionStates[0].labels).not.toContain("umbrella");
     expect(store.decompositionStates[0].followUpUrls).toHaveLength(2);
     // ApplyResult.labels (freshness baseline / audit) includes the umbrella.
     expect(result.labels).toContain("umbrella");

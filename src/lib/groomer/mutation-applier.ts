@@ -900,13 +900,18 @@ export async function applyGroomingMutations(
           }
         }
         appliedChildren = links;
-        // Record the decomposition state with the final label set (labelsAfter
-        // plus the umbrella this step lands next) and the child URLs, BEFORE
-        // the umbrella: a failure here — like a failed child create above —
-        // must leave the parent still re-selectable, so the umbrella, which
-        // removes it from every selection path, is the step's final write.
+        // Record the decomposition state with the parent's label set at the
+        // moment of the state write (labelsAfter — the umbrella genuinely is
+        // not on the issue yet) and the child URLs, BEFORE the umbrella add:
+        // a failure here — like a failed child create above — must leave the
+        // parent still re-selectable, so the umbrella, which removes it from
+        // every selection path, is the step's final write. The audit entry
+        // records labels at state-write time; the umbrella add lands
+        // afterwards and its own success/failure is visible on the children
+        // step record and the run's groom audit, so the entry never claims a
+        // label that has not landed.
         await store.setDecompositionState({
-          issue: { id: input.issueId, labels: [...new Set([...diff.labelsAfter, UMBRELLA_LABEL])] },
+          issue: { id: input.issueId, labels: diff.labelsAfter },
           repoFullName,
           issueNumber,
           actor: "hosted-groomer",
