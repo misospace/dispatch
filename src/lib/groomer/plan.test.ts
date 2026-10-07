@@ -325,7 +325,26 @@ describe("GroomingPlan readiness invariant", () => {
 
   it("rejects implementation-ready work that needs decomposition", () => {
     expectInvalid(
-      draft({ decomposition: { required: true, reason: "two changes", childBriefs: [{ title: "Fix redirect after reset", problem: "p", acceptanceCriteria: [] }] } }),
+      draft({
+        decomposition: {
+          required: true,
+          reason: "two changes",
+          childBriefs: [
+            {
+              title: "Fix redirect after reset",
+              problem: "p",
+              designDecision: null,
+              verifiedCurrentBehavior: null,
+              relevantPaths: [],
+              inScope: [],
+              outOfScope: [],
+              dependencies: [],
+              acceptanceCriteria: [],
+              tests: [],
+            },
+          ],
+        },
+      }),
       "readiness: decomposition.required is true",
     );
   });
@@ -531,6 +550,67 @@ describe("GroomingPlan validation failures", () => {
 
   it("requires children when decomposition is required", () => {
     expectInvalid(notReady("backlog", { decomposition: { required: true, reason: "umbrella", childBriefs: [] } }), "decomposition.childBriefs");
+  });
+
+  describe("child briefs (dispatch#1066)", () => {
+    const fullChild = {
+      title: "Add order search to the admin dashboard",
+      problem: "Admins cannot search orders from the dashboard.",
+      designDecision: "Search lives in a dedicated admin sub-route, not a dashboard widget.",
+      verifiedCurrentBehavior: "Dashboard.tsx renders four unrelated legacy widgets; routes.ts has no admin sub-routes.",
+      relevantPaths: ["src/admin/Dashboard.tsx", "src/admin/routes.ts"],
+      inScope: ["the order search query and results list"],
+      outOfScope: ["moving the dashboard to the new design system"],
+      dependencies: ["the refund approval queue child"],
+      acceptanceCriteria: ["an admin can search orders by id and see the match"],
+      tests: ["src/admin/orders-search.test.ts"],
+    };
+
+    it("round-trips every field of a full child brief", () => {
+      const plan = validPlan(
+        notReady("backlog", { decomposition: { required: true, reason: "umbrella", childBriefs: [fullChild] } }),
+      );
+      expect(plan.decomposition.childBriefs).toEqual([fullChild]);
+    });
+
+    it("parses an old three-field brief with the new fields defaulted to null/empty", () => {
+      const old = {
+        ...notReady("backlog"),
+        decomposition: {
+          required: true,
+          reason: "umbrella",
+          childBriefs: [{ title: "Fix redirect after reset", problem: "p", acceptanceCriteria: ["a reset-then-login test passes"] }],
+        },
+      } as unknown as Record<string, unknown>;
+      const plan = validPlan(old);
+      expect(plan.decomposition.childBriefs).toEqual([
+        {
+          title: "Fix redirect after reset",
+          problem: "p",
+          designDecision: null,
+          verifiedCurrentBehavior: null,
+          relevantPaths: [],
+          inScope: [],
+          outOfScope: [],
+          dependencies: [],
+          acceptanceCriteria: ["a reset-then-login test passes"],
+          tests: [],
+        },
+      ]);
+    });
+
+    it("bounds child brief fields with the field path", () => {
+      const overList = { ...fullChild, relevantPaths: Array.from({ length: PLAN_LIMITS.listItems + 1 }, (_, i) => `path/${i}.ts`) };
+      expectInvalid(
+        notReady("backlog", { decomposition: { required: true, reason: "umbrella", childBriefs: [overList] } }),
+        `decomposition.childBriefs[0].relevantPaths: must have at most ${PLAN_LIMITS.listItems} items`,
+      );
+      const overText = { ...fullChild, designDecision: "x".repeat(PLAN_LIMITS.text + 1) };
+      expectInvalid(
+        notReady("backlog", { decomposition: { required: true, reason: "umbrella", childBriefs: [overText] } }),
+        `decomposition.childBriefs[0].designDecision: must be at most ${PLAN_LIMITS.text} characters`,
+      );
+    });
   });
 
   describe("close decisions", () => {

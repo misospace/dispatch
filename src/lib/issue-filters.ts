@@ -1,4 +1,5 @@
 import { AGENT_PREFIX, isAgentLabel, isOwnerLabel, OWNER_PREFIX, STATUS_LABELS } from "@/types";
+import { UMBRELLA_LABEL } from "@/lib/decomposition";
 
 /**
  * Single source of truth for Renovate issue detection. Both the in-memory
@@ -141,7 +142,7 @@ export function buildUmbrellaIssueExclusionWhere() {
   return {
     NOT: {
       OR: [
-        { labels: { has: "umbrella" } },
+        { labels: { has: UMBRELLA_LABEL } },
         { title: { startsWith: "Weekly tech debt audit:", mode: "insensitive" } },
       ],
     },

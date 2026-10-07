@@ -35,6 +35,7 @@ export interface GitHubWrites {
   titleBody: Array<{ title?: string; body?: string | null }>;
   comments: string[];
   closes: number;
+  children: Array<{ number: number; url: string }>;
 }
 
 export interface GroomingOutcome {
@@ -112,8 +113,12 @@ function openTrackedIssues(c: GroomingCase, args: unknown) {
 /** GroomingApplication rows (#1063); share one between runs to exercise replay. */
 export type ApplicationRows = Map<string, Record<string, unknown> & { applicationKey: string }>;
 
+/** GroomingChildClaim rows (#1066); share one between runs to exercise child-creation idempotency. */
+export type ChildClaimRows = Map<string, Record<string, unknown> & { childKey: string }>;
+
 export interface RunCandidateOptions {
   applications?: ApplicationRows;
+  childClaims?: ChildClaimRows;
   /** Distinguishes GroomingRun ids when one case is run more than once. */
   runId?: string;
 }
@@ -123,7 +128,7 @@ export async function runCandidate(
   candidate: CaseCandidate,
   options: RunCandidateOptions = {},
 ): Promise<GroomingOutcome> {
-  const writes: GitHubWrites = { labels: [], titleBody: [], comments: [], closes: 0 };
+  const writes: GitHubWrites = { labels: [], titleBody: [], comments: [], closes: 0, children: [] };
   let validation: GroomingPlanValidationResult | null = null;
   let catalog: EvidenceCatalog | null = null;
   let context = "";
@@ -167,6 +172,7 @@ export async function runCandidate(
   };
 
   const applications: ApplicationRows = options.applications ?? new Map();
+  const childClaims: ChildClaimRows = options.childClaims ?? new Map();
   const runId = options.runId ?? `run-${c.id}`;
   const prisma = {
     automationRepo: { findUnique: async () => ({ id: "repo-1", fullName: c.repoFullName, enabled: true }) },
@@ -209,6 +215,25 @@ export async function runCandidate(
         return { count: 1 };
       },
     },
+    // Child-issue creation claims (#1066), in memory for this run.
+    groomingChildClaim: {
+      findUnique: async ({ where }: { where: { childKey: string } }) => childClaims.get(where.childKey) ?? null,
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        const key = String(data.childKey);
+        // The unique childKey, as Postgres enforces it.
+        if (childClaims.has(key)) throw Object.assign(new Error("Unique constraint failed on childKey"), { code: "P2002" });
+        // A created row has no childNumber/childUrl until the creation is
+        // recorded; updatedAt is stamped at create, mirroring @updatedAt.
+        const row = { ...structuredClone(data), childKey: key, childNumber: null, childUrl: null, updatedAt: new Date() };
+        childClaims.set(key, row);
+        return row;
+      },
+      update: async ({ where, data }: { where: { childKey: string }; data: Record<string, unknown> }) => {
+        const row = childClaims.get(where.childKey)!;
+        Object.assign(row, structuredClone(data));
+        return row;
+      },
+    },
   };
 
   const deps: GroomerDeps = {
@@ -241,6 +266,15 @@ export async function runCandidate(
     closeIssue: async () => {
       writes.closes++;
     },
+    createIssue: async (repoFullName, input) => {
+      const number = 1000 + writes.children.length;
+      const url = `https://github.com/${repoFullName}/issues/${number}`;
+      writes.children.push({ number, url });
+      return { number, html_url: url };
+    },
+    // The children step's umbrella: a separate additive write, not part of the
+    // labels-step writes.labels.
+    addLabel: async () => {},
     findActiveLeases: async () => [],
     upsertLease: async () => ({ created: true, lease: { id: "lease-1" } }),
     releaseLease: async () => ({ id: "lease-1" }),

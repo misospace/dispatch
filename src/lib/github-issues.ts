@@ -335,8 +335,9 @@ export async function closeIssue(
 }
 
 /**
- * Open a new issue. Used by the CI-failure ingester; every other issue in
- * Dispatch arrives from GitHub rather than being created by it.
+ * Open a new issue. Used by the CI-failure ingester and the hosted groomer's
+ * decomposition children (dispatch#1066); every other issue in Dispatch arrives
+ * from GitHub rather than being created by it.
  */
 export async function createIssue(
   repoFullName: string,

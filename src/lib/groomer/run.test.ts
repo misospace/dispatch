@@ -26,6 +26,7 @@ const { mocks } = vi.hoisted(() => ({
     addIssueComment: vi.fn(),
     updateIssueTitleAndBody: vi.fn(),
     closeIssue: vi.fn(),
+    createIssue: vi.fn(),
     findActiveLeasesForIssue: vi.fn(),
     upsertLease: vi.fn(),
     releaseLease: vi.fn(),
@@ -39,10 +40,12 @@ const { mocks } = vi.hoisted(() => ({
     releaseGroomerLock: vi.fn(),
     compareCommits: vi.fn(),
     applications: new Map<string, Record<string, any>>(),
+    childClaims: new Map<string, Record<string, any>>(),
     prisma: {
       automationRepo: { findUnique: vi.fn() },
       groomingRun: { create: vi.fn(), update: vi.fn(), findFirst: vi.fn(), findMany: vi.fn() },
       groomingApplication: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
+      groomingChildClaim: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
@@ -73,6 +76,7 @@ vi.mock("@/lib/github", () => ({
   addIssueComment: mocks.addIssueComment,
   updateIssueTitleAndBody: mocks.updateIssueTitleAndBody,
   closeIssue: mocks.closeIssue,
+  createIssue: mocks.createIssue,
   addIssueLabel: mocks.addIssueLabel,
   removeIssueLabel: mocks.removeIssueLabel,
 }));
@@ -287,6 +291,7 @@ describe("runHostedGroomer", () => {
     mocks.getHostedGroomerConfig.mockReturnValue(mockConfig);
     mocks.callGroomerLLM.mockResolvedValue(mockOutput);
     mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
     mocks.updateIssueTitleAndBody.mockResolvedValue(undefined);
     mocks.addIssueComment.mockResolvedValue({ url: null });
     mocks.closeIssue.mockResolvedValue(undefined);
@@ -354,6 +359,33 @@ describe("runHostedGroomer", () => {
         return row;
       },
     );
+    // In-memory GroomingChildClaim with the unique childKey claim (dispatch#1066).
+    // A created row has no childNumber/childUrl until the creation is recorded,
+    // matching the nullable columns the reuse check reads; updatedAt is stamped
+    // at create, mirroring @updatedAt, and applicationKey is carried from the
+    // claim input.
+    mocks.childClaims.clear();
+    mocks.prisma.groomingChildClaim.findUnique.mockImplementation(
+      async ({ where }: { where: { childKey: string } }) => mocks.childClaims.get(where.childKey) ?? null,
+    );
+    mocks.prisma.groomingChildClaim.create.mockImplementation(async ({ data }: { data: Record<string, any> }) => {
+      if (mocks.childClaims.has(data.childKey)) throw Object.assign(new Error("Unique constraint"), { code: "P2002" });
+      const row = { ...data, childNumber: null, childUrl: null, updatedAt: new Date() };
+      mocks.childClaims.set(data.childKey, row);
+      return row;
+    });
+    mocks.prisma.groomingChildClaim.update.mockImplementation(
+      async ({ where, data }: { where: { childKey: string }; data: Record<string, any> }) => {
+        const row = mocks.childClaims.get(where.childKey)!;
+        Object.assign(row, JSON.parse(JSON.stringify(data)));
+        return row;
+      },
+    );
+    // Each created child gets its own number and URL, as GitHub would.
+    mocks.createIssue.mockImplementation(async (repoFullName: string) => {
+      const number = mocks.createIssue.mock.calls.length + 1001;
+      return { number, html_url: `https://github.com/${repoFullName}/issues/${number}` };
+    });
   });
 
   it("returns null when no grooming candidate available", async () => {
@@ -2598,6 +2630,199 @@ Investigate session handling in auth module.`;
         mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/in-review", "priority/p0"] });
         await runHostedGroomer();
         expect(mocks.collectGroomingEvidenceSnapshot).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("decomposition child creation (dispatch#1066)", () => {
+      const childBrief = (n: number) => ({
+        title: `Bounded child ${n}`,
+        problem: `Child ${n} problem, as its own bounded change.`,
+        // Every field the apply-time decomposition policy requires a complete
+        // bounded brief to carry: an incomplete brief withholds the split.
+        designDecision: `Child ${n} follows the existing pattern; no design choice is left open.`,
+        verifiedCurrentBehavior: `Child ${n} is not implemented yet; login.ts drops the return URL.`,
+        relevantPaths: ["src/auth/login.ts"],
+        inScope: [`child ${n}`],
+        outOfScope: [`Child ${n} does not touch authentication`],
+        dependencies: [],
+        acceptanceCriteria: [`Child ${n} works end to end`],
+        tests: [`Child ${n} is covered by an automated test`],
+      });
+
+      /** A non-ready (backlog) verdict that splits the issue into `count` bounded children. */
+      const decomposingDraft = (count: number) =>
+        notReadyDraft("backlog", {
+          decomposition: {
+            required: true,
+            reason: "the issue spans several independent areas",
+            childBriefs: Array.from({ length: count }, (_, i) => childBrief(i + 1)),
+          },
+        });
+
+      it("creates one bounded child per brief, decorates the parent as an umbrella, and records the decomposition", async () => {
+        mocks.callGroomerLLM.mockResolvedValue(decomposingDraft(2));
+        const result = await runHostedGroomer();
+
+        expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
+        expect(mocks.createIssue).toHaveBeenCalledTimes(2);
+        // Each child lands as a backlog issue (not worker-ready).
+        expect(mocks.createIssue).toHaveBeenCalledWith(
+          "org/repo",
+          expect.objectContaining({ labels: ["status/backlog"] }),
+        );
+        // The umbrella is an additive write by the children step, not part of the labels write.
+        expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(1);
+        expect(mocks.updateIssueLabels).toHaveBeenCalledWith("org/repo", 42, expect.not.arrayContaining(["umbrella"]));
+        expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+        expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+        // The parent's decomposition state is persisted with the child URLs as follow-ups.
+        expect(mocks.prisma.issue.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ decomposed: true, followUpUrls: expect.any(Array) }),
+          }),
+        );
+        expect(mocks.prisma.auditLog.create).toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ action: "issue_decomposed" }) }),
+        );
+        // The run records the created child links, in brief order.
+        expect(result!.appliedMutations!.childrenCreated).toHaveLength(2);
+        // The children step writes a managed decomposition section into the
+        // parent body: the marker pair plus one `- #<n>: <url>` line per
+        // created child. The content step wrote nothing (no title/body in the
+        // plan), so this is the only body write.
+        expect(mocks.updateIssueTitleAndBody).toHaveBeenCalledTimes(1);
+        const written = mocks.updateIssueTitleAndBody.mock.calls[0][2] as { body?: string | null };
+        expect(written.body).toContain("<!-- dispatch-groomer:decomposition:start -->");
+        expect(written.body).toContain("<!-- dispatch-groomer:decomposition:end -->");
+        const created = result!.appliedMutations!.childrenCreated as { number: number; url: string }[];
+        for (const child of created) {
+          expect(written.body).toContain(`- #${child.number}: ${child.url}`);
+        }
+      });
+
+      it("an exact retry is a replay: it creates no new child and re-surfaces the created links", async () => {
+        mocks.callGroomerLLM.mockResolvedValue(decomposingDraft(2));
+
+        const first = await runHostedGroomer();
+        const second = await runHostedGroomer();
+
+        expect(first!.appliedMutations).toMatchObject({ outcome: "applied" });
+        expect(second!.appliedMutations).toMatchObject({ outcome: "replayed" });
+        // Only the first attempt created the children; the replay re-surfaces them.
+        expect(mocks.createIssue).toHaveBeenCalledTimes(2);
+        expect(first!.appliedMutations!.childrenCreated).toHaveLength(2);
+        expect(second!.appliedMutations!.childrenCreated).toHaveLength(2);
+        // The umbrella is added once, on the first attempt; the replay adds none.
+        expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+        expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+        // Same application key, so the replay is attributable to the first run.
+        expect(first!.mutationPlan!.applicationKey).toBe(second!.mutationPlan!.applicationKey);
+      });
+
+      it("a child-creation failure is a partial, retryable run; the retry reuses the landed child and creates only the missing ones", async () => {
+        const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        mocks.callGroomerLLM.mockResolvedValue(decomposingDraft(3));
+        let createCalls = 0;
+        mocks.createIssue.mockImplementation(async () => {
+          createCalls += 1;
+          if (createCalls === 2) throw new Error("GitHub API error creating issue: 502");
+          const number = createCalls + 1000;
+          return { number, html_url: `https://github.com/org/repo/issues/${number}` };
+        });
+
+        const first = await runHostedGroomer();
+        expect(first!.appliedMutations).toMatchObject({ outcome: "partial" });
+        expect(first!.appliedMutations!.childrenError).toMatch(/502/);
+        // A partial decomposition never lands the umbrella.
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+
+        // The retry: the failing creation now succeeds.
+        mocks.createIssue.mockImplementation(async () => {
+          createCalls += 1;
+          const number = createCalls + 1000;
+          return { number, html_url: `https://github.com/org/repo/issues/${number}` };
+        });
+        const second = await runHostedGroomer();
+        errSpy.mockRestore();
+
+        expect(second!.appliedMutations).toMatchObject({ outcome: "applied" });
+        // The child that landed before the failure is reused; only the missing ones are created.
+        expect(second!.appliedMutations!.childrenCreated).toHaveLength(2);
+        expect(second!.appliedMutations!.childrenReused).toHaveLength(1);
+        // The umbrella lands once the decomposition fully converges.
+        expect(mocks.addIssueLabel).toHaveBeenCalledTimes(1);
+        expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+        // One claim per distinct child, across both attempts (idempotent child identity).
+        expect(mocks.prisma.groomingChildClaim.create).toHaveBeenCalledTimes(3);
+      });
+
+      it("creates no children when the split is withheld for low confidence", async () => {
+        mocks.callGroomerLLM.mockResolvedValue(
+          notReadyDraft("backlog", {
+            verdict: { confidence: "low" },
+            decomposition: { required: true, reason: "split it", childBriefs: [childBrief(1)] },
+          }),
+        );
+        const result = await runHostedGroomer();
+
+        expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
+        expect(result!.appliedMutations!.withheld).toMatchObject({ decomposition: expect.any(Array) });
+        expect(mocks.createIssue).not.toHaveBeenCalled();
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+        expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
+      });
+
+      it("creates no children when a material uncertainty remains", async () => {
+        mocks.callGroomerLLM.mockResolvedValue(
+          notReadyDraft("backlog", {
+            verdict: { uncertainties: [{ kind: "scope", question: "Which child owns the migration?", material: true }] },
+            decomposition: { required: true, reason: "split it", childBriefs: [childBrief(1)] },
+          }),
+        );
+        const result = await runHostedGroomer();
+
+        expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
+        expect(result!.appliedMutations!.withheld).toMatchObject({ decomposition: expect.any(Array) });
+        expect(mocks.createIssue).not.toHaveBeenCalled();
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+        expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
+      });
+
+      it("withholds the decomposition end to end when a child brief is not a complete bounded implementation brief", async () => {
+        // Everything complete except the settled design decision: a child that
+        // leaves a design choice open is not bounded, so the split is withheld.
+        mocks.callGroomerLLM.mockResolvedValue(
+          notReadyDraft("backlog", {
+            decomposition: {
+              required: true,
+              reason: "split it",
+              childBriefs: [{ ...childBrief(1), designDecision: null }],
+            },
+          }),
+        );
+        const result = await runHostedGroomer();
+
+        // The plan still lands (as backlog); only the decomposition is withheld.
+        expect(result!.appliedMutations).toMatchObject({ outcome: "applied" });
+        // The run records exactly which child and which field is short.
+        const withheld = result!.appliedMutations!.withheld as { decomposition: string[] };
+        expect(withheld.decomposition).toEqual([
+          "child brief[0] is not a complete bounded implementation brief (missing: designDecision)",
+        ]);
+        // No child is created, no umbrella lands, and the parent is not decomposed.
+        expect(mocks.createIssue).not.toHaveBeenCalled();
+        expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+        expect(mocks.prisma.groomingChildClaim.create).not.toHaveBeenCalled();
+        expect(
+          (mocks.prisma.issue.update.mock.calls.map((c) => c[0].data as Record<string, unknown>) ?? []).some(
+            (data) => data.decomposed === true,
+          ),
+        ).toBe(false);
+        expect(
+          (mocks.prisma.auditLog.create.mock.calls.map((c) => c[0].data as Record<string, unknown>) ?? []).some(
+            (data) => data.action === "issue_decomposed",
+          ),
+        ).toBe(false);
       });
     });
 

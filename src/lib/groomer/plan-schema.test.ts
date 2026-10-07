@@ -83,6 +83,32 @@ describe("buildGroomingPlanResponseSchema", () => {
     expect(criteria.items.properties.excerpt).toMatchObject({ type: "string", minLength: 24, maxLength: 300 });
   });
 
+  it("describes the full child brief shape (dispatch#1066)", () => {
+    const childBriefs = schema.properties.decomposition.properties.childBriefs;
+    expect(childBriefs.maxItems).toBe(8);
+    expect(childBriefs.items.required).toEqual([
+      "title",
+      "problem",
+      "designDecision",
+      "verifiedCurrentBehavior",
+      "relevantPaths",
+      "inScope",
+      "outOfScope",
+      "dependencies",
+      "acceptanceCriteria",
+      "tests",
+    ]);
+    const props = childBriefs.items.properties;
+    expect(props.title).toMatchObject({ type: "string", minLength: 10, maxLength: 200 });
+    expect(props.problem).toMatchObject({ type: "string", maxLength: 1000 });
+    expect(props.designDecision).toMatchObject({ anyOf: [{ type: "null" }, { type: "string", maxLength: 1000 }] });
+    expect(props.verifiedCurrentBehavior).toMatchObject({ anyOf: [{ type: "null" }, { type: "string", maxLength: 1000 }] });
+    for (const key of ["relevantPaths", "inScope", "outOfScope", "dependencies", "tests"]) {
+      expect(props[key], key).toMatchObject({ type: "array", maxItems: 12, items: { type: "string", maxLength: 300 } });
+    }
+    expect(props.acceptanceCriteria).toMatchObject({ type: "array", maxItems: 8, items: { type: "string", maxLength: 300 } });
+  });
+
   it("forces arrays empty when the catalog has no ids of the needed kind", () => {
     const bare = buildGroomingPlanResponseSchema(buildEvidenceCatalog({ ...snapshot, sources: [] })) as Node;
     expect(bare.properties.relatedWork.maxItems).toBe(0);

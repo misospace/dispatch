@@ -25,7 +25,7 @@ import {
   type ExplorationToolCallLike,
   type NegativeSearchRecheckProbe,
 } from "./freshness";
-import { evaluateReadiness, type GroomingPlan } from "./plan";
+import { evaluateReadiness, type ChildBrief, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import { evaluateCloseGrounding } from "./close-grounding";
 
@@ -482,5 +482,84 @@ export function evaluateReadyPolicy(plan: GroomingPlan, catalog: EvidenceCatalog
     reasons.push("the plan's readiness is bound to a different evidence snapshot");
   }
   reasons.push(...evaluateReadiness(plan, catalog));
+  return reasons;
+}
+
+/**
+ * The child-brief fields that are missing from this brief, in field order
+ * (dispatch#1066). A field counts as present when it is non-blank after
+ * trimming; a list field needs at least one entry that trims non-empty
+ * (whitespace-only entries do not count). `dependencies` is deliberately
+ * never reported: a child may legitimately depend on nothing.
+ */
+export function childBriefCompletenessGaps(brief: ChildBrief): string[] {
+  const gaps: string[] = [];
+  if (brief.problem.trim().length === 0) gaps.push("problem");
+  if (brief.designDecision === null || brief.designDecision.trim().length === 0) gaps.push("designDecision");
+  if (brief.verifiedCurrentBehavior === null || brief.verifiedCurrentBehavior.trim().length === 0) {
+    gaps.push("verifiedCurrentBehavior");
+  }
+  const lists: Array<[string, string[]]> = [
+    ["relevantPaths", brief.relevantPaths],
+    ["inScope", brief.inScope],
+    ["outOfScope", brief.outOfScope],
+    ["acceptanceCriteria", brief.acceptanceCriteria],
+    ["tests", brief.tests],
+  ];
+  for (const [name, entries] of lists) {
+    if (!entries.some((entry) => entry.trim().length > 0)) gaps.push(name);
+  }
+  return gaps;
+}
+
+/**
+ * Decomposition re-checked at apply time (dispatch#1066). Returns every
+ * reason the plan's children may not be created; empty means they may.
+ *
+ * A decomposition splits one issue into bounded children, so it is only
+ * applied when the parent's analysis is decisive enough to trust the split:
+ * - the plan does not also recommend closing the issue (a closed parent has
+ *   no children to carry its work);
+ * - the verdict confidence is not low;
+ * - no material uncertainty of any kind remains.
+ * The apply preconditions separately guarantee the issue is still open.
+ *
+ * Every child brief must also be a COMPLETE bounded implementation brief,
+ * because each one becomes a real child GitHub issue that a fresh worker
+ * has to implement with no other context:
+ * - `problem` is non-blank (the plan parser already guarantees this; it is
+ *   enforced again so a forged plan cannot slip past);
+ * - `designDecision` is a non-blank string; null is rejected. Even the
+ *   outcome "no design choice, follow existing pattern X" must be stated,
+ *   so the worker knows nothing is left to decide;
+ * - `verifiedCurrentBehavior` is a non-blank string; null is rejected —
+ *   the brief must carry the current behavior the parent's analysis
+ *   verified;
+ * - `relevantPaths`, `inScope`, `outOfScope`, `acceptanceCriteria` and
+ *   `tests` each contain at least one entry whose trimmed value is
+ *   non-empty (whitespace-only entries do not count as present);
+ * - `dependencies` may legitimately be empty: a child may depend on
+ *   nothing, so it is never a reason.
+ * Each incomplete brief is a reason of its own naming its index and
+ * missing fields (see childBriefCompletenessGaps), so the run records
+ * exactly which children and which fields are short.
+ */
+export function evaluateDecompositionPolicy(plan: GroomingPlan): string[] {
+  const reasons: string[] = [];
+  if (plan.mutations.close) {
+    reasons.push("the plan recommends closing the issue; a decomposed parent is not closed");
+  }
+  if (plan.verdict.confidence === "low") {
+    reasons.push("verdict confidence is low; decomposition requires at least medium confidence");
+  }
+  plan.verdict.uncertainties.forEach((u, i) => {
+    if (u.material) reasons.push(`material uncertainty remains (verdict.uncertainties[${i}]): ${u.question}`);
+  });
+  plan.decomposition.childBriefs.forEach((brief, i) => {
+    const gaps = childBriefCompletenessGaps(brief);
+    if (gaps.length > 0) {
+      reasons.push(`child brief[${i}] is not a complete bounded implementation brief (missing: ${gaps.join(", ")})`);
+    }
+  });
   return reasons;
 }

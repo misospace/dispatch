@@ -175,4 +175,10 @@ export interface GroomingCase {
   candidates: CaseCandidate[];
   freshness?: FreshnessProbe[];
   pending?: PendingBehavior[];
+  /**
+   * Set when an accepted candidate decomposes the issue into bounded children.
+   * The runner then asserts the child-creation idempotency (dispatch#1066):
+   * the first run creates one child per brief, an exact replay creates none.
+   */
+  expectsChildCreation?: boolean;
 }

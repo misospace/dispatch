@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
+import { setDecompositionState } from "@/lib/decomposition";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { resolveActor } from "@/lib/resolve-actor";
@@ -65,41 +66,28 @@ export async function POST(request: Request) {
       return errorResponse(`Issue #${issueNumber} not found in ${repo}`, 404);
     }
 
-    // Update decomposed state
-    const updated = await prisma.issue.update({
-      where: { id: issue.id },
-      data: {
-        decomposed,
-        decomposedAt: decomposed ? new Date() : null,
-        decomposedBy: decomposed ? actor : null,
-        decomposedNote: note ?? null,
-        followUpUrls: followUpUrls ?? [],
-      },
+    // Persist the decomposition state and its audit entry through the shared
+    // helper, so the operator route and the hosted groomer write it identically
+    // (dispatch#1066).
+    await setDecompositionState(prisma, {
+      issue: { id: issue.id, labels: issue.labels },
+      repoFullName: `${owner}/${name}`,
+      issueNumber,
+      actor,
+      decomposed,
+      note: note ?? null,
+      followUpUrls: followUpUrls ?? [],
     });
 
-    // Log the action in audit trail
-    await prisma.auditLog.create({
-      data: {
-        actor,
-        action: decomposed ? "issue_decomposed" : "issue_reactivated",
-        repoFullName: `${owner}/${name}`,
-        issueNumber,
-        issueId: issue.id,
-        beforeLabels: [...issue.labels],
-        afterLabels: [...issue.labels],
-        success: true,
-        notes: decomposed
-          ? `Issue marked as decomposed. Note: ${note ?? "none"}. Follow-up URLs: ${(followUpUrls ?? []).join(", ")}`
-          : `Issue reactivated (decomposed set to false)`,
-      },
-    });
+    // Re-read the issue so the response reflects the persisted state.
+    const updated = await prisma.issue.findUnique({ where: { id: issue.id } });
 
     return NextResponse.json({
       success: true,
-      issueId: updated.id,
-      decomposed: updated.decomposed,
-      decomposedAt: updated.decomposedAt,
-      followUpUrls: updated.followUpUrls,
+      issueId: updated?.id ?? issue.id,
+      decomposed: updated?.decomposed ?? decomposed,
+      decomposedAt: updated?.decomposedAt ?? null,
+      followUpUrls: updated?.followUpUrls ?? (followUpUrls ?? []),
     }, { status: 200 });
   } catch (error) {
     return handleApiError("update decomposed state", error);

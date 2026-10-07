@@ -18,16 +18,38 @@
 import { createHash } from "crypto";
 
 import type { StatusLabel } from "@/types";
+import {
+  childBriefKey,
+  CHILD_ISSUE_LABELS,
+  renderChildIssueBody,
+  setDecompositionState,
+  UMBRELLA_LABEL,
+  type ChildIssueTarget,
+  type DecompositionStateClient,
+} from "@/lib/decomposition";
 import { getBacklogLane } from "@/lib/lane-config";
 import { isAutomationAuthor } from "./context";
 import { neutralizeMentions } from "./sanitize";
-import { inFlightStatus, toGroomerOutput, type GroomingPlan } from "./plan";
+import { inFlightStatus, toGroomerOutput, type ChildBrief, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import type { GroomerOutput } from "./schema";
-import { evaluateClosePolicy, evaluateReadyPolicy, type LiveComment, type LiveIssueState } from "./mutation-validator";
+import {
+  evaluateClosePolicy,
+  evaluateDecompositionPolicy,
+  evaluateReadyPolicy,
+  type LiveComment,
+  type LiveIssueState,
+} from "./mutation-validator";
 
 export const APPLICATION_KEY_VERSION = 1;
 export const MAX_GITHUB_COMMENT_CHARS = 4096;
+/**
+ * The largest body the applier will write to GitHub. GitHub's issue body cap
+ * is ~125k characters; a write at or over it fails, so a section render that
+ * would cross this cap is refused (like a malformed marker) rather than
+ * failing on every retry and never landing the umbrella.
+ */
+export const MAX_GITHUB_BODY_CHARS = 120_000;
 
 // ─── Label helpers (moved from run.ts) ───────────────────────────────────────
 
@@ -136,6 +158,77 @@ export function renderManagedBody(parsed: Extract<ManagedBody, { ok: true }>, co
   return `${human}${separator}${section}`;
 }
 
+// ─── Managed decomposition section ─────────────────────────────────────────────
+
+export const DECOMPOSITION_BODY_START = "<!-- dispatch-groomer:decomposition:start -->";
+export const DECOMPOSITION_BODY_END = "<!-- dispatch-groomer:decomposition:end -->";
+
+export type DecompositionBody =
+  | { ok: true; human: string; before: string; after: string; decomposition: string | null }
+  | { ok: false; reason: string };
+
+/**
+ * Split an issue body around its one managed decomposition section, if
+ * present. The section the children step writes after a decomposition (the
+ * children the issue was split into): the same marker discipline as the
+ * managed section — malformed markers (unpaired, repeated, or out of order)
+ * are reported rather than guessed at, so a human edit that broke them never
+ * makes the groomer rewrite text it does not own.
+ */
+export function parseDecompositionBody(body: string | null): DecompositionBody {
+  const text = body ?? "";
+  const starts = text.split(DECOMPOSITION_BODY_START).length - 1;
+  const ends = text.split(DECOMPOSITION_BODY_END).length - 1;
+  if (starts === 0 && ends === 0) return { ok: true, human: text, before: text, after: "", decomposition: null };
+  if (starts !== 1 || ends !== 1) return { ok: false, reason: "the decomposition section markers are unpaired or repeated" };
+  const start = text.indexOf(DECOMPOSITION_BODY_START);
+  const end = text.indexOf(DECOMPOSITION_BODY_END);
+  if (end < start) return { ok: false, reason: "the decomposition section end marker precedes its start" };
+  const before = text.slice(0, start);
+  const after = text.slice(end + DECOMPOSITION_BODY_END.length);
+  const decomposition = text.slice(start + DECOMPOSITION_BODY_START.length, end).trim();
+  const human = [before.trim(), after.trim()].filter((part) => part.length > 0).join("\n\n");
+  return { ok: true, human, before, after, decomposition };
+}
+
+function decompositionSection(content: string): string {
+  const cleaned = content.split(DECOMPOSITION_BODY_START).join("").split(DECOMPOSITION_BODY_END).join("").trim();
+  return `${DECOMPOSITION_BODY_START}\n${cleaned}\n${DECOMPOSITION_BODY_END}`;
+}
+
+/**
+ * The body with `content` as its one managed decomposition section. An
+ * existing section is replaced in place; otherwise the section is appended
+ * after the text that precedes it. Everything outside the section — including
+ * the managed enrichment section — is kept byte for byte, so re-rendering the
+ * same content is a fixed point.
+ */
+export function renderDecompositionBody(parsed: Extract<DecompositionBody, { ok: true }>, content: string): string {
+  const section = decompositionSection(content);
+  if (parsed.decomposition !== null) return `${parsed.before}${section}${parsed.after}`;
+  const human = parsed.before;
+  if (human.trim().length === 0) return section;
+  const separator = human.endsWith("\n\n") ? "" : human.endsWith("\n") ? "\n" : "\n\n";
+  return `${human}${separator}${section}`;
+}
+
+/**
+ * The section content: a human-readable heading and the one sentence that
+ * says what the section is, then one line per created-or-reused child link,
+ * in brief order. Deterministic — no timestamps, no digests — so re-rendering
+ * the same children is a fixed point.
+ */
+export function renderDecompositionSection(children: ChildIssueLink[]): string {
+  const bullets = children.map((child) => `- #${child.number}: ${child.url}`).join("\n");
+  return [
+    "## Decomposition",
+    "",
+    "Created from this parent's grooming decomposition plan. Each child starts `status/backlog` and needs its own grooming pass before pickup.",
+    "",
+    bullets,
+  ].join("\n");
+}
+
 // ─── Comment marker ───────────────────────────────────────────────────────────
 
 /** Only the marker Dispatch appends counts: it must end the comment. */
@@ -163,11 +256,21 @@ export function groomerCommentKey(comment: Pick<LiveComment, "author" | "body">)
 
 // ─── Diff ─────────────────────────────────────────────────────────────────────
 
+/**
+ * The plan's decomposition intent, when the plan splits the issue into
+ * bounded children (dispatch#1066). `null` when the plan does not decompose
+ * (or the decomposition was withheld at apply time).
+ */
+export interface DecompositionIntent {
+  briefs: ChildBrief[];
+  reason: string | null;
+}
+
 export interface GroomingMutationDiff {
   /** The effective legacy view the diff was computed from (after any withholding). */
   output: GroomerOutput;
-  /** Why an intended close or ready promotion was withheld at apply time. */
-  withheld: { close?: string[]; ready?: string[] };
+  /** Why an intended close, ready promotion or decomposition was withheld at apply time. */
+  withheld: { close?: string[]; ready?: string[]; decomposition?: string[] };
   labelsBefore: string[];
   /** Final label set. */
   labelsAfter: string[];
@@ -180,9 +283,21 @@ export interface GroomingMutationDiff {
   title: string | null;
   /** New full body; null when unchanged. */
   body: string | null;
+  /**
+   * The live body the diff was computed from, before any of this diff's
+   * writes; null when the issue has no body. The children step renders its
+   * managed section into the body as it stands after the content step — the
+   * post-content body when that step has a write, this live body otherwise.
+   * The apply preconditions verify the live body equals the evidence
+   * snapshot's, so this is exactly the body the children step starts from
+   * when the content step writes nothing.
+   */
+  bodyBefore: string | null;
   /** Why proposed body enrichment was not applied, when it was not. */
   bodySkippedReason: string | null;
   close: boolean;
+  /** The plan's decomposition intent; null when the plan does not decompose. */
+  children: DecompositionIntent | null;
 }
 
 export interface MutationDiffInput {
@@ -254,6 +369,23 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     }
   }
 
+  // The decomposition is a separate, independent decision from the close and
+  // ready promotions above: a plan that splits the issue into children is
+  // withheld only when its own decomposition policy fails (a close in the
+  // same plan, low confidence, or a material uncertainty), never because the
+  // close or ready policy did.
+  let children: DecompositionIntent | null =
+    plan.decomposition.required && plan.decomposition.childBriefs.length > 0
+      ? { briefs: plan.decomposition.childBriefs, reason: plan.decomposition.reason }
+      : null;
+  if (children) {
+    const reasons = evaluateDecompositionPolicy(plan);
+    if (reasons.length > 0) {
+      withheld.decomposition = reasons;
+      children = null;
+    }
+  }
+
   const output = toGroomerOutput(effective, live.labels);
   const done = effective.verdict.actionability === "already_done";
   const labelsBefore = [...live.labels];
@@ -264,6 +396,15 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     effective.mutations.status,
   );
 
+  // The umbrella label is deliberately NOT part of labelsAfter (and so not of
+  // the labels step): it is added by the children step, and only after every
+  // child exists or is reused. The groomer selector excludes umbrella-labeled
+  // issues from selection on every path — including a targeted re-groom by
+  // issueNumber (which bypasses only the grooming-state exclusion, not the
+  // umbrella one) — so landing the umbrella first would make a decomposition
+  // that fails halfway un-reselectable, breaking "a partial create converges on
+  // retry". The label we write is still folded into ApplyResult.labels below so
+  // the freshness baseline and audit record it.
   // status/done lands only after the close succeeds, so a failed close
   // leaves the issue open with its previous status (still groomable),
   // never open with status/done (which the selector skips forever). An issue
@@ -291,7 +432,13 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     } else if (!shouldEnrichBody(parsed.human)) {
       bodySkippedReason = "the human-authored body is not sparse";
     } else {
-      const rendered = renderManagedBody(parsed, neutralizeMentions(output.proposedBody));
+      // A marker the model wrote into its enrichment is stripped before it
+      // lands (like the comment's, below): a decomposition marker in
+      // particular would otherwise be parsed as the children step's own
+      // section — an embedded pair would have the model's text between it
+      // replaced, an unpaired one would poison the body into a refusal.
+      const enrichment = neutralizeMentions(output.proposedBody.replace(ANY_GROOMER_MARKER, ""));
+      const rendered = renderManagedBody(parsed, enrichment);
       if (rendered !== (live.body ?? "")) body = rendered;
       else bodySkippedReason = "the managed section already holds this content";
     }
@@ -311,8 +458,10 @@ export function computeMutationDiff(input: MutationDiffInput): GroomingMutationD
     comment,
     title,
     body,
+    bodyBefore: live.body,
     bodySkippedReason,
     close: done && live.state === "open" && inFlightStatus(live.labels) === null,
+    children,
   };
 }
 
@@ -341,6 +490,13 @@ export function computeApplicationKey(input: {
       title: diff.title,
       body: diff.body,
       close: diff.close,
+      // The decomposition is part of the intent: its children are the stable
+      // childBriefKeys, so a change to the split (or its withholding) changes
+      // the application key. Sorted, because the brief order is not identity —
+      // the same set of children in a different order is the same application.
+      children: diff.children
+        ? diff.children.briefs.map((brief) => childBriefKey(input.repoFullName, input.issueNumber, brief)).sort()
+        : null,
     },
   };
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
@@ -348,7 +504,19 @@ export function computeApplicationKey(input: {
 
 // ─── Application ──────────────────────────────────────────────────────────────
 
-export const APPLY_STEPS = ["labels", "comment", "content", "close", "done_label"] as const;
+/**
+ * A step write that failed partway, carrying the partial result that did
+ * complete (e.g. the children created before a later child's create threw) so
+ * the failed step record — and a retry — can see and reuse it.
+ */
+export class PartialStepError extends Error {
+  constructor(message: string, readonly partial: Partial<ApplyStepResult>) {
+    super(message);
+    this.name = "PartialStepError";
+  }
+}
+
+export const APPLY_STEPS = ["labels", "comment", "content", "children", "close", "done_label"] as const;
 export type ApplyStep = (typeof APPLY_STEPS)[number];
 
 /**
@@ -362,12 +530,27 @@ export type ApplyStep = (typeof APPLY_STEPS)[number];
  */
 export type ApplyStepStatus = "applied" | "replayed" | "noop" | "skipped" | "failed" | "not_attempted";
 
+/** A created-or-reused child issue, auditable from the run and the parent. */
+export interface ChildIssueLink {
+  key: string;
+  number: number;
+  url: string;
+}
+
+/** The child issues a decomposition step created and reused this attempt. */
+export interface AppliedChildIssues {
+  created: ChildIssueLink[];
+  reused: ChildIssueLink[];
+}
+
 export interface ApplyStepResult {
   status: ApplyStepStatus;
   detail?: string;
   error?: string;
   commentUrl?: string | null;
   at?: string;
+  /** Children step: the child issues created and reused this attempt. */
+  children?: AppliedChildIssues;
 }
 
 export type ApplySteps = Partial<Record<ApplyStep, ApplyStepResult>>;
@@ -399,6 +582,31 @@ export interface ApplicationRecord {
   updatedAt?: Date | string | null;
 }
 
+/**
+ * A GroomingChildClaim row, as the applier reads it: the stable child key and
+ * the created child's number/URL once the creation has been recorded. A claim
+ * whose childNumber is null means the creation write has not been recorded, so
+ * re-creating it covers a crashed attempt — though a create whose response was
+ * lost after GitHub accepted it can still duplicate, which the child body
+ * marker exists to surface for manual discovery.
+ */
+export interface ChildClaimRecord {
+  childKey: string;
+  childNumber: number | null;
+  childUrl: string | null;
+  /**
+   * The application that claimed this child (dispatch#1066); null for rows
+   * written before the column existed (none in any deployed env). The resume
+   * CAS (which serializes attempts while the prior application claim is fresh)
+   * plus the single-replica confinement of the groomer make concurrent
+   * same-key application attempts not expected, so a null claim under MY key
+   * is my own abandoned create, not a concurrent holder.
+   */
+  applicationKey: string | null;
+  /** When the claim row was last written; the prisma store returns it. */
+  updatedAt?: Date | string | null;
+}
+
 export interface ApplicationStore {
   /** The record for a key, if one exists. Read-only (dry runs use it). */
   find(applicationKey: string): Promise<ApplicationRecord | null>;
@@ -419,6 +627,36 @@ export interface ApplicationStore {
   resume(applicationKey: string, seen: ApplicationRecord): Promise<boolean>;
   /** Whether a hosted-groomer comment was recorded on this issue since `since`. */
   hasRecentComment(issueId: string, since: Date): Promise<boolean>;
+  /**
+   * Claim a child key, atomically (dispatch#1066). `existing` is the prior
+   * claim when the child was already created, so a retry reuses it rather than
+   * creating a second child. `applicationKey` is recorded on a new claim so a
+   * same-key retry can tell its own abandoned create apart from a fresh
+   * claim held by a DIFFERENT application.
+   */
+  claimChild(input: {
+    childKey: string;
+    parentIssueId: string;
+    repoFullName: string;
+    parentNumber: number;
+    title: string;
+    applicationKey: string;
+  }): Promise<{ existing: ChildClaimRecord | null }>;
+  /** Record the created child's number and URL on its claim. */
+  saveChild(childKey: string, data: { childNumber: number; childUrl: string }): Promise<void>;
+  /**
+   * Persist a parent's decomposition state and its audit entry (dispatch#1066),
+   * sharing the operator route's persistence path.
+   */
+  setDecompositionState(input: {
+    issue: { id: string; labels: readonly string[] };
+    repoFullName: string;
+    issueNumber: number;
+    actor: string;
+    decomposed: boolean;
+    note: string | null;
+    followUpUrls: string[];
+  }): Promise<void>;
 }
 
 export interface ApplierGitHub {
@@ -428,12 +666,18 @@ export interface ApplierGitHub {
   closeIssue(repoFullName: string, issueNumber: number): Promise<void>;
   /** Newest first; used to find a comment that landed before its write reported success. */
   fetchRecentComments(repoFullName: string, issueNumber: number, max: number): Promise<LiveComment[]>;
+  /** Open a new issue (a decomposition child); returns its number and URL. */
+  createIssue(repoFullName: string, input: { title: string; body: string; labels?: string[] }): Promise<{ number: number; url: string }>;
+  /** Add a single label to the issue (the children step's umbrella). */
+  addLabel(repoFullName: string, issueNumber: number, label: string): Promise<void>;
 }
 
 export interface ApplyInput {
   repoFullName: string;
   issueNumber: number;
   issueId: string;
+  /** The parent issue's URL, so a child body can link back to it. */
+  parentUrl: string;
   groomingRunId: string;
   applicationKey: string;
   diff: GroomingMutationDiff;
@@ -452,6 +696,8 @@ export interface ApplyResult {
   commentUrl: string | null;
   /** Labels on GitHub after this attempt, as far as the recorded steps show. */
   labels: string[];
+  /** Child issues created or reused this attempt, in brief order. */
+  children: ChildIssueLink[];
   title: string | null;
   body: string | null;
   closed: boolean;
@@ -507,7 +753,16 @@ export async function applyGroomingMutations(
   });
   const prior = readSteps(existing?.steps);
   const claimedByRunId = existing && existing.groomingRunId !== input.groomingRunId ? existing.groomingRunId : null;
-  const nothing = { claimedByRunId, commentUrl: null, labels: diff.labelsBefore, title: null, body: null, closed: false, failure: null };
+  const nothing = {
+    claimedByRunId,
+    commentUrl: null,
+    labels: diff.labelsBefore,
+    children: [] as ChildIssueLink[],
+    title: null,
+    body: null,
+    closed: false,
+    failure: null,
+  };
 
   if (existing && existing.status !== "applied") {
     const updatedAt = existing.updatedAt ? new Date(existing.updatedAt).getTime() : NaN;
@@ -521,6 +776,10 @@ export async function applyGroomingMutations(
 
   if (existing?.status === "applied") {
     const commentUrl = prior.comment?.commentUrl ?? null;
+    // A replay surfaces the children an earlier attempt created or reused.
+    const children = prior.children?.children
+      ? [...prior.children.children.created, ...prior.children.children.reused]
+      : [];
     return {
       outcome: "replayed",
       steps: Object.fromEntries(
@@ -531,6 +790,7 @@ export async function applyGroomingMutations(
       ) as ApplySteps,
       ...nothing,
       commentUrl,
+      children,
     };
   }
 
@@ -538,6 +798,7 @@ export async function applyGroomingMutations(
   let failure: ApplyResult["failure"] = null;
   let commentUrl: string | null = null;
   let labels = diff.labelsBefore;
+  let appliedChildren: ChildIssueLink[] = [];
 
   const persist = async (status: string) => {
     try {
@@ -556,6 +817,11 @@ export async function applyGroomingMutations(
     if (landed(prior[step])) {
       steps[step] = { ...prior[step]!, status: "replayed" };
       if (step === "comment") commentUrl = prior.comment?.commentUrl ?? null;
+      // A replayed children step surfaces its links in the result, the same
+      // as the full-replay path.
+      if (step === "children" && prior.children?.children) {
+        appliedChildren = [...prior.children.children.created, ...prior.children.children.reused];
+      }
       return;
     }
     if (failure) {
@@ -571,7 +837,15 @@ export async function applyGroomingMutations(
       steps[step] = { status: "applied", ...(result ?? {}), at: now().toISOString() };
     } catch (err) {
       const error = errorMessage(err);
-      steps[step] = { status: "failed", error, at: now().toISOString() };
+      // A PartialStepError carries the partial result that completed (e.g. the
+      // children created before a later create threw), so the failed step
+      // record — and a retry — can see and reuse it.
+      steps[step] = {
+        status: "failed",
+        error,
+        ...(err instanceof PartialStepError ? err.partial : {}),
+        at: now().toISOString(),
+      };
       failure = { step, error };
       console.error(`[groomer] ${repoFullName}#${issueNumber}: ${step} failed; later steps not attempted:`, err);
     }
@@ -652,12 +926,170 @@ export async function applyGroomingMutations(
     return { detail: Object.keys(fields).join("+") };
   }, diff.bodySkippedReason ?? "title and body unchanged");
 
-  // 4. Close, the highest-impact write, only after everything above landed.
+  // 4. Children (dispatch#1066): one bounded child issue per brief. Creation
+  //    is idempotent through the GroomingChildClaim keyed by the childBriefKey
+  //    (a retry reuses a created child and creates only the missing ones). Only
+  //    after every child exists or is reused does this step record the parent's
+  //    decomposition state with the child URLs as the follow-ups, and only then
+  //    add the umbrella label (an additive write) last. The umbrella lands last
+  //    — after the state write — so a decomposition that fails mid-create, or
+  //    whose state write fails, leaves the parent still re-selectable (the
+  //    selector excludes umbrella issues) and converges on retry. It lands
+  //    before the close, so a close is never applied on top of a decomposition
+  //    that failed to land.
+  const children = diff.children;
+  // The body the children step starts from: the post-content body when the
+  // content step has a write (the managed enrichment section, if it lands),
+  // the live body as diffed otherwise. `childrenFinalBody` records what the
+  // step's section write leaves the body as (the unchanged body when the
+  // write is refused or a no-op), so the result can report the real
+  // post-apply body for the freshness baseline.
+  const baseBody = diff.body !== null ? diff.body : (diff.bodyBefore ?? "");
+  const liveUnchangedBody = diff.body !== null ? diff.body : diff.bodyBefore;
+  let childrenFinalBody: string | null = null;
+  await run(
+    "children",
+    children !== null,
+    async () => {
+      if (children === null) return;
+      const parentTarget: ChildIssueTarget = { repoFullName, number: issueNumber, url: input.parentUrl };
+      const created: ChildIssueLink[] = [];
+      const reused: ChildIssueLink[] = [];
+      const links: ChildIssueLink[] = [];
+      try {
+        for (const brief of children.briefs) {
+          const childKey = childBriefKey(repoFullName, issueNumber, brief);
+          const { existing } = await store.claimChild({
+            childKey,
+            parentIssueId: input.issueId,
+            repoFullName,
+            parentNumber: issueNumber,
+            title: brief.title,
+            applicationKey: input.applicationKey,
+          });
+          if (existing && existing.childNumber !== null && existing.childUrl !== null) {
+            // An earlier attempt already created this child.
+            const link: ChildIssueLink = { key: childKey, number: existing.childNumber, url: existing.childUrl };
+            reused.push(link);
+            links.push(link);
+          } else {
+            // A null claim under a DIFFERENT application key with a fresh
+            // updatedAt is held by another in-flight attempt claiming the same
+            // child; do not create a duplicate on top of it. A null claim under
+            // THIS key is my own abandoned create: the GroomingApplication
+            // resume CAS (which serializes attempts only while the prior
+            // application claim is fresh) plus the single-replica confinement
+            // of the groomer make concurrent same-key application attempts not
+            // expected, so creating on top of it is how an immediate same-key
+            // retry converges. A row with no applicationKey (none exists in any
+            // deployed env; the migration ships with the feature) is not mine,
+            // so a fresh one is a foreign holder.
+            const heldAt = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : NaN;
+            if (
+              existing &&
+              existing.childNumber === null &&
+              existing.applicationKey !== input.applicationKey &&
+              Number.isFinite(heldAt) &&
+              now().getTime() - heldAt < ACTIVE_CLAIM_MS
+            ) {
+              throw new Error(`child claim ${childKey} is held by another in-flight attempt`);
+            }
+            const body = renderChildIssueBody({
+              brief,
+              parent: parentTarget,
+              decompositionReason: children.reason,
+              childKey,
+            });
+            const issue = await github.createIssue(repoFullName, {
+              title: brief.title,
+              body,
+              labels: [...CHILD_ISSUE_LABELS],
+            });
+            await store.saveChild(childKey, { childNumber: issue.number, childUrl: issue.url });
+            const link: ChildIssueLink = { key: childKey, number: issue.number, url: issue.url };
+            created.push(link);
+            links.push(link);
+          }
+        }
+        appliedChildren = links;
+        // Record the decomposition state with the parent's label set at the
+        // moment of the state write (labelsAfter — the umbrella genuinely is
+        // not on the issue yet) and the child URLs, BEFORE the umbrella add:
+        // a failure here — like a failed child create above — must leave the
+        // parent still re-selectable, so the umbrella, which removes it from
+        // every selection path, is the step's final write. The audit entry
+        // records labels at state-write time; the umbrella add lands
+        // afterwards and its own success/failure is visible on the children
+        // step record and the run's groom audit, so the entry never claims a
+        // label that has not landed.
+        await store.setDecompositionState({
+          issue: { id: input.issueId, labels: diff.labelsAfter },
+          repoFullName,
+          issueNumber,
+          actor: "hosted-groomer",
+          decomposed: true,
+          note: children.reason,
+          followUpUrls: links.map((child) => child.url),
+        });
+        // The managed decomposition section: one section in the parent's body
+        // listing the children this decomposition created or reused. It
+        // renders into the body as it stands after the content step, so the
+        // managed enrichment section and this one coexist, each parsed and
+        // rendered independently. A failed write here throws like a failed
+        // child create above, so the umbrella never lands on a decomposition
+        // whose section write failed, and a retry converges; a body whose
+        // markers a human edit broke is refused, not guessed at, and a
+        // rendered body that would exceed GitHub's body cap is refused
+        // likewise (the write would fail on every retry, and the umbrella
+        // would never land) — in either case the children, the state and the
+        // umbrella still land.
+        // The step's detail carries the created/reused counts plus the
+        // section outcome (written, unchanged, or refused with the reason),
+        // so the run record shows what the body write did without re-reading
+        // the issue.
+        let detail = `${created.length} created, ${reused.length} reused`;
+        const parsedSection = parseDecompositionBody(baseBody);
+        if (!parsedSection.ok) {
+          detail += `; decomposition section write refused: ${parsedSection.reason}`;
+          childrenFinalBody = liveUnchangedBody;
+        } else {
+          const rendered = renderDecompositionBody(parsedSection, renderDecompositionSection(links));
+          if (rendered !== baseBody) {
+            if (rendered.length > MAX_GITHUB_BODY_CHARS) {
+              detail += `; decomposition section write refused: body would exceed ${MAX_GITHUB_BODY_CHARS} characters`;
+              childrenFinalBody = liveUnchangedBody;
+            } else {
+              await github.updateTitleAndBody(repoFullName, issueNumber, { body: rendered });
+              childrenFinalBody = rendered;
+              detail += "; decomposition section written";
+            }
+          } else {
+            childrenFinalBody = liveUnchangedBody;
+            detail += "; decomposition section unchanged";
+          }
+        }
+        // The umbrella lands last, now that every child exists or is reused,
+        // the decomposition state is recorded and the section is written or
+        // refused; a failed create, a failed state write or a failed section
+        // write throws before this line, so a partial decomposition never
+        // lands the umbrella.
+        await github.addLabel(repoFullName, issueNumber, UMBRELLA_LABEL);
+        return { children: { created, reused }, detail };
+      } catch (err) {
+        // Carry what completed so far so the failed step record (and a retry)
+        // can see the children that did land.
+        throw new PartialStepError(errorMessage(err), { children: { created, reused } });
+      }
+    },
+    "no decomposition in the plan",
+  );
+
+  // 5. Close, the highest-impact write, only after everything above landed.
   await run("close", diff.close, async () => {
     await github.closeIssue(repoFullName, issueNumber);
   }, "no close in the plan");
 
-  // 5. status/done, only once the issue is actually closed.
+  // 6. status/done, only once the issue is actually closed.
   const closed = landed(steps.close);
   await run(
     "done_label",
@@ -670,10 +1102,28 @@ export async function applyGroomingMutations(
 
   if (landed(steps.labels)) labels = diff.labelsStep;
   if (landed(steps.done_label)) labels = diff.labelsAfter;
+  // The children step writes the umbrella additively (it is not part of
+  // diff.labelsAfter), so fold in the label we actually wrote. A union with the
+  // current set (not a reset to diff.labelsAfter) keeps whatever the labels /
+  // done-label step landed while adding the umbrella the children step wrote.
+  if (landed(steps.children)) labels = [...new Set([...labels, UMBRELLA_LABEL])];
 
   const wrote = APPLY_STEPS.some((step) => steps[step]?.status === "applied" || steps[step]?.status === "replayed");
   const outcome: ApplyOutcome = failure ? (wrote ? "partial" : "failed") : wrote ? "applied" : "noop";
   await persist(failure ? (wrote ? "partial" : "failed") : "applied");
+
+  // The real post-apply body, for the freshness baseline (run.ts): the
+  // children step's section write is the last word on the body, so what it
+  // left behind wins whenever it was reached (even if the step then failed at
+  // the umbrella — the write itself landed); otherwise the content step's
+  // write; otherwise null (nothing written, the baseline falls back to the
+  // snapshot).
+  const finalBody =
+    childrenFinalBody !== null
+      ? childrenFinalBody
+      : landed(steps.content) && diff.body !== null
+        ? diff.body
+        : null;
 
   return {
     outcome,
@@ -681,8 +1131,9 @@ export async function applyGroomingMutations(
     claimedByRunId,
     commentUrl,
     labels,
+    children: appliedChildren,
     title: landed(steps.content) && diff.title !== null ? diff.title : null,
-    body: landed(steps.content) && diff.body !== null ? diff.body : null,
+    body: finalBody,
     closed,
     failure,
   };
@@ -697,9 +1148,20 @@ interface GroomingApplicationDelegateLike {
   updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>;
 }
 
-export interface ApplicationStoreClient {
+/**
+ * The slice of the Prisma client the application store needs. Extends
+ * `DecompositionStateClient` so the store can also persist a parent's
+ * decomposition state through the shared helper (dispatch#1066).
+ */
+export interface ApplicationStoreClient extends DecompositionStateClient {
   groomingApplication: GroomingApplicationDelegateLike;
   groomingRun: { findFirst(args: unknown): Promise<unknown> };
+  /** GroomingChildClaim rows keying a decomposition's children (dispatch#1066). */
+  groomingChildClaim: {
+    findUnique(args: { where: { childKey: string } }): Promise<ChildClaimRecord | null>;
+    create(args: { data: Record<string, unknown> }): Promise<unknown>;
+    update(args: { where: { childKey: string }; data: Record<string, unknown> }): Promise<unknown>;
+  };
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -759,6 +1221,39 @@ export function makePrismaApplicationStore(client: ApplicationStoreClient): Appl
         where: { issueId, commentUrl: { not: null }, updatedAt: { gte: since } },
       });
       return recent !== null && recent !== undefined;
+    },
+    async claimChild(input) {
+      // The unique childKey makes the claim atomic: a concurrent creator for
+      // the same child loses with P2002 and reads the winner's row, so two
+      // attempts never create the same child twice. The create records
+      // applicationKey (and findUnique selects it back), so a same-key retry
+      // can tell its own abandoned create apart from a foreign in-flight
+      // holder.
+      const child = client.groomingChildClaim;
+      const existing = await child.findUnique({ where: { childKey: input.childKey } });
+      if (existing) return { existing };
+      try {
+        await child.create({
+          data: {
+            childKey: input.childKey,
+            parentIssueId: input.parentIssueId,
+            repoFullName: input.repoFullName,
+            parentNumber: input.parentNumber,
+            title: input.title,
+            applicationKey: input.applicationKey,
+          },
+        });
+        return { existing: null };
+      } catch (err) {
+        if (!isUniqueViolation(err)) throw err;
+        return { existing: await child.findUnique({ where: { childKey: input.childKey } }) };
+      }
+    },
+    async saveChild(childKey, data) {
+      await client.groomingChildClaim.update({ where: { childKey }, data });
+    },
+    async setDecompositionState(input) {
+      await setDecompositionState(client, input);
     },
   };
 }

@@ -4,6 +4,7 @@ import { makeDispatchEnvMock } from "@/test/route-helpers";
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findFirstIssue: vi.fn().mockResolvedValue(null),
+    findUniqueIssue: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
   },
@@ -13,6 +14,7 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       findFirst: mocks.findFirstIssue,
+      findUnique: mocks.findUniqueIssue,
       update: mocks.updateIssue,
     },
     auditLog: {
@@ -50,14 +52,16 @@ describe("POST /api/issues/actions/decompose — actor attribution", () => {
       number: 66,
       labels: ["priority/p1"],
     });
-    mocks.updateIssue.mockResolvedValue({
+    const updated = {
       id: "issue-1",
       decomposed: true,
       decomposedAt: new Date(),
       decomposedBy: "example-agent",
       decomposedNote: null,
       followUpUrls: [],
-    });
+    };
+    mocks.updateIssue.mockResolvedValue(updated);
+    mocks.findUniqueIssue.mockResolvedValue(updated);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
   });
 
@@ -213,14 +217,16 @@ describe("POST /api/issues/actions/decompose — reactivity", () => {
       number: 66,
       labels: ["priority/p1"],
     });
-    mocks.updateIssue.mockResolvedValue({
+    const updated = {
       id: "issue-1",
       decomposed: false,
       decomposedAt: null,
       decomposedBy: null,
       decomposedNote: null,
       followUpUrls: [],
-    });
+    };
+    mocks.updateIssue.mockResolvedValue(updated);
+    mocks.findUniqueIssue.mockResolvedValue(updated);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
   });
 

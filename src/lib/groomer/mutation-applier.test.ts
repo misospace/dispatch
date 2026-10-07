@@ -1,19 +1,27 @@
 import { describe, expect, it, vi } from "vitest";
+import { childBriefKey } from "@/lib/decomposition";
 import type { GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { validateGroomingPlan, type GroomingPlan, type GroomingPlanDraft } from "./plan";
 import type { LiveComment, LiveIssueState } from "./mutation-validator";
 import {
+  ACTIVE_CLAIM_MS,
+  DECOMPOSITION_BODY_END,
+  DECOMPOSITION_BODY_START,
   MANAGED_BODY_END,
   MANAGED_BODY_START,
   applyGroomingMutations,
+  parseDecompositionBody,
+  renderDecompositionBody,
+  renderDecompositionSection,
   commentMarker,
   commentMarkerKey,
   computeApplicationKey,
   groomerCommentKey,
   computeMutationDiff,
   makePrismaApplicationStore,
+  MAX_GITHUB_BODY_CHARS,
   parseManagedBody,
   renderManagedBody,
   type ApplicationRecord,
@@ -21,6 +29,7 @@ import {
   type ApplierGitHub,
   type ApplyInput,
   type ApplySteps,
+  type ChildClaimRecord,
   type GroomingMutationDiff,
 } from "./mutation-applier";
 
@@ -127,6 +136,38 @@ function planFor(d: GroomingPlanDraft, snap = snapshot()): GroomingPlan {
   return result.plan!;
 }
 
+/** A plan that splits the issue into `count` bounded children (dispatch#1066). */
+function decomposeDraft(count = 2): GroomingPlanDraft {
+  // A ready `implementation` plan may not decompose, so the split lands as a
+  // non-ready (backlog) verdict.
+  const letter = (n: number) => String.fromCharCode(64 + n);
+  return {
+    ...draft({ actionability: "backlog", lane: { id: "backlog", confidence: "high", reason: "bounded" } }),
+    implementationBrief: null,
+    decomposition: {
+      required: true,
+      reason: `splits into ${count} bounded children`,
+      childBriefs: Array.from({ length: count }, (_, i) => {
+        const l = letter(i + 1);
+        // Every field the apply-time decomposition policy requires a complete
+        // bounded brief to carry: an incomplete brief withholds the split.
+        return {
+          title: `Child issue ${l}`,
+          problem: `Child ${l} problem`,
+          designDecision: `Child ${l} follows the existing pattern; no design choice is left open.`,
+          verifiedCurrentBehavior: `Child ${l} is not implemented yet; login.ts drops the return URL.`,
+          relevantPaths: ["src/auth/login.ts"],
+          inScope: [l],
+          outOfScope: [`Child ${l} does not touch authentication`],
+          dependencies: [],
+          acceptanceCriteria: [`Child ${l} works`],
+          tests: [`Child ${l} is covered by an automated test`],
+        };
+      }),
+    },
+  };
+}
+
 function live(snap = snapshot()): LiveIssueState {
   return { title: snap.issue.title, body: snap.issue.body, labels: snap.issue.labels, state: snap.issue.state };
 }
@@ -177,6 +218,15 @@ describe("managed body section", () => {
   });
 });
 
+describe("parseDecompositionBody", () => {
+  it("refuses a section whose end marker precedes its start", () => {
+    expect(parseDecompositionBody(`${DECOMPOSITION_BODY_END}\nx\n${DECOMPOSITION_BODY_START}`)).toMatchObject({
+      ok: false,
+      reason: "the decomposition section end marker precedes its start",
+    });
+  });
+});
+
 describe("computeMutationDiff", () => {
   it("diffs labels from the live issue and leaves the derived status as the only status", () => {
     const snap = snapshot({ issue: { ...snapshot().issue, labels: ["priority/p1", "status/backlog", "status/needs-review"] } });
@@ -199,6 +249,17 @@ describe("computeMutationDiff", () => {
     const diff = diffFor(alreadyDone(), snap);
     expect(diff.labelsStep.filter((l) => l.startsWith("status/"))).toEqual(["status/backlog"]);
     expect(diff.labelsAfter.filter((l) => l.startsWith("status/"))).toEqual(["status/done"]);
+  });
+
+  it("keeps a non-status label in the labels step on the done (close) branch", () => {
+    // The umbrella is a non-status label; `umbrella` itself is not a model-usable
+    // label, so a representative allowed non-status label (type/bug) proves the
+    // done branch preserves non-status labels — the same derivation that keeps
+    // the umbrella once the decomposition adds it to labelsAfter.
+    const diff = diffFor(alreadyDone({ labelsToAdd: ["type/bug"] }));
+    expect(diff.close).toBe(true);
+    expect(diff.labelsAfter).toContain("type/bug");
+    expect(diff.labelsStep).toContain("type/bug");
   });
 
   it("neutralizes @-mentions in a rewritten title and in the managed body section", () => {
@@ -288,11 +349,19 @@ describe("computeApplicationKey", () => {
 
 // ─── applyGroomingMutations ──────────────────────────────────────────────────
 
-function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Map<string, ApplicationRecord> } {
+function memoryStore(initial?: ApplicationRecord): ApplicationStore & {
+  rows: Map<string, ApplicationRecord>;
+  children: Map<string, ChildClaimRecord>;
+  decompositionStates: Array<{ labels: readonly string[]; followUpUrls: string[] }>;
+} {
   const rows = new Map<string, ApplicationRecord>();
+  const children = new Map<string, ChildClaimRecord>();
+  const decompositionStates: Array<{ labels: readonly string[]; followUpUrls: string[] }> = [];
   if (initial) rows.set(initial.applicationKey, initial);
   return {
     rows,
+    children,
+    decompositionStates,
     find: async (key) => rows.get(key) ?? null,
     claim: async (input) => {
       const existing = rows.get(input.applicationKey) ?? null;
@@ -320,14 +389,43 @@ function memoryStore(initial?: ApplicationRecord): ApplicationStore & { rows: Ma
       row.updatedAt = new Date();
       return true;
     },
+    claimChild: async (input) => {
+      const existing = children.get(input.childKey) ?? null;
+      if (!existing) {
+        // Mirrors @updatedAt: the row is stamped at create, so a claim left by
+        // a crashed attempt is "fresh" until it ages out.
+        children.set(input.childKey, {
+          childKey: input.childKey,
+          childNumber: null,
+          childUrl: null,
+          applicationKey: input.applicationKey,
+          updatedAt: new Date(),
+        });
+      }
+      return { existing: existing ? { ...existing } : null };
+    },
+    saveChild: async (childKey, data) => {
+      const row = children.get(childKey)!;
+      row.childNumber = data.childNumber;
+      row.childUrl = data.childUrl;
+    },
+    // The shared helper's persistence is exercised by the route and
+    // integration tests; the in-memory fake records the call only.
+    setDecompositionState: async (input) => {
+      decompositionStates.push({ labels: input.issue.labels, followUpUrls: input.followUpUrls });
+    },
   };
 }
 
 function fakeGitHub(overrides: Partial<ApplierGitHub> = {}) {
   const calls: string[] = [];
+  const bodies: string[] = [];
   const github: ApplierGitHub = {
     updateLabels: vi.fn(async (_r, _n, labels: string[]) => {
       calls.push(`labels:${labels.filter((l) => l.startsWith("status/")).join(",")}`);
+    }),
+    addLabel: vi.fn(async (_r, _n, label: string) => {
+      calls.push(`addLabel:${label}`);
     }),
     addComment: vi.fn(async () => {
       calls.push("comment");
@@ -335,14 +433,35 @@ function fakeGitHub(overrides: Partial<ApplierGitHub> = {}) {
     }),
     updateTitleAndBody: vi.fn(async (_r, _n, fields) => {
       calls.push(`content:${Object.keys(fields).join("+")}`);
+      if (typeof fields.body === "string") bodies.push(fields.body);
     }),
     closeIssue: vi.fn(async () => {
       calls.push("close");
     }),
+    createIssue: vi.fn(async (_r, input) => {
+      calls.push(`child:${input.title}`);
+      return { number: 43, url: "https://github.com/org/repo/issues/43" };
+    }),
     fetchRecentComments: vi.fn(async () => []),
     ...overrides,
   };
-  return { github, calls };
+  return { github, calls, bodies };
+}
+
+/**
+ * A fakeGitHub whose child creates get a distinct number per brief title
+ * (the plain fake returns 43 for every child), still recording
+ * `child:<title>` in `calls` for ordering.
+ */
+function distinctChildGitHub(overrides: Partial<ApplierGitHub> = {}) {
+  const base = fakeGitHub(overrides);
+  const numbers: Record<string, number> = { "Child issue A": 43, "Child issue B": 44, "Child issue C": 45 };
+  const createIssue = vi.fn(async (r: string, input: { title: string }) => {
+    base.calls.push(`child:${input.title}`);
+    const number = numbers[input.title] ?? 43;
+    return { number, url: `https://github.com/org/repo/issues/${number}` };
+  });
+  return { github: { ...base.github, createIssue } as ApplierGitHub, calls: base.calls, bodies: base.bodies, createIssue };
 }
 
 function applyInput(diff: GroomingMutationDiff, overrides: Partial<ApplyInput> = {}): ApplyInput {
@@ -350,6 +469,7 @@ function applyInput(diff: GroomingMutationDiff, overrides: Partial<ApplyInput> =
     repoFullName: "org/repo",
     issueNumber: 42,
     issueId: "issue-42",
+    parentUrl: "https://github.com/org/repo/issues/42",
     groomingRunId: "run-1",
     applicationKey: KEY,
     diff,
@@ -604,6 +724,660 @@ describe("applyGroomingMutations", () => {
   });
 });
 
+describe("applyGroomingMutations → decomposition", () => {
+  it("creates each child issue, adds the umbrella via addLabel after all children land, and records the child links", async () => {
+    const { github, calls } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    expect(diff.children).not.toBeNull();
+    // The umbrella is NOT part of the labels step: it is an additive write the
+    // children step makes via addLabel, so it never rides labelsStep/labelsAfter.
+    expect(diff.labelsAfter).not.toContain("umbrella");
+    expect(diff.labelsStep).not.toContain("umbrella");
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    expect(store.children.size).toBe(2);
+    // The single labels write carries no umbrella; the children step makes it.
+    expect(github.updateLabels).toHaveBeenCalledTimes(1);
+    expect(github.updateLabels).toHaveBeenCalledWith("org/repo", 42, expect.not.arrayContaining(["umbrella"]));
+    // addLabel is called exactly once, with the umbrella, and only after every
+    // child was created or reused.
+    expect(github.addLabel).toHaveBeenCalledTimes(1);
+    expect(github.addLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+    const addLabelIdx = calls.indexOf("addLabel:umbrella");
+    const childAIdx = calls.indexOf("child:Child issue A");
+    const childBIdx = calls.indexOf("child:Child issue B");
+    expect(addLabelIdx).toBeGreaterThan(childAIdx);
+    expect(addLabelIdx).toBeGreaterThan(childBIdx);
+    // The children step carries the created child LINKS (key/number/url), not counts.
+    const step = result.steps.children!;
+    expect(step.status).toBe("applied");
+    expect(step.children?.created).toHaveLength(2);
+    expect(step.children?.reused).toHaveLength(0);
+    for (const link of step.children!.created) {
+      expect(link.key).toBeTypeOf("string");
+      expect(link.number).toBeTypeOf("number");
+      expect(link.url).toBeTypeOf("string");
+    }
+    // The parent's decomposition state is recorded with the label set at
+    // state-write time (labelsAfter — the umbrella add lands afterwards, so it
+    // is not claimed yet) and the child URLs as the follow-ups.
+    expect(store.decompositionStates).toHaveLength(1);
+    expect(store.decompositionStates[0].labels).toEqual(diff.labelsAfter);
+    expect(store.decompositionStates[0].labels).not.toContain("umbrella");
+    expect(store.decompositionStates[0].followUpUrls).toHaveLength(2);
+    // ApplyResult.labels (freshness baseline / audit) includes the umbrella.
+    expect(result.labels).toContain("umbrella");
+    // ApplyResult.children carries the created links in brief order.
+    expect(result.children).toHaveLength(2);
+  });
+
+  it("orders the children step's writes: child creates → decomposition state → body section → umbrella label", async () => {
+    const { github, calls } = fakeGitHub();
+    const store = memoryStore();
+    const recordState = store.setDecompositionState;
+    store.setDecompositionState = async (input) => {
+      calls.push("decompositionState");
+      return recordState(input);
+    };
+    const diff = diffFor(decomposeDraft());
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    const childAIdx = calls.indexOf("child:Child issue A");
+    const childBIdx = calls.indexOf("child:Child issue B");
+    const stateIdx = calls.indexOf("decompositionState");
+    const bodyIdx = calls.indexOf("content:body");
+    const addLabelIdx = calls.indexOf("addLabel:umbrella");
+    for (const idx of [childAIdx, childBIdx, stateIdx, bodyIdx, addLabelIdx]) expect(idx).toBeGreaterThan(-1);
+    // Both creates precede the state write; the state write precedes the
+    // section body write; the umbrella — which removes the parent from every
+    // selection path — is the step's final write.
+    expect(stateIdx).toBeGreaterThan(childAIdx);
+    expect(stateIdx).toBeGreaterThan(childBIdx);
+    expect(bodyIdx).toBeGreaterThan(stateIdx);
+    expect(addLabelIdx).toBeGreaterThan(bodyIdx);
+  });
+
+  it("reuses a child an earlier attempt already created, creating only the missing one", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const briefs = diff.children!.briefs;
+    // Simulate the first child having been created by an earlier attempt.
+    const firstKey = childBriefKey("org/repo", 42, briefs[0]);
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: 99,
+      childUrl: "https://github.com/org/repo/issues/99",
+      applicationKey: KEY,
+    });
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(github.createIssue).toHaveBeenCalledTimes(1);
+    const step = result.steps.children!;
+    expect(step.children?.created).toHaveLength(1);
+    expect(step.children?.reused).toEqual([{ key: firstKey, number: 99, url: "https://github.com/org/repo/issues/99" }]);
+    // ApplyResult.children is in brief order: the reused first child, then the created one.
+    expect(result.children.map((l) => l.number)).toEqual([99, 43]);
+  });
+
+  it("surfaces the created child links again on a replay, without re-creating them", async () => {
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const first = fakeGitHub();
+    const applied = await applyGroomingMutations(applyInput(diff), first.github, store);
+    expect(applied.outcome).toBe("applied");
+    expect(applied.children).toHaveLength(2);
+    // A replay of the same applied key re-surfaces the links and writes nothing.
+    const second = fakeGitHub();
+    const replayed = await applyGroomingMutations(applyInput(diff), second.github, store);
+    expect(replayed.outcome).toBe("replayed");
+    expect(second.github.createIssue).not.toHaveBeenCalled();
+    expect(replayed.children).toEqual(applied.children);
+  });
+
+  it("creates no children when the decomposition is withheld by policy", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    // A low-confidence split is withheld; no children land.
+    const base = decomposeDraft();
+    const diff = diffFor({ ...base, verdict: { ...base.verdict, confidence: "low" } });
+    expect(diff.children).toBeNull();
+    expect(diff.withheld.decomposition).toBeDefined();
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(github.createIssue).not.toHaveBeenCalled();
+    expect(github.addLabel).not.toHaveBeenCalled();
+    expect(store.children.size).toBe(0);
+    expect(store.decompositionStates).toHaveLength(0);
+    expect(result.steps.children).toMatchObject({ status: "noop" });
+    expect(result.labels).not.toContain("umbrella");
+  });
+
+  it("adds no umbrella when the decomposition is withheld for material uncertainty", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    // A split with a material uncertainty is withheld; no children and no umbrella.
+    const base = decomposeDraft();
+    const diff = diffFor({
+      ...base,
+      verdict: { ...base.verdict, uncertainties: [{ kind: "scope", question: "Which child owns the migration?", material: true }] },
+    });
+    expect(diff.children).toBeNull();
+    expect(diff.withheld.decomposition).toBeDefined();
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(github.createIssue).not.toHaveBeenCalled();
+    expect(github.addLabel).not.toHaveBeenCalled();
+    expect(store.children.size).toBe(0);
+    expect(store.decompositionStates).toHaveLength(0);
+    expect(result.steps.children).toMatchObject({ status: "noop" });
+    expect(result.labels).not.toContain("umbrella");
+  });
+
+  it("does not create a child whose null claim is held by a fresh in-flight attempt", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const briefs = diff.children!.briefs;
+    const firstKey = childBriefKey("org/repo", 42, briefs[0]);
+    // A claim with no recorded child under a DIFFERENT application key,
+    // written moments ago: another attempt is in flight on it. Do not create a
+    // duplicate on top of it.
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: null,
+      childUrl: null,
+      applicationKey: "b".repeat(64),
+      updatedAt: new Date(),
+    });
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("partial"); // the labels step landed, children failed
+    expect(result.failure).toMatchObject({ step: "children", error: expect.stringContaining(`child claim ${firstKey} is held by another in-flight attempt`) });
+    expect(result.steps.children).toMatchObject({ status: "failed" });
+    // No create for the held child, and no umbrella on a failed decomposition.
+    expect(github.createIssue).not.toHaveBeenCalled();
+    expect(github.addLabel).not.toHaveBeenCalled();
+    expect(result.labels).not.toContain("umbrella");
+  });
+
+  it("creates a child whose fresh null claim is its own (same application key)", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const briefs = diff.children!.briefs;
+    const firstKey = childBriefKey("org/repo", 42, briefs[0]);
+    // A claim with no recorded child under THIS application's own key, written
+    // moments ago: the GroomingApplication resume CAS already excludes a
+    // concurrent same-key attempt, so this is my own abandoned create from a
+    // crashed attempt — create on top of it (the immediate same-key retry).
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: null,
+      childUrl: null,
+      applicationKey: KEY,
+      updatedAt: new Date(),
+    });
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    // The abandoned claim is overwritten with the newly created child.
+    expect(store.children.get(firstKey)).toMatchObject({ childNumber: 43, childUrl: "https://github.com/org/repo/issues/43" });
+    expect(github.addLabel).toHaveBeenCalledTimes(1);
+  });
+
+  it("creates a child whose null claim has aged out (no in-flight attempt)", async () => {
+    const { github } = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const briefs = diff.children!.briefs;
+    const firstKey = childBriefKey("org/repo", 42, briefs[0]);
+    // A claim with no recorded child and no applicationKey (a row shape no
+    // deployed env has), written more than 2×ACTIVE_CLAIM_MS ago: the attempt
+    // that took it is long gone, so create proceeds.
+    store.children.set(firstKey, {
+      childKey: firstKey,
+      childNumber: null,
+      childUrl: null,
+      applicationKey: null,
+      updatedAt: new Date(Date.now() - 2 * ACTIVE_CLAIM_MS),
+    });
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    // The stale claim is overwritten with the newly created child.
+    expect(store.children.get(firstKey)).toMatchObject({ childNumber: 43, childUrl: "https://github.com/org/repo/issues/43" });
+    expect(github.addLabel).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries the partial children on a failed create, and converges on a retry of the same key", async () => {
+    const first = fakeGitHub({
+      createIssue: vi.fn(async (_r: string, input: { title: string }) => {
+        if (input.title === "Child issue B") throw new Error("GitHub API error creating issue: 502");
+        return { number: 43, url: "https://github.com/org/repo/issues/43" };
+      }),
+    });
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft(3));
+    const attempt = await applyGroomingMutations(applyInput(diff), first.github, store);
+    expect(attempt.outcome).toBe("partial"); // the labels step landed
+    const step = attempt.steps.children!;
+    expect(step.status).toBe("failed");
+    expect(step.error).toContain("502");
+    // The failed step record carries the child that landed before the failure.
+    expect(step.children?.created).toHaveLength(1);
+    expect(step.children?.created[0].number).toBe(43);
+    expect(attempt.failure).toMatchObject({ step: "children" });
+    // A partial decomposition never lands the umbrella.
+    expect(first.github.addLabel).not.toHaveBeenCalled();
+
+    // A retry under the same application key (no hand-seeded rows): child A
+    // is reused; child B's fresh null claim carries THIS key, which the
+    // GroomingApplication resume CAS proves is not a concurrent holder, so the
+    // held-claim guard does not fire and only the missing children are created,
+    // and the umbrella lands at that point.
+    const retry = fakeGitHub();
+    const converged = await applyGroomingMutations(applyInput(diff), retry.github, store);
+    expect(converged.outcome).toBe("applied");
+    expect(retry.github.createIssue).toHaveBeenCalledTimes(2); // B and C, not A
+    expect(retry.github.createIssue).not.toHaveBeenCalledWith("org/repo", expect.objectContaining({ title: "Child issue A" }));
+    const retriedStep = converged.steps.children!;
+    expect(retriedStep.children?.created).toHaveLength(2);
+    expect(retriedStep.children?.reused).toHaveLength(1);
+    expect(retry.github.addLabel).toHaveBeenCalledTimes(1);
+    expect(retry.github.addLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+  });
+
+  it("surfaces the child links again when a resumed partial application replays its landed children step", async () => {
+    const created = [{ key: "k-a", number: 43, url: "https://github.com/org/repo/issues/43" }];
+    const reused = [{ key: "k-b", number: 44, url: "https://github.com/org/repo/issues/44" }];
+    // The children step landed in the prior attempt (with its links recorded)
+    // but the application never finished: the resume replays the step instead
+    // of re-creating the children, and the result still carries the links.
+    const store = memoryStore({
+      applicationKey: KEY,
+      groomingRunId: "run-0",
+      status: "partial",
+      steps: { children: { status: "applied", children: { created, reused } } },
+      attempts: 1,
+      updatedAt: new Date(Date.now() - 11 * 60 * 1000),
+    });
+    const { github } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(diffFor(decomposeDraft())), github, store);
+    expect(result.outcome).not.toBe("busy");
+    expect(result.steps.children).toMatchObject({ status: "replayed" });
+    expect(github.createIssue).not.toHaveBeenCalled();
+    expect(result.children).toEqual([...created, ...reused]);
+  });
+
+  it("reuses every child under a different application key, creating no duplicates", async () => {
+    const first = fakeGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const applied = await applyGroomingMutations(applyInput(diff), first.github, store);
+    expect(applied.outcome).toBe("applied");
+    expect(first.github.createIssue).toHaveBeenCalledTimes(2);
+
+    // A different application (a re-plan under a new key) that plans the same
+    // children: the child claims from the first run are reused, no duplicates.
+    const otherKey = "b".repeat(64);
+    const second = fakeGitHub();
+    const reused = await applyGroomingMutations(applyInput(diff, { applicationKey: otherKey, groomingRunId: "run-2" }), second.github, store);
+    expect(reused.outcome).toBe("applied");
+    expect(second.github.createIssue).not.toHaveBeenCalled();
+    expect(reused.steps.children?.children?.reused).toHaveLength(2);
+    expect(reused.steps.children?.children?.created).toHaveLength(0);
+    expect(second.github.addLabel).toHaveBeenCalledTimes(1);
+  });
+
+  it("computes an identical application key for the same children in a different brief order", () => {
+    const base = decomposeDraft();
+    const keyA = computeApplicationKey({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      plan: planFor(base),
+      diff: diffFor(base),
+    });
+    // The same set of children, reordered: the application key is stable.
+    const reordered: GroomingPlanDraft = { ...base, decomposition: { ...base.decomposition, childBriefs: [...base.decomposition.childBriefs].reverse() } };
+    const keyB = computeApplicationKey({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      plan: planFor(reordered),
+      diff: diffFor(reordered),
+    });
+    expect(keyB).toBe(keyA);
+    // A changed brief (a new title) is a different application.
+    const changed: GroomingPlanDraft = {
+      ...base,
+      decomposition: { ...base.decomposition, childBriefs: base.decomposition.childBriefs.map((b, i) => (i === 0 ? { ...b, title: "A renamed child" } : b)) },
+    };
+    const keyC = computeApplicationKey({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      plan: planFor(changed),
+      diff: diffFor(changed),
+    });
+    expect(keyC).not.toBe(keyA);
+  });
+});
+
+describe("applyGroomingMutations → decomposition body section", () => {
+  it("writes one parent body whose section lists every child, keeping the human text byte for byte", async () => {
+    const { github, bodies } = distinctChildGitHub();
+    const store = memoryStore();
+    const diff = diffFor(decomposeDraft());
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    // One parent body write for the whole application: the children step's section.
+    expect(bodies).toHaveLength(1);
+    expect(github.updateTitleAndBody).toHaveBeenCalledTimes(1);
+    const body = bodies[0];
+    // One managed section: the parse succeeding means exactly one of each marker.
+    const parsed = parseDecompositionBody(body);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("unreachable");
+    expect(parsed.decomposition).toContain("## Decomposition");
+    // One "- #<n>: <url>" line per child, in brief order.
+    expect(body).toContain("- #43: https://github.com/org/repo/issues/43");
+    expect(body).toContain("- #44: https://github.com/org/repo/issues/44");
+    for (const child of result.children) expect(body).toContain(`- #${child.number}: ${child.url}`);
+    // The original human text is preserved byte for byte before the appended section.
+    expect(body.startsWith("Broken.\n\n")).toBe(true);
+    expect(parsed.human).toBe("Broken.");
+    // Re-rendering the same children is a fixed point.
+    expect(renderDecompositionBody(parsed, renderDecompositionSection(result.children))).toBe(body);
+    // The step's detail records the counts and the section outcome; the result
+    // reports the real post-apply body.
+    expect(result.steps.children?.detail).toBe("2 created, 0 reused; decomposition section written");
+    expect(result.body).toBe(body);
+  });
+
+  it("coexists with the managed enrichment section: the children step renders into the post-content body", async () => {
+    const base = decomposeDraft();
+    const diff = diffFor({ ...base, mutations: { ...base.mutations, proposedBody: "Notes." } });
+    expect(diff.body).not.toBeNull();
+    const { github, calls, bodies } = distinctChildGitHub();
+    const result = await applyGroomingMutations(applyInput(diff), github, memoryStore());
+    expect(result.outcome).toBe("applied");
+    // Two parent body writes: the content step's enrichment, then the children
+    // step's section rendered into the body as it stands after that write.
+    expect(bodies).toHaveLength(2);
+    const firstBodyIdx = calls.indexOf("content:body");
+    const lastBodyIdx = calls.lastIndexOf("content:body");
+    expect(lastBodyIdx).toBeGreaterThan(firstBodyIdx);
+    expect(calls.indexOf("addLabel:umbrella")).toBeGreaterThan(lastBodyIdx);
+    // The first is the managed enrichment section alone.
+    expect(bodies[0]).toBe(`Broken.\n\n${MANAGED_BODY_START}\nNotes.\n${MANAGED_BODY_END}`);
+    expect(bodies[0]).not.toContain(DECOMPOSITION_BODY_START);
+    // The last is both sections: the enrichment section kept, the decomposition
+    // section appended after it.
+    const section =
+      "## Decomposition\n\n" +
+      "Created from this parent's grooming decomposition plan. Each child starts `status/backlog` and needs its own grooming pass before pickup.\n\n" +
+      "- #43: https://github.com/org/repo/issues/43\n" +
+      "- #44: https://github.com/org/repo/issues/44";
+    const expected = `${bodies[0]}\n\n${DECOMPOSITION_BODY_START}\n${section}\n${DECOMPOSITION_BODY_END}`;
+    expect(bodies[bodies.length - 1]).toBe(expected);
+    // The human text survives both managed sections.
+    const managed = parseManagedBody(bodies[bodies.length - 1]);
+    expect(managed.ok).toBe(true);
+    if (!managed.ok) throw new Error("unreachable");
+    expect(managed.managed).toBe("Notes.");
+    const decomp = parseDecompositionBody(managed.human);
+    expect(decomp.ok).toBe(true);
+    if (!decomp.ok) throw new Error("unreachable");
+    expect(decomp.human).toBe("Broken.");
+    expect(result.body).toBe(bodies[bodies.length - 1]);
+    expect(result.steps.children?.detail).toBe("2 created, 0 reused; decomposition section written");
+  });
+
+  it("writes no body when the section already lists the same children (a fixed point), and still lands the umbrella", async () => {
+    const { github, bodies } = distinctChildGitHub();
+    const store = memoryStore();
+    const briefs = decomposeDraft().decomposition.childBriefs;
+    // Every child was already created by an earlier application.
+    const links = [
+      { key: childBriefKey("org/repo", 42, briefs[0]), number: 99, url: "https://github.com/org/repo/issues/99" },
+      { key: childBriefKey("org/repo", 42, briefs[1]), number: 100, url: "https://github.com/org/repo/issues/100" },
+    ];
+    for (const link of links) {
+      store.children.set(link.key, {
+        childKey: link.key,
+        childNumber: link.number,
+        childUrl: link.url,
+        applicationKey: KEY,
+      });
+    }
+    // The live body already carries the section rendered from those same links.
+    const parsed = parseDecompositionBody("Broken.");
+    if (!parsed.ok) throw new Error("unreachable");
+    const liveBody = renderDecompositionBody(parsed, renderDecompositionSection(links));
+    const diff = diffFor(decomposeDraft(), snapshot({ issue: { ...snapshot().issue, body: liveBody } }));
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    // Re-rendering the same section is a fixed point: no body write at all.
+    expect(bodies).toHaveLength(0);
+    expect(github.updateTitleAndBody).not.toHaveBeenCalled();
+    // The post-apply body is the (unchanged) live body.
+    expect(result.body).toBe(liveBody);
+    // The children are reused, the state is recorded, and the umbrella still lands.
+    expect(result.steps.children?.detail).toBe("0 created, 2 reused; decomposition section unchanged");
+    expect(result.children.map((l) => l.number)).toEqual([99, 100]);
+    expect(store.decompositionStates).toHaveLength(1);
+    expect(store.decompositionStates[0].followUpUrls).toEqual(["https://github.com/org/repo/issues/99", "https://github.com/org/repo/issues/100"]);
+    expect(github.addLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+  });
+
+  it("refuses a malformed section (two start markers): no body write, the umbrella still lands, and the detail says so", async () => {
+    const { github, bodies } = distinctChildGitHub();
+    const store = memoryStore();
+    // A human edit broke the section markers: two starts, one end.
+    const liveBody =
+      `Broken.\n\n` +
+      `${DECOMPOSITION_BODY_START}\n- #99: https://github.com/org/repo/issues/99\n${DECOMPOSITION_BODY_END}\n\n` +
+      `${DECOMPOSITION_BODY_START}\n- #100: https://github.com/org/repo/issues/100`;
+    const snap = snapshot({ issue: { ...snapshot().issue, body: liveBody } });
+    const diff = diffFor(decomposeDraft(), snap);
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    // The section write is refused, not guessed at: the body is untouched.
+    expect(bodies).toHaveLength(0);
+    expect(github.updateTitleAndBody).not.toHaveBeenCalled();
+    expect(result.body).toBe(liveBody);
+    // The children, the state and the umbrella still land.
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    expect(store.decompositionStates).toHaveLength(1);
+    expect(github.addLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+    expect(result.steps.children).toMatchObject({ status: "applied" });
+    expect(result.steps.children?.detail).toBe(
+      "2 created, 0 reused; decomposition section write refused: the decomposition section markers are unpaired or repeated",
+    );
+  });
+
+  it("records the created/reused counts and the section outcome on the step detail in all three outcomes", async () => {
+    // Written.
+    const written = await applyGroomingMutations(
+      applyInput(diffFor(decomposeDraft())),
+      distinctChildGitHub().github,
+      memoryStore(),
+    );
+    expect(written.steps.children?.detail).toBe("2 created, 0 reused; decomposition section written");
+    // Unchanged: every child reused, section already current.
+    const briefs = decomposeDraft().decomposition.childBriefs;
+    const store = memoryStore();
+    const links = [
+      { key: childBriefKey("org/repo", 42, briefs[0]), number: 99, url: "https://github.com/org/repo/issues/99" },
+      { key: childBriefKey("org/repo", 42, briefs[1]), number: 100, url: "https://github.com/org/repo/issues/100" },
+    ];
+    for (const link of links) {
+      store.children.set(link.key, {
+        childKey: link.key,
+        childNumber: link.number,
+        childUrl: link.url,
+        applicationKey: KEY,
+      });
+    }
+    const parsed = parseDecompositionBody("Broken.");
+    if (!parsed.ok) throw new Error("unreachable");
+    const liveBody = renderDecompositionBody(parsed, renderDecompositionSection(links));
+    const snap = snapshot({ issue: { ...snapshot().issue, body: liveBody } });
+    const unchanged = await applyGroomingMutations(
+      applyInput(diffFor(decomposeDraft(), snap)),
+      distinctChildGitHub().github,
+      store,
+    );
+    expect(unchanged.steps.children?.detail).toBe("0 created, 2 reused; decomposition section unchanged");
+    // Refused: malformed markers in the live body.
+    const broken = `${DECOMPOSITION_BODY_START}\nx\n${DECOMPOSITION_BODY_START}\ny`;
+    const refused = await applyGroomingMutations(
+      applyInput(diffFor(decomposeDraft(), snapshot({ issue: { ...snapshot().issue, body: broken } }))),
+      distinctChildGitHub().github,
+      memoryStore(),
+    );
+    expect(refused.steps.children?.detail).toBe(
+      "2 created, 0 reused; decomposition section write refused: the decomposition section markers are unpaired or repeated",
+    );
+  });
+
+  it("strips decomposition markers the model embedded in its enrichment, so the children section lands exactly once", async () => {
+    // A full marker pair the model embedded in its enrichment, and an
+    // unpaired start marker: without stripping, the pair would be parsed as
+    // the children step's own section (its model text between the markers
+    // replaced) and the unpaired one would poison the body into a refusal.
+    const variants: Array<[proposedBody: string, modelText: string]> = [
+      [`Before ${DECOMPOSITION_BODY_START}\nnested model text\n${DECOMPOSITION_BODY_END} After`, "nested model text"],
+      [`Before ${DECOMPOSITION_BODY_START} orphan marker text After`, "orphan marker text"],
+    ];
+    for (const [proposedBody, modelText] of variants) {
+      const base = decomposeDraft();
+      const diff = diffFor({ ...base, mutations: { ...base.mutations, proposedBody } });
+      const { github, bodies } = distinctChildGitHub();
+      const result = await applyGroomingMutations(applyInput(diff), github, memoryStore());
+      expect(result.outcome).toBe("applied");
+      // The content step's enrichment write carries no decomposition marker:
+      // the model's text survives, the markers do not.
+      expect(bodies).toHaveLength(2);
+      expect(bodies[0]).not.toContain(DECOMPOSITION_BODY_START);
+      expect(bodies[0]).not.toContain(DECOMPOSITION_BODY_END);
+      expect(bodies[0]).toContain(modelText);
+      // The children step's section lands exactly once, at the top level.
+      const finalBody = bodies[bodies.length - 1];
+      expect(finalBody.split(DECOMPOSITION_BODY_START).length - 1).toBe(1);
+      expect(finalBody.split(DECOMPOSITION_BODY_END).length - 1).toBe(1);
+      const managed = parseManagedBody(finalBody);
+      expect(managed.ok).toBe(true);
+      if (!managed.ok) throw new Error("unreachable");
+      expect(managed.managed).toContain(modelText);
+      expect(managed.managed).not.toContain(DECOMPOSITION_BODY_START);
+      expect(managed.managed).not.toContain(DECOMPOSITION_BODY_END);
+      const decomp = parseDecompositionBody(finalBody);
+      expect(decomp.ok).toBe(true);
+      if (!decomp.ok) throw new Error("unreachable");
+      expect(decomp.decomposition).toContain("## Decomposition");
+      // The section is not nested inside the managed one.
+      expect(decomp.decomposition).not.toContain(MANAGED_BODY_START);
+      // The human text is intact.
+      expect(decomp.human).toContain("Broken.");
+      expect(result.steps.children?.detail).toBe("2 created, 0 reused; decomposition section written");
+    }
+  });
+
+  it("refuses a section write that would exceed GitHub's body cap, and still lands the umbrella", async () => {
+    const { github, bodies } = distinctChildGitHub();
+    const store = memoryStore();
+    // A body at the cap: appending the section would exceed it, so the write
+    // is refused rather than failing on every retry.
+    const huge = "A".repeat(MAX_GITHUB_BODY_CHARS);
+    const snap = snapshot({ issue: { ...snapshot().issue, body: huge } });
+    const diff = diffFor(decomposeDraft(), snap);
+    const result = await applyGroomingMutations(applyInput(diff), github, store);
+    expect(result.outcome).toBe("applied");
+    // No body write at all: the body is left exactly as it was.
+    expect(bodies).toHaveLength(0);
+    expect(github.updateTitleAndBody).not.toHaveBeenCalled();
+    expect(result.body).toBe(huge);
+    // The children, the state and the umbrella still land.
+    expect(github.createIssue).toHaveBeenCalledTimes(2);
+    expect(store.decompositionStates).toHaveLength(1);
+    expect(github.addLabel).toHaveBeenCalledWith("org/repo", 42, "umbrella");
+    expect(result.steps.children).toMatchObject({ status: "applied" });
+    expect(result.steps.children?.detail).toBe(
+      `2 created, 0 reused; decomposition section write refused: body would exceed ${MAX_GITHUB_BODY_CHARS} characters`,
+    );
+  });
+
+  it("keeps an existing decomposition section byte for byte when the content step replaces the managed section", async () => {
+    // Cross-application: the parent was enriched by one application and
+    // decomposed by another; the body carries both managed sections. A fresh
+    // plan that enriches again must replace only the managed section.
+    const origDecomp = `${DECOMPOSITION_BODY_START}\n- #99: https://github.com/org/repo/issues/99\n${DECOMPOSITION_BODY_END}`;
+    const baseBody = `Broken.\n\n${MANAGED_BODY_START}\nold enrichment\n${MANAGED_BODY_END}\n\n${origDecomp}`;
+    const snap = snapshot({ issue: { ...snapshot().issue, body: baseBody } });
+    const base = decomposeDraft();
+    const diff = diffFor({ ...base, mutations: { ...base.mutations, proposedBody: "Notes." } }, snap);
+    const { github, bodies } = distinctChildGitHub();
+    const result = await applyGroomingMutations(applyInput(diff), github, memoryStore());
+    expect(result.outcome).toBe("applied");
+    expect(bodies).toHaveLength(2);
+    // The content step replaces only the managed section: the pre-existing
+    // decomposition section survives the enrichment write byte for byte.
+    expect(bodies[0]).toBe(`Broken.\n\n${MANAGED_BODY_START}\nNotes.\n${MANAGED_BODY_END}\n\n${origDecomp}`);
+    // The children step then re-renders the decomposition section in place:
+    // the old child lines are replaced, and both managed sections coexist in
+    // the final body, each holding its own.
+    const section =
+      "## Decomposition\n\n" +
+      "Created from this parent's grooming decomposition plan. Each child starts `status/backlog` and needs its own grooming pass before pickup.\n\n" +
+      "- #43: https://github.com/org/repo/issues/43\n" +
+      "- #44: https://github.com/org/repo/issues/44";
+    const finalBody = `Broken.\n\n${MANAGED_BODY_START}\nNotes.\n${MANAGED_BODY_END}\n\n${DECOMPOSITION_BODY_START}\n${section}\n${DECOMPOSITION_BODY_END}`;
+    expect(bodies[bodies.length - 1]).toBe(finalBody);
+    const managed = parseManagedBody(bodies[bodies.length - 1]);
+    expect(managed.ok).toBe(true);
+    if (!managed.ok) throw new Error("unreachable");
+    expect(managed.managed).toBe("Notes.");
+    const decomp = parseDecompositionBody(bodies[bodies.length - 1]);
+    expect(decomp.ok).toBe(true);
+    if (!decomp.ok) throw new Error("unreachable");
+    expect(decomp.decomposition).toBe(section);
+    expect(decomp.human).toContain("Broken.");
+    expect(result.body).toBe(bodies[bodies.length - 1]);
+  });
+});
+
+describe("applyGroomingMutations → ApplyResult.body", () => {
+  it("is the newly written section body when the children step wrote the section", async () => {
+    const { github, bodies } = distinctChildGitHub();
+    const result = await applyGroomingMutations(applyInput(diffFor(decomposeDraft())), github, memoryStore());
+    expect(result.outcome).toBe("applied");
+    expect(result.body).not.toBeNull();
+    expect(result.body).toBe(bodies[bodies.length - 1]);
+    expect(result.body).toContain(DECOMPOSITION_BODY_START);
+    expect(result.body).toContain(DECOMPOSITION_BODY_END);
+  });
+
+  it("is the content step's body when the content step wrote and the plan does not decompose", async () => {
+    const { github, bodies } = fakeGitHub();
+    const diff = diffFor(draft({}, { proposedBody: "Notes." }));
+    const result = await applyGroomingMutations(applyInput(diff), github, memoryStore());
+    expect(result.outcome).toBe("applied");
+    expect(result.steps.content).toMatchObject({ status: "applied" });
+    expect(result.steps.children).toMatchObject({ status: "noop" });
+    expect(bodies).toHaveLength(1);
+    expect(result.body).toBe(diff.body);
+    expect(result.body).toContain(MANAGED_BODY_START);
+    expect(result.body).not.toContain(DECOMPOSITION_BODY_START);
+  });
+
+  it("is null when neither the content nor the children step wrote a body", async () => {
+    const snap = snapshot({ issue: { ...snapshot().issue, labels: ["priority/p1", "status/ready", "type/bug"] } });
+    const { github, bodies } = fakeGitHub();
+    const result = await applyGroomingMutations(applyInput(diffFor(draft(), snap)), github, memoryStore());
+    expect(result.outcome).toBe("noop");
+    expect(bodies).toHaveLength(0);
+    expect(result.body).toBeNull();
+  });
+});
+
 function addCommentBody(github: ApplierGitHub): string {
   return (github.addComment as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
 }
@@ -631,6 +1405,13 @@ describe("makePrismaApplicationStore", () => {
         updateMany: vi.fn(async () => ({ count: 1 })),
       },
       groomingRun: { findFirst: vi.fn(async () => null) },
+      groomingChildClaim: {
+        findUnique: vi.fn(async (): Promise<ChildClaimRecord | null> => null),
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+        update: vi.fn(async () => ({})),
+      },
+      issue: { update: vi.fn(async () => ({})) },
+      auditLog: { create: vi.fn(async () => ({})) },
     };
   }
 
@@ -684,12 +1465,51 @@ describe("makePrismaApplicationStore", () => {
     expect(claimed.existing).toEqual(winner);
   });
 
+  it("reads the winner when it loses a concurrent child claim (P2002)", async () => {
+    const c = client();
+    const winner: ChildClaimRecord = {
+      childKey: "child-key",
+      childNumber: 43,
+      childUrl: "https://github.com/org/repo/issues/43",
+      applicationKey: KEY,
+    };
+    c.groomingChildClaim.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(winner);
+    c.groomingChildClaim.create.mockRejectedValueOnce(Object.assign(new Error("Unique constraint failed"), { code: "P2002" }));
+    const store = makePrismaApplicationStore(c);
+    const claimed = await store.claimChild({
+      childKey: "child-key",
+      parentIssueId: "issue-42",
+      repoFullName: "org/repo",
+      parentNumber: 42,
+      title: "Child issue A",
+      applicationKey: KEY,
+    });
+    expect(claimed.existing).toEqual(winner);
+  });
+
   it("propagates other database errors, so nothing is applied unclaimed", async () => {
     const c = client();
     c.groomingApplication.create.mockRejectedValueOnce(new Error("connection refused"));
     const store = makePrismaApplicationStore(c);
     await expect(
       store.claim({ applicationKey: KEY, issueId: "i", groomingRunId: "r1", repoFullName: "org/repo", issueNumber: 42 }),
+    ).rejects.toThrow("connection refused");
+  });
+
+  it("propagates other database errors from a child-claim create, so nothing is claimed unrecorded", async () => {
+    const c = client();
+    c.groomingChildClaim.findUnique.mockResolvedValueOnce(null);
+    c.groomingChildClaim.create.mockRejectedValueOnce(new Error("connection refused"));
+    const store = makePrismaApplicationStore(c);
+    await expect(
+      store.claimChild({
+        childKey: "child-key",
+        parentIssueId: "issue-42",
+        repoFullName: "org/repo",
+        parentNumber: 42,
+        title: "Child issue A",
+        applicationKey: KEY,
+      }),
     ).rejects.toThrow("connection refused");
   });
 });
