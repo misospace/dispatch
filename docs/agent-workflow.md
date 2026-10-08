@@ -95,10 +95,11 @@ Refresh Dispatch's cache of GitHub Issues before selecting work. This fetches th
 
 ```
 POST /api/sync
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
-**Auth:** None required (public endpoint).
+**Auth:** Bearer token required (maintainer tier).
 
 **Expected response:** `{ syncedCount: N }` where N is the number of issues synced.
 
@@ -112,9 +113,10 @@ Fetch the list of issues actionable for this agent, ranked by priority and statu
 
 ```
 GET /api/agents/<agent-name>/queue
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 ```
 
-**Auth:** None required (public endpoint).
+**Auth:** Bearer token required (worker or maintainer tier).
 
 **Response:** Array of issue objects containing `number`, `title`, `url`, and `labels`.
 
@@ -226,7 +228,7 @@ Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 Content-Type: application/json
 ```
 
-**Auth:** Bearer token required for agents.
+**Auth:** Bearer token required (maintainer tier — `/api/issues/move` is not in the worker allowlist).
 
 This endpoint writes to the audit log and updates both GitHub labels and the local cache.
 
@@ -263,20 +265,22 @@ All Dispatch interactions are best-effort from the agent's perspective:
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/api/health` | GET | None | Health check — `{ ok: true, database: "ok" }` |
-| `/api/sync` | POST | None | Trigger issue sync from GitHub (best-effort) |
-| `/api/sync/scheduled` | POST | Bearer token | Scheduled sync runner — primary freshness mechanism |
-| `/api/issues` | GET | None | List all issues in Dispatch cache |
-| `/api/agents/<name>/queue` | GET | None | Agent-specific issue queue |
-| `/api/issues/claim` | POST | Bearer token | Claim an issue (adds agent label) |
-| `/api/issues/unclaim` | POST | Bearer token | Release an issue (removes agent label) |
-| `/api/issues/actions` | POST | None | Assign/unassign agent or owner labels |
-| `/api/issues/unassign` | POST | None | Remove all agent/owner labels of a type |
-| `/api/issues/move` | POST | Bearer token | Move an issue on the board |
-| `/api/agent-runs` | GET | None | List recent agent runs |
-| `/api/agent-runs` | POST | Bearer token | Submit a new agent run record |
-| `/api/agents/{name}/heartbeat` | POST | Bearer token | Internal sync/reconcile pass. Returns `touchedIssueUrls: []` because the sync phase is repo-scoped and carries no per-issue URL data. |
-| `/api/automation/repos` | GET | None | List tracked repositories |
-| `/api/audit` | GET | None | Query audit log entries |
+| `/api/sync` | POST | Bearer (maintainer) | Trigger issue sync from GitHub (best-effort) |
+| `/api/sync/scheduled` | POST | Bearer (maintainer) | Scheduled sync runner — primary freshness mechanism |
+| `/api/issues` | GET | Bearer (worker or maintainer) | List all issues in Dispatch cache |
+| `/api/agents/<name>/queue` | GET | Bearer (worker or maintainer) | Agent-specific issue queue |
+| `/api/issues/claim` | POST | Bearer (worker; `force` requires maintainer) | Claim an issue (adds agent label) |
+| `/api/issues/unclaim` | POST | Bearer (worker or maintainer) | Release an issue (removes agent label) |
+| `/api/issues/actions` | POST | Bearer (maintainer) | Assign/unassign agent or owner labels |
+| `/api/issues/unassign` | POST | Bearer (maintainer) | Remove all agent/owner labels of a type |
+| `/api/issues/move` | POST | Bearer (maintainer) | Move an issue on the board |
+| `/api/agent-runs` | GET | Bearer (maintainer) | List recent agent runs |
+| `/api/agent-runs` | POST | Bearer (maintainer) | Submit a new agent run record |
+| `/api/agents/{name}/heartbeat` | POST | Bearer (worker or maintainer) | Internal sync/reconcile pass. Returns `touchedIssueUrls: []` because the sync phase is repo-scoped and carries no per-issue URL data. |
+| `/api/automation/repos` | GET | Bearer (maintainer) | List tracked repositories |
+| `/api/audit` | GET | Bearer (maintainer) | Query audit log entries |
+
+**Tiers:** `worker` = `DISPATCH_WORKER_TOKEN`; `maintainer` = `DISPATCH_AGENT_TOKEN` (or the `DISPATCH_MAINTAINER_TOKEN` alias). A worker token calling a maintainer-tier route gets `403`. The authoritative allowlist is `WORKER_ALLOWLIST` in `src/lib/auth.ts` — see [Token Tiers](./worker-execution-contract.md#token-tiers). Every row above is guarded by `authorizeRequest` except `/api/health`, the only unguarded endpoint in this table.
 
 ## Five-Column Workflow Details
 
