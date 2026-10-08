@@ -408,11 +408,17 @@ async function executeGroomerRun(
         engagementWarnings.push(warning);
         console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: ${warning}`, error);
       }
-      if (evidence.issue.commentsCount != null && participants.length < evidence.issue.commentsCount) {
+      const reported = evidence.issue.commentsCount;
+      const countVerifiable = typeof reported === "number" && Number.isInteger(reported) && reported >= 0;
+      if (!countVerifiable) {
+        engagement = { ...engagement, engaged: true };
+        engagementReason = "participant_scan_incomplete";
+        engagementWarnings.push("trust: participant count unverifiable; external replies require operator approval");
+      } else if (participants.length < reported) {
         engagement = { ...engagement, engaged: true };
         engagementReason = "participant_scan_incomplete";
         engagementWarnings.push(
-          `trust: participant scan incomplete (${participants.length}/${evidence.issue.commentsCount}); external replies require operator approval`,
+          `trust: participant scan incomplete (${participants.length}/${reported}); external replies require operator approval`,
         );
       }
     }

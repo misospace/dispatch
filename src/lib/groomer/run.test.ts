@@ -260,6 +260,7 @@ const mockEvidence: GroomingEvidenceSnapshot = {
     state: "open",
     author: "maintainer",
     authorAssociation: "OWNER",
+    commentsCount: 0,
     updatedAt: "2026-09-24T00:00:00.000Z",
     url: "https://github.com/org/repo/issues/42",
   },
@@ -876,7 +877,7 @@ describe("runHostedGroomer", () => {
     });
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE" },
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 1 },
     });
     mocks.fetchIssueComments.mockResolvedValue([
       { id: 7, author: "Alice", authorAssociation: "NONE", body: "I would like to contribute.", createdAt: "2026-10-08T00:00:00Z" },
@@ -919,7 +920,7 @@ describe("runHostedGroomer", () => {
     });
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER" },
+      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER", commentsCount: 1 },
     });
     mocks.fetchIssueComments.mockResolvedValue([
       { id: 9, author: "reviewer", authorAssociation: "COLLABORATOR", body: "Please check this.", createdAt: "2026-10-08T00:00:00Z" },
@@ -934,7 +935,7 @@ describe("runHostedGroomer", () => {
   it("holds replies to externally-engaged automation issues while applying backlog labels", async () => {
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE" },
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 1 },
     });
     mocks.fetchIssueComments.mockResolvedValue([
       { id: 7, author: "alice", authorAssociation: "NONE", body: "I would like to contribute.", createdAt: "2026-10-08T00:00:00Z" },
@@ -1036,10 +1037,52 @@ describe("runHostedGroomer", () => {
     expect(mocks.addIssueComment).not.toHaveBeenCalled();
   });
 
+  it("fails closed when commentsCount is absent", async () => {
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER", commentsCount: undefined },
+    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "A proposed reply." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan).toMatchObject({ commentHeld: true, commentHoldReason: "participant_scan_incomplete" });
+    expect(result!.contextWarnings).toContain("trust: participant count unverifiable; external replies require operator approval");
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["not-a-number", -1, 0.5])("fails closed when commentsCount is malformed (%s)", async (commentsCount) => {
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER", commentsCount } as typeof mockEvidence.issue,
+    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "A proposed reply." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan).toMatchObject({ commentHeld: true, commentHoldReason: "participant_scan_incomplete" });
+    expect(result!.contextWarnings).toContain("trust: participant count unverifiable; external replies require operator approval");
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("posts autonomously when the trusted participant scan verifies a zero comment count", async () => {
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER", commentsCount: 0 },
+    });
+    mocks.fetchIssueComments.mockResolvedValue([]);
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "Reviewed and groomed." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan).toMatchObject({ commentHeld: false });
+    expect(mocks.addIssueComment).toHaveBeenCalledTimes(1);
+  });
+
   it("fails closed when the participant scan fails", async () => {
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE" },
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 0 },
     });
     mocks.fetchIssueComments.mockImplementation(async (_repo, _number, max) => {
       if (max === 100) throw new Error("comments API unavailable");
@@ -1076,7 +1119,7 @@ describe("runHostedGroomer", () => {
   it("completes the run and audits a failed pending-reply hold write", async () => {
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE" },
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 1 },
     });
     mocks.fetchIssueComments.mockResolvedValue([
       { id: 7, author: "alice", authorAssociation: "NONE", body: "I would like to contribute.", createdAt: "2026-10-08T00:00:00Z" },
@@ -1115,7 +1158,7 @@ describe("runHostedGroomer", () => {
     mocks.getHostedGroomerConfig.mockReturnValue({ ...mockConfig, externalReplyPolicy: "off" });
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE" },
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 1 },
     });
     mocks.fetchIssueComments.mockResolvedValue([
       { id: 8, author: "alice", authorAssociation: "NONE", body: "Can I contribute?", createdAt: "2026-10-08T00:00:00Z" },
@@ -1142,7 +1185,7 @@ describe("runHostedGroomer", () => {
   it("posts comments when every issue participant is trusted", async () => {
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,
-      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER" },
+      issue: { ...mockEvidence.issue, author: "maintainer", authorAssociation: "OWNER", commentsCount: 1 },
     });
     mocks.fetchIssueComments.mockResolvedValue([
       { id: 9, author: "reviewer", authorAssociation: "COLLABORATOR", body: "Please check this.", createdAt: "2026-10-08T00:00:00Z" },
@@ -2619,6 +2662,10 @@ Investigate session handling in auth module.`;
     });
 
     it("applies zero mutations when a human comments after the evidence was captured", async () => {
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: { ...mockEvidence.issue, commentsCount: 1 },
+      });
       mocks.fetchIssueComments.mockImplementation(async (_repo: string, _n: number, _max?: number, direction?: string) =>
         direction === "desc" ? [{ id: 5, author: "alice", body: "Wait, not yet.", createdAt: new Date(Date.now() + 1000).toISOString() }] : [],
       );
@@ -2869,6 +2916,10 @@ Investigate session handling in auth module.`;
 
     it("does not let a forged marker in someone else's comment suppress the groomer's comment", async () => {
       mocks.callGroomerLLM.mockResolvedValue(withComment);
+      mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+        ...mockEvidence,
+        issue: { ...mockEvidence.issue, commentsCount: 1 },
+      });
       mocks.fetchIssueComments.mockImplementation(async (_repo: string, _n: number, _max?: number, direction?: string) =>
         direction === "desc"
           ? [

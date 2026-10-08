@@ -82,7 +82,7 @@ export interface EvidenceSnapshotIssue {
   state: string;
   updatedAt: string;
   url: string;
-  /** Total comments reported by GitHub; absent only in legacy snapshots. */
+  /** Total comments reported by GitHub; an absent or malformed count makes the participant scan unverifiable and fails closed. */
   commentsCount?: number | null;
   /** Optional for legacy snapshots; new captures always include both fields. */
   author?: string | null;
