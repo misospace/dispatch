@@ -186,7 +186,7 @@ function request(url: string, agentName = "example-agent", includeAuth = true) {
 }
 
 /** A plain issue with no linked PR: independent implement work. */
-function independentIssue(number: number) {
+function independentIssue(number: number, overrides: Record<string, unknown> = {}) {
   return {
     id: `issue-${number}`,
     number,
@@ -203,6 +203,7 @@ function independentIssue(number: number) {
     linkedPrReviewDecision: null,
     linkedPrMergeState: null,
     linkedPrHealthCheckedAt: null,
+    ...overrides,
   };
 }
 
@@ -1635,7 +1636,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       feedback: ["wait for approval"],
       agentHandouts: [],
     };
-    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15), independentIssue(99)]);
     mocks.prFixCreate.mockRejectedValue(Object.assign(new Error("unique constraint"), { code: "P2002" }));
     mocks.prFixFindUniqueByRepo.mockResolvedValueOnce(null).mockResolvedValueOnce(winner);
     mocks.linkedRows.push(winner);
@@ -1645,15 +1646,17 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
-    expect((await res.json()).type).toBe("idle");
+    const raceBody = await res.json();
+    expect(raceBody.type).toBe("implement");
+    expect(raceBody.issue.number).toBe(99);
     expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
     expect(mocks.prFixHistoryCreate).not.toHaveBeenCalled();
     expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
     expect(winner).toMatchObject({ status: "BLOCKED", generation: 4, lane: "ESCALATED", agentHandouts: [] });
   });
 
-  it("does not create linked follow-up for a PR with the needs-human label", async () => {
-    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+  it("does not create linked follow-up for a PR with the needs-human label, and serves the next issue", async () => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15), independentIssue(99)]);
     mocks.fetchPullRequestLabels.mockResolvedValue(["needs-human"]);
 
     const res = await GET(
@@ -1661,7 +1664,41 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
 
-    expect((await res.json()).type).toBe("idle");
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+  });
+
+  it("defers the issue when the needs-human label read is unavailable, and serves the next issue", async () => {
+    // A transient GitHub failure must not fail the verdict open: the PR may be
+    // human-blocked, so the issue is not eligible for implement pickup either.
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15), independentIssue(99)]);
+    mocks.fetchPullRequestLabels.mockResolvedValue(null);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+  });
+
+  it("idles when the label read is unavailable and the linked issue is the only ready work", async () => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+    mocks.fetchPullRequestLabels.mockResolvedValue(null);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("idle");
+    expect(body.reason).toContain("deferred");
     expect(mocks.prFixCreate).not.toHaveBeenCalled();
   });
 
@@ -1692,7 +1729,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     // null: discovered work must still converge onto the queue (NORMAL) so a
     // capable lane picks it up, rather than being silently dropped. The cloud
     // caller itself must not consume PR-fix work (#1046).
-    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15, { currentLane: "cloud" })]);
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, { currentLane: "cloud" }),
+      independentIssue(99, { currentLane: "cloud" }),
+    ]);
 
     const res = await GET(
       request("/api/agents/example-agent/next-task?lane=cloud"),
@@ -1700,7 +1740,9 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     );
 
     const body = await res.json();
-    expect(body.type).toBe("idle");
+    // The linked issue is queue-owned; the caller drains to its next issue.
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
     expect(mocks.prFixCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ lane: "NORMAL", status: "QUEUED" }),
     }));
@@ -1726,6 +1768,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     mocks.issueFindMany.mockResolvedValue([
       linkedIssue(42, 15),
       linkedIssue(43, 16, { id: "issue-43", number: 43, title: "Second issue", url: "https://github.com/org/repo/issues/43" }),
+      independentIssue(99),
     ]);
     mocks.prFixCreate
       .mockRejectedValueOnce(Object.assign(new Error("db down"), { code: "P2024" }))
