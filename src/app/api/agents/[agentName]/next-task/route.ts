@@ -1,17 +1,19 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import {
   createIdleTask,
   createImplementTask,
   createFollowupPrTask,
   createGroomTask,
 } from "@/lib/agent-task";
-import { isBacklogLane, getBacklogLane } from "@/lib/lane-config";
+import { isBacklogLane, getBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 import { selectGroomingCandidate } from "@/lib/groomer/selector";
-import { agentAlreadyHanded, agentHandoutToken } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem } from "@/lib/pr-fix-queue";
+import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
+import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 
 /** A queued PR-fix item as the route consumes it (see toAgentQueuePrFixItem). */
 type PrFixCandidate = {
@@ -54,9 +56,11 @@ type PrFixCandidate = {
  */
 async function confirmPrFixHandOut(
   candidate: PrFixCandidate,
-): Promise<{ generation: number; reason: string; feedback: string[] } | null> {
+  agentName: string,
+): Promise<{ generation: number; reason: string; feedback: string[]; lane: string | null } | null> {
   let dispatchReason = candidate.reason;
   let dispatchFeedback = candidate.feedback;
+  let dispatchLane = candidate.lane ?? null;
   // The generation the task token ships, or null when no pass
   // confirmed the live row (defer the hand-out to the next poll).
   let confirmedGeneration: number | null = null;
@@ -71,6 +75,7 @@ async function confirmPrFixHandOut(
         where: {
           id: candidate.id,
           generation: stampGeneration,
+          status: "QUEUED",
           OR: [
             { dispatchedGeneration: null },
             { dispatchedGeneration: { not: stampGeneration } },
@@ -84,11 +89,17 @@ async function confirmPrFixHandOut(
       });
       const fresh = await prisma.prFixQueueItem.findUnique({
         where: { id: candidate.id },
-        select: { reason: true, feedback: true, generation: true },
+        select: { reason: true, feedback: true, generation: true, status: true, lane: true, agentHandouts: true },
       });
-      if (!fresh) break;
+      if (
+        !fresh ||
+        (fresh.status !== undefined && fresh.status !== "QUEUED") ||
+        (fresh.lane !== undefined && candidate.lane !== undefined && fresh.lane !== candidate.lane)
+      ) break;
+      if (agentAlreadyHanded({ agentHandouts: fresh.agentHandouts, generation: fresh.generation }, agentName)) break;
       dispatchReason = fresh.reason;
       dispatchFeedback = fresh.feedback ?? [];
+      dispatchLane = fresh.lane ?? null;
       // A re-read generation that is a number and not the one we just
       // stamped means the row moved under us: log the race (#1119) and
       // retry the stamp+re-read against the new generation. The token
@@ -120,7 +131,7 @@ async function confirmPrFixHandOut(
     console.warn(`next-task pr-fix hand-out for ${candidate.repo}#${candidate.pr}: no confirmed generation; deferring the item to the next poll`);
     return null;
   }
-  return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback };
+  return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane };
 }
 
 export async function GET(
@@ -163,7 +174,7 @@ export async function GET(
       return NextResponse.json(task);
     }
 
-    const { laneValid, rankedQueue, fullQueue, withheldQueue, admissionMode, prFixItems, availableLanes } =
+    const { laneValid, resolvedLane, rankedQueue, fullQueue, withheldQueue, admissionMode, prFixItems, availableLanes } =
       await fetchAgentQueueData({
         agentName,
         lane,
@@ -176,46 +187,24 @@ export async function GET(
       return errorResponse(`Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`, 400);
     }
 
-    // PR-fix items come first, but an item this agent already received at
-    // its current generation is not dispatchable to it again (#1133): the
-    // polling worker drops the re-hand (it already has a run for that work
-    // identity), so re-handing only starves the lane behind it. Scan for
-    // the first item that is both new to this agent and confirmable; a
-    // skipped or contested candidate falls through to the next one, and
-    // only a fully undispatchable PR-fix queue falls through to issue work.
-    for (const candidate of prFixItems) {
-      // The hand-out record is per-agent: another agent still gets the
-      // item, and this agent gets it again once a fresh attempt bumps the
-      // generation (#1133).
-      if (agentAlreadyHanded(candidate, agentName)) continue;
+    const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
+      if (agentAlreadyHanded(candidate, agentName)) return null;
+      const confirmed = await confirmPrFixHandOut(candidate, agentName);
+      if (!confirmed) return null;
 
-      const confirmed = await confirmPrFixHandOut(candidate);
-      if (!confirmed) continue;
-
-      // Record the per-agent hand-out at the confirmed generation so the
-      // skip applies to this agent's future polls. The write is pinned to
-      // the confirmed generation, so a re-issue landing between the
-      // confirmation and this push no-ops instead of recording a hand-out
-      // for a dead identity. Best-effort: a failure only loses the skip
-      // (the next poll may re-hand, which workers already dedupe), never
-      // the task itself.
       try {
         await prisma.prFixQueueItem.updateMany({
-          where: { id: candidate.id, generation: confirmed.generation },
-          data: {
-            agentHandouts: {
-              push: [agentHandoutToken(agentName, confirmed.generation)],
-            },
-          },
+          where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED" },
+          data: { agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] } },
         });
       } catch (error) {
         console.error(`next-task pr-fix hand-out record failed for ${candidate.repo}#${candidate.pr}:`, error);
       }
 
       const reasons = [...new Set([confirmed.reason, ...confirmed.feedback].filter(Boolean))];
-      const task = createFollowupPrTask({
+      return createFollowupPrTask({
         agentName,
-        lane: candidate.lane ?? undefined,
+        lane: confirmed.lane ?? undefined,
         pullRequest: {
           repoFullName: candidate.repo,
           number: candidate.pr,
@@ -224,44 +213,119 @@ export async function GET(
         issue: candidate.issue
           ? { repoFullName: candidate.repo, number: candidate.issue }
           : undefined,
-        prFixItem: {
-          id: candidate.id,
-          generation: confirmed.generation,
-        },
+        prFixItem: { id: candidate.id, generation: confirmed.generation },
         reasons,
       });
-      return NextResponse.json(task);
+    };
+
+    // PR-fix items come first, but an item this agent already received at
+    // its current generation is not dispatchable to it again (#1133): the
+    // polling worker drops the re-hand (it already has a run for that work
+    // identity), so re-handing only starves the lane behind it. Scan for
+    // the first item that is both new to this agent and confirmable; a
+    // skipped or contested candidate falls through to the next one, and
+    // only a fully undispatchable PR-fix queue falls through to issue work.
+    for (const candidate of prFixItems) {
+      const task = await dispatchPrFixCandidate(candidate);
+      if (task) return NextResponse.json(task);
     }
 
     // Linked-PR follow-up is PR work, not implementation pickup, so it scans
     // the queue before grooming admission (#1065); in off/audit mode the two
     // queues are the same list.
-    if (fullQueue.length > 0) {
-      // Scan for linked PR follow-up before returning implement task
-      const followupItem = fullQueue.find(
-        (item) => item.linkedPrHealth?.needsFollowup && item.linkedPrHealth?.number,
-      );
+    //
+    // The caller's lane decides whether it may consume PR-fix work at all
+    // (#1046): `null` means a configured lane with no PR-fix equivalent (e.g.
+    // "cloud"), `undefined` an unfiltered request that serves every lane.
+    const requestPrFixLane = prFixLaneForRequest(resolvedLane);
+    const dispatchedLinkedPrs = new Set<string>();
+    for (const followupItem of fullQueue) {
+      const health = followupItem.linkedPrHealth;
+      const repo = followupItem.repoFullName;
+      const pr = health?.number;
+      if (!health?.needsFollowup || !pr || !repo) continue;
+      const key = `${repo.toLowerCase()}#${pr}`;
+      if (dispatchedLinkedPrs.has(key)) continue;
+      dispatchedLinkedPrs.add(key);
 
-      if (followupItem && followupItem.linkedPrHealth?.number) {
-        const health = followupItem.linkedPrHealth;
-        const task = createFollowupPrTask({
-          agentName,
-          lane: followupItem.lane ?? undefined,
-          issue: {
-            repoFullName: followupItem.repoFullName ?? "",
-            number: followupItem.number,
-            title: followupItem.title,
-            url: followupItem.url,
-          },
-          pullRequest: {
-            repoFullName: followupItem.repoFullName ?? "",
-            number: health.number!,
-            url: health.url ?? undefined,
-          },
-          reasons: health.followupReasons.length > 0
-            ? health.followupReasons
-            : ["Linked PR needs follow-up"],
+      // Queue rows in every state own the PR identity. Never route around a
+      // BLOCKED/terminal verdict via the cached linked-health path.
+      const existing = await prisma.prFixQueueItem.findUnique({
+        where: { repo_pr: { repo, pr } },
+      });
+      if (existing) continue;
+
+      const labels = await fetchPullRequestLabels(repo, pr);
+      if (labels === null || labels.some((label) => label.toLowerCase() === NEEDS_HUMAN_LABEL)) continue;
+
+      // Lane for the materialized item: the issue's lane when it has a PR-fix
+      // equivalent (default -> NORMAL, escalation -> ESCALATED). A claimable
+      // lane with no role (e.g. a "cloud" lane) has no PR-fix equivalent, but
+      // that must not silently drop discovered work — fall back to NORMAL,
+      // the same lane the default claimable lane consumes.
+      const queueLane = prFixLaneForRequest(followupItem.lane) ?? "NORMAL";
+      const reasons = [...new Set(
+        (health.followupReasons.length > 0 ? health.followupReasons : ["Linked PR needs follow-up"])
+          .filter((reason): reason is string => Boolean(reason)),
+      )];
+      // Materialization is best-effort per candidate: a transient DB failure
+      // must not 500 the poll (and with it the whole lane), so log and move on
+      // to the next candidate.
+      let materialized: Awaited<ReturnType<typeof createLinkedPrFixItem>>;
+      try {
+        // Capture the head the follow-up attempt starts from (#1074), so the
+        // #940 no-progress guard can refuse a FIXED tombstone for a worker that
+        // pushed nothing — the same protection queue-enqueued rows get.
+        const headSha = await fetchPullRequestHeadSha(repo, pr);
+        materialized = await createLinkedPrFixItem(asPrFixQueueClient(prisma), {
+          repo,
+          pr,
+          issue: followupItem.number,
+          lane: queueLane,
+          reason: reasons[0],
+          feedback: reasons,
+          evidenceKey: `linked-health:${followupItem.number}:${health.checkedAt ?? "unknown"}`,
+          url: health.url,
+          title: `Follow up linked PR for ${repo}#${followupItem.number}`,
+          headSha,
         });
+      } catch (error) {
+        console.error(`next-task linked-PR materialization failed for ${repo}#${pr}:`, error);
+        continue;
+      }
+
+      // A concurrent enqueue wins ownership without mutation. It appears in
+      // the queue snapshot next poll; do not manufacture a second token here.
+      if (!materialized.created || materialized.item?.status !== "QUEUED") continue;
+
+      // A lane without a PR-fix equivalent must not consume PR-fix work
+      // (#1046). The row is materialized above so a capable lane picks it up
+      // next poll; this caller keeps to its own issue work.
+      if (requestPrFixLane === null) continue;
+      const linkedContext = {
+        reasons,
+        issueTitle: followupItem.title,
+        issueUrl: followupItem.url,
+      };
+      const candidate = {
+        id: materialized.item.id,
+        repo,
+        pr,
+        lane: materialized.item.lane,
+        url: materialized.item.url,
+        issue: materialized.item.issue,
+        generation: materialized.item.generation,
+        reason: materialized.item.reason,
+        feedback: materialized.item.feedback ?? [],
+        agentHandouts: materialized.item.agentHandouts ?? [],
+      };
+      const task = await dispatchPrFixCandidate(candidate);
+      if (task) {
+        if (task.issue) {
+          task.issue.title = linkedContext.issueTitle ?? followupItem.title;
+          task.issue.url = linkedContext.issueUrl ?? followupItem.url;
+        }
+        if (linkedContext.reasons?.length) task.reasons = linkedContext.reasons;
         return NextResponse.json(task);
       }
     }

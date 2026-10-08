@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -3103,5 +3103,120 @@ describe("enqueue post-dispatch append pinning (#1134)", () => {
     // `enqueue` history row beyond the seed's.
     expect(client.items).toHaveLength(0);
     expect(client.history).toHaveLength(historyRowsAfterSeed);
+  });
+});
+
+describe("createLinkedPrFixItem materialization (#1145)", () => {
+  it("creates a QUEUED row with history and the observed head baseline", async () => {
+    const client = makeClient();
+    const { item, created } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "changes_requested",
+      feedback: ["changes_requested", "failing_checks"],
+      evidenceKey: "linked-health:42:2026-01-01T00:00:00.000Z",
+      url: "https://github.com/org/repo/pull/15",
+      title: "Follow up linked PR for org/repo#42",
+      headSha: "a".repeat(40),
+    });
+
+    expect(created).toBe(true);
+    expect(item).toMatchObject({
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      status: "QUEUED",
+      type: "OTHER",
+      generation: 1,
+      headSha: "a".repeat(40),
+      attemptHeadSha: "a".repeat(40),
+      feedback: ["changes_requested", "failing_checks"],
+    });
+    expect(client.history).toEqual([
+      expect.objectContaining({
+        itemId: item.id,
+        action: "enqueue",
+        lane: "NORMAL",
+        evidenceKey: "linked-health:42:2026-01-01T00:00:00.000Z",
+      }),
+    ]);
+  });
+
+  it("leaves the baseline null when GitHub could not be read", async () => {
+    const client = makeClient();
+    const { item } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "ESCALATED",
+      reason: "failing_checks",
+      feedback: ["failing_checks"],
+      evidenceKey: "linked-health:42:unknown",
+      headSha: null,
+    });
+    expect(item.headSha).toBeNull();
+    expect(item.attemptHeadSha).toBeNull();
+  });
+
+  it("returns the concurrent winner untouched on a unique-constraint race", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      lane: "escalated",
+      reason: "operator blocked",
+      feedback: "wait for approval",
+      evidenceKey: "operator:1",
+    });
+    const winner = client.items[0];
+    const winnerSnapshot = { ...winner };
+    const historyRowsBefore = client.history.length;
+
+    // A concurrent enqueue won the (repo, pr) unique key between our create
+    // attempt and its commit: Prisma raises P2002 on the losing insert.
+    client.prFixQueueItem.create = async () => {
+      const err = new Error("Unique constraint failed on the fields: (`repo`,`pr`)");
+      (err as any).code = "P2002";
+      throw err;
+    };
+
+    const result = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "failing_checks",
+      feedback: ["failing_checks"],
+      evidenceKey: "linked-health:42:unknown",
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.item.id).toBe(winner.id);
+    // No mutation of the winner, and no orphaned history row from the loser.
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0]).toEqual(winnerSnapshot);
+    expect(client.history).toHaveLength(historyRowsBefore);
+  });
+
+  it("rethrows a non-constraint failure", async () => {
+    const client = makeClient();
+    client.prFixQueueItem.create = async () => {
+      throw Object.assign(new Error("connection reset"), { code: "P2024" });
+    };
+    await expect(
+      createLinkedPrFixItem(client, {
+        repo: "org/repo",
+        pr: 15,
+        issue: 42,
+        lane: "NORMAL",
+        reason: "failing_checks",
+        feedback: ["failing_checks"],
+        evidenceKey: "linked-health:42:unknown",
+      }),
+    ).rejects.toThrow("connection reset");
+    expect(client.history).toHaveLength(0);
   });
 });

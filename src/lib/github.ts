@@ -47,6 +47,7 @@ export {
 export {
   type GithubPR,
   fetchPullRequests,
+  fetchPullRequestLabels,
   fetchClosedPullRequests,
   type PrHealthSignals,
   fetchPullRequestHealthSignals,

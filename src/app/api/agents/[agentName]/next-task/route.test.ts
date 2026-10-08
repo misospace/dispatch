@@ -9,9 +9,15 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     issueFindMany: vi.fn(),
     prFixFindMany: vi.fn(),
+    prFixCreate: vi.fn(),
+    prFixHistoryCreate: vi.fn(),
     prFixFindUnique: vi.fn(),
+    prFixFindUniqueByRepo: vi.fn(),
     prFixUpdateMany: vi.fn(),
     findLeasedIssueIds: vi.fn(),
+    linkedRows: [] as any[],
+    fetchPullRequestLabels: vi.fn().mockResolvedValue([]),
+    fetchPullRequestHeadSha: vi.fn().mockResolvedValue(null),
   },
 }));
 
@@ -20,11 +26,32 @@ vi.mock("@/lib/prisma", () => ({
     issue: { findMany: mocks.issueFindMany },
     prFixQueueItem: {
       findMany: mocks.prFixFindMany,
-      findUnique: mocks.prFixFindUnique,
+      findUnique: vi.fn(async ({ where }: any) => {
+        const rows = [...mocks.linkedRows, ...(await mocks.prFixFindMany())];
+        if (where.id !== undefined) {
+          const byId = await mocks.prFixFindUnique({ where });
+          return byId ?? rows.find((row: any) => row.id === where.id) ?? null;
+        }
+        return mocks.prFixFindUniqueByRepo({ where });
+      }),
+      create: mocks.prFixCreate,
       updateMany: mocks.prFixUpdateMany,
     },
+    prFixHistory: { create: mocks.prFixHistoryCreate },
+    $transaction: async (fn: any) => fn({
+      prFixQueueItem: {
+        create: mocks.prFixCreate,
+        findUnique: mocks.prFixFindUniqueByRepo,
+      },
+      prFixHistory: { create: mocks.prFixHistoryCreate },
+    }),
   },
   asPrFixQueueClient: (client: any) => client,
+}));
+
+vi.mock("@/lib/github", () => ({
+  fetchPullRequestLabels: mocks.fetchPullRequestLabels,
+  fetchPullRequestHeadSha: mocks.fetchPullRequestHeadSha,
 }));
 
 vi.mock("@/lib/lease", () => ({
@@ -35,6 +62,7 @@ vi.mock("@/lib/lease", () => ({
 // outcomes to GitHub; no-op them so route-level lifecycle tests can drive the
 // real state machine without network.
 vi.mock("@/lib/pr-fix-surfacing", () => ({
+  NEEDS_HUMAN_LABEL: "needs-human",
   surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: false, commentPosted: false, errors: [] }),
   surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: false, commentUpdated: false, errors: [] }),
   surfacePrFixUnblocked: vi.fn().mockResolvedValue({ labelRemoved: false, commentUpdated: false, errors: [] }),
@@ -157,12 +185,46 @@ function request(url: string, agentName = "example-agent", includeAuth = true) {
   return authedRequest(`http://localhost${url}`, { includeAuth });
 }
 
+function linkedIssue(number: number, pr: number, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `issue-${number}`,
+    number,
+    title: `Issue ${number}`,
+    url: `https://github.com/org/repo/issues/${number}`,
+    labels: ["priority/p0", "status/ready"],
+    currentLane: "local",
+    decomposed: false,
+    repository: { fullName: "org/repo" },
+    linkedPrNumber: pr,
+    linkedPrUrl: `https://github.com/org/repo/pull/${pr}`,
+    linkedPrNeedsFollowup: true,
+    linkedPrFollowupReasons: ["changes requested", "checks failing"],
+    linkedPrReviewDecision: "CHANGES_REQUESTED",
+    linkedPrMergeState: null,
+    linkedPrHealthCheckedAt: new Date("2026-10-01T00:00:00Z"),
+    ...overrides,
+  };
+}
+
 describe("GET /api/agents/[agentName]/next-task", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
     vi.clearAllMocks();
     mocks.prFixFindMany.mockResolvedValue([]);
+    mocks.linkedRows = [];
+    mocks.prFixFindUniqueByRepo.mockImplementation(async ({ where }: any) => {
+      const rows = [...mocks.linkedRows, ...(await mocks.prFixFindMany())];
+      return rows.find((row: any) => row.repo === where.repo_pr.repo && row.pr === where.repo_pr.pr) ?? null;
+    });
+    mocks.fetchPullRequestLabels.mockResolvedValue([]);
+    mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+    mocks.prFixCreate.mockImplementation(async ({ data }: any) => {
+      const item = { id: "linked-prfix", generation: 1, status: "QUEUED", agentHandouts: [], ...data };
+      mocks.linkedRows.push(item);
+      return item;
+    });
+    mocks.prFixHistoryCreate.mockResolvedValue({});
     // Default re-read mirrors production: the row read back after the stamp
     // is the same live row listQueuedPrFixItems served. Stateful tests
     // override this with their own implementation.
@@ -170,7 +232,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       const items = await mocks.prFixFindMany();
       const first = items[0];
       return first
-        ? { reason: first.reason, feedback: first.feedback, generation: first.generation }
+        ? { reason: first.reason, feedback: first.feedback, generation: first.generation, status: first.status, lane: first.lane, agentHandouts: first.agentHandouts }
         : null;
     });
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
@@ -435,6 +497,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       where: {
         id: "prfix-1",
         generation: 2,
+        status: "QUEUED",
         OR: [
           { dispatchedGeneration: null },
           { dispatchedGeneration: { not: 2 } },
@@ -1308,23 +1371,11 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("returns followup-pr when issue has linked PR needing follow-up", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      {
-        id: "issue-1",
-        number: 42,
+      linkedIssue(42, 15, {
         title: "Fix login bug",
-        url: "https://github.com/org/repo/issues/42",
-        labels: ["priority/p0", "status/ready"],
-        currentLane: "local",
-        decomposed: false,
-        repository: { fullName: "org/repo" },
-        linkedPrNumber: 15,
-        linkedPrUrl: "https://github.com/org/repo/pull/15",
-        linkedPrNeedsFollowup: true,
         linkedPrFollowupReasons: ["tests failing", "lint errors"],
         linkedPrReviewDecision: null,
-        linkedPrMergeState: null,
-        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
-      },
+      }),
     ]);
 
     const res = await GET(
@@ -1336,28 +1387,216 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.shouldRun).toBe(true);
-    expect(body.prFixItem).toBeUndefined();
+    expect(body.prFixItem).toEqual({ id: "linked-prfix", generation: 1 });
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.prFixHistoryCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("the PR-fix queue owns a linked PR that also qualifies as a queued issue", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "existing-prfix",
+        repo: "org/repo",
+        pr: 15,
+        issue: 42,
+        branch: null,
+        url: "https://github.com/org/repo/pull/15",
+        title: "Existing queued work",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "review changes requested",
+        feedback: ["update tests"],
+        evidenceKeys: ["review:1"],
+        agentHandouts: [],
+        generation: 3,
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toEqual({ id: "existing-prfix", generation: 3 });
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+    expect(mocks.fetchPullRequestLabels).not.toHaveBeenCalled();
+  });
+
+  it("linked-only work is materialized once and handout identity is not repeated", async () => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+
+    const first = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const firstBody = await first.json();
+    expect(firstBody.type).toBe("followup-pr");
+    expect(firstBody.prFixItem).toEqual({ id: "linked-prfix", generation: 1 });
+    expect(mocks.prFixHistoryCreate).toHaveBeenCalledTimes(1);
+
+    const second = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect((await second.json()).type).toBe("implement");
+    expect(mocks.fetchPullRequestLabels).toHaveBeenCalledTimes(1);
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.prFixHistoryCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.prFixUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "linked-prfix", generation: 1, status: "QUEUED" },
+      data: { agentHandouts: { push: ["example-agent@1"] } },
+    }));
+  });
+
+  it.each(
+    ["QUEUED", "BLOCKED", "FIXED", "IGNORED", "STALE"].flatMap((status) =>
+      ["NORMAL", "ESCALATED", "NEEDS_HUMAN"].map((lane) => [status, lane]),
+    ),
+  )("linked path defers to existing %s/%s queue row", async (status, lane) => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+    mocks.linkedRows.push({ repo: "org/repo", pr: 15, status, lane });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect((await res.json()).type).toBe("implement");
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+    expect(mocks.fetchPullRequestLabels).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch or mutate a concurrent queue winner during linked materialization", async () => {
+    const winner = {
+      id: "concurrent-prfix",
+      repo: "org/repo",
+      pr: 15,
+      issue: 7,
+      lane: "ESCALATED",
+      status: "BLOCKED",
+      generation: 4,
+      reason: "operator blocked",
+      feedback: ["wait for approval"],
+      agentHandouts: [],
+    };
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+    mocks.prFixCreate.mockRejectedValue(Object.assign(new Error("unique constraint"), { code: "P2002" }));
+    mocks.prFixFindUniqueByRepo.mockResolvedValueOnce(null).mockResolvedValueOnce(winner);
+    mocks.linkedRows.push(winner);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect((await res.json()).type).toBe("implement");
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.prFixHistoryCreate).not.toHaveBeenCalled();
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(winner).toMatchObject({ status: "BLOCKED", generation: 4, lane: "ESCALATED", agentHandouts: [] });
+  });
+
+  it("does not create linked follow-up for a PR with the needs-human label", async () => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+    mocks.fetchPullRequestLabels.mockResolvedValue(["needs-human"]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect((await res.json()).type).toBe("implement");
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+  });
+
+  it("continues to the next linked PR when the first cannot be materialized", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15),
+      linkedIssue(43, 16, { id: "issue-43", number: 43, title: "Second issue", url: "https://github.com/org/repo/issues/43" }),
+    ]);
+    mocks.linkedRows.push({ repo: "org/repo", pr: 15, status: "BLOCKED", lane: "NEEDS_HUMAN" });
+    mocks.prFixCreate.mockImplementation(async ({ data }: any) => {
+      const item = { id: "linked-prfix-2", generation: 1, status: "QUEUED", agentHandouts: [], ...data };
+      mocks.linkedRows.push(item);
+      return item;
+    });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(16);
+    expect(body.prFixItem).toEqual({ id: "linked-prfix-2", generation: 1 });
+  });
+
+  it("materializes linked-only work for a lane without a PR-fix equivalent, without handing it to that lane", async () => {
+    // "cloud" is claimable but carries no role, so prFixLaneForRequest returns
+    // null: discovered work must still converge onto the queue (NORMAL) so a
+    // capable lane picks it up, rather than being silently dropped. The cloud
+    // caller itself must not consume PR-fix work (#1046).
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15, { currentLane: "cloud" })]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=cloud"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(mocks.prFixCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ lane: "NORMAL", status: "QUEUED" }),
+    }));
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("records the discovered head as the attempt baseline when materializing linked work", async () => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 15)]);
+    mocks.fetchPullRequestHeadSha.mockResolvedValue("b".repeat(40));
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect((await res.json()).type).toBe("followup-pr");
+    expect(mocks.prFixCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ headSha: "b".repeat(40), attemptHeadSha: "b".repeat(40) }),
+    }));
+  });
+
+  it("does not fail the poll when linked materialization errors, and still serves the next candidate", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15),
+      linkedIssue(43, 16, { id: "issue-43", number: 43, title: "Second issue", url: "https://github.com/org/repo/issues/43" }),
+    ]);
+    mocks.prFixCreate
+      .mockRejectedValueOnce(Object.assign(new Error("db down"), { code: "P2024" }))
+      .mockImplementation(async ({ data }: any) => {
+        const item = { id: "linked-prfix-2", generation: 1, status: "QUEUED", agentHandouts: [], ...data };
+        mocks.linkedRows.push(item);
+        return item;
+      });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(16);
   });
 
   it("linked PR follow-up beats normal implement work", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      {
-        id: "issue-followup",
-        number: 42,
-        title: "Issue with PR needing follow-up",
-        url: "https://github.com/org/repo/issues/42",
-        labels: ["priority/p1", "status/ready"],
-        currentLane: "local",
-        decomposed: false,
-        repository: { fullName: "org/repo" },
-        linkedPrNumber: 15,
-        linkedPrUrl: "https://github.com/org/repo/pull/15",
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: ["needs changes"],
-        linkedPrReviewDecision: null,
-        linkedPrMergeState: null,
-        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
-      },
+      linkedIssue(42, 15, { title: "Issue with PR needing follow-up", linkedPrFollowupReasons: ["needs changes"] }),
       {
         id: "issue-normal",
         number: 99,
@@ -1439,23 +1678,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("linked PR follow-up includes issue context", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      {
-        id: "issue-1",
-        number: 42,
-        title: "Fix login bug",
-        url: "https://github.com/org/repo/issues/42",
-        labels: ["priority/p0", "status/ready"],
-        currentLane: "local",
-        decomposed: false,
-        repository: { fullName: "org/repo" },
-        linkedPrNumber: 15,
-        linkedPrUrl: "https://github.com/org/repo/pull/15",
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: ["needs changes"],
-        linkedPrReviewDecision: null,
-        linkedPrMergeState: null,
-        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
-      },
+      linkedIssue(42, 15, { title: "Fix login bug", linkedPrFollowupReasons: ["needs changes"] }),
     ]);
 
     const res = await GET(
@@ -1473,23 +1696,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("linked PR follow-up includes pull request context", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      {
-        id: "issue-1",
-        number: 42,
-        title: "Fix login bug",
-        url: "https://github.com/org/repo/issues/42",
-        labels: ["priority/p0", "status/ready"],
-        currentLane: "local",
-        decomposed: false,
-        repository: { fullName: "org/repo" },
-        linkedPrNumber: 15,
-        linkedPrUrl: "https://github.com/org/repo/pull/15",
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: ["needs changes"],
-        linkedPrReviewDecision: null,
-        linkedPrMergeState: null,
-        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
-      },
+      linkedIssue(42, 15, { title: "Fix login bug", linkedPrFollowupReasons: ["needs changes"] }),
     ]);
 
     const res = await GET(
@@ -1506,23 +1713,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("linked PR follow-up uses followup reasons", async () => {
     mocks.issueFindMany.mockResolvedValue([
-      {
-        id: "issue-1",
-        number: 42,
-        title: "Fix login bug",
-        url: "https://github.com/org/repo/issues/42",
-        labels: ["priority/p0", "status/ready"],
-        currentLane: "local",
-        decomposed: false,
-        repository: { fullName: "org/repo" },
-        linkedPrNumber: 15,
-        linkedPrUrl: "https://github.com/org/repo/pull/15",
-        linkedPrNeedsFollowup: true,
-        linkedPrFollowupReasons: ["tests failing", "lint errors", "missing docs"],
-        linkedPrReviewDecision: null,
-        linkedPrMergeState: null,
-        linkedPrHealthCheckedAt: new Date("2026-01-01T00:00:00Z"),
-      },
+      linkedIssue(42, 15, { linkedPrFollowupReasons: ["tests failing", "lint errors", "missing docs"] }),
     ]);
 
     const res = await GET(

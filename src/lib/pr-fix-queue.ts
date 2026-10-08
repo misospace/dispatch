@@ -56,6 +56,25 @@ export interface EnqueuePrFixInput {
   author?: string | null;
 }
 
+export interface CreateLinkedPrFixInput {
+  repo: string;
+  pr: number;
+  issue: number;
+  lane: PrFixLane;
+  reason: string;
+  feedback: string[];
+  evidenceKey: string;
+  url?: string | null;
+  title?: string | null;
+  /**
+   * Head observed when the linked follow-up was discovered (#1074). Stored as
+   * both the mutable `headSha` and the immutable per-attempt `attemptHeadSha`
+   * so the #940 no-progress guard can refuse a FIXED tombstone for a worker
+   * that pushed nothing. Null when GitHub could not be read.
+   */
+  headSha?: string | null;
+}
+
 export interface MarkPrFixInput {
   repo: string;
   pr: number;
@@ -698,14 +717,64 @@ async function retractNeedsHuman(repo: string, pr: number, outcome: PrFixUnblock
   });
 }
 
+export async function createLinkedPrFixItem(
+  client: PrFixQueueClient,
+  input: CreateLinkedPrFixInput,
+): Promise<{ item: any; created: boolean }> {
+  try {
+    const item = await client.$transaction(async (tx) => {
+      const item = await tx.prFixQueueItem.create({
+        data: {
+          repo: input.repo,
+          pr: input.pr,
+          issue: input.issue,
+          lane: input.lane,
+          type: "OTHER",
+          status: "QUEUED",
+          reason: input.reason,
+          feedback: input.feedback,
+          evidenceKeys: [input.evidenceKey],
+          ...(input.url ? { url: input.url } : {}),
+          ...(input.title ? { title: input.title } : {}),
+          headSha: input.headSha ?? null,
+          attemptHeadSha: input.headSha ?? null,
+        },
+      });
+      await tx.prFixHistory.create({
+        data: {
+          itemId: item.id,
+          action: "enqueue",
+          lane: item.lane,
+          reason: input.reason,
+          evidenceKey: input.evidenceKey,
+          note: "Materialized from linked PR health scan.",
+        },
+      });
+      return item;
+    });
+    return { item, created: true };
+  } catch (error) {
+    // The unique (repo, pr) constraint is the ownership boundary. If another
+    // enqueue won, return its row without mutating or reopening it. A
+    // transaction-level P2002 may also come from history, so only treat it as
+    // the ownership race when the unique-key winner can be read back.
+    if ((error as { code?: string })?.code !== "P2002") throw error;
+    const item = await client.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo: input.repo, pr: input.pr } },
+    });
+    if (!item) throw error;
+    return { item, created: false };
+  }
+}
+
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
   const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
   const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED"] } : "QUEUED";
-  
+
   const items = await client.prFixQueueItem.findMany({
     where: { status, ...(lane ? { lane } : {}) },
   });
-  
+
   // Sort by type priority first, then by queuedAt
   if (options.prioritizeByType !== false) {
     items.sort((a, b) => {
@@ -718,7 +787,7 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
   } else {
     items.sort((a, b) => new Date(a.queuedAt).getTime() - new Date(b.queuedAt).getTime());
   }
-  
+
   return items;
 }
 
