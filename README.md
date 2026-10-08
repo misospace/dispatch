@@ -86,7 +86,9 @@ Issues are classified into execution lanes that control agent queue behavior and
 |----------|----------|-------------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string (canonical) |
 | `GITHUB_TOKEN` | Yes | GitHub Personal Access Token or GitHub App token (fallback when GitHub App auth is not configured) |
-| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication |
+| `DISPATCH_AGENT_TOKEN` | Yes | Bearer token for agent API authentication — the **maintainer-tier** token, with full rights on every route |
+| `DISPATCH_MAINTAINER_TOKEN` | No | Optional alias for the maintainer-tier bearer token; identical rights to `DISPATCH_AGENT_TOKEN` |
+| `DISPATCH_WORKER_TOKEN` | No | Optional **worker-tier** bearer token for autonomous executors. Restricted to the route allowlist in `src/lib/auth.ts` (`WORKER_ALLOWLIST`); every other route returns `403` naming the required tier. Must be a distinct value — a token that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning. See [Token Tiers](docs/worker-execution-contract.md#token-tiers) |
 | `GITHUB_REPOSITORIES` | Yes | Bootstrap seed config for repos to track. Accepts comma-separated or newline-separated values (e.g., `myorg/repo1,myorg/repo2` or `myorg/repo1` on separate lines). Repos can also be managed via Dispatch UI or `/api/automation/repos` after initial setup. |
 | `DISPATCH_AUTH_MODE` | No | Authentication mode: `"basic"` (HTTP Basic Auth), `"oidc"` (OIDC/SSO), `"disabled"` (no auth, **local development only** — see [Operational Notes](#operational-notes)), or unset (legacy mode) |
 | `DISPATCH_AUTH_USERNAME` | Conditional | Username for Basic Auth — required when `DISPATCH_AUTH_MODE=basic` |
@@ -142,7 +144,7 @@ Dispatch supports optional GitHub App authentication to provide a separate ident
 - **Partial** configuration is silently ignored — Dispatch falls back to PAT without error.
 - Secrets, tokens, and private keys are never logged.
 
-**Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens). `DISPATCH_URL` (for instance URL).
+**Resolution order:** `DATABASE_URL` > `DISPATCH_DATABASE_URL` (for database URLs). `DISPATCH_AGENT_TOKEN` (for agent tokens; `DISPATCH_MAINTAINER_TOKEN` is an equivalent alias, not a fallback). `DISPATCH_URL` (for instance URL).
 
 **TLS to Postgres:** put `sslmode` in the connection string — there is no separate setting. The URL is handed to `@prisma/adapter-pg`, so node-postgres parses it:
 
@@ -220,7 +222,12 @@ Production database migrations (`prisma migrate deploy`) run automatically on co
 
 Dispatch supports three authentication models:
 
-1. **Agent/Worker Auth** (`DISPATCH_AGENT_TOKEN`): Bearer token authentication for API calls from agents, MCP clients, and scheduled workers. This is required for all mutating API endpoints.
+1. **Agent/Worker Auth** (bearer tokens): Bearer token authentication for API calls from agents, MCP clients, and scheduled workers. Bearer tokens come in two tiers:
+
+   - **Maintainer** — `DISPATCH_AGENT_TOKEN`, or the optional `DISPATCH_MAINTAINER_TOKEN` alias. Full rights on every route.
+   - **Worker** — `DISPATCH_WORKER_TOKEN` (optional). Restricted to an explicit route allowlist: the per-agent worker loop (`next-task`, `tasks/report`, `heartbeat`, `active-work`, `queue`, `work-summary`), the agent-work lifecycle (`start`/`checkpoint`/`finish` and the listing), the issue listing (`GET /api/issues`) plus `claim` (non-force) / `unclaim` / `state` / `status`, and the PR-fix queue reads plus `FIXED`/`BLOCKED`/`STALE` marks. Every other route returns `403` naming the required tier.
+
+   Every mutating API endpoint requires a bearer token, and every authenticated route requires the maintainer tier unless it appears in the worker allowlist. The authoritative list is `WORKER_ALLOWLIST` in `src/lib/auth.ts`, mirrored in [Token Tiers](docs/worker-execution-contract.md#token-tiers). Outside this bearer model, `/api/health` is public and the `/api/auth/*` and `/api/login` routes serve the operator sign-in flow. The webhook receivers (`/api/pr-followup/webhook`, `/api/issues/webhook`) verify an HMAC-SHA256 signature against `WEBHOOK_SECRET` when it is configured, and otherwise require the normal auth layer; `/api/groomer/run` accepts its own `DISPATCH_GROOMER_TOKEN` bearer token.
 
 2. **Operator UI Auth**: Browser-based operator authentication with two modes:
    - **Basic Auth** (`DISPATCH_AUTH_MODE=basic`): HTTP Basic Auth — the browser prompts for username/password. Mutating API calls from the browser automatically include these credentials via `authedFetch()`.
@@ -232,9 +239,9 @@ Dispatch supports three authentication models:
 
 | `DISPATCH_AUTH_MODE` | Behavior |
 |---|---|
-| *(not set)* | Legacy mode — no middleware enforcement. Agent routes use Bearer token auth via `DISPATCH_AGENT_TOKEN`. Browser UI has no separate auth model. |
-| `basic` | HTTP Basic Auth required for operator UI routes. API routes also accept `DISPATCH_AGENT_TOKEN` bearer auth for agents and workers. |
-| `oidc` | OIDC session-based authentication for operator UI routes. Route handlers accept either a valid NextAuth session cookie or `DISPATCH_AGENT_TOKEN` bearer auth. |
+| *(not set)* | Legacy mode — no middleware enforcement. Agent routes use Bearer token auth via `DISPATCH_AGENT_TOKEN` (maintainer tier) or `DISPATCH_WORKER_TOKEN` (worker tier). Browser UI has no separate auth model. |
+| `basic` | HTTP Basic Auth required for operator UI routes. API routes also accept maintainer- or worker-tier bearer auth (`DISPATCH_AGENT_TOKEN` / `DISPATCH_WORKER_TOKEN`). |
+| `oidc` | OIDC session-based authentication for operator UI routes. Route handlers accept either a valid NextAuth session cookie or a maintainer- or worker-tier bearer token. |
 | `disabled` | **No auth enforcement — full open access.** All routes are publicly accessible without authentication. **Local development only.** See [Operational Notes](#operational-notes). |
 
 ### How it works
@@ -283,9 +290,9 @@ Setting `DISPATCH_AUTH_MODE=disabled` disables all authentication enforcement fo
 | | Agent/Worker Auth | Operator UI Auth (Basic) | Operator UI Auth (OIDC) |
 |---|---|---|---|
 | **Header/Cookie** | `Authorization: Bearer <token>` | `Authorization: Basic <base64(user:pass)>` | Session cookie (NextAuth JWT) |
-| **Config** | `DISPATCH_AGENT_TOKEN` | `DISPATCH_AUTH_USERNAME` + `DISPATCH_AUTH_PASSWORD` | `DISPATCH_OIDC_ISSUER`, `DISPATCH_OIDC_CLIENT_ID`, `DISPATCH_OIDC_CLIENT_SECRET` |
-| **Used by** | Agents, MCP clients, cron workers | Browser UI (human operators) | Browser UI (human operators) |
-| **Protected routes** | Mutating API endpoints | Operator UI + mutating browser API calls | Operator UI + mutating browser API calls |
+| **Config** | `DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN` (maintainer tier), `DISPATCH_WORKER_TOKEN` (worker tier) | `DISPATCH_AUTH_USERNAME` + `DISPATCH_AUTH_PASSWORD` | `DISPATCH_OIDC_ISSUER`, `DISPATCH_OIDC_CLIENT_ID`, `DISPATCH_OIDC_CLIENT_SECRET` |
+| **Used by** | Agents, MCP clients, cron workers (maintainer for full rights, worker for the allowlisted loop) | Browser UI (human operators) | Browser UI (human operators) |
+| **Protected routes** | Every bearer-guarded route (maintainer); worker-allowlisted routes only (worker) | Operator UI + mutating browser API calls | Operator UI + mutating browser API calls |
 
 ### OIDC Setup
 
@@ -308,7 +315,7 @@ To enable OIDC authentication:
 
 3. **Restart Dispatch**. Operators will see a login page at `/login` with a "Sign in with SSO" button.
 
-4. **Agent tokens continue to work** — agents use `DISPATCH_AGENT_TOKEN` bearer auth regardless of the operator auth mode.
+4. **Bearer tokens continue to work** — maintainer tokens (`DISPATCH_AGENT_TOKEN`, `DISPATCH_MAINTAINER_TOKEN`) and worker tokens (`DISPATCH_WORKER_TOKEN`) authenticate regardless of the operator auth mode.
 
 ## Required Labels
 

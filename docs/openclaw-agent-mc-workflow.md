@@ -25,10 +25,11 @@ The OpenClaw agent gradually moves from GitHub Projects grooming to Dispatch as 
 
 ```
 POST /api/sync
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 ```
 
 - **Purpose:** Refresh Dispatch's issue cache before selecting work (best-effort).
-- **Auth:** None required.
+- **Auth:** Bearer token required (maintainer tier).
 - **Expected response:** `{ syncedCount: N }` (N may be 0 if no repos configured).
 - **Failure handling:** Treat any non-2xx, timeout, or network error as a freshness warning — log it and continue. **Do not fail the heartbeat on a sync failure.**
 
@@ -67,10 +68,11 @@ Content-Type: application/json
 
 ```
 GET /api/issues
+Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 ```
 
 - **Purpose:** Fetch the current issue list for the agent to select work from.
-- **Auth:** None required.
+- **Auth:** Bearer token required (worker or maintainer tier).
 - **Expected response:** Array of issue objects.
 - **Selection priority:**
   1. Prefer issues labeled `agent/<agent-id>` if present (e.g. `agent/saffron`, `agent/matcha`).
@@ -112,14 +114,22 @@ Before the OpenClaw agent stops grooming GitHub Projects and fully adopts Dispat
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/api/health` | GET | None | Health check — `{ ok: true, database: "ok" }` |
-| `/api/sync` | POST | None | Trigger issue sync from GitHub (best-effort) |
-| `/api/sync/scheduled` | POST | Bearer token | Scheduled sync runner — primary freshness mechanism |
-| `/api/issues` | GET | None | List all issues in Dispatch cache |
-| `/api/agent-runs` | GET | None | List recent agent runs |
-| `/api/agent-runs` | POST | Bearer token | Submit a new agent run record |
-| `/api/issues/move` | POST | Bearer token (for agents) | Move an issue on the board (writes audit log) |
-| `/api/automation/repos` | GET | None | List tracked repositories |
-| `/api/audit` | GET | None | Query audit log entries |
+| `/api/sync` | POST | Bearer (maintainer) | Trigger issue sync from GitHub (best-effort) |
+| `/api/sync/scheduled` | POST | Bearer (maintainer) | Scheduled sync runner — primary freshness mechanism |
+| `/api/issues` | GET | Bearer (worker or maintainer) | List all issues in Dispatch cache |
+| `/api/agents/<name>/queue` | GET | Bearer (worker or maintainer) | Agent-specific issue queue |
+| `/api/issues/claim` | POST | Bearer (worker; `force` requires maintainer) | Claim an issue (adds agent label) |
+| `/api/issues/unclaim` | POST | Bearer (worker or maintainer) | Release an issue (removes agent label) |
+| `/api/issues/actions` | POST | Bearer (maintainer) | Assign/unassign agent or owner labels |
+| `/api/issues/unassign` | POST | Bearer (maintainer) | Remove all agent/owner labels of a type |
+| `/api/issues/move` | POST | Bearer (maintainer) | Move an issue on the board (writes audit log) |
+| `/api/agent-runs` | GET | Bearer (maintainer) | List recent agent runs |
+| `/api/agent-runs` | POST | Bearer (maintainer) | Submit a new agent run record |
+| `/api/agents/{name}/heartbeat` | POST | Bearer (worker or maintainer) | Internal sync/reconcile pass |
+| `/api/automation/repos` | GET | Bearer (maintainer) | List tracked repositories |
+| `/api/audit` | GET | Bearer (maintainer) | Query audit log entries |
+
+**Tiers:** `worker` = `DISPATCH_WORKER_TOKEN`; `maintainer` = `DISPATCH_AGENT_TOKEN` (or the `DISPATCH_MAINTAINER_TOKEN` alias). A worker token calling a maintainer-tier route gets `403`. The authoritative allowlist is `WORKER_ALLOWLIST` in `src/lib/auth.ts` — see [Token Tiers](./worker-execution-contract.md#token-tiers). Every row above is guarded by `authorizeRequest` except `/api/health`, the only unguarded endpoint in this table.
 
 ## Worker Execution Contract
 

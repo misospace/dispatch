@@ -15,7 +15,7 @@ dependency on the legacy `project_groom.py` script.
 GET /api/automation/repos/tracked
 ```
 
-**Auth:** None required (public endpoint).
+**Auth:** Bearer token required (maintainer tier — `/api/automation/repos/tracked` is not in the worker allowlist).
 
 **Response:** `200 OK` — JSON array of enabled tracked repositories.
 
