@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.5.68](https://github.com/misospace/dispatch/compare/v0.5.67...v0.5.68) (2026-10-08)
+
+
+### Features
+
+* **deps:** update dependency @modelcontextprotocol/sdk (1.31.0 → 1.32.0) ([#1160](https://github.com/misospace/dispatch/issues/1160)) ([05039a6](https://github.com/misospace/dispatch/commit/05039a6f119cedd240d479f22e72921cb78e54a3))
+* **deps:** update dependency @radix-ui/react-slot (1.3.3 → 1.4.0) ([#1185](https://github.com/misospace/dispatch/issues/1185)) ([73133e7](https://github.com/misospace/dispatch/commit/73133e7377e6bfe3a2f3acb6e4edf2f0c623a2ed))
+* **deps:** update dependency eslint (10.11.0 → 10.12.0) ([#1161](https://github.com/misospace/dispatch/issues/1161)) ([ba8217f](https://github.com/misospace/dispatch/commit/ba8217faa880ef4f6e2455132d21bde9e789a1ff))
+* **deps:** update dependency lucide-react (1.48.0 → 1.49.0) ([#1139](https://github.com/misospace/dispatch/issues/1139)) ([278135c](https://github.com/misospace/dispatch/commit/278135cf2e23ece1e8051d714c27818bdd22c48f))
+* **deps:** update dependency lucide-react (1.49.0 → 1.50.0) ([#1159](https://github.com/misospace/dispatch/issues/1159)) ([049cf41](https://github.com/misospace/dispatch/commit/049cf4116bc5d88d66bae4778f97bcc50dde28b2))
+* **deps:** update dependency lucide-react (1.50.0 → 1.51.0) ([#1170](https://github.com/misospace/dispatch/issues/1170)) ([9556f61](https://github.com/misospace/dispatch/commit/9556f61f843d6e3e99b7f3ff21e9be779845f644))
+* **deps:** update dependency lucide-react (1.51.0 → 1.52.0) ([#1176](https://github.com/misospace/dispatch/issues/1176)) ([535520c](https://github.com/misospace/dispatch/commit/535520c08c6ca63ba20dd2e44d0d01c35255bb7e))
+* **deps:** update dependency lucide-react (1.52.0 → 1.53.0) ([#1195](https://github.com/misospace/dispatch/issues/1195)) ([2925a9f](https://github.com/misospace/dispatch/commit/2925a9f23973db14ea492a42a71cd25aefa8545c))
+* **deps:** update nextjs monorepo (16.3.8 → 16.4.0) ([#1187](https://github.com/misospace/dispatch/issues/1187)) ([890a8fa](https://github.com/misospace/dispatch/commit/890a8faa48be2f3b61f14f342a98889f6c5713ab))
+* **groomer:** create bounded child issues idempotently for decomposition plans ([#1066](https://github.com/misospace/dispatch/issues/1066)) ([#1186](https://github.com/misospace/dispatch/issues/1186)) ([381003e](https://github.com/misospace/dispatch/commit/381003e708b6c23ec7f87b53d88fbeb4546552f9))
+* **pr-fix:** accept an explicit already_addressed settlement without a push ([#1142](https://github.com/misospace/dispatch/issues/1142)) ([889e451](https://github.com/misospace/dispatch/commit/889e4513da5c43e7c575e337dd496e2cd4664610))
+* **tasks/report:** accept worker startedAt so AgentRun durations are real ([#1120](https://github.com/misospace/dispatch/issues/1120)) ([#1168](https://github.com/misospace/dispatch/issues/1168)) ([4d9af7a](https://github.com/misospace/dispatch/commit/4d9af7a4e8a66671f0f66024418a26b13f0c6940))
+
+
+### Bug Fixes
+
+* **auth:** guard GET /api/automation/repos/[...repo] with authorizeRequest ([#1151](https://github.com/misospace/dispatch/issues/1151)) ([6a9c552](https://github.com/misospace/dispatch/commit/6a9c552a1cab5f563406f89adf112c848fe74c4c))
+* **ci:** pass --include=optional in audit script so --omit=dev survives .npmrc include=dev ([#1162](https://github.com/misospace/dispatch/issues/1162)) ([#1169](https://github.com/misospace/dispatch/issues/1169)) ([cca5600](https://github.com/misospace/dispatch/commit/cca5600dc347c11ab6f02f35bfc4c2928f73fb9f))
+* **ci:** scope the npm audit gate to production dependencies ([#1166](https://github.com/misospace/dispatch/issues/1166)) ([#1172](https://github.com/misospace/dispatch/issues/1172)) ([f683575](https://github.com/misospace/dispatch/commit/f683575809abec9dda53c92cfa46d99ba7f60db6))
+* **deps:** update dependency @modelcontextprotocol/sdk (1.32.0 → 1.32.1) ([#1181](https://github.com/misospace/dispatch/issues/1181)) ([148b435](https://github.com/misospace/dispatch/commit/148b435aa311f7874ba7d422a14bf55fa496f140))
+* **deps:** update dependency @types/node (24.19.0 → 24.19.1) ([#1155](https://github.com/misospace/dispatch/issues/1155)) ([b593d4f](https://github.com/misospace/dispatch/commit/b593d4f356e557f11c1c011d0d250113c91e1eeb))
+* **deps:** update dependency @vitejs/plugin-react (6.1.1 → 6.1.2) ([#1180](https://github.com/misospace/dispatch/issues/1180)) ([459c52e](https://github.com/misospace/dispatch/commit/459c52eab54179aae9e3345a3897948c9247b7dd))
+* **deps:** update dependency jsdom (30.1.1 → 30.1.2) ([#1177](https://github.com/misospace/dispatch/issues/1177)) ([01b6bad](https://github.com/misospace/dispatch/commit/01b6bad90187297f7da7e760aefb10131b05a476))
+* **deps:** update nextjs monorepo (16.3.6 → 16.3.7) ([#1136](https://github.com/misospace/dispatch/issues/1136)) ([edc1afb](https://github.com/misospace/dispatch/commit/edc1afbe6eaab4db302c028dfc388b44608d9e73))
+* **deps:** update nextjs monorepo (16.3.7 → 16.3.8) ([#1146](https://github.com/misospace/dispatch/issues/1146)) ([d6d4db3](https://github.com/misospace/dispatch/commit/d6d4db34dfbbf9b0b30984de9fdfa4e2851e3fa4))
+* **deps:** update vitest monorepo (5.0.2 → 5.0.3) ([#1144](https://github.com/misospace/dispatch/issues/1144)) ([e1e657e](https://github.com/misospace/dispatch/commit/e1e657e695b1c1e3ce56dfd1b08c03d285f72151))
+* **groomer:** align apply-time head precondition with search-rechecked freshness ([#1153](https://github.com/misospace/dispatch/issues/1153)) ([ba5f607](https://github.com/misospace/dispatch/commit/ba5f607f52709eb2dab0a38d5c95ce7619ec56b1)), closes [#1116](https://github.com/misospace/dispatch/issues/1116)
+* **groomer:** capture repository-context empty searches in the freshness baseline ([#1138](https://github.com/misospace/dispatch/issues/1138)) ([f22dae4](https://github.com/misospace/dispatch/commit/f22dae468a590a4db1132c21c169c94eb3a22796))
+* **groomer:** sanitize provider error text before it reaches GroomingRun.errorMessage ([#1157](https://github.com/misospace/dispatch/issues/1157)) ([#1163](https://github.com/misospace/dispatch/issues/1163)) ([34f0162](https://github.com/misospace/dispatch/commit/34f016231ed849dbce001582598db22577b80e1a))
+* **groomer:** strip NUL and C0 control chars from model text before validation and persistence ([#1156](https://github.com/misospace/dispatch/issues/1156)) ([05db272](https://github.com/misospace/dispatch/commit/05db272ad2bdf161ee13364ae90e1c312f02ab82))
+* **mcp:** ship only the runtime closure in the -mcp image (prod deps + tsx layer) ([#1175](https://github.com/misospace/dispatch/issues/1175)) ([752d4a9](https://github.com/misospace/dispatch/commit/752d4a9190b6a0e631f2d7e0e2b9197befef407c))
+* **next-task:** make the PR-fix queue own linked-PR follow-up ([#1192](https://github.com/misospace/dispatch/issues/1192)) ([a1797e3](https://github.com/misospace/dispatch/commit/a1797e3532c9a0da6045b600de57b84d80718a82))
+* **pr-fix-queue:** pin enqueue post-dispatch append to its keys snapshot ([#1134](https://github.com/misospace/dispatch/issues/1134)) ([#1158](https://github.com/misospace/dispatch/issues/1158)) ([c9dd382](https://github.com/misospace/dispatch/commit/c9dd3826b0d685d0ec3aa8c27c02453ff30a4741))
+
+
+### Chores
+
+* **ai-review:** upgrade reviewer to v3.2.0 ([#1165](https://github.com/misospace/dispatch/issues/1165)) ([b0863de](https://github.com/misospace/dispatch/commit/b0863de9a4d2fec17fc5d38110955d7df69d818c))
+
+
+### Documentation
+
+* **auth:** document token tiers and correct stale endpoint auth tables ([#1193](https://github.com/misospace/dispatch/issues/1193)) ([a19accb](https://github.com/misospace/dispatch/commit/a19accb873aee480e307e38e600a354a4d626d4d)), closes [#1140](https://github.com/misospace/dispatch/issues/1140)
+
 ## [0.5.67](https://github.com/misospace/dispatch/compare/v0.5.66...v0.5.67) (2026-09-29)
 
 
