@@ -39,7 +39,21 @@ The feature is disabled by default.
 | `DISPATCH_GROOMER_EXPLORE_MAX_FILE_BYTES` | from mode | Overrides bytes per file returned to the model. Never exceeds the total budget. |
 | `DISPATCH_GROOMER_EXPLORE_TIMEOUT_MS` | from mode | Overrides the wall-clock cap on the exploration loop. |
 | `DISPATCH_GROOMER_TOKEN` | unset | Optional bearer token for scheduled or admin groomer invocations. When set, `POST /api/groomer/run` accepts this token in addition to `DISPATCH_AGENT_TOKEN`. |
+| `DISPATCH_GROOMER_TRUSTED_LOGINS` | empty | Comma- or newline-separated GitHub logins treated as trusted participants for the external-participant reply gate. |
+| `DISPATCH_GROOMER_EXTERNAL_REPLIES` | `pending` | `pending` queues externally-engaged comments for operator approval; `off` suppresses them without queueing. |
 | `DISPATCH_GROOMER_INTERVAL_MS` | 600000 | Interval for the in-process scheduler's `groomer` job. Dispatch still processes at most one issue per run. |
+
+## External-participant reply gate
+
+The hosted groomer's public-comment side effect is gated independently from its ordinary grooming writes. Issue labels, status, and other validated grooming changes can still apply, but an externally-engaged issue never receives an autonomous public groomer comment; the proposed reply is held for an operator to review and approve.
+
+Trust is resolved per issue author and commenter. Dispatch's internal automation authors are trusted, as are logins explicitly listed in `DISPATCH_GROOMER_TRUSTED_LOGINS`. `author_association` values `OWNER`, `MEMBER`, and `COLLABORATOR` are only trusted after a live repository collaborator-permission lookup confirms `admin`, `maintain`, or `write`. Every other association and permission is untrusted. Missing logins, unknown associations, lookup errors, and any other failure fail closed as untrusted. The issue is externally engaged when any participant is untrusted.
+
+`DISPATCH_GROOMER_EXTERNAL_REPLIES` controls the held-comment behavior: `pending` (the default) creates a pending approval item, while `off` suppresses the comment without queueing it. `DISPATCH_GROOMER_TRUSTED_LOGINS` accepts comma- or newline-separated GitHub logins; configure it only for accounts that operators intend to trust.
+
+Operators can review pending replies in the Hosted Groomer page or use `GET /api/groomer/pending-replies`, then call `POST /api/groomer/pending-replies/{id}/approve` or `POST /api/groomer/pending-replies/{id}/dismiss`. Approval posts the saved reply with its idempotency marker; dismissal records the operator decision without posting. Both mutation endpoints require operator authentication: an OIDC session, basic auth, or auth-disabled mode. Any bearer token is rejected, including `DISPATCH_GROOMER_TOKEN` (401) and maintainer-tier `DISPATCH_AGENT_TOKEN` (403); bearer tokens cannot approve or dismiss a held reply. Audit actions include `groomer_reply_held`, `groomer_reply_suppressed`, `groomer_reply_approved`, and `groomer_reply_dismissed`.
+
+**Known gap:** `GET /api/agents/<name>/next-task?mode=groom` is executed by an EXTERNAL harness, which posts comments with its own token. That external posting path is NOT covered by this hosted groomer gate.
 
 ## Exploration budget
 
