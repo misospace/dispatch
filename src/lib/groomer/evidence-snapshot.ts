@@ -82,6 +82,8 @@ export interface EvidenceSnapshotIssue {
   state: string;
   updatedAt: string;
   url: string;
+  /** Total comments reported by GitHub; absent only in legacy snapshots. */
+  commentsCount?: number | null;
   /** Optional for legacy snapshots; new captures always include both fields. */
   author?: string | null;
   authorAssociation?: string | null;
@@ -288,6 +290,7 @@ export function summarizeEvidenceForPersistence(snapshot: GroomingEvidenceSnapsh
     evidenceDigest: snapshot.evidenceDigest,
     issueFingerprint: snapshot.issueFingerprint,
     issueUpdatedAt: snapshot.issue.updatedAt,
+    issueCommentsCount: snapshot.issue.commentsCount,
     issueState: snapshot.issue.state,
     issueAuthor: snapshot.issue.author,
     issueAuthorAssociation: snapshot.issue.authorAssociation,
@@ -366,6 +369,7 @@ export async function collectGroomingEvidenceSnapshot(
       state: live.state,
       updatedAt: live.updated_at,
       url: live.html_url,
+      commentsCount: live.comments,
       author: live.user?.login ?? null,
       authorAssociation: live.author_association ?? null,
     };

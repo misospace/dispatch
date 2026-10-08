@@ -1,5 +1,5 @@
 import type { CollaboratorPermissionResult } from "@/lib/github-issues";
-import { isAutomationAuthor } from "./context";
+import { isInternalAutomationAuthor } from "./context";
 
 export type ParticipantRole = "author" | "commenter";
 
@@ -57,7 +57,7 @@ export async function resolveParticipantTrust(
   });
 
   if (!normalizedLogin) return result(false, "unknown_login");
-  if (isAutomationAuthor(login)) return result(true, "internal_automation");
+  if (isInternalAutomationAuthor(login)) return result(true, "internal_automation");
   if (config.trustedLogins.some((trustedLogin) => trustedLogin.toLowerCase() === normalizedLogin)) {
     return result(true, "operator_allowlist");
   }

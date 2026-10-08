@@ -982,6 +982,97 @@ describe("runHostedGroomer", () => {
     );
   });
 
+  it("holds replies when an external commenter is beyond the prompt comment window", async () => {
+    const olderTrusted = Array.from({ length: 5 }, (_, index) => ({
+      id: index + 1,
+      author: "itsmiso-ai",
+      authorAssociation: "NONE",
+      body: `Automation note ${index + 1}`,
+      createdAt: `2026-10-0${index + 1}T00:00:00Z`,
+    }));
+    const external = {
+      id: 6,
+      author: "unrelated-app[bot]",
+      authorAssociation: "NONE",
+      body: "Please reply to me",
+      createdAt: "2026-10-08T00:00:00Z",
+    };
+    const fullSet = [...olderTrusted, external];
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 6 },
+    });
+    mocks.fetchIssueComments.mockImplementation(async (_repo, _number, max, direction) =>
+      max === 100 && direction === "desc" ? fullSet : olderTrusted,
+    );
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "A proposed reply." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(mocks.fetchIssueComments).toHaveBeenCalledWith("org/repo", 42);
+    expect(mocks.fetchIssueComments).toHaveBeenCalledWith("org/repo", 42, 100, "desc");
+    expect(result!.mutationPlan).toMatchObject({ commentHeld: true, commentHoldReason: "externally_engaged" });
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("holds replies to an unknown bot with no trusted association", async () => {
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 1 },
+    });
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 1, author: "unrelated-app[bot]", authorAssociation: "NONE", body: "Please reply", createdAt: "2026-10-08T00:00:00Z" },
+    ]);
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "A proposed reply." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan).toMatchObject({
+      commentHeld: true,
+      externalParticipants: expect.arrayContaining([
+        expect.objectContaining({ login: "unrelated-app[bot]", trusted: false, reason: "external_association:none" }),
+      ]),
+    });
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the participant scan fails", async () => {
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE" },
+    });
+    mocks.fetchIssueComments.mockImplementation(async (_repo, _number, max) => {
+      if (max === 100) throw new Error("comments API unavailable");
+      return [];
+    });
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "A proposed reply." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan).toMatchObject({ commentHeld: true, commentHoldReason: "participant_scan_incomplete" });
+    expect(result!.contextWarnings).toContain("trust: participant scan failed; external replies require operator approval");
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when participant scan visibility is incomplete", async () => {
+    mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
+      ...mockEvidence,
+      issue: { ...mockEvidence.issue, author: "itsmiso-ai", authorAssociation: "NONE", commentsCount: 3 },
+    });
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 1, author: "itsmiso-ai", authorAssociation: "NONE", body: "internal", createdAt: "2026-10-08T00:00:00Z" },
+    ]);
+    mocks.callGroomerLLM.mockResolvedValue(planDraft({ mutations: { githubComment: "A proposed reply." } }));
+
+    const result = await runHostedGroomer();
+
+    expect(result!.mutationPlan).toMatchObject({ commentHeld: true, commentHoldReason: "participant_scan_incomplete" });
+    expect(result!.contextWarnings).toContain(
+      "trust: participant scan incomplete (1/3); external replies require operator approval",
+    );
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+  });
+
   it("completes the run and audits a failed pending-reply hold write", async () => {
     mocks.collectGroomingEvidenceSnapshot.mockResolvedValue({
       ...mockEvidence,

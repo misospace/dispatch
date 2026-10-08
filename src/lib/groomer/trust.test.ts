@@ -100,12 +100,24 @@ describe("resolveParticipantTrust", () => {
     expect(deps.lookup).not.toHaveBeenCalled();
   });
 
-  it("trusts internal automation without a permission lookup", async () => {
+  it.each(["itsmiso-ai", "its-saffron", "its-miso", "github-actions[bot]"])(
+    "trusts internal automation %s without a permission lookup",
+    async (login) => {
+      const deps = depsReturning({ status: "not_found" });
+
+      const participant = await resolve(login, "NONE", deps);
+
+      expect(participant).toMatchObject({ trusted: true, reason: "internal_automation" });
+      expect(deps.lookup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not trust an unrelated bot by suffix alone", async () => {
     const deps = depsReturning({ status: "not_found" });
 
-    const participant = await resolve("github-actions[bot]", "NONE", deps);
+    const participant = await resolve("unrelated-app[bot]", "NONE", deps);
 
-    expect(participant).toMatchObject({ trusted: true, reason: "internal_automation" });
+    expect(participant).toMatchObject({ trusted: false, reason: "external_association:none" });
     expect(deps.lookup).not.toHaveBeenCalled();
   });
 

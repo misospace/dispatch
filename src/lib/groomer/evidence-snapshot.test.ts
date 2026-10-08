@@ -182,6 +182,7 @@ describe("collectGroomingEvidenceSnapshot", () => {
       url: `https://github.com/${REPO}/issues/42`,
       author: "maintainer",
       authorAssociation: "OWNER",
+      commentsCount: 2,
     });
     expect(snapshot.issueFingerprint).toBe(computeIssueFingerprint(snapshot.issue));
     expect(snapshot.evidenceDigest).toBe(
@@ -364,6 +365,7 @@ describe("summarizeEvidenceForPersistence", () => {
       "humanCommentCount",
       "issueAuthor",
       "issueAuthorAssociation",
+      "issueCommentsCount",
       "issueFingerprint",
       "issueState",
       "issueUpdatedAt",

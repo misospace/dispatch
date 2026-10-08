@@ -62,6 +62,7 @@ export interface RunHostedGroomerOptions {
 }
 
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
+const PARTICIPANT_SCAN_LIMIT = 100;
 
 /**
  * The tail of the run's lease-based deadline, reserved for the apply stage
@@ -263,6 +264,14 @@ async function executeGroomerRun(
       comments = [];
     }
 
+    let participants: Awaited<ReturnType<typeof fetchIssueComments>> = [];
+    let participantScanFailed = false;
+    try {
+      participants = await deps.fetchComments(candidate.repoFullName, candidate.number, PARTICIPANT_SCAN_LIMIT, "desc");
+    } catch {
+      participantScanFailed = true;
+    }
+
     // Capture the evidence snapshot BEFORE model analysis: the pinned
     // default-branch head SHA plus the live issue/comment state that every
     // repository read in this run is pinned to. Never fatal — the collector
@@ -297,6 +306,7 @@ async function executeGroomerRun(
           state: "unknown",
           updatedAt: "",
           url: "",
+          commentsCount: null,
         },
         issueFingerprint: "",
         comments: [],
@@ -373,24 +383,38 @@ async function executeGroomerRun(
 
     const engagementWarnings: string[] = [];
     let engagement: Awaited<ReturnType<typeof assessExternalEngagement>>;
-    try {
-      engagement = await assessExternalEngagement(
-        {
-          repoFullName: candidate.repoFullName,
-          author: {
-            login: evidence.issue.author ?? null,
-            authorAssociation: evidence.issue.authorAssociation,
-          },
-          comments,
-        },
-        { lookup: (login) => (deps.fetchCollaboratorPermission ?? fetchCollaboratorPermission)(candidate.repoFullName, login) },
-        { trustedLogins: config.trustedLogins ?? [] },
-      );
-    } catch (error) {
+    let engagementReason = "externally_engaged";
+    if (participantScanFailed) {
       engagement = { engaged: true, participants: [] };
-      const warning = "trust: participant assessment failed; external replies require operator approval";
-      engagementWarnings.push(warning);
-      console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: ${warning}`, error);
+      engagementReason = "participant_scan_incomplete";
+      engagementWarnings.push("trust: participant scan failed; external replies require operator approval");
+    } else {
+      try {
+        engagement = await assessExternalEngagement(
+          {
+            repoFullName: candidate.repoFullName,
+            author: {
+              login: evidence.issue.author ?? null,
+              authorAssociation: evidence.issue.authorAssociation,
+            },
+            comments: participants,
+          },
+          { lookup: (login) => (deps.fetchCollaboratorPermission ?? fetchCollaboratorPermission)(candidate.repoFullName, login) },
+          { trustedLogins: config.trustedLogins ?? [] },
+        );
+      } catch (error) {
+        engagement = { engaged: true, participants: [] };
+        const warning = "trust: participant assessment failed; external replies require operator approval";
+        engagementWarnings.push(warning);
+        console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: ${warning}`, error);
+      }
+      if (evidence.issue.commentsCount != null && participants.length < evidence.issue.commentsCount) {
+        engagement = { ...engagement, engaged: true };
+        engagementReason = "participant_scan_incomplete";
+        engagementWarnings.push(
+          `trust: participant scan incomplete (${participants.length}/${evidence.issue.commentsCount}); external replies require operator approval`,
+        );
+      }
     }
     const policy = config.externalReplyPolicy ?? "pending";
     const held = engagement.engaged && policy === "pending";
@@ -640,7 +664,7 @@ async function executeGroomerRun(
       notReadyReason: notReadyReason ?? null,
       willComment: diff.comment !== null,
       commentHeld: held,
-      commentHoldReason: engagement.engaged ? "externally_engaged" : undefined,
+      commentHoldReason: engagement.engaged ? engagementReason : undefined,
       externalParticipants: engagement.participants,
       willCloseIssue: diff.close,
       willCreateChildren: diff.children !== null,
@@ -905,7 +929,7 @@ async function executeGroomerRun(
         commentPolicy: (held || suppressed)
           ? {
               mode: "hold",
-              reason: "externally_engaged",
+              reason: engagementReason,
               detail: engagement.participants
                 .filter((participant) => !participant.trusted)
                 .map((participant) => `untrusted: ${participant.login || "unknown"} (${participant.reason})`)
@@ -928,7 +952,7 @@ async function executeGroomerRun(
             issueId: candidate.id,
             groomingRunId: groomingRun.id,
             commentBody: diff.comment ?? "",
-            reason: "externally_engaged",
+            reason: engagementReason,
             trustContext: { participants: engagement.participants },
           });
         } catch (error) {
@@ -947,7 +971,7 @@ async function executeGroomerRun(
                 afterLabels: applied.labels,
                 success: false,
                 errorMessage: error instanceof Error ? error.message : String(error),
-                notes: JSON.stringify({ applicationKey, reason: "externally_engaged", participants: engagement.participants }),
+                notes: JSON.stringify({ applicationKey, reason: engagementReason, participants: engagement.participants }),
               },
             });
           } catch (auditError) {
@@ -968,7 +992,7 @@ async function executeGroomerRun(
               beforeLabels: analyzed.labels,
               afterLabels: applied.labels,
               success: true,
-              notes: JSON.stringify({ applicationKey, reason: "externally_engaged", participants: engagement.participants }),
+              notes: JSON.stringify({ applicationKey, reason: engagementReason, participants: engagement.participants }),
             },
           });
         } catch (error) {

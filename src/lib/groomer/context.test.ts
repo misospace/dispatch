@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { buildIssueContext, fetchIssueComments } from "./context";
+import { buildIssueContext, fetchIssueComments, isInternalAutomationAuthor } from "./context";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -10,6 +10,13 @@ const { mocks } = vi.hoisted(() => ({
 vi.mock("@/lib/github", () => ({
   fetchIssueComments: mocks.fetchGitHubIssueComments,
 }));
+
+describe("internal automation identities", () => {
+  it("matches only exact identities case-insensitively", () => {
+    expect(isInternalAutomationAuthor("ITS-MISO")).toBe(true);
+    expect(isInternalAutomationAuthor("unrelated-app[bot]")).toBe(false);
+  });
+});
 
 describe("buildIssueContext", () => {
   it("returns context with title, body, and labels from DB issue", async () => {

@@ -30,6 +30,22 @@ export interface IssueContextInput {
  */
 const AUTOMATION_AUTHORS = new Set(["itsmiso-ai", "its-saffron", "its-miso", "github-actions[bot]"]);
 
+/**
+ * Exact identities for automation operated by this system. Other bots,
+ * including renovate[bot] and dependabot[bot], are untrusted by default;
+ * operators can allow them via DISPATCH_GROOMER_TRUSTED_LOGINS.
+ */
+export const INTERNAL_AUTOMATION_AUTHORS: ReadonlySet<string> = new Set([
+  "itsmiso-ai",
+  "its-saffron",
+  "its-miso",
+  "github-actions[bot]",
+]);
+
+export function isInternalAutomationAuthor(author: string): boolean {
+  return INTERNAL_AUTOMATION_AUTHORS.has((author || "").trim().toLowerCase());
+}
+
 export function isAutomationAuthor(author: string): boolean {
   const a = (author || "").toLowerCase();
   return AUTOMATION_AUTHORS.has(a) || a.endsWith("[bot]");
