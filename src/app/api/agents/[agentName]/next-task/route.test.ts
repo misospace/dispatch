@@ -1789,6 +1789,65 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.number).toBe(16);
   });
 
+  it("defers a linked issue whose PR has a queue row even when cached health says no follow-up", async () => {
+    // The cached health column is refreshed on a reconcile cadence and can lag
+    // the queue row's creation. A false value must not let the issue through to
+    // implement pickup on a PR the queue is holding back (BLOCKED rows are not
+    // in the pr-fix list, so nothing else would stop it).
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, { linkedPrNeedsFollowup: false, linkedPrFollowupReasons: [] }),
+      independentIssue(99),
+    ]);
+    mocks.linkedRows.push({ repo: "org/repo", pr: 15, status: "BLOCKED", lane: "NEEDS_HUMAN" });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+  });
+
+  it("still serves implement work for a linked PR that needs no follow-up and has no queue row", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, { linkedPrNeedsFollowup: false, linkedPrFollowupReasons: [] }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(42);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+    expect(mocks.fetchPullRequestLabels).not.toHaveBeenCalled();
+  });
+
+  it("finds an existing queue row when the issue cache's repo casing differs from the queue key", async () => {
+    // Queue rows are stored under a case-folded repo; the issue cache is not
+    // normalized against them, so the identity lookup must fold too (#1145).
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, { repository: { fullName: "Org/Repo" } }),
+      independentIssue(99, { repository: { fullName: "Org/Repo" } }),
+    ]);
+    mocks.linkedRows.push({ repo: "org/repo", pr: 15, status: "BLOCKED", lane: "NEEDS_HUMAN" });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+  });
+
   it("linked PR follow-up beats normal implement work", async () => {
     mocks.issueFindMany.mockResolvedValue([
       linkedIssue(42, 15, { title: "Issue with PR needing follow-up", linkedPrFollowupReasons: ["needs changes"] }),

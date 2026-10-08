@@ -11,7 +11,7 @@ import {
 import { isBacklogLane, getBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 import { selectGroomingCandidate } from "@/lib/groomer/selector";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, normalizeQueueRepo } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 
@@ -259,19 +259,30 @@ export async function GET(
       const health = followupItem.linkedPrHealth;
       const repo = followupItem.repoFullName;
       const pr = health?.number;
-      if (!health?.needsFollowup || !pr || !repo) continue;
-      // The queue owns this issue for the poll whatever happens next.
+      if (!pr || !repo) continue;
+
+      // Queue rows own the PR identity in every state — including BLOCKED,
+      // which `listQueuedPrFixItems` does not surface, so it never appears in
+      // prFixItems above. This check deliberately does NOT depend on the cached
+      // `needsFollowup` flag: that column is refreshed on a reconcile cadence
+      // and can lag the row's creation, and a false value must not let the
+      // issue through to implement pickup on a PR the queue is holding back.
+      const existing = await prisma.prFixQueueItem.findUnique({
+        where: { repo_pr: { repo: normalizeQueueRepo(repo), pr } },
+      });
+      if (existing) {
+        deferredIssues.add(issueKey(repo, followupItem.number));
+        continue;
+      }
+
+      // No row: only follow-up health asks us to create one. A linked PR that
+      // needs no follow-up leaves the issue as ordinary implement work.
+      if (!health?.needsFollowup) continue;
+      // From here the issue is queue-owned for the poll whatever happens next.
       deferredIssues.add(issueKey(repo, followupItem.number));
       const key = `${repo.toLowerCase()}#${pr}`;
       if (dispatchedLinkedPrs.has(key)) continue;
       dispatchedLinkedPrs.add(key);
-
-      // Queue rows in every state own the PR identity. Never route around a
-      // BLOCKED/terminal verdict via the cached linked-health path.
-      const existing = await prisma.prFixQueueItem.findUnique({
-        where: { repo_pr: { repo, pr } },
-      });
-      if (existing) continue;
 
       const labels = await fetchPullRequestLabels(repo, pr);
       if (labels === null || labels.some((label) => label.toLowerCase() === NEEDS_HUMAN_LABEL)) continue;

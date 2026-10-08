@@ -122,7 +122,11 @@ The implementation is generic: there are no hardcoded agent names or repository 
 
 ## Deduplication
 
-Items are deduplicated by `(repo, pr)`. When the same PR receives additional feedback:
+Items are deduplicated by `(repo, pr)`. The repo is case-folded
+(`normalizeQueueRepo`) on every write and identity lookup, because the unique
+key itself is case-sensitive while GitHub is not — otherwise `Org/Repo` and
+`org/repo` would be two rows owning the same PR and the second could shadow a
+`BLOCKED` verdict (#1145). When the same PR receives additional feedback:
 
 - New feedback strings are appended (up to 12, unique)
 - New evidence keys are appended (up to 40, unique)
@@ -177,7 +181,11 @@ health (failing checks, requested changes, merge conflicts) is only a
 
 - **Any existing row wins.** If a `PrFixQueueItem` exists for the PR — in any
   status, any lane — the linked-PR scan defers to it. A `BLOCKED` /
-  `NEEDS_HUMAN` verdict is never bypassed.
+  `NEEDS_HUMAN` verdict is never bypassed. This check deliberately does **not**
+  consult the cached `linkedPrNeedsFollowup` column: that column is refreshed on
+  a reconcile cadence and can lag the row's creation, so a stale `false` must
+  not let the issue through to implement pickup on a PR the queue is holding
+  back.
 - **First discovery materializes.** A PR with follow-up health and no queue row
   is created as a real row (lane derived from the issue's lane: default →
   `NORMAL`, escalation → `ESCALATED`, otherwise `NORMAL`) with an `enqueue`
