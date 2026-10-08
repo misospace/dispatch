@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -53,7 +54,7 @@ export async function GET(request: Request) {
 
   try {
     const item = await prisma.prFixQueueItem.findUnique({
-      where: { repo_pr: { repo, pr } },
+      where: { repo_pr: { repo: normalizeQueueRepo(repo), pr } },
     });
 
     if (!item) {

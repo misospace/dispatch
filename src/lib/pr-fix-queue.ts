@@ -56,6 +56,25 @@ export interface EnqueuePrFixInput {
   author?: string | null;
 }
 
+export interface CreateLinkedPrFixInput {
+  repo: string;
+  pr: number;
+  issue: number;
+  lane: PrFixLane;
+  reason: string;
+  feedback: string[];
+  evidenceKey: string;
+  url?: string | null;
+  title?: string | null;
+  /**
+   * Head observed when the linked follow-up was discovered (#1074). Stored as
+   * both the mutable `headSha` and the immutable per-attempt `attemptHeadSha`
+   * so the #940 no-progress guard can refuse a FIXED tombstone for a worker
+   * that pushed nothing. Null when GitHub could not be read.
+   */
+  headSha?: string | null;
+}
+
 export interface MarkPrFixInput {
   repo: string;
   pr: number;
@@ -88,6 +107,21 @@ export interface RequeuePrFixInput {
 
 export function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Canonical queue identity for a repository (#1145).
+ *
+ * GitHub treats `owner/repo` case-insensitively, but the `(repo, pr)` unique
+ * key does not. A row written as `Org/Repo` and a lookup for `org/repo` are
+ * different records, so two rows could own the same PR — one of them `BLOCKED`
+ * — and the second would shadow the human verdict. Every queue write and every
+ * identity lookup folds the repo through this so the key is stable regardless
+ * of the casing the caller derived it from (GitHub payload, issue cache, or a
+ * hand-written API call).
+ */
+export function normalizeQueueRepo(repo: string): string {
+  return repo.trim().toLowerCase();
 }
 
 export function parseEnqueuePrFixInput(body: unknown): EnqueuePrFixInput | { error: string } {
@@ -413,7 +447,10 @@ export function maxPrFixAttempts(): number {
   return Number.isInteger(n) && n > 0 ? n : 5;
 }
 
-export async function enqueuePrFixItem(client: PrFixQueueClient, input: EnqueuePrFixInput) {
+export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: EnqueuePrFixInput) {
+  // Fold the repo before any read or write: `(repo, pr)` is the ownership key
+  // and must not depend on the caller's casing (#1145).
+  const input: EnqueuePrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
   const lane = normalizePrFixLane(input.lane);
   const type = normalizePrFixType(input.type);
   const nextStatus: PrFixStatus = lane === "NEEDS_HUMAN" ? "BLOCKED" : "QUEUED";
@@ -698,14 +735,66 @@ async function retractNeedsHuman(repo: string, pr: number, outcome: PrFixUnblock
   });
 }
 
+export async function createLinkedPrFixItem(
+  client: PrFixQueueClient,
+  rawInput: CreateLinkedPrFixInput,
+): Promise<{ item: any; created: boolean }> {
+  // Same identity fold as enqueuePrFixItem (#1145).
+  const input: CreateLinkedPrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
+  try {
+    const item = await client.$transaction(async (tx) => {
+      const item = await tx.prFixQueueItem.create({
+        data: {
+          repo: input.repo,
+          pr: input.pr,
+          issue: input.issue,
+          lane: input.lane,
+          type: "OTHER",
+          status: "QUEUED",
+          reason: input.reason,
+          feedback: input.feedback,
+          evidenceKeys: [input.evidenceKey],
+          ...(input.url ? { url: input.url } : {}),
+          ...(input.title ? { title: input.title } : {}),
+          headSha: input.headSha ?? null,
+          attemptHeadSha: input.headSha ?? null,
+        },
+      });
+      await tx.prFixHistory.create({
+        data: {
+          itemId: item.id,
+          action: "enqueue",
+          lane: item.lane,
+          reason: input.reason,
+          evidenceKey: input.evidenceKey,
+          note: "Materialized from linked PR health scan.",
+        },
+      });
+      return item;
+    });
+    return { item, created: true };
+  } catch (error) {
+    // The unique (repo, pr) constraint is the ownership boundary. If another
+    // enqueue won, return its row without mutating or reopening it. A
+    // transaction-level P2002 may also come from history, so only treat it as
+    // the ownership race when the unique-key winner can be read back.
+    if ((error as { code?: string })?.code !== "P2002") throw error;
+    const item = await client.prFixQueueItem.findUnique({
+      where: { repo_pr: { repo: input.repo, pr: input.pr } },
+    });
+    if (!item) throw error;
+    return { item, created: false };
+  }
+}
+
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
   const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
   const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED"] } : "QUEUED";
-  
+
   const items = await client.prFixQueueItem.findMany({
     where: { status, ...(lane ? { lane } : {}) },
   });
-  
+
   // Sort by type priority first, then by queuedAt
   if (options.prioritizeByType !== false) {
     items.sort((a, b) => {
@@ -718,7 +807,7 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
   } else {
     items.sort((a, b) => new Date(a.queuedAt).getTime() - new Date(b.queuedAt).getTime());
   }
-  
+
   return items;
 }
 
@@ -801,8 +890,11 @@ export type MarkPrFixResult =
 
 export async function markPrFixItem(
   client: PrFixQueueClient,
-  input: MarkPrFixInput,
+  rawInput: MarkPrFixInput,
 ): Promise<MarkPrFixResult> {
+  // Fold the repo so the repo_pr lookup and every pinned write agree on the
+  // same identity regardless of the caller's casing (#1145).
+  const input: MarkPrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
   const nextStatus = normalizePrFixStatus(input.status) as PrFixStatus | null;
   if (!nextStatus) throw new Error("Invalid status");
 
@@ -1408,7 +1500,8 @@ export function toAgentQueuePrFixItem(item: any) {
  * `classify_pr_lifecycle` treating those as nothing-left-to-fix. The caller
  * passes `isPrMergedOrClosed` (computed upstream) so this stays a pure db op.
  */
-export async function requeuePrFixItem(client: PrFixQueueClient, input: RequeuePrFixInput) {
+export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: RequeuePrFixInput) {
+  const input: RequeuePrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
   if (input.isPrMergedOrClosed) {
     throw new Error("Cannot requeue: upstream PR is merged or closed");
   }
@@ -1576,7 +1669,7 @@ export interface ResolvePrFixFromAgentReportResult {
 export async function resolvePrFixFromAgentReport(
   input: ResolvePrFixFromAgentReportInput,
 ): Promise<ResolvePrFixFromAgentReportResult> {
-  const repo = input.repoFullName?.trim();
+  const repo = input.repoFullName ? normalizeQueueRepo(input.repoFullName) : undefined;
   const pr =
     typeof input.pullRequestNumber === "number" && Number.isInteger(input.pullRequestNumber)
       ? input.pullRequestNumber

@@ -8,7 +8,7 @@
  * (real-time GitHub event reception). Both paths converge on the same ingestion logic.
  */
 
-import { EnqueuePrFixInput, enqueuePrFixItem, PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
@@ -822,7 +822,7 @@ export async function clearResolvedConflictItems(
   if (opts.mergeable.toUpperCase() === "CONFLICTING") return false;
 
   const existing = await client.prFixQueueItem.findUnique({
-    where: { repo_pr: { repo: opts.repoFullName, pr: opts.prNumber } },
+    where: { repo_pr: { repo: normalizeQueueRepo(opts.repoFullName), pr: opts.prNumber } },
   });
 
   if (!existing) return false;

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { enqueuePrFixItem, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -83,6 +83,14 @@ function makeClient(): PrFixQueueClient & {
         return items.find((i) => i.repo === where.repo_pr.repo && i.pr === where.repo_pr.pr) ?? null;
       },
       create: async ({ data }: any) => {
+        // Mirror the schema's @@unique([repo, pr]) — without it a duplicate
+        // identity would silently "succeed" and tests could not tell a
+        // convergence from a second row (#1145).
+        if (items.some((i) => i.repo === data.repo && i.pr === data.pr)) {
+          const err = new Error("Unique constraint failed on the fields: (`repo`,`pr`)");
+          (err as any).code = "P2002";
+          throw err;
+        }
         const item = {
           id: `item-${++seq}`,
           generation: 1, // mirrors the column's @default(1)
@@ -3103,5 +3111,203 @@ describe("enqueue post-dispatch append pinning (#1134)", () => {
     // `enqueue` history row beyond the seed's.
     expect(client.items).toHaveLength(0);
     expect(client.history).toHaveLength(historyRowsAfterSeed);
+  });
+});
+
+describe("createLinkedPrFixItem materialization (#1145)", () => {
+  it("creates a QUEUED row with history and the observed head baseline", async () => {
+    const client = makeClient();
+    const { item, created } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "changes_requested",
+      feedback: ["changes_requested", "failing_checks"],
+      evidenceKey: "linked-health:42:2026-01-01T00:00:00.000Z",
+      url: "https://github.com/org/repo/pull/15",
+      title: "Follow up linked PR for org/repo#42",
+      headSha: "a".repeat(40),
+    });
+
+    expect(created).toBe(true);
+    expect(item).toMatchObject({
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      status: "QUEUED",
+      type: "OTHER",
+      generation: 1,
+      headSha: "a".repeat(40),
+      attemptHeadSha: "a".repeat(40),
+      feedback: ["changes_requested", "failing_checks"],
+    });
+    expect(client.history).toEqual([
+      expect.objectContaining({
+        itemId: item.id,
+        action: "enqueue",
+        lane: "NORMAL",
+        evidenceKey: "linked-health:42:2026-01-01T00:00:00.000Z",
+      }),
+    ]);
+  });
+
+  it("leaves the baseline null when GitHub could not be read", async () => {
+    const client = makeClient();
+    const { item } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "ESCALATED",
+      reason: "failing_checks",
+      feedback: ["failing_checks"],
+      evidenceKey: "linked-health:42:unknown",
+      headSha: null,
+    });
+    expect(item.headSha).toBeNull();
+    expect(item.attemptHeadSha).toBeNull();
+  });
+
+  it("returns the concurrent winner untouched on a unique-constraint race", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      lane: "escalated",
+      reason: "operator blocked",
+      feedback: "wait for approval",
+      evidenceKey: "operator:1",
+    });
+    const winner = client.items[0];
+    const winnerSnapshot = { ...winner };
+    const historyRowsBefore = client.history.length;
+
+    // A concurrent enqueue won the (repo, pr) unique key between our create
+    // attempt and its commit: Prisma raises P2002 on the losing insert.
+    client.prFixQueueItem.create = async () => {
+      const err = new Error("Unique constraint failed on the fields: (`repo`,`pr`)");
+      (err as any).code = "P2002";
+      throw err;
+    };
+
+    const result = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "failing_checks",
+      feedback: ["failing_checks"],
+      evidenceKey: "linked-health:42:unknown",
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.item.id).toBe(winner.id);
+    // No mutation of the winner, and no orphaned history row from the loser.
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0]).toEqual(winnerSnapshot);
+    expect(client.history).toHaveLength(historyRowsBefore);
+  });
+
+  it("rethrows a non-constraint failure", async () => {
+    const client = makeClient();
+    client.prFixQueueItem.create = async () => {
+      throw Object.assign(new Error("connection reset"), { code: "P2024" });
+    };
+    await expect(
+      createLinkedPrFixItem(client, {
+        repo: "org/repo",
+        pr: 15,
+        issue: 42,
+        lane: "NORMAL",
+        reason: "failing_checks",
+        feedback: ["failing_checks"],
+        evidenceKey: "linked-health:42:unknown",
+      }),
+    ).rejects.toThrow("connection reset");
+    expect(client.history).toHaveLength(0);
+  });
+});
+
+describe("queue identity folds repo casing (#1145)", () => {
+  it("enqueue with different casing resolves to the same row", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "Org/Repo",
+      pr: 15,
+      lane: "normal",
+      reason: "first",
+      feedback: "f",
+      evidenceKey: "e1",
+    });
+    expect(client.items[0].repo).toBe("org/repo");
+
+    // A second enqueue for the same PR with different casing must land on the
+    // same identity, not create a second row that could shadow it.
+    await enqueuePrFixItem(client, {
+      repo: "ORG/REPO",
+      pr: 15,
+      lane: "normal",
+      reason: "second",
+      feedback: "g",
+      evidenceKey: "e2",
+    });
+    expect(client.items).toHaveLength(1);
+    expect(client.history.filter((h: any) => h.action === "enqueue")).toHaveLength(2);
+  });
+
+  it("mark and requeue find a row written with different casing", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "Org/Repo",
+      pr: 15,
+      lane: "needs-human",
+      reason: "r",
+      feedback: "f",
+      evidenceKey: "e1",
+    });
+    expect(client.items[0].status).toBe("BLOCKED");
+    const requeued = await requeuePrFixItem(client, { repo: "oRg/rEpO", pr: 15 });
+    expect(requeued).not.toBeNull();
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].status).toBe("QUEUED");
+
+    const marked = await markPrFixItem(client, { repo: "ORG/repo", pr: 15, status: "fixed", alreadyAddressed: true });
+    expect(marked.mutated).toBe(true);
+    expect(client.items[0].status).toBe("FIXED");
+  });
+
+  it("linked materialization with different casing finds the enqueued row instead of duplicating it", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      lane: "needs-human",
+      reason: "operator blocked",
+      feedback: "wait",
+      evidenceKey: "op:1",
+    });
+    expect(client.items[0].status).toBe("BLOCKED");
+
+    // The linked path derives its repo from the issue cache, which is not
+    // casing-normalized against the queue row. It must converge on the
+    // existing BLOCKED row rather than creating a fresh QUEUED one.
+    const result = await createLinkedPrFixItem(client, {
+      repo: "Org/Repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "failing_checks",
+      feedback: ["failing_checks"],
+      evidenceKey: "linked-health:42:unknown",
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.item.status).toBe("BLOCKED");
+    expect(client.items).toHaveLength(1);
+  });
+
+  it("normalizeQueueRepo trims and lowercases", () => {
+    expect(normalizeQueueRepo("  Org/Repo  ")).toBe("org/repo");
   });
 });

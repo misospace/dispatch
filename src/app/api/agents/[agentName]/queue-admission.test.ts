@@ -15,6 +15,12 @@ const { mocks } = vi.hoisted(() => ({
     issueFindMany: vi.fn(),
     groomingRunFindMany: vi.fn(),
     prFixFindMany: vi.fn(),
+    prFixFindUnique: vi.fn(),
+    prFixCreate: vi.fn(),
+    prFixHistoryCreate: vi.fn(),
+    prFixRows: [] as any[],
+    fetchPullRequestLabels: vi.fn(),
+    fetchPullRequestHeadSha: vi.fn(),
     findLeasedIssueIds: vi.fn(),
   },
 }));
@@ -23,9 +29,25 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findMany: mocks.issueFindMany },
     groomingRun: { findMany: mocks.groomingRunFindMany },
-    prFixQueueItem: { findMany: mocks.prFixFindMany },
+    prFixQueueItem: {
+      findMany: mocks.prFixFindMany,
+      findUnique: mocks.prFixFindUnique,
+      create: mocks.prFixCreate,
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    prFixHistory: { create: mocks.prFixHistoryCreate },
+    $transaction: async (fn: any) => fn({
+      prFixQueueItem: { create: mocks.prFixCreate, findUnique: mocks.prFixFindUnique },
+      prFixHistory: { create: mocks.prFixHistoryCreate },
+    }),
   },
   asPrFixQueueClient: (client: unknown) => client,
+}));
+
+vi.mock("@/lib/github", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/github")>()),
+  fetchPullRequestLabels: mocks.fetchPullRequestLabels,
+  fetchPullRequestHeadSha: mocks.fetchPullRequestHeadSha,
 }));
 
 vi.mock("@/lib/lease", () => ({ findLeasedIssueIds: mocks.findLeasedIssueIds }));
@@ -191,6 +213,20 @@ beforeEach(() => {
     RUNS.filter((r) => where.id.in.includes(r.id)),
   );
   mocks.prFixFindMany.mockResolvedValue([]);
+  mocks.prFixRows = [];
+  mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => {
+    const rows = [...mocks.prFixRows, ...(await mocks.prFixFindMany())];
+    if (where.id !== undefined) return rows.find((r: any) => r.id === where.id) ?? null;
+    return rows.find((r: any) => r.repo === where.repo_pr.repo && r.pr === where.repo_pr.pr) ?? null;
+  });
+  mocks.prFixCreate.mockImplementation(async ({ data }: any) => {
+    const item = { id: "linked-prfix", generation: 1, agentHandouts: [], ...data };
+    mocks.prFixRows.push(item);
+    return item;
+  });
+  mocks.prFixHistoryCreate.mockResolvedValue({});
+  mocks.fetchPullRequestLabels.mockResolvedValue([]);
+  mocks.fetchPullRequestHeadSha.mockResolvedValue(null);
   mocks.findLeasedIssueIds.mockResolvedValue([]);
 });
 

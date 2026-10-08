@@ -23,6 +23,19 @@ export async function fetchPullRequests(repoFullName: string, perPage = 100): Pr
   return fetchPaginated<GithubPR>(url, 200);
 }
 
+/** Read labels from the PR's issue endpoint; null means GitHub state was unavailable. */
+export async function fetchPullRequestLabels(repoFullName: string, prNumber: number): Promise<string[] | null> {
+  try {
+    const labels = await fetchPaginated<{ name?: string }>(
+      `${GITHUB_API}/repos/${repoFullName}/issues/${prNumber}/labels?per_page=100`,
+    );
+    return labels.flatMap((label) => typeof label.name === "string" ? [label.name] : []);
+  } catch (error) {
+    console.warn(`[github-prs] labels unavailable for ${repoFullName}#${prNumber}:`, error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
 export async function fetchClosedPullRequests(repoFullName: string, maxItems = 100): Promise<GithubPR[]> {
   const url = `${GITHUB_API}/repos/${repoFullName}/pulls?state=closed&sort=updated&direction=desc&per_page=100`;
   return fetchPaginated<GithubPR>(url, maxItems);

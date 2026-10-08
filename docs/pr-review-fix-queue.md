@@ -122,7 +122,11 @@ The implementation is generic: there are no hardcoded agent names or repository 
 
 ## Deduplication
 
-Items are deduplicated by `(repo, pr)`. When the same PR receives additional feedback:
+Items are deduplicated by `(repo, pr)`. The repo is case-folded
+(`normalizeQueueRepo`) on every write and identity lookup, because the unique
+key itself is case-sensitive while GitHub is not — otherwise `Org/Repo` and
+`org/repo` would be two rows owning the same PR and the second could shadow a
+`BLOCKED` verdict (#1145). When the same PR receives additional feedback:
 
 - New feedback strings are appended (up to 12, unique)
 - New evidence keys are appended (up to 40, unique)
@@ -158,7 +162,7 @@ Each queue item carries a Dispatch-owned `generation` (integer, starts at `1`). 
 - `prFixItem.id` — stable for the persistent `PrFixQueueItem` row.
 - `prFixItem.generation` — changes only when Dispatch creates a fresh dispatchable attempt: an explicit requeue from `BLOCKED` or `FIXED`, genuinely new evidence reopening a resolved item, recovery from a no-progress `FIXED` tombstone (#940), or the refused-`FIXED` head-SHA rollback. Repeated reads, repeated sync of known evidence, and updates that stay within the same active attempt never change it.
 
-Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. `generation` is an integer; the SHA-256 hex derivation from this change's first revision was superseded before ever shipping, so no released contract exposed a string form. Follow-up tasks driven by linked-PR health (not backed by a `PrFixQueueItem`) omit `prFixItem`.
+Together the pair answers "which distinct unit of PR-fix work is this". Consumers should treat `(id, generation)` as opaque work identity — for example, to key their own per-attempt records — and must not derive queue policy from the number. `generation` is an integer; the SHA-256 hex derivation from this change's first revision was superseded before ever shipping, so no released contract exposed a string form. Follow-up tasks discovered by linked-PR health are materialized into a `PrFixQueueItem` before hand-out and therefore always carry `prFixItem` (see "Linked-PR follow-up ownership" below); a hand-out never ships without one.
 
 For downstream consumers that also report results through `POST /api/agents/{agentName}/tasks/report`: reports accept an optional opaque `idempotencyKey` that makes retries safe — a retry with the same key and payload returns the original `agentRunId` (with `duplicate: true`) and never re-runs PR-fix resolution; the stored resolution is replayed when it has been persisted, and otherwise the response carries an explicit `action: "skipped"` resolution. The same key with a different payload is rejected with `409`, as is a claim whose referenced run was deleted; an unexpected persistence failure returns a structured `500` whose retry lands in the duplicate branch. Full contract: "Idempotent reporting" in AGENTS.md.
 
@@ -168,6 +172,54 @@ For downstream consumers that also report results through `POST /api/agents/{age
 - **Token absent** (legacy report) → the queue is **never** mutated: the report matches the item (so the response stays informative) but takes no action and makes no GitHub calls. A worker that was never issued an attempt can no longer settle an item.
 
 The token is part of the report's canonical payload, so it participates in `idempotencyKey` replay semantics: a retry with the same key and a different `prFixItem` is a `409`, exactly like any other payload change.
+
+## Linked-PR follow-up ownership (#1145)
+
+The queue is the single owner of dispatchable follow-up attempts. Linked-PR
+health (failing checks, requested changes, merge conflicts) is only a
+*discovery* signal: it never produces a task of its own.
+
+- **Any existing row wins.** If a `PrFixQueueItem` exists for the PR — in any
+  status, any lane — the linked-PR scan defers to it. A `BLOCKED` /
+  `NEEDS_HUMAN` verdict is never bypassed. This check deliberately does **not**
+  consult the cached `linkedPrNeedsFollowup` column: that column is refreshed on
+  a reconcile cadence and can lag the row's creation, so a stale `false` must
+  not let the issue through to implement pickup on a PR the queue is holding
+  back.
+- **First discovery materializes.** A PR with follow-up health and no queue row
+  is created as a real row (lane derived from the issue's lane: default →
+  `NORMAL`, escalation → `ESCALATED`, otherwise `NORMAL`) with an `enqueue`
+  history entry, then handed out through the normal generation flow. Creation
+  is create-only against the `(repo, pr)` unique key: a concurrent
+  `enqueuePrFixItem` wins and its row is never mutated or reopened.
+- **`needs-human` PRs are skipped.** The label is read from the PR, which is
+  where `surfacePrFixBlocked` applies it. If the label read fails, the
+  candidate is skipped for that poll rather than materialized — a transient
+  GitHub failure must not be what bypasses a human-intervention verdict.
+- **No identity-less hand-outs.** A worker is never issued a `followup-pr`
+  task without a `prFixItem: { id, generation }` token, so dropping a task no
+  longer causes it to be re-served on every poll.
+
+### The owning issue is deferred from implement pickup
+
+While the queue owns a PR for this poll, the linked *issue* is withheld from
+ordinary implement work for that poll. Without this, a worker handed the issue
+as an `implement` task would push to the very PR the queue is holding back —
+bypassing a `BLOCKED` verdict and re-creating the starvation loop. The same
+applies to an issue whose PR-fix item was already handed to this agent.
+
+`next-task` then returns the next independent issue, or idles with a
+distinguishing reason:
+
+```json
+{ "type": "idle", "shouldRun": false,
+  "reason": "No work available (2 ready issues deferred: linked PR follow-up is owned by the PR-fix queue)" }
+```
+
+A grooming-admission hold and a queue-owned deferral are reported together when
+both apply. Note the deferral is **not** time-bounded: an issue whose PR sits in
+`BLOCKED` stays deferred until an operator requeues or resolves the item, or
+until a health reconcile observes the PR closed.
 
 ## Status lifecycle
 
