@@ -236,6 +236,8 @@ This contract is referenced from:
 
 Workers using the canonical `next-task` endpoint automatically receive PR-fix items before issue work. The `next-task` endpoint handles PR-fix queue precedence, linked PR follow-up detection, and idle checks internally. This contract documents the detailed execution rules that apply regardless of how a worker discovers its task.
 
+Linked-PR follow-up is a discovery signal only: the PR-fix queue is the single owner of dispatchable follow-up attempts, and a discovered PR is materialized into a `PrFixQueueItem` before it is handed out. While the queue owns a PR, its issue is withheld from implement pickup for that poll, so `next-task` returns the next independent issue or an idle task whose reason distinguishes the deferral from a grooming-admission hold. See [PR review-fix queue](./pr-review-fix-queue.md#linked-pr-follow-up-ownership-1145).
+
 ---
 
 ## History

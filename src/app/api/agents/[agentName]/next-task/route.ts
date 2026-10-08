@@ -187,6 +187,17 @@ export async function GET(
       return errorResponse(`Invalid lane: "${lane}". Must be one of: ${availableLanes.join(", ")}`, 400);
     }
 
+    // Issue identity for the deferred-work set: `<repo>#<issueNumber>`, repo
+    // case-folded so a cache row written with different casing than the
+    // issue's `repository.fullName` still matches (#1145).
+    const issueKey = (repo: string | null | undefined, number: number) =>
+      `${(repo ?? "").toLowerCase()}#${number}`;
+    // Issues the queue owns for this poll (#1145). They must not be handed out
+    // as ordinary implement work: a worker would push to the very PR the queue
+    // is holding back — bypassing a BLOCKED / needs-human verdict and
+    // re-creating the loop this fix removes.
+    const deferredIssues = new Set<string>();
+
     const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
       if (agentAlreadyHanded(candidate, agentName)) return null;
       const confirmed = await confirmPrFixHandOut(candidate, agentName);
@@ -228,6 +239,10 @@ export async function GET(
     for (const candidate of prFixItems) {
       const task = await dispatchPrFixCandidate(candidate);
       if (task) return NextResponse.json(task);
+      // The item stays queue-owned: this agent already holds its work
+      // identity, or the row was contested. Its issue must not be re-served
+      // as implement work on the same PR (#1145).
+      if (candidate.issue != null) deferredIssues.add(issueKey(candidate.repo, candidate.issue));
     }
 
     // Linked-PR follow-up is PR work, not implementation pickup, so it scans
@@ -239,11 +254,14 @@ export async function GET(
     // "cloud"), `undefined` an unfiltered request that serves every lane.
     const requestPrFixLane = prFixLaneForRequest(resolvedLane);
     const dispatchedLinkedPrs = new Set<string>();
+
     for (const followupItem of fullQueue) {
       const health = followupItem.linkedPrHealth;
       const repo = followupItem.repoFullName;
       const pr = health?.number;
       if (!health?.needsFollowup || !pr || !repo) continue;
+      // The queue owns this issue for the poll whatever happens next.
+      deferredIssues.add(issueKey(repo, followupItem.number));
       const key = `${repo.toLowerCase()}#${pr}`;
       if (dispatchedLinkedPrs.has(key)) continue;
       dispatchedLinkedPrs.add(key);
@@ -330,8 +348,13 @@ export async function GET(
       }
     }
 
-    if (rankedQueue.length > 0) {
-      const first = rankedQueue[0];
+    // Ordinary issue pickup skips every issue whose linked PR the queue owns
+    // for this poll (#1145), so the lane drains to the next independent issue
+    // instead of re-serving the deferred one.
+    const isDeferred = (item: { repoFullName?: string | null; number: number }) =>
+      deferredIssues.has(issueKey(item.repoFullName, item.number));
+    const first = rankedQueue.find((item) => !isDeferred(item));
+    if (first) {
       if (admissionMode === "audit" && first.admission && !first.admission.admitted) {
         console.warn(
           `[queue-admission] audit: ${agentName} handed ${first.repoFullName ?? ""}#${first.number}, which enforce mode would withhold: ${first.admission.summary}`,
@@ -350,12 +373,23 @@ export async function GET(
       return NextResponse.json(task);
     }
 
+    // No dispatchable issue left: report why, so an operator can tell a
+    // queue-owned deferral apart from a grooming-admission hold.
+    const deferredCount = rankedQueue.filter(isDeferred).length;
+    const deferredNote =
+      deferredCount > 0
+        ? `${deferredCount} ready issue${deferredCount === 1 ? "" : "s"} deferred: linked PR follow-up is owned by the PR-fix queue`
+        : null;
+
     if (withheldQueue.length > 0) {
+      const withheldNote = `${withheldQueue.length} ready issue${withheldQueue.length === 1 ? "" : "s"} withheld by grooming admission`;
       return NextResponse.json(
-        createIdleTask(
-          `No work available (${withheldQueue.length} ready issue${withheldQueue.length === 1 ? "" : "s"} withheld by grooming admission)`,
-        ),
+        createIdleTask(`No work available (${[withheldNote, deferredNote].filter(Boolean).join("; ")})`),
       );
+    }
+
+    if (deferredNote) {
+      return NextResponse.json(createIdleTask(`No work available (${deferredNote})`));
     }
 
     return NextResponse.json(createIdleTask("No work available"));
