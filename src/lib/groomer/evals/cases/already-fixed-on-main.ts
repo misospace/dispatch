@@ -31,7 +31,7 @@ export const alreadyFixedOnMain: GroomingCase = {
     labels: ["priority/p1", "type/bug", "status/backlog"],
     lane: "backlog",
   },
-  comments: [{ id: 4101, author: "kim-support", body: "Looks fixed for me now.", createdAt: "2026-09-12T15:00:00Z" }],
+  comments: [{ id: 4101, author: "kim-support", authorAssociation: "COLLABORATOR", body: "Looks fixed for me now.", createdAt: "2026-09-12T15:00:00Z" }],
   repository: {
     headSha: STOREFRONT_HEAD,
     read: ["src/checkout/coupons.ts", "src/checkout/coupons.test.ts"],

@@ -528,7 +528,7 @@ export type ApplyStep = (typeof APPLY_STEPS)[number];
  * - failed: the write failed; later steps were not attempted.
  * - not_attempted: an earlier step failed.
  */
-export type ApplyStepStatus = "applied" | "replayed" | "noop" | "skipped" | "failed" | "not_attempted";
+export type ApplyStepStatus = "applied" | "replayed" | "noop" | "skipped" | "held" | "failed" | "not_attempted";
 
 /** A created-or-reused child issue, auditable from the run and the parent. */
 export interface ChildIssueLink {
@@ -541,6 +541,12 @@ export interface ChildIssueLink {
 export interface AppliedChildIssues {
   created: ChildIssueLink[];
   reused: ChildIssueLink[];
+}
+
+export interface CommentPolicy {
+  mode: "publish" | "hold";
+  reason: string;
+  detail: string;
 }
 
 export interface ApplyStepResult {
@@ -685,6 +691,8 @@ export interface ApplyInput {
   recentComments: LiveComment[];
   force: boolean;
   commentCooldownHours: number;
+  /** Undefined means publish. A hold is persisted under the stable application key. */
+  commentPolicy?: CommentPolicy;
   now?: () => Date;
 }
 
@@ -729,6 +737,37 @@ export function commentBodyWithMarker(comment: string, applicationKey: string): 
   const marker = commentMarker(applicationKey);
   const room = MAX_GITHUB_COMMENT_CHARS - marker.length - 2;
   return `${comment.slice(0, room)}\n\n${marker}`;
+}
+
+/** Whether adding Dispatch's marker would force an approved comment to be truncated. */
+export function willExceedCommentCap(comment: string, applicationKey: string): boolean {
+  return comment.length + 2 + commentMarker(applicationKey).length > MAX_GITHUB_COMMENT_CHARS;
+}
+
+/** Post once, resolving ambiguous failures through the canonical application marker. */
+export async function postCommentIdempotently(
+  github: Pick<ApplierGitHub, "addComment" | "fetchRecentComments">,
+  input: { repoFullName: string; issueNumber: number; applicationKey: string; comment: string },
+): Promise<{ url: string | null }> {
+  const body = commentBodyWithMarker(input.comment, input.applicationKey);
+  try {
+    return await github.addComment(input.repoFullName, input.issueNumber, body);
+  } catch (first) {
+    let found: LiveComment | undefined;
+    try {
+      found = (await github.fetchRecentComments(input.repoFullName, input.issueNumber, 10)).find(
+        (comment) => groomerCommentKey(comment) === input.applicationKey,
+      );
+    } catch {
+      throw first;
+    }
+    if (found) return { url: found.url };
+    try {
+      return await github.addComment(input.repoFullName, input.issueNumber, body);
+    } catch {
+      throw first;
+    }
+  }
 }
 
 /**
@@ -868,6 +907,10 @@ export async function applyGroomingMutations(
     if (own) {
       commentDecision = { status: "replayed", detail: "already posted for this application", commentUrl: own.url };
       commentUrl = own.url;
+    } else if (prior.comment?.status === "held") {
+      commentDecision = prior.comment;
+    } else if (input.commentPolicy?.mode === "hold") {
+      commentDecision = { status: "held", detail: `pending_approval:${input.commentPolicy.reason}` };
     } else if (!input.force && input.commentCooldownHours > 0) {
       const since = new Date(now().getTime() - input.commentCooldownHours * 60 * 60 * 1000);
       const markedRecently = input.recentComments.some((c) => {
@@ -884,33 +927,12 @@ export async function applyGroomingMutations(
     await persist("in_progress");
   } else {
     await run("comment", diff.comment !== null, async () => {
-      const body = commentBodyWithMarker(diff.comment!, applicationKey);
-      let posted: { url: string | null };
-      try {
-        posted = await github.addComment(repoFullName, issueNumber, body);
-      } catch (first) {
-        // The write may have landed even though it reported failure (e.g. a
-        // 504 after GitHub accepted it). Look for the marker before retrying.
-        let found: LiveComment | undefined;
-        try {
-          found = (await github.fetchRecentComments(repoFullName, issueNumber, 10)).find(
-            (c) => groomerCommentKey(c) === applicationKey,
-          );
-        } catch {
-          // Cannot tell whether the first write landed: retrying could post
-          // it twice, so fail the step; a later attempt finds the marker.
-          throw first;
-        }
-        if (found) {
-          posted = { url: found.url };
-        } else {
-          try {
-            posted = await github.addComment(repoFullName, issueNumber, body);
-          } catch {
-            throw first;
-          }
-        }
-      }
+      const posted = await postCommentIdempotently(github, {
+        repoFullName,
+        issueNumber,
+        applicationKey,
+        comment: diff.comment!,
+      });
       commentUrl = posted.url ?? null;
       return { commentUrl };
     }, "no comment in the plan");
