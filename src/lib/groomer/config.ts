@@ -20,6 +20,10 @@ export interface HostedGroomerConfig {
   maxSearchResults: number;
   maxDirEntries: number;
   exploration: ExplorationBudget;
+  /** Optional for legacy harness configs; getHostedGroomerConfig always populates it. */
+  trustedLogins?: string[];
+  /** Optional for legacy harness configs; getHostedGroomerConfig always populates it. */
+  externalReplyPolicy?: "pending" | "off";
 }
 
 const parseBool = (value: string | undefined, defaultValue = false): boolean => {
@@ -43,8 +47,32 @@ function computeDefaultTimeoutMs(maxContextBytes: number): number {
   );
 }
 
+function parseTrustedLogins(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(/[\s,]+/)
+    .map((login) => login.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+let warnedExternalReplyPolicy: string | null = null;
+
+function parseExternalReplyPolicy(value: string | undefined): "pending" | "off" {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized || normalized === "pending") return "pending";
+  if (normalized === "off") return "off";
+  if (warnedExternalReplyPolicy !== normalized) {
+    warnedExternalReplyPolicy = normalized;
+    console.warn(
+      `[hosted-groomer] unrecognised DISPATCH_GROOMER_EXTERNAL_REPLIES="${normalized}"; expected pending or off. Using pending.`,
+    );
+  }
+  return "pending";
+}
+
 export function getHostedGroomerConfig(): HostedGroomerConfig {
   const enabled = parseBool(process.env.DISPATCH_HOSTED_GROOMER_ENABLED);
+  const trustedLogins = parseTrustedLogins(process.env.DISPATCH_GROOMER_TRUSTED_LOGINS);
+  const externalReplyPolicy = parseExternalReplyPolicy(process.env.DISPATCH_GROOMER_EXTERNAL_REPLIES);
 
   if (!enabled) {
     return {
@@ -67,6 +95,8 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
       maxFileBytes: 4096,
       commentCooldownHours: 24,
       groomerToken: null,
+      trustedLogins: [],
+      externalReplyPolicy: "pending",
     };
   }
 
@@ -107,6 +137,8 @@ export function getHostedGroomerConfig(): HostedGroomerConfig {
     maxSearchResults: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_SEARCH_RESULTS, 10),
     maxDirEntries: parseIntEnv(process.env.DISPATCH_GROOMER_MAX_DIR_ENTRIES, 60),
     exploration: resolveExplorationBudget(),
+    trustedLogins,
+    externalReplyPolicy,
   };
 
   // timeoutMs: env override wins; otherwise scale with maxContextBytes.

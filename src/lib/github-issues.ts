@@ -161,9 +161,60 @@ export async function updateIssueLabels(
 export interface GitHubIssueComment {
   id?: number;
   user?: { login?: string };
+  author_association?: string | null;
   body?: string | null;
   created_at?: string;
   html_url?: string;
+}
+
+export type CollaboratorPermission = "admin" | "maintain" | "write" | "triage" | "read" | "none";
+export type CollaboratorPermissionResult =
+  | { status: "ok"; permission: CollaboratorPermission }
+  | { status: "not_found" }
+  | { status: "error"; message: string };
+
+const COLLABORATOR_PERMISSIONS = new Set<CollaboratorPermission>([
+  "admin",
+  "maintain",
+  "write",
+  "triage",
+  "read",
+  "none",
+]);
+
+/** Best-effort permission lookup; callers must treat every failure as untrusted. */
+export async function fetchCollaboratorPermission(
+  repoFullName: string,
+  login: string,
+): Promise<CollaboratorPermissionResult> {
+  try {
+    const [owner, repo] = repoFullName.split("/");
+    const url = `${GITHUB_API}/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`;
+    const response = await fetchWithRetry(url, { headers: await getHeadersAsync() });
+    if (response.status === 404) return { status: "not_found" };
+    if (!response.ok) {
+      const text = await response.text();
+      return { status: "error", message: `GitHub API error: ${response.status} ${text}` };
+    }
+
+    const data: unknown = await response.json();
+    const permission =
+      data && typeof data === "object" && "permission" in data
+        ? (data as { permission?: unknown }).permission
+        : undefined;
+    if (
+      typeof permission === "string" &&
+      COLLABORATOR_PERMISSIONS.has(permission as CollaboratorPermission)
+    ) {
+      return { status: "ok", permission: permission as CollaboratorPermission };
+    }
+    return { status: "error", message: "GitHub API returned an invalid collaborator permission" };
+  } catch (error) {
+    return {
+      status: "error",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export async function fetchIssueComments(
