@@ -176,6 +176,7 @@ An `already_done` plan closes the issue, the highest-impact write the groomer ma
   - When the issue lists acceptance criteria (list items under an `Acceptance criteria` heading or label), every one of them must appear in `criteria`, compared ignoring case, backticks/emphasis, spacing and a trailing stop; with no enumerable criteria, at least one grounded criterion is required. When the issue names expected files, at least one grounded criterion must cite one of them.
 - evidence about other issues, and related work in general, corroborates but never satisfies the close:
   - a merged pull request into the default branch whose GitHub closing reference is this exact issue is recorded as corroboration only. Such a PR closes the issue when it merges, so an issue still open afterwards was usually reopened, which is evidence it is not done;
+  - GitHub reopen history (`state_reason: "reopened"`), an explicit authoritative human report that the issue still reproduces, or unavailable reopen history vetoes the close; a withheld close lands as backlog for human review, even when repository excerpts still match;
   - a changelog or release-notes file (`CHANGELOG`, `CHANGES`, `HISTORY`, `NEWS`, `RELEASE_NOTES`, `RELEASES`, any extension) cannot ground a criterion unless the issue lists it as an expected file;
   - an excerpt that mentions another issue or PR (`#N`, `owner/repo#N`, or a GitHub issue/PR URL) cannot ground a criterion.
 

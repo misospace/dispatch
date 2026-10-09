@@ -26,6 +26,12 @@ export interface CaseIssue {
   labels: string[];
   /** Dispatch's cached lane at selection time. */
   lane?: string | null;
+  /**
+   * GitHub's issue state reason for the fixture's live issue (#1113):
+   * "reopened" models a closed-then-reopened issue, null/omitted an ordinary
+   * open issue that was never reopened.
+   */
+  stateReason?: string | null;
 }
 
 /**

@@ -14,7 +14,7 @@ Recommendations are persisted in `GroomingRun.mutationPlan`, not surfaced in the
 
 No comment, label, duplicate marker, or other timeline event is sufficient human authority for automatic closure. Similar titles, bodies, labels, and citations do not establish duplicate identity. A superseded issue can qualify as `already_done` only when pinned repository evidence independently grounds that issue's own acceptance.
 
-A merged PR that references the issue is corroboration only, in part because an open issue may have been reopened after the merge. The remaining risk is a live regression while the cited code remains present: verbatim excerpts can still pass grounding even when behavior is broken. [#1113](https://github.com/misospace/dispatch/issues/1113) tracks that guardrail.
+A merged PR that references the issue is corroboration only, in part because an open issue may have been reopened after the merge. An issue GitHub reports as reopened (`state_reason: "reopened"`), an explicit authoritative human report that it still reproduces, or unavailable reopen history withholds the `already_done` close and leaves the issue in backlog for human review; matching repository excerpts cannot override this veto.
 
 ## Gate for any separately approved extension
 

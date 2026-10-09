@@ -145,7 +145,10 @@ Rules:
   expected files, at least one criterion must cite one of them.
   Related work only corroborates. Even a merged pull request whose closing
   references include this issue does not close it alone: an issue still open
-  after such a PR merged was usually reopened. CHANGELOG or release-note
+  after such a PR merged was usually reopened. An issue GitHub records as
+  reopened (state_reason "reopened"), or an authoritative comment that
+  explicitly reports it still reproduces or regressed, is never already_done —
+  leave it for human review. CHANGELOG or release-note
   entries, excerpts that mention other issues, and PRs for other issues never
   ground a close. Never argue that work "must" be done because something
   downstream shipped: if you cannot quote this issue's own acceptance from

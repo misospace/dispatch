@@ -27,7 +27,7 @@ import {
 } from "./freshness";
 import { evaluateReadiness, type ChildBrief, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
-import { evaluateCloseGrounding } from "./close-grounding";
+import { evaluateCloseGrounding, reopenRegressionReasons } from "./close-grounding";
 
 // ─── Preconditions ────────────────────────────────────────────────────────────
 
@@ -60,6 +60,8 @@ export interface LiveIssueState {
   body: string | null;
   labels: string[];
   state: string;
+  /** GitHub's issue state reason; null when absent (#1113). */
+  stateReason?: string | null;
 }
 
 export interface LiveComment {
@@ -148,6 +150,7 @@ function checkIssue(input: PreconditionInput, fresh: GroomingEvidenceSnapshot): 
     body: current.body ?? null,
     labels: sortedLabels(current.labels),
     state: current.state,
+    stateReason: current.stateReason ?? null,
   };
   if (captured.state === "unknown" || !input.evidence.issueFingerprint) {
     return {
@@ -171,6 +174,10 @@ function checkIssue(input: PreconditionInput, fresh: GroomingEvidenceSnapshot): 
     changed.push(`labels (${delta})`);
   }
   if (live.state !== captured.state) changed.push(`state (${captured.state} -> ${live.state})`);
+  const capturedStateReason = captured.stateReason ?? null;
+  if (live.stateReason !== capturedStateReason) {
+    changed.push(`state reason (${capturedStateReason ?? "none"} -> ${live.stateReason ?? "none"})`);
+  }
   if (changed.length > 0) {
     return {
       check: { name: "issue", status: "changed", detail: `issue changed since the evidence snapshot: ${changed.join(", ")}` },
@@ -440,7 +447,11 @@ function isPinnedRepositoryCitation(catalog: EvidenceCatalog, id: string): boole
  * - grounding for THIS issue (dispatch#1099): every acceptance criterion
  *   backed by a verbatim excerpt of a file read at the pinned head (with one
  *   of the issue's expected files among them, when it names any), or a cited
- *   merged PR whose closing reference is this issue.
+ *   merged PR whose closing reference is this issue;
+ * - no credible reopen/regression counter-evidence (dispatch#1113): an issue
+ *   GitHub reports as reopened, an explicit regression report in an
+ *   authoritative comment, or unavailable reopen history, all withhold the
+ *   close rather than let matching excerpts override them.
  * The apply preconditions separately guarantee that the head has not moved
  * under that evidence and the issue is still open.
  */
@@ -461,6 +472,7 @@ export function evaluateClosePolicy(plan: GroomingPlan, catalog: EvidenceCatalog
     if (u.material) reasons.push(`material uncertainty remains (verdict.uncertainties[${i}]): ${u.question}`);
   });
   reasons.push(...evaluateCloseGrounding({ evidenceRefs: close.evidenceRefs, criteria: close.criteria ?? [] }, catalog).errors);
+  reasons.push(...reopenRegressionReasons(catalog.grounding.counterEvidence));
   if (plan.evidence.evidenceDigest !== catalog.binding.evidenceDigest) {
     reasons.push("the plan is bound to a different evidence snapshot");
   }

@@ -258,6 +258,7 @@ const mockEvidence: GroomingEvidenceSnapshot = {
     body: "Login fails after password reset.",
     labels: ["priority/p0"],
     state: "open",
+    stateReason: null,
     author: "maintainer",
     authorAssociation: "OWNER",
     commentsCount: 0,

@@ -10,6 +10,8 @@ export interface GitHubIssue {
   created_at: string;
   updated_at: string;
   closed_at: string | null;
+  /** GitHub's issue state reason: null when open and never closed, "reopened" when it was reopened, or the close reason when closed (#1113). */
+  state_reason?: string | null;
   pull_request?: { url: string };
   user?: { login?: string } | null;
   author_association?: string | null;

@@ -30,6 +30,7 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
       body: "Login fails after password reset.",
       labels: ["priority/p1", "status/backlog"],
       state: "open",
+      stateReason: null,
       updatedAt: "2026-09-25T00:00:00.000Z",
       url: "https://github.com/org/repo/issues/42",
     },
@@ -216,6 +217,7 @@ describe("validateApplyPreconditions", () => {
       ["body", { body: "Edited body." }, /body/],
       ["labels", { labels: ["priority/p1", "status/in-progress", "agent/coder"] }, /labels \(\+agent\/coder \+status\/in-progress -status\/backlog\)/],
       ["state", { state: "closed" }, /state \(open -> closed\)/],
+      ["state reason", { stateReason: "reopened" }, /state reason \(none -> reopened\)/],
     ])("fails when the %s changed after the snapshot", async (_field, patch, detail) => {
       const result = await validateApplyPreconditions(
         input(),
@@ -523,6 +525,62 @@ describe("evaluateClosePolicy", () => {
     const plan = planFor(alreadyDoneDraft());
     const unpinned = catalogFor(snapshot({ headSha: null, pinnedRef: null }));
     expect(evaluateClosePolicy(plan, unpinned)).toContain("the close cites no repository content read at the pinned head SHA");
+  });
+
+  it("withholds a reopened issue despite grounded excerpts (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const reopened = catalogFor(snapshot({ issue: { ...snapshot().issue, stateReason: "reopened" } }));
+    expect(evaluateClosePolicy(plan, reopened)).toEqual([
+      "the issue was reopened after it was closed; an already_done close needs human review",
+    ]);
+  });
+
+  it("withholds an issue with an explicit regression report despite grounded excerpts (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const reported = catalogFor(
+      snapshot({
+        comments: [
+          {
+            id: "7001",
+            author: "maintainer",
+            createdAt: "2026-09-25T00:00:00Z",
+            body: "This regressed on main; the redirect still drops the return URL.",
+            provenance: "human_comment",
+            authoritative: true,
+          },
+        ],
+      }),
+    );
+    expect(evaluateClosePolicy(plan, reported)).toEqual([
+      "authoritative comments report the issue still reproduces (comment:7001 by maintainer); an already_done close needs human review",
+    ]);
+  });
+
+  it("fails closed when reopen history was not captured (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const unknown = catalogFor(snapshot({ issue: { ...snapshot().issue, stateReason: undefined } }));
+    expect(evaluateClosePolicy(plan, unknown)).toEqual([
+      "the issue's reopen history was not captured, so it cannot be established that this open issue was not reopened (fail closed)",
+    ]);
+  });
+
+  it("does not let an automation regression claim withhold a close (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const automated = catalogFor(
+      snapshot({
+        comments: [
+          {
+            id: "7002",
+            author: "itsmiso-ai",
+            createdAt: "2026-09-25T00:00:00Z",
+            body: "This regressed on main.",
+            provenance: "automation_comment",
+            authoritative: false,
+          },
+        ],
+      }),
+    );
+    expect(evaluateClosePolicy(plan, automated)).toEqual([]);
   });
 });
 

@@ -100,6 +100,7 @@ function liveIssue(c: GroomingCase): GitHubIssue {
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-20T00:00:00Z",
     closed_at: null,
+    state_reason: c.issue.stateReason ?? null,
   };
 }
 
