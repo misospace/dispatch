@@ -3,7 +3,6 @@ import {
   createIdleTask,
   createImplementTask,
   createFollowupPrTask,
-  createGroomTask,
 } from "./agent-task";
 
 describe("createIdleTask", () => {
@@ -219,87 +218,6 @@ describe("createFollowupPrTask", () => {
   });
 });
 
-describe("createGroomTask", () => {
-  const baseInput = {
-    agentName: "gamma",
-  };
-
-  it("has shouldRun true", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.shouldRun).toBe(true);
-  });
-
-  it("has type groom", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.type).toBe("groom");
-  });
-
-  it("includes agentName", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.agentName).toBe("gamma");
-  });
-
-  it("includes default groom-specific instructions", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.instructions).toContain("Enrich the issue");
-    expect(task.instructions).toContain("labels");
-    expect(task.instructions).toContain("lane");
-  });
-
-  it("includes default forbidden actions for grooming", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.forbiddenActions).toContain("Writing implementation code");
-    expect(task.forbiddenActions).toContain("Opening pull requests");
-    expect(task.forbiddenActions).not.toContain("Merging any pull request");
-  });
-
-  it("preserves optional issue when provided", () => {
-    const task = createGroomTask({
-      ...baseInput,
-      issue: {
-        repoFullName: "misospace/dispatch",
-        number: 100,
-        title: "Needs grooming",
-        url: "https://github.com/misospace/dispatch/issues/100",
-      },
-    });
-    expect(task.issue?.number).toBe(100);
-    expect(task.issue?.title).toBe("Needs grooming");
-  });
-
-  it("omits issue when not provided", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.issue).toBeUndefined();
-  });
-
-  it("preserves lane when provided", () => {
-    const task = createGroomTask({ ...baseInput, lane: "backlog" });
-    expect(task.lane).toBe("backlog");
-  });
-
-  it("omits lane when not provided", () => {
-    const task = createGroomTask(baseInput);
-    expect(task.lane).toBeUndefined();
-  });
-
-  it("preserves custom instructions", () => {
-    const task = createGroomTask({ ...baseInput, instructions: "Custom grooming" });
-    expect(task.instructions).toBe("Custom grooming");
-  });
-
-  it("preserves custom forbiddenActions", () => {
-    const custom = ["No code changes"];
-    const task = createGroomTask({ ...baseInput, forbiddenActions: custom });
-    expect(task.forbiddenActions).toEqual(custom);
-  });
-
-  it("does not require harness-specific fields", () => {
-    const task = createGroomTask(baseInput);
-    expect("harness" in task).toBe(false);
-    expect("workflowRepo" in task).toBe(false);
-  });
-});
-
 describe("AgentTask discriminated union", () => {
   it("idle task is distinguishable by type", () => {
     const task = createIdleTask("no work");
@@ -326,11 +244,6 @@ describe("AgentTask discriminated union", () => {
     expect(task.pullRequest.number).toBe(2);
   });
 
-  it("groom task is distinguishable by type", () => {
-    const task = createGroomTask({ agentName: "a" });
-    if (task.type !== "groom") throw new Error("should be groom");
-    expect(task.agentName).toBe("a");
-  });
 });
 
 describe("forbiddenActions mutation isolation", () => {
@@ -349,16 +262,6 @@ describe("forbiddenActions mutation isolation", () => {
     const pr = { repoFullName: "r", number: 1 };
     const taskA = createFollowupPrTask({ agentName: "a", pullRequest: pr, reasons: ["r"] });
     const taskB = createFollowupPrTask({ agentName: "b", pullRequest: pr, reasons: ["r"] });
-
-    taskA.forbiddenActions.push("Injected action");
-
-    expect(taskA.forbiddenActions).toContain("Injected action");
-    expect(taskB.forbiddenActions).not.toContain("Injected action");
-  });
-
-  it("mutating one groom task's forbiddenActions does not affect another", () => {
-    const taskA = createGroomTask({ agentName: "a" });
-    const taskB = createGroomTask({ agentName: "b" });
 
     taskA.forbiddenActions.push("Injected action");
 

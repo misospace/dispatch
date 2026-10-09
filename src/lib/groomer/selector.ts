@@ -64,10 +64,7 @@ export interface SelectGroomingCandidateOptions {
   issueNumber?: number;
   /**
    * Also offer fully classified issues with no freshness baseline, at the
-   * lowest priority, so they acquire one. Only the hosted groomer records a
-   * baseline; an external groomer (next-task?mode=groom) applies decisions
-   * through /api/issues/groom, which leaves freshness unknown, so offering it
-   * these would re-groom every ready issue once per cooldown forever.
+   * lowest priority, so they acquire one. Only the hosted groomer records a baseline; backfill is opt-in to its runner so fully classified issues do not repeatedly re-groom without improving freshness.
    */
   freshnessBackfill?: boolean;
   /**
