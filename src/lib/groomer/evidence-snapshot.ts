@@ -19,6 +19,7 @@ export interface EvidenceComment {
   author: string;
   createdAt: string;
   body: string;
+  authorAssociation?: string | null;
   provenance: "human_comment" | "automation_comment";
   authoritative: boolean; // human => true, automation => false
 }
@@ -81,6 +82,11 @@ export interface EvidenceSnapshotIssue {
   state: string;
   updatedAt: string;
   url: string;
+  /** Total comments reported by GitHub; an absent or malformed count makes the participant scan unverifiable and fails closed. */
+  commentsCount?: number | null;
+  /** Optional for legacy snapshots; new captures always include both fields. */
+  author?: string | null;
+  authorAssociation?: string | null;
 }
 
 export interface GroomingEvidenceSnapshot {
@@ -100,7 +106,13 @@ export interface GroomingEvidenceSnapshot {
 export interface EvidenceSnapshotInput {
   repoFullName: string;
   issueNumber: number;
-  comments: Array<{ id?: number | null; author: string; createdAt: string; body: string }>;
+  comments: Array<{
+    id?: number | null;
+    author: string;
+    createdAt: string;
+    body: string;
+    authorAssociation?: string | null;
+  }>;
 }
 
 export interface EvidenceSnapshotDeps {
@@ -278,7 +290,10 @@ export function summarizeEvidenceForPersistence(snapshot: GroomingEvidenceSnapsh
     evidenceDigest: snapshot.evidenceDigest,
     issueFingerprint: snapshot.issueFingerprint,
     issueUpdatedAt: snapshot.issue.updatedAt,
+    issueCommentsCount: snapshot.issue.commentsCount,
     issueState: snapshot.issue.state,
+    issueAuthor: snapshot.issue.author,
+    issueAuthorAssociation: snapshot.issue.authorAssociation,
     commentCount: comments.length,
     humanCommentCount: comments.filter((comment) => comment.provenance === "human_comment").length,
     automationCommentCount: comments.filter((comment) => comment.provenance === "automation_comment").length,
@@ -354,6 +369,9 @@ export async function collectGroomingEvidenceSnapshot(
       state: live.state,
       updatedAt: live.updated_at,
       url: live.html_url,
+      commentsCount: live.comments,
+      author: live.user?.login ?? null,
+      authorAssociation: live.author_association ?? null,
     };
   } catch (err) {
     warnings.push(`evidence: failed to fetch live issue state: ${errorMessage(err)}`);
@@ -365,6 +383,8 @@ export async function collectGroomingEvidenceSnapshot(
       state: "unknown",
       updatedAt: "",
       url: "",
+      author: null,
+      authorAssociation: null,
     };
   }
 
@@ -375,6 +395,7 @@ export async function collectGroomingEvidenceSnapshot(
       author: comment.author,
       createdAt: comment.createdAt,
       body: comment.body,
+      authorAssociation: comment.authorAssociation ?? null,
       provenance: automation ? "automation_comment" : "human_comment",
       authoritative: !automation,
     };

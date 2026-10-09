@@ -20,6 +20,7 @@ describe("github domain modules expose expected exports", () => {
       "addIssueLabel",
       "closeIssue",
       "createIssue",
+      "fetchCollaboratorPermission",
       "fetchIssue",
       "fetchIssueComments",
       "fetchIssueNativeBlockers",

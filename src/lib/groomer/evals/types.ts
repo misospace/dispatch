@@ -36,6 +36,7 @@ export interface CaseIssue {
 export interface CaseComment {
   id: number;
   author: string;
+  authorAssociation?: string | null;
   body: string;
   createdAt: string;
 }

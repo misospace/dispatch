@@ -41,8 +41,9 @@ model Issue {
   agentWork     AgentWork[]
   leases        Lease[]
   groomingRuns  GroomingRun[]
-  groomingApplications GroomingApplication[]
-  groomingChildClaims  GroomingChildClaim[]
+  groomingApplications  GroomingApplication[]
+  groomingChildClaims   GroomingChildClaim[]
+  groomerPendingReplies GroomerPendingReply[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -631,6 +632,31 @@ model GroomingChildClaim {
   parentIssue Issue @relation(fields: [parentIssueId], references: [id], onDelete: Cascade)
 
   @@index([parentIssueId])
+}
+
+model GroomerPendingReply {
+  id             String   @id @default(cuid())
+  applicationKey String   @unique
+  repoFullName   String
+  issueNumber    Int
+  issueId        String
+  issue          Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  groomingRunId  String?
+  commentBody    String   @db.Text
+  reason         String
+  trustContext   Json
+  status         String   @default("pending")
+  approvedBy     String?
+  approvedAt     DateTime?
+  postedUrl      String?
+  resolvedBy     String?
+  resolvedAt     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([issueId])
+  @@index([status])
+  @@index([repoFullName, issueNumber])
 }
 
 // ---------------------------------------------------------------------------

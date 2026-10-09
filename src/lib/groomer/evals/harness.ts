@@ -88,6 +88,8 @@ function relatedObservations(c: GroomingCase): RelatedWorkObservation[] {
 function liveIssue(c: GroomingCase): GitHubIssue {
   return {
     number: c.issue.number,
+    user: { login: "maintainer" },
+    author_association: "OWNER",
     title: c.issue.title,
     body: c.issue.body,
     state: "open",
@@ -278,6 +280,7 @@ export async function runCandidate(
     findActiveLeases: async () => [],
     upsertLease: async () => ({ created: true, lease: { id: "lease-1" } }),
     releaseLease: async () => ({ id: "lease-1" }),
+    fetchCollaboratorPermission: async () => ({ status: "ok", permission: "write" }),
     prisma: prisma as unknown as GroomerDeps["prisma"],
     buildRepositoryContext: async () => ({ text: "", sources: [], warnings: [], bytes: 0, queries: [], emptyQueries: [] }),
     exploreRepository: async () => exploration,

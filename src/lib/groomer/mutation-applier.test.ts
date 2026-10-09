@@ -572,6 +572,35 @@ describe("applyGroomingMutations", () => {
     expect(store.rows.get(KEY)).toMatchObject({ status: "applied" });
   });
 
+  it("holds autonomous comments while still applying the other mutation steps", async () => {
+    const { github, calls } = fakeGitHub();
+    const result = await applyGroomingMutations(
+      applyInput(fullDiff(), { commentPolicy: { mode: "hold", reason: "externally_engaged", detail: "external commenter" } }),
+      github,
+      memoryStore(),
+    );
+
+    expect(result.steps.comment).toMatchObject({ status: "held", detail: "pending_approval:externally_engaged" });
+    expect(github.addComment).not.toHaveBeenCalled();
+    expect(calls).toEqual(["labels:status/backlog", "content:title+body", "close", "labels:status/done"]);
+  });
+
+  it("keeps a held comment held on same-key retries even if policy changes to publish", async () => {
+    const store = memoryStore();
+    const held = fakeGitHub();
+    const first = await applyGroomingMutations(
+      applyInput(fullDiff(), { commentPolicy: { mode: "hold", reason: "externally_engaged", detail: "external commenter" } }),
+      held.github,
+      store,
+    );
+    const retry = fakeGitHub();
+    const replay = await applyGroomingMutations(applyInput(fullDiff(), { commentPolicy: { mode: "publish", reason: "", detail: "" } }), retry.github, store);
+
+    expect(first.steps.comment?.status).toBe("held");
+    expect(replay.steps.comment).toMatchObject({ status: "held", detail: "pending_approval:externally_engaged" });
+    expect(retry.github.addComment).not.toHaveBeenCalled();
+  });
+
   it("finds its own comment on GitHub by marker instead of posting it twice", async () => {
     const own: LiveComment = { id: 7, author: "itsmiso-ai", createdAt: "2026-09-26T00:00:00Z", body: `x\n\n${commentMarker(KEY)}`, url: "u7" };
     const { github } = fakeGitHub();

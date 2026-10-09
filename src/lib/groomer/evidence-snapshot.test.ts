@@ -32,13 +32,15 @@ const fakeIssue: GitHubIssue = {
   created_at: "2026-09-01T00:00:00Z",
   updated_at: "2026-09-15T12:00:00Z",
   closed_at: null,
+  user: { login: "maintainer" },
+  author_association: "OWNER",
 };
 
 const input: EvidenceSnapshotInput = {
   repoFullName: REPO,
   issueNumber: 42,
   comments: [
-    { id: 1, author: "alice", createdAt: "2026-09-10T00:00:00Z", body: "Please fix this" },
+    { id: 1, author: "alice", createdAt: "2026-09-10T00:00:00Z", body: "Please fix this", authorAssociation: "NONE" },
     { id: 2, author: "github-actions[bot]", createdAt: "2026-09-11T00:00:00Z", body: "CI is green" },
     { id: 3, author: "itsmiso-ai", createdAt: "2026-09-12T00:00:00Z", body: "On it" },
     { author: "bob", createdAt: "2026-09-13T00:00:00Z", body: "Bumping" },
@@ -124,11 +126,22 @@ describe("computeEvidenceDigest", () => {
         author: "alice",
         createdAt: "2026-09-10T00:00:00Z",
         body: "hello",
+        authorAssociation: "NONE",
         provenance: "human_comment" as const,
         authoritative: true,
       },
     ],
   };
+
+  it("does not change when author associations are provided (trust data is not digest input)", () => {
+    const before = computeEvidenceDigest({ ...base, headSha: HEAD_SHA });
+    const after = computeEvidenceDigest({
+      ...base,
+      headSha: HEAD_SHA,
+      comments: base.comments.map((comment) => ({ ...comment, authorAssociation: "OWNER" })),
+    });
+    expect(after).toBe(before);
+  });
 
   it("changes when the pinned head SHA changes (branch moved)", () => {
     const before = computeEvidenceDigest({ ...base, headSha: "b".repeat(40) });
@@ -167,6 +180,9 @@ describe("collectGroomingEvidenceSnapshot", () => {
       state: "open",
       updatedAt: "2026-09-15T12:00:00Z",
       url: `https://github.com/${REPO}/issues/42`,
+      author: "maintainer",
+      authorAssociation: "OWNER",
+      commentsCount: 2,
     });
     expect(snapshot.issueFingerprint).toBe(computeIssueFingerprint(snapshot.issue));
     expect(snapshot.evidenceDigest).toBe(
@@ -183,7 +199,7 @@ describe("collectGroomingEvidenceSnapshot", () => {
     const snapshot = await collectGroomingEvidenceSnapshot(input, happyDeps());
     const byId = new Map(snapshot.comments.map((comment) => [comment.id, comment]));
 
-    expect(byId.get("1")).toMatchObject({ author: "alice", provenance: "human_comment", authoritative: true });
+    expect(byId.get("1")).toMatchObject({ author: "alice", authorAssociation: "NONE", provenance: "human_comment", authoritative: true });
     expect(byId.get("2")).toMatchObject({
       author: "github-actions[bot]",
       provenance: "automation_comment",
@@ -197,6 +213,7 @@ describe("collectGroomingEvidenceSnapshot", () => {
     // Comment without an id gets a synthetic positional id.
     expect(byId.get("synthetic-3")).toMatchObject({
       author: "bob",
+      authorAssociation: null,
       provenance: "human_comment",
       authoritative: true,
     });
@@ -241,6 +258,8 @@ describe("collectGroomingEvidenceSnapshot", () => {
       state: "unknown",
       updatedAt: "",
       url: "",
+      author: null,
+      authorAssociation: null,
     });
     // Comments are still mapped from the provided input.
     expect(snapshot.comments).toHaveLength(4);
@@ -344,6 +363,9 @@ describe("summarizeEvidenceForPersistence", () => {
       "evidenceDigest",
       "headSha",
       "humanCommentCount",
+      "issueAuthor",
+      "issueAuthorAssociation",
+      "issueCommentsCount",
       "issueFingerprint",
       "issueState",
       "issueUpdatedAt",

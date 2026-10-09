@@ -19,11 +19,15 @@ describe("groomer config", () => {
     delete process.env.DISPATCH_GROOMER_MAX_FILE_BYTES;
     delete process.env.DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS;
     delete process.env.DISPATCH_GROOMER_TOKEN;
+    delete process.env.DISPATCH_GROOMER_TRUSTED_LOGINS;
+    delete process.env.DISPATCH_GROOMER_EXTERNAL_REPLIES;
   });
 
-  it("is disabled by default", () => {
+  it("is disabled by default and includes safe external-reply defaults", () => {
     const config = getHostedGroomerConfig();
     expect(config.enabled).toBe(false);
+    expect(config.trustedLogins).toEqual([]);
+    expect(config.externalReplyPolicy).toBe("pending");
   });
 
   it("is dry-run by default when enabled", () => {
@@ -233,6 +237,20 @@ describe("groomer config", () => {
   it("is disabled when baseUrl or apiKey is missing (no throw)", () => {
     const config = getHostedGroomerConfig();
     expect(config.enabled).toBe(false);
+  });
+
+  it("parses the trust allowlist and external-reply policy", () => {
+    process.env.DISPATCH_HOSTED_GROOMER_ENABLED = "true";
+    process.env.DISPATCH_LLM_BASE_URL = "https://llm.example.com";
+    process.env.DISPATCH_LLM_API_KEY = "test-key";
+    process.env.DISPATCH_GROOMER_MODEL = "gpt-4o-mini";
+    process.env.DISPATCH_GROOMER_TRUSTED_LOGINS = " Alice,BOB\n Carol ";
+    process.env.DISPATCH_GROOMER_EXTERNAL_REPLIES = "off";
+
+    const config = getHostedGroomerConfig();
+
+    expect(config.trustedLogins).toEqual(["alice", "bob", "carol"]);
+    expect(config.externalReplyPolicy).toBe("off");
   });
 
   it("defaults repository context and cooldown settings safely", () => {

@@ -8,8 +8,18 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { ExternalLink, Play, RefreshCw, Loader2, AlertCircle, CheckCircle2, Hash, GitBranch } from "lucide-react";
+import { ExternalLink, Play, RefreshCw, Loader2, AlertCircle, CheckCircle2, Hash, GitBranch, MessageSquareWarning } from "lucide-react";
 import { summarizeGroomingOutput } from "@/lib/groomer/plan-summary";
+
+interface PendingReplyRow {
+  id: string;
+  repoFullName: string;
+  issueNumber: number;
+  commentBody: string;
+  reason: string;
+  trustContext: { participants?: Array<{ login: string; role: string; reason: string; trusted: boolean }> };
+  createdAt: string;
+}
 
 interface GroomingRunRow {
   id: string;
@@ -142,6 +152,10 @@ export default function GroomerHistoryPage() {
   const [runs, setRuns] = useState<GroomingRunRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [pendingReplies, setPendingReplies] = useState<PendingReplyRow[]>([]);
+  const [repliesLoading, setRepliesLoading] = useState(true);
+  const [replyError, setReplyError] = useState("");
+  const [replyActionId, setReplyActionId] = useState<string | null>(null);
 
   // Groom trigger state
   const [grooming, setGrooming] = useState(false);
@@ -168,9 +182,45 @@ export default function GroomerHistoryPage() {
     }
   }
 
+  async function loadPendingReplies() {
+    setRepliesLoading(true);
+    setReplyError("");
+    try {
+      const res = await authedFetch("/api/groomer/pending-replies");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to load pending replies");
+      setPendingReplies(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setReplyError(err instanceof Error ? err.message : "Failed to load pending replies");
+      setPendingReplies([]);
+    } finally {
+      setRepliesLoading(false);
+    }
+  }
+
   useEffect(() => {
     void loadRuns();
+    void loadPendingReplies();
   }, []);
+
+  async function handleReplyAction(reply: PendingReplyRow, action: "approve" | "dismiss") {
+    setReplyActionId(`${reply.id}:${action}`);
+    setReplyError("");
+    try {
+      const res = await authedFetch(`/api/groomer/pending-replies/${reply.id}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || `Failed to ${action} reply`);
+      await loadPendingReplies();
+    } catch (err) {
+      setReplyError(err instanceof Error ? err.message : `Failed to ${action} reply`);
+    } finally {
+      setReplyActionId(null);
+    }
+  }
 
   async function handleGroomNext() {
     setGrooming(true);
@@ -212,7 +262,7 @@ export default function GroomerHistoryPage() {
     } finally {
       setGrooming(false);
       // Refresh the history table after a short delay so the new run appears
-      setTimeout(() => void loadRuns(), 500);
+      setTimeout(() => { void loadRuns(); void loadPendingReplies(); }, 500);
     }
   }
 
@@ -255,7 +305,7 @@ export default function GroomerHistoryPage() {
       setGroomError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setGrooming(false);
-      setTimeout(() => void loadRuns(), 500);
+      setTimeout(() => { void loadRuns(); void loadPendingReplies(); }, 500);
     }
   }
 
@@ -268,8 +318,8 @@ export default function GroomerHistoryPage() {
             Visible history for Dispatch-hosted issue grooming runs.
           </p>
         </div>
-        <Button variant="outline" onClick={loadRuns} disabled={grooming}>
-          <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
+        <Button variant="outline" onClick={() => { void loadRuns(); void loadPendingReplies(); }} disabled={grooming}>
+          <RefreshCw className={`h-4 w-4 mr-2 ${loading || repliesLoading ? "animate-spin" : ""}`} />
           Refresh
         </Button>
       </div>
@@ -385,6 +435,68 @@ export default function GroomerHistoryPage() {
       </Card>
 
       {/* History Table */}
+      <Card className={pendingReplies.length > 0 ? "border-amber-500/50" : ""}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <MessageSquareWarning className="h-5 w-5 text-amber-600" />
+            Replies awaiting approval
+            {pendingReplies.length > 0 && <Badge className="bg-amber-100 text-amber-800">{pendingReplies.length}</Badge>}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {repliesLoading ? (
+            <div className="py-8 text-center text-muted-foreground">Loading pending replies...</div>
+          ) : replyError ? (
+            <div className="text-destructive text-sm">{replyError}</div>
+          ) : pendingReplies.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-muted-foreground">No replies awaiting approval.</p>
+              <p className="text-sm text-muted-foreground mt-1">Held replies appear here for operator review before they are posted.</p>
+            </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Repo / Issue</TableHead>
+                  <TableHead>Proposed reply</TableHead>
+                  <TableHead>Reason / Participants</TableHead>
+                  <TableHead>Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pendingReplies.map((reply) => {
+                  const participants = reply.trustContext?.participants ?? [];
+                  return (
+                    <TableRow key={reply.id}>
+                      <TableCell className="font-medium">{reply.repoFullName}#{reply.issueNumber}</TableCell>
+                      <TableCell className="max-w-sm">
+                        <p className="line-clamp-3 whitespace-pre-wrap text-sm" title={reply.commentBody}>{reply.commentBody}</p>
+                      </TableCell>
+                      <TableCell className="max-w-xs text-sm">
+                        <div>{reply.reason.replace(/_/g, " ")}</div>
+                        <div className="mt-1 text-xs text-muted-foreground line-clamp-2">
+                          {participants.map((participant) => `${participant.login || "unknown"} (${participant.role}${participant.trusted ? ", trusted" : ", untrusted"})`).join(", ") || "Trust context unavailable"}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex gap-2">
+                          <Button size="sm" onClick={() => void handleReplyAction(reply, "approve")} disabled={replyActionId !== null}>
+                            {replyActionId === `${reply.id}:approve` ? "Approving..." : "Approve"}
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => void handleReplyAction(reply, "dismiss")} disabled={replyActionId !== null}>
+                            {replyActionId === `${reply.id}:dismiss` ? "Dismissing..." : "Dismiss"}
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
       <Card>
         <CardHeader>
           <CardTitle>Recent Grooming Runs</CardTitle>

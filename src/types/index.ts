@@ -11,6 +11,8 @@ export interface GitHubIssue {
   updated_at: string;
   closed_at: string | null;
   pull_request?: { url: string };
+  user?: { login?: string } | null;
+  author_association?: string | null;
   /** Native GitHub blocked_by links as canonical `owner/repo#N` keys (repo lowercased). Populated by sync ingestion (#1086). */
   nativeBlockedBy?: string[];
   /** GitHub's per-issue dependency counts from the list payload; `blocked_by > 0` means native blockers exist and must be fetched per-issue (#1086). */

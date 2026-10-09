@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
+import { fetchCollaboratorPermission } from "@/lib/github-issues";
 import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
@@ -11,6 +12,8 @@ import { inFlightStatus, validateGroomingPlan, type GroomingPlan } from "./plan"
 import { buildEvidenceCatalog } from "./plan-evidence";
 import { collectPinnedReadContent } from "./close-grounding";
 import { getHostedGroomerConfig } from "./config";
+import { assessExternalEngagement } from "./trust";
+import { holdPendingReply } from "./pending-reply";
 import { buildRepositoryContext } from "./repository-context";
 import { exploreRepository } from "./explore";
 import {
@@ -59,6 +62,7 @@ export interface RunHostedGroomerOptions {
 }
 
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
+const PARTICIPANT_SCAN_LIMIT = 100;
 
 /**
  * The tail of the run's lease-based deadline, reserved for the apply stage
@@ -115,6 +119,7 @@ export interface GroomerDeps {
   upsertLease: typeof upsertLease;
   releaseLease: typeof releaseLease;
   prisma: typeof prisma;
+  fetchCollaboratorPermission?: typeof fetchCollaboratorPermission;
   buildRepositoryContext: typeof buildRepositoryContext;
   exploreRepository: typeof exploreRepository;
   collectEvidence: typeof collectGroomingEvidenceSnapshot;
@@ -148,6 +153,7 @@ const defaultDeps: GroomerDeps = {
   upsertLease,
   releaseLease,
   prisma,
+  fetchCollaboratorPermission,
   buildRepositoryContext,
   exploreRepository,
   collectEvidence: collectGroomingEvidenceSnapshot,
@@ -258,6 +264,14 @@ async function executeGroomerRun(
       comments = [];
     }
 
+    let participants: Awaited<ReturnType<typeof fetchIssueComments>> = [];
+    let participantScanFailed = false;
+    try {
+      participants = await deps.fetchComments(candidate.repoFullName, candidate.number, PARTICIPANT_SCAN_LIMIT, "desc");
+    } catch {
+      participantScanFailed = true;
+    }
+
     // Capture the evidence snapshot BEFORE model analysis: the pinned
     // default-branch head SHA plus the live issue/comment state that every
     // repository read in this run is pinned to. Never fatal — the collector
@@ -292,6 +306,7 @@ async function executeGroomerRun(
           state: "unknown",
           updatedAt: "",
           url: "",
+          commentsCount: null,
         },
         issueFingerprint: "",
         comments: [],
@@ -366,6 +381,54 @@ async function executeGroomerRun(
       };
     }
 
+    const engagementWarnings: string[] = [];
+    let engagement: Awaited<ReturnType<typeof assessExternalEngagement>>;
+    let engagementReason = "externally_engaged";
+    if (participantScanFailed) {
+      engagement = { engaged: true, participants: [] };
+      engagementReason = "participant_scan_incomplete";
+      engagementWarnings.push("trust: participant scan failed; external replies require operator approval");
+    } else {
+      try {
+        engagement = await assessExternalEngagement(
+          {
+            repoFullName: candidate.repoFullName,
+            author: {
+              login: evidence.issue.author ?? null,
+              authorAssociation: evidence.issue.authorAssociation,
+            },
+            comments: participants,
+          },
+          { lookup: (login) => (deps.fetchCollaboratorPermission ?? fetchCollaboratorPermission)(candidate.repoFullName, login) },
+          { trustedLogins: config.trustedLogins ?? [] },
+        );
+      } catch (error) {
+        engagement = { engaged: true, participants: [] };
+        const warning = "trust: participant assessment failed; external replies require operator approval";
+        engagementWarnings.push(warning);
+        console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: ${warning}`, error);
+      }
+      const reported = evidence.issue.commentsCount;
+      const countVerifiable = typeof reported === "number" && Number.isInteger(reported) && reported >= 0;
+      if (!countVerifiable) {
+        engagement = { ...engagement, engaged: true };
+        engagementReason = "participant_scan_incomplete";
+        engagementWarnings.push("trust: participant count unverifiable; external replies require operator approval");
+      } else if (participants.length < reported) {
+        engagement = { ...engagement, engaged: true };
+        engagementReason = "participant_scan_incomplete";
+        engagementWarnings.push(
+          `trust: participant scan incomplete (${participants.length}/${reported}); external replies require operator approval`,
+        );
+      }
+    }
+    const policy = config.externalReplyPolicy ?? "pending";
+    const held = engagement.engaged && policy === "pending";
+    const suppressed = engagement.engaged && policy === "off";
+    const untrustedAuthors = new Set(
+      engagement.participants.filter((participant) => !participant.trusted).map((participant) => participant.login.toLowerCase()),
+    );
+
     // The issue the model analyzes is the one the snapshot pinned (#1063):
     // the apply-time preconditions compare live state against the snapshot,
     // so the prompt must be built from the same state, not Dispatch's cache.
@@ -396,7 +459,7 @@ async function executeGroomerRun(
     // Persist stage context_built with warnings and summary. Repository
     // evidence sources are folded into the snapshot before it is persisted so
     // the summary's sources reflect what this run actually read.
-    const contextWarnings = repositoryContext.warnings;
+    const contextWarnings = [...engagementWarnings, ...repositoryContext.warnings];
     evidence = addEvidenceSources(evidence, repositoryContext.sources);
     await updateGroomingRunRecord(deps.prisma, groomingRun.id, {
       stage: "context_built",
@@ -416,11 +479,13 @@ async function executeGroomerRun(
       number: candidate.number,
       title: analyzed.title,
       body: analyzed.body,
+      bodyAuthor: evidence.issue.author,
       labels: analyzed.labels,
       currentLane: candidate.currentLane,
       comments,
       maxContextBytes: config.maxContextBytes,
       repositoryContext,
+      untrustedAuthors,
     });
 
     // Let the groomer drive its own look at the repository. This is where it
@@ -604,6 +669,9 @@ async function executeGroomerRun(
       summary: output.summary ?? null,
       notReadyReason: notReadyReason ?? null,
       willComment: diff.comment !== null,
+      commentHeld: held,
+      commentHoldReason: engagement.engaged ? engagementReason : undefined,
+      externalParticipants: engagement.participants,
       willCloseIssue: diff.close,
       willCreateChildren: diff.children !== null,
       titleRewritten: diff.title !== null,
@@ -864,11 +932,82 @@ async function executeGroomerRun(
         recentComments: preconditions.recentComments,
         force: options.force === true,
         commentCooldownHours: config.commentCooldownHours,
+        commentPolicy: (held || suppressed)
+          ? {
+              mode: "hold",
+              reason: engagementReason,
+              detail: engagement.participants
+                .filter((participant) => !participant.trusted)
+                .map((participant) => `untrusted: ${participant.login || "unknown"} (${participant.reason})`)
+                .join("; ") || "trust assessment failed; no participants available",
+            }
+          : undefined,
       },
       github,
       store,
     );
     const appliedMutations = describeApplication(applied, diff.withheld);
+
+    if (applied.steps.comment?.status === "held") {
+      if (held) {
+        try {
+          await holdPendingReply(deps.prisma, {
+            applicationKey,
+            repoFullName: candidate.repoFullName,
+            issueNumber: candidate.number,
+            issueId: candidate.id,
+            groomingRunId: groomingRun.id,
+            commentBody: diff.comment ?? "",
+            reason: engagementReason,
+            trustContext: { participants: engagement.participants },
+          });
+        } catch (error) {
+          const warning = "reply_gate: failed to persist pending reply";
+          contextWarnings.push(warning);
+          console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: ${warning}`, error);
+          try {
+            await deps.prisma.auditLog.create({
+              data: {
+                actor: "hosted-groomer",
+                action: "groomer_reply_hold_write_failed",
+                repoFullName: candidate.repoFullName,
+                issueNumber: candidate.number,
+                issueId: candidate.id,
+                beforeLabels: analyzed.labels,
+                afterLabels: applied.labels,
+                success: false,
+                errorMessage: error instanceof Error ? error.message : String(error),
+                notes: JSON.stringify({ applicationKey, reason: engagementReason, participants: engagement.participants }),
+              },
+            });
+          } catch (auditError) {
+            console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: failed to audit pending reply hold write failure`, auditError);
+          }
+        }
+      }
+      if (held || suppressed) {
+        const action = held ? "groomer_reply_held" : "groomer_reply_suppressed";
+        try {
+          await deps.prisma.auditLog.create({
+            data: {
+              actor: "hosted-groomer",
+              action,
+              repoFullName: candidate.repoFullName,
+              issueNumber: candidate.number,
+              issueId: candidate.id,
+              beforeLabels: analyzed.labels,
+              afterLabels: applied.labels,
+              success: true,
+              notes: JSON.stringify({ applicationKey, reason: engagementReason, participants: engagement.participants }),
+            },
+          });
+        } catch (error) {
+          const warning = `reply_gate: failed to write ${action} audit entry`;
+          contextWarnings.push(warning);
+          console.warn(`[groomer] ${candidate.repoFullName}#${candidate.number}: ${warning}`, error);
+        }
+      }
+    }
 
     if (applied.outcome === "failed") {
       // The first needed write failed and nothing landed: fail the run
@@ -1165,6 +1304,10 @@ function describeApplication(applied: ApplyResult, withheld: Record<string, stri
   const comment = steps.comment;
   if (comment && comment.status !== "noop") {
     if (applied.commentUrl) out.commentUrl = applied.commentUrl;
+    if (comment.status === "held") {
+      out.commentHeld = true;
+      out.commentHeldReason = comment.detail?.replace(/^pending_approval:/, "") ?? "pending_approval";
+    }
     if (comment.status === "skipped") out.commentSkippedReason = comment.detail ?? "skipped";
     if (comment.status === "failed" || comment.status === "not_attempted") out.commentPosted = false;
     if (comment.status === "failed") out.commentError = comment.error;

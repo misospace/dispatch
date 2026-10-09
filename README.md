@@ -124,6 +124,8 @@ Dispatch can optionally run issue grooming itself by calling an OpenAI-compatibl
 | `DISPATCH_GROOMER_MAX_SEARCHES` | No | Maximum GitHub code searches per grooming run. Defaults to `3`. |
 | `DISPATCH_GROOMER_MAX_FILE_BYTES` | No | Maximum bytes per fetched file snippet. Defaults to `4096`. |
 | `DISPATCH_GROOMER_COMMENT_COOLDOWN_HOURS` | No | Suppresses repeated hosted-groomer comments on the same issue. Defaults to `24`. |
+| `DISPATCH_GROOMER_TRUSTED_LOGINS` | No | Comma- or newline-separated GitHub logins trusted by the hosted groomer's external-participant reply gate. |
+| `DISPATCH_GROOMER_EXTERNAL_REPLIES` | No | `pending` (default) queues externally-engaged replies for operator approval; `off` suppresses them without queueing. |
 | `DISPATCH_GROOMER_TOKEN` | No | Optional bearer token for scheduled/admin groomer invocations. |
 | `DISPATCH_GROOMER_INTERVAL_MS` | No | Interval for the scheduler's `groomer` job (default 600000). Dispatch runs at most one issue per run. |
 
