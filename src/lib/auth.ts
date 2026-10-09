@@ -31,6 +31,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "./api-errors";
 import { getAuthMode, resetAuthModeCache } from "./auth-mode";
 import {
+  getBearerTokenIdentity,
   getBearerTokenTier,
   isAuthorizedBearerToken as _isAuthed,
   resetCaches as _resetEnvCaches,
@@ -228,7 +229,7 @@ export function requiredTierForRoute(pathname: string, method: string): TokenTie
 
 export type AuthorizedRequest =
   | { authorized: true; type: "basic"; username: string; actor: string; tier: "maintainer" }
-  | { authorized: true; type: "bearer"; actor: string; tier: TokenTier }
+  | { authorized: true; type: "bearer"; actor: string; tier: TokenTier; agentName?: string }
   | { authorized: true; type: "oidc"; actor: string; tier: "maintainer" }
   | { authorized: true; type: "disabled"; actor: string; tier: "maintainer" }
   | { authorized: false }
@@ -236,10 +237,14 @@ export type AuthorizedRequest =
 
 /**
  * Check header-based auth (Bearer / Basic) and return the parsed auth info.
+ *
+ * A bound worker credential carries its immutable `agentName` (from the token,
+ * never from a self-reported header or body). Maintainer and legacy-unbound
+ * worker tokens carry no `agentName`.
  */
 export function authenticateRequest(request: Request):
   | { authorized: true; type: "basic"; username: string }
-  | { authorized: true; type: "bearer"; tier: TokenTier }
+  | { authorized: true; type: "bearer"; tier: TokenTier; agentName?: string }
   | { authorized: false } {
   const authMode = getAuthMode();
 
@@ -251,8 +256,18 @@ export function authenticateRequest(request: Request):
   const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
 
   if (parsed?.type === "bearer") {
-    const tier = getBearerTokenTier(parsed.token);
-    if (tier) return { authorized: true, type: "bearer", tier };
+    const identity = getBearerTokenIdentity(parsed.token);
+    if (identity) {
+      if (identity.tier === "maintainer") {
+        return { authorized: true, type: "bearer", tier: "maintainer" };
+      }
+      return {
+        authorized: true,
+        type: "bearer",
+        tier: "worker",
+        ...(identity.agentName ? { agentName: identity.agentName } : {}),
+      };
+    }
   }
 
   // OIDC mode — route handlers must call authorizeRequest for session cookies
@@ -357,7 +372,14 @@ export async function authorizeRequest(request: Request): Promise<AuthorizedRequ
       }
     }
 
-    return { ...headerAuth, actor: resolveBearerActor(request) };
+    // A bound worker credential's actor is its immutable token-derived agent
+    // name; maintainer and legacy-unbound tokens keep the self-reported
+    // x-agent-name fallback.
+    const actor =
+      headerAuth.type === "bearer" && headerAuth.agentName
+        ? headerAuth.agentName
+        : resolveBearerActor(request);
+    return { ...headerAuth, actor };
   }
 
   if (authMode === "oidc") {
@@ -385,7 +407,18 @@ export function getAuthorizedActor(
   if (auth.type === "basic" || auth.type === "oidc" || auth.type === "disabled") {
     return auth.actor;
   }
+  // A bound worker token's identity is immutable: never let a self-reported
+  // header or body fallback override it.
+  if (auth.agentName) return auth.agentName;
   return (typeof fallback === "string" && fallback.trim()) || resolveBearerActor(request);
+}
+
+/**
+ * The agent a worker-tier bearer token is bound to, if any. Returns undefined
+ * for maintainer, OIDC, basic, disabled, and legacy-unbound worker callers.
+ */
+export function getBoundWorkerAgent(auth: AuthorizedRequest): string | undefined {
+  return auth.authorized && auth.type === "bearer" ? auth.agentName : undefined;
 }
 
 /**

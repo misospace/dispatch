@@ -3,14 +3,19 @@
  *
  * Supported env vars: DISPATCH_URL, DISPATCH_AGENT_TOKEN,
  *                     DISPATCH_MAINTAINER_TOKEN, DISPATCH_WORKER_TOKEN,
- *                     DISPATCH_AGENT_NAME, DISPATCH_AUTH_MODE,
- *                     DISPATCH_AUTH_USERNAME, DISPATCH_AUTH_PASSWORD
+ *                     DISPATCH_WORKER_TOKENS, DISPATCH_AGENT_NAME,
+ *                     DISPATCH_AUTH_MODE, DISPATCH_AUTH_USERNAME,
+ *                     DISPATCH_AUTH_PASSWORD
  *
  * Bearer tokens carry a tier:
  *   - "maintainer" : DISPATCH_AGENT_TOKEN and the optional
  *                    DISPATCH_MAINTAINER_TOKEN alias — full rights.
- *   - "worker"     : DISPATCH_WORKER_TOKEN — restricted allowlist of routes
- *                    (see `requiredTierForRoute` in src/lib/auth.ts).
+ *   - "worker"     : DISPATCH_WORKER_TOKEN (legacy, unbound) and bound
+ *                    credentials from DISPATCH_WORKER_TOKENS
+ *                    ("agent:token" pairs) — restricted allowlist of routes
+ *                    (see `requiredTierForRoute` in src/lib/auth.ts). Bound
+ *                    credentials additionally carry an immutable agent
+ *                    identity (see `getBearerTokenIdentity`).
  *
  * NOTE: This module is imported by src/middleware.ts, which runs in the Edge
  * runtime. It must therefore stay free of Node-only APIs (node:crypto, Buffer,
@@ -85,13 +90,165 @@ export function getDispatchAgentName(): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Worker token → agent bindings (DISPATCH_WORKER_TOKENS)
+// ---------------------------------------------------------------------------
+
+/**
+ * A worker bearer credential bound to exactly one agent name.
+ */
+export type WorkerTokenBinding = { token: string; agentName: string };
+
+let _workerTokenBindings: WorkerTokenBinding[] | undefined;
+let _ambiguousWorkerTokens: Set<string> | undefined;
+
+/**
+ * Parse `DISPATCH_WORKER_TOKENS` into token→agent bindings.
+ *
+ * Format: `agentName:token` entries separated by commas and/or newlines, e.g.
+ * `alpha:<token-a>,bravo:<token-b>`. Each entry and each side is trimmed; the
+ * split happens on the FIRST colon only so tokens may contain `:`. Empty and
+ * malformed entries are skipped with a one-time warning that names the env var
+ * but NEVER the token value.
+ *
+ * A token mapped to two different agent names is ambiguous: it is excluded
+ * from the binding table (and from the accepted-token table) so it fails
+ * closed everywhere. Multiple tokens may map to the same agent (rotation).
+ */
+export function getWorkerTokenBindings(): WorkerTokenBinding[] {
+  if (_workerTokenBindings !== undefined) return _workerTokenBindings;
+
+  const raw = process.env.DISPATCH_WORKER_TOKENS ?? "";
+  const parsed: WorkerTokenBinding[] = [];
+  const tokenAgents = new Map<string, Set<string>>();
+
+  for (const rawEntry of raw.split(/[\n,]+/)) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+
+    const colonIndex = entry.indexOf(":");
+    if (colonIndex <= 0 || colonIndex === entry.length - 1) {
+      console.warn(
+        'DISPATCH_WORKER_TOKENS: ignoring a malformed entry (expected "agent:token")',
+      );
+      continue;
+    }
+
+    const agentName = entry.slice(0, colonIndex).trim();
+    const token = entry.slice(colonIndex + 1).trim();
+    if (!agentName || !token) {
+      console.warn(
+        "DISPATCH_WORKER_TOKENS: ignoring an entry with an empty agent name or token",
+      );
+      continue;
+    }
+
+    parsed.push({ token, agentName });
+    const agents = tokenAgents.get(token) ?? new Set<string>();
+    agents.add(agentName);
+    tokenAgents.set(token, agents);
+  }
+
+  // A token bound to more than one agent is ambiguous — fail closed by
+  // dropping it entirely. Only the env var name is logged.
+  const ambiguous = new Set<string>();
+  for (const [token, agents] of tokenAgents) {
+    if (agents.size > 1) {
+      ambiguous.add(token);
+      console.warn(
+        "DISPATCH_WORKER_TOKENS: a token is bound to multiple agent names; ignoring it (fail-closed)",
+      );
+    }
+  }
+
+  _ambiguousWorkerTokens = ambiguous;
+  _workerTokenBindings = parsed.filter((binding) => !ambiguous.has(binding.token));
+  return _workerTokenBindings;
+}
+
+/**
+ * Full identity resolved from a bearer token:
+ *   - `{ tier: "maintainer" }` — a maintainer token (unbound, full rights)
+ *   - `{ tier: "worker", agentName }` — a bound worker credential
+ *   - `{ tier: "worker", legacyUnbound: true }` — the legacy shared
+ *     DISPATCH_WORKER_TOKEN, which carries no agent identity
+ *
+ * Returns null for unknown, empty, or ambiguous tokens (fail closed).
+ */
+export type BearerTokenIdentity =
+  | { tier: "maintainer" }
+  | { tier: "worker"; agentName: string; legacyUnbound?: false }
+  | { tier: "worker"; agentName?: undefined; legacyUnbound: true };
+
+/**
+ * Resolve the full identity of a bearer token. The presented token is trimmed
+ * before comparison. Ambiguous bound tokens resolve to null (fail closed) even
+ * when they also match the legacy worker token.
+ */
+export function getBearerTokenIdentity(
+  token: string | null | undefined,
+): BearerTokenIdentity | null {
+  if (!token) return null;
+  const trimmed = token.trim();
+  if (!trimmed) return null;
+
+  // Populate the binding/ambiguity caches first.
+  const bindings = getWorkerTokenBindings();
+
+  // A non-ambiguous bound credential wins any cross-tier collision (worker is
+  // the lower privilege) and carries its immutable agent identity.
+  const bound = bindings.find((binding) => safeEqual(binding.token, trimmed));
+  if (bound) return { tier: "worker", agentName: bound.agentName };
+
+  // An ambiguous binding is excluded from the table above. It must never
+  // authenticate as maintainer; it is usable only as the legacy unbound worker
+  // token when its value also matches DISPATCH_WORKER_TOKEN, and is otherwise
+  // rejected outright.
+  if (_ambiguousWorkerTokens?.has(trimmed)) {
+    const legacy = process.env.DISPATCH_WORKER_TOKEN?.trim();
+    if (legacy && safeEqual(legacy, trimmed)) return { tier: "worker", legacyUnbound: true };
+    return null;
+  }
+
+  const tier = getBearerTokenTier(trimmed);
+  if (tier === null) return null;
+  if (tier === "maintainer") return { tier: "maintainer" };
+  return { tier: "worker", legacyUnbound: true };
+}
+
+/**
+ * Convenience accessor: the agent name a token is bound to, or undefined for
+ * maintainer/legacy-unbound/unknown tokens.
+ */
+export function getBoundAgentName(token: string | null | undefined): string | undefined {
+  const identity = getBearerTokenIdentity(token);
+  return identity && identity.tier === "worker" ? identity.agentName : undefined;
+}
+
+let _warnedLegacyWorkerToken = false;
+
+/**
+ * Emit a one-time deprecation notice when the legacy unbound
+ * DISPATCH_WORKER_TOKEN is configured. Called at boot from
+ * src/instrumentation.ts. Never logs the token value.
+ */
+export function warnLegacyWorkerToken(): void {
+  if (_warnedLegacyWorkerToken) return;
+  if (!process.env.DISPATCH_WORKER_TOKEN?.trim()) return;
+  _warnedLegacyWorkerToken = true;
+  console.warn(
+    "DISPATCH_WORKER_TOKEN is a legacy unbound worker credential; agent-scoped worker routes now require a bound credential from DISPATCH_WORKER_TOKENS (\"agent:token\"). Migrate before the legacy token stops working.",
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Accepted tokens and tiers (for server-side auth)
 // ---------------------------------------------------------------------------
 
 /**
  * Bearer token tiers:
  *   - "maintainer" : full rights (DISPATCH_AGENT_TOKEN, DISPATCH_MAINTAINER_TOKEN)
- *   - "worker"     : restricted allowlist (DISPATCH_WORKER_TOKEN)
+ *   - "worker"     : restricted allowlist (DISPATCH_WORKER_TOKEN and bound
+ *                    DISPATCH_WORKER_TOKENS credentials)
  */
 export type TokenTier = "worker" | "maintainer";
 
@@ -131,24 +288,49 @@ export function getAcceptedTokenTiers(): Array<{ token: string; tier: TokenTier 
     // Surface that once (the table is cached, so this runs once per module
     // instance) without ever logging a token value. A duplicate between the
     // two maintainer aliases is fine and needs no warning.
-    const collidesWithAgent = agentToken !== undefined && safeEqual(workerToken, agentToken);
-    const collidesWithMaintainer =
-      maintainerToken !== undefined && safeEqual(workerToken, maintainerToken);
-    if (collidesWithAgent || collidesWithMaintainer) {
-      const collidingVars = [
-        collidesWithAgent ? "DISPATCH_AGENT_TOKEN" : null,
-        collidesWithMaintainer ? "DISPATCH_MAINTAINER_TOKEN" : null,
-      ]
-        .filter((v): v is string => v !== null)
-        .join(" and ");
-      console.warn(
-        `Token tier misconfiguration: DISPATCH_WORKER_TOKEN has the same value as ${collidingVars}; it will be treated as worker-tier only. Set DISPATCH_WORKER_TOKEN to a distinct value.`,
-      );
-    }
+    warnWorkerMaintainerCollision("DISPATCH_WORKER_TOKEN", workerToken, agentToken, maintainerToken);
+  }
+
+  // Bound worker credentials from DISPATCH_WORKER_TOKENS. Ambiguous tokens are
+  // already excluded by getWorkerTokenBindings() (fail-closed). A bound token
+  // that collides with a maintainer token resolves to the LOWER worker tier
+  // with its agent binding intact.
+  const boundTokens = new Set<string>();
+  for (const binding of getWorkerTokenBindings()) {
+    if (boundTokens.has(binding.token)) continue;
+    boundTokens.add(binding.token);
+    tiers.push({ token: binding.token, tier: "worker" });
+    warnWorkerMaintainerCollision("DISPATCH_WORKER_TOKENS", binding.token, agentToken, maintainerToken);
   }
 
   _tokenTiers = tiers;
   return _tokenTiers;
+}
+
+/**
+ * One-time (per module instance) fail-closed warning when a worker credential
+ * shares its value with a maintainer token. Names the colliding env vars but
+ * never the token value.
+ */
+function warnWorkerMaintainerCollision(
+  envVar: string,
+  token: string,
+  agentToken: string | undefined,
+  maintainerToken: string | undefined,
+): void {
+  const collidesWithAgent = agentToken !== undefined && safeEqual(token, agentToken);
+  const collidesWithMaintainer =
+    maintainerToken !== undefined && safeEqual(token, maintainerToken);
+  if (!collidesWithAgent && !collidesWithMaintainer) return;
+  const collidingVars = [
+    collidesWithAgent ? "DISPATCH_AGENT_TOKEN" : null,
+    collidesWithMaintainer ? "DISPATCH_MAINTAINER_TOKEN" : null,
+  ]
+    .filter((v): v is string => v !== null)
+    .join(" and ");
+  console.warn(
+    `Token tier misconfiguration: a worker token from ${envVar} has the same value as ${collidingVars}; it will be treated as worker-tier only. Set ${envVar} to a distinct value.`,
+  );
 }
 
 /**
@@ -230,4 +412,7 @@ export function resetCaches(): void {
   _cachedToken = undefined;
   _cachedAgentName = undefined;
   _tokenTiers = undefined;
+  _workerTokenBindings = undefined;
+  _ambiguousWorkerTokens = undefined;
+  _warnedLegacyWorkerToken = false;
 }

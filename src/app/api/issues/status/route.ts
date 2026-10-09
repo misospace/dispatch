@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { STATUS_LABELS, StatusLabel, isStatusLabel } from "@/types";
-import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { STATUS_LABELS, StatusLabel, isStatusLabel, getAgentFromLabels, AGENT_PREFIX } from "@/types";
+import { authorizeRequest, getAuthorizedActor, getBoundWorkerAgent, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identity";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -46,6 +47,17 @@ export async function POST(request: Request) {
     }
 
     const actorName = getAuthorizedActor(auth, request, (actor as string | undefined) ?? (agentName as string | undefined));
+
+    // #1129: a worker credential is bound to a specific agent. An unbound
+    // legacy worker token may not set status at all, and a bound token may
+    // only act for the agent it is bound to (never the self-reported body).
+    const boundWorkerAgent = getBoundWorkerAgent(auth);
+    const unboundError = await enforceWorkerBound(auth);
+    if (unboundError) return unboundError;
+    if (typeof agentName === "string" && agentName.trim()) {
+      const scopeError = await enforceWorkerAgentScope(auth, agentName);
+      if (scopeError) return scopeError;
+    }
 
     try {
       const issue = await prisma.issue.findUnique({
@@ -91,6 +103,18 @@ export async function POST(request: Request) {
         }
 
         return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
+      }
+
+      // #1129: a bound worker may only transition issues assigned to it. The
+      // live GitHub labels are authoritative, matching the transition base.
+      if (
+        boundWorkerAgent &&
+        getAgentFromLabels(liveLabels) !== `${AGENT_PREFIX}${boundWorkerAgent}`
+      ) {
+        return errorResponse(
+          `Worker token is bound to agent "${boundWorkerAgent}" and may only set status on issues assigned to it`,
+          403,
+        );
       }
 
       // Remove ALL existing status labels before adding the new one, via the

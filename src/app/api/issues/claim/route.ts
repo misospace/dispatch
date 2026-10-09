@@ -5,7 +5,8 @@ import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX } from "@/types";
-import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse, getAuthorizedActor } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 import { transitionIssueStatus } from "@/lib/issue-status";
@@ -42,13 +43,22 @@ export async function POST(request: Request) {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
 
+    // A bound worker credential may only claim for its own agent; an unbound
+    // legacy worker token is refused here (#1129).
+    const scopeError = await enforceWorkerAgentScope(auth, agentName);
+    if (scopeError) return scopeError;
+
+    // The audit actor is the immutable token-derived identity for a bound
+    // worker; operators/maintainers keep the body-supplied agent name.
+    const actor = getAuthorizedActor(auth, request, agentName);
+
     // Worker tokens may only claim normally: force-claiming over another
     // agent's lease/assignment requires a maintainer token (#1111).
     if (force === true && auth.type === "bearer" && auth.tier === "worker") {
       try {
         await prisma.auditLog.create({
           data: {
-            actor: agentName as string,
+            actor,
             action: "claim_issue",
             repoFullName: repoFullName as string,
             issueNumber: issueNumber as number,
@@ -94,7 +104,7 @@ export async function POST(request: Request) {
       try {
         await prisma.auditLog.create({
           data: {
-            actor: agentName as string,
+            actor,
             action: "claim_issue",
             repoFullName: repoFullName as string,
             issueNumber: issueNumber as number,

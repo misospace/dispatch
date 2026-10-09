@@ -19,6 +19,10 @@ const { mocks } = vi.hoisted(() => ({
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
+// #1129: bind the worker credential to `test-agent` (the body agentName used
+// by the worker-tier cases below) so the identity-scope gate accepts its
+// own-agent unclaim.
+process.env.DISPATCH_WORKER_TOKENS = `test-agent:${WORKER_TOKEN}`;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -568,10 +572,22 @@ describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
     expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
   });
 
-  it("returns 400 when a worker's body agentName is not assigned to the issue", async () => {
+  it("returns 403 when a bound worker names another agent in the body", async () => {
     const res = await workerPost(makePayload({ agentName: "other-agent" }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain("may not act for");
+    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when the bound worker's own agent is not assigned to the issue", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/other-agent"],
+    } as never);
+    const res = await workerPost();
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toBe("Issue is not assigned to other-agent");
+    expect((await res.json()).error).toBe("Issue is not assigned to test-agent");
     expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
   });
 });

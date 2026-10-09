@@ -9,6 +9,7 @@ function clearAll() {
   delete process.env.DISPATCH_AGENT_TOKEN;
   delete process.env.DISPATCH_MAINTAINER_TOKEN;
   delete process.env.DISPATCH_WORKER_TOKEN;
+  delete process.env.DISPATCH_WORKER_TOKENS;
 }
 
 describe("getDispatchUrl", () => {
@@ -335,5 +336,147 @@ describe("token tier cache reset", () => {
     expect(mod.getBearerTokenTier("worker-1")).toBeNull();
     expect(mod.getBearerTokenTier("worker-2")).toBe("worker");
     expect(mod.getAcceptedTokenTiers()).toEqual([{ token: "worker-2", tier: "worker" }]);
+  });
+});
+
+describe("DISPATCH_WORKER_TOKENS binding (#1129)", () => {
+  beforeEach(() => {
+    clearAll();
+    vi.resetModules();
+  });
+  afterEach(() => { clearAll(); });
+
+  it("parses comma- and newline-separated agent:token entries, trimming each side", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = " alpha : tok-a ,\n bravo:tok-b \n\n";
+    const mod = await import("./dispatch-env");
+    expect(mod.getWorkerTokenBindings()).toEqual([
+      { token: "tok-a", agentName: "alpha" },
+      { token: "tok-b", agentName: "bravo" },
+    ]);
+  });
+
+  it("splits on the first colon so tokens may contain colons", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:aa:bb:cc";
+    const mod = await import("./dispatch-env");
+    expect(mod.getWorkerTokenBindings()).toEqual([{ token: "aa:bb:cc", agentName: "alpha" }]);
+  });
+
+  it("skips malformed entries without logging the value", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_WORKER_TOKENS = "no-colon,alpha:, :tok,bravo:tok-b";
+      const mod = await import("./dispatch-env");
+      expect(mod.getWorkerTokenBindings()).toEqual([{ token: "tok-b", agentName: "bravo" }]);
+      expect(warnSpy).toHaveBeenCalled();
+      for (const call of warnSpy.mock.calls) {
+        expect(String(call[0])).not.toContain("tok-b");
+      }
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("resolves a bound token to worker tier with its agent identity", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:tok-a,bravo:tok-b";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenIdentity("tok-a")).toEqual({ tier: "worker", agentName: "alpha" });
+    expect(mod.getBearerTokenIdentity("tok-b")).toEqual({ tier: "worker", agentName: "bravo" });
+    expect(mod.getBoundAgentName("tok-a")).toBe("alpha");
+    expect(mod.getBearerTokenTier("tok-a")).toBe("worker");
+    expect(mod.isAuthorizedBearerToken("tok-a")).toBe(true);
+  });
+
+  it("allows multiple tokens per agent (rotation)", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:old,alpha:new";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBoundAgentName("old")).toBe("alpha");
+    expect(mod.getBoundAgentName("new")).toBe("alpha");
+  });
+
+  it("fails closed on an ambiguous token bound to two agents", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_WORKER_TOKENS = "alpha:dup,bravo:dup,charlie:ok";
+      const mod = await import("./dispatch-env");
+      expect(mod.getWorkerTokenBindings()).toEqual([{ token: "ok", agentName: "charlie" }]);
+      expect(mod.getBearerTokenIdentity("dup")).toBeNull();
+      expect(mod.getBoundAgentName("dup")).toBeUndefined();
+      expect(mod.isAuthorizedBearerToken("dup")).toBe(false);
+      // The non-ambiguous credential still works.
+      expect(mod.getBoundAgentName("ok")).toBe("charlie");
+      expect(warnSpy).toHaveBeenCalled();
+      for (const call of warnSpy.mock.calls) {
+        expect(String(call[0])).not.toContain("dup");
+      }
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("never binds an ambiguous token, even when it also matches the legacy worker token", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_WORKER_TOKEN = "dup";
+      process.env.DISPATCH_WORKER_TOKENS = "alpha:dup,bravo:dup";
+      const mod = await import("./dispatch-env");
+      // It is usable only as the unbound legacy token — never as a bound
+      // identity and never as maintainer.
+      expect(mod.getBearerTokenIdentity("dup")).toEqual({ tier: "worker", legacyUnbound: true });
+      expect(mod.getBoundAgentName("dup")).toBeUndefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("resolves a bound token that duplicates a maintainer token to worker tier with binding intact", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_AGENT_TOKEN = "shared";
+      process.env.DISPATCH_WORKER_TOKENS = "alpha:shared";
+      const mod = await import("./dispatch-env");
+      // Building the tier table (as instrumentation does at boot) surfaces the
+      // collision warning.
+      mod.getAcceptedTokenTiers();
+      expect(mod.getBearerTokenIdentity("shared")).toEqual({ tier: "worker", agentName: "alpha" });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_AGENT_TOKEN");
+      expect(String(warnSpy.mock.calls[0][0])).not.toContain("shared");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("resolves the legacy unbound worker token with legacyUnbound true", async () => {
+    process.env.DISPATCH_WORKER_TOKEN = "legacy";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBearerTokenIdentity("legacy")).toEqual({ tier: "worker", legacyUnbound: true });
+    expect(mod.getBoundAgentName("legacy")).toBeUndefined();
+  });
+
+  it("rotates bound credentials after resetCaches", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:old";
+    const mod = await import("./dispatch-env");
+    expect(mod.getBoundAgentName("old")).toBe("alpha");
+
+    mod.resetCaches();
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:new";
+    expect(mod.getBoundAgentName("old")).toBeUndefined();
+    expect(mod.isAuthorizedBearerToken("old")).toBe(false);
+    expect(mod.getBoundAgentName("new")).toBe("alpha");
+  });
+
+  it("warnLegacyWorkerToken warns once and never logs the value", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.DISPATCH_WORKER_TOKEN = "legacy-secret";
+      const mod = await import("./dispatch-env");
+      mod.warnLegacyWorkerToken();
+      mod.warnLegacyWorkerToken();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("DISPATCH_WORKER_TOKENS");
+      expect(String(warnSpy.mock.calls[0][0])).not.toContain("legacy-secret");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

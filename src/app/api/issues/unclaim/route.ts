@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import {
   releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue,
@@ -39,6 +40,11 @@ export async function POST(request: Request) {
     if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
+
+    // A bound worker credential may only release its own claim; an unbound
+    // legacy worker token is refused here (#1129).
+    const scopeError = await enforceWorkerAgentScope(auth, agentName);
+    if (scopeError) return scopeError;
 
     const agentLabel = `${AGENT_PREFIX}${agentName}` as const;
     const actor = getAuthorizedActor(auth, request, agentName as string);

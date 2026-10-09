@@ -24,6 +24,9 @@ const { mocks } = vi.hoisted(() => ({
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
+// #1129: bind the worker credential to the agent it acts as, so the
+// identity-scope gate accepts its own-agent claim.
+process.env.DISPATCH_WORKER_TOKENS = `worker-agent:${WORKER_TOKEN}`;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -537,6 +540,14 @@ describe("POST /api/issues/claim — worker tier (#1111)", () => {
     expect(res.status).toBe(409);
     expect((await res.json()).error).toContain("Use force=true to override");
     expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+  });
+
+  it("denies a bound worker naming another agent in the body", async () => {
+    const res = await POST(workerRequest({ agentName: "other-agent" }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain("may not act for");
+    expect(mocks.findUnique).not.toHaveBeenCalled();
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
   });
 });

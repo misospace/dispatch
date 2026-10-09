@@ -29,13 +29,16 @@ export const TEST_AGENT_TOKEN = "test-agent-token";
  * common pattern of comparing an incoming token against a fixed test token.
  * The test token resolves to the "maintainer" tier so existing suites keep
  * exercising the full-rights path. Pass `tierMap` to accept extra tokens at
- * a specific tier (e.g. a worker token for tier-gate tests).
+ * a specific tier (e.g. a worker token for tier-gate tests), and `bindings`
+ * (token -> agentName) to model bound worker credentials for identity-scope
+ * tests.
  */
 export function makeDispatchEnvMock(
   token: string = TEST_AGENT_TOKEN,
   tierMap: Record<string, "worker" | "maintainer"> = {},
+  bindings: Record<string, string> = {},
 ) {
-  const accepted = [token, ...Object.keys(tierMap)];
+  const accepted = [token, ...Object.keys(tierMap), ...Object.keys(bindings)];
   return {
     isAuthorizedAgentToken: vi.fn((t: string | null | undefined) => (t !== null && t !== undefined ? accepted.includes(t) : false)),
     isAuthorizedBearerToken: vi.fn((t: string | null | undefined) => (t !== null && t !== undefined ? accepted.includes(t) : false)),
@@ -43,8 +46,23 @@ export function makeDispatchEnvMock(
     getBearerTokenTier: vi.fn((t: string | null | undefined) => {
       if (t === null || t === undefined) return null;
       if (t === token) return tierMap[token] ?? "maintainer";
+      if (t in bindings) return "worker";
       return tierMap[t] ?? null;
     }),
+    getBearerTokenIdentity: vi.fn((t: string | null | undefined) => {
+      if (t === null || t === undefined) return null;
+      if (t === token) {
+        return (tierMap[token] ?? "maintainer") === "worker"
+          ? { tier: "worker" }
+          : { tier: "maintainer" };
+      }
+      if (t in bindings) return { tier: "worker", agentName: bindings[t] };
+      const tier = tierMap[t];
+      return tier ? { tier } : null;
+    }),
+    getBoundAgentName: vi.fn((t: string | null | undefined) =>
+      t !== null && t !== undefined && t in bindings ? bindings[t] : undefined,
+    ),
     resetCaches: vi.fn(),
   };
 }
@@ -56,9 +74,10 @@ export function makeDispatchEnvMock(
 export function makeDispatchEnvMockWithSafeEqual(
   token: string = TEST_AGENT_TOKEN,
   tierMap: Record<string, "worker" | "maintainer"> = {},
+  bindings: Record<string, string> = {},
 ) {
   return {
-    ...makeDispatchEnvMock(token, tierMap),
+    ...makeDispatchEnvMock(token, tierMap, bindings),
     safeEqual: vi.fn((a: string, b: string) => a === b),
   };
 }

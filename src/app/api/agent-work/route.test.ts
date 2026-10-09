@@ -759,3 +759,67 @@ describe("POST /api/agent-work", () => {
     });
   });
 });
+
+describe("GET /api/agent-work — bound worker scope (#1129)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    agentWork.findMany.mockResolvedValue([]);
+    lease.findMany.mockResolvedValue([]);
+  });
+
+  function asBoundWorker(agentName: string) {
+    mockAuthorizeRequest.mockResolvedValue({
+      authorized: true,
+      type: "bearer",
+      actor: agentName,
+      tier: "worker",
+      agentName,
+    });
+  }
+
+  it("denies a bound worker listing another agent's work", async () => {
+    asBoundWorker("alpha");
+    const res = await makeGetRequest("http://localhost/api/agent-work?agent=bravo");
+    expect(res.status).toBe(403);
+    expect(agentWork.findMany).not.toHaveBeenCalled();
+  });
+
+  it("forces the agent filter to the bound identity", async () => {
+    asBoundWorker("alpha");
+    await makeGetRequest("http://localhost/api/agent-work");
+    const callArgs = agentWork.findMany.mock.calls[0][0];
+    expect(callArgs.where.agentName).toBe("alpha");
+  });
+
+  it("accepts an explicit filter naming the bound agent", async () => {
+    asBoundWorker("alpha");
+    const res = await makeGetRequest("http://localhost/api/agent-work?agent=alpha");
+    expect(res.status).toBe(200);
+  });
+
+  it("scopes the stale-lease query to the bound agent", async () => {
+    asBoundWorker("alpha");
+    await makeGetRequest("http://localhost/api/agent-work");
+    const callArgs = lease.findMany.mock.calls[0][0];
+    expect(callArgs.where.agentName).toBe("alpha");
+  });
+
+  it("does not scope the stale-lease query for maintainer callers", async () => {
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+    await makeGetRequest("http://localhost/api/agent-work");
+    const callArgs = lease.findMany.mock.calls[0][0];
+    expect(callArgs.where.agentName).toBeUndefined();
+  });
+
+  it("denies an unbound legacy worker token", async () => {
+    mockAuthorizeRequest.mockResolvedValue({
+      authorized: true,
+      type: "bearer",
+      actor: "agent",
+      tier: "worker",
+    });
+    const res = await makeGetRequest("http://localhost/api/agent-work");
+    expect(res.status).toBe(403);
+    expect(agentWork.findMany).not.toHaveBeenCalled();
+  });
+});

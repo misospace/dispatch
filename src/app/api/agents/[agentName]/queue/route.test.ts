@@ -4,7 +4,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -794,5 +794,33 @@ describe("GET /api/agents/[agentName]/queue", () => {
     const body = await res.json();
     expect(body).toHaveLength(1);
     expect(body[0].number).toBe(9);
+  });
+});
+
+describe("GET /api/agents/[agentName]/queue — bound worker scope (#1129)", () => {
+  it("denies a bound worker polling another agent's queue", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/bravo/queue?lane=local", { token: "bound-token" }),
+      { params: Promise.resolve({ agentName: "bravo" }) },
+    );
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("GET /api/agents/[agentName]/queue — hard cutover (#1129)", () => {
+  it("denies an unbound legacy worker token", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/alpha/queue?lane=local", { token: "test-worker-token" }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("allows a bound worker to reach its own queue", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/alpha/queue?lane=local", { token: "bound-token" }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).not.toBe(403);
   });
 });

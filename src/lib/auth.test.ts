@@ -7,12 +7,15 @@ import {
   isAuthorizedBasicAuth,
   authenticateRequest,
   authorizeRequest,
+  getAuthorizedActor,
+  getBoundWorkerAgent,
   requiredTierForRoute,
   authErrorResponse,
   resetAuthCaches,
   validateOidcConfig,
   authorizeGroomerRequest,
 } from "./auth";
+import { enforceWorkerAgentScope, enforceWorkerBound } from "./worker-identity";
 import { resetRateLimits, type RateLimitOptions, type RateLimitResult } from "./rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
@@ -65,6 +68,7 @@ function clearAll() {
   delete process.env.DISPATCH_AGENT_TOKEN;
   delete process.env.DISPATCH_MAINTAINER_TOKEN;
   delete process.env.DISPATCH_WORKER_TOKEN;
+  delete process.env.DISPATCH_WORKER_TOKENS;
   delete process.env.DISPATCH_GROOMER_TOKEN;
 }
 
@@ -806,5 +810,216 @@ describe("bearer token tiers (#1111)", () => {
       type: "bearer",
       tier: "worker",
     });
+  });
+});
+
+describe("bound worker identity (#1129)", () => {
+  const BOUND_TOKEN = "bound-worker-token";
+
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    resetRateLimits();
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:${BOUND_TOKEN}`;
+  });
+  afterEach(() => {
+    clearAll();
+  });
+
+  function boundRequest(pathname: string, method = "GET", headers: Record<string, string> = {}): Request {
+    return new Request(`http://localhost${pathname}`, {
+      method,
+      headers: { Authorization: `Bearer ${BOUND_TOKEN}`, ...headers },
+    });
+  }
+
+  it("derives actor and agentName from the token, ignoring x-agent-name", async () => {
+    const result = await authorizeRequest(
+      boundRequest("/api/agents/alpha/next-task", "GET", { "x-agent-name": "bravo" }),
+    );
+    expect(result).toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+      agentName: "alpha",
+      actor: "alpha",
+    });
+  });
+
+  it("authenticateRequest carries the bound agentName", () => {
+    expect(authenticateRequest(boundRequest("/api/agents/alpha/next-task"))).toEqual({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+      agentName: "alpha",
+    });
+  });
+
+  it("getAuthorizedActor ignores a body fallback for a bound worker", async () => {
+    const auth = await authorizeRequest(boundRequest("/api/issues/status", "POST"));
+    expect(getAuthorizedActor(auth, boundRequest("/api/issues/status", "POST"), "bravo")).toBe("alpha");
+  });
+
+  it("getBoundWorkerAgent returns the bound agent and undefined for maintainers", async () => {
+    const bound = await authorizeRequest(boundRequest("/api/agents/alpha/next-task"));
+    expect(getBoundWorkerAgent(bound)).toBe("alpha");
+
+    delete process.env.DISPATCH_WORKER_TOKENS;
+    resetAuthCaches();
+    process.env.DISPATCH_AGENT_TOKEN = "maintainer-token";
+    const maintainer = await authorizeRequest(
+      new Request("http://localhost/api/agents/alpha/next-task", {
+        headers: { Authorization: "Bearer maintainer-token" },
+      }),
+    );
+    expect(getBoundWorkerAgent(maintainer)).toBeUndefined();
+  });
+
+  it("keeps the x-agent-name fallback for maintainer tokens", async () => {
+    delete process.env.DISPATCH_WORKER_TOKENS;
+    resetAuthCaches();
+    process.env.DISPATCH_AGENT_TOKEN = "maintainer-token";
+    const result = await authorizeRequest(
+      new Request("http://localhost/api/test", {
+        headers: { Authorization: "Bearer maintainer-token", "x-agent-name": "bravo" },
+      }),
+    );
+    expect(result).toMatchObject({ authorized: true, tier: "maintainer", actor: "bravo" });
+  });
+
+  it("legacy unbound worker token still resolves at worker tier (denied at the route gate)", async () => {
+    delete process.env.DISPATCH_WORKER_TOKENS;
+    resetAuthCaches();
+    process.env.DISPATCH_WORKER_TOKEN = "legacy-token";
+    const result = await authorizeRequest(
+      new Request("http://localhost/api/agents/alpha/next-task", {
+        headers: { Authorization: "Bearer legacy-token" },
+      }),
+    );
+    expect(result).toMatchObject({ authorized: true, tier: "worker" });
+    expect(getBoundWorkerAgent(result)).toBeUndefined();
+  });
+});
+
+describe("enforceWorkerAgentScope (#1129)", () => {
+  beforeEach(() => {
+    resetRateLimits();
+    mocks.auditCreate.mockReset();
+  });
+
+  it("allows maintainer, oidc, basic and disabled callers for any agent", async () => {
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "oidc", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "basic", username: "operator", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "disabled", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "bearer", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("allows a bound worker acting for its own agent", async () => {
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+        "alpha",
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("denies a bound worker acting for another agent with a 403 and no token leak", async () => {
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(res?.status).toBe(403);
+    const body = (await res!.json()) as { error: string };
+    expect(body.error).toContain("alpha");
+    expect(body.error).toContain("bravo");
+  });
+
+  it("writes a best-effort worker_scope_denied audit row on denial", async () => {
+    await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.action).toBe("worker_scope_denied");
+    expect(call.data.success).toBe(false);
+    expect(call.data.actor).toBe("alpha");
+    expect(JSON.stringify(call.data)).not.toContain("bound-worker-token");
+  });
+
+  it("a failing scope-denial audit write never changes the 403 decision", async () => {
+    mocks.auditCreate.mockRejectedValueOnce(new Error("db down"));
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(res?.status).toBe(403);
+  });
+
+  it("a throwing rate limiter never changes the 403 decision", async () => {
+    mocks.checkRateLimit.mockImplementationOnce(() => {
+      throw new Error("limiter down");
+    });
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(res?.status).toBe(403);
+  });
+
+  it("throttles scope-denial audit rows per actor", async () => {
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 14; i += 1) {
+        await enforceWorkerAgentScope(
+          { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+          "bravo",
+        );
+      }
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("denies an unbound legacy worker token with a 403 naming the migration env var", async () => {
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "agent", tier: "worker" },
+      "alpha",
+    );
+    expect(res?.status).toBe(403);
+    const body = (await res!.json()) as { error: string };
+    expect(body.error).toContain("DISPATCH_WORKER_TOKENS");
+  });
+
+  it("enforceWorkerBound passes bound workers and maintainers, denies unbound workers", async () => {
+    await expect(
+      enforceWorkerBound({ authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" }),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerBound({ authorized: true, type: "bearer", actor: "operator", tier: "maintainer" }),
+    ).resolves.toBeNull();
+    const res = await enforceWorkerBound({ authorized: true, type: "bearer", actor: "agent", tier: "worker" });
+    expect(res?.status).toBe(403);
   });
 });

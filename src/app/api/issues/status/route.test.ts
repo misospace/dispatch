@@ -13,6 +13,8 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+// #1129: a bound worker credential for `alpha`, used by the scope tests below.
+process.env.DISPATCH_WORKER_TOKENS = "alpha:status-worker-token";
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -335,5 +337,96 @@ describe("POST /api/issues/status — business logic", () => {
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({ beforeLabels: ["status/in-review"] }),
     });
+  });
+});
+
+describe("POST /api/issues/status — bound worker scope (#1129)", () => {
+  const BOUND = "status-worker-token";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready", "agent/alpha"]);
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/alpha", "status/ready"],
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+  });
+
+  function workerRequest(overrides: Record<string, unknown> = {}) {
+    return POST(
+      new Request("http://localhost/api/issues/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${BOUND}` },
+        body: JSON.stringify({
+          issueId: "issue-1",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          status: "in-progress",
+          ...overrides,
+        }),
+      }),
+    );
+  }
+
+  it("allows a bound worker to set status on its own assigned issue", async () => {
+    const res = await workerRequest();
+    expect(res.status).toBe(200);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ actor: "alpha" }),
+    });
+  });
+
+  it("denies a bound worker setting status on another agent's issue", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "agent/bravo"]);
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      labels: ["agent/bravo", "status/ready"],
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    const res = await workerRequest();
+    expect(res.status).toBe(403);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+  });
+
+  it("denies a bound worker naming another agent in the body", async () => {
+    const res = await workerRequest({ agentName: "bravo" });
+    expect(res.status).toBe(403);
+    expect(mocks.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("denies an unbound legacy worker token", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = "";
+    const { resetAuthCaches } = await import("@/lib/auth");
+    resetAuthCaches();
+    process.env.DISPATCH_WORKER_TOKEN = "legacy-status-token";
+    try {
+      const res = await POST(
+        new Request("http://localhost/api/issues/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer legacy-status-token" },
+          body: JSON.stringify({
+            issueId: "issue-1",
+            repoFullName: "org/repo",
+            issueNumber: 42,
+            status: "in-progress",
+          }),
+        }),
+      );
+      expect(res.status).toBe(403);
+    } finally {
+      delete process.env.DISPATCH_WORKER_TOKEN;
+      process.env.DISPATCH_WORKER_TOKENS = "alpha:status-worker-token";
+      resetAuthCaches();
+    }
   });
 });

@@ -22,8 +22,12 @@ export async function register() {
   // token) surfaces with its console warning at startup rather than on the
   // first authenticated request. The warning fires once per module instance,
   // so isolated chunk graphs (see the note above) may warn once per runtime.
-  const { getAcceptedTokenTiers } = await import("@/lib/dispatch-env");
+  const { getAcceptedTokenTiers, warnLegacyWorkerToken } = await import("@/lib/dispatch-env");
   getAcceptedTokenTiers();
+  // Warn when the legacy unbound DISPATCH_WORKER_TOKEN is configured: it can
+  // no longer act on agent-scoped routes, which now require a bound credential
+  // from DISPATCH_WORKER_TOKENS (#1129).
+  warnLegacyWorkerToken();
 
   if (process.env.DISPATCH_AUTH_MODE === "oidc") {
     const { validateOidcConfig } = await import("@/lib/auth");
