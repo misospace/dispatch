@@ -6,11 +6,9 @@ import {
   createIdleTask,
   createImplementTask,
   createFollowupPrTask,
-  createGroomTask,
 } from "@/lib/agent-task";
-import { isBacklogLane, getBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
+import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { selectGroomingCandidate } from "@/lib/groomer/selector";
 import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, normalizeQueueRepo } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
@@ -152,28 +150,12 @@ export async function GET(
   const includeRenovate = searchParams.get("includeRenovate") === "true";
   const mode = searchParams.get("mode");
 
+  // External grooming is retired. Reject before any candidate or queue reads.
+  if (mode === "groom") {
+    return errorResponse("External grooming task dispatch is retired; use POST /api/groomer/run", 410);
+  }
+
   try {
-    // Groom mode: return exactly one issue to triage/enrich
-    if (mode === "groom") {
-      const candidate = await selectGroomingCandidate();
-      if (!candidate) {
-        return NextResponse.json(createIdleTask("No grooming work available"));
-      }
-
-      const task = createGroomTask({
-        agentName,
-        lane: candidate.currentLane ?? getBacklogLane()?.id ?? "backlog",
-        issue: {
-          id: candidate.id,
-          repoFullName: candidate.repoFullName,
-          number: candidate.number,
-          title: candidate.title,
-          url: candidate.url,
-        },
-      });
-      return NextResponse.json(task);
-    }
-
     const { laneValid, resolvedLane, rankedQueue, fullQueue, withheldQueue, admissionMode, prFixItems, availableLanes } =
       await fetchAgentQueueData({
         agentName,

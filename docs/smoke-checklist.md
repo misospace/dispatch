@@ -287,33 +287,15 @@ Authorization: Bearer <DISPATCH_AGENT_TOKEN>
 
 ---
 
-### 17. Next-task with mode=groom returns groom task
+### 17. Retired external groom mode returns Gone
 
 **Endpoint:** `GET <base-url>/api/agents/<agent-name>/next-task?mode=groom`
 
-**Headers:**
-```
-Authorization: Bearer <DISPATCH_AGENT_TOKEN>
-```
+**Expected:** HTTP `410 Gone` with an `error` explaining the mode is retired. No issue or task is returned. Ordinary `next-task` calls still work.
 
-**Expected response:**
-```json
-{
-  "shouldRun": true,
-  "type": "groom",
-  "issue": {
-    "number": 456,
-    "title": "Example issue title",
-    "url": "https://github.com/owner/repo/issues/456",
-    "labels": ["status/backlog"],
-    "repository": "owner/repo"
-  }
-}
-```
+**Prerequisites:** Valid bearer token; unauthenticated requests return `401`.
 
-**Prerequisites:** At least one issue exists that needs triage (e.g., missing `status/*` label, or in `status/backlog`). The agent must have been synced via `POST /api/sync` at least once.
-
-**Failure signal:** HTTP 401 (missing/invalid bearer token), or `shouldRun: false` when groomable issues exist. The `type` field must be `"groom"` when `mode=groom` is used.
+**Failure:** HTTP 200, a `groom` task, or any candidate/queue lookup.
 
 ---
 

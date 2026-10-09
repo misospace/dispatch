@@ -52,18 +52,6 @@ interface GroomResult {
   error?: string;
 }
 
-interface GroomCandidateTask {
-  type: string;
-  shouldRun: boolean;
-  issue?: {
-    repoFullName: string;
-    number: number;
-    title: string;
-    url: string;
-  };
-  reason?: string;
-}
-
 function StatusBadge({ status }: { status: string }) {
   const cls =
     status === "completed" || status === "dry_run_completed"
@@ -227,28 +215,11 @@ export default function GroomerHistoryPage() {
     setGroomResult(null);
     setGroomError(null);
     try {
-      // Step 1: Get the next grooming candidate
-      const taskRes = await authedFetch("/api/agents/saffron/next-task?mode=groom");
-      const taskData: GroomCandidateTask = await taskRes.json();
-      if (!taskRes.ok) {
-        throw new Error(taskData?.reason || "Failed to get next grooming candidate");
-      }
-
-      // If idle (no candidate), report that
-      if (!taskData.shouldRun || !taskData.issue) {
-        setGroomResult({ candidateNumber: null });
-        return;
-      }
-
-      // Step 2: Run the groomer on the selected issue
+      // Let the hosted runner select its own candidate and enforce the reply gate.
       const runRes = await authedFetch("/api/groomer/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          issueNumber: taskData.issue.number,
-          repoFullName: taskData.issue.repoFullName,
-          dryRun: false,
-        }),
+        body: JSON.stringify({ dryRun: false }),
       });
 
       const runData: GroomResult = await runRes.json();

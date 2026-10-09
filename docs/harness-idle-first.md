@@ -1,7 +1,7 @@
 # Idle-First Harness Checks
 
 > **⚠️ SUPERSEDED** — This content has been consolidated into [docs/generic-harness-loop.md](./generic-harness-loop.md).
-> See the Generic Worker Loop and Generic Groomer Loop sections for the current integration pattern.
+> See the Generic Worker Loop for the current integration pattern. External groom mode was retired in #1200.
 >
 > **Issue:** [misospace/dispatch#399](https://github.com/misospace/dispatch/issues/399)
 > **Date:** 2026-06-16
@@ -17,9 +17,8 @@ Starting an AI model (loading weights, initializing context) is the most expensi
 | Role | Endpoint | Idle reason |
 |------|----------|-------------|
 | Normal worker | `GET /api/agents/{agentName}/next-task?lane=normal` | `"No work available"` |
-| Groomer | `GET /api/agents/{agentName}/next-task?mode=groom` | `"No grooming work available"` |
 
-Both endpoints return a single `AgentTask` object (not an array). When idle, the response is:
+The worker endpoint returns a single `AgentTask` object (not an array). When idle, the response is:
 
 ```json
 {
@@ -66,22 +65,6 @@ Response when work is available:
 }
 ```
 
-### Groomer
-
-```bash
-# Fetch next grooming task
-curl -s "https://dispatch.example.com/api/agents/saffron/next-task?mode=groom"
-```
-
-Response when idle:
-```json
-{
-  "type": "idle",
-  "shouldRun": false,
-  "reason": "No grooming work available"
-}
-```
-
 ### Pseudo-Code
 
 ```python
@@ -112,20 +95,6 @@ def heartbeat():
 2. **Cheap:** No model calls, no classification, no network calls to GitHub. The endpoint queries Dispatch's local Postgres cache.
 3. **No lease mutation:** Calling `next-task` does not claim or lock any issue. The agent must claim the issue as part of executing the task.
 4. **Should run before model startup:** The entire point of this pattern is to avoid starting an expensive model when there is nothing to do.
-
-## Groom Mode Idle
-
-The groomer idle check works the same way but queries for issues that need enrichment (missing labels, priority, agent assignment, or lane classification). When all open issues are fully labeled and classified, the response is idle:
-
-```json
-{
-  "type": "idle",
-  "shouldRun": false,
-  "reason": "No grooming work available"
-}
-```
-
-Groom mode does not query the PR-fix queue or leases — it only reads issues.
 
 ## Non-Goals
 

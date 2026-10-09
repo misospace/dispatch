@@ -8,7 +8,7 @@ The hosted groomer is intentionally narrow:
 - It runs at most one issue per request.
 - It does not edit code, open PRs, merge PRs, or run shell commands. It closes an issue only when its plan's verdict is `already_done` at high confidence with current-revision evidence that proves that issue's own acceptance (see [Close policy](#close-policy)).
 - Before writing anything it re-checks that the issue and default branch still match the evidence the plan was built on, and it applies each plan at most once (see [Applying a plan](#applying-a-plan)).
-- Existing external groomer workers using `next-task?mode=groom` remain supported.
+- External `next-task?mode=groom` task dispatch is retired (#1200). Hosted grooming remains available through `POST /api/groomer/run`.
 
 ## Configuration
 
@@ -53,7 +53,7 @@ Trust is resolved per issue author and commenter. Dispatch's internal automation
 
 Operators can review pending replies in the Hosted Groomer page or use `GET /api/groomer/pending-replies`, then call `POST /api/groomer/pending-replies/{id}/approve` or `POST /api/groomer/pending-replies/{id}/dismiss`. Approval posts the saved reply with its idempotency marker; dismissal records the operator decision without posting. Both mutation endpoints require operator authentication: an OIDC session, basic auth, or auth-disabled mode. Any bearer token is rejected, including `DISPATCH_GROOMER_TOKEN` (401) and maintainer-tier `DISPATCH_AGENT_TOKEN` (403); bearer tokens cannot approve or dismiss a held reply. Audit actions include `groomer_reply_held`, `groomer_reply_suppressed`, `groomer_reply_approved`, and `groomer_reply_dismissed`.
 
-**Known gap:** `GET /api/agents/<name>/next-task?mode=groom` is executed by an EXTERNAL harness, which posts comments with its own token. That external posting path is NOT covered by this hosted groomer gate.
+**External grooming retired (#1200):** `GET /api/agents/<name>/next-task?mode=groom` returns HTTP `410 Gone` and never hands out a task. The Hosted Groomer page calls `POST /api/groomer/run` directly. Disable legacy external pollers and revoke their unnecessary GitHub write credentials; removing task discovery cannot revoke independently held credentials.
 
 ## Exploration budget
 

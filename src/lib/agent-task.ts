@@ -62,18 +62,7 @@ export interface FollowupPrTask {
   forbiddenActions: string[];
 }
 
-export interface GroomTask {
-  type: "groom";
-  shouldRun: true;
-  agentName: string;
-  lane?: string;
-  issue?: IssueRef;
-  instructions: string;
-  stopAfter: string;
-  forbiddenActions: string[];
-}
-
-export type AgentTask = IdleTask | ImplementTask | FollowupPrTask | GroomTask;
+export type AgentTask = IdleTask | ImplementTask | FollowupPrTask;
 
 const IMPLEMENT_INSTRUCTIONS =
   "Claim or work the assigned issue. Open or update exactly one PR, then stop. Do not merge, groom unrelated issues, or claim another issue.";
@@ -87,12 +76,6 @@ const FOLLOWUP_PR_INSTRUCTIONS =
 const FOLLOWUP_PR_STOP_AFTER =
   "The queued PR has been updated with the requested fixes. Push remaining work to a follow-up.";
 
-const GROOM_INSTRUCTIONS =
-  "Enrich the issue with labels, lane classification, and status assignment. Close completed work. Do not implement or open PRs.";
-
-const GROOM_STOP_AFTER =
-  "The issue has been enriched with labels, lane, and status. Close if completed.";
-
 const IMPLEMENT_FORBIDDEN = [
   "Merging any pull request",
   "Grooming unrelated issues",
@@ -103,12 +86,6 @@ const FOLLOWUP_PR_FORBIDDEN = [
   "Merging any pull request",
   "Opening a new pull request",
   "Claiming another issue while this PR is queued",
-];
-
-const GROOM_FORBIDDEN = [
-  "Writing implementation code",
-  "Opening pull requests",
-  "Modifying production configuration",
 ];
 
 export function createIdleTask(reason: string): IdleTask {
@@ -169,24 +146,3 @@ export function createFollowupPrTask(input: FollowupPrTaskInput): FollowupPrTask
   };
 }
 
-export interface GroomTaskInput {
-  agentName: string;
-  lane?: string;
-  issue?: IssueRef;
-  instructions?: string;
-  stopAfter?: string;
-  forbiddenActions?: string[];
-}
-
-export function createGroomTask(input: GroomTaskInput): GroomTask {
-  return {
-    type: "groom",
-    shouldRun: true,
-    agentName: input.agentName,
-    lane: input.lane,
-    issue: input.issue,
-    instructions: input.instructions ?? GROOM_INSTRUCTIONS,
-    stopAfter: input.stopAfter ?? GROOM_STOP_AFTER,
-    forbiddenActions: input.forbiddenActions ? [...input.forbiddenActions] : [...GROOM_FORBIDDEN],
-  };
-}

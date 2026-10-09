@@ -14,19 +14,17 @@ Dispatch is not the harness. Dispatch does not run the model. A second runtime r
 | Role | Endpoint |
 |------|----------|
 | Worker | `GET /api/agents/{agentName}/next-task?lane=normal` |
-| Groomer | `GET /api/agents/{agentName}/next-task?mode=groom` |
 | Report | `POST /api/agents/{agentName}/tasks/report` |
 
 ## Task Types
 
-The `next-task` endpoint returns one of four task types:
+The `next-task` endpoint returns one of three task types:
 
 | Type | `shouldRun` | Description |
 |------|-------------|-------------|
 | `idle` | `false` | No work available. The harness should exit immediately. |
 | `implement` | `true` | Work exactly one GitHub issue. Open or update one PR, then stop. |
 | `followup-pr` | `true` | Update exactly one existing PR with requested changes, then stop. |
-| `groom` | `true` | Triage and enrich exactly one issue (labels, lane, status), then stop. |
 
 ## Report Outcomes
 
@@ -79,35 +77,11 @@ Autonomous workers may authenticate the loop above with `DISPATCH_WORKER_TOKEN` 
 
 **Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
 
-## Generic Groomer Loop
+## Hosted grooming
 
-```python
-def groomer_heartbeat(agent_name, dispatch_url):
-    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
-
-    # Fetch grooming task (auth required)
-    task = get(
-        f"{dispatch_url}/api/agents/{agent_name}/next-task?mode=groom",
-        headers=auth,
-    )
-
-    # Exit immediately on idle
-    if not task["shouldRun"]:
-        return
-
-    # Execute exactly one grooming task
-    if task["type"] == "groom":
-        result = groom_issue(task["issue"])
-
-    # Report outcome (auth required)
-    post(
-        f"{dispatch_url}/api/agents/{agent_name}/tasks/report",
-        headers=auth,
-        json={"taskType": task["type"], "outcome": result["outcome"], **result["metadata"]},
-    )
-
-    # Stop
-```
+External `next-task?mode=groom` has been retired (#1200) and returns HTTP 410.
+Use Dispatch-hosted `POST /api/groomer/run` instead. Stop legacy external
+groomer pollers and revoke unnecessary GitHub write credentials.
 
 ## Small Harness Examples
 

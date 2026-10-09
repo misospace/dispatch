@@ -6,7 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
 
-const VALID_TASK_TYPES = ["implement", "followup-pr", "groom"] as const;
+const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
 
 const VALID_OUTCOMES = [

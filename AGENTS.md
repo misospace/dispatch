@@ -291,14 +291,13 @@ curl -s -X POST -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
 
 ### Task Types
 
-The `next-task` endpoint returns one of four task types:
+The `next-task` endpoint returns one of three task types:
 
 | Type | `shouldRun` | Description |
 |------|-------------|-------------|
 | `idle` | `false` | No work available. Stop immediately — do not start the model. |
 | `implement` | `true` | Work exactly one GitHub issue. Open or update one PR, then stop. |
 | `followup-pr` | `true` | Update exactly one existing PR with requested changes, then stop. |
-| `groom` | `true` | Triage and enrich exactly one issue (labels, lane, status), then stop. (Use `?mode=groom`) |
 
 ### Report Outcomes
 
@@ -328,7 +327,7 @@ The report body also accepts an optional `startedAt` — an extended ISO 8601 ti
 Workers must respect these constraints:
 
 * **Do not merge PRs.** Workers never merge pull requests.
-* **Do not groom unless taskType is `groom`.** Implementation workers do not triage issues.
+* **Do not groom through external harnesses.** The `groom` task type and `?mode=groom` were retired (#1200). Use the hosted groomer.
 * **Do not claim another issue after finishing one task.** Report outcome and stop. The next heartbeat fetches the next task.
 * **Report outcome and stop.** Every heartbeat executes at most one task.
 

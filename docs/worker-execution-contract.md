@@ -34,6 +34,12 @@ The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TO
 
 ---
 
+## Retired external grooming
+
+`GET /api/agents/{agentName}/next-task?mode=groom` returns `410 Gone` and no task. The external `groom` task and report contract are retired (#1200). Use hosted grooming through `POST /api/groomer/run` or the Hosted Groomer page. Decommission external pollers and unnecessary GitHub write credentials; normal implementation and PR-fix tasks are unaffected.
+
+---
+
 ## One Item Per Run
 
 A worker must handle **exactly one** queue item per execution:

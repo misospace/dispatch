@@ -180,19 +180,9 @@ describe("POST /api/agents/[agentName]/tasks/report — validation", () => {
     expect(body.report.outcome).toBe("pr_updated");
   });
 
-  it("returns 200 for a valid groom report", async () => {
-    const res = await postRequest({
-      taskType: "groom",
-      outcome: "issue_updated",
-      repoFullName: "org/repo",
-      issueNumber: 42,
-    });
-
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.ok).toBe(true);
-    expect(body.report.taskType).toBe("groom");
-    expect(body.report.outcome).toBe("issue_updated");
+  it("rejects retired groom task reports", async () => {
+    const res = await postRequest({ taskType: "groom", outcome: "issue_updated" });
+    expect(res.status).toBe(400);
   });
 
   it("returns 200 with minimal valid payload", async () => {
@@ -319,7 +309,7 @@ describe("POST /api/agents/[agentName]/tasks/report — validation", () => {
   });
 
   it("accepts all valid taskTypes", async () => {
-    const validTaskTypes = ["implement", "followup-pr", "groom"];
+    const validTaskTypes = ["implement", "followup-pr"];
 
     for (const taskType of validTaskTypes) {
       const res = await postRequest({ taskType, outcome: "no_changes_needed" });
