@@ -327,6 +327,8 @@ describe("isExplicitRegressionReport", () => {
       "Thanks, this works now.",
       "We should add a regression test for this.",
       "The regression tests pass.",
+      "Adding regression-testing coverage for the new path.",
+      "The regression_test suite is green.",
       "Can you clarify the expected behavior?",
       "LGTM.",
     ]) {

@@ -272,12 +272,12 @@ export interface ReopenRegressionEvidence {
 /**
  * Patterns marking an authoritative comment as an explicit regression report:
  * it asserts the issue still reproduces or has regressed. Deliberately
- * conservative, and "regression test(s)" is excluded. This is a textual signal
- * only — it cannot establish runtime behavior, and its absence is not proof
- * that no regression exists.
+ * conservative, and "regression test(s)" (including hyphen/underscore
+ * variants) is excluded. This is a textual signal only — it cannot establish
+ * runtime behavior, and its absence is not proof that no regression exists.
  */
 const REGRESSION_REPORT_PATTERNS: readonly RegExp[] = [
-  /\bregress(?:ed|ion|ing)\b(?!\s+tests?\b)/i,
+  /\bregress(?:ed|ion|ing)\b(?![-\s_]*test\w*)/i,
   /\bstill\s+(?:broken|fails?|failing|happens?|occur(?:s|ring)?|reproduc(?:e|es|ing|ible)|present|see(?:ing)?|an?\s+(?:issue|problem|bug))/i,
   /\b(?:not|isn'?t|wasn'?t|aren'?t)\s+(?:been\s+)?(?:fixed|resolved|addressed|working|done)\b/i,
   /\bbroke(?:n)?\s+again\b/i,
