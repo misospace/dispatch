@@ -19,6 +19,10 @@ const { mocks } = vi.hoisted(() => ({
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
+// #1129: bind the worker credential to `test-agent` (the body agentName used
+// by the worker-tier cases below) so the identity-scope gate accepts its
+// own-agent unclaim.
+process.env.DISPATCH_WORKER_TOKENS = `test-agent:${WORKER_TOKEN}`;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
@@ -145,6 +149,7 @@ describe("POST /api/issues/unclaim — agent self-unclaim (regression)", () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent"],
     } as never);
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -187,6 +192,7 @@ describe("POST /api/issues/unclaim — operator path", () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/in-progress"],
     } as never);
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -294,6 +300,7 @@ describe("POST /api/issues/unclaim — status handling", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/in-progress"],
       blockedReason: null,
       linkedPrNumber: null,
@@ -321,6 +328,7 @@ describe("POST /api/issues/unclaim — status handling", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/blocked"],
       blockedReason: null,
       linkedPrNumber: null,
@@ -346,6 +354,7 @@ describe("POST /api/issues/unclaim — status handling", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/blocked"],
       blockedReason: "waiting on upstream API change",
       linkedPrNumber: null,
@@ -371,6 +380,7 @@ describe("POST /api/issues/unclaim — status handling", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/in-review"],
       blockedReason: null,
       linkedPrNumber: 7,
@@ -404,6 +414,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent"],
     } as never);
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -428,6 +439,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "closed",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent"],
     } as never);
 
@@ -441,6 +453,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/done"],
     } as never);
 
@@ -454,6 +467,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/other-agent"],
     } as never);
 
@@ -467,6 +481,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: [],
     } as never);
 
@@ -497,6 +512,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "priority/p1"],
     } as never);
 
@@ -520,6 +536,7 @@ describe("POST /api/issues/unclaim — guards", () => {
     mocks.findUnique.mockResolvedValueOnce({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "status/ready"],
     } as never);
 
@@ -540,6 +557,7 @@ describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent"],
     } as never);
     mocks.updateIssue.mockResolvedValue(undefined);
@@ -568,10 +586,84 @@ describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
     expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
   });
 
-  it("returns 400 when a worker's body agentName is not assigned to the issue", async () => {
+  it("returns 403 when a bound worker names another agent in the body", async () => {
     const res = await workerPost(makePayload({ agentName: "other-agent" }));
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toBe("Issue is not assigned to other-agent");
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain("may not act for");
     expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when the bound worker's own agent is not assigned to the issue", async () => {
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "open",
+      number: 42, repository: { fullName: "org/repo" },
+      labels: ["agent/other-agent"],
+    } as never);
+    const res = await workerPost();
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Issue is not assigned to test-agent");
+    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/unclaim — cross-issue identity invariant (#1129 review)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      number: 42,
+      repository: { fullName: "org/repo" },
+      labels: ["agent/test-agent"],
+    } as never);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
+  });
+
+  it("refuses with 400 when body repoFullName does not match the loaded issue's canonical repo", async () => {
+    // Token for alpha passes issueId of alpha-assigned A but repoFullName/issueNumber
+    // of a bravo-owned B. Without the cross-issue guard the route could
+    // mutate B's labels on GitHub while releasing A locally.
+    const res = await postRequest(makePayload({
+      repoFullName: "bravo/repo",
+      issueNumber: 99,
+    }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("does not match");
+    expect(body.error).toContain("org/repo#42");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 400 when body issueNumber does not match the loaded issue's canonical number", async () => {
+    const res = await postRequest(makePayload({ issueNumber: 7 }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("does not match");
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
+  });
+
+  it("releases against the canonical pair when bodies agree", async () => {
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "unclaim_issue",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        success: true,
+      }),
+    });
   });
 });

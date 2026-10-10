@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identity";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -60,6 +61,19 @@ export async function GET(request: Request) {
   const agentNameFilter = searchParams.get("agent");
   const includeStale = searchParams.get("include_stale") !== "false";
 
+  // #1129: a bound worker may only list its own agent's work — the `?agent=`
+  // filter can never widen its scope. An unbound legacy worker token is
+  // refused here.
+  const boundWorkerAgent =
+    auth.authorized && auth.type === "bearer" ? auth.agentName : undefined;
+  const unboundError = await enforceWorkerBound(auth);
+  if (unboundError) return unboundError;
+  if (boundWorkerAgent && agentNameFilter && agentNameFilter !== boundWorkerAgent) {
+    const scopeError = await enforceWorkerAgentScope(auth, agentNameFilter);
+    if (scopeError) return scopeError;
+  }
+  const effectiveAgentFilter = boundWorkerAgent ?? agentNameFilter;
+
   try {
     const where: Record<string, unknown> = {};
 
@@ -72,8 +86,8 @@ export async function GET(request: Request) {
       ];
     }
 
-    if (agentNameFilter) {
-      where.agentName = agentNameFilter;
+    if (effectiveAgentFilter) {
+      where.agentName = effectiveAgentFilter;
     }
 
     const activeItems = await prisma.agentWork.findMany({
@@ -89,8 +103,12 @@ export async function GET(request: Request) {
     const items: AgentWorkItem[] = activeItems.map(toItem);
 
     const now = new Date();
+    // #1129: a bound worker's stale-lease view is scoped to its own agent too;
+    // otherwise the listing would leak every other agent's leases.
+    const leaseWhere: Record<string, unknown> = { expiredAt: { lte: now } };
+    if (effectiveAgentFilter) leaseWhere.agentName = effectiveAgentFilter;
     const expiredLeases = await prisma.lease.findMany({
-      where: { expiredAt: { lte: now } },
+      where: leaseWhere,
       orderBy: { expiredAt: "asc" },
       take: 50,
       include: {

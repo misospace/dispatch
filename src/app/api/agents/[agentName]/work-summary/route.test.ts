@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -333,5 +333,35 @@ describe("GET /api/agents/[agentName]/work-summary — lane aliases", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.unknownLanes).toBeUndefined();
+  });
+});
+
+describe("GET /api/agents/[agentName]/work-summary — bound worker scope (#1129)", () => {
+  it("denies a bound worker summarizing another agent", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/bravo/work-summary", { token: "bound-token" }),
+      { params: Promise.resolve({ agentName: "bravo" }) },
+    );
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("GET /api/agents/[agentName]/work-summary — hard cutover (#1129)", () => {
+  it("denies an unbound legacy worker token", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/alpha/work-summary", { token: "test-worker-token" }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("allows a bound worker to reach its own work summary", async () => {
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.prFixFindMany.mockResolvedValue([]);
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/alpha/work-summary", { token: "bound-token" }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).toBe(200);
   });
 });

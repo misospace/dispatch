@@ -5,7 +5,8 @@ import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX } from "@/types";
-import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse, getAuthorizedActor } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 import { transitionIssueStatus } from "@/lib/issue-status";
@@ -35,12 +36,21 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName, issueNumber, agentName, force } = body as Record<string, unknown>;
+    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName, force } = body as Record<string, unknown>;
 
     // Validate required fields
-    if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
+    if (!issueId || !bodyRepoFullName || typeof bodyIssueNumber !== "number" || !agentName || typeof agentName !== "string") {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
+
+    // A bound worker credential may only claim for its own agent; an unbound
+    // legacy worker token is refused here (#1129).
+    const scopeError = await enforceWorkerAgentScope(auth, agentName);
+    if (scopeError) return scopeError;
+
+    // The audit actor is the immutable token-derived identity for a bound
+    // worker; operators/maintainers keep the body-supplied agent name.
+    const actor = getAuthorizedActor(auth, request, agentName);
 
     // Worker tokens may only claim normally: force-claiming over another
     // agent's lease/assignment requires a maintainer token (#1111).
@@ -48,10 +58,10 @@ export async function POST(request: Request) {
       try {
         await prisma.auditLog.create({
           data: {
-            actor: agentName as string,
+            actor,
             action: "claim_issue",
-            repoFullName: repoFullName as string,
-            issueNumber: issueNumber as number,
+            repoFullName: bodyRepoFullName as string,
+            issueNumber: bodyIssueNumber as number,
             issueId: issueId as string,
             beforeLabels: [],
             afterLabels: [],
@@ -75,6 +85,26 @@ export async function POST(request: Request) {
       return errorResponse("Issue not found in local cache", 404);
     }
 
+    // Cross-issue identity invariant (#1129 review): derive the canonical
+    // GitHub repo and issue number from the loaded DB record rather than
+    // trusting the body. A bound worker passing `issueId` of A and
+    // `repoFullName`/`issueNumber` of B (or any other cross-reference) must
+    // not be able to mutate B on GitHub while claiming A locally — the
+    // subsequent GitHub label writes and the audit row both flow through
+    // the canonical values. Reject any mismatch before any write so a
+    // happy-path worker cannot be steered onto a foreign issue.
+    const repoFullName = issue.repository.fullName;
+    const issueNumber = issue.number;
+    if (
+      bodyRepoFullName !== repoFullName ||
+      bodyIssueNumber !== issueNumber
+    ) {
+      return errorResponse(
+        `issueId does not match repoFullName/issueNumber; expected ${repoFullName}#${issueNumber}`,
+        400,
+      );
+    }
+
     // Refuse closed issues (cached state is fine for this check)
     if (issue.state === "closed") {
       return errorResponse("Cannot claim a closed issue", 400);
@@ -86,7 +116,7 @@ export async function POST(request: Request) {
     // is unreachable: no label writes, no cache update, no lease.
     let liveLabels: string[];
     try {
-      liveLabels = await getLiveIssueLabels(repoFullName as string, issueNumber as number);
+      liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
@@ -94,10 +124,10 @@ export async function POST(request: Request) {
       try {
         await prisma.auditLog.create({
           data: {
-            actor: agentName as string,
+            actor,
             action: "claim_issue",
-            repoFullName: repoFullName as string,
-            issueNumber: issueNumber as number,
+            repoFullName,
+            issueNumber,
             issueId: issueId as string,
             beforeLabels: issue.labels,
             afterLabels: [],
@@ -133,7 +163,7 @@ export async function POST(request: Request) {
     }
 
     // Clean up stale AgentWork records (no matching active Lease)
-    const staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string, repoFullName as string);
+    const staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string, repoFullName);
     if (staleWorkCount > 0) {
       console.warn(`Released ${staleWorkCount} stale AgentWork record(s) for issue #${issueNumber}`);
     }
@@ -153,7 +183,7 @@ export async function POST(request: Request) {
         // is the same GitHub/cache divergence class #1037 fights.
         for (const staleAgentLabel of analysis.existingAgents) {
           try {
-            await removeIssueLabel(repoFullName as string, issueNumber as number, staleAgentLabel);
+            await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
           } catch (e) {
             console.error(`Failed to remove stale agent label ${staleAgentLabel} during force claim:`, e);
             // Non-fatal: continue with force claim even if label removal fails
@@ -172,13 +202,13 @@ export async function POST(request: Request) {
 
     try {
       // Add agent label on GitHub
-      await addIssueLabel(repoFullName as string, issueNumber as number, agentLabel);
+      await addIssueLabel(repoFullName, issueNumber, agentLabel);
 
       // Remove ALL existing status labels (not just the first) before adding
       // status/in-progress — keeps GitHub and the Prisma cache from
       // diverging when an issue carries more than one status label.
       // Base is the live GitHub label set (authoritative — #1037).
-      await transitionIssueStatus(repoFullName as string, issueNumber as number, liveLabels, IN_PROGRESS_STATUS);
+      await transitionIssueStatus(repoFullName, issueNumber, liveLabels, IN_PROGRESS_STATUS);
 
       // Update local cache
       await prisma.issue.update({
@@ -214,8 +244,8 @@ export async function POST(request: Request) {
         data: {
           actor: agentName as string,
           action: "claim_issue",
-          repoFullName: repoFullName as string,
-          issueNumber: issueNumber as number,
+          repoFullName,
+          issueNumber,
           issueId: issueId as string,
           beforeLabels: liveLabels,
           afterLabels: updatedLabels,
@@ -233,8 +263,8 @@ export async function POST(request: Request) {
         data: {
           actor: agentName as string,
           action: "claim_issue",
-          repoFullName: repoFullName as string,
-          issueNumber: issueNumber as number,
+          repoFullName,
+          issueNumber,
           issueId: issueId as string,
           beforeLabels: liveLabels,
           afterLabels: [],

@@ -29,7 +29,7 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token"));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha" }));
 
 import { POST as handleStart } from "./route";
 
@@ -175,5 +175,19 @@ describe("POST /api/agent-work/start", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("Missing required field: agentName (string)");
+  });
+});
+
+describe("POST /api/agent-work/start — bound worker scope (#1129)", () => {
+  it("denies a bound worker starting work for another agent", async () => {
+    const res = await handleStart(
+      new Request("http://localhost/api/agent-work/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer bound-token" },
+        body: JSON.stringify({ agentName: "bravo" }),
+      }),
+    );
+    expect(res.status).toBe(403);
+    expect(mockAgentWork.create).not.toHaveBeenCalled();
   });
 });

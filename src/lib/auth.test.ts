@@ -7,12 +7,15 @@ import {
   isAuthorizedBasicAuth,
   authenticateRequest,
   authorizeRequest,
+  getAuthorizedActor,
+  getBoundWorkerAgent,
   requiredTierForRoute,
   authErrorResponse,
   resetAuthCaches,
   validateOidcConfig,
   authorizeGroomerRequest,
 } from "./auth";
+import { enforceWorkerAgentScope, enforceWorkerBound } from "./worker-identity";
 import { resetRateLimits, type RateLimitOptions, type RateLimitResult } from "./rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
@@ -65,6 +68,7 @@ function clearAll() {
   delete process.env.DISPATCH_AGENT_TOKEN;
   delete process.env.DISPATCH_MAINTAINER_TOKEN;
   delete process.env.DISPATCH_WORKER_TOKEN;
+  delete process.env.DISPATCH_WORKER_TOKENS;
   delete process.env.DISPATCH_GROOMER_TOKEN;
 }
 
@@ -641,6 +645,25 @@ describe("bearer token tiers (#1111)", () => {
     expect(JSON.stringify(call.data)).not.toContain(WORKER_TOKEN);
   });
 
+  it("attributes BOUND worker denial audits to the token-derived identity, ignoring rotated x-agent-name (#1129 review)", async () => {
+    // A denied alpha-bound worker previously could rotate the x-agent-name
+    // header to bravo and either attribute the row to bravo or evade the
+    // per-actor throttle. The audit row must follow the token.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:bound-token`;
+    const request = new Request("http://localhost/api/sync", {
+      method: "POST",
+      headers: { Authorization: "Bearer bound-token", "x-agent-name": "bravo" },
+    });
+    await authorizeRequest(request);
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.actor).toBe("alpha");
+    // The throttle bucket must also derive from the token-derived identity.
+    expect(JSON.stringify(call.data)).not.toContain("bound-token");
+    expect(JSON.stringify(call.data)).not.toContain("bravo");
+  });
+
   it("authorizeGroomerRequest preserves the worker-tier forbidden result", async () => {
     // No dedicated groomer token configured.
     await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
@@ -678,6 +701,91 @@ describe("bearer token tiers (#1111)", () => {
       authorized: false,
       forbidden: true,
       requiredTier: "maintainer",
+    });
+  });
+
+  it("does not escalate a groomer token that duplicates a BOUND worker token to maintainer (#1129 review)", async () => {
+    // The groomer token value is also a token listed in DISPATCH_WORKER_TOKENS:
+    // the tier table resolves it to the lower worker tier, and the privileged
+    // fallback must keep that fail-closed behaviour rather than promote the
+    // value to the hosted-groomer maintainer identity.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:${WORKER_TOKEN}`;
+    process.env.DISPATCH_GROOMER_TOKEN = WORKER_TOKEN;
+    const request = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    await expect(authorizeGroomerRequest(request)).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+  });
+
+  it("does not escalate an AMBIGUOUS bound token presented as the groomer token to maintainer (#1129 review)", async () => {
+    // DISPATCH_WORKER_TOKENS="alpha:dup,bravo:dup" — the value is dropped from
+    // the tier table as ambiguous, but its value MUST still fail-closed in the
+    // privileged fallback so it cannot be promoted into the
+    // hosted-groomer/maintainer identity through a value collision. The
+    // ambiguous value is not a recognized identity at all, so the result here
+    // is the same plain `authorized: false` (401 Unauthorized) the standard
+    // auth path returns for an unknown token — what matters is that the
+    // hostile escalation to maintainer is blocked.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:dup,bravo:dup";
+    process.env.DISPATCH_GROOMER_TOKEN = "dup";
+    const request = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer dup" },
+    });
+    const result = await authorizeGroomerRequest(request);
+    expect(result).toEqual({ authorized: false });
+    expect(result).not.toMatchObject({ tier: "maintainer" });
+    // authErrorResponse maps a plain `authorized: false` to 401, so the
+    // ambiguous value is denied rather than escalated.
+    expect(authErrorResponse(result as Extract<typeof result, { authorized: false }>).status).toBe(401);
+  });
+
+  it("denies the exact 3-env ambiguous-token/legacy collision at the worker route gate (#1129 review)", async () => {
+    // DISPATCH_WORKER_TOKENS="alpha:shared,bravo:shared" + DISPATCH_WORKER_TOKEN="shared".
+    // The previous implementation demoted "shared" to the legacy unbound
+    // worker credential ({ tier: "worker", legacyUnbound: true }) and let it
+    // bypass the binding gate on identity-scoped worker routes. The #1129
+    // contract requires fail-closed: the ambiguous value is rejected
+    // outright, even though its value matches DISPATCH_WORKER_TOKEN, and the
+    // standard auth path returns plain `authorized: false` (401). The
+    // groomer fallback above already pins the maintainer-escape path; this
+    // test pins the worker-route path for completeness.
+    delete process.env.DISPATCH_GROOMER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:shared,bravo:shared";
+    process.env.DISPATCH_WORKER_TOKEN = "shared";
+    resetAuthCaches();
+    const request = new Request("http://localhost/api/agents/alpha/next-task", {
+      method: "GET",
+      headers: { Authorization: "Bearer shared" },
+    });
+    const result = await authorizeRequest(request);
+    expect(result).toEqual({ authorized: false });
+    expect(result).not.toMatchObject({ tier: "worker", legacyUnbound: true });
+    expect(result).not.toMatchObject({ tier: "worker" });
+    expect(authErrorResponse(result as Extract<typeof result, { authorized: false }>).status).toBe(401);
+  });
+
+  it("still authorizes a distinct, non-worker groomer token at maintainer tier", async () => {
+    // Sanity check that the new worker-configured-value guard does not
+    // regress the plain happy path: a unique groomer token unrelated to any
+    // worker credential still escalates to the maintainer tier.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_GROOMER_TOKEN = "groomer-token";
+    const request = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer groomer-token" },
+    });
+    await expect(authorizeGroomerRequest(request)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "maintainer",
     });
   });
 
@@ -806,5 +914,216 @@ describe("bearer token tiers (#1111)", () => {
       type: "bearer",
       tier: "worker",
     });
+  });
+});
+
+describe("bound worker identity (#1129)", () => {
+  const BOUND_TOKEN = "bound-worker-token";
+
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    resetRateLimits();
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:${BOUND_TOKEN}`;
+  });
+  afterEach(() => {
+    clearAll();
+  });
+
+  function boundRequest(pathname: string, method = "GET", headers: Record<string, string> = {}): Request {
+    return new Request(`http://localhost${pathname}`, {
+      method,
+      headers: { Authorization: `Bearer ${BOUND_TOKEN}`, ...headers },
+    });
+  }
+
+  it("derives actor and agentName from the token, ignoring x-agent-name", async () => {
+    const result = await authorizeRequest(
+      boundRequest("/api/agents/alpha/next-task", "GET", { "x-agent-name": "bravo" }),
+    );
+    expect(result).toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+      agentName: "alpha",
+      actor: "alpha",
+    });
+  });
+
+  it("authenticateRequest carries the bound agentName", () => {
+    expect(authenticateRequest(boundRequest("/api/agents/alpha/next-task"))).toEqual({
+      authorized: true,
+      type: "bearer",
+      tier: "worker",
+      agentName: "alpha",
+    });
+  });
+
+  it("getAuthorizedActor ignores a body fallback for a bound worker", async () => {
+    const auth = await authorizeRequest(boundRequest("/api/issues/status", "POST"));
+    expect(getAuthorizedActor(auth, boundRequest("/api/issues/status", "POST"), "bravo")).toBe("alpha");
+  });
+
+  it("getBoundWorkerAgent returns the bound agent and undefined for maintainers", async () => {
+    const bound = await authorizeRequest(boundRequest("/api/agents/alpha/next-task"));
+    expect(getBoundWorkerAgent(bound)).toBe("alpha");
+
+    delete process.env.DISPATCH_WORKER_TOKENS;
+    resetAuthCaches();
+    process.env.DISPATCH_AGENT_TOKEN = "maintainer-token";
+    const maintainer = await authorizeRequest(
+      new Request("http://localhost/api/agents/alpha/next-task", {
+        headers: { Authorization: "Bearer maintainer-token" },
+      }),
+    );
+    expect(getBoundWorkerAgent(maintainer)).toBeUndefined();
+  });
+
+  it("keeps the x-agent-name fallback for maintainer tokens", async () => {
+    delete process.env.DISPATCH_WORKER_TOKENS;
+    resetAuthCaches();
+    process.env.DISPATCH_AGENT_TOKEN = "maintainer-token";
+    const result = await authorizeRequest(
+      new Request("http://localhost/api/test", {
+        headers: { Authorization: "Bearer maintainer-token", "x-agent-name": "bravo" },
+      }),
+    );
+    expect(result).toMatchObject({ authorized: true, tier: "maintainer", actor: "bravo" });
+  });
+
+  it("legacy unbound worker token still resolves at worker tier (denied at the route gate)", async () => {
+    delete process.env.DISPATCH_WORKER_TOKENS;
+    resetAuthCaches();
+    process.env.DISPATCH_WORKER_TOKEN = "legacy-token";
+    const result = await authorizeRequest(
+      new Request("http://localhost/api/agents/alpha/next-task", {
+        headers: { Authorization: "Bearer legacy-token" },
+      }),
+    );
+    expect(result).toMatchObject({ authorized: true, tier: "worker" });
+    expect(getBoundWorkerAgent(result)).toBeUndefined();
+  });
+});
+
+describe("enforceWorkerAgentScope (#1129)", () => {
+  beforeEach(() => {
+    resetRateLimits();
+    mocks.auditCreate.mockReset();
+  });
+
+  it("allows maintainer, oidc, basic and disabled callers for any agent", async () => {
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "oidc", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "basic", username: "operator", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "disabled", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "bearer", actor: "operator", tier: "maintainer" },
+        "any-agent",
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("allows a bound worker acting for its own agent", async () => {
+    await expect(
+      enforceWorkerAgentScope(
+        { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+        "alpha",
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("denies a bound worker acting for another agent with a 403 and no token leak", async () => {
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(res?.status).toBe(403);
+    const body = (await res!.json()) as { error: string };
+    expect(body.error).toContain("alpha");
+    expect(body.error).toContain("bravo");
+  });
+
+  it("writes a best-effort worker_scope_denied audit row on denial", async () => {
+    await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.action).toBe("worker_scope_denied");
+    expect(call.data.success).toBe(false);
+    expect(call.data.actor).toBe("alpha");
+    expect(JSON.stringify(call.data)).not.toContain("bound-worker-token");
+  });
+
+  it("a failing scope-denial audit write never changes the 403 decision", async () => {
+    mocks.auditCreate.mockRejectedValueOnce(new Error("db down"));
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(res?.status).toBe(403);
+  });
+
+  it("a throwing rate limiter never changes the 403 decision", async () => {
+    mocks.checkRateLimit.mockImplementationOnce(() => {
+      throw new Error("limiter down");
+    });
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      "bravo",
+    );
+    expect(res?.status).toBe(403);
+  });
+
+  it("throttles scope-denial audit rows per actor", async () => {
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 14; i += 1) {
+        await enforceWorkerAgentScope(
+          { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+          "bravo",
+        );
+      }
+      expect(mocks.auditCreate).toHaveBeenCalledTimes(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("denies an unbound legacy worker token with a 403 naming the migration env var", async () => {
+    const res = await enforceWorkerAgentScope(
+      { authorized: true, type: "bearer", actor: "agent", tier: "worker" },
+      "alpha",
+    );
+    expect(res?.status).toBe(403);
+    const body = (await res!.json()) as { error: string };
+    expect(body.error).toContain("DISPATCH_WORKER_TOKENS");
+  });
+
+  it("enforceWorkerBound passes bound workers and maintainers, denies unbound workers", async () => {
+    await expect(
+      enforceWorkerBound({ authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" }),
+    ).resolves.toBeNull();
+    await expect(
+      enforceWorkerBound({ authorized: true, type: "bearer", actor: "operator", tier: "maintainer" }),
+    ).resolves.toBeNull();
+    const res = await enforceWorkerBound({ authorized: true, type: "bearer", actor: "agent", tier: "worker" });
+    expect(res?.status).toBe(403);
   });
 });

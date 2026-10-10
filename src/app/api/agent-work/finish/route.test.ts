@@ -34,7 +34,7 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token"));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha" }));
 
 import { POST as handleFinish } from "./route";
 
@@ -294,5 +294,19 @@ describe("POST /api/agent-work/finish", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.state).toBe("IN_PROGRESS");
+  });
+});
+
+describe("POST /api/agent-work/finish — bound worker scope (#1129)", () => {
+  it("denies a bound worker finishing another agent's work", async () => {
+    const res = await handleFinish(
+      new Request("http://localhost/api/agent-work/finish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer bound-token" },
+        body: JSON.stringify({ agentName: "bravo", state: "DONE" }),
+      }),
+    );
+    expect(res.status).toBe(403);
+    expect(mockAgentWork.update).not.toHaveBeenCalled();
   });
 });
