@@ -1,10 +1,12 @@
 import type { EvidenceProvenance, GroomingEvidenceSnapshot } from "./evidence-snapshot";
 import {
   EMPTY_PINNED_CONTENT,
+  isExplicitRegressionReport,
   parseAcceptanceCriteria,
   parseExpectedFiles,
   type CloseGroundingContext,
   type PinnedReadContent,
+  type ReopenRegressionEvidence,
 } from "./close-grounding";
 
 /**
@@ -78,6 +80,20 @@ export function repositoryEvidenceId(path: string): string {
 
 export function commentEvidenceId(commentId: string): string {
   return `comment:${commentId}`;
+}
+
+/** Cap on explicit regression reports retained in the grounding context (#1113). */
+const MAX_REGRESSION_REPORTS = 5;
+
+function reopenRegressionEvidenceOf(snapshot: GroomingEvidenceSnapshot): ReopenRegressionEvidence {
+  return {
+    reopened: snapshot.issue.stateReason === "reopened",
+    historyKnown: snapshot.issue.stateReason !== undefined,
+    regressionReports: snapshot.comments
+      .filter((comment) => comment.authoritative && isExplicitRegressionReport(comment.body))
+      .slice(0, MAX_REGRESSION_REPORTS)
+      .map((comment) => `comment:${comment.id} by ${comment.author}`),
+  };
 }
 
 /**
@@ -177,6 +193,7 @@ export function buildEvidenceCatalog(
       expectedFiles: parseExpectedFiles(snapshot.issue.body),
       acceptanceCriteria: parseAcceptanceCriteria(snapshot.issue.body),
       pinnedContent: pinnedContent.headSha === snapshot.headSha ? pinnedContent : EMPTY_PINNED_CONTENT,
+      counterEvidence: reopenRegressionEvidenceOf(snapshot),
     },
   };
 }
@@ -203,6 +220,18 @@ export function renderEvidenceCatalog(catalog: EvidenceCatalog): string {
     closeLines.push(
       "Its acceptance criteria, which an already_done close must ground one by one:",
       ...grounding.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+    );
+  }
+  const { counterEvidence } = grounding;
+  if (!counterEvidence.historyKnown) {
+    closeLines.push("This issue's reopen history was not captured; an already_done close cannot be trusted without it.");
+  }
+  if (counterEvidence.reopened) {
+    closeLines.push("This issue was reopened after being closed; do not close it as already_done.");
+  }
+  if (counterEvidence.regressionReports.length > 0) {
+    closeLines.push(
+      `Authoritative comments report this issue still reproduces (${counterEvidence.regressionReports.join(", ")}); do not close it as already_done.`,
     );
   }
   return [

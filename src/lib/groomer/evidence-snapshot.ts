@@ -87,6 +87,11 @@ export interface EvidenceSnapshotIssue {
   /** Optional for legacy snapshots; new captures always include both fields. */
   author?: string | null;
   authorAssociation?: string | null;
+  /**
+   * GitHub's `state_reason` as captured (#1113): null = open and never
+   * reopened, "reopened" = closed then reopened, undefined = not captured.
+   */
+  stateReason?: string | null;
 }
 
 export interface GroomingEvidenceSnapshot {
@@ -292,6 +297,7 @@ export function summarizeEvidenceForPersistence(snapshot: GroomingEvidenceSnapsh
     issueUpdatedAt: snapshot.issue.updatedAt,
     issueCommentsCount: snapshot.issue.commentsCount,
     issueState: snapshot.issue.state,
+    issueStateReason: snapshot.issue.stateReason ?? null,
     issueAuthor: snapshot.issue.author,
     issueAuthorAssociation: snapshot.issue.authorAssociation,
     commentCount: comments.length,
@@ -372,6 +378,7 @@ export async function collectGroomingEvidenceSnapshot(
       commentsCount: live.comments,
       author: live.user?.login ?? null,
       authorAssociation: live.author_association ?? null,
+      stateReason: live.state_reason,
     };
   } catch (err) {
     warnings.push(`evidence: failed to fetch live issue state: ${errorMessage(err)}`);

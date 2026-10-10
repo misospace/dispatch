@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma, asAgentWorkClient } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { parseFinishAgentWorkInput, finishAgentWork } from "@/lib/agent-work";
 
 /**
@@ -58,6 +59,11 @@ export async function POST(request: Request) {
     if ("error" in parsed) {
       return errorResponse(parsed.error, 400);
     }
+
+    // #1129: a bound worker credential may only finish its own agent's work;
+    // an unbound legacy worker token is refused here.
+    const scopeError = await enforceWorkerAgentScope(auth, parsed.agentName);
+    if (scopeError) return scopeError;
 
     const work = await finishAgentWork(asAgentWorkClient(prisma), parsed);
     if (!work) {

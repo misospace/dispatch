@@ -4,10 +4,12 @@ import {
   asRepoFilePath,
   collectPinnedReadContent,
   evaluateCloseGrounding,
+  isExplicitRegressionReport,
   normalizeCriterion,
   normalizeWhitespace,
   parseAcceptanceCriteria,
   parseExpectedFiles,
+  reopenRegressionReasons,
   trivialExcerptReason,
 } from "./close-grounding";
 import { buildEvidenceCatalog } from "./plan-evidence";
@@ -301,5 +303,62 @@ describe("catalog grounding context", () => {
     const pr = cat.entries.find((e) => e.id === "github:pr:org/repo#50")!;
     expect(pr).toMatchObject({ closes: ["org/repo#42"], baseRef: "main" });
     expect(pr.label).toContain("closes org/repo#42");
+  });
+});
+
+describe("isExplicitRegressionReport", () => {
+  it("recognises explicit regression or still-reproduces language", () => {
+    for (const body of [
+      "This regressed on main after the merged fix.",
+      "The bug is still present after the fix.",
+      "sync --dry-run still fails.",
+      "This is not fixed on main.",
+      "The bug is back.",
+      "The issue persists.",
+      "I reopened this; it still fails.",
+      "It recurred again today.",
+    ]) {
+      expect(isExplicitRegressionReport(body), body).toBe(true);
+    }
+  });
+
+  it("does not treat ordinary prose or regression tests as a report", () => {
+    for (const body of [
+      "Thanks, this works now.",
+      "We should add a regression test for this.",
+      "The regression tests pass.",
+      "Adding regression-testing coverage for the new path.",
+      "The regression_test suite is green.",
+      "Can you clarify the expected behavior?",
+      "LGTM.",
+    ]) {
+      expect(isExplicitRegressionReport(body), body).toBe(false);
+    }
+  });
+});
+
+describe("reopenRegressionReasons", () => {
+  it("is empty for an ordinary issue with known history and no reports", () => {
+    expect(reopenRegressionReasons({ reopened: false, historyKnown: true, regressionReports: [] })).toEqual([]);
+  });
+
+  it("vetoes a reopened issue", () => {
+    const reasons = reopenRegressionReasons({ reopened: true, historyKnown: true, regressionReports: [] });
+    expect(reasons.some((reason) => reason.includes("reopened after it was closed"))).toBe(true);
+  });
+
+  it("vetoes an explicit regression report and names the comment", () => {
+    const reasons = reopenRegressionReasons({
+      reopened: false,
+      historyKnown: true,
+      regressionReports: ["comment:7001 by maintainer"],
+    });
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain("comment:7001 by maintainer");
+  });
+
+  it("fails closed when reopen history was not captured", () => {
+    const reasons = reopenRegressionReasons({ reopened: false, historyKnown: false, regressionReports: [] });
+    expect(reasons.some((reason) => reason.includes("reopen history was not captured"))).toBe(true);
   });
 });

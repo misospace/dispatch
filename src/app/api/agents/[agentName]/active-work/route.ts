@@ -3,6 +3,7 @@ import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { resolveActiveWork } from "@/lib/lease";
 import type { ActiveWorkResult } from "@/lib/next-action";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
   const auth = await authorizeRequest(request);
@@ -11,6 +12,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   }
 
   const { agentName } = await params;
+
+  // A bound worker credential may only read its own agent's active work; an
+  // unbound legacy worker token is refused here (#1129).
+  const scopeError = await enforceWorkerAgentScope(auth, agentName);
+  if (scopeError) return scopeError;
 
   try {
     const context = await resolveActiveWork(agentName);

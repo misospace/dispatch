@@ -49,6 +49,7 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
       body: "Broken.",
       labels: ["priority/p1", "status/backlog"],
       state: "open",
+      stateReason: null,
       updatedAt: "2026-09-25T00:00:00.000Z",
       url: "https://github.com/org/repo/issues/42",
     },
@@ -169,7 +170,13 @@ function decomposeDraft(count = 2): GroomingPlanDraft {
 }
 
 function live(snap = snapshot()): LiveIssueState {
-  return { title: snap.issue.title, body: snap.issue.body, labels: snap.issue.labels, state: snap.issue.state };
+  return {
+    title: snap.issue.title,
+    body: snap.issue.body,
+    labels: snap.issue.labels,
+    state: snap.issue.state,
+    stateReason: snap.issue.stateReason ?? null,
+  };
 }
 
 function diffFor(d: GroomingPlanDraft, snap = snapshot()): GroomingMutationDiff {

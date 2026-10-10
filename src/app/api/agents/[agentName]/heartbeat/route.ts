@@ -15,6 +15,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { runSyncBestEffort, runReconcileBestEffort } from "@/lib/heartbeat";
 
 export type AgentHeartbeatResponse = {
@@ -43,6 +44,11 @@ export async function POST(
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  // A bound worker credential may only heartbeat for its own agent; an unbound
+  // legacy worker token is refused on this identity-scoped route (#1129).
+  const scopeError = await enforceWorkerAgentScope(auth, agentName);
+  if (scopeError) return scopeError;
 
   const startedAt = new Date();
   const warnings: string[] = [];

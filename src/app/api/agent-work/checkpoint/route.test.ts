@@ -34,7 +34,7 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token"));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha" }));
 
 import { POST as handleCheckpoint } from "./route";
 
@@ -332,5 +332,19 @@ describe("POST /api/agent-work/checkpoint", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.checkpoint).toBe("BRANCH_CREATED");
+  });
+});
+
+describe("POST /api/agent-work/checkpoint — bound worker scope (#1129)", () => {
+  it("denies a bound worker checkpointing another agent's work", async () => {
+    const res = await handleCheckpoint(
+      new Request("http://localhost/api/agent-work/checkpoint", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer bound-token" },
+        body: JSON.stringify({ agentName: "bravo", checkpoint: "CHANGES_MADE" }),
+      }),
+    );
+    expect(res.status).toBe(403);
+    expect(mockAgentWork.update).not.toHaveBeenCalled();
   });
 });

@@ -30,6 +30,7 @@ function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEv
       body: "Login fails after password reset.",
       labels: ["priority/p1", "status/backlog"],
       state: "open",
+      stateReason: null,
       updatedAt: "2026-09-25T00:00:00.000Z",
       url: "https://github.com/org/repo/issues/42",
     },
@@ -216,6 +217,7 @@ describe("validateApplyPreconditions", () => {
       ["body", { body: "Edited body." }, /body/],
       ["labels", { labels: ["priority/p1", "status/in-progress", "agent/coder"] }, /labels \(\+agent\/coder \+status\/in-progress -status\/backlog\)/],
       ["state", { state: "closed" }, /state \(open -> closed\)/],
+      ["state reason", { stateReason: "reopened" }, /state reason \(none -> reopened\)/],
     ])("fails when the %s changed after the snapshot", async (_field, patch, detail) => {
       const result = await validateApplyPreconditions(
         input(),
@@ -248,6 +250,46 @@ describe("validateApplyPreconditions", () => {
       );
       expect(check(result, "issue")).toMatchObject({ status: "unverifiable", detail: expect.stringContaining("502") });
       expect(result.ok).toBe(false);
+    });
+
+    it("fails closed when the snapshot captured state_reason=null but the fresh read did not capture state_reason (dispatch#1113)", async () => {
+      // Repro of the blocker-2 bypass: an open issue with state_reason=null at
+      // planning time, where the apply-time re-read omits the field. The
+      // captured safety signal must not be silently treated as re-validated.
+      const captured = snapshot({ issue: { ...snapshot().issue, stateReason: null } });
+      const freshWithoutReason = { ...snapshot().issue, stateReason: undefined };
+      const result = await validateApplyPreconditions(
+        input({ evidence: captured }),
+        reader({ fresh: { issue: freshWithoutReason } }),
+      );
+      expect(check(result, "issue")).toMatchObject({
+        status: "unverifiable",
+        detail: expect.stringContaining("the live state_reason was not captured"),
+      });
+      expect(check(result, "issue").detail).toMatch(/fail closed/);
+      expect(result.ok).toBe(false);
+    });
+
+    it("fails closed when the snapshot captured state_reason=reopened but the fresh read did not capture state_reason (dispatch#1113)", async () => {
+      const captured = snapshot({ issue: { ...snapshot().issue, stateReason: "reopened" } });
+      const freshWithoutReason = { ...snapshot().issue, stateReason: undefined };
+      const result = await validateApplyPreconditions(
+        input({ evidence: captured }),
+        reader({ fresh: { issue: freshWithoutReason } }),
+      );
+      expect(check(result, "issue")).toMatchObject({
+        status: "unverifiable",
+        detail: expect.stringContaining("the live state_reason was not captured"),
+      });
+      expect(check(result, "issue").detail).toContain("reopened");
+      expect(result.ok).toBe(false);
+    });
+
+    it("passes when both the snapshot and the fresh read capture state_reason=null", async () => {
+      // The fail-closed branch must not change ordinary same-state comparisons.
+      const result = await validateApplyPreconditions(input(), reader());
+      expect(check(result, "issue").status).toBe("passed");
+      expect(result.ok).toBe(true);
     });
 
     it("is unverifiable when the snapshot never captured the issue", async () => {
@@ -539,6 +581,62 @@ describe("evaluateClosePolicy", () => {
     const plan = planFor(alreadyDoneDraft());
     const unpinned = catalogFor(snapshot({ headSha: null, pinnedRef: null }));
     expect(evaluateClosePolicy(plan, unpinned)).toContain("the close cites no repository content read at the pinned head SHA");
+  });
+
+  it("withholds a reopened issue despite grounded excerpts (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const reopened = catalogFor(snapshot({ issue: { ...snapshot().issue, stateReason: "reopened" } }));
+    expect(evaluateClosePolicy(plan, reopened)).toEqual([
+      "the issue was reopened after it was closed; an already_done close needs human review",
+    ]);
+  });
+
+  it("withholds an issue with an explicit regression report despite grounded excerpts (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const reported = catalogFor(
+      snapshot({
+        comments: [
+          {
+            id: "7001",
+            author: "maintainer",
+            createdAt: "2026-09-25T00:00:00Z",
+            body: "This regressed on main; the redirect still drops the return URL.",
+            provenance: "human_comment",
+            authoritative: true,
+          },
+        ],
+      }),
+    );
+    expect(evaluateClosePolicy(plan, reported)).toEqual([
+      "authoritative comments report the issue still reproduces (comment:7001 by maintainer); an already_done close needs human review",
+    ]);
+  });
+
+  it("fails closed when reopen history was not captured (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const unknown = catalogFor(snapshot({ issue: { ...snapshot().issue, stateReason: undefined } }));
+    expect(evaluateClosePolicy(plan, unknown)).toEqual([
+      "the issue's reopen history was not captured, so it cannot be established that this open issue was not reopened (fail closed)",
+    ]);
+  });
+
+  it("does not let an automation regression claim withhold a close (dispatch#1113)", () => {
+    const plan = planFor(alreadyDoneDraft());
+    const automated = catalogFor(
+      snapshot({
+        comments: [
+          {
+            id: "7002",
+            author: "itsmiso-ai",
+            createdAt: "2026-09-25T00:00:00Z",
+            body: "This regressed on main.",
+            provenance: "automation_comment",
+            authoritative: false,
+          },
+        ],
+      }),
+    );
+    expect(evaluateClosePolicy(plan, automated)).toEqual([]);
   });
 });
 

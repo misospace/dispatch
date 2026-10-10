@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
 const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, prismaMock } = vi.hoisted(() => {
   const mockAgentRun = {
@@ -1632,5 +1632,35 @@ describe("POST /api/agents/[agentName]/tasks/report — late/duplicate settlemen
       where: { agentName_idempotencyKey: { agentName: "test-agent", idempotencyKey: "worker-run-9:report-2" } },
       data: { prFixResolution: expect.objectContaining({ action: "skipped" }) },
     });
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — bound worker scope (#1129)", () => {
+  it("denies a bound worker reporting for another agent", async () => {
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/bravo/tasks/report", {
+        method: "POST",
+        token: "bound-token",
+        body: { taskType: "implement", outcome: "pr_opened" },
+      }),
+      { params: Promise.resolve({ agentName: "bravo" }) },
+    );
+    expect(res.status).toBe(403);
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — hard cutover (#1129)", () => {
+  it("denies an unbound legacy worker token", async () => {
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/alpha/tasks/report", {
+        method: "POST",
+        token: "test-worker-token",
+        body: { taskType: "implement", outcome: "pr_opened" },
+      }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).toBe(403);
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
   });
 });

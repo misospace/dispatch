@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -2374,5 +2374,23 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       expect(mocks.prFixFindMany).not.toHaveBeenCalled();
       expect(mocks.findLeasedIssueIds).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("GET /api/agents/[agentName]/next-task — bound worker scope (#1129)", () => {
+  it("denies a bound worker requesting another agent's task", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/bravo/next-task", { token: "bound-token" }),
+      { params: Promise.resolve({ agentName: "bravo" }) },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("denies an unbound legacy worker token", async () => {
+    const res = await GET(
+      authedRequest("http://localhost/api/agents/alpha/next-task", { token: "test-worker-token" }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).toBe(403);
   });
 });

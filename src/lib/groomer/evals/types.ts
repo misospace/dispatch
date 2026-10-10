@@ -26,6 +26,12 @@ export interface CaseIssue {
   labels: string[];
   /** Dispatch's cached lane at selection time. */
   lane?: string | null;
+  /**
+   * GitHub's issue state reason for the fixture's live issue (#1113):
+   * "reopened" models a closed-then-reopened issue, null/omitted an ordinary
+   * open issue that was never reopened.
+   */
+  stateReason?: string | null;
 }
 
 /**
@@ -166,6 +172,14 @@ export interface GroomingCase {
   regressionOf?: string;
   repoFullName: string;
   issue: CaseIssue;
+  /**
+   * Optional newest-first comment list for the snapshot evidence fetch
+   * (dispatch#1205). When set, the harness returns this list (capped) for
+   * direction="desc" fetches and `comments` for direction="asc", modelling
+   * the snapshot's independent newest-comment fetch. Absent: the single
+   * `comments` list is returned for any direction (legacy behaviour).
+   */
+  commentsDesc?: CaseComment[];
   comments?: CaseComment[];
   repository: CaseRepository;
   relatedWork?: Array<Pick<RelatedWorkObservation, "key" | "kind" | "state" | "via" | "closes" | "baseRef">>;

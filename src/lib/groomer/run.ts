@@ -63,6 +63,15 @@ export interface RunHostedGroomerOptions {
 
 const GROOMER_LEASE_TTL_MS = 10 * 60 * 1000;
 const PARTICIPANT_SCAN_LIMIT = 100;
+/**
+ * Comments fetched for the evidence snapshot (dispatch#1205): the newest N
+ * descending, so a regression report outside the oldest-five window is seen
+ * by the reopen/regression guard (#1113). The prompt context separately
+ * keeps its own oldest-ascending fetch (`fetchIssueComments` defaults); this
+ * snapshot fetch is independent and dedicated to the guard. Bounded so a
+ * runaway comment count cannot bloat the snapshot or the apply re-read.
+ */
+const SNAPSHOT_COMMENT_LIMIT = 30;
 
 /**
  * The tail of the run's lease-based deadline, reserved for the apply stage
@@ -272,6 +281,20 @@ async function executeGroomerRun(
       participantScanFailed = true;
     }
 
+    // Snapshot comments: newest first, capped and bounded (dispatch#1205),
+    // so the reopen/regression guard (#1113) sees a recent human regression
+    // report outside the prompt's oldest-five window. Fetched independently
+    // of `comments` (prompt context) and `participants` (trust scan): a
+    // snapshot-comment failure degrades to the prompt's oldest-five so the
+    // run still captures the head of the conversation; this matches the
+    // existing fail-closed semantics elsewhere in the snapshot.
+    let snapshotComments: Awaited<ReturnType<typeof fetchIssueComments>> = comments;
+    try {
+      snapshotComments = await deps.fetchComments(candidate.repoFullName, candidate.number, SNAPSHOT_COMMENT_LIMIT, "desc");
+    } catch {
+      snapshotComments = comments;
+    }
+
     // Capture the evidence snapshot BEFORE model analysis: the pinned
     // default-branch head SHA plus the live issue/comment state that every
     // repository read in this run is pinned to. Never fatal — the collector
@@ -282,7 +305,7 @@ async function executeGroomerRun(
       evidence = await deps.collectEvidence({
         repoFullName: candidate.repoFullName,
         issueNumber: candidate.number,
-        comments,
+        comments: snapshotComments,
       });
     } catch (err) {
       // Defensive: a broken injected dep must not fail the groom. Fall back

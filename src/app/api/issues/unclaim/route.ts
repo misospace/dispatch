@@ -3,6 +3,7 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { getAgentFromLabels, AGENT_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import {
   releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue,
@@ -33,25 +34,49 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName, issueNumber, agentName } = body as Record<string, unknown>;
+    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName } = body as Record<string, unknown>;
 
     // Validate required fields
-    if (!issueId || !repoFullName || typeof issueNumber !== "number" || !agentName || typeof agentName !== "string") {
+    if (!issueId || !bodyRepoFullName || typeof bodyIssueNumber !== "number" || !agentName || typeof agentName !== "string") {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
+
+    // A bound worker credential may only release its own claim; an unbound
+    // legacy worker token is refused here (#1129).
+    const scopeError = await enforceWorkerAgentScope(auth, agentName);
+    if (scopeError) return scopeError;
 
     const agentLabel = `${AGENT_PREFIX}${agentName}` as const;
     const actor = getAuthorizedActor(auth, request, agentName as string);
     const isAgentSelfUnclaim = auth.type === "bearer" && actor === agentName;
     const auditAction = isAgentSelfUnclaim ? "unclaim_issue" : "unclaim_issue_by_operator";
 
-    // Fetch the issue from the local database to get current labels
+    // Fetch the issue from the local database to get current labels and the
+    // canonical GitHub repo so we can reject a cross-reference mix-up before
+    // any GitHub write (#1129 review): a token for alpha passing `issueId`
+    // of an alpha-assigned A but `repoFullName/issueNumber` of a bravo-owned
+    // B must not be able to strip labels off B while releasing A locally.
     const issue = await prisma.issue.findUnique({
       where: { id: issueId as string },
+      include: { repository: true },
     });
 
     if (!issue) {
       return errorResponse("Issue not found in local cache", 404);
+    }
+
+    // Cross-issue identity invariant: derive canonical repo + number from the
+    // loaded DB record and refuse any mismatch before any write.
+    const repoFullName = issue.repository.fullName;
+    const issueNumber = issue.number;
+    if (
+      bodyRepoFullName !== repoFullName ||
+      bodyIssueNumber !== issueNumber
+    ) {
+      return errorResponse(
+        `issueId does not match repoFullName/issueNumber; expected ${repoFullName}#${issueNumber}`,
+        400,
+      );
     }
 
     // Refuse closed issues
@@ -77,8 +102,8 @@ export async function POST(request: Request) {
       const released = await releaseIssueClaim({
         prisma,
         issue,
-        repoFullName: repoFullName as string,
-        issueNumber: issueNumber as number,
+        repoFullName,
+        issueNumber,
         agentName: agentName as string,
       });
 
@@ -101,8 +126,8 @@ export async function POST(request: Request) {
         data: {
           actor,
           action: auditAction,
-          repoFullName: repoFullName as string,
-          issueNumber: issueNumber as number,
+          repoFullName,
+          issueNumber,
           issueId: issueId as string,
           beforeLabels: issue.labels,
           afterLabels: updatedLabels,
@@ -125,8 +150,8 @@ export async function POST(request: Request) {
         data: {
           actor,
           action: auditAction,
-          repoFullName: repoFullName as string,
-          issueNumber: issueNumber as number,
+          repoFullName,
+          issueNumber,
           issueId: issueId as string,
           beforeLabels: issue.labels,
           afterLabels: [],
