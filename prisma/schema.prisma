@@ -194,6 +194,20 @@ model PrFixQueueItem {
   // the generation; entries for older generations are inert, and every
   // fresh attempt clears the list.
   agentHandouts String[] @default([])
+  // Acknowledged hand-outs, per generation (#1211): each entry is
+  // `<agentName>@<generation>`, written when a worker durably materialized the
+  // attempt (e.g. created the executor run that owns the work). next-task
+  // stamps a hand-out and records the agent in `agentHandouts`, but a worker
+  // that dies before durably creating its run leaves no trace — no ack, no
+  // re-offer — and the item is stranded. The reclaimer refuses to reclaim a
+  // generation any agent acknowledged; entries for older generations are inert
+  // and every fresh attempt clears the list.
+  handoutAcks  String[] @default([])
+  // Bounded automatic reclamations of stale unacknowledged hand-outs (#1211):
+  // counts how many times the reclaimer has reopened this item because a
+  // stamped hand-out was never acknowledged. Past PR_FIX_MAX_RECLAIMS the item
+  // goes to BLOCKED in the NEEDS_HUMAN lane instead of being reclaimed again.
+  handoutReclaims Int @default(0)
   author       String?
   history      PrFixHistory[]
 

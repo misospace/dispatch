@@ -47,7 +47,7 @@ describe("schedulerConfigFromEnv", () => {
 
   it("configures sync + groomer + pr-followup + ci-failures + prune-closed + reconcile + stale-work with defaults", () => {
     const jobs = schedulerConfigFromEnv({}).jobs;
-    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "ci-failures", "prune-closed", "reconcile", "stale-work"]);
+    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "ci-failures", "prune-closed", "reconcile", "stale-work", "pr-fix-sweep"]);
     const byName = (n: string) => jobs.find((j) => j.name === n)!;
     expect(byName("groomer").path).toBe("/api/groomer/run");
     expect(byName("groomer").intervalMs).toBe(10 * 60 * 1000);
@@ -61,6 +61,8 @@ describe("schedulerConfigFromEnv", () => {
     expect(byName("reconcile").intervalMs).toBe(30 * 60 * 1000);
     expect(byName("stale-work").path).toBe("/api/agent-work/sweep");
     expect(byName("stale-work").intervalMs).toBe(5 * 60 * 1000);
+    expect(byName("pr-fix-sweep").path).toBe("/api/pr-fix-queue/sweep");
+    expect(byName("pr-fix-sweep").intervalMs).toBe(5 * 60 * 1000);
   });
 
   it("disables reconcile when DISPATCH_RECONCILE_INTERVAL_MS is 0", () => {
@@ -71,6 +73,11 @@ describe("schedulerConfigFromEnv", () => {
   it("disables stale-work when DISPATCH_STALE_WORK_INTERVAL_MS is 0", () => {
     const jobs = schedulerConfigFromEnv({ DISPATCH_STALE_WORK_INTERVAL_MS: "0" }).jobs;
     expect(jobs.map((j) => j.name)).not.toContain("stale-work");
+  });
+
+  it("disables pr-fix-sweep when DISPATCH_PR_FIX_SWEEP_INTERVAL_MS is 0", () => {
+    const jobs = schedulerConfigFromEnv({ DISPATCH_PR_FIX_SWEEP_INTERVAL_MS: "0" }).jobs;
+    expect(jobs.map((j) => j.name)).not.toContain("pr-fix-sweep");
   });
 
   it("disables an individual job when its interval env is 0", () => {

@@ -517,6 +517,7 @@ describe("bearer token tiers (#1111)", () => {
     ["GET", "/api/pr-fix-queue/queued"],
     ["GET", "/api/pr-fix-queue/history"],
     ["POST", "/api/pr-fix-queue/mark"],
+    ["POST", "/api/pr-fix-queue/ack"],
   ];
 
   for (const [method, pathname] of workerAllowlistedRoutes) {
@@ -533,6 +534,7 @@ describe("bearer token tiers (#1111)", () => {
     ["POST", "/api/agent-work"],
     ["POST", "/api/agent-work/sweep"],
     ["POST", "/api/pr-fix-queue/requeue"],
+    ["POST", "/api/pr-fix-queue/sweep"],
     ["POST", "/api/sync"],
     ["POST", "/api/issues/move"],
     ["POST", "/api/issues/groom"],

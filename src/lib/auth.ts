@@ -206,6 +206,9 @@ export const WORKER_ALLOWLIST: ReadonlyArray<{ method: string | "*"; pattern: Re
   { method: "GET", pattern: /^\/api\/pr-fix-queue\/queued$/ },
   { method: "GET", pattern: /^\/api\/pr-fix-queue\/history$/ },
   { method: "POST", pattern: /^\/api\/pr-fix-queue\/mark$/ },
+  // A worker acknowledges its own hand-out after durably materializing the
+  // attempt (#1211); the reclaimer sweep stays maintainer-only.
+  { method: "POST", pattern: /^\/api\/pr-fix-queue\/ack$/ },
 ];
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -22,6 +22,7 @@ const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
   githubPrsMocks: {
     fetchPullRequestMergeState: vi.fn(async (_repo: string, _pr: number): Promise<{ mergeableState: string | null; mergeable: boolean | null }> => ({ mergeableState: null, mergeable: null })),
     fetchPullRequestHeadSha: vi.fn(async (_repo: string, _pr: number): Promise<string | null> => null),
+    fetchPullRequestState: vi.fn(async (_repo: string, _pr: number): Promise<{ state: string | null; mergedAt: string | null }> => ({ state: null, mergedAt: null })),
   },
 }));
 
@@ -39,7 +40,27 @@ vi.mock("./lesson-feed", () => ({
 vi.mock("./github-prs", () => ({
   fetchPullRequestMergeState: githubPrsMocks.fetchPullRequestMergeState,
   fetchPullRequestHeadSha: githubPrsMocks.fetchPullRequestHeadSha,
+  fetchPullRequestState: githubPrsMocks.fetchPullRequestState,
 }));
+
+// Interpret the Prisma atomic operations the queue uses: `{ increment: n }`
+// for counters and `{ push: [...] }` for scalar lists (append, dedupe —
+// mirroring the real client's array append, with the queue's own dedupe).
+function applyAtomicOps(current: any, patch: Record<string, any>): Record<string, any> {
+  const next: Record<string, any> = { ...patch };
+  for (const key of Object.keys(next)) {
+    const value = next[key];
+    if (value && typeof value === "object" && typeof value.increment === "number") {
+      next[key] = (current[key] ?? 0) + value.increment;
+    } else if (value && typeof value === "object" && Array.isArray(value.push)) {
+      const existing: any[] = Array.isArray(current[key]) ? current[key] : [];
+      const appended = [...existing];
+      for (const entry of value.push) if (!appended.includes(entry)) appended.push(entry);
+      next[key] = appended;
+    }
+  }
+  return next;
+}
 
 function makeClient(): PrFixQueueClient & {
   items: any[];
@@ -101,6 +122,10 @@ function makeClient(): PrFixQueueClient & {
           postDispatchEvidenceKeys: [], // mirrors the column's @default([])
           dispatchedGeneration: null, // Int? — no hand-out recorded yet
           dispatchedAt: null, // DateTime? — no hand-out recorded yet
+          // #1211 hand-out ack/reclaim columns: default to their schema values
+          // so a freshly created row reads back as "no ack, never reclaimed".
+          handoutAcks: [], // mirrors the column's @default([])
+          handoutReclaims: 0, // mirrors the column's @default(0)
           queuedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           updatedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           ...data,
@@ -116,14 +141,9 @@ function makeClient(): PrFixQueueClient & {
           (err as any).code = "P2025";
           throw err;
         }
-        // Interpret Prisma atomic operations ({ increment }) like the real client.
-        const patch: Record<string, any> = { ...data };
-        for (const key of Object.keys(patch)) {
-          const value = patch[key];
-          if (value && typeof value === "object" && typeof value.increment === "number") {
-            patch[key] = (items[idx][key] ?? 0) + value.increment;
-          }
-        }
+        // Interpret Prisma atomic operations ({ increment }, { push }) like the
+        // real client.
+        const patch = applyAtomicOps(items[idx], data);
         items[idx] = { ...items[idx], ...patch, updatedAt: new Date(Date.UTC(2026, 0, 1, 1, ++seq)) };
         return items[idx];
       },
@@ -138,24 +158,23 @@ function makeClient(): PrFixQueueClient & {
         client.hooks.beforeUpdateManyEvery?.();
         // Generation-conditional (and/or id-scoped) bulk write — mirrors the
         // real client's commit-time revalidation semantics for #1074, plus
-        // the post-dispatch evidence guard ({ equals: [...] }) for #1119.
+        // the post-dispatch evidence guard ({ equals: [...] }) for #1119 and
+        // the hand-out ack-list pin ({ equals: [...] }) for #1211.
         const matches = items.filter(
           (i) =>
             (where.id === undefined || i.id === where.id) &&
             (where.generation === undefined || i.generation === where.generation) &&
+            (where.status === undefined || i.status === where.status) &&
             (where.postDispatchEvidenceKeys === undefined ||
               JSON.stringify(i.postDispatchEvidenceKeys ?? []) ===
-                JSON.stringify(where.postDispatchEvidenceKeys.equals ?? [])),
+                JSON.stringify(where.postDispatchEvidenceKeys.equals ?? [])) &&
+            (where.handoutAcks === undefined ||
+              JSON.stringify(i.handoutAcks ?? []) ===
+                JSON.stringify(where.handoutAcks.equals ?? [])),
         );
         for (const match of matches) {
           const idx = items.findIndex((i) => i.id === match.id);
-          const patch: Record<string, any> = { ...data };
-          for (const key of Object.keys(patch)) {
-            const value = patch[key];
-            if (value && typeof value === "object" && typeof value.increment === "number") {
-              patch[key] = (match[key] ?? 0) + value.increment;
-            }
-          }
+          const patch = applyAtomicOps(match, data);
           items[idx] = { ...match, ...patch, updatedAt: new Date(Date.UTC(2026, 0, 1, 1, ++seq)) };
         }
         return { count: matches.length };
@@ -3309,5 +3328,292 @@ describe("queue identity folds repo casing (#1145)", () => {
 
   it("normalizeQueueRepo trims and lowercases", () => {
     expect(normalizeQueueRepo("  Org/Repo  ")).toBe("org/repo");
+  });
+});
+
+describe("reclaim stale hand-outs (#1211)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixUnblocked.mockReset();
+    surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestState.mockReset();
+    githubPrsMocks.fetchPullRequestState.mockResolvedValue({ state: null, mergedAt: null });
+  });
+
+  // Seed a QUEUED item whose current generation was stamped but never
+  // acknowledged, past the hand-out timeout.
+  async function seedStaleUnacked(pr: number) {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: `k${pr}`, headSha: "H1",
+    });
+    const row = client.items.find((i) => i.pr === pr)!;
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date("2026-01-01T00:00:00Z");
+    row.agentHandouts = [`courier@${row.generation}`];
+    row.handoutAcks = [];
+    row.handoutReclaims = 0;
+    return row;
+  }
+
+  // 1h after the seeded dispatch — well past the 30m default timeout.
+  const STALE_NOW = new Date("2026-01-01T01:00:00Z");
+
+  it("reclaims a stamped-but-unacknowledged hand-out (Courier died before Create)", async () => {
+    await seedStaleUnacked(201);
+    const historyBefore = client.history.length;
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.examined).toBe(1);
+    expect(report.reclaimed).toBe(1);
+    expect(report.staled).toBe(0);
+    expect(report.blocked).toBe(0);
+    expect(report.skipped).toBe(0);
+    expect(report.unknownState).toBe(0);
+    expect(report.errors).toEqual([]);
+
+    const after = client.items[0];
+    expect(after.generation).toBe(2);
+    expect(after.status).toBe("QUEUED");
+    expect(after.agentHandouts).toEqual([]);
+    expect(after.handoutAcks).toEqual([]);
+    expect(after.dispatchedGeneration).toBeNull();
+    expect(after.dispatchedAt).toBeNull();
+    expect(after.handoutReclaims).toBe(1);
+    expect(after.fixAttempts).toBe(1); // unchanged: no worker ever ran
+    const last = client.history.at(-1);
+    expect(last).toMatchObject({ action: "reclaim", status: "QUEUED", lane: "NORMAL" });
+    expect(last.note).toContain("generation 2");
+    expect(last.note).toContain("1211");
+    expect(client.history.length).toBe(historyBefore + 1);
+  });
+
+  it("reclaims when all eligible agents were handed and none acknowledged", async () => {
+    const row = await seedStaleUnacked(202);
+    row.agentHandouts = ["alpha@1", "beta@1"];
+    row.handoutAcks = [];
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].agentHandouts).toEqual([]);
+  });
+
+  it("never reclaims a generation a live worker acknowledged", async () => {
+    const row = await seedStaleUnacked(203);
+    row.handoutAcks = ["courier@1"];
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].generation).toBe(1);
+    expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+  });
+
+  it("a late ack for generation N cannot touch N+1 (generation-mismatch)", async () => {
+    const row = await seedStaleUnacked(204);
+    row.generation = 2;
+    const historyBefore = client.history.length;
+    const result = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 204, generation: 1, agentName: "courier",
+    });
+    expect(result).toEqual({ acknowledged: false, reason: "generation-mismatch" });
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].handoutAcks).toEqual([]);
+    expect(client.history.length).toBe(historyBefore);
+  });
+
+  it("routes to a human (BLOCKED/NEEDS_HUMAN) once the reclaim cap is reached", async () => {
+    const prev = process.env.PR_FIX_MAX_RECLAIMS;
+    process.env.PR_FIX_MAX_RECLAIMS = "3";
+    try {
+      const row = await seedStaleUnacked(205);
+      row.handoutReclaims = 3;
+      const report = await reclaimStalePrFixHandouts(client, {
+        now: STALE_NOW,
+        isPrMergedOrClosed: async () => false,
+      });
+      expect(report.blocked).toBe(1);
+      expect(report.reclaimed).toBe(0);
+      const after = client.items[0];
+      expect(after.status).toBe("BLOCKED");
+      expect(after.lane).toBe("NEEDS_HUMAN");
+      expect(after.generation).toBe(1); // terminal: no identity bump
+      expect(after.agentHandouts).toEqual([]);
+      expect(after.handoutAcks).toEqual([]);
+      expect(after.dispatchedGeneration).toBeNull();
+      expect(after.dispatchedAt).toBeNull();
+      const last = client.history.at(-1);
+      expect(last).toMatchObject({ action: "mark", status: "BLOCKED", lane: "NEEDS_HUMAN" });
+      expect(last.note).toContain("PR_FIX_MAX_RECLAIMS=3");
+      expect(last.note).toContain("1211");
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
+      else process.env.PR_FIX_MAX_RECLAIMS = prev;
+    }
+  });
+
+  it("reaps a stale unacknowledged hand-out to STALE when the PR is merged or closed", async () => {
+    await seedStaleUnacked(206);
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => true,
+    });
+    expect(report.staled).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    const after = client.items[0];
+    expect(after.status).toBe("STALE");
+    expect(after.agentHandouts).toEqual([]);
+    expect(after.handoutAcks).toEqual([]);
+    expect(after.dispatchedGeneration).toBeNull();
+    expect(after.dispatchedAt).toBeNull();
+    const last = client.history.at(-1);
+    expect(last).toMatchObject({ action: "mark", status: "STALE" });
+    expect(last.note).toContain("1211");
+  });
+
+  it("defers (unknownState) when the PR state cannot be determined, without mutating", async () => {
+    await seedStaleUnacked(207);
+    const historyBefore = client.history.length;
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => null,
+    });
+    expect(report.unknownState).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(report.staled).toBe(0);
+    expect(report.blocked).toBe(0);
+    expect(report.skipped).toBe(0);
+    expect(client.items[0].generation).toBe(1);
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].dispatchedGeneration).toBe(1);
+    expect(client.history.length).toBe(historyBefore);
+  });
+
+  it("a hand-out ack landing in the read→write gap no-ops the pinned reclaim", async () => {
+    const row = await seedStaleUnacked(208);
+    row.handoutAcks = [];
+    // The ack lands right before the reclaim's conditional write, so the
+    // handoutAcks pin misses and the live attempt is not clobbered.
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].handoutAcks = ["courier@1"];
+    };
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.reclaimed).toBe(0);
+    expect(client.items[0].generation).toBe(1);
+    expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+  });
+
+  it("uses the GitHub PR-state probe by default (open reclaims, merged_at stales)", async () => {
+    await seedStaleUnacked(211);
+    githubPrsMocks.fetchPullRequestState.mockResolvedValueOnce({ state: "open", mergedAt: null });
+    const openReport = await reclaimStalePrFixHandouts(client, { now: STALE_NOW });
+    expect(openReport.reclaimed).toBe(1);
+    expect(githubPrsMocks.fetchPullRequestState).toHaveBeenCalledWith("org/repo", 211);
+
+    await seedStaleUnacked(212);
+    githubPrsMocks.fetchPullRequestState.mockResolvedValueOnce({ state: null, mergedAt: "2026-01-01T00:00:00Z" });
+    const mergedReport = await reclaimStalePrFixHandouts(client, { now: STALE_NOW });
+    expect(mergedReport.staled).toBe(1);
+  });
+
+  it("ackPrFixHandout appends the token with an ack history row, idempotently", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 209, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k209", headSha: "H1",
+    });
+    const row = client.items[0];
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date("2026-01-01T00:00:00Z");
+    const historyBefore = client.history.length;
+
+    const first = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 209, generation: 1, agentName: "courier",
+    });
+    expect(first.acknowledged).toBe(true);
+    if (!first.acknowledged) throw new Error("expected ack");
+    expect(first.item.handoutAcks).toEqual(["courier@1"]);
+    const ackHistory = client.history.at(-1);
+    expect(ackHistory).toMatchObject({ action: "ack", status: "QUEUED" });
+    expect(ackHistory.note).toContain("generation 1");
+
+    // Duplicate ack: idempotent, no second history row.
+    const second = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 209, generation: 1, agentName: "courier",
+    });
+    expect(second).toEqual({ acknowledged: false, reason: "already-acknowledged" });
+    expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
+    expect(client.history.length).toBe(historyBefore + 1);
+  });
+
+  it("ackPrFixHandout refuses a non-QUEUED item and a missing item", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 210, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k210", headSha: "H1",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 210, status: "FIXED" });
+    const notQueued = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 210, generation: 1, agentName: "courier",
+    });
+    expect(notQueued).toEqual({ acknowledged: false, reason: "not-queued" });
+
+    const notFound = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 999, generation: 1, agentName: "courier",
+    });
+    expect(notFound).toEqual({ acknowledged: false, reason: "not-found" });
+  });
+
+  it("parseAckPrFixHandoutInput validates its input", () => {
+    expect(parseAckPrFixHandoutInput(null)).toEqual({ error: "Invalid JSON body" });
+    expect(parseAckPrFixHandoutInput("x")).toEqual({ error: "Invalid JSON body" });
+    expect(parseAckPrFixHandoutInput({})).toEqual({ error: "Missing required field: repo" });
+    expect(parseAckPrFixHandoutInput({ repo: "o/r" })).toEqual({ error: "Missing required field: pr" });
+    expect(parseAckPrFixHandoutInput({ repo: "o/r", pr: 1 })).toEqual({ error: "generation must be an integer >= 1" });
+    expect(parseAckPrFixHandoutInput({ repo: "o/r", pr: 1, generation: 0 })).toEqual({ error: "generation must be an integer >= 1" });
+    expect(parseAckPrFixHandoutInput({ repo: "o/r", pr: 1, generation: 1.5 })).toEqual({ error: "generation must be an integer >= 1" });
+    expect(parseAckPrFixHandoutInput({ repo: "o/r", pr: 1, generation: 1, agentName: 7 })).toEqual({ error: "agentName must be a string" });
+    expect(parseAckPrFixHandoutInput({ repo: "  o/r  ", pr: 1, generation: 2 })).toEqual({
+      repo: "o/r", pr: 1, generation: 2, agentName: null,
+    });
+  });
+
+  it("exposes the env-bounded defaults and getters", () => {
+    expect(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS).toBe(30 * 60 * 1000);
+    expect(DEFAULT_PR_FIX_MAX_RECLAIMS).toBe(3);
+    const prevTimeout = process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
+    const prevReclaims = process.env.PR_FIX_MAX_RECLAIMS;
+    try {
+      delete process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
+      delete process.env.PR_FIX_MAX_RECLAIMS;
+      expect(prFixHandoutTimeoutMs()).toBe(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS);
+      expect(maxPrFixReclaims()).toBe(DEFAULT_PR_FIX_MAX_RECLAIMS);
+      process.env.PR_FIX_HANDOUT_TIMEOUT_MS = "1000";
+      process.env.PR_FIX_MAX_RECLAIMS = "7";
+      expect(prFixHandoutTimeoutMs()).toBe(1000);
+      expect(maxPrFixReclaims()).toBe(7);
+      process.env.PR_FIX_HANDOUT_TIMEOUT_MS = "0";
+      process.env.PR_FIX_MAX_RECLAIMS = "nope";
+      expect(prFixHandoutTimeoutMs()).toBe(DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS);
+      expect(maxPrFixReclaims()).toBe(DEFAULT_PR_FIX_MAX_RECLAIMS);
+    } finally {
+      if (prevTimeout === undefined) delete process.env.PR_FIX_HANDOUT_TIMEOUT_MS;
+      else process.env.PR_FIX_HANDOUT_TIMEOUT_MS = prevTimeout;
+      if (prevReclaims === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
+      else process.env.PR_FIX_MAX_RECLAIMS = prevReclaims;
+    }
   });
 });

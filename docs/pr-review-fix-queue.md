@@ -235,3 +235,35 @@ QUEUED → IGNORED (deliberately skipped)
 ### Attempt cap
 
 `PR_FIX_MAX_ATTEMPTS` (default 5) bounds dispatched fix attempts per item, tracked as `fixAttempts`. An item starts at attempt 1; each return to `QUEUED` (new evidence after a fix, the #940 no-progress reopen, a mark back to `QUEUED`, a refused no-push `FIXED`) is another attempt. Once the count reaches the cap, the next return goes to `BLOCKED` in the `NEEDS_HUMAN` lane instead. Evidence that lands while the item is already `QUEUED`, such as the other inline comments of the same review, is the same attempt and never counts. `POST /api/pr-fix-queue/requeue` resets the count to 1.
+
+## Hand-out acknowledgement and reclamation (#1211)
+
+A hand-out is stamped when `next-task` issues a `followup-pr` task (the item's
+current generation is recorded in `dispatchedGeneration`/`dispatchedAt`). To
+prove the stamped hand-out reached a live worker, the worker acknowledges it
+**after durably creating the run that owns the work**:
+
+- `POST /api/pr-fix-queue/ack` — body `{ repo, pr, generation, agentName? }`.
+  The write is generation-pinned and idempotent: a repeat ack for the same
+  `(agent, generation)` returns `200` with `alreadyAcknowledged: true`, a late
+  ack for an older generation is refused `409` (`generation-mismatch`), and a
+  non-`QUEUED` item is refused `409` (`not-queued`). Worker tokens may call it
+  (a worker acks its own hand-out); the sweep below is maintainer-only.
+- MCP `ack_pr_fix` wraps the same endpoint.
+
+An unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default
+30 min) is treated as abandoned (the executor likely died before creating its
+run) and reclaimed by `POST /api/pr-fix-queue/sweep`, also scheduled in-process
+as the `pr-fix-sweep` job:
+
+- A **reclaimed** item is reopened as a **fresh generation** — a new work
+  identity — but `fixAttempts` is **not** bumped, because the hand-out never
+  reached a worker.
+- An **acknowledged live attempt is never reclaimed**, even when stale by
+  wall-clock: the ack pins the generation and the read→write gap is guarded, so
+  a worker that acknowledges mid-sweep is not clobbered.
+- A **merged or closed** PR goes `STALE` (nothing left to fix).
+- **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
+  never reclaimed into a fresh attempt.
+- Past `PR_FIX_MAX_RECLAIMS` (default 3) the item goes `BLOCKED` in the
+  `NEEDS_HUMAN` lane instead of being reclaimed again.
