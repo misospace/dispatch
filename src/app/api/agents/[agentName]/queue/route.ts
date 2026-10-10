@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
 
 export async function GET(request: Request, { params }: { params: Promise<{ agentName: string }> }) {
@@ -10,6 +11,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  // A bound worker credential may only poll its own agent's queue; an unbound
+  // legacy worker token is refused here (#1129).
+  const scopeError = await enforceWorkerAgentScope(auth, agentName);
+  if (scopeError) return scopeError;
 
   const { searchParams } = new URL(request.url);
   const lane = searchParams.get("lane");

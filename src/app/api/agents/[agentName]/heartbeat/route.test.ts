@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
 const { mocks, mockAgentRun } = vi.hoisted(() => ({
   mockAgentRun: {
@@ -397,5 +397,25 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
     expect(body.status).toBe("error");
     expect(body.errors.length).toBe(2);
     expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("POST /api/agents/[agentName]/heartbeat — bound worker scope (#1129)", () => {
+  it("denies a bound worker heartbeating for another agent", async () => {
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/bravo/heartbeat", { method: "POST", token: "bound-token" }),
+      { params: Promise.resolve({ agentName: "bravo" }) },
+    );
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("POST /api/agents/[agentName]/heartbeat — hard cutover (#1129)", () => {
+  it("denies an unbound legacy worker token", async () => {
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/alpha/heartbeat", { method: "POST", token: "test-worker-token" }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    expect(res.status).toBe(403);
   });
 });

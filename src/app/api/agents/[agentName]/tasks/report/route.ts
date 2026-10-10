@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
@@ -147,6 +148,11 @@ export async function POST(
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  // A bound worker credential may only report for its own agent; an unbound
+  // legacy worker token is refused on this identity-scoped route (#1129).
+  const scopeError = await enforceWorkerAgentScope(auth, agentName);
+  if (scopeError) return scopeError;
 
   let body: unknown;
   try {

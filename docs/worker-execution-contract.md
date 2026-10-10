@@ -21,17 +21,29 @@ This document defines the generic execution contract for any agent worker consum
 
 ## Token Tiers
 
-Dispatch bearer tokens have two tiers. A **worker** token (`DISPATCH_WORKER_TOKEN`) may call exactly:
+Dispatch bearer tokens have two tiers. A **worker** token may call exactly:
 
 - `GET /api/agents/{agentName}/next-task`, `POST /api/agents/{agentName}/tasks/report`, `POST /api/agents/{agentName}/heartbeat`, `GET /api/agents/{agentName}/active-work`, `GET /api/agents/{agentName}/queue`, `GET /api/agents/{agentName}/work-summary`
-- `GET /api/agent-work`, `POST /api/agent-work/start`, `POST /api/agent-work/checkpoint`, `POST /api/agent-work/finish`
-- `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (bounded by the assignment check — the issue must be assigned to the `agentName` in the request body)
-- `GET /api/issues/state`, `POST /api/issues/status`
+- `GET /api/agent-work` (scoped to the caller's own agent), `POST /api/agent-work/start`, `POST /api/agent-work/checkpoint`, `POST /api/agent-work/finish`
+- `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (for the caller's own agent)
+- `GET /api/issues/state`, `POST /api/issues/status` (status only for issues assigned to the caller's own agent)
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
 - `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
 - `POST /api/pr-fix-queue/ack` (the durable hand-out acknowledgement, see "Hand-out acknowledgement" below)
 
-The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, `POST /api/pr-fix-queue/requeue`, and the `POST /api/pr-fix-queue/sweep` reclaim job are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
+The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights and acts on any agent's behalf. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, `POST /api/pr-fix-queue/requeue`, and the `POST /api/pr-fix-queue/sweep` reclaim job are maintainer-only. Unclaim is not tier-gated — the target agent is bound to the caller and is only bounded by the assignment check; the legacy `DISPATCH_WORKER_TOKEN` falls back to the request body, but `DISPATCH_WORKER_TOKENS` overrides that with a token-derived identity. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
+
+### Bound worker identity (#1129)
+
+Worker credentials are **bound to an agent name** so the caller's identity is derived from the token, never from a self-reported `x-agent-name` header or a request-body `agentName`:
+
+- Configure bound credentials with `DISPATCH_WORKER_TOKENS`, a comma- or newline-separated list of `agentName:token` pairs, e.g. `alpha:<token-a>,bravo:<token-b>`. Multiple tokens may map to the same agent for rotation.
+- A bound worker may only act for its own agent. It cannot read another agent's task state (`next-task`, `active-work`, `queue`, `work-summary`), report another agent's task, start/checkpoint/finish another agent's work, claim/unclaim for another agent, list another agent's work (`GET /api/agent-work` is forced to the bound agent), or set status on an issue not assigned to it.
+- A token bound to two different agents is ambiguous and is rejected everywhere (fail-closed). A bound token whose value duplicates a maintainer token resolves to the lower worker tier with its binding intact. Misconfigurations log a one-time warning naming the env vars but never the token value.
+
+### Legacy migration window
+
+The single `DISPATCH_WORKER_TOKEN` is a **legacy, unbound** credential. It carries no agent identity, so it cannot satisfy the identity-scoped routes above: `next-task`, `tasks/report`, `heartbeat`, `active-work`, `queue`, `work-summary`, `agent-work` start/checkpoint/finish, `issues/claim`, `issues/unclaim`, and `issues/status` return **403** for it. It remains accepted, as a migration-window fallback, only for the identity-free worker routes (`GET /api/issues`, the PR-fix queue reads, and PR-fix `mark`), and a deprecation warning is logged at boot. Migrate every worker deployment to `DISPATCH_WORKER_TOKENS` (or a maintainer token) before removing the legacy variable.
 
 ## Hand-out acknowledgement (#1211)
 
@@ -45,7 +57,7 @@ Content-Type: application/json
 { "repo": "org/repo", "pr": 42, "generation": 2, "agentName": "courier" }
 ```
 
-The route is bearer-only (basic / OIDC sessions are rejected with 403), and `agentName` is verified against the authenticated actor (the `x-agent-name` header) — a body value that disagrees returns 400. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
+The route is bearer-only (basic / OIDC sessions are rejected with 403), and `agentName` is verified against the authenticated actor — for `DISPATCH_WORKER_TOKENS` the actor comes from the token's binding, for the legacy `DISPATCH_WORKER_TOKEN` it falls back to the `x-agent-name` header. A body value that disagrees with the bound/header agent returns 400. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
 
 A worker that cannot ack (because the hand-out stamp does not include its agent identity, e.g. a multi-agent dispatch raced) gets a `403 not-handed` response and should retry against a freshly-issued hand-out. The reclaimer sweep below is maintainer-only and **default-disabled** until every worker is confirmed to call ack.
 

@@ -254,6 +254,67 @@ export function normalizeCriterion(text: string): string {
 
 // ─── The close check ──────────────────────────────────────────────────────────
 
+/**
+ * Reopen/regression counter-evidence for an already_done close (dispatch#1113).
+ * Authoritative and bounded: the issue's own GitHub state reason plus explicit
+ * regression reports in authoritative (human) comments. It is a veto only: it
+ * can stop a close, never justify one.
+ */
+export interface ReopenRegressionEvidence {
+  /** True when GitHub reports the issue as reopened (state_reason === "reopened"). */
+  reopened: boolean;
+  /** True when the snapshot captured GitHub's state reason at all. */
+  historyKnown: boolean;
+  /** Bounded `comment:<id> by <author>` descriptions of explicit regression reports. */
+  regressionReports: string[];
+}
+
+/**
+ * Patterns marking an authoritative comment as an explicit regression report:
+ * it asserts the issue still reproduces or has regressed. Deliberately
+ * conservative, and "regression test(s)" (including hyphen/underscore
+ * variants) is excluded. This is a textual signal only — it cannot establish
+ * runtime behavior, and its absence is not proof that no regression exists.
+ */
+const REGRESSION_REPORT_PATTERNS: readonly RegExp[] = [
+  /\bregress(?:ed|ion|ing)\b(?![-\s_]*test\w*)/i,
+  /\bstill\s+(?:broken|fails?|failing|happens?|occur(?:s|ring)?|reproduc(?:e|es|ing|ible)|present|see(?:ing)?|an?\s+(?:issue|problem|bug))/i,
+  /\b(?:not|isn'?t|wasn'?t|aren'?t)\s+(?:been\s+)?(?:fixed|resolved|addressed|working|done)\b/i,
+  /\bbroke(?:n)?\s+again\b/i,
+  /\b(?:came|comes|coming)\s+back\b/i,
+  /\b(?:issue|problem|bug|it)\s+(?:persists?|remains?|is\s+back|recurred)\b/i,
+  /\bre-?open(?:ed|ing)?\b/i,
+  /\brecurr(?:ed|ing|ence)\b/i,
+];
+
+/** Whether an authoritative comment explicitly reports the issue still reproduces. */
+export function isExplicitRegressionReport(body: string): boolean {
+  return REGRESSION_REPORT_PATTERNS.some((pattern) => pattern.test(body));
+}
+
+/**
+ * Why the reopen/regression guard withholds an already_done close, or [] when
+ * it does not (dispatch#1113). Fails closed: unavailable reopen history is
+ * treated as not-established, never as "no reopen".
+ */
+export function reopenRegressionReasons(evidence: ReopenRegressionEvidence): string[] {
+  const reasons: string[] = [];
+  if (!evidence.historyKnown) {
+    reasons.push(
+      "the issue's reopen history was not captured, so it cannot be established that this open issue was not reopened (fail closed)",
+    );
+  }
+  if (evidence.reopened) {
+    reasons.push("the issue was reopened after it was closed; an already_done close needs human review");
+  }
+  if (evidence.regressionReports.length > 0) {
+    reasons.push(
+      `authoritative comments report the issue still reproduces (${evidence.regressionReports.join(", ")}); an already_done close needs human review`,
+    );
+  }
+  return reasons;
+}
+
 /** What the catalog carries for close grounding; not rendered as evidence ids. */
 export interface CloseGroundingContext {
   /** `owner/repo#N` of the issue being groomed. */
@@ -261,6 +322,8 @@ export interface CloseGroundingContext {
   expectedFiles: string[];
   acceptanceCriteria: string[];
   pinnedContent: PinnedReadContent;
+  /** Reopen/regression counter-evidence (#1113). */
+  counterEvidence: ReopenRegressionEvidence;
 }
 
 const CHANGELOG_NAME = /^(?:changelog|changes|history|news|release[-_ ]?notes|releases)$/i;

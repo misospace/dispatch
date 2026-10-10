@@ -32,6 +32,7 @@ const fakeIssue: GitHubIssue = {
   created_at: "2026-09-01T00:00:00Z",
   updated_at: "2026-09-15T12:00:00Z",
   closed_at: null,
+  state_reason: "reopened",
   user: { login: "maintainer" },
   author_association: "OWNER",
 };
@@ -178,6 +179,7 @@ describe("collectGroomingEvidenceSnapshot", () => {
       body: "Users get a 504 when the auth service is slow.",
       labels: ["priority/p2", "status/ready"],
       state: "open",
+      stateReason: "reopened",
       updatedAt: "2026-09-15T12:00:00Z",
       url: `https://github.com/${REPO}/issues/42`,
       author: "maintainer",
@@ -193,6 +195,36 @@ describe("collectGroomingEvidenceSnapshot", () => {
         comments: snapshot.comments,
       }),
     );
+  });
+
+  it("preserves the issue state_reason (null vs undefined) through the snapshot and the persistence summary (dispatch#1113)", async () => {
+    const reopenedDeps = makeDeps();
+    reopenedDeps.fetchRepositoryMetadata.mockResolvedValue({ defaultBranch: "main" });
+    reopenedDeps.fetchLatestCommit.mockResolvedValue({ sha: HEAD_SHA });
+    reopenedDeps.fetchIssue.mockResolvedValue({ ...fakeIssue, state_reason: "reopened" });
+    const reopenedSnapshot = await collectGroomingEvidenceSnapshot(input, reopenedDeps);
+    expect(reopenedSnapshot.issue.stateReason).toBe("reopened");
+    expect(summarizeEvidenceForPersistence(reopenedSnapshot).issueStateReason).toBe("reopened");
+
+    const nullDeps = makeDeps();
+    nullDeps.fetchRepositoryMetadata.mockResolvedValue({ defaultBranch: "main" });
+    nullDeps.fetchLatestCommit.mockResolvedValue({ sha: HEAD_SHA });
+    nullDeps.fetchIssue.mockResolvedValue({ ...fakeIssue, state_reason: null });
+    const nullSnapshot = await collectGroomingEvidenceSnapshot(input, nullDeps);
+    expect(nullSnapshot.issue.stateReason).toBeNull();
+    expect(summarizeEvidenceForPersistence(nullSnapshot).issueStateReason).toBeNull();
+
+    // The undefined-vs-null distinction is the apply-time fail-closed signal
+    // (dispatch#1113): GitHub may omit state_reason for an open issue, and the
+    // captured-vs-fresh comparison must treat that as "not established".
+    const unknownDeps = makeDeps();
+    unknownDeps.fetchRepositoryMetadata.mockResolvedValue({ defaultBranch: "main" });
+    unknownDeps.fetchLatestCommit.mockResolvedValue({ sha: HEAD_SHA });
+    const { state_reason: _ignored, ...issueWithoutStateReason } = fakeIssue;
+    unknownDeps.fetchIssue.mockResolvedValue(issueWithoutStateReason as GitHubIssue);
+    const unknownSnapshot = await collectGroomingEvidenceSnapshot(input, unknownDeps);
+    expect(unknownSnapshot.issue.stateReason).toBeUndefined();
+    expect(summarizeEvidenceForPersistence(unknownSnapshot).issueStateReason).toBeNull();
   });
 
   it("classifies comment provenance: automation authors are never authoritative", async () => {
@@ -368,6 +400,7 @@ describe("summarizeEvidenceForPersistence", () => {
       "issueCommentsCount",
       "issueFingerprint",
       "issueState",
+      "issueStateReason",
       "issueUpdatedAt",
       "pinnedRef",
       "sourceCount",
@@ -383,6 +416,7 @@ describe("summarizeEvidenceForPersistence", () => {
       issueFingerprint: snapshot.issueFingerprint,
       issueUpdatedAt: "2026-09-15T12:00:00Z",
       issueState: "open",
+      issueStateReason: "reopened",
       commentCount: 4,
       humanCommentCount: 2,
       automationCommentCount: 2,

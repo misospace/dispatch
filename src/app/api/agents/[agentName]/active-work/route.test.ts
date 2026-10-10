@@ -314,3 +314,34 @@ describe("GET /api/agents/:agentName/active-work", () => {
     expect(body.hasActiveWork).toBe(false);
   });
 });
+
+describe("GET /api/agents/[agentName]/active-work — bound worker scope (#1129)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("denies a bound worker reading another agent's active work", async () => {
+    mockAuthorizeRequest.mockResolvedValue({
+      authorized: true,
+      type: "bearer",
+      actor: "alpha",
+      tier: "worker",
+      agentName: "alpha",
+    });
+    const res = await makeActiveWorkRequest("bravo");
+    expect(res.status).toBe(403);
+    expect(mocks.leaseFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("denies an unbound legacy worker token", async () => {
+    mockAuthorizeRequest.mockResolvedValue({
+      authorized: true,
+      type: "bearer",
+      actor: "agent",
+      tier: "worker",
+    });
+    const res = await makeActiveWorkRequest("alpha");
+    expect(res.status).toBe(403);
+    expect(mocks.leaseFindFirst).not.toHaveBeenCalled();
+  });
+});

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import {
   createIdleTask,
@@ -154,6 +155,11 @@ export async function GET(
   if (mode === "groom") {
     return errorResponse("External grooming task dispatch is retired; use POST /api/groomer/run", 410);
   }
+
+  // A bound worker credential may only act for its own agent; an unbound
+  // legacy worker token is refused on this identity-scoped route (#1129).
+  const scopeError = await enforceWorkerAgentScope(auth, agentName);
+  if (scopeError) return scopeError;
 
   try {
     const { laneValid, resolvedLane, rankedQueue, fullQueue, withheldQueue, admissionMode, prFixItems, availableLanes } =

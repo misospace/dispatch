@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { listQueuedPrFixItems } from "@/lib/pr-fix-queue";
 import { getConfiguredLanes, getDefaultClaimableLane, resolveLaneId } from "@/lib/lane-config";
@@ -33,6 +34,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  // A bound worker credential may only summarize its own agent; an unbound
+  // legacy worker token is refused here (#1129).
+  const scopeError = await enforceWorkerAgentScope(auth, agentName);
+  if (scopeError) return scopeError;
 
   try {
     const issueWhere: Record<string, unknown> = {
