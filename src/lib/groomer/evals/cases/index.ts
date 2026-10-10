@@ -1,6 +1,13 @@
 import type { GroomingCase } from "../types";
 import { alreadyDoneCloses } from "./already-done-closes";
 import { alreadyDoneGrounded } from "./already-done-grounded";
+import {
+  alreadyDoneAutomationRegression,
+  alreadyDoneOrdinary,
+  alreadyDoneRegressionReport,
+  alreadyDoneRegressionReportOutsideOldestFive,
+  alreadyDoneReopenRegression,
+} from "./already-done-reopen-regression";
 import { alreadyFixedOnMain } from "./already-fixed-on-main";
 import { automationCommentFalseClaim } from "./automation-comment-false-claim";
 import { broadNeedsDecomposition } from "./broad-needs-decomposition";
@@ -33,6 +40,11 @@ export const CASES: GroomingCase[] = [
   exactlyOneStatusForeignLabel,
   siblingShippedNotThisIssue,
   alreadyDoneGrounded,
+  alreadyDoneOrdinary,
+  alreadyDoneReopenRegression,
+  alreadyDoneRegressionReport,
+  alreadyDoneRegressionReportOutsideOldestFive,
+  alreadyDoneAutomationRegression,
   evidenceIdAsRelatedWork,
   // Safety edges.
   inFlightUntouched,

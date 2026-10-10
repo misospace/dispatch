@@ -42,6 +42,11 @@ function anyWrite(o: GroomingOutcome): boolean {
   return w.labels.length > 0 || w.titleBody.length > 0 || w.comments.length > 0 || w.closes > 0;
 }
 
+function closeWithheld(o: GroomingOutcome): boolean {
+  const withheld = o.mutationPlan?.withheld as { close?: unknown } | undefined;
+  return Array.isArray(withheld?.close) && withheld.close.length > 0;
+}
+
 function entryFor(o: GroomingOutcome, id: string): EvidenceCatalogEntry | undefined {
   return o.catalog?.entries.find((entry) => entry.id === id);
 }
@@ -119,10 +124,14 @@ function globalViolations(c: GroomingCase, o: GroomingOutcome): Violation[] {
     if (o.issueData && "currentLane" in o.issueData) add("in-flight-untouched", "the run moved the lane of an in-flight issue");
   } else {
     const statuses = o.labelsAfter.filter(isStatus);
+    // A withheld close lands as backlog, so the effective status is the one
+    // toGroomerOutput derived for the applied plan, not the withheld plan's
+    // original status (#1113).
+    const derived = (o.output?.labelsToAdd ?? []).find(isStatus) ?? plan.mutations.status;
     if (statuses.length !== 1) {
       add("single-status", `labels after the run carry ${statuses.length} status labels: ${statuses.join(", ") || "none"}`);
-    } else if (statuses[0] !== plan.mutations.status) {
-      add("single-status", `applied ${statuses[0]} but the plan derived ${plan.mutations.status}`);
+    } else if (statuses[0] !== derived) {
+      add("single-status", `applied ${statuses[0]} but the plan derived ${derived}`);
     }
   }
 
@@ -181,7 +190,7 @@ function globalViolations(c: GroomingCase, o: GroomingOutcome): Violation[] {
     if (o.issueData?.state !== "closed") {
       add("close-only-already-done", "closed on GitHub but the local issue row was not marked closed");
     }
-  } else if (verdict.actionability === "already_done" && !inFlight) {
+  } else if (verdict.actionability === "already_done" && !inFlight && !closeWithheld(o)) {
     add("close-only-already-done", "already_done was accepted but the issue was not closed");
   }
 

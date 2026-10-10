@@ -100,6 +100,7 @@ function liveIssue(c: GroomingCase): GitHubIssue {
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-20T00:00:00Z",
     closed_at: null,
+    state_reason: c.issue.stateReason ?? null,
   };
 }
 
@@ -136,6 +137,19 @@ export async function runCandidate(
   let context = "";
   let issueData: Record<string, unknown> | null = null;
   const comments = c.comments ?? [];
+  // Direction-aware fetchComments (dispatch#1205): cases that need to model
+  // the snapshot's independent newest-desc fetch set `commentsDesc`. Absent:
+  // the single `comments` list is returned for any direction (legacy).
+  const fetchComments = async (
+    _repo: string,
+    _number: number,
+    max?: number,
+    direction?: "asc" | "desc",
+  ) => {
+    const cap = max ?? comments.length;
+    const list = direction === "desc" && c.commentsDesc ? c.commentsDesc : comments;
+    return list.slice(0, cap).map((comment) => ({ ...comment }));
+  };
   const read = c.repository.read ?? [];
   const surfaced = c.repository.surfaced ?? [];
   const related = relatedObservations(c);
@@ -240,7 +254,7 @@ export async function runCandidate(
 
   const deps: GroomerDeps = {
     selectCandidate: async () => selected,
-    fetchComments: async () => comments.map((comment) => ({ ...comment })),
+    fetchComments,
     buildContext: async (input) => {
       context = await buildIssueContext(input);
       return context;
