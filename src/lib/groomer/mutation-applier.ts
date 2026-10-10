@@ -29,7 +29,7 @@ import {
 } from "@/lib/decomposition";
 import { getBacklogLane } from "@/lib/lane-config";
 import { isAutomationAuthor } from "./context";
-import { neutralizeMentions } from "./sanitize";
+import { neutralizeMentions, sanitizeModelText } from "./sanitize";
 import { inFlightStatus, toGroomerOutput, type ChildBrief, type GroomingPlan } from "./plan";
 import type { EvidenceCatalog } from "./plan-evidence";
 import type { GroomerOutput } from "./schema";
@@ -729,7 +729,9 @@ function landed(result: ApplyStepResult | undefined): boolean {
 }
 
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  // GitHub-authored failure text is foreign input into Postgres errorMessage
+  // columns (dispatch#1164): strip NUL and the other C0 controls (keep \n/\t).
+  return sanitizeModelText(err instanceof Error ? err.message : String(err));
 }
 
 /** The comment body with its marker, within GitHub's comment cap. */
