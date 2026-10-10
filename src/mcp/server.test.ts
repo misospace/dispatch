@@ -7,6 +7,7 @@ import {
   listIssuesHandler,
   listPrFixesHandler,
   markPrFixHandler,
+  ackPrFixHandler,
   runGroomerHandler,
   setIssueStatusHandler,
   claimWorkHandler,
@@ -15,12 +16,19 @@ import {
   createServer,
   warnIfAgentNameUnset,
 } from "./server";
+import { DispatchClientError } from "../lib/mc-client.js";
 
 const mockToken = "test-agent-token";
 const mockBaseUrl = "http://localhost:3000";
 
 process.env.DISPATCH_URL = mockBaseUrl;
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
+
+const ackPrFixMock = vi.hoisted(() => vi.fn());
+vi.mock("../lib/mc-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/mc-client.js")>();
+  return { ...actual, ackPrFix: ackPrFixMock };
+});
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -967,6 +975,21 @@ describe("queue / pr-fix / groomer handlers", () => {
   it("markPrFixHandler surfaces API errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(errorResponse("PR fix queue item not found", 404));
     const result = await markPrFixHandler(makeArgs({ repo: "org/repo", pr: 7, status: "fixed" }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/not found/);
+  });
+
+  it("ackPrFixHandler forwards repo/pr/generation/agentName to the client", async () => {
+    ackPrFixMock.mockResolvedValueOnce({ acknowledged: true });
+    const result = await ackPrFixHandler(makeArgs({ repo: "org/repo", pr: 7, generation: 3, agentName: "worker" }));
+    expect(result.isError).toBeUndefined();
+    expect(ackPrFixMock).toHaveBeenCalledWith({ repo: "org/repo", pr: 7, generation: 3, agentName: "worker" });
+    expect(JSON.parse(result.content[0].text as string)).toEqual({ acknowledged: true });
+  });
+
+  it("ackPrFixHandler surfaces API errors", async () => {
+    ackPrFixMock.mockRejectedValueOnce(new DispatchClientError("PR fix queue item not found", 404));
+    const result = await ackPrFixHandler(makeArgs({ repo: "org/repo", pr: 7, generation: 3 }));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found/);
   });

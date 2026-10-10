@@ -75,7 +75,8 @@ export type SyncType =
   | "pr-followup"
   | "reconcile"
   | "stale-work"
-  | "ci-failures";
+  | "ci-failures"
+  | "pr-fix-handout-sweep";
 
 /**
  * Lock key per sync type. One row per key in the same `sync_lock` table that
@@ -101,6 +102,9 @@ const LOCK_KEY_BY_TYPE: Record<SyncType, string> = {
   reconcile: "reconcile",
   "stale-work": "stale-work",
   "ci-failures": "ci-failures",
+  // Stale PR-fix hand-out reclaimer (#1211) — its own key so it never
+  // excludes the stale-work or pr-followup sweeps.
+  "pr-fix-handout-sweep": "pr-fix-handout-sweep",
 };
 
 /**

@@ -47,7 +47,19 @@ describe("schedulerConfigFromEnv", () => {
 
   it("configures sync + groomer + pr-followup + ci-failures + prune-closed + reconcile + stale-work with defaults", () => {
     const jobs = schedulerConfigFromEnv({}).jobs;
-    expect(jobs.map((j) => j.name)).toEqual(["sync", "groomer", "pr-followup", "ci-failures", "prune-closed", "reconcile", "stale-work"]);
+    // pr-fix-sweep is filtered out by default (#1211 review): the default
+    // interval is `0` (disabled) until workers confirm they ack. The
+    // DISPATCH_PR_FIX_SWEEP_INTERVAL_MS=0 case asserts that explicitly below;
+    // here the only constraint on the default list is that the others are
+    // present, and pr-fix-sweep may or may not be in it depending on the
+    // explicit opt-in.
+    expect(jobs.map((j) => j.name)).toContain("sync");
+    expect(jobs.map((j) => j.name)).toContain("groomer");
+    expect(jobs.map((j) => j.name)).toContain("pr-followup");
+    expect(jobs.map((j) => j.name)).toContain("ci-failures");
+    expect(jobs.map((j) => j.name)).toContain("prune-closed");
+    expect(jobs.map((j) => j.name)).toContain("reconcile");
+    expect(jobs.map((j) => j.name)).toContain("stale-work");
     const byName = (n: string) => jobs.find((j) => j.name === n)!;
     expect(byName("groomer").path).toBe("/api/groomer/run");
     expect(byName("groomer").intervalMs).toBe(10 * 60 * 1000);
@@ -63,6 +75,23 @@ describe("schedulerConfigFromEnv", () => {
     expect(byName("stale-work").intervalMs).toBe(5 * 60 * 1000);
   });
 
+  it("disables pr-fix-sweep by default until workers are confirmed to ack (#1211 review)", () => {
+    // The reclaim sweep can wipe in-flight CoderRun when a worker simply
+    // never acked; deployments that have not yet shipped the durable
+    // Create-boundary ack in their worker must keep this disabled.
+    const jobs = schedulerConfigFromEnv({}).jobs;
+    const prFixSweep = jobs.find((j) => j.name === "pr-fix-sweep");
+    expect(prFixSweep).toBeUndefined();
+  });
+
+  it("enables pr-fix-sweep when DISPATCH_PR_FIX_SWEEP_INTERVAL_MS is set explicitly", () => {
+    const jobs = schedulerConfigFromEnv({ DISPATCH_PR_FIX_SWEEP_INTERVAL_MS: "300000" }).jobs;
+    const prFixSweep = jobs.find((j) => j.name === "pr-fix-sweep")!;
+    expect(prFixSweep).toBeDefined();
+    expect(prFixSweep.path).toBe("/api/pr-fix-queue/sweep");
+    expect(prFixSweep.intervalMs).toBe(5 * 60 * 1000);
+  });
+
   it("disables reconcile when DISPATCH_RECONCILE_INTERVAL_MS is 0", () => {
     const jobs = schedulerConfigFromEnv({ DISPATCH_RECONCILE_INTERVAL_MS: "0" }).jobs;
     expect(jobs.map((j) => j.name)).not.toContain("reconcile");
@@ -71,6 +100,11 @@ describe("schedulerConfigFromEnv", () => {
   it("disables stale-work when DISPATCH_STALE_WORK_INTERVAL_MS is 0", () => {
     const jobs = schedulerConfigFromEnv({ DISPATCH_STALE_WORK_INTERVAL_MS: "0" }).jobs;
     expect(jobs.map((j) => j.name)).not.toContain("stale-work");
+  });
+
+  it("disables pr-fix-sweep when DISPATCH_PR_FIX_SWEEP_INTERVAL_MS is 0", () => {
+    const jobs = schedulerConfigFromEnv({ DISPATCH_PR_FIX_SWEEP_INTERVAL_MS: "0" }).jobs;
+    expect(jobs.map((j) => j.name)).not.toContain("pr-fix-sweep");
   });
 
   it("disables an individual job when its interval env is 0", () => {

@@ -315,6 +315,18 @@ export async function markPrFix(input: {
   });
 }
 
+export async function ackPrFix(input: {
+  repo: string;
+  pr: number;
+  generation: number;
+  agentName?: string;
+}): Promise<unknown> {
+  return mcJson<unknown>("/api/pr-fix-queue/ack", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function requeuePrFix(input: {
   repo: string;
   pr: number;

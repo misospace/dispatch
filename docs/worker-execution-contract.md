@@ -29,8 +29,9 @@ Dispatch bearer tokens have two tiers. A **worker** token may call exactly:
 - `GET /api/issues/state`, `POST /api/issues/status` (status only for issues assigned to the caller's own agent)
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
 - `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
+- `POST /api/pr-fix-queue/ack` (the durable hand-out acknowledgement, see "Hand-out acknowledgement" below)
 
-The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights and acts on any agent's behalf. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only.
+The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights and acts on any agent's behalf. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, `POST /api/pr-fix-queue/requeue`, and the `POST /api/pr-fix-queue/sweep` reclaim job are maintainer-only. Unclaim is not tier-gated — the target agent is bound to the caller and is only bounded by the assignment check; the legacy `DISPATCH_WORKER_TOKEN` falls back to the request body, but `DISPATCH_WORKER_TOKENS` overrides that with a token-derived identity. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
 
 ### Bound worker identity (#1129)
 
@@ -43,6 +44,22 @@ Worker credentials are **bound to an agent name** so the caller's identity is de
 ### Legacy migration window
 
 The single `DISPATCH_WORKER_TOKEN` is a **legacy, unbound** credential. It carries no agent identity, so it cannot satisfy the identity-scoped routes above: `next-task`, `tasks/report`, `heartbeat`, `active-work`, `queue`, `work-summary`, `agent-work` start/checkpoint/finish, `issues/claim`, `issues/unclaim`, and `issues/status` return **403** for it. It remains accepted, as a migration-window fallback, only for the identity-free worker routes (`GET /api/issues`, the PR-fix queue reads, and PR-fix `mark`), and a deprecation warning is logged at boot. Migrate every worker deployment to `DISPATCH_WORKER_TOKENS` (or a maintainer token) before removing the legacy variable.
+
+## Hand-out acknowledgement (#1211)
+
+A worker that receives a `followup-pr` task acknowledges it **after durably creating the run that owns the work** (e.g. after creating the executor `CoderRun`), via `POST /api/pr-fix-queue/ack`:
+
+```
+POST /api/pr-fix-queue/ack
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "repo": "org/repo", "pr": 42, "generation": 2, "agentName": "courier" }
+```
+
+The route is bearer-only (basic / OIDC sessions are rejected with 403), and `agentName` is verified against the authenticated actor — for `DISPATCH_WORKER_TOKENS` the actor comes from the token's binding, for the legacy `DISPATCH_WORKER_TOKEN` it falls back to the `x-agent-name` header. A body value that disagrees with the bound/header agent returns 400. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
+
+A worker that cannot ack (because the hand-out stamp does not include its agent identity, e.g. a multi-agent dispatch raced) gets a `403 not-handed` response and should retry against a freshly-issued hand-out. The reclaimer sweep below is maintainer-only and **default-disabled** until every worker is confirmed to call ack.
 
 ---
 
@@ -71,6 +88,7 @@ Before selecting any work from the assignment queue, the worker **must** check t
    - Alternatively, query `GET /api/pr-fix-queue/queued?lane=normal` directly for PR-fix items only.
 2. For each item with `type: "pr-review-fix"`:
    - Verify the PR is still open and authored by the expected bot account.
+   - If the task was issued via next-task with a prFixItem token, acknowledge the hand-out after the run is durably created so the stale hand-out reclaimer does not reopen a live attempt: `POST /api/pr-fix-queue/ack` with `{ repo, pr, generation, agentName? }` (MCP `ack_pr_fix`). The ack is generation-pinned and idempotent; an unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default 30m) is reclaimed by the scheduled pr-fix-sweep.
    - Verify the head owner matches the trusted owner (`misospace` or `joryirving`).
    - Fetch origin, checkout the queued branch, pull/rebase as appropriate.
    - Read the item's `feedback[]` array to determine the requested fix (from PR comments, reviews, and check failures).
