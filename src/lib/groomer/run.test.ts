@@ -667,6 +667,75 @@ describe("runHostedGroomer", () => {
       });
     });
 
+    it("feeds the snapshot the newest comments (descending, capped) so the reopen/regression guard sees a recent human report (dispatch#1205)", async () => {
+      // Repro of blocker 1: six older ordinary comments, then a human regression
+      // report posted later. The prompt context's oldest-five asc fetch must
+      // not hide it from the snapshot's guard.
+      const oldestFive = Array.from({ length: 5 }, (_, index) => ({
+        id: index + 1,
+        author: "reviewer",
+        authorAssociation: "COLLABORATOR",
+        body: `Older note ${index + 1}`,
+        createdAt: `2026-10-0${index + 1}T00:00:00Z`,
+      }));
+      const regressionReport = {
+        id: 6,
+        author: "maintainer",
+        authorAssociation: "OWNER",
+        body: "This regressed on main; the dry-run flag still writes.",
+        createdAt: "2026-10-08T00:00:00Z",
+      };
+      const newest = [regressionReport, ...oldestFive];
+      mocks.fetchIssueComments.mockImplementation(async (_repo, _number, max, direction) => {
+        if (direction === "desc") return newest.slice(0, max ?? newest.length);
+        return oldestFive;
+      });
+
+      const result = await runHostedGroomer();
+
+      // The snapshot is called with newest-desc comments (dispatch#1205).
+      const snapshotCalls = mocks.collectGroomingEvidenceSnapshot.mock.calls;
+      const firstSnapshot = snapshotCalls[0][0] as { comments: Array<{ id: number; body: string }> };
+      expect(firstSnapshot.comments.find((c) => c.id === regressionReport.id)).toBeDefined();
+      expect(firstSnapshot.comments[0]?.id).toBe(regressionReport.id);
+      // The prompt context is still oldest-asc: regression report is outside
+      // that window (after oldestFive), so it is absent from the prompt.
+      const buildContextCalls = mocks.buildIssueContext.mock.calls;
+      const promptComments = (buildContextCalls[0]?.[0] as { comments?: Array<{ id: number }> } | undefined)?.comments;
+      expect(promptComments?.find((c) => c.id === regressionReport.id)).toBeUndefined();
+      expect(result).not.toBeNull();
+    });
+
+    it("falls back to the prompt's oldest-five asc comments when the newest-desc snapshot fetch fails", async () => {
+      // The snapshot fetch is independent: a transient failure must not abort
+      // the run. The guard then operates on the prompt's head of the
+      // conversation (oldest five asc), matching pre-#1205 behaviour.
+      const oldestFive = Array.from({ length: 5 }, (_, index) => ({
+        id: index + 1,
+        author: "reviewer",
+        authorAssociation: "COLLABORATOR",
+        body: `Note ${index + 1}`,
+        createdAt: `2026-10-0${index + 1}T00:00:00Z`,
+      }));
+      mocks.fetchIssueComments.mockImplementation(async (_repo, _number, max, direction) => {
+        if (direction === "desc" && max === 100) return oldestFive; // participants
+        if (direction === "desc") throw new Error("snapshot fetch failed");
+        return oldestFive;
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const result = await runHostedGroomer();
+        expect(result).not.toBeNull();
+        // The snapshot got the fallback comments (oldestFive), not [].
+        const firstSnapshot = mocks.collectGroomingEvidenceSnapshot.mock.calls[0][0] as {
+          comments: Array<{ id: number }>;
+        };
+        expect(firstSnapshot.comments.length).toBe(oldestFive.length);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it("pins repository exploration and file reads to the captured SHA", async () => {
       mocks.getHostedGroomerConfig.mockReturnValue({
         ...mockConfig,

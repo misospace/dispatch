@@ -132,3 +132,41 @@ export const alreadyDoneOrdinary: GroomingCase = regressionCase(
   "ordinary already-done with current-state proof still closes",
   true,
 );
+
+/**
+ * Dispatch#1205: an authoritative human regression report posted after the
+ * prompt context's oldest-five window is invisible to the snapshot unless
+ * the snapshot independently fetches newest-desc comments. With five older
+ * ordinary comments and the regression report posted later, this case models
+ * the pre-#1205 bypass that PR #1204's reviewer flagged: a regression report
+ * outside the oldest-five window would have been missed, and the already-done
+ * close would have landed. The `commentsDesc` field carries the full list
+ * (newest first) so the snapshot's direction="desc" fetch sees it.
+ */
+const olderComments = Array.from({ length: 5 }, (_, index) => ({
+  id: 8000 + index,
+  author: "reviewer",
+  authorAssociation: "COLLABORATOR",
+  body: `Older note ${index + 1}`,
+  createdAt: `2026-09-${10 + index}T00:00:00Z`,
+}));
+const newerRegressionReport = {
+  id: 8100,
+  author: "maintainer",
+  authorAssociation: "OWNER",
+  body: regressionReport,
+  createdAt: "2026-09-30T00:00:00Z",
+};
+const case1205Comments = [...olderComments, newerRegressionReport];
+
+export const alreadyDoneRegressionReportOutsideOldestFive: GroomingCase = {
+  ...regressionCase(
+    "already-done-regression-report-outside-oldest-five",
+    "An authoritative human regression report posted after the prompt's oldest-five window is still seen by the guard when the snapshot fetches newest-desc comments (dispatch#1205).",
+    null,
+    case1205Comments,
+    "a recent regression report outside the oldest-five window withholds the close",
+    false,
+  ),
+  commentsDesc: [...case1205Comments].reverse(),
+};

@@ -32,8 +32,10 @@ import { evaluateCloseGrounding, reopenRegressionReasons } from "./close-groundi
 // ─── Preconditions ────────────────────────────────────────────────────────────
 
 /**
- * - issue: the live issue (title, body, labels, state) still matches the
- *   snapshot, and is still open.
+ * - issue: the live issue (title, body, labels, state, state_reason) still
+ *   matches the snapshot, and is still open. A fresh read missing
+ *   state_reason is treated as unverifiable when the snapshot captured one,
+ *   so the apply-time reopen signal cannot silently go stale (dispatch#1113).
  * - comments: no human comment arrived after the evidence window opened.
  * - head: the default branch and its head still match the pinned SHA, or the
  *   head moved without touching any repository evidence the plan relies on.
@@ -60,7 +62,12 @@ export interface LiveIssueState {
   body: string | null;
   labels: string[];
   state: string;
-  /** GitHub's issue state reason; null when absent (#1113). */
+  /**
+   * GitHub's issue state reason; null when GitHub reports none, undefined
+   * when the fresh read did not capture it (dispatch#1113). The undefined
+   * form is deliberate: a known-null and an unknown read are not the same
+   * precondition, and the apply-time close fails closed on the latter.
+   */
   stateReason?: string | null;
 }
 
@@ -150,7 +157,10 @@ function checkIssue(input: PreconditionInput, fresh: GroomingEvidenceSnapshot): 
     body: current.body ?? null,
     labels: sortedLabels(current.labels),
     state: current.state,
-    stateReason: current.stateReason ?? null,
+    // Preserve undefined vs null (dispatch#1113): a fresh read that did not
+    // capture state_reason (undefined) is treated as not-established, never as
+    // "matches the captured null", and an already_done close must fail closed.
+    stateReason: current.stateReason,
   };
   if (captured.state === "unknown" || !input.evidence.issueFingerprint) {
     return {
@@ -174,6 +184,20 @@ function checkIssue(input: PreconditionInput, fresh: GroomingEvidenceSnapshot): 
     changed.push(`labels (${delta})`);
   }
   if (live.state !== captured.state) changed.push(`state (${captured.state} -> ${live.state})`);
+  if (live.stateReason === undefined && captured.stateReason !== undefined) {
+    // The snapshot captured a known state_reason but the fresh read did not.
+    // The reopen signal cannot be re-validated, so the precondition fails
+    // closed (dispatch#1113): a withheld already_done close is safer than
+    // letting matching excerpts override a stale reopen signal.
+    return {
+      check: {
+        name: "issue",
+        status: "unverifiable",
+        detail: `the live state_reason was not captured, so the reopen signal from the snapshot (${captured.stateReason ?? "none"}) cannot be re-validated (fail closed)`,
+      },
+      live,
+    };
+  }
   const capturedStateReason = captured.stateReason ?? null;
   if (live.stateReason !== capturedStateReason) {
     changed.push(`state reason (${capturedStateReason ?? "none"} -> ${live.stateReason ?? "none"})`);
@@ -451,7 +475,10 @@ function isPinnedRepositoryCitation(catalog: EvidenceCatalog, id: string): boole
  * - no credible reopen/regression counter-evidence (dispatch#1113): an issue
  *   GitHub reports as reopened, an explicit regression report in an
  *   authoritative comment, or unavailable reopen history, all withhold the
- *   close rather than let matching excerpts override them.
+ *   close rather than let matching excerpts override them. The apply
+ *   preconditions separately re-validate the reopen signal at apply time: a
+ *   fresh read that did not capture state_reason when the snapshot did is
+ *   unverifiable, so the close cannot land on a stale reopen signal.
  * The apply preconditions separately guarantee that the head has not moved
  * under that evidence and the issue is still open.
  */

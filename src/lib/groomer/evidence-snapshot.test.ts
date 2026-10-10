@@ -197,6 +197,36 @@ describe("collectGroomingEvidenceSnapshot", () => {
     );
   });
 
+  it("preserves the issue state_reason (null vs undefined) through the snapshot and the persistence summary (dispatch#1113)", async () => {
+    const reopenedDeps = makeDeps();
+    reopenedDeps.fetchRepositoryMetadata.mockResolvedValue({ defaultBranch: "main" });
+    reopenedDeps.fetchLatestCommit.mockResolvedValue({ sha: HEAD_SHA });
+    reopenedDeps.fetchIssue.mockResolvedValue({ ...fakeIssue, state_reason: "reopened" });
+    const reopenedSnapshot = await collectGroomingEvidenceSnapshot(input, reopenedDeps);
+    expect(reopenedSnapshot.issue.stateReason).toBe("reopened");
+    expect(summarizeEvidenceForPersistence(reopenedSnapshot).issueStateReason).toBe("reopened");
+
+    const nullDeps = makeDeps();
+    nullDeps.fetchRepositoryMetadata.mockResolvedValue({ defaultBranch: "main" });
+    nullDeps.fetchLatestCommit.mockResolvedValue({ sha: HEAD_SHA });
+    nullDeps.fetchIssue.mockResolvedValue({ ...fakeIssue, state_reason: null });
+    const nullSnapshot = await collectGroomingEvidenceSnapshot(input, nullDeps);
+    expect(nullSnapshot.issue.stateReason).toBeNull();
+    expect(summarizeEvidenceForPersistence(nullSnapshot).issueStateReason).toBeNull();
+
+    // The undefined-vs-null distinction is the apply-time fail-closed signal
+    // (dispatch#1113): GitHub may omit state_reason for an open issue, and the
+    // captured-vs-fresh comparison must treat that as "not established".
+    const unknownDeps = makeDeps();
+    unknownDeps.fetchRepositoryMetadata.mockResolvedValue({ defaultBranch: "main" });
+    unknownDeps.fetchLatestCommit.mockResolvedValue({ sha: HEAD_SHA });
+    const { state_reason: _ignored, ...issueWithoutStateReason } = fakeIssue;
+    unknownDeps.fetchIssue.mockResolvedValue(issueWithoutStateReason as GitHubIssue);
+    const unknownSnapshot = await collectGroomingEvidenceSnapshot(input, unknownDeps);
+    expect(unknownSnapshot.issue.stateReason).toBeUndefined();
+    expect(summarizeEvidenceForPersistence(unknownSnapshot).issueStateReason).toBeNull();
+  });
+
   it("classifies comment provenance: automation authors are never authoritative", async () => {
     const snapshot = await collectGroomingEvidenceSnapshot(input, happyDeps());
     const byId = new Map(snapshot.comments.map((comment) => [comment.id, comment]));

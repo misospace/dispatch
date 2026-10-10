@@ -252,6 +252,46 @@ describe("validateApplyPreconditions", () => {
       expect(result.ok).toBe(false);
     });
 
+    it("fails closed when the snapshot captured state_reason=null but the fresh read did not capture state_reason (dispatch#1113)", async () => {
+      // Repro of the blocker-2 bypass: an open issue with state_reason=null at
+      // planning time, where the apply-time re-read omits the field. The
+      // captured safety signal must not be silently treated as re-validated.
+      const captured = snapshot({ issue: { ...snapshot().issue, stateReason: null } });
+      const freshWithoutReason = { ...snapshot().issue, stateReason: undefined };
+      const result = await validateApplyPreconditions(
+        input({ evidence: captured }),
+        reader({ fresh: { issue: freshWithoutReason } }),
+      );
+      expect(check(result, "issue")).toMatchObject({
+        status: "unverifiable",
+        detail: expect.stringContaining("the live state_reason was not captured"),
+      });
+      expect(check(result, "issue").detail).toMatch(/fail closed/);
+      expect(result.ok).toBe(false);
+    });
+
+    it("fails closed when the snapshot captured state_reason=reopened but the fresh read did not capture state_reason (dispatch#1113)", async () => {
+      const captured = snapshot({ issue: { ...snapshot().issue, stateReason: "reopened" } });
+      const freshWithoutReason = { ...snapshot().issue, stateReason: undefined };
+      const result = await validateApplyPreconditions(
+        input({ evidence: captured }),
+        reader({ fresh: { issue: freshWithoutReason } }),
+      );
+      expect(check(result, "issue")).toMatchObject({
+        status: "unverifiable",
+        detail: expect.stringContaining("the live state_reason was not captured"),
+      });
+      expect(check(result, "issue").detail).toContain("reopened");
+      expect(result.ok).toBe(false);
+    });
+
+    it("passes when both the snapshot and the fresh read capture state_reason=null", async () => {
+      // The fail-closed branch must not change ordinary same-state comparisons.
+      const result = await validateApplyPreconditions(input(), reader());
+      expect(check(result, "issue").status).toBe("passed");
+      expect(result.ok).toBe(true);
+    });
+
     it("is unverifiable when the snapshot never captured the issue", async () => {
       const shell = snapshot({ issue: { ...snapshot().issue, state: "unknown", title: "", body: null, labels: [] }, issueFingerprint: "" });
       const result = await validateApplyPreconditions(input({ evidence: shell, plan: planFor(alreadyDoneDraft(), snapshot()) }), reader());

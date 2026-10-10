@@ -5,6 +5,7 @@ import {
   alreadyDoneAutomationRegression,
   alreadyDoneOrdinary,
   alreadyDoneRegressionReport,
+  alreadyDoneRegressionReportOutsideOldestFive,
   alreadyDoneReopenRegression,
 } from "./already-done-reopen-regression";
 import { alreadyFixedOnMain } from "./already-fixed-on-main";
@@ -42,6 +43,7 @@ export const CASES: GroomingCase[] = [
   alreadyDoneOrdinary,
   alreadyDoneReopenRegression,
   alreadyDoneRegressionReport,
+  alreadyDoneRegressionReportOutsideOldestFive,
   alreadyDoneAutomationRegression,
   evidenceIdAsRelatedWork,
   // Safety edges.

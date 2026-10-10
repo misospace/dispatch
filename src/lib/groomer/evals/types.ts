@@ -172,6 +172,14 @@ export interface GroomingCase {
   regressionOf?: string;
   repoFullName: string;
   issue: CaseIssue;
+  /**
+   * Optional newest-first comment list for the snapshot evidence fetch
+   * (dispatch#1205). When set, the harness returns this list (capped) for
+   * direction="desc" fetches and `comments` for direction="asc", modelling
+   * the snapshot's independent newest-comment fetch. Absent: the single
+   * `comments` list is returned for any direction (legacy behaviour).
+   */
+  commentsDesc?: CaseComment[];
   comments?: CaseComment[];
   repository: CaseRepository;
   relatedWork?: Array<Pick<RelatedWorkObservation, "key" | "kind" | "state" | "via" | "closes" | "baseRef">>;
