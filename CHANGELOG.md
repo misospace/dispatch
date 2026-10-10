@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.69](https://github.com/misospace/dispatch/compare/v0.5.68...v0.5.69) (2026-10-10)
+
+
+### Features
+
+* **auth:** bind worker bearer tokens to agent names ([#1129](https://github.com/misospace/dispatch/issues/1129)) ([#1207](https://github.com/misospace/dispatch/issues/1207)) ([616dbd1](https://github.com/misospace/dispatch/commit/616dbd1e220abdf6b75b178e54f023a7577c0790))
+* **deps:** update dependency lucide-react (1.52.0 → 1.53.0) ([#1196](https://github.com/misospace/dispatch/issues/1196)) ([99c93f5](https://github.com/misospace/dispatch/commit/99c93f52953b3bcdd7c1c5d27064dfc1d06e6cb9))
+* **deps:** update dependency lucide-react (1.53.0 → 1.54.0) ([#1208](https://github.com/misospace/dispatch/issues/1208)) ([7ee3e66](https://github.com/misospace/dispatch/commit/7ee3e66d77d1804738dea269a96b59eb82efbf9c))
+* **deps:** update dependency lucide-react (1.54.0 → 1.55.0) ([#1213](https://github.com/misospace/dispatch/issues/1213)) ([ab41eac](https://github.com/misospace/dispatch/commit/ab41eacdc64bb835ba277328019226b25a644b71))
+* **helm:** update chart common (5.2.1 → 5.3.0) ([#1216](https://github.com/misospace/dispatch/issues/1216)) ([3c61ef8](https://github.com/misospace/dispatch/commit/3c61ef8a35fe33d41887d8c2f9116f12232a643e))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @types/node (24.19.1 → 24.19.2) ([#1209](https://github.com/misospace/dispatch/issues/1209)) ([7ae16a4](https://github.com/misospace/dispatch/commit/7ae16a4eda80454242d51d0cf97dc5cd63cefe33))
+* **dispatch:** retire external groom task dispatch ([#1200](https://github.com/misospace/dispatch/issues/1200)) ([#1201](https://github.com/misospace/dispatch/issues/1201)) ([e7ac005](https://github.com/misospace/dispatch/commit/e7ac005243810534d1ac24a0a2d5b338d512120f))
+* **groomer:** gate contributor-facing replies to external users ([#1198](https://github.com/misospace/dispatch/issues/1198)) ([#1199](https://github.com/misospace/dispatch/issues/1199)) ([b42cecf](https://github.com/misospace/dispatch/commit/b42cecfbe291091edaf5b20c9c50dbe01a44a5fb))
+* **groomer:** guard already_done closes against reopen/regression evidence ([#1204](https://github.com/misospace/dispatch/issues/1204)) ([89e1b78](https://github.com/misospace/dispatch/commit/89e1b78413a440b87530eb6b4eb6f1f30d96a783))
+* **groomer:** sanitize GitHub-authored error text at mutation errorMessage helpers ([#1164](https://github.com/misospace/dispatch/issues/1164)) ([#1215](https://github.com/misospace/dispatch/issues/1215)) ([366edf9](https://github.com/misospace/dispatch/commit/366edf9f14afbe63982c23da357b3eb752865bd8))
+
 ## [0.5.68](https://github.com/misospace/dispatch/compare/v0.5.67...v0.5.68) (2026-10-08)
 
 
