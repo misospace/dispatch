@@ -10,6 +10,7 @@ import {
   listIssues,
   listPrFixes,
   markPrFix,
+  ackPrFix,
   requeuePrFix,
   runGroomer,
   resolveAgentName,
@@ -183,6 +184,17 @@ export async function markPrFixHandler(args: ExtraArgs): Promise<ToolResult> {
       status: args.status as string,
       note: args.note as string | undefined,
       generation: args.generation as number | undefined,
+    }),
+  );
+}
+
+export async function ackPrFixHandler(args: ExtraArgs): Promise<ToolResult> {
+  return wrapToolCall(() =>
+    ackPrFix({
+      repo: args.repo as string,
+      pr: args.pr as number,
+      generation: args.generation as number,
+      agentName: args.agentName as string | undefined,
     }),
   );
 }
@@ -393,6 +405,27 @@ export function createServer(): McpServerType {
       },
     },
     markPrFixHandler,
+  );
+
+  // ── ack_pr_fix ───────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "ack_pr_fix",
+    {
+      description:
+        "Acknowledge a PR-fix hand-out after durably materializing the attempt, so the stale hand-out reclaimer will not reclaim it. Requires repo, pr, and the generation issued on the hand-out.",
+      inputSchema: {
+        repo: z.string().describe("GitHub repo full name (e.g. 'org/repo')"),
+        pr: z.number().int().positive().describe("Pull request number"),
+        generation: z
+          .number()
+          .int()
+          .positive()
+          .describe("Queue item generation issued on the hand-out being acknowledged"),
+        agentName: z.string().optional().describe("Agent name acknowledging the hand-out (defaults to the configured agent)"),
+      },
+    },
+    ackPrFixHandler,
   );
 
   // ── requeue_pr_fix ───────────────────────────────────────────────────────

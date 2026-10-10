@@ -208,6 +208,13 @@ export const WORKER_ALLOWLIST: ReadonlyArray<{ method: string | "*"; pattern: Re
   { method: "GET", pattern: /^\/api\/pr-fix-queue\/queued$/ },
   { method: "GET", pattern: /^\/api\/pr-fix-queue\/history$/ },
   { method: "POST", pattern: /^\/api\/pr-fix-queue\/mark$/ },
+  // A worker acknowledges its own hand-out after durably materializing the
+  // attempt (#1211). The route is also identity-scoped (#1207 review):
+  // `enforceWorkerAgentScope` refuses the legacy unbound `DISPATCH_WORKER_TOKEN`
+  // and any bound credential that does not match the body/header agent, so a
+  // token holder cannot spoof an ack for another agent. The reclaimer sweep
+  // stays maintainer-only.
+  { method: "POST", pattern: /^\/api\/pr-fix-queue\/ack$/ },
 ];
 
 /**
