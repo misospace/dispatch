@@ -490,7 +490,7 @@ export type AckPrFixHandoutResult =
   | { acknowledged: true; item: any }
   | {
       acknowledged: false;
-      reason: "not-found" | "generation-mismatch" | "not-queued" | "already-acknowledged";
+      reason: "not-found" | "generation-mismatch" | "not-queued" | "already-acknowledged" | "not-stamped";
     };
 
 export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput | { error: string } {
@@ -524,10 +524,14 @@ export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput |
  * Record a durable hand-out acknowledgement for the CURRENT generation
  * (#1211). A late ack for an older generation is refused
  * (`generation-mismatch`) so it can never mark the fresh generation as live.
- * The write is pinned on `{ id, generation, status: "QUEUED" }`: a concurrent
- * reclaim or settlement that moves the row in the read→write gap no-ops it,
- * and the caller gets `generation-mismatch`. A repeat ack for the same
- * `(agent, generation)` is idempotent (`already-acknowledged`, no write).
+ * Only a generation that was actually stamped/handed out can be acknowledged
+ * (`not-stamped` otherwise): an unstamped item was never offered, so an ack
+ * cannot pin it against reclamation. The write is a compare-and-swap pinned
+ * on `{ id, generation, status: "QUEUED", handoutAcks }`: a concurrent
+ * reclaim, settlement, or ack that moves the row (or its ack list) in the
+ * read→write gap no-ops it, and the caller gets `generation-mismatch`. A
+ * repeat ack for the same `(agent, generation)` is idempotent
+ * (`already-acknowledged`, no write).
  */
 export async function ackPrFixHandout(
   client: PrFixQueueClient,
@@ -545,16 +549,27 @@ export async function ackPrFixHandout(
   if (existing.status !== "QUEUED") {
     return { acknowledged: false, reason: "not-queued" };
   }
+  // Only a generation that was actually handed out may be acknowledged: an
+  // unstamped item was never offered, so an ack cannot pin it against
+  // reclamation (#1211).
+  if (existing.dispatchedGeneration !== input.generation || existing.dispatchedAt == null) {
+    return { acknowledged: false, reason: "not-stamped" };
+  }
   const token = agentHandoutToken(input.agentName || "unknown", input.generation);
   const acks: string[] = Array.isArray(existing.handoutAcks) ? existing.handoutAcks : [];
   if (acks.includes(token)) {
     return { acknowledged: false, reason: "already-acknowledged" };
   }
 
+  // Compare-and-swap on the exact ack-list snapshot the idempotency check
+  // read (#1211): two concurrent acks serialize — one wins the pin, the other
+  // misses (returns generation-mismatch for the caller to retry) — so no
+  // duplicate tokens and no lost update.
+  const nextAcks = [...acks, token];
   const item = await client.$transaction(async (tx) => {
     const { count } = await tx.prFixQueueItem.updateMany({
-      where: { id: existing.id, generation: input.generation, status: "QUEUED" },
-      data: { handoutAcks: { push: [token] } },
+      where: { id: existing.id, generation: input.generation, status: "QUEUED", handoutAcks: { equals: acks } },
+      data: { handoutAcks: nextAcks },
     });
     if (count !== 1) return null;
     await tx.prFixHistory.create({
@@ -563,7 +578,7 @@ export async function ackPrFixHandout(
         action: "ack",
         status: "QUEUED",
         lane: existing.lane,
-        note: `Hand-out acknowledged for generation ${input.generation}.`,
+        note: `Hand-out acknowledged for generation ${input.generation} by ${input.agentName || "unknown"}.`,
       },
     });
     return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });

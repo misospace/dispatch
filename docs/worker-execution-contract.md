@@ -59,6 +59,7 @@ Before selecting any work from the assignment queue, the worker **must** check t
    - Alternatively, query `GET /api/pr-fix-queue/queued?lane=normal` directly for PR-fix items only.
 2. For each item with `type: "pr-review-fix"`:
    - Verify the PR is still open and authored by the expected bot account.
+   - If the task was issued via next-task with a prFixItem token, acknowledge the hand-out after the run is durably created so the stale hand-out reclaimer does not reopen a live attempt: `POST /api/pr-fix-queue/ack` with `{ repo, pr, generation, agentName? }` (MCP `ack_pr_fix`). The ack is generation-pinned and idempotent; an unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default 30m) is reclaimed by the scheduled pr-fix-sweep.
    - Verify the head owner matches the trusted owner (`misospace` or `joryirving`).
    - Fetch origin, checkout the queued branch, pull/rebase as appropriate.
    - Read the item's `feedback[]` array to determine the requested fix (from PR comments, reviews, and check failures).

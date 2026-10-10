@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -3463,6 +3463,67 @@ describe("reclaim stale hand-outs (#1211)", () => {
     }
   });
 
+  it("accumulates the reclaim bound across repeated sweeps until the cap routes to a human", async () => {
+    await seedStaleUnacked(215);
+    // The sweep clears the stamp on each reclaim, so a further sweep only sees
+    // a stale hand-out once the item is re-stamped stale — mirroring next-task
+    // handing the fresh generation out again. Never set handoutReclaims directly.
+    const restampStale = () => {
+      const current = client.items[0];
+      current.dispatchedGeneration = current.generation;
+      current.dispatchedAt = new Date("2026-01-01T00:00:00Z");
+      current.agentHandouts = [`courier@${current.generation}`];
+    };
+
+    const generations: number[] = [];
+    for (let i = 1; i <= 3; i += 1) {
+      restampStale();
+      const report = await reclaimStalePrFixHandouts(client, {
+        now: STALE_NOW,
+        maxReclaims: 3,
+        isPrMergedOrClosed: async () => false,
+      });
+      expect(report.reclaimed).toBe(1);
+      expect(client.items[0].handoutReclaims).toBe(i);
+      generations.push(client.items[0].generation);
+    }
+    expect(generations).toEqual([2, 3, 4]);
+
+    // The 4th sweep is past the cap: BLOCKED / NEEDS_HUMAN, no further bump.
+    restampStale();
+    const finalReport = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      maxReclaims: 3,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(finalReport.blocked).toBe(1);
+    expect(finalReport.reclaimed).toBe(0);
+    expect(client.items[0].status).toBe("BLOCKED");
+    expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+    expect(client.items[0].generation).toBe(4);
+  });
+
+  it("a reclaimed item is re-dispatchable: no per-agent suppression survives the identity change", async () => {
+    const row = await seedStaleUnacked(216);
+    row.agentHandouts = ["agent@1"];
+    // The agent already held generation 1, so a re-hand was suppressed before.
+    expect(agentAlreadyHanded({ agentHandouts: row.agentHandouts, generation: row.generation }, "agent")).toBe(true);
+
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      isPrMergedOrClosed: async () => false,
+    });
+    expect(report.reclaimed).toBe(1);
+
+    // Reclaimed to a new generation with a cleared hand-out list: the same
+    // agent can be handed the fresh attempt again.
+    const reclaimed = client.items[0];
+    expect(agentAlreadyHanded(
+      { agentHandouts: reclaimed.agentHandouts, generation: reclaimed.generation },
+      "agent",
+    )).toBe(false);
+  });
+
   it("reaps a stale unacknowledged hand-out to STALE when the PR is merged or closed", async () => {
     await seedStaleUnacked(206);
     const report = await reclaimStalePrFixHandouts(client, {
@@ -3558,6 +3619,38 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(second).toEqual({ acknowledged: false, reason: "already-acknowledged" });
     expect(client.items[0].handoutAcks).toEqual(["courier@1"]);
     expect(client.history.length).toBe(historyBefore + 1);
+  });
+
+  it("ackPrFixHandout refuses an unstamped generation (not-stamped) without mutating", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 213, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k213", headSha: "H1",
+    });
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 214, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "k214", headSha: "H1",
+    });
+    // 213: right generation but never handed out (both stamp columns null).
+    // 214: generation stamped but no dispatchedAt — still not a live hand-out.
+    const second = client.items.find((i) => i.pr === 214)!;
+    second.dispatchedGeneration = second.generation;
+    second.dispatchedAt = null;
+    expect(client.items.find((i) => i.pr === 213)!.dispatchedGeneration).toBeNull();
+    expect(client.items.find((i) => i.pr === 213)!.dispatchedAt).toBeNull();
+    const historyBefore = client.history.length;
+
+    const bothNull = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 213, generation: 1, agentName: "courier",
+    });
+    const noDispatchedAt = await ackPrFixHandout(client, {
+      repo: "org/repo", pr: 214, generation: 1, agentName: "courier",
+    });
+
+    expect(bothNull).toEqual({ acknowledged: false, reason: "not-stamped" });
+    expect(noDispatchedAt).toEqual({ acknowledged: false, reason: "not-stamped" });
+    expect(client.items.find((i) => i.pr === 213)!.handoutAcks).toEqual([]);
+    expect(client.items.find((i) => i.pr === 214)!.handoutAcks).toEqual([]);
+    expect(client.history.length).toBe(historyBefore);
   });
 
   it("ackPrFixHandout refuses a non-QUEUED item and a missing item", async () => {

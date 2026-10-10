@@ -53,6 +53,11 @@ export async function POST(request: Request) {
           { error: "PR fix queue item is not QUEUED", reason: result.reason },
           { status: 409 },
         );
+      case "not-stamped":
+        return NextResponse.json(
+          { error: "PR fix queue item has no live hand-out at that generation", reason: result.reason },
+          { status: 409 },
+        );
     }
   } catch (error) {
     console.error("Failed to acknowledge pr-fix hand-out:", error);

@@ -148,6 +148,17 @@ describe("POST /api/pr-fix-queue/ack", () => {
     expect(body.reason).toBe("not-queued");
   });
 
+  it("returns 409 when the generation was never handed out", async () => {
+    mocks.ackPrFixHandout.mockResolvedValue({ acknowledged: false, reason: "not-stamped" });
+
+    const res = await postRequest({ repo: "org/repo", pr: 42, generation: 2 });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("PR fix queue item has no live hand-out at that generation");
+    expect(body.reason).toBe("not-stamped");
+  });
+
   it("returns 500 when the acknowledgement throws", async () => {
     mocks.ackPrFixHandout.mockRejectedValue(new Error("db connection lost"));
 
