@@ -483,7 +483,7 @@ export interface AckPrFixHandoutInput {
   repo: string;
   pr: number;
   generation: number;
-  agentName?: string | null;
+  agentName: string;
 }
 
 export type AckPrFixHandoutResult =

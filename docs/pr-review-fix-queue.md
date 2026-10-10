@@ -246,18 +246,27 @@ prove the stamped hand-out reached a live worker, the worker acknowledges it
 - `POST /api/pr-fix-queue/ack` — body `{ repo, pr, generation, agentName }`.
   Bearer auth only (or `DISPATCH_AUTH_MODE=disabled` for dev); basic / OIDC
   sessions are rejected with 403 because they would otherwise let any signed-in
-  user forge an ack for any (repo, pr, generation). The route derives
-  `agentName` from the authenticated actor (the `x-agent-name` header) — a
-  body value that disagrees with the actor is rejected with 400. The
-  underlying write is generation-pinned and idempotent: a repeat ack for the
-  same `(agent, generation)` returns `200` with `alreadyAcknowledged: true`, a
-  late ack for an older generation is refused `409` (`generation-mismatch`), a
-  non-`QUEUED` item is refused `409` (`not-queued`), an item that was never
-  stamped is refused `409` (`not-stamped`), and an item that was stamped but
-  not handed to the authenticated agent is refused `403` (`not-handed`). The
-  write is a CAS pinned on `id + generation + status + handoutAcks`, so a
-  concurrent reclaim, settlement, or ack that moves the row in the read→write
-  gap no-ops it. Worker tokens may call it (a worker acks its own hand-out);
+  user forge an ack for any (repo, pr, generation). The route also enforces
+  the worker identity-scope gate from #1129 / #1207: a worker-tier caller
+  must be **bound** to the agent it is acking for, so the legacy
+  `DISPATCH_WORKER_TOKEN` (which has no binding) is refused with 403, and a
+  bound credential for the wrong agent is refused with 403. Maintainer-tier
+  bearers (`DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN`) pass
+  through and may ack for any agent the hand-out table actually stamped —
+  the operator escape hatch for the reclaimer sweep. The authenticated
+  actor (`auth.agentName` for a bound worker, the `x-agent-name` header for
+  the legacy token, the maintainer identity) is the source of truth for
+  `agentName`; a body value that disagrees with the actor is rejected
+  with 400. The underlying write is generation-pinned and idempotent: a
+  repeat ack for the same `(agent, generation)` returns `200` with
+  `alreadyAcknowledged: true`, a late ack for an older generation is
+  refused `409` (`generation-mismatch`), a non-`QUEUED` item is refused
+  `409` (`not-queued`), an item that was never stamped is refused `409`
+  (`not-stamped`), and an item that was stamped but not handed to the
+  authenticated agent is refused `403` (`not-handed`). The write is a CAS
+  pinned on `id + generation + status + handoutAcks`, so a concurrent
+  reclaim, settlement, or ack that moves the row in the read→write gap
+  no-ops it. Worker tokens may call it (a worker acks its own hand-out);
   the sweep below is maintainer-only.
 - MCP `ack_pr_fix` wraps the same endpoint.
 
