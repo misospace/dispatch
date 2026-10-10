@@ -34,6 +34,7 @@ import {
   getBearerTokenIdentity,
   getBearerTokenTier,
   isAuthorizedBearerToken as _isAuthed,
+  isConfiguredWorkerToken,
   resetCaches as _resetEnvCaches,
   safeEqual,
   type TokenTier,
@@ -300,6 +301,14 @@ function resolveSessionActor(user: { email?: string | null; name?: string | null
  * client-import-free) module graph lean, and the try/catch guarantees a DB
  * failure can never change the auth decision — the denial stands either way.
  *
+ * The audit actor is the token-derived identity when one is available
+ * (preferring the bound worker `agentName`); legacy unbound worker tokens
+ * fall back to the self-reported `x-agent-name` header. Source from the
+ * request header rather than a body argument so the bound identity cannot
+ * be overridden by the caller, and so a denied worker cannot rotate header
+ * values to evade the per-actor throttle or attribute the row to another
+ * agent.
+ *
  * Rows are throttled two ways so a misconfigured worker cannot write-amplify
  * the audit table: one row per (actor, method, pathname) per minute, with an
  * overall per-actor ceiling per minute (dynamic maintainer paths like
@@ -308,12 +317,21 @@ function resolveSessionActor(user: { email?: string | null; name?: string | null
  * decision, so every step sits inside a try/catch.
  */
 async function recordTierDenialAudit(
+  headerAuth: {
+    authorized: true;
+    type: "bearer";
+    tier: TokenTier;
+    agentName?: string;
+  },
   request: Request,
   pathname: string,
   method: string,
 ): Promise<void> {
   try {
-    const actor = resolveBearerActor(request);
+    // Prefer the token-derived identity over the self-reported header so a
+    // denied worker cannot attribute rows to another agent or rotate
+    // identities to evade per-actor throttling.
+    const actor = headerAuth.agentName ?? resolveBearerActor(request);
     const { checkRateLimit } = await import("./rate-limit");
     if (!checkRateLimit(`auth_tier_denied:${actor}`, { limit: 10, windowMs: 60_000 }).allowed) return;
     if (!checkRateLimit(`auth_tier_denied:${actor}:${method}:${pathname}`, { limit: 1, windowMs: 60_000 }).allowed) return;
@@ -367,7 +385,7 @@ export async function authorizeRequest(request: Request): Promise<AuthorizedRequ
       const { pathname } = new URL(request.url);
       const required = requiredTierForRoute(pathname, request.method);
       if (required === "maintainer") {
-        await recordTierDenialAudit(request, pathname, request.method);
+        await recordTierDenialAudit(headerAuth, request, pathname, request.method);
         return { authorized: false, forbidden: true, requiredTier: "maintainer" };
       }
     }
@@ -457,9 +475,16 @@ export async function authorizeGroomerRequest(request: Request): Promise<Authori
 
   const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
   if (parsed?.type === "bearer" && safeEqual(parsed.token, token)) {
-    // Fail-closed: if the presented groomer token value is also the
-    // configured worker token, the tier table resolves it to the lower
-    // "worker" tier — do not escalate it to maintainer here.
+    // Fail-closed: a groomer token value that also appears in
+    // `DISPATCH_WORKER_TOKENS` (whether resolved successfully or dropped as
+    // an ambiguous two-agent binding) cannot be escalated to the privileged
+    // groomer/maintainer tier — even though the value matches DISPATCH_GROOMER_TOKEN.
+    // `isConfiguredWorkerToken` checks every value parsed from that env var,
+    // which is broader than `getBearerTokenTier === "worker"` (the tier table
+    // excludes ambiguous bindings entirely). Returning the original `standard`
+    // result preserves the worker-tier `forbidden` outcome so the caller gets
+    // a 403 either way.
+    if (isConfiguredWorkerToken(parsed.token)) return standard;
     if (getBearerTokenTier(parsed.token) === "worker") return standard;
     return {
       authorized: true,

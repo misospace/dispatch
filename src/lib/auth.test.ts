@@ -645,6 +645,25 @@ describe("bearer token tiers (#1111)", () => {
     expect(JSON.stringify(call.data)).not.toContain(WORKER_TOKEN);
   });
 
+  it("attributes BOUND worker denial audits to the token-derived identity, ignoring rotated x-agent-name (#1129 review)", async () => {
+    // A denied alpha-bound worker previously could rotate the x-agent-name
+    // header to bravo and either attribute the row to bravo or evade the
+    // per-actor throttle. The audit row must follow the token.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:bound-token`;
+    const request = new Request("http://localhost/api/sync", {
+      method: "POST",
+      headers: { Authorization: "Bearer bound-token", "x-agent-name": "bravo" },
+    });
+    await authorizeRequest(request);
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
+    const call = mocks.auditCreate.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data.actor).toBe("alpha");
+    // The throttle bucket must also derive from the token-derived identity.
+    expect(JSON.stringify(call.data)).not.toContain("bound-token");
+    expect(JSON.stringify(call.data)).not.toContain("bravo");
+  });
+
   it("authorizeGroomerRequest preserves the worker-tier forbidden result", async () => {
     // No dedicated groomer token configured.
     await expect(authorizeGroomerRequest(workerRequest("/api/groomer/run", "POST"))).resolves.toEqual({
@@ -682,6 +701,66 @@ describe("bearer token tiers (#1111)", () => {
       authorized: false,
       forbidden: true,
       requiredTier: "maintainer",
+    });
+  });
+
+  it("does not escalate a groomer token that duplicates a BOUND worker token to maintainer (#1129 review)", async () => {
+    // The groomer token value is also a token listed in DISPATCH_WORKER_TOKENS:
+    // the tier table resolves it to the lower worker tier, and the privileged
+    // fallback must keep that fail-closed behaviour rather than promote the
+    // value to the hosted-groomer maintainer identity.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = `alpha:${WORKER_TOKEN}`;
+    process.env.DISPATCH_GROOMER_TOKEN = WORKER_TOKEN;
+    const request = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    await expect(authorizeGroomerRequest(request)).resolves.toEqual({
+      authorized: false,
+      forbidden: true,
+      requiredTier: "maintainer",
+    });
+  });
+
+  it("does not escalate an AMBIGUOUS bound token presented as the groomer token to maintainer (#1129 review)", async () => {
+    // DISPATCH_WORKER_TOKENS="alpha:dup,bravo:dup" — the value is dropped from
+    // the tier table as ambiguous, but its value MUST still fail-closed in the
+    // privileged fallback so it cannot be promoted into the
+    // hosted-groomer/maintainer identity through a value collision. The
+    // ambiguous value is not a recognized identity at all, so the result here
+    // is the same plain `authorized: false` (401 Unauthorized) the standard
+    // auth path returns for an unknown token — what matters is that the
+    // hostile escalation to maintainer is blocked.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:dup,bravo:dup";
+    process.env.DISPATCH_GROOMER_TOKEN = "dup";
+    const request = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer dup" },
+    });
+    const result = await authorizeGroomerRequest(request);
+    expect(result).toEqual({ authorized: false });
+    expect(result).not.toMatchObject({ tier: "maintainer" });
+    // authErrorResponse maps a plain `authorized: false` to 401, so the
+    // ambiguous value is denied rather than escalated.
+    expect(authErrorResponse(result as Extract<typeof result, { authorized: false }>).status).toBe(401);
+  });
+
+  it("still authorizes a distinct, non-worker groomer token at maintainer tier", async () => {
+    // Sanity check that the new worker-configured-value guard does not
+    // regress the plain happy path: a unique groomer token unrelated to any
+    // worker credential still escalates to the maintainer tier.
+    delete process.env.DISPATCH_WORKER_TOKEN;
+    process.env.DISPATCH_GROOMER_TOKEN = "groomer-token";
+    const request = new Request("http://localhost/api/groomer/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer groomer-token" },
+    });
+    await expect(authorizeGroomerRequest(request)).resolves.toMatchObject({
+      authorized: true,
+      type: "bearer",
+      tier: "maintainer",
     });
   });
 

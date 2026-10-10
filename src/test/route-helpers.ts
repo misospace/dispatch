@@ -63,6 +63,12 @@ export function makeDispatchEnvMock(
     getBoundAgentName: vi.fn((t: string | null | undefined) =>
       t !== null && t !== undefined && t in bindings ? bindings[t] : undefined,
     ),
+    // Privileged-fallback guard: true when the value appears in the
+    // configured worker bindings table — drives the groomer route's
+    // fail-closed behaviour (#1129 review).
+    isConfiguredWorkerToken: vi.fn((t: string | null | undefined) =>
+      t !== null && t !== undefined && accepted.includes(t),
+    ),
     resetCaches: vi.fn(),
   };
 }

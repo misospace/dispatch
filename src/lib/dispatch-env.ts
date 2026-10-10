@@ -100,6 +100,7 @@ export type WorkerTokenBinding = { token: string; agentName: string };
 
 let _workerTokenBindings: WorkerTokenBinding[] | undefined;
 let _ambiguousWorkerTokens: Set<string> | undefined;
+let _allConfiguredWorkerTokens: Set<string> | undefined;
 
 /**
  * Parse `DISPATCH_WORKER_TOKENS` into token→agent bindings.
@@ -161,6 +162,11 @@ export function getWorkerTokenBindings(): WorkerTokenBinding[] {
   }
 
   _ambiguousWorkerTokens = ambiguous;
+  // Track every distinct token value parsed from DISPATCH_WORKER_TOKENS —
+  // including the ones dropped as ambiguous — so callers like the groomer
+  // route can reject any worker-configured value fail-closed regardless of
+  // whether the binding survived.
+  _allConfiguredWorkerTokens = new Set(tokenAgents.keys());
   _workerTokenBindings = parsed.filter((binding) => !ambiguous.has(binding.token));
   return _workerTokenBindings;
 }
@@ -222,6 +228,31 @@ export function getBearerTokenIdentity(
 export function getBoundAgentName(token: string | null | undefined): string | undefined {
   const identity = getBearerTokenIdentity(token);
   return identity && identity.tier === "worker" ? identity.agentName : undefined;
+}
+
+/**
+ * Resolve the full set of every distinct token value parsed from
+ * `DISPATCH_WORKER_TOKENS`, including the ones dropped as ambiguous bindings.
+ * Returned tokens are trimmed the same way `getBearerTokenTier` compares.
+ */
+function getAllConfiguredWorkerTokenValues(): Set<string> {
+  // Parsing populates this set as a side effect.
+  getWorkerTokenBindings();
+  return _allConfiguredWorkerTokens ?? new Set<string>();
+}
+
+/**
+ * Return true when `token` appears as the token side of any entry in
+ * `DISPATCH_WORKER_TOKENS` — whether the binding was kept or dropped as
+ * ambiguous. Privileged callers (groomer, maintainer fallbacks) use this to
+ * refuse any worker-configured value fail-closed, independent of how the
+ * tier table ends up resolving the token.
+ */
+export function isConfiguredWorkerToken(token: string | null | undefined): boolean {
+  if (!token) return false;
+  const trimmed = token.trim();
+  if (!trimmed) return false;
+  return getAllConfiguredWorkerTokenValues().has(trimmed);
 }
 
 let _warnedLegacyWorkerToken = false;
@@ -414,5 +445,6 @@ export function resetCaches(): void {
   _tokenTiers = undefined;
   _workerTokenBindings = undefined;
   _ambiguousWorkerTokens = undefined;
+  _allConfiguredWorkerTokens = undefined;
   _warnedLegacyWorkerToken = false;
 }

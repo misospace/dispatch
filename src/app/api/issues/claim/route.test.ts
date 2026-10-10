@@ -127,7 +127,7 @@ describe("POST /api/issues/claim — validation", () => {
 describe("POST /api/issues/claim — business logic", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
@@ -150,14 +150,14 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("refuses closed issues", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "closed", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "closed", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     const res = await POST(makeRequest());
     expect(res.status).toBe(400);
     expect((await res.json()).error).toBe("Cannot claim a closed issue");
   });
 
   it("refuses done issues", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/done"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/done"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/done"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(400);
@@ -171,6 +171,7 @@ describe("POST /api/issues/claim — business logic", () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["status/ready", "agent/test-agent", "priority/p0"],
     });
     const res = await POST(makeRequest());
@@ -182,6 +183,7 @@ describe("POST /api/issues/claim — business logic", () => {
     mocks.findUnique.mockResolvedValue({
       id: "issue-1",
       state: "open",
+      number: 42, repository: { fullName: "org/repo" },
       labels: ["agent/test-agent", "agent/other-agent"],
     });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/test-agent", "agent/other-agent"]);
@@ -190,7 +192,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("returns 409 when already assigned to another agent without force", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
@@ -198,7 +200,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("force claims by removing old agent label when force=true", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
@@ -209,7 +211,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("force claims by removing ALL conflicting agent labels when live labels carry more than one", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "agent/third-agent"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent", "agent/third-agent"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "agent/third-agent"]);
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
@@ -225,7 +227,7 @@ describe("POST /api/issues/claim — business logic", () => {
 
   it("logs error when force claim label removal fails but continues", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockReturnValue();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
     const res = await POST(makeRequest({ force: true }));
@@ -250,7 +252,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("replaces an existing status label with in-progress", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/in-review"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-review"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
@@ -260,7 +262,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("removes ALL existing status labels when an issue carries more than one (approved fix)", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review", "status/backlog"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/in-review", "status/backlog"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-review", "status/backlog"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
@@ -280,7 +282,7 @@ describe("POST /api/issues/claim — business logic", () => {
   });
 
   it("adds agent and in-progress labels regardless of force when no status exists", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     const res = await POST(makeRequest({ force: false }));
     expect(res.status).toBe(200);
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
@@ -291,7 +293,7 @@ describe("POST /api/issues/claim — business logic", () => {
 describe("POST /api/issues/claim — owner label handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
@@ -300,7 +302,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
   });
 
   it("preserves owner labels when claiming an issue with owner/*", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["owner/alice"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/alice"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
@@ -312,7 +314,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
   });
 
   it("allows claim when only owner label exists (no agent conflict)", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/bob", "priority/p1"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["owner/bob", "priority/p1"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/bob", "priority/p1"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
@@ -323,7 +325,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
   });
 
   it("handles both agent and owner conflicts — refuses without force", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "owner/alice"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent", "owner/alice"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "owner/alice"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
@@ -331,7 +333,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
   });
 
   it("force claims when both agent and owner labels exist", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent", "owner/alice", "priority/p2"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent", "owner/alice", "priority/p2"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "owner/alice", "priority/p2"]);
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
@@ -348,7 +350,7 @@ describe("POST /api/issues/claim — owner label handling", () => {
 describe("POST /api/issues/claim — audit trail with conflict analysis", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
@@ -357,7 +359,7 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
   });
 
   it("includes conflict details in audit log when agent conflict exists and force is used", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["agent/other-agent"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other-agent"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent"]);
     await POST(makeRequest({ force: true }));
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
@@ -370,7 +372,7 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
   });
 
   it("includes owner conflict details in audit log when owner labels exist", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["owner/alice"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["owner/alice"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["owner/alice"]);
     await POST(makeRequest());
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
@@ -383,7 +385,7 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
   });
 
   it("no conflict notes when no existing assignments", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/backlog"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/backlog"] });
     await POST(makeRequest());
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -398,7 +400,7 @@ describe("POST /api/issues/claim — audit trail with conflict analysis", () => 
 describe("POST /api/issues/claim — #1037 live label gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
@@ -408,7 +410,7 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
   });
 
   it("refuses 409 when only the live GitHub labels show another agent (cache is clean)", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/ready"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "agent/other-agent"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
@@ -416,7 +418,7 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
   });
 
   it("force-claims when only the live GitHub labels show another agent, removing that label", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/ready"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "agent/other-agent"]);
     const res = await POST(makeRequest({ force: true }));
     expect(res.status).toBe(200);
@@ -443,7 +445,7 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
 
   it("builds the resulting label set from live labels, not the stale cache", async () => {
     // Cache still has status/in-review; GitHub no longer does and carries status/backlog
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/in-review"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/in-review"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "priority/p0"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
@@ -457,7 +459,7 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
   });
 
   it("refuses a done issue when only live labels carry status/done (cache does not)", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: ["status/ready"] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/ready"] });
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready", "status/done"]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(400);
@@ -468,7 +470,7 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
 describe("POST /api/issues/claim — worker tier (#1111)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", labels: [] as string[] });
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.addIssueLabel.mockResolvedValue(undefined);
@@ -549,5 +551,73 @@ describe("POST /api/issues/claim — worker tier (#1111)", () => {
     expect((await res.json()).error).toContain("may not act for");
     expect(mocks.findUnique).not.toHaveBeenCalled();
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/claim — cross-issue identity invariant (#1129 review)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      number: 42,
+      repository: { fullName: "org/repo" },
+      labels: [] as string[],
+    });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+  });
+
+  it("refuses with 400 when body repoFullName does not match the loaded issue's canonical repo", async () => {
+    // Loaded issue belongs to org/repo but the caller supplies their own
+    // org/repo#42 (alpha-owned) while pointing at issueId of an alpha-assigned A.
+    const res = await POST(makeRequest({
+      issueId: "issue-1",
+      repoFullName: "bravo/repo",
+      issueNumber: 99,
+    }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("does not match");
+    expect(body.error).toContain("org/repo#42");
+    // No GitHub or DB writes — the mismatch is caught before any side effect.
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 400 when body issueNumber does not match the loaded issue's canonical number", async () => {
+    const res = await POST(makeRequest({
+      issueId: "issue-1",
+      repoFullName: "org/repo",
+      issueNumber: 7,
+    }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("does not match");
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+  });
+
+  it("uses the canonical repoFullName/issueNumber for every GitHub write when bodies agree", async () => {
+    const res = await POST(makeRequest({ repoFullName: "org/repo", issueNumber: 42 }));
+    expect(res.status).toBe(200);
+    // All label operations hit the canonical pair derived from the DB row.
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        success: true,
+      }),
+    });
   });
 });
