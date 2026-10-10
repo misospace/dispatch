@@ -490,7 +490,13 @@ export type AckPrFixHandoutResult =
   | { acknowledged: true; item: any }
   | {
       acknowledged: false;
-      reason: "not-found" | "generation-mismatch" | "not-queued" | "already-acknowledged" | "not-stamped";
+      reason:
+        | "not-found"
+        | "generation-mismatch"
+        | "not-queued"
+        | "already-acknowledged"
+        | "not-stamped"
+        | "not-handed";
     };
 
 export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput | { error: string } {
@@ -509,14 +515,22 @@ export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput |
   ) {
     return { error: "generation must be an integer >= 1" };
   }
+  // agentName is required (#1211 review): the route layer derives it from the
+  // authenticated bearer actor (no basic / oidc / disabled fallback). The
+  // field is kept in the schema for transport-layer redundancy (the MCP
+  // client forwards it) but parsed even when the bearer layer already
+  // supplied it, so a caller mismatch surfaces as 400 before any DB write.
+  // Type check first so a non-string value (e.g. 7) surfaces as the type
+  // error, not as "Missing required field" (nonEmpty is type-agnostic).
   if (input.agentName !== undefined && input.agentName !== null && typeof input.agentName !== "string") {
     return { error: "agentName must be a string" };
   }
+  if (!nonEmpty(input.agentName)) return { error: "Missing required field: agentName" };
   return {
     repo: input.repo.trim(),
     pr: Number(input.pr),
     generation: input.generation,
-    agentName: typeof input.agentName === "string" ? input.agentName : null,
+    agentName: (input.agentName as string).trim(),
   };
 }
 
@@ -526,12 +540,16 @@ export function parseAckPrFixHandoutInput(body: unknown): AckPrFixHandoutInput |
  * (`generation-mismatch`) so it can never mark the fresh generation as live.
  * Only a generation that was actually stamped/handed out can be acknowledged
  * (`not-stamped` otherwise): an unstamped item was never offered, so an ack
- * cannot pin it against reclamation. The write is a compare-and-swap pinned
- * on `{ id, generation, status: "QUEUED", handoutAcks }`: a concurrent
- * reclaim, settlement, or ack that moves the row (or its ack list) in the
- * read→write gap no-ops it, and the caller gets `generation-mismatch`. A
- * repeat ack for the same `(agent, generation)` is idempotent
- * (`already-acknowledged`, no write).
+ * cannot pin it against reclamation. The ack is further pinned to an
+ * authenticated agent — the agent must appear in `agentHandouts` at this
+ * generation (`not-handed` otherwise), so a forged ack by a token that never
+ * received the hand-out cannot pin a live reclaim against the worker that
+ * actually has the item. The write is a compare-and-swap pinned on
+ * `{ id, generation, status: "QUEUED", handoutAcks }`: a concurrent reclaim,
+ * settlement, or ack that moves the row (or its ack list) in the read→write
+ * gap no-ops it, and the caller gets `generation-mismatch`. A repeat ack for
+ * the same `(agent, generation)` is idempotent (`already-acknowledged`, no
+ * write).
  */
 export async function ackPrFixHandout(
   client: PrFixQueueClient,
@@ -555,7 +573,22 @@ export async function ackPrFixHandout(
   if (existing.dispatchedGeneration !== input.generation || existing.dispatchedAt == null) {
     return { acknowledged: false, reason: "not-stamped" };
   }
-  const token = agentHandoutToken(input.agentName || "unknown", input.generation);
+  // The ack must come from an agent that was handed this item at this
+  // generation (#1211 review): a token that never received the hand-out
+  // cannot pin a future reclaim against the worker that actually has it.
+  // Entries from prior generations are inert (same envelope as
+  // agentAlreadyHanded): only the SAME generation's hand-out matches.
+  const handouts: string[] = Array.isArray(existing.agentHandouts) ? existing.agentHandouts : [];
+  const handedThisAgent =
+    input.agentName != null &&
+    handouts.some((entry) => {
+      const parsed = parseAgentHandoutToken(entry);
+      return parsed !== null && parsed.agentName === input.agentName && parsed.generation === input.generation;
+    });
+  if (!handedThisAgent) {
+    return { acknowledged: false, reason: "not-handed" };
+  }
+  const token = agentHandoutToken(input.agentName as string, input.generation);
   const acks: string[] = Array.isArray(existing.handoutAcks) ? existing.handoutAcks : [];
   if (acks.includes(token)) {
     return { acknowledged: false, reason: "already-acknowledged" };
@@ -578,7 +611,7 @@ export async function ackPrFixHandout(
         action: "ack",
         status: "QUEUED",
         lane: existing.lane,
-        note: `Hand-out acknowledged for generation ${input.generation} by ${input.agentName || "unknown"}.`,
+        note: `Hand-out acknowledged for generation ${input.generation} by ${input.agentName}.`,
       },
     });
     return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
@@ -664,151 +697,201 @@ export async function reclaimStalePrFixHandouts(
     errors: [],
   };
 
-  const candidates = await client.prFixQueueItem.findMany({
-    where: { status: "QUEUED" },
-    take: batchSize,
-    orderBy: { updatedAt: "asc" },
-  });
-  report.examined = candidates.length;
+  // Filter on the WHERE clause for the actual reclaimable population, not
+  // the first 50 QUEUED rows (#1211 review): the older scan ordered by
+  // updatedAt took items stale by elapsed time AFTER fetching them, so a
+  // stamp that never aged enough permanently occupied the head of the
+  // window and starved the rest. Paginating past unseen items lets the
+  // sweep make progress against a backlog larger than batchSize.
+  const dueBefore = new Date(now.getTime() - timeoutMs);
+  let cursorId: string | undefined = undefined;
+  // Bound the loop so a runaway mismatch (where dispatchedAt is unset) can
+  // never scan the whole table; a few pages is enough for normal load and
+  // surfaces a stuck tail through the unprocessed row count, not silent
+  // starvation.
+  const maxPages = 50;
+  for (let page = 0; page < maxPages; page++) {
+    const candidates = await client.prFixQueueItem.findMany({
+      where: {
+        status: "QUEUED",
+        dispatchedAt: { lt: dueBefore },
+        dispatchedGeneration: { not: null },
+      },
+      take: batchSize,
+      orderBy: { dispatchedAt: "asc" },
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    });
+    if (candidates.length === 0) break;
+    report.examined += candidates.length;
 
-  for (const item of candidates) {
-    try {
-      const dispatchedAtMs = item.dispatchedAt ? new Date(item.dispatchedAt).getTime() : null;
-      const stampedThisGeneration =
-        item.dispatchedGeneration != null && item.dispatchedGeneration === item.generation;
-      if (
-        dispatchedAtMs === null ||
-        !stampedThisGeneration ||
-        !(dispatchedAtMs < now.getTime() - timeoutMs)
-      ) {
-        report.skipped++;
-        continue;
-      }
+    for (const item of candidates) {
+      try {
+        const dispatchedAtMs = item.dispatchedAt ? new Date(item.dispatchedAt).getTime() : null;
+        const stampedThisGeneration =
+          item.dispatchedGeneration != null && item.dispatchedGeneration === item.generation;
+        if (
+          dispatchedAtMs === null ||
+          !stampedThisGeneration ||
+          !(dispatchedAtMs < now.getTime() - timeoutMs)
+        ) {
+          report.skipped++;
+          continue;
+        }
 
-      // A live acknowledged attempt must never be reclaimed, even when stale
-      // by wall-clock: the worker durably owns the generation.
-      const acks: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
-      const acknowledgedForGeneration = acks.some((entry) => {
-        const parsed = parseAgentHandoutToken(entry);
-        return parsed !== null && parsed.generation === item.generation;
-      });
-      if (acknowledgedForGeneration) {
-        report.skipped++;
-        continue;
-      }
+        // A live acknowledged attempt must never be reclaimed, even when stale
+        // by wall-clock: the worker durably owns the generation. The cheap
+        // `some` over `handoutAcks` covers the same generation as the item;
+        // older-generation entries are inert and never match.
+        const acks: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+        const acknowledgedForGeneration = acks.some((entry) => {
+          const parsed = parseAgentHandoutToken(entry);
+          return parsed !== null && parsed.generation === item.generation;
+        });
+        if (acknowledgedForGeneration) {
+          report.skipped++;
+          continue;
+        }
 
-      const merged = await probe(item.repo, item.pr);
-      if (merged === null) {
-        // GitHub could not answer: never retry a possibly-closed PR.
-        report.unknownState++;
-        continue;
-      }
-      if (merged === true) {
-        const { count } = await client.$transaction(async (tx) => {
-          const result = await tx.prFixQueueItem.updateMany({
-            where: { id: item.id, generation: item.generation, status: "QUEUED" },
-            data: {
-              status: "STALE",
-              agentHandouts: [],
-              handoutAcks: [],
-              dispatchedGeneration: null,
-              dispatchedAt: null,
-            },
-          });
-          if (result.count === 1) {
-            await tx.prFixHistory.create({
+        const merged = await probe(item.repo, item.pr);
+        if (merged === null) {
+          // GitHub could not answer: never retry a possibly-closed PR.
+          report.unknownState++;
+          continue;
+        }
+        if (merged === true) {
+          // Pin the ack-list snapshot (#1211 review): an ack that lands in
+          // the read→write gap below MUST no-op the terminal write, exactly
+          // as the fresh-generation reclaim does. Without this pin a live
+          // worker that acks a moment before the terminal write would be
+          // wiped to STALE — the same loss class the reclaim already
+          // guards against.
+          const acksBeforeStale: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+          const { count } = await client.$transaction(async (tx) => {
+            const result = await tx.prFixQueueItem.updateMany({
+              where: {
+                id: item.id,
+                generation: item.generation,
+                status: "QUEUED",
+                handoutAcks: { equals: acksBeforeStale },
+              },
               data: {
-                itemId: item.id,
-                action: "mark",
                 status: "STALE",
-                lane: item.lane,
-                note: `Stale unacknowledged hand-out: upstream PR is merged or closed; reaped to STALE (#1211).`,
+                agentHandouts: [],
+                handoutAcks: [],
+                dispatchedGeneration: null,
+                dispatchedAt: null,
               },
             });
-          }
-          return result;
-        });
-        if (count === 1) report.staled++;
-        else report.skipped++;
-        continue;
-      }
-
-      // PR is open. Past the reclaim cap, hand the item to a human.
-      const reclaimCount = item.handoutReclaims ?? 0;
-      if (reclaimCount >= maxReclaims) {
-        const { count } = await client.$transaction(async (tx) => {
-          const result = await tx.prFixQueueItem.updateMany({
-            where: { id: item.id, generation: item.generation, status: "QUEUED" },
-            data: {
-              status: "BLOCKED",
-              lane: "NEEDS_HUMAN",
-              agentHandouts: [],
-              handoutAcks: [],
-              dispatchedGeneration: null,
-              dispatchedAt: null,
-            },
+            if (result.count === 1) {
+              await tx.prFixHistory.create({
+                data: {
+                  itemId: item.id,
+                  action: "mark",
+                  status: "STALE",
+                  lane: item.lane,
+                  note: `Stale unacknowledged hand-out: upstream PR is merged or closed; reaped to STALE (#1211).`,
+                },
+              });
+            }
+            return result;
           });
-          if (result.count === 1) {
-            await tx.prFixHistory.create({
+          if (count === 1) report.staled++;
+          else report.skipped++;
+          continue;
+        }
+
+        // PR is open. Past the reclaim cap, hand the item to a human.
+        const reclaimCount = item.handoutReclaims ?? 0;
+        if (reclaimCount >= maxReclaims) {
+          // Same ack-list pin (#1211 review): the terminal BLOCKED write
+          // would otherwise wipe a freshly-acknowledged live attempt off
+          // NEEDS_HUMAN, never to be reclaimed again.
+          const acksBeforeBlock: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+          const { count } = await client.$transaction(async (tx) => {
+            const result = await tx.prFixQueueItem.updateMany({
+              where: {
+                id: item.id,
+                generation: item.generation,
+                status: "QUEUED",
+                handoutAcks: { equals: acksBeforeBlock },
+              },
               data: {
-                itemId: item.id,
-                action: "mark",
                 status: "BLOCKED",
                 lane: "NEEDS_HUMAN",
-                note: `Hand-out reclaimed ${reclaimCount} times without acknowledgement (PR_FIX_MAX_RECLAIMS=${maxReclaims}); routed to a human (#1211).`,
+                agentHandouts: [],
+                handoutAcks: [],
+                dispatchedGeneration: null,
+                dispatchedAt: null,
+              },
+            });
+            if (result.count === 1) {
+              await tx.prFixHistory.create({
+                data: {
+                  itemId: item.id,
+                  action: "mark",
+                  status: "BLOCKED",
+                  lane: "NEEDS_HUMAN",
+                  note: `Hand-out reclaimed ${reclaimCount} times without acknowledgement (PR_FIX_MAX_RECLAIMS=${maxReclaims}); routed to a human (#1211).`,
+                },
+              });
+            }
+            return result;
+          });
+          if (count === 1) report.blocked++;
+          else report.skipped++;
+          continue;
+        }
+
+        // Reclaim: reopen as a fresh generation. Bump the work identity but do
+        // NOT count a fix attempt — the hand-out never reached a worker. The
+        // `handoutAcks` pin makes an ack landing in the read→write gap a no-op.
+        const acksBeforeReclaim: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
+        const { count } = await client.$transaction(async (tx) => {
+          const result = await tx.prFixQueueItem.updateMany({
+            where: {
+              id: item.id,
+              generation: item.generation,
+              status: "QUEUED",
+              handoutAcks: { equals: acksBeforeReclaim },
+            },
+            data: {
+              ...freshAttemptGeneration(),
+              handoutReclaims: { increment: 1 },
+              agentHandouts: [],
+              handoutAcks: [],
+              postDispatchEvidenceKeys: [],
+              dispatchedGeneration: null,
+              dispatchedAt: null,
+              attemptHeadSha: item.headSha ?? item.attemptHeadSha ?? null,
+            },
+          });
+          if (result.count === 1) {
+            await tx.prFixHistory.create({
+              data: {
+                itemId: item.id,
+                action: "reclaim",
+                status: "QUEUED",
+                lane: "NORMAL",
+                note: `Stale unacknowledged hand-out reclaimed; reopened as generation ${item.generation + 1} (#1211).`,
               },
             });
           }
           return result;
         });
-        if (count === 1) report.blocked++;
+        if (count === 1) report.reclaimed++;
         else report.skipped++;
-        continue;
-      }
-
-      // Reclaim: reopen as a fresh generation. Bump the work identity but do
-      // NOT count a fix attempt — the hand-out never reached a worker. The
-      // `handoutAcks` pin makes an ack landing in the read→write gap a no-op.
-      const { count } = await client.$transaction(async (tx) => {
-        const result = await tx.prFixQueueItem.updateMany({
-          where: {
-            id: item.id,
-            generation: item.generation,
-            status: "QUEUED",
-            handoutAcks: { equals: item.handoutAcks ?? [] },
-          },
-          data: {
-            ...freshAttemptGeneration(),
-            handoutReclaims: { increment: 1 },
-            agentHandouts: [],
-            handoutAcks: [],
-            postDispatchEvidenceKeys: [],
-            dispatchedGeneration: null,
-            dispatchedAt: null,
-            attemptHeadSha: item.headSha ?? item.attemptHeadSha ?? null,
-          },
+      } catch (error) {
+        report.errors.push({
+          itemId: item.id,
+          error: error instanceof Error ? error.message : String(error),
         });
-        if (result.count === 1) {
-          await tx.prFixHistory.create({
-            data: {
-              itemId: item.id,
-              action: "reclaim",
-              status: "QUEUED",
-              lane: "NORMAL",
-              note: `Stale unacknowledged hand-out reclaimed; reopened as generation ${item.generation + 1} (#1211).`,
-            },
-          });
-        }
-        return result;
-      });
-      if (count === 1) report.reclaimed++;
-      else report.skipped++;
-    } catch (error) {
-      report.errors.push({
-        itemId: item.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      }
     }
+
+    // Paginate: advance past the last row we saw. A short page means the
+    // table is drained for this filter, so stop even before maxPages.
+    cursorId = candidates[candidates.length - 1].id;
+    if (candidates.length < batchSize) break;
   }
 
   return report;

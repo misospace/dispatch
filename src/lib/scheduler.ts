@@ -52,7 +52,14 @@ const DEFAULT_PR_FOLLOWUP_INTERVAL_MS = 15 * 60 * 1000; // 15m
 const DEFAULT_PRUNE_CLOSED_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 const DEFAULT_RECONCILE_INTERVAL_MS = 30 * 60 * 1000; // 30m
 const DEFAULT_STALE_WORK_INTERVAL_MS = 5 * 60 * 1000; // 5m
-const DEFAULT_PR_FIX_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5m
+// Default-disabled (#1211 review): the reclaimer reopens stamped hand-outs as
+// fresh generations. Until every worker that takes a pr-fix hand-out
+// durably acks it after Create, the sweep can wipe in-flight Courier work
+// that simply never acked. Opt in explicitly by setting
+// `DISPATCH_PR_FIX_SWEEP_INTERVAL_MS` to a positive value; the operator
+// sweep endpoint (`POST /api/pr-fix-queue/sweep`) is the audit-friendly
+// alternative when only a small set of items is at risk.
+const DEFAULT_PR_FIX_SWEEP_INTERVAL_MS = 0; // disabled
 const DEFAULT_CI_FAILURES_INTERVAL_MS = 30 * 60 * 1000; // 30m
 const DEFAULT_STARTUP_DELAY_MS = 5 * 1000;
 

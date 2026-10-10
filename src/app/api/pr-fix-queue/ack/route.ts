@@ -12,11 +12,31 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
  * durably materialized its attempt (created the run that owns the work) so the
  * stale hand-out reclaimer knows the stamped generation was not lost. The write
  * is generation-pinned and idempotent: a repeat ack is a 200, not an error.
+ *
+ * Auth tier (#1211 review): the ack carries a worker identity that must
+ * match an entry in `agentHandouts` for the stamped generation — a basic or
+ * OIDC session user with a maintainer tier could otherwise forge an ack for
+ * any (repo, pr, generation) by submitting a body alone. The route therefore
+ * restricts to bearer auth (or `disabled`, which is the tokenless dev mode
+ * and a no-op for cross-account forgery anyway) and derives `agentName`
+ * from the authenticated actor (the `x-agent-name` header the bearer actor
+ * resolver reads). The body's `agentName` is preserved as a redundant
+ * transport signal — a caller-supplied value that disagrees with the actor
+ * is rejected before any DB read so the mismatch surfaces clearly.
  */
 export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
     return authErrorResponse(auth);
+  }
+  // Bearer only (#1211 review): a basic / OIDC session is enough to land an
+  // ack today because they resolve to maintainer tier. Dev (`disabled`) is
+  // accepted to keep local test runs working.
+  if (auth.type !== "bearer" && auth.type !== "disabled") {
+    return errorResponse(
+      "Forbidden: pr-fix ack requires a bearer token (DISPATCH_AGENT_TOKEN or DISPATCH_WORKER_TOKEN); basic / OIDC sessions cannot ack on behalf of an agent",
+      403,
+    );
   }
 
   const limited = enforceRateLimit(`pr-fix-ack:${auth.actor}`, RATE_LIMIT);
@@ -31,6 +51,15 @@ export async function POST(request: Request) {
 
   const input = parseAckPrFixHandoutInput(body);
   if ("error" in input) return errorResponse(input.error, 400);
+
+  // The actor is the source of truth for who is acking. A mismatch with the
+  // body's `agentName` is a 400 — the caller has misconfigured its transport.
+  if (input.agentName !== auth.actor) {
+    return errorResponse(
+      `Forbidden: agentName in body (${input.agentName}) does not match the authenticated actor (${auth.actor}); the actor identity is authoritative`,
+      400,
+    );
+  }
 
   try {
     const result = await ackPrFixHandout(asPrFixQueueClient(prisma), input);
@@ -57,6 +86,17 @@ export async function POST(request: Request) {
         return NextResponse.json(
           { error: "PR fix queue item has no live hand-out at that generation", reason: result.reason },
           { status: 409 },
+        );
+      case "not-handed":
+        // A bare-agentName ack from an authenticated actor that doesn't
+        // appear in the item's hand-out records — a token that never
+        // received the work cannot pin a future reclaim against it.
+        return NextResponse.json(
+          {
+            error: "PR fix queue item was not handed to the authenticated agent at that generation",
+            reason: result.reason,
+          },
+          { status: 403 },
         );
     }
   } catch (error) {

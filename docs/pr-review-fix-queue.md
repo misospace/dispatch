@@ -243,12 +243,22 @@ current generation is recorded in `dispatchedGeneration`/`dispatchedAt`). To
 prove the stamped hand-out reached a live worker, the worker acknowledges it
 **after durably creating the run that owns the work**:
 
-- `POST /api/pr-fix-queue/ack` — body `{ repo, pr, generation, agentName? }`.
-  The write is generation-pinned and idempotent: a repeat ack for the same
-  `(agent, generation)` returns `200` with `alreadyAcknowledged: true`, a late
-  ack for an older generation is refused `409` (`generation-mismatch`), and a
-  non-`QUEUED` item is refused `409` (`not-queued`). Worker tokens may call it
-  (a worker acks its own hand-out); the sweep below is maintainer-only.
+- `POST /api/pr-fix-queue/ack` — body `{ repo, pr, generation, agentName }`.
+  Bearer auth only (or `DISPATCH_AUTH_MODE=disabled` for dev); basic / OIDC
+  sessions are rejected with 403 because they would otherwise let any signed-in
+  user forge an ack for any (repo, pr, generation). The route derives
+  `agentName` from the authenticated actor (the `x-agent-name` header) — a
+  body value that disagrees with the actor is rejected with 400. The
+  underlying write is generation-pinned and idempotent: a repeat ack for the
+  same `(agent, generation)` returns `200` with `alreadyAcknowledged: true`, a
+  late ack for an older generation is refused `409` (`generation-mismatch`), a
+  non-`QUEUED` item is refused `409` (`not-queued`), an item that was never
+  stamped is refused `409` (`not-stamped`), and an item that was stamped but
+  not handed to the authenticated agent is refused `403` (`not-handed`). The
+  write is a CAS pinned on `id + generation + status + handoutAcks`, so a
+  concurrent reclaim, settlement, or ack that moves the row in the read→write
+  gap no-ops it. Worker tokens may call it (a worker acks its own hand-out);
+  the sweep below is maintainer-only.
 - MCP `ack_pr_fix` wraps the same endpoint.
 
 An unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default
@@ -256,14 +266,41 @@ An unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (default
 run) and reclaimed by `POST /api/pr-fix-queue/sweep`, also scheduled in-process
 as the `pr-fix-sweep` job:
 
+- **Default-disabled** (`DISPATCH_PR_FIX_SWEEP_INTERVAL_MS=0`). Until every
+  worker that takes a pr-fix hand-out durably acks it after Create, an active
+  sweep can wipe in-flight CoderRuns that simply never acked and dispatch a
+  fresh attempt. Opt in by setting a positive interval. The operator endpoint
+  `POST /api/pr-fix-queue/sweep` is the audit-friendly alternative for a
+  small set of items — it is a maintainer-only POST and runs the same code
+  path as the scheduled job, so the lock + report shape are identical.
+- The sweep is bounded and paged: it filters on `dispatchedAt < now - timeout`
+  so ineligible rows never occupy the head of the queue, and pages through
+  eligible rows until a short page returns. Multiple workers writing the same
+  `dispatchedAt` advance past the cursor deterministically.
 - A **reclaimed** item is reopened as a **fresh generation** — a new work
   identity — but `fixAttempts` is **not** bumped, because the hand-out never
-  reached a worker.
+  reached a worker. The CAS pins the exact `handoutAcks` snapshot the sweep
+  read, so an ack landing in the read→write gap no-ops the reclaim.
 - An **acknowledged live attempt is never reclaimed**, even when stale by
-  wall-clock: the ack pins the generation and the read→write gap is guarded, so
-  a worker that acknowledges mid-sweep is not clobbered.
+  wall-clock: the ack pins the generation and every terminal write (STALE,
+  BLOCKED, fresh-generation) is CAS-pinned on the same `handoutAcks` snapshot,
+  so a worker that acknowledges mid-sweep is not clobbered.
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
 - Past `PR_FIX_MAX_RECLAIMS` (default 3) the item goes `BLOCKED` in the
-  `NEEDS_HUMAN` lane instead of being reclaimed again.
+  `NEEDS_HUMAN` lane instead of being reclaimed again. Operator requeue
+  resets the recovery budget.
+
+### Migration handling for pre-existing stamped rows
+
+The `20261009000000_add_pr_fix_handout_acks` migration intentionally backfills
+**no acks**: a row that was stamped by `next-task` before this column existed
+starts at `handoutAcks = []` and `handoutReclaims = 0`. A sweep enabled
+immediately after deploy will therefore see those rows as "never acked" the
+moment they cross `PR_FIX_HANDOUT_TIMEOUT_MS`, even when a worker is actively
+running them. If you enable the sweep on a deployment with in-flight Courier
+work, drain (or explicitly requeue) the queue first, or set
+`PR_FIX_HANDOUT_TIMEOUT_MS` to a value larger than the slowest worker's
+expected run time, so the pre-existing rows have a chance to ack through the
+new route.

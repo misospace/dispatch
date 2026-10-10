@@ -29,8 +29,25 @@ Dispatch bearer tokens have two tiers. A **worker** token (`DISPATCH_WORKER_TOKE
 - `GET /api/issues/state`, `POST /api/issues/status`
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
 - `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
+- `POST /api/pr-fix-queue/ack` (the durable hand-out acknowledgement, see "Hand-out acknowledgement" below)
 
-The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, and `POST /api/pr-fix-queue/requeue` are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
+The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, `POST /api/pr-fix-queue/requeue`, and the `POST /api/pr-fix-queue/sweep` reclaim job are maintainer-only. Unclaim is not tier-gated — the target agent comes from the request body and is only bounded by the assignment check; cryptographic token→agent-name binding is a known follow-up. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
+
+## Hand-out acknowledgement (#1211)
+
+A worker that receives a `followup-pr` task acknowledges it **after durably creating the run that owns the work** (e.g. after creating the executor `CoderRun`), via `POST /api/pr-fix-queue/ack`:
+
+```
+POST /api/pr-fix-queue/ack
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "repo": "org/repo", "pr": 42, "generation": 2, "agentName": "courier" }
+```
+
+The route is bearer-only (basic / OIDC sessions are rejected with 403), and `agentName` is verified against the authenticated actor (the `x-agent-name` header) — a body value that disagrees returns 400. The underlying write is generation-pinned and idempotent. See `docs/pr-review-fix-queue.md` for the full contract.
+
+A worker that cannot ack (because the hand-out stamp does not include its agent identity, e.g. a multi-agent dispatch raced) gets a `403 not-handed` response and should retry against a freshly-issued hand-out. The reclaimer sweep below is maintainer-only and **default-disabled** until every worker is confirmed to call ack.
 
 ---
 
