@@ -19,8 +19,6 @@ const catalog = buildEvidenceCatalog({
 });
 
 describe("callGroomerLLM", () => {
-  const originalFetch = global.fetch;
-
   beforeEach(() => {
     vi.restoreAllMocks();
   });

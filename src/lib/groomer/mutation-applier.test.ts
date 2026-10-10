@@ -521,6 +521,31 @@ describe("applyGroomingMutations", () => {
     expect(store.rows.get(KEY)).toMatchObject({ status: "partial" });
   });
 
+  it("sanitizes control characters out of a GitHub-authored failure error (dispatch#1164)", async () => {
+    const { github, calls } = fakeGitHub({
+      addComment: vi.fn(async () => {
+        // A realistic GitHub API failure body laced with a NUL, a backspace, a
+        // form feed, an escape and a unit separator (all C0 controls), plus a
+        // newline and a tab that the strip tier deliberately keeps.
+        throw new Error("GitHub API error adding comment: 502\u0000 bad\b\fesc\u001B\u001F\nkept line\tkept tab");
+      }),
+    });
+    const store = memoryStore();
+    const result = await applyGroomingMutations(applyInput(fullDiff()), github, store);
+    expect(calls).toEqual(["labels:status/backlog"]);
+    expect(result.failure?.step).toBe("comment");
+    expect(result.outcome).toBe("partial");
+    // The recorded failure error carries no forbidden control bytes (the NUL,
+    // the backspace, the form feed, the escape and the unit separator are
+    // stripped), while the ordinary text, the newline and the tab survive.
+    expect(result.failure!.error).not.toMatch(/[\u0000-\u0008\u000B-\u001F]/);
+    expect(result.failure!.error).toContain("GitHub API error adding comment: 502");
+    expect(result.failure!.error).toContain("\n");
+    expect(result.failure!.error).toContain("\t");
+    // The per-step record is cleaned by the same source path.
+    expect(result.steps.comment?.error).not.toMatch(/[\u0000-\u0008\u000B-\u001F]/);
+  });
+
   it("reports failed, with nothing applied, when the first needed write fails", async () => {
     const { github } = fakeGitHub({
       updateLabels: vi.fn(async () => {

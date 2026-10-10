@@ -300,6 +300,22 @@ describe("validateApplyPreconditions", () => {
       );
       expect(check(result, "comments")).toMatchObject({ status: "unverifiable", detail: expect.stringContaining("504") });
     });
+
+    it("sanitizes control characters out of a comment-read failure detail (dispatch#1164)", async () => {
+      const message = "GitHub API error reading comments: 502\u0000 bad\u0007\u001B\u001F\nkept line\tkept tab";
+      const result = await validateApplyPreconditions(
+        input(),
+        reader({ fetchRecentComments: vi.fn(async () => Promise.reject(new Error(message))) }),
+      );
+      const comments = check(result, "comments");
+      expect(comments.status).toBe("unverifiable");
+      expect(comments.detail).not.toMatch(/[\u0000-\u0008\u000B-\u001F]/);
+      expect(comments.detail).toContain("GitHub API error reading comments: 502");
+      expect(comments.detail).toContain("\n");
+      expect(comments.detail).toContain("\t");
+      expect(result.failures.join("\n")).not.toMatch(/[\u0000-\u0008\u000B-\u001F]/);
+      expect(result.failures.join("\n")).toContain("comments");
+    });
   });
 
   describe("head", () => {
