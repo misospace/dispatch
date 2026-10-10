@@ -419,10 +419,61 @@ describe("DISPATCH_WORKER_TOKENS binding (#1129)", () => {
       process.env.DISPATCH_WORKER_TOKEN = "dup";
       process.env.DISPATCH_WORKER_TOKENS = "alpha:dup,bravo:dup";
       const mod = await import("./dispatch-env");
-      // It is usable only as the unbound legacy token — never as a bound
-      // identity and never as maintainer.
-      expect(mod.getBearerTokenIdentity("dup")).toEqual({ tier: "worker", legacyUnbound: true });
+      // The #1129 contract is that ambiguous tokens are rejected everywhere
+      // (fail-closed). They cannot authenticate as a bound worker, as
+      // maintainer, or — even when the value happens to match the legacy
+      // DISPATCH_WORKER_TOKEN — as the legacy unbound worker credential.
+      expect(mod.getBearerTokenIdentity("dup")).toBeNull();
       expect(mod.getBoundAgentName("dup")).toBeUndefined();
+      expect(mod.isAuthorizedBearerToken("dup")).toBe(false);
+      expect(mod.getBearerTokenTier("dup")).toBeNull();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("rejects the exact 3-env ambiguous-with-legacy collision fail-closed (#1129 review)", async () => {
+    // The reviewer called out the scenario where DISPATCH_WORKER_TOKENS
+    // binds the same value to two different agents AND the value also equals
+    // DISPATCH_WORKER_TOKEN. The previous implementation silently demoted
+    // such a token to the legacy unbound worker credential
+    // ({ tier: "worker", legacyUnbound: true }), letting the ambiguous value
+    // bypass the binding gate via a side-channel collision. The #1129 contract
+    // requires fail-closed; this test pins the corrected behavior alongside
+    // the distinct legacy-only happy path so the regression cannot return.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Scenario A — the failure mode the reviewer identified.
+      process.env.DISPATCH_WORKER_TOKENS = "alpha:shared,bravo:shared";
+      process.env.DISPATCH_WORKER_TOKEN = "shared";
+      const mod = await import("./dispatch-env");
+      expect(mod.getWorkerTokenBindings()).toEqual([]);
+      expect(mod.getBearerTokenIdentity("shared")).toBeNull();
+      expect(mod.getBoundAgentName("shared")).toBeUndefined();
+      expect(mod.isAuthorizedBearerToken("shared")).toBe(false);
+      expect(mod.getBearerTokenTier("shared")).toBeNull();
+
+      // Scenario B — the distinct, non-colliding legacy token still resolves
+      // as the legacy unbound worker credential (no regression to that path).
+      mod.resetCaches();
+      process.env.DISPATCH_WORKER_TOKENS = "alpha:shared,bravo:shared";
+      process.env.DISPATCH_WORKER_TOKEN = "distinct-legacy";
+      expect(mod.getBearerTokenIdentity("shared")).toBeNull();
+      expect(mod.getBearerTokenIdentity("distinct-legacy")).toEqual({
+        tier: "worker",
+        legacyUnbound: true,
+      });
+      expect(mod.isAuthorizedBearerToken("distinct-legacy")).toBe(true);
+
+      // Scenario C — only the legacy worker token set (no bound credentials
+      // at all) still resolves as legacy unbound worker.
+      mod.resetCaches();
+      delete process.env.DISPATCH_WORKER_TOKENS;
+      process.env.DISPATCH_WORKER_TOKEN = "legacy-only";
+      expect(mod.getBearerTokenIdentity("legacy-only")).toEqual({
+        tier: "worker",
+        legacyUnbound: true,
+      });
     } finally {
       warnSpy.mockRestore();
     }

@@ -747,6 +747,31 @@ describe("bearer token tiers (#1111)", () => {
     expect(authErrorResponse(result as Extract<typeof result, { authorized: false }>).status).toBe(401);
   });
 
+  it("denies the exact 3-env ambiguous-token/legacy collision at the worker route gate (#1129 review)", async () => {
+    // DISPATCH_WORKER_TOKENS="alpha:shared,bravo:shared" + DISPATCH_WORKER_TOKEN="shared".
+    // The previous implementation demoted "shared" to the legacy unbound
+    // worker credential ({ tier: "worker", legacyUnbound: true }) and let it
+    // bypass the binding gate on identity-scoped worker routes. The #1129
+    // contract requires fail-closed: the ambiguous value is rejected
+    // outright, even though its value matches DISPATCH_WORKER_TOKEN, and the
+    // standard auth path returns plain `authorized: false` (401). The
+    // groomer fallback above already pins the maintainer-escape path; this
+    // test pins the worker-route path for completeness.
+    delete process.env.DISPATCH_GROOMER_TOKEN;
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:shared,bravo:shared";
+    process.env.DISPATCH_WORKER_TOKEN = "shared";
+    resetAuthCaches();
+    const request = new Request("http://localhost/api/agents/alpha/next-task", {
+      method: "GET",
+      headers: { Authorization: "Bearer shared" },
+    });
+    const result = await authorizeRequest(request);
+    expect(result).toEqual({ authorized: false });
+    expect(result).not.toMatchObject({ tier: "worker", legacyUnbound: true });
+    expect(result).not.toMatchObject({ tier: "worker" });
+    expect(authErrorResponse(result as Extract<typeof result, { authorized: false }>).status).toBe(401);
+  });
+
   it("still authorizes a distinct, non-worker groomer token at maintainer tier", async () => {
     // Sanity check that the new worker-configured-value guard does not
     // regress the plain happy path: a unique groomer token unrelated to any

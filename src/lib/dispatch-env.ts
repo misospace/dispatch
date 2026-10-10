@@ -187,8 +187,11 @@ export type BearerTokenIdentity =
 
 /**
  * Resolve the full identity of a bearer token. The presented token is trimmed
- * before comparison. Ambiguous bound tokens resolve to null (fail closed) even
- * when they also match the legacy worker token.
+ * before comparison. Ambiguous bound tokens resolve to null (fail closed) —
+ * never to the legacy unbound worker credential, even when their value also
+ * matches `DISPATCH_WORKER_TOKEN`. The #1129 contract is that ambiguous
+ * tokens are rejected everywhere; a collision with the legacy worker env var
+ * is not an escape hatch.
  */
 export function getBearerTokenIdentity(
   token: string | null | undefined,
@@ -206,14 +209,11 @@ export function getBearerTokenIdentity(
   if (bound) return { tier: "worker", agentName: bound.agentName };
 
   // An ambiguous binding is excluded from the table above. It must never
-  // authenticate as maintainer; it is usable only as the legacy unbound worker
-  // token when its value also matches DISPATCH_WORKER_TOKEN, and is otherwise
-  // rejected outright.
-  if (_ambiguousWorkerTokens?.has(trimmed)) {
-    const legacy = process.env.DISPATCH_WORKER_TOKEN?.trim();
-    if (legacy && safeEqual(legacy, trimmed)) return { tier: "worker", legacyUnbound: true };
-    return null;
-  }
+  // authenticate as anything — not as a bound worker, not as the legacy
+  // unbound worker credential, and not as maintainer — regardless of any
+  // value collision with DISPATCH_WORKER_TOKEN or DISPATCH_GROOMER_TOKEN.
+  // The #1129 contract is fail-closed here.
+  if (_ambiguousWorkerTokens?.has(trimmed)) return null;
 
   const tier = getBearerTokenTier(trimmed);
   if (tier === null) return null;
@@ -390,11 +390,22 @@ export function getAcceptedAgentTokens(): string[] {
  * "maintainer" privilege. The misconfiguration is surfaced by a one-time
  * console warning when the token table is built (token values are never
  * logged).
+ *
+ * A token value that is configured in `DISPATCH_WORKER_TOKENS` but bound to
+ * two different agents (ambiguous) is also rejected: it is excluded from the
+ * binding table, and even when its value happens to equal `DISPATCH_WORKER_TOKEN`
+ * the #1129 contract requires fail-closed — such a value resolves to null
+ * here, not to the lower "worker" privilege through a side-channel collision.
  */
 export function getBearerTokenTier(token: string | null | undefined): TokenTier | null {
   if (!token) return null;
   const trimmed = token.trim();
   if (!trimmed) return null;
+
+  // Populate the binding/ambiguity caches first so the ambiguous-token guard
+  // below sees the same view of the env that getAcceptedTokenTiers() uses.
+  getWorkerTokenBindings();
+  if (_ambiguousWorkerTokens?.has(trimmed)) return null;
 
   let maintainerMatch = false;
   let workerMatch = false;
