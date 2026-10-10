@@ -1,0 +1,397 @@
+import { describe, expect, it, vi } from "vitest";
+import type { GroomingEvidenceSnapshot } from "./groomer/evidence-snapshot";
+import {
+  applyReportClose,
+  evaluateReportClose,
+  resolveAlreadyDoneFromAgentReport,
+  type ReportCloseClient,
+  type ReportCloseCriterion,
+  type ReportCloseDeps,
+} from "./report-close";
+import { resolvePrFixFromAgentReport } from "./pr-fix-queue";
+
+const HEAD = "aaaa1111bbbb2222";
+
+const LOGIN_TS =
+  'export function redirectAfterLogin(session: Session) {\n  return session.returnTo ?? "/";\n}\n';
+
+const BODY = [
+  "## Acceptance criteria",
+  "- [ ] Login redirects after password reset",
+  "",
+  "## Expected files",
+  "- `src/auth/login.ts`",
+].join("\n");
+
+const GROUNDED_EXCERPT = 'return session.returnTo ?? "/";';
+
+function snapshot(overrides: Partial<GroomingEvidenceSnapshot> = {}): GroomingEvidenceSnapshot {
+  return {
+    capturedAt: "2026-10-10T00:00:00.000Z",
+    repoFullName: "org/repo",
+    defaultBranch: "main",
+    headSha: HEAD,
+    pinnedRef: HEAD,
+    issue: {
+      number: 42,
+      title: "Fix login redirect after password reset",
+      body: BODY,
+      labels: ["priority/p1", "status/backlog"],
+      state: "open",
+      stateReason: null,
+      updatedAt: "2026-10-09T00:00:00.000Z",
+      url: "https://github.com/org/repo/issues/42",
+    },
+    issueFingerprint: "fp",
+    comments: [],
+    evidenceDigest: "digest",
+    warnings: [],
+    sources: [],
+    ...overrides,
+  };
+}
+
+function criterion(overrides: Partial<ReportCloseCriterion> = {}): ReportCloseCriterion {
+  return {
+    criterion: "Login redirects after password reset",
+    path: "src/auth/login.ts",
+    excerpt: GROUNDED_EXCERPT,
+    ...overrides,
+  };
+}
+
+function deps(overrides: Partial<ReportCloseDeps> = {}): ReportCloseDeps {
+  return {
+    collectSnapshot: async () => snapshot(),
+    fetchComments: async () => [],
+    fetchIssueState: async () => ({ state: "open", stateReason: null }),
+    readFile: async (_repo, path) => (path === "src/auth/login.ts" ? LOGIN_TS : ""),
+    closeIssue: vi.fn(async () => {}),
+    transitionStatus: vi.fn(async (_repo, _issue, _labels, target) => ["status/backlog", target]),
+    now: () => new Date("2026-10-10T00:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+function client(): ReportCloseClient & {
+  issue: { update: ReturnType<typeof vi.fn> };
+  auditLog: { create: ReturnType<typeof vi.fn> };
+} {
+  return {
+    issue: { update: vi.fn(async () => ({})) },
+    auditLog: { create: vi.fn(async () => ({})) },
+  };
+}
+
+describe("evaluateReportClose — grounded close", () => {
+  it("is eligible when every criterion grounds against the pinned head", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps(),
+    );
+    expect(result.eligible).toBe(true);
+    expect(result.reasons).toEqual([]);
+    expect(result.headSha).toBe(HEAD);
+    expect(result.issueKey).toBe("org/repo#42");
+    expect(result.criteria).toEqual([{ criterion: "Login redirects after password reset", path: "src/auth/login.ts" }]);
+  });
+
+  it("does not require or read a worker confidence claim", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps(),
+    );
+    expect(result.eligible).toBe(true);
+  });
+
+  it("applies the close: GitHub close, status/done, mirror and audit", async () => {
+    const d = deps();
+    const c = client();
+    const evaluation = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      d,
+    );
+    const applied = await applyReportClose({
+      evaluation,
+      actor: "alpha",
+      issueId: "issue-42",
+      client: c,
+      evidence: "already shipped in abc123",
+      deps: d,
+    });
+    expect(applied.closed).toBe(true);
+    expect(applied.labelsAfter).toEqual(["status/backlog", "status/done"]);
+    expect(d.closeIssue).toHaveBeenCalledWith("org/repo", 42);
+    expect(c.issue.update).toHaveBeenCalledWith({
+      where: { id: "issue-42" },
+      data: expect.objectContaining({ state: "closed" }),
+    });
+    const audit = c.auditLog.create.mock.calls[0][0].data;
+    expect(audit.action).toBe("already_done");
+    expect(audit.actor).toBe("alpha");
+    expect(audit.success).toBe(true);
+    expect(JSON.parse(audit.notes).evidence).toBe("already shipped in abc123");
+    expect(JSON.parse(audit.notes).headSha).toBe(HEAD);
+  });
+
+  it("surfaces a best-effort warning when the status write fails after the close", async () => {
+    const d = deps({
+      transitionStatus: vi.fn(async () => {
+        throw new Error("labels unavailable");
+      }),
+    });
+    const c = client();
+    const evaluation = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      d,
+    );
+    const applied = await applyReportClose({ evaluation, actor: "alpha", issueId: "issue-42", client: c, deps: d });
+    expect(applied.closed).toBe(true);
+    expect(applied.warning).toContain("status/done");
+    expect(applied.labelsAfter).toEqual(["priority/p1", "status/done"]);
+  });
+
+  it("resolver returns action closed", async () => {
+    const d = deps();
+    const c = client();
+    const result = await resolveAlreadyDoneFromAgentReport({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      criteria: [criterion()],
+      actor: "alpha",
+      issueId: "issue-42",
+      client: c,
+      deps: d,
+    });
+    expect(result.action).toBe("closed");
+    expect(result.matched).toBe(true);
+    expect(result.reasons).toEqual([]);
+  });
+});
+
+describe("evaluateReportClose — refusal (fail closed)", () => {
+  const cases: Array<[string, Partial<ReportCloseCriterion>, Partial<GroomingEvidenceSnapshot>]> = [
+    ["forged excerpt not present in the file", { excerpt: "this text is definitely not in the file at all" }, {}],
+    ["trivial excerpt", { excerpt: "return" }, {}],
+    ["criterion cites an unreadable path", { path: "src/auth/missing.ts" }, {}],
+  ];
+
+  it.each(cases)("refuses: %s", async (_name, criterionOverride, snapshotOverride) => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion(criterionOverride)] },
+      deps({ collectSnapshot: async () => snapshot(snapshotOverride) }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.length).toBeGreaterThan(0);
+  });
+
+  it("refuses when there are no criteria", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [] },
+      deps(),
+    );
+    expect(result.eligible).toBe(false);
+  });
+
+  it("refuses when the head SHA is unavailable", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({ collectSnapshot: async () => snapshot({ headSha: null, pinnedRef: null }) }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("head"))).toBe(true);
+  });
+
+  it("refuses when the live issue could not be read", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({
+        collectSnapshot: async () => snapshot({ issue: { ...snapshot().issue, state: "unknown" } }),
+      }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("could not be read"))).toBe(true);
+  });
+
+  it("refuses when the issue is already closed", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({
+        collectSnapshot: async () => snapshot({ issue: { ...snapshot().issue, state: "closed" } }),
+      }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("not open"))).toBe(true);
+  });
+
+  it("refuses when the issue names expected files none of which are grounded", async () => {
+    const body = [
+      "## Acceptance criteria",
+      "- [ ] Login redirects after password reset",
+      "",
+      "## Expected files",
+      "- `src/other/file.ts`",
+    ].join("\n");
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({ collectSnapshot: async () => snapshot({ issue: { ...snapshot().issue, body } }) }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("expected files"))).toBe(true);
+  });
+
+  it("refuses when acceptance-criteria coverage is incomplete", async () => {
+    const body = [
+      "## Acceptance criteria",
+      "- [ ] Login redirects after password reset",
+      "- [ ] Sessions are revoked on reset",
+      "",
+      "## Expected files",
+      "- `src/auth/login.ts`",
+    ].join("\n");
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({ collectSnapshot: async () => snapshot({ issue: { ...snapshot().issue, body } }) }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("not grounded"))).toBe(true);
+  });
+
+  it("refuses when the reopen history was not captured (fail closed)", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({
+        collectSnapshot: async () =>
+          snapshot({ issue: { ...snapshot().issue, stateReason: undefined } }),
+      }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("reopen history"))).toBe(true);
+  });
+
+  it("refuses a reopened issue", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({
+        collectSnapshot: async () =>
+          snapshot({ issue: { ...snapshot().issue, stateReason: "reopened" } }),
+      }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("reopened"))).toBe(true);
+  });
+
+  it("refuses when an authoritative comment reports a regression", async () => {
+    const result = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      deps({
+        collectSnapshot: async () =>
+          snapshot({
+            comments: [
+              {
+                id: "55",
+                author: "alice",
+                createdAt: "2026-10-09T12:00:00Z",
+                body: "This is still broken on main.",
+                provenance: "human_comment",
+                authoritative: true,
+              },
+            ],
+          }),
+      }),
+    );
+    expect(result.eligible).toBe(false);
+    expect(result.reasons.some((r) => r.includes("still reproduces"))).toBe(true);
+  });
+
+  it("resolver reports refused with the policy reasons", async () => {
+    const result = await resolveAlreadyDoneFromAgentReport({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      criteria: [criterion({ excerpt: "not in the file" })],
+      actor: "alpha",
+      issueId: null,
+      client: client(),
+      deps: deps(),
+    });
+    expect(result.action).toBe("refused");
+    expect(result.reasons.length).toBeGreaterThan(0);
+  });
+});
+
+describe("resolveAlreadyDoneFromAgentReport — apply-time freshness re-check", () => {
+  function resolve(d: ReportCloseDeps) {
+    return resolveAlreadyDoneFromAgentReport({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      criteria: [criterion()],
+      actor: "alpha",
+      issueId: "issue-42",
+      client: client(),
+      deps: d,
+    });
+  }
+
+  it("refuses when the issue was reopened between evaluation and close", async () => {
+    const result = await resolve(deps({ fetchIssueState: async () => ({ state: "open", stateReason: "reopened" }) }));
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("reopened"))).toBe(true);
+  });
+
+  it("refuses when a new regression comment appears before the close", async () => {
+    const result = await resolve(
+      deps({
+        fetchComments: async () => [
+          { id: 9, author: "bob", createdAt: "2026-10-10T00:00:01Z", body: "This is still broken.", authorAssociation: null },
+        ],
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("still reproduces"))).toBe(true);
+  });
+
+  it("refuses when the issue is already closed at close time", async () => {
+    const result = await resolve(deps({ fetchIssueState: async () => ({ state: "closed", stateReason: null }) }));
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("not open"))).toBe(true);
+  });
+
+  it("fails closed when the issue state cannot be re-read before the close", async () => {
+    const result = await resolve(
+      deps({
+        fetchIssueState: async () => {
+          throw new Error("github down");
+        },
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("could not be re-read"))).toBe(true);
+  });
+
+  it("returns failed when the GitHub close itself throws", async () => {
+    const result = await resolve(
+      deps({
+        closeIssue: async () => {
+          throw new Error("boom");
+        },
+      }),
+    );
+    expect(result.action).toBe("failed");
+    expect(result.reason).toContain("GitHub close failed");
+  });
+});
+
+describe("already_done never touches the PR-fix queue (#1143)", () => {
+  it("resolvePrFixFromAgentReport no-ops for already_done", async () => {
+    const result = await resolvePrFixFromAgentReport({
+      repoFullName: "org/repo",
+      pullRequestNumber: 10,
+      outcome: "already_done",
+    });
+    expect(result).toEqual({
+      matched: false,
+      action: "none",
+      reason: "already_done is an issue close, not a pr-fix settlement",
+    });
+  });
+});

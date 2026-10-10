@@ -5,7 +5,7 @@ process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
-const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, prismaMock } = vi.hoisted(() => {
+const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, prismaMock } = vi.hoisted(() => {
   const mockAgentRun = {
     create: vi.fn().mockResolvedValue({
       id: "run-1",
@@ -58,6 +58,17 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, prismaMock } = vi.hoi
       itemId: null,
       reason: "no matching pr-fix queue item",
     }),
+    closeResolveMock: vi.fn().mockResolvedValue({
+      matched: true,
+      action: "closed",
+      reason: "issue closed after the close policy was satisfied",
+      reasons: [],
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      headSha: "abc123",
+      evidenceDigest: "digest",
+      criteria: [{ criterion: "Login redirects", path: "src/auth/login.ts" }],
+    }),
     mocks: {
       repoFindUnique: prismaMock.repository.findUnique,
       issueFindUnique: prismaMock.issue.findUnique,
@@ -86,6 +97,10 @@ vi.mock("@prisma/client", () => ({
 vi.mock("@/lib/pr-fix-queue", () => ({
   resolvePrFixFromAgentReport: prFixResolveMock,
   MAX_EVIDENCE_LENGTH: 2000,
+}));
+
+vi.mock("@/lib/report-close", () => ({
+  resolveAlreadyDoneFromAgentReport: closeResolveMock,
 }));
 
 import { POST } from "./route";
@@ -1662,5 +1677,241 @@ describe("POST /api/agents/[agentName]/tasks/report — hard cutover (#1129)", (
     );
     expect(res.status).toBe(403);
     expect(mockAgentRun.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — already_done close (#1143)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  const groundedCriterion = {
+    criterion: "Login redirects after password reset",
+    path: "src/auth/login.ts",
+    excerpt: 'return session.returnTo ?? "/";',
+  };
+
+  const validBody = {
+    taskType: "implement",
+    outcome: "already_done",
+    repoFullName: "org/repo",
+    issueNumber: 42,
+    idempotencyKey: "worker-run-1:already_done",
+    close: { criteria: [groundedCriterion] },
+  };
+
+  function p2002(): Error {
+    return new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+      code: "P2002",
+      clientVersion: "test",
+    });
+  }
+
+  it("returns 400 when already_done has no idempotencyKey", async () => {
+    const { idempotencyKey: _omit, ...body } = validBody;
+    const res = await postRequest(body);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/idempotencyKey/);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when already_done has no repoFullName/issueNumber", async () => {
+    const { repoFullName: _r, issueNumber: _i, ...body } = validBody;
+    const res = await postRequest(body);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/repoFullName and issueNumber/);
+  });
+
+  it("returns 400 when close is missing", async () => {
+    const { close: _c, ...body } = validBody;
+    const res = await postRequest(body);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/close must be an object/);
+  });
+
+  it("returns 400 when close.criteria is empty", async () => {
+    const res = await postRequest({ ...validBody, close: { criteria: [] } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/close.criteria must have between/);
+  });
+
+  it("returns 400 when close.criteria exceeds the limit", async () => {
+    const criteria = Array.from({ length: 13 }, () => groundedCriterion);
+    const res = await postRequest({ ...validBody, close: { criteria } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/close.criteria must have between/);
+  });
+
+  it("returns 400 when a criterion item is not an object", async () => {
+    const res = await postRequest({ ...validBody, close: { criteria: ["nope"] } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/close.criteria\[0\] must be an object/);
+  });
+
+  it("returns 400 when a criterion path is not a repository file path", async () => {
+    const res = await postRequest({
+      ...validBody,
+      close: { criteria: [{ ...groundedCriterion, path: "not a path!" }] },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/path must be a repository file path/);
+  });
+
+  it("returns 400 when a criterion has no criterion text", async () => {
+    const res = await postRequest({
+      ...validBody,
+      close: { criteria: [{ ...groundedCriterion, criterion: "   " }] },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/criterion must be a non-empty string/);
+  });
+
+  it("returns 400 when a criterion excerpt is not a string", async () => {
+    const res = await postRequest({
+      ...validBody,
+      close: { criteria: [{ ...groundedCriterion, excerpt: 123 }] },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/excerpt must be a non-empty string/);
+  });
+
+  it("returns 200 and runs the close resolver for a valid already_done report", async () => {
+    const res = await postRequest({ ...validBody, evidence: "  shipped in abc123  " });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.closeResolution).toEqual(
+      expect.objectContaining({ action: "closed", repoFullName: "org/repo", issueNumber: 42 }),
+    );
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+    const arg = closeResolveMock.mock.calls[0][0];
+    expect(arg).toEqual(
+      expect.objectContaining({
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        actor: "test-agent",
+        criteria: [groundedCriterion],
+        evidence: "shipped in abc123",
+        client: prismaMock,
+      }),
+    );
+  });
+
+  it("persists the close resolution on the idempotency claim", async () => {
+    await postRequest(validBody);
+    expect(mockDedupe.update).toHaveBeenCalledWith({
+      where: { agentName_idempotencyKey: { agentName: "test-agent", idempotencyKey: validBody.idempotencyKey } },
+      data: { closeResolution: expect.objectContaining({ action: "closed" }) },
+    });
+  });
+
+  it("replays the stored close resolution on an idempotent retry without re-closing", async () => {
+    const first = await postRequest(validBody);
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+    expect(first.status).toBe(200);
+
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: validBody.idempotencyKey,
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+      closeResolution: {
+        matched: true,
+        action: "closed",
+        reason: "issue closed after the close policy was satisfied",
+        reasons: [],
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        headSha: "abc123",
+        evidenceDigest: "digest",
+        criteria: [{ criterion: "Login redirects", path: "src/auth/login.ts" }],
+      },
+    });
+
+    const retry = await postRequest(validBody);
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    expect(body.closeResolution.action).toBe("closed");
+    // The close resolver ran only for the first report, never the replay.
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not route already_addressed through the close resolver", async () => {
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "already_addressed",
+      repoFullName: "o/r",
+      pullRequestNumber: 5,
+      evidence: "done",
+      prFixItem: { id: "item-1", generation: 1 },
+    });
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("does not route already_done through PR-fix settlement (no PR coordinates)", async () => {
+    await postRequest(validBody);
+    // The route still calls the shared resolver, which no-ops for already_done;
+    // the important guarantee is that the close resolver ran and no pr-fix
+    // side effects were attempted (no PR coordinates here).
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({ outcome: "already_done" }));
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 400 when repoFullName is not an owner/repo slug", async () => {
+    const res = await postRequest({ ...validBody, repoFullName: "not a repo" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/owner\/repo slug/);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("reports an honest skipped close resolution when the first attempt's outcome was not persisted", async () => {
+    // First attempt: the AgentRun/claim commit, the PR-fix resolution
+    // persists, then the close-resolution persistence fails, so the response
+    // is a structured 5xx.
+    mockDedupe.update
+      .mockResolvedValueOnce({}) // in-transaction agentRunId stamp
+      .mockResolvedValueOnce({}) // prFixResolution persistence
+      .mockRejectedValueOnce(new Error("db hiccup")); // closeResolution persistence
+
+    const first = await postRequest(validBody);
+    expect(first.status).toBe(500);
+
+    // Retry with the same key lands in the duplicate branch with no stored
+    // closeResolution: the route must NOT claim a close and must NOT re-run it.
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: validBody.idempotencyKey,
+      payloadHash: mockDedupe.create.mock.calls[0][0].data.payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+      closeResolution: null,
+    });
+
+    const retry = await postRequest(validBody);
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    expect(body.closeResolution.action).toBe("skipped");
+    expect(body.closeResolution.reason).toContain("not re-run");
+    // The close resolver ran only for the first attempt.
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a maintainer-tier caller submit already_done (audit actor is the path agent)", async () => {
+    const res = await postRequest(validBody, "operator-agent");
+    expect(res.status).toBe(200);
+    expect(closeResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({ actor: "operator-agent", repoFullName: "org/repo", issueNumber: 42 }),
+    );
   });
 });

@@ -6,6 +6,13 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
+import {
+  resolveAlreadyDoneFromAgentReport,
+  type ReportCloseCriterion,
+  type ResolveAlreadyDoneResult,
+} from "@/lib/report-close";
+import { asRepoFilePath } from "@/lib/groomer/close-grounding";
+import { PLAN_LIMITS } from "@/lib/groomer/plan";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -19,8 +26,12 @@ const VALID_OUTCOMES = [
   "failed",
   "no_changes_needed",
   "already_addressed",
+  "already_done",
 ] as const;
 type ValidOutcome = (typeof VALID_OUTCOMES)[number];
+
+/** Internal signal for a malformed already_done close proposal; mapped to 400. */
+class CloseValidationError extends Error {}
 
 export interface TaskReportBody {
   taskType: ValidTaskType;
@@ -33,6 +44,10 @@ export interface TaskReportBody {
   error?: string;
   // #1121: evidence string (commit SHAs / paths) carried by an already_addressed report; recorded in settlement history.
   evidence?: string;
+  // #1143: the already_done close proposal. The worker supplies per-criterion
+  // pinned excerpts; Dispatch re-derives the catalog and applies the shared
+  // close policy. Not close authorization on its own.
+  close?: { criteria: ReportCloseCriterion[] };
   // #1120: worker-reported task start time (ISO 8601). Accepted only when
   // parseable, not in the future, and within 24h of the report; otherwise
   // omitted and the report time is used. It participates in the idempotency
@@ -192,15 +207,76 @@ export async function POST(
     }
   }
 
-  // #1121: evidence is only meaningful for an already_addressed settlement — it
-  // is trimmed, bounded, and recorded in the PR-fix settlement history. On any
-  // other outcome it is ignored (never hashed, never persisted). A non-string
-  // evidence is rejected above by the stringFields validation.
+  // #1121/#1143: evidence is meaningful for an already_addressed settlement and
+  // for an already_done close — it is trimmed, bounded, and recorded in the
+  // settlement/close history. On any other outcome it is ignored (never hashed,
+  // never persisted). A non-string evidence is rejected above by the
+  // stringFields validation.
   const isAlreadyAddressed = (outcome as ValidOutcome) === "already_addressed";
+  const isAlreadyDone = (outcome as ValidOutcome) === "already_done";
   const evidence =
-    isAlreadyAddressed && typeof raw.evidence === "string" ? raw.evidence.trim() : undefined;
+    (isAlreadyAddressed || isAlreadyDone) && typeof raw.evidence === "string"
+      ? raw.evidence.trim()
+      : undefined;
   if (evidence && evidence.length > MAX_EVIDENCE_LENGTH) {
     return errorResponse(`evidence must be at most ${MAX_EVIDENCE_LENGTH} characters`, 400);
+  }
+
+  // #1143: the already_done close proposal. The worker supplies per-criterion
+  // pinned excerpts; the server re-derives the catalog and applies the shared
+  // close policy. Only parsed for already_done; ignored otherwise (like
+  // evidence). Paths are normalized through the same conservative
+  // `asRepoFilePath` the groomer uses.
+  let closeCriteria: ReportCloseCriterion[] | undefined;
+  if (isAlreadyDone) {
+    if (raw.close === undefined || raw.close === null || typeof raw.close !== "object" || Array.isArray(raw.close)) {
+      return errorResponse("close must be an object for an already_done report", 400);
+    }
+    const rawClose = raw.close as Record<string, unknown>;
+    const rawCriteria = rawClose.criteria;
+    if (!Array.isArray(rawCriteria)) {
+      return errorResponse("close.criteria must be an array", 400);
+    }
+    if (rawCriteria.length === 0 || rawCriteria.length > PLAN_LIMITS.closeCriteria) {
+      return errorResponse(
+        `close.criteria must have between 1 and ${PLAN_LIMITS.closeCriteria} items`,
+        400,
+      );
+    }
+    try {
+      closeCriteria = rawCriteria.map((item, i) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          throw new CloseValidationError(`close.criteria[${i}] must be an object`);
+        }
+        const entry = item as Record<string, unknown>;
+        if (
+          typeof entry.criterion !== "string" ||
+          entry.criterion.trim().length === 0 ||
+          entry.criterion.trim().length > PLAN_LIMITS.shortText
+        ) {
+          throw new CloseValidationError(
+            `close.criteria[${i}].criterion must be a non-empty string of at most ${PLAN_LIMITS.shortText} characters`,
+          );
+        }
+        const path = typeof entry.path === "string" ? asRepoFilePath(entry.path) : null;
+        if (!path) {
+          throw new CloseValidationError(`close.criteria[${i}].path must be a repository file path`);
+        }
+        if (
+          typeof entry.excerpt !== "string" ||
+          entry.excerpt.trim().length === 0 ||
+          entry.excerpt.length > PLAN_LIMITS.excerpt
+        ) {
+          throw new CloseValidationError(
+            `close.criteria[${i}].excerpt must be a non-empty string of at most ${PLAN_LIMITS.excerpt} characters`,
+          );
+        }
+        return { criterion: entry.criterion.trim(), path, excerpt: entry.excerpt };
+      });
+    } catch (err) {
+      if (err instanceof CloseValidationError) return errorResponse(err.message, 400);
+      throw err;
+    }
   }
 
   // Optional attempt token for PR-fix queue settlement (#1074). The worker
@@ -236,6 +312,26 @@ export async function POST(
     return errorResponse(`idempotencyKey must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`, 400);
   }
 
+  // #1143: an already_done close targets one concrete issue and must carry a
+  // report-scoped idempotency key (the compare-and-swap token that keeps a
+  // retried report from executing the close twice).
+  if (isAlreadyDone) {
+    const reportRepo = raw.repoFullName;
+    const reportIssue = raw.issueNumber;
+    if (typeof reportRepo !== "string" || reportRepo.trim().length === 0 || reportIssue === undefined) {
+      return errorResponse("repoFullName and issueNumber are required for an already_done report", 400);
+    }
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(reportRepo.trim())) {
+      return errorResponse("repoFullName must be an owner/repo slug for an already_done report", 400);
+    }
+    if (typeof idempotencyKey !== "string") {
+      return errorResponse(
+        "an already_done report requires an idempotencyKey so the close is not applied twice",
+        400,
+      );
+    }
+  }
+
   const prFixItem =
     raw.prFixItem && typeof raw.prFixItem === "object" && !Array.isArray(raw.prFixItem)
       ? {
@@ -251,13 +347,14 @@ export async function POST(
   const report: TaskReportBody = {
     taskType: taskType as ValidTaskType,
     outcome: outcome as ValidOutcome,
-    repoFullName: raw.repoFullName as string | undefined,
+    repoFullName: typeof raw.repoFullName === "string" ? raw.repoFullName.trim() : undefined,
     issueNumber: raw.issueNumber as number | undefined,
     pullRequestNumber: raw.pullRequestNumber as number | undefined,
     pullRequestUrl: raw.pullRequestUrl as string | undefined,
     summary: raw.summary as string | undefined,
     error: raw.error as string | undefined,
     evidence,
+    close: closeCriteria ? { criteria: closeCriteria } : undefined,
     // #1120: normalized worker start time; undefined → report time (now).
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
     prFixItem,
@@ -287,6 +384,7 @@ export async function POST(
     let run: { id: string };
     let duplicate = false;
     let storedResolution: ResolvePrFixFromAgentReportResult | undefined;
+    let storedCloseResolution: ResolveAlreadyDoneResult | undefined;
 
     if (typeof idempotencyKey === "string") {
       // Idempotent reporting (#1044): claim the key and create the AgentRun in
@@ -331,6 +429,8 @@ export async function POST(
         run = { id: existing.agentRunId };
         storedResolution =
           (existing.prFixResolution as ResolvePrFixFromAgentReportResult | null) ?? undefined;
+        storedCloseResolution =
+          (existing.closeResolution as ResolveAlreadyDoneResult | null) ?? undefined;
       }
     } else {
       run = await prisma.agentRun.create({ data: runData });
@@ -377,12 +477,51 @@ export async function POST(
       }
     }
 
+    // #1143: an already_done report closes the issue through the shared close
+    // policy, evaluated against a server-built, revision-pinned catalog. The
+    // resolution is persisted like the PR-fix one, so a retried report with the
+    // same idempotency key replays the close outcome instead of re-executing it.
+    let closeResolution: ResolveAlreadyDoneResult | undefined;
+    if (isAlreadyDone) {
+      if (duplicate) {
+        closeResolution = storedCloseResolution ?? {
+          matched: true,
+          action: "skipped",
+          reason:
+            "duplicate report (idempotency key already processed); the already_done close was not re-run — the outcome was not recorded, so verify the issue state and audit log before retrying",
+          reasons: [],
+          repoFullName: report.repoFullName!,
+          issueNumber: report.issueNumber!,
+          headSha: null,
+          evidenceDigest: null,
+          criteria: [],
+        };
+      } else {
+        closeResolution = await resolveAlreadyDoneFromAgentReport({
+          repoFullName: report.repoFullName!,
+          issueNumber: report.issueNumber!,
+          criteria: report.close!.criteria,
+          evidence: report.evidence,
+          actor: agentName,
+          issueId,
+          client: prisma,
+        });
+        if (typeof idempotencyKey === "string") {
+          await prisma.agentReportDedupe.update({
+            where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
+            data: { closeResolution: closeResolution as unknown as Prisma.InputJsonValue },
+          });
+        }
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       agentName,
       report,
       agentRunId: run.id,
       prFixResolution,
+      ...(closeResolution ? { closeResolution } : {}),
       ...(duplicate ? { duplicate: true } : {}),
     });
   } catch (error) {
