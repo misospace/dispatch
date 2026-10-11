@@ -23,7 +23,13 @@ import {
   type GroomingEvidenceSnapshot,
 } from "@/lib/groomer/evidence-snapshot";
 import { closeIssue, fetchIssue, fetchIssueComments } from "@/lib/github-issues";
-import { fetchRepositoryFileText } from "@/lib/github-code-search";
+import {
+  fetchLatestCommit,
+} from "@/lib/github-ci";
+import {
+  fetchRepositoryFileText,
+  fetchRepositoryMetadata,
+} from "@/lib/github-code-search";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { buildEvidenceCatalog, repositoryEvidenceId } from "@/lib/groomer/plan-evidence";
 import {
@@ -69,6 +75,12 @@ export interface ReportCloseEvaluation {
   evidenceDigest: string | null;
   /** Live GitHub issue state ("open" | "closed" | "unknown"). */
   issueState: string;
+  /** Issue state_reason captured by the evaluation snapshot (#1113). */
+  issueStateReason?: string | null;
+  /** Issue title captured by the evaluation snapshot. */
+  issueTitle: string;
+  /** Issue body captured by the evaluation snapshot. */
+  issueBody: string | null;
   /** Sorted live labels. */
   liveLabels: string[];
   /** The criteria that were grounded (all of them when eligible). */
@@ -78,6 +90,27 @@ export interface ReportCloseEvaluation {
 /** How many recent comments are read for the reopen/regression veto. */
 export const REPORT_CLOSE_COMMENT_WINDOW = 50;
 
+/**
+ * The pinned issue/body/labels and default-branch head SHA captured by the
+ * evaluation snapshot (#1143 review). The apply-time freshness re-check
+ * re-reads the live equivalents and refuses on any change or unverifiable
+ * read, so a mid-flight edit to the cited criteria or the cited code cannot
+ * land a stale close.
+ */
+export interface PinnedCloseState {
+  /** Pinned default-branch head SHA — null when the snapshot did not resolve one. */
+  headSha: string | null;
+  /** Pinned default-branch name — null when the snapshot did not resolve one. */
+  defaultBranch: string | null;
+  issue: {
+    title: string;
+    body: string | null;
+    labels: string[];
+    state: string;
+    stateReason?: string | null;
+  };
+}
+
 export interface ReportCloseDeps {
   collectSnapshot?: (input: EvidenceSnapshotInput) => Promise<GroomingEvidenceSnapshot>;
   fetchComments?: (repoFullName: string, issueNumber: number) => Promise<EvidenceSnapshotInput["comments"]>;
@@ -86,6 +119,19 @@ export interface ReportCloseDeps {
     repoFullName: string,
     issueNumber: number,
   ) => Promise<{ state: string; stateReason?: string | null }>;
+  /**
+   * Fresh issue (title, body, labels, state, state_reason) re-read immediately
+   * before the GitHub close (#1143 review). Defaults to a live `fetchIssue`.
+   */
+  fetchFullIssue?: (repoFullName: string, issueNumber: number) => Promise<{
+    title: string;
+    body: string | null;
+    labels: string[];
+    state: string;
+    stateReason?: string | null;
+  }>;
+  /** Fresh default-branch head SHA re-read immediately before the GitHub close. */
+  fetchHeadSha?: (repoFullName: string) => Promise<string | null>;
   readFile?: (repoFullName: string, path: string, ref: string) => Promise<string>;
   closeIssue?: (repoFullName: string, issueNumber: number) => Promise<void>;
   transitionStatus?: (
@@ -123,20 +169,60 @@ async function defaultFetchIssueState(
   return { state: issue.state, stateReason: issue.state_reason };
 }
 
+async function defaultFetchFullIssue(
+  repoFullName: string,
+  issueNumber: number,
+): Promise<{
+  title: string;
+  body: string | null;
+  labels: string[];
+  state: string;
+  stateReason?: string | null;
+}> {
+  const issue = await fetchIssue(repoFullName, issueNumber);
+  return {
+    title: issue.title,
+    body: issue.body,
+    labels: issue.labels.map((label) => label.name),
+    state: issue.state,
+    stateReason: issue.state_reason,
+  };
+}
+
+async function defaultFetchHeadSha(repoFullName: string): Promise<string | null> {
+  try {
+    const meta = await fetchRepositoryMetadata(repoFullName);
+    const commit = await fetchLatestCommit(repoFullName, meta.defaultBranch);
+    return commit?.sha ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function sortedLabels(labels: string[]): string[] {
+  return [...new Set(labels)].sort();
+}
+
 /**
- * Re-read the live issue and its recent comments immediately before the GitHub
- * close and re-run the reopen/regression veto (#1113). This is the apply-time
- * freshness re-check the hosted groomer performs between planning and writing;
- * here the snapshot and the close are one request apart, so this closes the
- * remaining window. Fails closed: any read that cannot be performed is a
- * refusal reason, never a silent pass. Returns [] when the close may proceed.
+ * Re-read the live issue, the default-branch head SHA, and recent comments
+ * immediately before the GitHub close, and re-run the reopen/regression veto
+ * plus the issue-identity / head pins the evaluation snapshot relied on
+ * (#1143 review of #1219). Closes the snapshot→close window: a mid-flight
+ * edit to the cited criteria, the cited code, or the live assignment all
+ * refuse the close.
+ *
+ * Fails closed: every read that cannot be performed is a refusal reason,
+ * never a silent pass. Returns [] when the close may proceed.
  */
 export async function recheckCloseFreshness(
   input: Pick<ReportCloseInput, "repoFullName" | "issueNumber">,
+  pinned: PinnedCloseState,
   deps: ReportCloseDeps = {},
 ): Promise<string[]> {
   const fetchIssueState = deps.fetchIssueState ?? defaultFetchIssueState;
   const fetchComments = deps.fetchComments ?? defaultFetchComments;
+  const fetchFullIssue = deps.fetchFullIssue ?? defaultFetchFullIssue;
+  const fetchHeadSha = deps.fetchHeadSha ?? defaultFetchHeadSha;
 
   let state: { state: string; stateReason?: string | null };
   try {
@@ -152,6 +238,84 @@ export async function recheckCloseFreshness(
     reasons.push(`issue: the issue is ${state.state}, not open at close time`);
   }
 
+  // Re-read the issue identity (title/body/labels/state/state_reason) and
+  // refuse any change. Issue-body edits that re-shape the acceptance criteria
+  // are the dangerous case the freshness gate exists to catch.
+  let live: {
+    title: string;
+    body: string | null;
+    labels: string[];
+    state: string;
+    stateReason?: string | null;
+  };
+  try {
+    live = await fetchFullIssue(input.repoFullName, input.issueNumber);
+  } catch (err) {
+    return [
+      ...reasons,
+      `issue: the live issue (title/body/labels) could not be re-read immediately before the close (${errorMessage(err)}); failing closed`,
+    ];
+  }
+
+  const liveLabels = sortedLabels(live.labels);
+  const pinnedLabels = sortedLabels(pinned.issue.labels);
+  if (live.title !== pinned.issue.title) {
+    reasons.push(
+      `issue: the issue title changed between evaluation and close (was "${pinned.issue.title}", now "${live.title}")`,
+    );
+  }
+  if ((live.body ?? null) !== (pinned.issue.body ?? null)) {
+    reasons.push("issue: the issue body changed between evaluation and close (the cited acceptance criteria are no longer authoritative)");
+  }
+  if (liveLabels.length !== pinnedLabels.length || liveLabels.some((label, i) => label !== pinnedLabels[i])) {
+    reasons.push(
+      `issue: the issue labels changed between evaluation and close (was [${pinnedLabels.join(", ")}], now [${liveLabels.join(", ")}])`,
+    );
+  }
+  if (live.state !== pinned.issue.state) {
+    reasons.push(`issue: the issue state changed between evaluation and close (was ${pinned.issue.state}, now ${live.state})`);
+  }
+  if (pinned.issue.stateReason !== undefined && live.stateReason === undefined) {
+    // The snapshot captured a state_reason but the live read did not. The
+    // reopen signal cannot be re-validated, so the close refuses (#1113).
+    reasons.push(
+      `issue: the live state_reason was not captured, so the reopen signal from the snapshot (${pinned.issue.stateReason ?? "none"}) cannot be re-validated (failing closed)`,
+    );
+  } else if ((live.stateReason ?? null) !== (pinned.issue.stateReason ?? null)) {
+    reasons.push(
+      `issue: the state_reason changed between evaluation and close (was ${pinned.issue.stateReason ?? "none"}, now ${live.stateReason ?? "none"})`,
+    );
+  }
+
+  // Re-read the default-branch head SHA and refuse any move. The evaluation
+  // pinned every cited excerpt at `pinned.headSha`; a push that adds or
+  // removes the cited code invalidates that pin without changing the file
+  // contents the worker read, which only a head comparison can detect.
+  let liveHeadSha: string | null;
+  try {
+    liveHeadSha = await fetchHeadSha(input.repoFullName);
+  } catch (err) {
+    return [
+      ...reasons,
+      `head: the default-branch head SHA could not be re-read immediately before the close (${errorMessage(err)}); failing closed`,
+    ];
+  }
+  if (pinned.headSha !== null && liveHeadSha === null) {
+    reasons.push("head: the default-branch head SHA could not be re-read immediately before the close; failing closed");
+  } else if (pinned.headSha !== null && liveHeadSha !== null && pinned.headSha !== liveHeadSha) {
+    reasons.push(
+      `head: the default-branch head moved between evaluation and close (was ${pinned.headSha.slice(0, 12)}, now ${liveHeadSha.slice(0, 12)}); the cited excerpts are no longer pinned`,
+    );
+  } else if (pinned.headSha === null && liveHeadSha !== null) {
+    // The evaluation could not resolve a head SHA — that case is already
+    // refused by `evaluateClosePolicy`. If the live read now resolves one,
+    // it means the snapshot was unreadable for an unrelated reason and the
+    // catalog may have been grounded against unpinned state; refuse.
+    reasons.push(
+      "head: the evaluation snapshot had no head SHA but the default-branch head is now resolvable; the cited excerpts cannot be re-validated",
+    );
+  }
+
   let regressionReports: string[] = [];
   try {
     const comments = await fetchComments(input.repoFullName, input.issueNumber);
@@ -161,6 +325,7 @@ export async function recheckCloseFreshness(
       .map((comment) => `comment:${comment.id ?? "?"} by ${comment.author}`);
   } catch (err) {
     return [
+      ...reasons,
       `comments: recent comments could not be re-read immediately before the close (${errorMessage(err)}); failing closed`,
     ];
   }
@@ -298,6 +463,9 @@ export async function evaluateReportClose(
     defaultBranch: snapshot.defaultBranch,
     evidenceDigest: catalog.binding.evidenceDigest,
     issueState: snapshot.issue.state,
+    issueStateReason: snapshot.issue.stateReason,
+    issueTitle: snapshot.issue.title,
+    issueBody: snapshot.issue.body,
     liveLabels: snapshot.issue.labels,
     criteria: input.criteria.map((criterion) => ({ criterion: criterion.criterion, path: criterion.path })),
   };
@@ -481,12 +649,26 @@ export async function resolveAlreadyDoneFromAgentReport(
     };
   }
 
-  // Apply-time freshness re-check: re-read the issue and recent comments
-  // immediately before the close and re-run the reopen/regression veto, so a
-  // reopen or a new regression report in the snapshot-to-close window still
-  // withholds the close (dispatch#1143).
+  // Apply-time freshness re-check (#1143 review of #1219): re-read the live
+  // issue title/body/labels, the default-branch head SHA, and recent comments
+  // immediately before the close. Any change — including a mid-flight edit to
+  // the cited acceptance criteria or the cited code, or the live agent
+  // assignment shifting off the worker who reported — withholds the close.
+  // The pinned values come straight from the evaluation snapshot so the
+  // comparison is like-for-like against what the close policy just grounded.
   const freshness = await recheckCloseFreshness(
     { repoFullName: input.repoFullName, issueNumber: input.issueNumber },
+    {
+      headSha: evaluation.headSha,
+      defaultBranch: evaluation.defaultBranch,
+      issue: {
+        title: evaluation.issueTitle,
+        body: evaluation.issueBody,
+        labels: evaluation.liveLabels,
+        state: evaluation.issueState,
+        stateReason: evaluation.issueStateReason,
+      },
+    },
     input.deps,
   );
   if (freshness.length > 0) {

@@ -5,7 +5,7 @@ process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
 
-const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, prismaMock } = vi.hoisted(() => {
+const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, prismaMock, getLiveIssueLabelsMock } = vi.hoisted(() => {
   const mockAgentRun = {
     create: vi.fn().mockResolvedValue({
       id: "run-1",
@@ -74,6 +74,7 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, pri
       issueFindUnique: prismaMock.issue.findUnique,
     },
     prismaMock,
+    getLiveIssueLabelsMock: vi.fn(),
   };
 });
 
@@ -101,6 +102,10 @@ vi.mock("@/lib/pr-fix-queue", () => ({
 
 vi.mock("@/lib/report-close", () => ({
   resolveAlreadyDoneFromAgentReport: closeResolveMock,
+}));
+
+vi.mock("@/lib/claim-gate", () => ({
+  getLiveIssueLabels: getLiveIssueLabelsMock,
 }));
 
 import { POST } from "./route";
@@ -1913,5 +1918,225 @@ describe("POST /api/agents/[agentName]/tasks/report — already_done close (#114
     expect(closeResolveMock).toHaveBeenCalledWith(
       expect.objectContaining({ actor: "operator-agent", repoFullName: "org/repo", issueNumber: 42 }),
     );
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — bound worker scope on already_done close (#1143 review of #1219)", () => {
+  const BOUND = "bound-token";
+  const boundBody = {
+    taskType: "implement",
+    outcome: "already_done",
+    repoFullName: "org/repo",
+    issueNumber: 42,
+    idempotencyKey: "worker-run-bound:already_done",
+    close: {
+      criteria: [
+        {
+          criterion: "Login redirects after password reset",
+          path: "src/auth/login.ts",
+          excerpt: 'return session.returnTo ?? "/";',
+        },
+      ],
+    },
+  };
+
+  function setupTrackedIssue() {
+    // The default tracked state: the issue exists in Dispatch's cache with a
+    // known id. Both `resolveIssueId` calls (the route's pre-AgentRun one and
+    // the gate's) succeed. Override per-test to model an untracked issue.
+    prismaMock.repository.findUnique.mockReset().mockResolvedValue({ id: "repo-1" });
+    prismaMock.issue.findUnique.mockReset().mockResolvedValue({ id: "issue-42" });
+    // #1143 review: re-establish default AgentReportDedupe/AgentRun behavior
+    // so prior tests' `mockReset()` doesn't leave later requests returning
+    // undefined (which becomes a 500 from the route's outer catch).
+    mockDedupe.create.mockReset().mockResolvedValue({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "key-1",
+      payloadHash: "hash-1",
+      agentRunId: null,
+      prFixResolution: null,
+    });
+    mockDedupe.findUnique.mockReset().mockResolvedValue(null);
+    mockDedupe.update.mockReset().mockResolvedValue({});
+    getLiveIssueLabelsMock.mockReset();
+  }
+
+  function setupUntrackedIssue() {
+    prismaMock.repository.findUnique.mockReset().mockResolvedValue(null);
+    prismaMock.issue.findUnique.mockReset().mockResolvedValue(null);
+  }
+
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    setupTrackedIssue();
+  });
+
+  function workerRequest(body: unknown, agentName = "alpha") {
+    return POST(
+      authedRequest(`http://localhost/api/agents/${agentName}/tasks/report`, {
+        method: "POST",
+        token: BOUND,
+        body,
+      }),
+      { params: Promise.resolve({ agentName }) },
+    );
+  }
+
+  it("lets a bound worker close an issue live-assigned to it", async () => {
+    getLiveIssueLabelsMock.mockReset().mockResolvedValueOnce(["agent/alpha", "priority/p1", "status/backlog"]);
+    const res = await workerRequest(boundBody);
+    expect(res.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledWith("org/repo", 42);
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies (403) a bound worker closing an issue live-assigned to a different agent", async () => {
+    getLiveIssueLabelsMock.mockReset().mockResolvedValueOnce(["agent/bravo", "priority/p1", "status/backlog"]);
+    const res = await workerRequest(boundBody);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toMatch(/agent "alpha" and may only close issues live-assigned/);
+    // The close resolver must not run; the gate denies before it ever would.
+    // (The in-transaction claim-update still runs for the AgentRun commit —
+    // that's the durable idempotency claim, not a close write.)
+    expect(closeResolveMock).not.toHaveBeenCalled();
+    // No closeResolution persistence may follow a denial.
+    expect(mockDedupe.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ closeResolution: expect.anything() }) }),
+    );
+  });
+
+  it("denies (403) a bound worker closing an issue with no live agent label", async () => {
+    getLiveIssueLabelsMock.mockReset().mockResolvedValueOnce(["priority/p1", "status/backlog"]);
+    const res = await workerRequest(boundBody);
+    expect(res.status).toBe(403);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("denies (403) a bound worker closing an issue Dispatch does not track", async () => {
+    setupUntrackedIssue();
+    const res = await workerRequest(boundBody);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toMatch(/not tracked/);
+    expect(getLiveIssueLabelsMock).not.toHaveBeenCalled();
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("denies (503) when the live GitHub label fetch fails (fail closed)", async () => {
+    getLiveIssueLabelsMock.mockReset().mockRejectedValue(new Error("github down"));
+    const res = await workerRequest(boundBody);
+    expect(res.status).toBe(503);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("denies (403) an unbound legacy worker token from any already_done close", async () => {
+    setupTrackedIssue();
+    const res = await POST(
+      authedRequest("http://localhost/api/alpha/tasks/report", {
+        method: "POST",
+        token: "test-worker-token",
+        body: boundBody,
+      }),
+      { params: Promise.resolve({ agentName: "alpha" }) },
+    );
+    // Falls under the 403 from enforceWorkerAgentScope — an unbound token
+    // cannot even act for "alpha", so the route short-circuits before the
+    // already_done-specific scope check.
+    expect(res.status).toBe(403);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("bypasses the scope gate on idempotent replay (replays stored closed result)", async () => {
+    // First request passes the gate, close resolver runs, dedupe persists the
+    // closed resolution.
+    getLiveIssueLabelsMock.mockReset().mockResolvedValue(["agent/alpha", "priority/p1", "status/backlog"]);
+    const first = await workerRequest(boundBody);
+    expect(first.status).toBe(200);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1);
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+
+    const firstPayloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+    // Retry: simulate P2002 + findUnique returns the prior dedupe row with
+    // the stored close resolution. The gate must NOT re-fire on replay.
+    mockDedupe.create.mockReset().mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+        code: "P2002",
+        clientVersion: "test",
+      }),
+    );
+    mockDedupe.findUnique.mockReset().mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "alpha",
+      idempotencyKey: boundBody.idempotencyKey,
+      payloadHash: firstPayloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+      closeResolution: {
+        matched: true,
+        action: "closed",
+        reason: "issue closed after the close policy was satisfied",
+        reasons: [],
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        headSha: "abc123",
+        evidenceDigest: "digest",
+        criteria: [{ criterion: "Login redirects", path: "src/auth/login.ts" }],
+      },
+    });
+
+    const retry = await workerRequest(boundBody);
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    expect(body.closeResolution.action).toBe("closed");
+    // Critical: the gate must not re-fetch live labels and the close resolver
+    // must not re-fire on replay.
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1);
+    expect(closeResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an honest skipped close on replay when the first attempt was denied at the gate", async () => {
+    // First request: tracked but assigned to bravo — gate denies with 403,
+    // but the dedupe commit ($transaction) still lands and stores no close
+    // resolution. Idempotent replay must re-emit an honest "skipped" rather
+    // than re-running the gate or the resolver.
+    getLiveIssueLabelsMock.mockReset().mockResolvedValueOnce(["agent/bravo", "priority/p1", "status/backlog"]);
+    const first = await workerRequest(boundBody);
+    expect(first.status).toBe(403);
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1);
+    expect(closeResolveMock).not.toHaveBeenCalled();
+
+    const firstPayloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+    mockDedupe.create.mockReset().mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+        code: "P2002",
+        clientVersion: "test",
+      }),
+    );
+    mockDedupe.findUnique.mockReset().mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "alpha",
+      idempotencyKey: boundBody.idempotencyKey,
+      payloadHash: firstPayloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+      closeResolution: null,
+    });
+
+    const retry = await workerRequest(boundBody);
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.duplicate).toBe(true);
+    expect(body.closeResolution.action).toBe("skipped");
+    expect(body.closeResolution.reason).toContain("not re-run");
+    // The duplicate branch must NOT re-fire the gate or run the resolver.
+    expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1);
+    expect(closeResolveMock).not.toHaveBeenCalled();
   });
 });

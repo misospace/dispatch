@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
 import {
@@ -13,6 +13,8 @@ import {
 } from "@/lib/report-close";
 import { asRepoFilePath } from "@/lib/groomer/close-grounding";
 import { PLAN_LIMITS } from "@/lib/groomer/plan";
+import { getLiveIssueLabels } from "@/lib/claim-gate";
+import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -108,6 +110,77 @@ async function resolveIssueId(
   });
 
   return issue?.id ?? null;
+}
+
+/**
+ * Worker-tier scope check for an `already_done` close (dispatch#1143 review of
+ * #1219): the close can ONLY target one concrete issue that is both
+ *
+ *   (a) tracked in Dispatch's cache (so the close's Prisma mirror update is
+ *       not a no-op on a ghost issue), AND
+ *   (b) live-assigned to the token-derived worker (`agent/<bound name>` is
+ *       present in GitHub's live label set for the issue).
+ *
+ * The check hits GitHub for the live label set — the Prisma cache can lag a
+ * claim made directly on GitHub (#1037), so a stale `agent/<bound>` in cache
+ * would let a worker close an issue Dispatch thinks is theirs but another
+ * agent actually owns on the forge. Maintainer-tier callers (basic / OIDC /
+ * maintainer bearer / auth-disabled) bypass the gate; the close proceeds even
+ * for an untracked issue. Errors thrown by the live fetch surface as 503 with
+ * a fail-closed refusal — the close never lands on an unreadable assignment.
+ *
+ * Returns a `NextResponse` to return when the gate denies, or `null` when the
+ * gate allows.
+ */
+async function enforceAlreadyDoneWorkerScope(
+  auth: Awaited<ReturnType<typeof authorizeRequest>>,
+  repoFullName: string,
+  issueNumber: number,
+): Promise<NextResponse<{ error: string }> | null> {
+  // Maintainer / OIDC / basic / auth-disabled callers are unconstrained —
+  // the route's agent-name URL gate already passed.
+  if (!auth.authorized) return null;
+  if (auth.type !== "bearer" || auth.tier !== "worker") return null;
+
+  const bound = getBoundWorkerAgent(auth);
+  // An unbound legacy worker token has no agent identity to scope against —
+  // it cannot close a tracked issue on someone else's behalf; deny.
+  if (!bound) {
+    return errorResponse(
+      "Worker token is not bound to an agent; an already_done close requires a bound worker credential or a maintainer token",
+      403,
+    );
+  }
+
+  const issueId = await resolveIssueId(repoFullName, issueNumber);
+  if (!issueId) {
+    return errorResponse(
+      `Worker token is bound to agent "${bound}" and may only close issues Dispatch tracks; ${repoFullName}#${issueNumber} is not tracked`,
+      403,
+    );
+  }
+
+  // The labels GitHub currently has are authoritative for the assignment
+  // decision (matches the issue-status and claim gates — #1037).
+  let liveLabels: string[];
+  try {
+    liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return errorResponse(
+      `Could not verify live GitHub labels for ${repoFullName}#${issueNumber}: ${message}`,
+      503,
+    );
+  }
+
+  if (getAgentFromLabels(liveLabels) !== `${AGENT_PREFIX}${bound}`) {
+    return errorResponse(
+      `Worker token is bound to agent "${bound}" and may only close issues live-assigned to it; ${repoFullName}#${issueNumber} is not assigned to that agent`,
+      403,
+    );
+  }
+
+  return null;
 }
 
 function buildTouchedUrls(
@@ -484,6 +557,10 @@ export async function POST(
     let closeResolution: ResolveAlreadyDoneResult | undefined;
     if (isAlreadyDone) {
       if (duplicate) {
+        // Idempotent replay: the original attempt already passed the
+        // worker-tier scope gate, the close policy, and the freshness re-check
+        // (or recorded a refusal). A retry re-runs none of those, and the
+        // stored resolution carries the audit-worthy outcome.
         closeResolution = storedCloseResolution ?? {
           matched: true,
           action: "skipped",
@@ -497,6 +574,19 @@ export async function POST(
           criteria: [],
         };
       } else {
+        // #1143 review (Blocker 1): a bound worker may only close issues that
+        // are tracked AND live-assigned to the token-derived agent. Enforce
+        // before any GitHub close or status-label write so an unauthorized
+        // close cannot reach the apply path. Maintainer / OIDC / basic /
+        // auth-disabled callers are unconstrained — the gate is a no-op for
+        // them.
+        const scopeDenial = await enforceAlreadyDoneWorkerScope(
+          auth,
+          report.repoFullName!,
+          report.issueNumber!,
+        );
+        if (scopeDenial) return scopeDenial;
+
         closeResolution = await resolveAlreadyDoneFromAgentReport({
           repoFullName: report.repoFullName!,
           issueNumber: report.issueNumber!,

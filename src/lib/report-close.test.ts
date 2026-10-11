@@ -65,6 +65,14 @@ function deps(overrides: Partial<ReportCloseDeps> = {}): ReportCloseDeps {
     collectSnapshot: async () => snapshot(),
     fetchComments: async () => [],
     fetchIssueState: async () => ({ state: "open", stateReason: null }),
+    fetchFullIssue: async () => ({
+      title: "Fix login redirect after password reset",
+      body: BODY,
+      labels: ["priority/p1", "status/backlog"],
+      state: "open",
+      stateReason: null,
+    }),
+    fetchHeadSha: async () => HEAD,
     readFile: async (_repo, path) => (path === "src/auth/login.ts" ? LOGIN_TS : ""),
     closeIssue: vi.fn(async () => {}),
     transitionStatus: vi.fn(async (_repo, _issue, _labels, target) => ["status/backlog", target]),
@@ -378,6 +386,246 @@ describe("resolveAlreadyDoneFromAgentReport — apply-time freshness re-check", 
     );
     expect(result.action).toBe("failed");
     expect(result.reason).toContain("GitHub close failed");
+  });
+});
+
+describe("recheckCloseFreshness — issue identity + head SHA + live assignment pins (#1143 review of #1219)", () => {
+  const livePinned: {
+    title: string;
+    body: string | null;
+    labels: string[];
+    state: string;
+    stateReason: string | null;
+  } = {
+    title: "Fix login redirect after password reset",
+    body: BODY,
+    labels: ["priority/p1", "status/backlog"],
+    state: "open",
+    stateReason: null,
+  };
+  const pinned = {
+    headSha: HEAD,
+    defaultBranch: "main",
+    issue: livePinned,
+  };
+
+  function freshen(overrides: Partial<ReportCloseDeps> = {}): ReportCloseDeps {
+    return deps({
+      fetchIssueState: async () => ({ state: "open", stateReason: null }),
+      fetchComments: async () => [],
+      fetchFullIssue: async () => ({ ...livePinned }),
+      fetchHeadSha: async () => HEAD,
+      ...overrides,
+    });
+  }
+
+  it("emits no reasons when the live issue and head match the snapshot", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen(),
+    );
+    expect(reasons).toEqual([]);
+  });
+
+  it("refuses when the live issue body changed (mid-flight criteria edit)", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({
+        fetchFullIssue: async () => ({ ...livePinned, body: BODY + "\n- [ ] Additional criterion" }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes("body changed"))).toBe(true);
+  });
+
+  it("refuses when the live issue title changed", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({
+        fetchFullIssue: async () => ({ ...livePinned, title: "Rename: fix login redirect" }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes("title changed"))).toBe(true);
+  });
+
+  it("refuses when the live issue labels changed (assignment shifted off the worker)", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({
+        fetchFullIssue: async () => ({ ...livePinned, labels: ["agent/bravo", "status/backlog"] }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes("labels changed"))).toBe(true);
+  });
+
+  it("refuses when the live default-branch head SHA moved under the pinned evidence", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({ fetchHeadSha: async () => "cccc3333dddd4444" }),
+    );
+    expect(reasons.some((r) => r.includes("head moved"))).toBe(true);
+  });
+
+  it("fails closed when the live issue cannot be re-read", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({
+        fetchFullIssue: async () => {
+          throw new Error("github down");
+        },
+      }),
+    );
+    expect(reasons.some((r) => r.includes("could not be re-read"))).toBe(true);
+    expect(reasons.some((r) => r.includes("title/body/labels"))).toBe(true);
+  });
+
+  it("fails closed when the live head SHA cannot be re-read", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({
+        fetchHeadSha: async () => null,
+      }),
+    );
+    expect(reasons.some((r) => r.includes("head SHA could not be re-read"))).toBe(true);
+  });
+
+  it("fails closed when the live head SHA read itself throws", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinned,
+      freshen({
+        fetchHeadSha: async () => {
+          throw new Error("network blip");
+        },
+      }),
+    );
+    expect(reasons.some((r) => r.includes("default-branch head"))).toBe(true);
+  });
+
+  it("refuses when the snapshot pinned state_reason was lost on the live re-read", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      { ...pinned, issue: { ...livePinned, stateReason: null } },
+      freshen({
+        fetchFullIssue: async () => ({ ...livePinned, stateReason: undefined }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes("state_reason was not captured"))).toBe(true);
+  });
+});
+
+describe("resolveAlreadyDoneFromAgentReport — mid-flight change refuses with zero GitHub closes (#1143 review of #1219)", () => {
+  function resolve(d: ReportCloseDeps) {
+    return resolveAlreadyDoneFromAgentReport({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      criteria: [criterion()],
+      actor: "alpha",
+      issueId: "issue-42",
+      client: client(),
+      deps: d,
+    });
+  }
+
+  it("refuses with zero close calls when the live issue body changes between evaluation and close", async () => {
+    const closeMock = vi.fn(async () => {});
+    const result = await resolve(
+      deps({
+        closeIssue: closeMock,
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset",
+          body: BODY + "\n- [ ] New criterion added mid-flight",
+          labels: ["priority/p1", "status/backlog"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("body changed"))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses with zero close calls when the default-branch head moves between evaluation and close", async () => {
+    const closeMock = vi.fn(async () => {});
+    const result = await resolve(
+      deps({
+        closeIssue: closeMock,
+        fetchHeadSha: async () => "cccc3333dddd4444",
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("head moved"))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses with zero close calls when the live agent label shifts off the worker", async () => {
+    const closeMock = vi.fn(async () => {});
+    const result = await resolve(
+      deps({
+        closeIssue: closeMock,
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset",
+          body: BODY,
+          // Worker is bound to "alpha"; live assignment moved to bravo.
+          labels: ["agent/bravo", "status/backlog", "priority/p1"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("labels changed"))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the live issue title is renamed mid-flight", async () => {
+    const closeMock = vi.fn(async () => {});
+    const result = await resolve(
+      deps({
+        closeIssue: closeMock,
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset (renamed)",
+          body: BODY,
+          labels: ["priority/p1", "status/backlog"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("title changed"))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed with zero close calls when the live issue read throws", async () => {
+    const closeMock = vi.fn(async () => {});
+    const result = await resolve(
+      deps({
+        closeIssue: closeMock,
+        fetchFullIssue: async () => {
+          throw new Error("github down");
+        },
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes("title/body/labels"))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
   });
 });
 
