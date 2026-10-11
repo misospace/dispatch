@@ -529,6 +529,136 @@ describe("recheckCloseFreshness — issue identity + head SHA + live assignment 
   });
 });
 
+describe("recheckCloseFreshness — bound worker final-read identity check (#1143 review of #1219 P1)", () => {
+  // The route's pre-close scope gate already enforces agent<=auth on the
+  // FIRST live read; this block covers the snapshot/final-read TOCTOU window
+  // — the apply-time freshness re-check independently requires the FINAL
+  // live labels to still assign the issue to agent/<boundAgent>, fail-closed
+  // before closeIssue.
+
+  const alphaPinned: {
+    title: string;
+    body: string | null;
+    labels: string[];
+    state: string;
+    stateReason: string | null;
+  } = {
+    title: "Fix login redirect after password reset",
+    body: BODY,
+    labels: ["agent/alpha", "priority/p1", "status/backlog"],
+    state: "open",
+    stateReason: null,
+  };
+  const pinnedAlpha = {
+    headSha: HEAD,
+    defaultBranch: "main",
+    issue: alphaPinned,
+    boundAgent: "alpha",
+  };
+
+  function freshenAlpha(overrides: Partial<ReportCloseDeps> = {}): ReportCloseDeps {
+    return deps({
+      fetchIssueState: async () => ({ state: "open", stateReason: null }),
+      fetchComments: async () => [],
+      fetchFullIssue: async () => ({ ...alphaPinned }),
+      fetchHeadSha: async () => HEAD,
+      ...overrides,
+    });
+  }
+
+  it("refuses when the live issue is no longer assigned to the bound worker (reassigned to bravo)", async () => {
+    // Gate saw agent/alpha; the snapshot captured the same; by close time the
+    // live labels have been reassigned to bravo. The snapshot-vs-final diff
+    // catches this directly (labels changed) AND the bound-agent check fires
+    // independently — both branches refuse.
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinnedAlpha,
+      freshenAlpha({
+        fetchFullIssue: async () => ({
+          ...alphaPinned,
+          labels: ["agent/bravo", "priority/p1", "status/backlog"],
+        }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes('live agent assignment is "agent/bravo"'))).toBe(true);
+    expect(reasons.some((r) => r.includes("agent/bravo"))).toBe(true);
+  });
+
+  it("refuses when the live assignment label has been removed mid-flight", async () => {
+    // Gate saw agent/alpha; the snapshot captured the same; the live label
+    // set no longer carries any agent/* label. The snapshot-vs-final diff
+    // catches this (labels changed), AND the bound-agent check independently
+    // confirms the live assignment is gone (none != agent/alpha).
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinnedAlpha,
+      freshenAlpha({
+        fetchFullIssue: async () => ({ ...alphaPinned, labels: ["priority/p1", "status/backlog"] }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes('live agent assignment is "none"'))).toBe(true);
+  });
+
+  it("refuses when the snapshot already shows the wrong agent (TOCTOU between gate and snapshot)", async () => {
+    // This is the case the snapshot-vs-final diff cannot catch by itself:
+    // gate saw agent/alpha (allowed), the snapshot was taken AFTER a
+    // reassignment to bravo so the snapshot shows bravo, and the final read
+    // also shows bravo — labels do not change between snapshot and close.
+    // The bound-agent check still catches it: live assignment is bravo, not
+    // alpha.
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      {
+        ...pinnedAlpha,
+        issue: { ...alphaPinned, labels: ["agent/bravo", "priority/p1", "status/backlog"] },
+      },
+      freshenAlpha({
+        fetchFullIssue: async () => ({
+          ...alphaPinned,
+          labels: ["agent/bravo", "priority/p1", "status/backlog"],
+        }),
+      }),
+    );
+    expect(reasons.some((r) => r.includes('live agent assignment is "agent/bravo"'))).toBe(true);
+  });
+
+  it("emits no reasons when the live issue is still assigned to the bound worker", async () => {
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      pinnedAlpha,
+      freshenAlpha(),
+    );
+    expect(reasons).toEqual([]);
+  });
+
+  it("does not apply the bound-agent check when boundAgent is null (maintainer escape hatch)", async () => {
+    // Same live labels that would refuse under a bound worker — but the
+    // route passes null for maintainer / OIDC / basic / auth-disabled
+    // callers, so the check is a no-op and the only refusal reasons come
+    // from the snapshot-vs-final labels diff (live=bravo vs snapshot=alpha).
+    const { recheckCloseFreshness } = await import("./report-close");
+    const reasons = await recheckCloseFreshness(
+      { repoFullName: "org/repo", issueNumber: 42 },
+      { ...pinnedAlpha, boundAgent: null },
+      freshenAlpha({
+        fetchFullIssue: async () => ({
+          ...alphaPinned,
+          labels: ["agent/bravo", "priority/p1", "status/backlog"],
+        }),
+      }),
+    );
+    // The bound-agent reason MUST NOT appear; only the labels-changed diff
+    // reason should be present.
+    expect(reasons.some((r) => r.includes("live agent assignment"))).toBe(false);
+    expect(reasons.some((r) => r.includes("labels changed"))).toBe(true);
+  });
+});
+
 describe("resolveAlreadyDoneFromAgentReport — mid-flight change refuses with zero GitHub closes (#1143 review of #1219)", () => {
   function resolve(d: ReportCloseDeps) {
     return resolveAlreadyDoneFromAgentReport({
@@ -626,6 +756,134 @@ describe("resolveAlreadyDoneFromAgentReport — mid-flight change refuses with z
     expect(result.action).toBe("refused");
     expect(result.reasons.some((r) => r.includes("title/body/labels"))).toBe(true);
     expect(closeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveAlreadyDoneFromAgentReport — bound worker final-read identity check (#1143 review of #1219 P1)", () => {
+  // The route passes `boundAgent` from the auth context so the resolver can
+  // close the TOCTOU window between the gate's first read and the snapshot
+  // and final reads. Snapshot vs final labels alone are not enough: a
+  // reassignment that lands before the snapshot read shows up identically
+  // in both, so the diff is benign — only the independent bound-agent
+  // check on the FINAL live labels catches it.
+
+  function resolveBound(boundAgent: string | null, d: ReportCloseDeps) {
+    return resolveAlreadyDoneFromAgentReport({
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      criteria: [criterion()],
+      actor: boundAgent ?? "alpha",
+      issueId: "issue-42",
+      client: client(),
+      deps: d,
+      boundAgent,
+    });
+  }
+
+  it("refuses with zero close calls when the snapshot already shows the wrong agent (TOCTOU before snapshot)", async () => {
+    // Gate allowed alpha (worker bound to alpha); the snapshot was taken
+    // AFTER a reassignment to bravo so the pinned snapshot shows bravo;
+    // final live labels also show bravo. The snapshot-vs-final diff is
+    // benign; the bound-agent check refuses the close.
+    const closeMock = vi.fn(async () => {});
+    const result = await resolveBound(
+      "alpha",
+      deps({
+        closeIssue: closeMock,
+        collectSnapshot: async () =>
+          snapshot({
+            issue: {
+              ...snapshot().issue,
+              labels: ["agent/bravo", "priority/p1", "status/backlog"],
+            },
+          }),
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset",
+          body: BODY,
+          labels: ["agent/bravo", "priority/p1", "status/backlog"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes('live agent assignment is "agent/bravo"'))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses with zero close calls when the live agent label is removed mid-flight", async () => {
+    // Snapshot was alpha (gate allowed alpha); final live labels have no
+    // agent/* label. The bound-agent check independently catches the
+    // removed assignment.
+    const closeMock = vi.fn(async () => {});
+    const result = await resolveBound(
+      "alpha",
+      deps({
+        closeIssue: closeMock,
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset",
+          body: BODY,
+          labels: ["priority/p1", "status/backlog"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.action).toBe("refused");
+    expect(result.reasons.some((r) => r.includes('live agent assignment is "none"'))).toBe(true);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("closes when the live issue is still assigned to the bound worker", async () => {
+    const closeMock = vi.fn(async () => {});
+    const result = await resolveBound(
+      "alpha",
+      deps({
+        closeIssue: closeMock,
+        // Snapshot includes agent/alpha so the labels-diff is clean; the
+        // bound-agent check then independently confirms the live labels
+        // also still carry agent/alpha.
+        collectSnapshot: async () =>
+          snapshot({
+            issue: {
+              ...snapshot().issue,
+              labels: ["agent/alpha", "priority/p1", "status/backlog"],
+            },
+          }),
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset",
+          body: BODY,
+          labels: ["agent/alpha", "priority/p1", "status/backlog"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.action).toBe("closed");
+    expect(closeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refuse on a bound-agent mismatch when boundAgent is null (maintainer escape hatch)", async () => {
+    // Same live-vs-snapshot assignment drift that would refuse under a
+    // bound worker — but the route passes null for maintainer / OIDC /
+    // basic / auth-disabled callers. The labels-changed diff still fires
+    // because the labels genuinely differ from the snapshot; the
+    // bound-agent reason must NOT fire.
+    const closeMock = vi.fn(async () => {});
+    const result = await resolveBound(
+      null,
+      deps({
+        closeIssue: closeMock,
+        fetchFullIssue: async () => ({
+          title: "Fix login redirect after password reset",
+          body: BODY,
+          labels: ["agent/bravo", "priority/p1", "status/backlog"],
+          state: "open",
+          stateReason: null,
+        }),
+      }),
+    );
+    expect(result.reasons.some((r) => r.includes("live agent assignment"))).toBe(false);
   });
 });
 

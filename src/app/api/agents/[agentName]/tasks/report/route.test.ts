@@ -1967,6 +1967,16 @@ describe("POST /api/agents/[agentName]/tasks/report — already_done close (#114
       expect.objectContaining({ actor: "operator-agent", repoFullName: "org/repo", issueNumber: 42 }),
     );
   });
+
+  it("does not pass boundAgent to the resolver for a maintainer-tier caller (no extra constraint)", async () => {
+    // #1143 review of #1219 P1: maintainer / OIDC / basic / auth-disabled
+    // callers leave `boundAgent` undefined so the apply-time freshness re-
+    // check's independent bound-agent check is a no-op. Only the snapshot-
+    // vs-final labels diff applies.
+    const res = await postRequest(validBody, "operator-agent");
+    expect(res.status).toBe(200);
+    expect(closeResolveMock.mock.calls[0][0].boundAgent).toBeUndefined();
+  });
 });
 
 describe("POST /api/agents/[agentName]/tasks/report — bound worker scope on already_done close (#1143 review of #1219)", () => {
@@ -2039,6 +2049,13 @@ describe("POST /api/agents/[agentName]/tasks/report — bound worker scope on al
     expect(res.status).toBe(200);
     expect(getLiveIssueLabelsMock).toHaveBeenCalledWith("org/repo", 42);
     expect(closeResolveMock).toHaveBeenCalledTimes(1);
+    // #1143 review of #1219 P1: the resolver receives the bound agent so the
+    // apply-time freshness re-check independently enforces that the FINAL
+    // live labels still assign the issue to agent/alpha — closing the
+    // snapshot/final-read TOCTOU window the gate alone leaves open.
+    expect(closeResolveMock.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ boundAgent: "alpha" }),
+    );
   });
 
   it("denies (403) a bound worker closing an issue live-assigned to a different agent", async () => {

@@ -597,6 +597,12 @@ export async function POST(
           actor: agentName,
           issueId,
           client: prisma,
+          // #1143 review of #1219 P1: the bound agent closes the snapshot-vs-
+          // final-read window — the apply-time freshness re-check also requires
+          // the FINAL live issue labels to still assign the issue to
+          // `agent/<boundAgent>`. Maintainer / OIDC / basic / auth-disabled
+          // callers leave this undefined so no extra constraint applies.
+          boundAgent: getBoundWorkerAgent(auth),
         });
         if (typeof idempotencyKey === "string") {
           await prisma.agentReportDedupe.update({

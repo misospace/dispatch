@@ -45,6 +45,7 @@ import {
   type GroomingPlan,
 } from "@/lib/groomer/plan";
 import { evaluateClosePolicy } from "@/lib/groomer/mutation-validator";
+import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 
 /** One acceptance criterion the worker grounds in a pinned repository excerpt. */
 export interface ReportCloseCriterion {
@@ -109,6 +110,18 @@ export interface PinnedCloseState {
     state: string;
     stateReason?: string | null;
   };
+  /**
+   * The bound worker the route authenticated as, when the caller is a worker
+   * with a bound credential (#1143 review of #1219 P1). The apply-time
+   * freshness re-check independently requires that the FINAL live issue
+   * labels still assign the issue to `agent/<boundAgent>` — comparing
+   * snapshot labels against the final live labels is not enough on its own,
+   * because a reassignment that lands between the gate's first read and the
+   * evaluation snapshot is invisible to that diff. Undefined (or null) for
+   * maintainer / OIDC / basic / auth-disabled callers: no assignment
+   * constraint beyond the snapshot diff.
+   */
+  boundAgent?: string | null;
 }
 
 export interface ReportCloseDeps {
@@ -271,6 +284,22 @@ export async function recheckCloseFreshness(
     reasons.push(
       `issue: the issue labels changed between evaluation and close (was [${pinnedLabels.join(", ")}], now [${liveLabels.join(", ")}])`,
     );
+  }
+  // #1143 review of #1219 P1: when the caller is a bound worker, the FINAL
+  // live labels must still assign the issue to `agent/<boundAgent>` —
+  // independent of the snapshot diff above. Comparing snapshot vs final
+  // labels is not enough: a reassignment that lands between the gate's
+  // first read and the evaluation snapshot is invisible to that diff (both
+  // reads show the same post-reassignment labels). A bare `agent/<bound>`
+  // label present in the snapshot but missing live — assignment removed
+  // mid-flight — is also caught here, not by the diff.
+  if (pinned.boundAgent != null) {
+    const liveAgent = getAgentFromLabels(liveLabels);
+    if (liveAgent !== `${AGENT_PREFIX}${pinned.boundAgent}`) {
+      reasons.push(
+        `issue: the live agent assignment is "${liveAgent ?? "none"}" but the bound worker is "${pinned.boundAgent}"; the issue is no longer authorized for this worker (failing closed)`,
+      );
+    }
   }
   if (live.state !== pinned.issue.state) {
     reasons.push(`issue: the issue state changed between evaluation and close (was ${pinned.issue.state}, now ${live.state})`);
@@ -584,6 +613,15 @@ export interface ResolveAlreadyDoneInput {
   issueId: string | null;
   client: ReportCloseClient;
   deps?: ReportCloseDeps;
+  /**
+   * The bound worker the caller authenticated as, when the caller is a
+   * worker with a bound credential (#1143 review of #1219 P1). When set,
+   * the apply-time freshness re-check requires the FINAL live issue labels
+   * to still assign the issue to `agent/<boundAgent>`, fail-closed before
+   * `closeIssue`. Undefined / null for maintainer / OIDC / basic /
+   * auth-disabled callers: no constraint beyond the snapshot diff.
+   */
+  boundAgent?: string | null;
 }
 
 export interface ResolveAlreadyDoneResult {
@@ -668,6 +706,7 @@ export async function resolveAlreadyDoneFromAgentReport(
         state: evaluation.issueState,
         stateReason: evaluation.issueStateReason,
       },
+      boundAgent: input.boundAgent ?? null,
     },
     input.deps,
   );
