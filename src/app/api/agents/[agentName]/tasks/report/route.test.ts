@@ -300,6 +300,7 @@ describe("POST /api/agents/[agentName]/tasks/report — validation", () => {
       "failed",
       "no_changes_needed",
       "already_addressed",
+      "handed-off",
     ];
 
     for (const outcome of validOutcomes) {
@@ -1051,6 +1052,43 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
     });
   }
 
+  it.each(["implement", "followup-pr"])("persists %s handoff identity without duplicate lifecycle writes", async (taskType) => {
+    mocks.repoFindUnique.mockResolvedValueOnce({ id: "repo-1" });
+    mocks.issueFindUnique.mockResolvedValueOnce({ id: "issue-42" });
+    const body = { ...keyedBody, taskType, outcome: "handed-off", issueNumber: 42, pullRequestUrl: "https://github.com/org/repo/pull/12" };
+    const first = await postRequest(body);
+    expect(first.status).toBe(200);
+    const firstJson = await first.json();
+    expect(firstJson.report).toMatchObject({ outcome: "handed-off", issueNumber: 42, pullRequestNumber: 12, pullRequestUrl: body.pullRequestUrl });
+    expect(firstJson.report.repoFullName).toBe("org/repo");
+    expect(mockAgentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        runType: taskType,
+        status: "handed-off",
+        issueId: "issue-42",
+        finishedAt: expect.any(Date),
+        touchedIssueUrls: ["https://github.com/org/repo/issues/42", body.pullRequestUrl],
+      }),
+    }));
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+    expect(prFixResolveMock.mock.calls[0][0].outcome).toBe("handed-off");
+
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+    mockDedupe.create.mockRejectedValueOnce(p2002());
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1", agentName: "test-agent", idempotencyKey: body.idempotencyKey,
+      payloadHash, agentRunId: "run-1", prFixResolution: firstJson.prFixResolution,
+    });
+    const retry = await postRequest(body);
+    expect(retry.status).toBe(200);
+    const retryJson = await retry.json();
+    expect(retryJson.duplicate).toBe(true);
+    expect(retryJson.agentRunId).toBe(firstJson.agentRunId);
+    expect(retryJson.prFixResolution).toEqual(firstJson.prFixResolution);
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+    expect(prFixResolveMock).toHaveBeenCalledTimes(1);
+  });
+
   it("reports without idempotencyKey keep at-least-once behavior", async () => {
     const body = { taskType: "implement", outcome: "pr_opened" };
 
@@ -1636,6 +1674,11 @@ describe("POST /api/agents/[agentName]/tasks/report — late/duplicate settlemen
 });
 
 describe("POST /api/agents/[agentName]/tasks/report — bound worker scope (#1129)", () => {
+  beforeEach(() => {
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
   it("denies a bound worker reporting for another agent", async () => {
     const res = await POST(
       authedRequest("http://localhost/api/agents/bravo/tasks/report", {
@@ -1651,6 +1694,11 @@ describe("POST /api/agents/[agentName]/tasks/report — bound worker scope (#112
 });
 
 describe("POST /api/agents/[agentName]/tasks/report — hard cutover (#1129)", () => {
+  beforeEach(() => {
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
   it("denies an unbound legacy worker token", async () => {
     const res = await POST(
       authedRequest("http://localhost/api/agents/alpha/tasks/report", {

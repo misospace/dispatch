@@ -40,6 +40,7 @@ The report endpoint accepts these outcomes:
 | `failed` | The task failed unexpectedly |
 | `no_changes_needed` | No action was required |
 | `already_addressed` | PR-fix feedback was already handled; settles with optional evidence and no push (#1121) |
+| `handed-off` | The accepted task was handed to another process; preserves issue/PR identity without mutating the PR-fix queue. Independent pr-followup sync owns ingestion. |
 
 ## Generic Worker Loop
 

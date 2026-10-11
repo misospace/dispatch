@@ -2053,7 +2053,8 @@ export type AgentReportOutcome =
   | "no_changes_needed"
   | "blocked"
   | "failed"
-  | "already_addressed";
+  | "already_addressed"
+  | "handed-off";
 
 /**
  * The (id, generation) attempt token `next-task` issues on a followup-pr
@@ -2114,6 +2115,8 @@ export interface ResolvePrFixFromAgentReportResult {
  * marking:
  * - No matching item or no PR coordinates → no-op (issue-work reports pass
  *   through untouched).
+ * - Outcome `handed-off` → no settlement, queue mutation, or PR state lookup.
+ *   The report records a terminal worker handoff; independent sync owns follow-up.
  * - Outcome `blocked` → mark BLOCKED immediately. Doesn't need PR state; the
  *   agent hit a wall.
  * - Outcome `failed` → settle the consumed generation (#1133): reopen a
@@ -2144,6 +2147,17 @@ export async function resolvePrFixFromAgentReport(
 
   const client = input.client ?? prisma;
   const attempt = input.attempt ?? null;
+
+  // Hand-off ends this worker's task but leaves PR ingestion and queue state to
+  // the independent pr-followup sync owner.
+  if (input.outcome === "handed-off") {
+    return {
+      matched: false,
+      action: "none",
+      reason: "task handed off; pr-followup sync retains ownership",
+      attemptGeneration: attempt?.generation ?? null,
+    };
+  }
 
   let existing: any;
   if (attempt) {
