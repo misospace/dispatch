@@ -713,6 +713,14 @@ export interface ReclaimStalePrFixHandoutsReport {
   examined: number;
   reclaimed: number;
   staled: number;
+  /**
+   * Items PARKED at the reclaim cap (#1218). Legacy callers may still read
+   * `blocked` for the same count — both are incremented in the cap path so
+   * old dashboards keep working, but `parked` is the truthful name going
+   * forward (a parked item is bounded exhaustion, not a human decision).
+   */
+  parked: number;
+  /** @deprecated Use `parked` (#1218). Retained for callers that still key off it. */
   blocked: number;
   skipped: number;
   unknownState: number;
@@ -772,6 +780,7 @@ export async function reclaimStalePrFixHandouts(
     examined: 0,
     reclaimed: 0,
     staled: 0,
+    parked: 0,
     blocked: 0,
     skipped: 0,
     unknownState: 0,
@@ -923,8 +932,36 @@ export async function reclaimStalePrFixHandouts(
             }
             return result;
           });
-          if (count === 1) report.blocked++;
-          else report.skipped++;
+          if (count === 1) {
+            report.parked++;
+            // Legacy alias: the reclaim-cap path counted toward `blocked`
+            // historically. Bumping both keeps older dashboards working
+            // (#1218) while `parked` is the truthful name going forward.
+            report.blocked++;
+            // Park the GitHub-side surface outside the DB transaction
+            // (#1218 review): the other cap paths call surfacePrFixParked
+            // here, so the reclaim-cap transition must post the same
+            // diagnostic marker so operators see every PARKED item in one
+            // place. Best-effort — a missed GitHub write must not block the
+            // sweep.
+            try {
+              await surfacePrFixParked({
+                repo: item.repo,
+                pr: item.pr,
+                reason: item.reason,
+                outcome: "no_progress",
+                latestNote: `Reclaimed ${reclaimCount} times without acknowledgement; parked (#1211).`,
+                context: await buildPrFixBlockedContext(client, { ...item, fixAttempts: item.fixAttempts ?? null }),
+              });
+            } catch (error) {
+              report.errors.push({
+                itemId: item.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          } else {
+            report.skipped++;
+          }
           continue;
         }
 
@@ -1591,17 +1628,19 @@ export async function markPrFixItem(
     }
   };
 
-  // A settlement (FIXED/BLOCKED/PARKED) on an item whose post-dispatch evidence
-  // list still holds an actionable entry must NOT absorb that evidence: reopen
-  // as a fresh dispatchable attempt so a worker actually runs on it (#1119).
-  // Evaluated only for settlements, so a non-settle mark never triggers a head
-  // fetch. A capped item still gives up (PARKED, #1218), matching the other
-  // fresh-attempt caps. The head fetch inside the actionability check always
+  // Only FIXED settlements reopen on fresh post-dispatch evidence (#1218):
+  // human-decision BLOCKED and operational PARKED are sticky — a fresh
+  // post-dispatch entry on a sticky settlement stays recorded on the row for
+  // operator visibility, and only an explicit operator requeue (or a
+  // maintainer mark to QUEUED) releases it. A capped FIXED still gives up
+  // (PARKED), matching the other fresh-attempt caps; BLOCKED/PARKED skip the
+  // cap path entirely. The head fetch inside the actionability check always
   // runs OUTSIDE any transaction: Prisma's ~5s interactive-transaction
   // timeout must never have to span a GitHub round-trip (#1124 review).
   const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED" || nextStatus === "PARKED";
+  const reopenEligible = nextStatus === "FIXED";
   const reopenOnPostDispatch =
-    settlesAttempt &&
+    reopenEligible &&
     (await hasActionablePostDispatchEvidence(existing.postDispatchEvidenceKeys ?? [], input.repo, input.pr));
   // The initial reopen attempt can miss its keys/generation pin when evidence
   // is recorded between the check above and the write. That is not a
@@ -1854,7 +1893,11 @@ export async function markPrFixItem(
     }
     lastFresh = fresh;
     const freshKeys: string[] = fresh.postDispatchEvidenceKeys ?? [];
-    if (await hasActionablePostDispatchEvidence(freshKeys, input.repo, input.pr)) {
+    // #1218 sticky settlement: a BLOCKED/PARKED settle must absorb the keys
+    // (cleared below) rather than reopen. Only FIXED settlements can be
+    // auto-released by fresh evidence; the head fetch is skipped for the
+    // sticky pair so a never-released row never costs a GitHub round-trip.
+    if (reopenEligible && (await hasActionablePostDispatchEvidence(freshKeys, input.repo, input.pr))) {
       const reopened = await client.$transaction(async (tx) =>
         writeReopen(tx, fresh, " Post-dispatch evidence landed while this settlement was in flight."),
       );
@@ -1901,13 +1944,49 @@ export async function markPrFixItem(
   }
 
   // The loop exhausted: the pinned writes kept losing the race to evidence
-  // that keeps landing. Never return no-mutation for a settle mark merely
-  // because of that — the item would stay QUEUED at the generation the
-  // worker already consumed, next-task would keep handing the spent
+  // that keeps landing. Only FIXED settlements can be force-released by
+  // racing evidence — BLOCKED/PARKED are sticky (#1218), so for them we
+  // drop straight to the unguarded settle (clearing keys + honoring the
+  // caller's status). For FIXED, never return no-mutation merely because
+  // of the racing evidence — the item would stay QUEUED at the generation
+  // the worker already consumed, next-task would keep handing the spent
   // generation first to the deduping worker, and the lane would starve
   // (#1124 review). Force a fresh attempt (or, past the cap, a human
   // hand-off): pinned on id (+ the generation when the token defines one)
   // WITHOUT the keys pin, so racing evidence cannot block it.
+  if (!reopenEligible) {
+    // Sticky-settlement force: clear keys without status flip. The settlement
+    // data already encodes lane/outcome/decisionDetail for the requested
+    // status; writing the cleared-keys update is what the gap-reopen loop's
+    // "no-reopen" branch would have done if it had won the keys pin.
+    const stickyRow = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: {
+          id: existing.id,
+          ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        },
+        data: { ...data, postDispatchEvidenceKeys: [] },
+      });
+      if (count !== 1) return null;
+      const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      await tx.prFixHistory.create({
+        data: {
+          itemId: row.id,
+          action: "mark",
+          status: nextStatus,
+          lane: row.lane,
+          outcome: row.outcome ?? resolvePrFixOutcome(nextStatus, input.outcome),
+          note: input.alreadyAddressed ? alreadyAddressedHistoryNote(input) : input.note ?? undefined,
+        },
+      });
+      return row;
+    });
+    if (!stickyRow) {
+      const remaining = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      return { mutated: false, reason: remaining ? "generation-mismatch" : "not-found" };
+    }
+    return finishMarked(stickyRow);
+  }
   const forceCapped = (lastFresh.fixAttempts ?? 1) >= maxPrFixAttempts();
   const forceData: Record<string, unknown> = forceCapped
     ? {
@@ -1955,8 +2034,8 @@ export async function markPrFixItem(
         note: [
           input.note,
           forceCapped
-            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked (#1119).`
-            : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1119).`,
+            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked (#1218).`
+            : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1218).`,
         ]
           .filter(Boolean)
           .join(" "),

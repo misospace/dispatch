@@ -663,4 +663,50 @@ describe("resolvePrFixFromAgentReport", () => {
     // it settles (a red PR is never marked FIXED off an unverified report).
     expect(fetchPullRequestMergeStateMock).toHaveBeenCalledWith("acme/widgets", 1234);
   });
+
+  it("keeps a human_decision report sticky even with actionable post-dispatch evidence (#1218)", async () => {
+    // A dispatched worker reports `blocked` carrying a `human_decision`
+    // reason while a fresh review arrived after hand-out. The pre-#1218
+    // reopen path silently flipped the row back to QUEUED (or PARKED at
+    // cap), cleared the decision payload, and re-dispatched without an
+    // operator. The fix: a BLOCKED settlement is sticky — fresh evidence
+    // is absorbed by the BLOCKED, the operator-facing decision payload is
+    // preserved, and only an explicit operator requeue releases it.
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FIXTURE_ITEM,
+      postDispatchEvidenceKeys: ["review:fresh@H1"],
+    });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const decision = { question: "needs a human decision", evidence: "fresh review" };
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      attempt: ATTEMPT,
+      blockReason: "human_decision",
+      decision,
+    }));
+
+    expect(result.action).toBe("blocked");
+    expect(result.matched).toBe(true);
+    // Sticky: the settlement write is status=BLOCKED with the decision
+    // payload preserved, NOT a reopen write that would set status=QUEUED.
+    const calls = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastWrite = calls.at(-1)?.[0];
+    expect(lastWrite).toMatchObject({
+      where: expect.objectContaining({ id: "item-42", generation: 1 }),
+      data: expect.objectContaining({
+        status: "BLOCKED",
+        lane: "NEEDS_HUMAN",
+        outcome: "human_decision",
+        decisionDetail: decision,
+      }),
+    });
+    // No FIXED-redirect reopen was attempted: no fresh generation bump, no
+    // attempt increment, no queued reset.
+    expect(lastWrite?.data).not.toMatchObject({ generation: expect.anything() });
+    expect(lastWrite?.data).not.toMatchObject({ fixAttempts: expect.anything() });
+    // The merge-state probe was skipped — a hard block never reaches GitHub.
+    expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
+  });
 });

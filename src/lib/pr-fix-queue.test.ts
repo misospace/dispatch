@@ -2185,7 +2185,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(client.items[0].evidenceKeys).toEqual(["review:1", "review:2"]);
   });
 
-  it("evidence after hand-out turns a BLOCKED settlement into a fresh QUEUED attempt", async () => {
+  it("a BLOCKED settlement is sticky on fresh post-dispatch evidence (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 22, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2204,16 +2204,27 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 22, status: "BLOCKED",
+      decision: { question: "needs a human decision", evidence: "fresh feedback" },
       expectedGeneration: 1,
     });
 
     expect(result.mutated).toBe(true);
-    const reopened = mutatedItem(result);
-    expect(reopened.status).toBe("QUEUED");
-    expect(reopened.generation).toBe(2);
-    expect(reopened.fixAttempts).toBe(2);
-    expect(reopened.lane).toBe("NORMAL");
-    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    const settled = mutatedItem(result);
+    // BLOCKED is sticky (#1218): fresh post-dispatch evidence must not flip the
+    // row back to QUEUED. The new evidence is absorbed by the BLOCKED
+    // settlement and stays recorded on the row for operator visibility.
+    expect(settled.status).toBe("BLOCKED");
+    expect(settled.lane).toBe("NEEDS_HUMAN");
+    expect(settled.outcome).toBe("human_decision");
+    expect(settled.decisionDetail).toEqual({
+      question: "needs a human decision",
+      evidence: "fresh feedback",
+    });
+    expect(settled.generation).toBe(1);
+    expect(settled.fixAttempts).toBe(1);
+    // Only the keys-clear write touched the post-dispatch field; the keys are
+    // absorbed by the BLOCKED settlement.
+    expect(settled.postDispatchEvidenceKeys).toEqual([]);
   });
 
   it("evidence after hand-out turns a FIXED settlement into a fresh QUEUED attempt (regardless of head movement)", async () => {
@@ -2309,7 +2320,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(marked.postDispatchEvidenceKeys).toEqual([]);
   });
 
-  it("post-dispatch evidence past the attempt cap parks the item (#1218)", async () => {
+  it("a BLOCKED settlement past the attempt cap stays sticky and never reopens (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 26, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2327,18 +2338,21 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 26, status: "BLOCKED",
+      decision: { question: "needs a human decision" },
       expectedGeneration: 1,
     });
 
     expect(result.mutated).toBe(true);
-    const capped = mutatedItem(result);
-    expect(capped.status).toBe("PARKED");
-    expect(capped.lane).toBe("NORMAL");
-    expect(capped.outcome).toBe("no_progress");
-    expect(capped.postDispatchEvidenceKeys).toEqual([]);
-    // Gave up: no generation bump, no attempt increment.
-    expect(capped.generation).toBe(1);
-    expect(capped.fixAttempts).toBe(5);
+    const settled = mutatedItem(result);
+    // BLOCKED is sticky even past the cap (#1218): the cap is a fresh-attempt
+    // guard, not a release-from-BLOCKED guard. Only an explicit operator
+    // requeue or maintainer mark to QUEUED releases it.
+    expect(settled.status).toBe("BLOCKED");
+    expect(settled.lane).toBe("NEEDS_HUMAN");
+    expect(settled.outcome).toBe("human_decision");
+    expect(settled.postDispatchEvidenceKeys).toEqual([]);
+    expect(settled.generation).toBe(1);
+    expect(settled.fixAttempts).toBe(5);
   });
 
   it("a stale settlement token cannot reopen on post-dispatch evidence", async () => {
@@ -2761,8 +2775,10 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     // Evidence landed on the fast path, every loop iteration, AND the forced
     // fallback write — strictly more than the 3-iteration loop allows.
     expect(landCount).toBeGreaterThan(3);
-    // The capped forced-fallback history row names the parked hand-off.
-    expect(client.history.at(-1).note).toContain("parked (#1119)");
+    // The capped forced-fallback history row names the parked hand-off. The
+    // note was retagged from #1119 to #1218 when the same fallback also
+    // covers the sticky BLOCKED/PARKED settlements.
+    expect(client.history.at(-1).note).toContain("parked (#1218)");
   });
 
   it("a post-dispatch check encoded from an `@`-bearing headSha degrades to an unknown head and still reopens", async () => {
@@ -2872,7 +2888,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(settled.postDispatchEvidenceKeys).toEqual([]);
   });
 
-  it("a post-dispatch reopen retracts the needs-human marker (surfacePrFixUnblocked)", async () => {
+  it("a BLOCKED settlement with post-dispatch evidence stays sticky and never retracts (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 44, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2886,13 +2902,17 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 44, status: "BLOCKED",
+      decision: { question: "needs a human decision", evidence: "fresh feedback" },
       expectedGeneration: 1,
     });
 
-    // The initial post-dispatch reopen leaves the would-be settlement: the
-    // needs-human marker must be folded back into a requeued notice.
-    expect(mutatedItem(result).status).toBe("QUEUED");
-    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 44, "requeued", undefined);
+    // BLOCKED is sticky on fresh post-dispatch evidence (#1218): the row
+    // stays BLOCKED with the operator-facing decision payload. Only an
+    // explicit operator requeue releases it; surfacePrFixUnblocked must NOT
+    // be called (no needs-human retraction happened).
+    expect(mutatedItem(result).status).toBe("BLOCKED");
+    expect(mutatedItem(result).lane).toBe("NEEDS_HUMAN");
+    expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
   });
 
   it("a gap-loop post-dispatch reopen retracts the needs-human marker too", async () => {
@@ -3542,10 +3562,15 @@ describe("reclaim stale hand-outs (#1211)", () => {
     try {
       const row = await seedStaleUnacked(205);
       row.handoutReclaims = 3;
+      surfacingMocks.surfacePrFixParked.mockClear();
       const report = await reclaimStalePrFixHandouts(client, {
         now: STALE_NOW,
         isPrMergedOrClosed: async () => false,
       });
+      // Both `parked` and `blocked` count the reclaim-cap transition (#1218):
+      // `blocked` is the legacy alias for backwards-compatible dashboards,
+      // `parked` is the truthful name going forward.
+      expect(report.parked).toBe(1);
       expect(report.blocked).toBe(1);
       expect(report.reclaimed).toBe(0);
       const after = client.items[0];
@@ -3563,6 +3588,17 @@ describe("reclaim stale hand-outs (#1211)", () => {
       expect(last.note).toContain("1211");
       // The reclaim cap never applies the needs-human label/marker (#1218).
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      // The reclaim cap posts the parked diagnostic (#1218), matching the
+      // other cap paths so operators see every PARKED item in one place.
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repo: "org/repo",
+          pr: 205,
+          outcome: "no_progress",
+          latestNote: expect.stringContaining("1211"),
+        }),
+      );
     } finally {
       if (prev === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
       else process.env.PR_FIX_MAX_RECLAIMS = prev;
