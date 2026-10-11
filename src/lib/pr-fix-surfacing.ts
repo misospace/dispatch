@@ -52,9 +52,17 @@ export interface SurfacePrFixParkedInput {
   outcome?: string | null;
   latestNote?: string | null;
   context?: PrFixSurfaceContext | null;
+  /**
+   * Best-effort retraction of the `needs-human` label (#1218). A BLOCKED item
+   * that later parks (bounded exhaustion / infra / security) must not keep the
+   * label that claims a human decision is pending. Off by default.
+   */
+  removeNeedsHumanLabel?: boolean;
 }
 
 export interface SurfacePrFixParkedResult {
+  /** True when the `needs-human` label was removed (only when requested). */
+  labelRemoved: boolean;
   /** True when a fresh marker comment was posted. */
   commentPosted: boolean;
   /** True when an existing marker comment was PATCHed in place. */
@@ -341,6 +349,7 @@ export async function surfacePrFixBlocked(input: SurfacePrFixBlockedInput): Prom
  */
 export async function surfacePrFixParked(input: SurfacePrFixParkedInput): Promise<SurfacePrFixParkedResult> {
   const result: SurfacePrFixParkedResult = {
+    labelRemoved: false,
     commentPosted: false,
     commentUpdated: false,
     skippedTerminal: false,
@@ -361,6 +370,20 @@ export async function surfacePrFixParked(input: SurfacePrFixParkedInput): Promis
         `${prState.mergedAt ? ` merged=${prState.mergedAt}` : ""}; not commenting on a finished PR`,
     );
     return result;
+  }
+
+  // A BLOCKED item that parks is no longer awaiting a human decision (#1218):
+  // retract the needs-human label before writing the parked notice so the two
+  // never disagree. Best-effort — a failed retraction is recorded, never thrown.
+  if (input.removeNeedsHumanLabel === true) {
+    try {
+      await removeIssueLabel(input.repo, input.pr, NEEDS_HUMAN_LABEL);
+      result.labelRemoved = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`pr-fix-surfacing parked label error for ${input.repo}#${input.pr}:`, error);
+      result.errors.push(`label: ${message}`);
+    }
   }
 
   try {

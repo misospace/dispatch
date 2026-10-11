@@ -13,7 +13,7 @@
 | `infra_failure` | Infrastructure or authentication failure | `PARKED` | `NORMAL` | Diagnostic parked comment; fail closed, not blindly retried |
 | `security_failure` | Security failure | `PARKED` | `NORMAL` | Diagnostic parked comment; fail closed, not blindly retried |
 
-The structured outcome is stored on `PrFixQueueItem` and `PrFixHistory`; human decisions may also include `decisionDetail`. A `tasks/report` request may provide `blockReason` and `decision` (`question`, `options`, `evidence`). A bare `outcome: "blocked"` without `blockReason` means `no_progress`, not `human_decision`.
+The structured outcome is stored on `PrFixQueueItem` and `PrFixHistory`; human decisions may also include `decisionDetail`. A `tasks/report` request may provide `blockReason` and `decision` (`question`, `options`, `evidence`). A bare `outcome: "blocked"` without `blockReason` means `no_progress`, not `human_decision`. An `outcome` supplied on a brand-new `NORMAL`-lane enqueue is advisory and only takes effect if/when the item parks (a fresh item starts `QUEUED`).
 
 ## Budgets and recovery
 

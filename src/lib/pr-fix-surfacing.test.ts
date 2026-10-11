@@ -412,6 +412,29 @@ describe("surfacePrFixParked (#1218)", () => {
     expect(result.commentPosted).toBe(false);
     expect(result.errors).toHaveLength(1);
   });
+
+  it("retracts the needs-human label when removeNeedsHumanLabel is set (#1218)", async () => {
+    const result = await surfacePrFixParked({
+      ...baseInput,
+      outcome: "no_progress",
+      removeNeedsHumanLabel: true,
+    });
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, NEEDS_HUMAN_LABEL);
+    expect(result.labelRemoved).toBe(true);
+    // The retraction happens before/with the parked notice, never in place of it.
+    expect(mocks.addIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      expect.stringContaining(PARKED_COMMENT_MARKER),
+    );
+    expect(result.errors).toEqual([]);
+  });
+
+  it("leaves the needs-human label alone when removeNeedsHumanLabel is absent", async () => {
+    const result = await surfacePrFixParked({ ...baseInput, outcome: "no_progress" });
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(result.labelRemoved).toBe(false);
+  });
 });
 
 describe("surfacePrFixRequeued", () => {

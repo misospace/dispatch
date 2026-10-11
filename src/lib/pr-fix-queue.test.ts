@@ -3569,6 +3569,33 @@ describe("reclaim stale hand-outs (#1211)", () => {
     }
   });
 
+  it("a concurrent re-issue no-ops the terminal PARKED write at the reclaim cap (#1218)", async () => {
+    const row = await seedStaleUnacked(230);
+    // At the reclaim cap: the sweep's terminal write would PARK this item.
+    row.handoutReclaims = 3;
+    const historyBefore = client.history.length;
+    // A concurrent re-issue bumps the generation between the sweep's read and
+    // its terminal write, so the generation pin must make the PARKED write a
+    // no-op rather than parking a row a newer generation now owns.
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].generation = client.items[0].generation + 1;
+    };
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      maxReclaims: 3,
+      isPrMergedOrClosed: async () => false,
+    });
+
+    expect(report.blocked).toBe(0);
+    expect(report.staled).toBe(0);
+    expect(report.reclaimed).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(2);
+    expect(client.history.length).toBe(historyBefore);
+    expect(client.history.some((h) => h.status === "PARKED")).toBe(false);
+  });
+
   it("accumulates the reclaim bound across repeated sweeps until the cap parks the item", async () => {
     await seedStaleUnacked(215);
     // The sweep clears the stamp on each reclaim, so a further sweep only sees
@@ -4321,5 +4348,132 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(toAgentQueuePrFixItem(parkedRow).outcome).toBe("security_failure");
     // PARKED is excluded from the default (QUEUED-only) listing.
     expect((await listQueuedPrFixItems(client)).map((i) => i.pr)).not.toContain(310);
+  });
+
+  it("retracts the needs-human label when a BLOCKED item is later parked", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 311, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k311",
+    });
+    const blocked = await markPrFixItem(client, { repo: "org/repo", pr: 311, status: "BLOCKED" });
+    expect(mutatedItem(blocked).status).toBe("BLOCKED");
+    // The BLOCKED transition is what applied the needs-human label.
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+    surfacingMocks.surfacePrFixParked.mockClear();
+
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 311, status: "PARKED", outcome: "no_progress",
+    });
+
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("no_progress");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ removeNeedsHumanLabel: true, outcome: "no_progress" }),
+    );
+    // The prior surface was the BLOCKED one that applied the label.
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retract the label when a QUEUED item parks directly", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 315, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k315",
+    });
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 315, status: "PARKED", outcome: "no_progress",
+    });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ removeNeedsHumanLabel: false }),
+    );
+  });
+
+  it("surfaces infra_failure through the mark park path without a needs-human label", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 312, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k312",
+    });
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 312, status: "PARKED", outcome: "infra_failure",
+    });
+
+    expect(mutatedItem(result).status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("infra_failure");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "infra_failure" }),
+    );
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("surfaces security_failure through the mark park path without a needs-human label", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 313, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k313",
+    });
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 313, status: "PARKED", outcome: "security_failure",
+    });
+
+    expect(mutatedItem(result).status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("security_failure");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "security_failure" }),
+    );
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("does NOT reopen a PARKED item on new evidence (sticky, #1218)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 316, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 316, status: "PARKED", outcome: "no_progress",
+    });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    surfacingMocks.surfacePrFixParked.mockClear();
+    surfacingMocks.surfacePrFixBlocked.mockClear();
+    surfacingMocks.surfacePrFixUnblocked.mockClear();
+
+    // A fresh automated review lands after the park (a new evidence key).
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 316, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H2",
+    });
+
+    expect(after.status).toBe("PARKED");
+    expect(after.lane).toBe("NORMAL");
+    expect(after.outcome).toBe("no_progress");
+    expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("a stale generation cannot reopen a PARKED item via post-dispatch evidence", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 317, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 317, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+    });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    // A current, actionable post-dispatch entry sits on the parked row (a
+    // review entry is actionable with no GitHub call).
+    client.items[0].postDispatchEvidenceKeys = ["review:2@H2"];
+    // A concurrent re-issue bumps the row; the late worker still holds gen 1.
+    client.items[0].generation = 2;
+    const historyBefore = client.history.length;
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 317, status: "FIXED", expectedGeneration: 1,
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    expect(client.items[0].status).toBe("PARKED");
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual(["review:2@H2"]);
+    expect(client.history.length).toBe(historyBefore);
   });
 });

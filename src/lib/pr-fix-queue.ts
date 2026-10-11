@@ -1774,6 +1774,9 @@ export async function markPrFixItem(
         outcome: row.outcome ?? resolvePrFixOutcome("PARKED", input.outcome) ?? "no_progress",
         latestNote: input.note ?? null,
         context,
+        // A BLOCKED item that parks is no longer awaiting a human decision
+        // (#1218): retract the needs-human label it carried as BLOCKED.
+        removeNeedsHumanLabel: existing.status === "BLOCKED",
       });
     } else if (
       (existing.status === "BLOCKED" || existing.status === "PARKED") &&
