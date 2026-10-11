@@ -56,6 +56,7 @@ type PrFixCandidate = {
 async function confirmPrFixHandOut(
   candidate: PrFixCandidate,
   agentName: string,
+  excluded: (repo: string, pr: number, generation: number) => boolean,
 ): Promise<{ generation: number; reason: string; feedback: string[]; lane: string | null } | null> {
   let dispatchReason = candidate.reason;
   let dispatchFeedback = candidate.feedback;
@@ -70,6 +71,7 @@ async function confirmPrFixHandOut(
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       const stampGeneration = nextGeneration;
+      if (excluded(candidate.repo, candidate.pr, stampGeneration)) return null;
       await prisma.prFixQueueItem.updateMany({
         where: {
           id: candidate.id,
@@ -150,6 +152,47 @@ export async function GET(
   const includeClaimed = searchParams.get("includeClaimed") === "true";
   const includeRenovate = searchParams.get("includeRenovate") === "true";
   const mode = searchParams.get("mode");
+  // Versioned, bounded contract: repeated `exclude_pr_fix` values are
+  // `<owner/repo>#<PR>@<generation>`. Canonicalization is case-insensitive.
+  const exclusionsRaw = searchParams.getAll("exclude_pr_fix");
+  const versions = searchParams.getAll("exclude_pr_fix_version");
+  if (versions.length > 1) return errorResponse("Repeated exclude_pr_fix_version", 400);
+  const exclusionVersion = versions[0] ?? null;
+  if ((exclusionsRaw.length > 0 || exclusionVersion !== null) && exclusionVersion !== "1") {
+    return errorResponse("Unsupported or missing exclude_pr_fix_version (expected 1)", 400);
+  }
+  if (exclusionsRaw.length > 32 || exclusionsRaw.some((value) => value.length > 300) || new Set(exclusionsRaw).size !== exclusionsRaw.length) {
+    return errorResponse("PR-fix exclusions exceed count or size limit", 400);
+  }
+  const excludedPrFixGenerations = new Set<string>();
+  for (const value of exclusionsRaw) {
+    const match = /^([A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99})#([1-9][0-9]*)@([1-9][0-9]*)$/.exec(value);
+    if (!match || !Number.isSafeInteger(Number(match[2])) || !Number.isSafeInteger(Number(match[3]))) {
+      return errorResponse("Malformed exclude_pr_fix entry", 400);
+    }
+    excludedPrFixGenerations.add(`${normalizeQueueRepo(match[1])}#${Number(match[2])}@${Number(match[3])}`);
+  }
+  const skipped = new Map<string, {
+    repoFullName: string; pullRequestNumber: number; generation: number;
+    phase: string; reason: "client-excluded";
+  }>();
+  const excluded = (repo: string, pr: number, generation: number, phase = "QUEUED") => {
+    const key = `${normalizeQueueRepo(repo)}#${pr}@${generation}`;
+    if (!excludedPrFixGenerations.has(key)) return false;
+    if (!skipped.has(key)) {
+      const diagnostic = {
+        repoFullName: normalizeQueueRepo(repo), pullRequestNumber: pr, generation,
+        phase, reason: "client-excluded" as const,
+      };
+      skipped.set(key, diagnostic);
+      console.info("[next-task-pr-fix]", diagnostic);
+    }
+    return true;
+  };
+  const respond = (task: ReturnType<typeof createIdleTask> | ReturnType<typeof createImplementTask> | ReturnType<typeof createFollowupPrTask>) =>
+    NextResponse.json(exclusionVersion === "1"
+      ? { ...task, prFixExclusions: { version: 1, skipped: [...skipped.values()] } }
+      : task);
 
   // External grooming is retired. Reject before any candidate or queue reads.
   if (mode === "groom") {
@@ -187,17 +230,24 @@ export async function GET(
     const deferredIssues = new Set<string>();
 
     const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
+      if (excluded(candidate.repo, candidate.pr, candidate.generation)) {
+        return null;
+      }
       if (agentAlreadyHanded(candidate, agentName)) return null;
-      const confirmed = await confirmPrFixHandOut(candidate, agentName);
+      const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded);
       if (!confirmed) return null;
 
+      if (excluded(candidate.repo, candidate.pr, confirmed.generation)) return null;
       try {
-        await prisma.prFixQueueItem.updateMany({
-          where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED" },
+        // Conditional append fences concurrent polls for the same agent/generation.
+        const claimed = await prisma.prFixQueueItem.updateMany({
+          where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED", NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } } },
           data: { agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] } },
         });
+        if (claimed.count !== 1) return null;
       } catch (error) {
         console.error(`next-task pr-fix hand-out record failed for ${candidate.repo}#${candidate.pr}:`, error);
+        return null;
       }
 
       const reasons = [...new Set([confirmed.reason, ...confirmed.feedback].filter(Boolean))];
@@ -226,7 +276,7 @@ export async function GET(
     // only a fully undispatchable PR-fix queue falls through to issue work.
     for (const candidate of prFixItems) {
       const task = await dispatchPrFixCandidate(candidate);
-      if (task) return NextResponse.json(task);
+      if (task) return respond(task);
       // The item stays queue-owned: this agent already holds its work
       // identity, or the row was contested. Its issue must not be re-served
       // as implement work on the same PR (#1145).
@@ -260,12 +310,19 @@ export async function GET(
       });
       if (existing) {
         deferredIssues.add(issueKey(repo, followupItem.number));
+        excluded(repo, pr, existing.generation, existing.status);
         continue;
       }
 
       // No row: only follow-up health asks us to create one. A linked PR that
-      // needs no follow-up leaves the issue as ordinary implement work.
+      // needs no follow-up leaves the issue as ordinary implement work. A
+      // linked-only source starts at generation 1; honor that exclusion before
+      // fetching GitHub state or materializing/stamping anything.
       if (!health?.needsFollowup) continue;
+      if (excluded(repo, pr, 1, "linked")) {
+        deferredIssues.add(issueKey(repo, followupItem.number));
+        continue;
+      }
       // From here the issue is queue-owned for the poll whatever happens next.
       deferredIssues.add(issueKey(repo, followupItem.number));
       const key = `${repo.toLowerCase()}#${pr}`;
@@ -343,7 +400,7 @@ export async function GET(
           task.issue.url = linkedContext.issueUrl ?? followupItem.url;
         }
         if (linkedContext.reasons?.length) task.reasons = linkedContext.reasons;
-        return NextResponse.json(task);
+        return respond(task);
       }
     }
 
@@ -369,7 +426,7 @@ export async function GET(
           url: first.url,
         },
       });
-      return NextResponse.json(task);
+      return respond(task);
     }
 
     // No dispatchable issue left: report why, so an operator can tell a
@@ -380,18 +437,21 @@ export async function GET(
         ? `${deferredCount} ready issue${deferredCount === 1 ? "" : "s"} deferred: linked PR follow-up is owned by the PR-fix queue`
         : null;
 
+    const excludedNote = skipped.size > 0
+      ? `${skipped.size} PR-fix generations skipped by client exclusion` : null;
+
     if (withheldQueue.length > 0) {
       const withheldNote = `${withheldQueue.length} ready issue${withheldQueue.length === 1 ? "" : "s"} withheld by grooming admission`;
-      return NextResponse.json(
-        createIdleTask(`No work available (${[withheldNote, deferredNote].filter(Boolean).join("; ")})`),
+      return respond(
+        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote].filter(Boolean).join("; ")})`),
       );
     }
 
-    if (deferredNote) {
-      return NextResponse.json(createIdleTask(`No work available (${deferredNote})`));
+    if (deferredNote || excludedNote) {
+      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote].filter(Boolean).join("; ")})`));
     }
 
-    return NextResponse.json(createIdleTask("No work available"));
+    return respond(createIdleTask("No work available"));
   } catch (error) {
     return handleApiError("fetch next task", error);
   }
