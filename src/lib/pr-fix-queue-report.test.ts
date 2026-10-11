@@ -99,6 +99,21 @@ function baseInput(overrides: Partial<ResolvePrFixFromAgentReportInput> = {}) {
 }
 
 describe("resolvePrFixFromAgentReport", () => {
+  it.each([ATTEMPT, null])("hands off without looking up or mutating queue state (attempt: %j)", async (attempt) => {
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "handed-off",
+      attempt,
+    }));
+    expect(result.action).toBe("none");
+    expect(result.reason).toContain("handed off");
+    for (const method of Object.values(prisma.prFixQueueItem)) {
+      expect(method).not.toHaveBeenCalled();
+    }
+    expect(prisma.prFixHistory.create).not.toHaveBeenCalled();
+    expect(prisma.agentRun.create).not.toHaveBeenCalled();
+    expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
+  });
+
   it("does nothing when the report carries no PR coordinates", async () => {
     const result = await resolvePrFixFromAgentReport(baseInput({
       repoFullName: null,
