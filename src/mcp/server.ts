@@ -378,7 +378,7 @@ export function createServer(): McpServerType {
         "List queued PR-fix items (CI failures, CHANGES_REQUESTED reviews, merge conflicts) awaiting a fix push. Optionally filter by lane (e.g. 'NORMAL', 'ESCALATED') or include BLOCKED items.",
       inputSchema: {
         lane: z.string().optional().describe("Filter by PR-fix lane (e.g. 'NORMAL', 'ESCALATED', 'NEEDS_HUMAN')"),
-        includeBlocked: z.boolean().optional().describe("Include BLOCKED (needs-human) items (default false)"),
+        includeBlocked: z.boolean().optional().describe("Include BLOCKED (needs-human) and PARKED (exhausted / operational failure) items (default false)"),
       },
     },
     listPrFixesHandler,

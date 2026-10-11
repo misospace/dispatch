@@ -131,6 +131,7 @@ enum PrFixStatus {
   QUEUED
   FIXED
   BLOCKED
+  PARKED
   STALE
   IGNORED
 }
@@ -155,6 +156,13 @@ model PrFixQueueItem {
   feedback     String[]       @default([])
   evidenceKeys String[]       @default([])
   status       PrFixStatus    @default(QUEUED)
+  // Structured outcome classification (#1218): why the item is in its current
+  // non-active terminal-ish state. Only meaningful for BLOCKED (human_decision)
+  // and PARKED (no_progress | infra_failure | security_failure).
+  outcome      String?
+  // Human-decision payload for a BLOCKED item (#1218): the question, options,
+  // and evidence an operator needs to make the call. Null for non-human states.
+  decisionDetail Json?
   // Dispatch-owned work generation (#1044): 1 on creation, bumped when a
   // non-QUEUED item becomes dispatchable again as a fresh attempt. Workers
   // consume (id, generation) as an opaque work identity via next-task.
@@ -231,6 +239,7 @@ model PrFixHistory {
   reason      String?        @db.Text
   note        String?        @db.Text
   evidenceKey String?
+  outcome     String?
 
   @@index([itemId])
   @@index([at])

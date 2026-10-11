@@ -1115,6 +1115,10 @@ describe("isInformationalComment", () => {
     expect(isInformationalComment("<!-- dispatch-pr-fix-blocked -->\n> ⚠️ needs human")).toBe(true);
   });
 
+  it("flags dispatch's own PARKED notice (#1218)", () => {
+    expect(isInformationalComment("<!-- dispatch-pr-fix-parked -->\n> ⏸️ parked after repeated attempts")).toBe(true);
+  });
+
   it("does NOT flag an ai-pr-reviewer comment even with a marker", () => {
     const body = `<!-- Sticky Pull Request Comment -->
 <!-- ai-pr-reviewer:${JSON.stringify({ review_result: "issues", open_findings: [{ severity: "blocker", message: "no upgrade performed" }] })} -->
@@ -1168,6 +1172,25 @@ describe("ingestCommentEvent — informational comments", () => {
 
     expect(client.items).toHaveLength(1);
     expect(client.items[0].lane).toBe("NORMAL");
+  });
+
+  it("does not enqueue dispatch's own PARKED marker comment (#1218)", async () => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    const client = makeClient();
+
+    const key = await ingestCommentEvent(client, {
+      repoFullName: "misospace/llmkube-images",
+      prNumber: 116,
+      branch: "foreman/x",
+      url: "https://github.com/misospace/llmkube-images/pull/116",
+      title: "Something",
+      author: "itsmiso-ai",
+      commentBody: "<!-- dispatch-pr-fix-parked -->\n> ⏸️ This PR fix item is PARKED after repeated attempts. An operator can requeue it.",
+      commentId: "c-parked",
+    });
+
+    expect(key).toBeNull();
+    expect(client.items).toHaveLength(0);
   });
 });
 

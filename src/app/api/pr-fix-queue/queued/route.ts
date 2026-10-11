@@ -14,6 +14,8 @@ export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const lane = searchParams.get("lane");
+    // include_blocked surfaces BLOCKED (needs-human) and PARKED (exhausted /
+    // operational failure) items alongside QUEUED ones (#1218).
     const includeBlocked = searchParams.get("include_blocked") === "true";
     const prioritizeByType = searchParams.get("prioritize_by_type") !== "false"; // default true
 

@@ -12,6 +12,7 @@ import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, PrFixQueueClie
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
+import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -208,6 +209,7 @@ export function parseAiReviewerFindings(body: string | undefined | null): AiRevi
 const INFORMATIONAL_COMMENT_MARKERS = [
   "<!-- Sticky Pull Request Comment",
   "<!-- dispatch-pr-fix-blocked -->",
+  PARKED_COMMENT_MARKER,
 ];
 
 /**

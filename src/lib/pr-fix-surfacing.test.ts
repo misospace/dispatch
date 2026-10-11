@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { buildNeedsHumanComment, surfacePrFixBlocked, surfacePrFixRequeued, surfacePrFixUnblocked, NEEDS_HUMAN_LABEL, NEEDS_HUMAN_COMMENT_MARKER } from "./pr-fix-surfacing";
+import { buildNeedsHumanComment, buildParkedComment, surfacePrFixBlocked, surfacePrFixParked, surfacePrFixRequeued, surfacePrFixUnblocked, NEEDS_HUMAN_LABEL, NEEDS_HUMAN_COMMENT_MARKER, PARKED_COMMENT_MARKER } from "./pr-fix-surfacing";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -49,6 +49,29 @@ describe("buildNeedsHumanComment", () => {
   it("includes the timestamp line", () => {
     const body = buildNeedsHumanComment(baseInput);
     expect(body).toMatch(/Posted automatically by Dispatch on \d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("renders the decision question, options, and evidence when present (#1218)", () => {
+    const body = buildNeedsHumanComment({
+      ...baseInput,
+      decision: {
+        question: "Should we keep the legacy endpoint?",
+        options: ["Keep it", "Remove it"],
+        evidence: "Breaking change in the public API.",
+      },
+    });
+    expect(body).toContain("**Decision needed:** Should we keep the legacy endpoint?");
+    expect(body).toContain("**Options:**");
+    expect(body).toContain("- Keep it");
+    expect(body).toContain("- Remove it");
+    expect(body).toContain("**Evidence:** Breaking change in the public API.");
+  });
+
+  it("omits the decision block when absent", () => {
+    const body = buildNeedsHumanComment(baseInput);
+    expect(body).not.toContain("Decision needed");
+    expect(body).not.toContain("**Options:**");
+    expect(body).not.toContain("**Evidence:**");
   });
 });
 
@@ -262,37 +285,132 @@ describe("surfacePrFixBlocked — terminal PR guard", () => {
 });
 
 describe("buildNeedsHumanComment — richer context", () => {
-  it("renders totalAttempts, attemptsByLane, finalFailure, run links, and last attempt", () => {
+  it("renders workerExecutions and enqueueRows separately, never as 'attempts' (#1218)", () => {
     const body = buildNeedsHumanComment({
       ...baseInput,
       context: {
-        totalAttempts: 3,
+        workerExecutions: 3,
+        enqueueRows: 7,
         attemptsByLane: { NORMAL: 2, ESCALATED: 1 },
         finalFailureSignature: "tests failed after 3 attempts",
         failingRunLinks: ["https://github.com/org/repo/actions/runs/42"],
         lastAttemptSummary: "final attempt still failing",
+        // Retained for back-compat but must NOT be rendered as "attempts".
+        totalAttempts: 99,
       },
     });
 
-    expect(body).toContain("**Total attempts:** 3");
-    expect(body).toContain("**NORMAL:** 2 attempts");
-    expect(body).toContain("**ESCALATED:** 1 attempt");
+    expect(body).toContain("**Worker executions:** 3");
+    expect(body).toContain("**Enqueue rows:** 7");
+    expect(body).toContain("**Enqueues by lane:**");
+    expect(body).toContain("**NORMAL:** 2");
+    expect(body).toContain("**ESCALATED:** 1");
     expect(body).toContain("**Final failure:** tests failed after 3 attempts");
     expect(body).toContain("https://github.com/org/repo/actions/runs/42");
     expect(body).toContain("**Last attempt:** final attempt still failing");
+    // The legacy totalAttempts is never rendered as "attempts".
+    expect(body).not.toContain("Total attempts");
+    expect(body).not.toContain("99");
   });
 
   it("omits context sections that are absent (backwards compatible)", () => {
     const body = buildNeedsHumanComment(baseInput);
-    expect(body).not.toContain("Total attempts");
-    expect(body).not.toContain("Attempts by lane");
+    expect(body).not.toContain("Worker executions");
+    expect(body).not.toContain("Enqueue rows");
+    expect(body).not.toContain("Enqueues by lane");
     expect(body).not.toContain("Final failure");
     expect(body).not.toContain("Last attempt");
   });
 
   it("omits empty attemptsByLane and no-op context", () => {
     const body = buildNeedsHumanComment({ ...baseInput, context: { attemptsByLane: {} } });
-    expect(body).not.toContain("Attempts by lane");
+    expect(body).not.toContain("Enqueues by lane");
+  });
+});
+
+describe("buildParkedComment (#1218)", () => {
+  it("includes the parked marker, reason, and outcome", () => {
+    const body = buildParkedComment({ ...baseInput, reason: "bounded at 5 attempts", outcome: "no_progress" });
+    expect(body).toContain(PARKED_COMMENT_MARKER);
+    expect(body).toContain("**Reason:** bounded at 5 attempts");
+    expect(body).toContain("**Outcome:** no_progress");
+    expect(body).not.toContain(NEEDS_HUMAN_COMMENT_MARKER);
+    expect(body).toMatch(/Posted automatically by Dispatch on \d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("defaults a missing/unknown outcome to no_progress", () => {
+    expect(buildParkedComment(baseInput)).toContain("**Outcome:** no_progress");
+    expect(buildParkedComment({ ...baseInput, outcome: "nonsense" })).toContain("**Outcome:** no_progress");
+  });
+
+  it("renders infra_failure and security_failure headlines", () => {
+    expect(buildParkedComment({ ...baseInput, outcome: "infra_failure" })).toContain("infrastructure or authentication failure");
+    expect(buildParkedComment({ ...baseInput, outcome: "security_failure" })).toContain("security failure");
+  });
+
+  it("renders metrics and context without the needs-human claim", () => {
+    const body = buildParkedComment({
+      ...baseInput,
+      outcome: "no_progress",
+      context: { workerExecutions: 5, enqueueRows: 12, lastAttemptSummary: "still failing" },
+    });
+    expect(body).toContain("**Worker executions:** 5");
+    expect(body).toContain("**Enqueue rows:** 12");
+    expect(body).toContain("**Last attempt:** still failing");
+    expect(body).not.toContain("needs human attention");
+  });
+});
+
+describe("surfacePrFixParked (#1218)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueComment.mockResolvedValue({ url: null });
+    mocks.updateIssueComment.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.fetchIssueComments.mockResolvedValue([]);
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
+  });
+
+  it("posts a parked comment and applies NO label", async () => {
+    const result = await surfacePrFixParked({ ...baseInput, outcome: "no_progress" });
+    expect(mocks.addIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      expect.stringContaining(PARKED_COMMENT_MARKER),
+    );
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(result.commentPosted).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("updates an existing needs-human marker comment in place (single marker)", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 11, body: `${NEEDS_HUMAN_COMMENT_MARKER}\n> old block` },
+    ]);
+    const result = await surfacePrFixParked({ ...baseInput, outcome: "no_progress" });
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(result.commentUpdated).toBe(true);
+    expect(mocks.updateIssueComment).toHaveBeenCalledWith(
+      "org/repo",
+      11,
+      expect.stringContaining(PARKED_COMMENT_MARKER),
+    );
+  });
+
+  it("writes nothing on a terminal PR", async () => {
+    mocks.fetchPullRequestState.mockResolvedValue({ state: "closed", mergedAt: "2026-05-14T22:00:19Z" });
+    const result = await surfacePrFixParked({ ...baseInput, outcome: "no_progress" });
+    expect(result.skippedTerminal).toBe(true);
+    expect(mocks.addIssueComment).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+  });
+
+  it("never throws when the comment lookup fails", async () => {
+    mocks.fetchIssueComments.mockRejectedValue(new Error("GitHub API error: 502"));
+    const result = await surfacePrFixParked({ ...baseInput, outcome: "no_progress" });
+    expect(result.commentPosted).toBe(false);
+    expect(result.errors).toHaveLength(1);
   });
 });
 
@@ -391,5 +509,18 @@ describe("surfacePrFixUnblocked (#1105)", () => {
   it("uses the requeued notice for the requeued outcome", async () => {
     await surfacePrFixUnblocked("org/repo", 42, "requeued");
     expect(mocks.updateIssueComment.mock.calls[0][2]).toContain("**requeued**");
+  });
+
+  it("detects and folds a PARKED marker, preserving it (#1218)", async () => {
+    mocks.fetchIssueComments.mockResolvedValue([
+      { id: 8, body: `${PARKED_COMMENT_MARKER}\n> parked after 5 attempts` },
+    ]);
+    const result = await surfacePrFixUnblocked("org/repo", 42, "requeued", "operator released");
+    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, NEEDS_HUMAN_LABEL);
+    const body = mocks.updateIssueComment.mock.calls[0][2] as string;
+    expect(body.startsWith(PARKED_COMMENT_MARKER)).toBe(true);
+    expect(body).toContain("**requeued**");
+    expect(body).toContain("operator released");
+    expect(result).toMatchObject({ labelRemoved: true, commentUpdated: true, errors: [] });
   });
 });

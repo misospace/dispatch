@@ -249,10 +249,42 @@ export function isValidEscalatedOutcome(outcome: string): outcome is EscalatedOu
 // ─── PR Review-Fix Queue Constants and Helpers ───────────────────────────────
 
 export type PrFixLane = "NORMAL" | "ESCALATED" | "NEEDS_HUMAN";
-export type PrFixStatus = "QUEUED" | "FIXED" | "BLOCKED" | "STALE" | "IGNORED";
+export type PrFixStatus = "QUEUED" | "FIXED" | "BLOCKED" | "PARKED" | "STALE" | "IGNORED";
 
 export const VALID_PR_FIX_LANES: PrFixLane[] = ["NORMAL", "ESCALATED", "NEEDS_HUMAN"];
-export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED", "STALE", "IGNORED"];
+export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED", "PARKED", "STALE", "IGNORED"];
+
+// ─── PR Fix Outcome Constants ────────────────────────────────────────────────
+//
+// A structured classification of WHY a PR-fix item left the active lane (#1218).
+// `BLOCKED` is reserved for a genuine human decision (`human_decision`); every
+// bounded retry/no-progress exhaustion and every infrastructure/auth/security
+// failure is `PARKED` instead. Keeping these separate stops operational failure
+// from masquerading as a design decision in the queue.
+export type PrFixOutcome = "human_decision" | "no_progress" | "infra_failure" | "security_failure";
+
+export const VALID_PR_FIX_OUTCOMES: PrFixOutcome[] = ["human_decision", "no_progress", "infra_failure", "security_failure"];
+
+export function isValidPrFixOutcome(value: string): value is PrFixOutcome {
+  return VALID_PR_FIX_OUTCOMES.includes(value as PrFixOutcome);
+}
+
+export function normalizePrFixOutcome(value?: string | null): PrFixOutcome | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  return isValidPrFixOutcome(normalized) ? normalized : null;
+}
+
+/**
+ * The human-decision payload attached to a BLOCKED item (#1218): the question
+ * an operator must answer, the concrete options, and any supporting evidence.
+ * Every field is optional so a minimally-reported decision still surfaces.
+ */
+export interface PrFixDecisionContext {
+  question?: string;
+  options?: string[];
+  evidence?: string;
+}
 // ─── PR Fix Type Constants ───────────────────────────────────────────────────
 
 export type PrFixType = "MERGE_CONFLICT" | "CI_FAILURE" | "REVIEW_FEEDBACK" | "OTHER";

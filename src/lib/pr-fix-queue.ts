@@ -1,5 +1,5 @@
-import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, PrFixLane, PrFixStatus, PrFixType, PR_FIX_TYPE_PRIORITY } from "@/types";
-import { surfacePrFixBlocked, surfacePrFixRequeued, surfacePrFixUnblocked, extractUrlsFromText, type PrFixUnblockOutcome } from "./pr-fix-surfacing";
+import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, normalizePrFixOutcome, PrFixLane, PrFixOutcome, PrFixStatus, PrFixType, PrFixDecisionContext, PR_FIX_TYPE_PRIORITY } from "@/types";
+import { surfacePrFixBlocked, surfacePrFixParked, surfacePrFixRequeued, surfacePrFixUnblocked, extractUrlsFromText, type PrFixUnblockOutcome } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
 import { fetchPullRequestMergeState, fetchPullRequestHeadSha, fetchPullRequestState } from "./github-prs";
 import { fetchRepositoryMetadata } from "./github-code-search";
@@ -54,6 +54,14 @@ export interface EnqueuePrFixInput {
   title?: string | null;
   headSha?: string | null;
   author?: string | null;
+  /**
+   * Structured outcome (#1218). Only meaningful when the enqueue resolves to a
+   * PARKED state (e.g. an explicit infra/security failure); a BLOCKED result
+   * always records `human_decision`. Defaults to `no_progress` for PARKED.
+   */
+  outcome?: string | null;
+  /** Human-decision payload persisted on a BLOCKED result (#1218). */
+  decision?: PrFixDecisionContext | null;
 }
 
 export interface CreateLinkedPrFixInput {
@@ -95,6 +103,14 @@ export interface MarkPrFixInput {
   // item; a repeated disagreement reopens via #940 and counts toward fixAttempts.
   alreadyAddressed?: boolean;
   evidence?: string | null;
+  /**
+   * Structured outcome (#1218) for a BLOCKED/PARKED mark. BLOCKED defaults to
+   * `human_decision`; PARKED defaults to `no_progress`. Ignored for other
+   * statuses.
+   */
+  outcome?: string | null;
+  /** Human-decision payload persisted when the mark resolves to BLOCKED (#1218). */
+  decision?: PrFixDecisionContext | null;
 }
 
 export interface RequeuePrFixInput {
@@ -107,6 +123,46 @@ export interface RequeuePrFixInput {
 
 export function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * The structured outcome a status implies (#1218). BLOCKED is reserved for a
+ * genuine human decision; PARKED carries the explicit outcome or `no_progress`.
+ * Any other status has no outcome.
+ */
+export function resolvePrFixOutcome(status: PrFixStatus, explicit?: string | null): PrFixOutcome | null {
+  if (status === "BLOCKED") return "human_decision";
+  if (status === "PARKED") return normalizePrFixOutcome(explicit) ?? "no_progress";
+  return null;
+}
+
+/**
+ * Validate and normalize a `decision` payload (#1218). Returns the cleaned
+ * context, `null` when absent, or an error string when malformed.
+ */
+function parseDecisionContext(value: unknown): { decision: PrFixDecisionContext | null; error?: string } {
+  if (value === undefined || value === null) return { decision: null };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return { decision: null, error: "decision must be an object" };
+  }
+  const raw = value as Record<string, unknown>;
+  const decision: PrFixDecisionContext = {};
+  if (raw.question !== undefined && raw.question !== null) {
+    if (typeof raw.question !== "string") return { decision: null, error: "decision.question must be a string" };
+    if (raw.question.trim()) decision.question = raw.question.trim();
+  }
+  if (raw.options !== undefined && raw.options !== null) {
+    if (!Array.isArray(raw.options) || raw.options.some((o) => typeof o !== "string")) {
+      return { decision: null, error: "decision.options must be an array of strings" };
+    }
+    const options = raw.options.map((o) => (o as string).trim()).filter(Boolean);
+    if (options.length > 0) decision.options = options;
+  }
+  if (raw.evidence !== undefined && raw.evidence !== null) {
+    if (typeof raw.evidence !== "string") return { decision: null, error: "decision.evidence must be a string" };
+    if (raw.evidence.trim()) decision.evidence = raw.evidence.trim();
+  }
+  return { decision };
 }
 
 /**
@@ -132,6 +188,13 @@ export function parseEnqueuePrFixInput(body: unknown): EnqueuePrFixInput | { err
   if (!nonEmpty(input.reason)) return { error: "Missing required field: reason" };
   if (!nonEmpty(input.feedback)) return { error: "Missing required field: feedback" };
   if (!nonEmpty(input.evidenceKey)) return { error: "Missing required field: evidenceKey" };
+  if (input.outcome !== undefined && input.outcome !== null) {
+    if (typeof input.outcome !== "string" || !normalizePrFixOutcome(input.outcome)) {
+      return { error: "Invalid outcome" };
+    }
+  }
+  const decisionResult = parseDecisionContext(input.decision);
+  if (decisionResult.error) return { error: decisionResult.error };
 
   return {
     repo: input.repo.trim(),
@@ -147,6 +210,8 @@ export function parseEnqueuePrFixInput(body: unknown): EnqueuePrFixInput | { err
     title: typeof input.title === "string" ? input.title : null,
     headSha: typeof input.headSha === "string" ? input.headSha : null,
     author: typeof input.author === "string" ? input.author : null,
+    ...(typeof input.outcome === "string" ? { outcome: normalizePrFixOutcome(input.outcome) } : {}),
+    ...(decisionResult.decision ? { decision: decisionResult.decision } : {}),
   };
 }
 
@@ -181,16 +246,28 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
   if (evidence && evidence.length > MAX_EVIDENCE_LENGTH) {
     return { error: `evidence must be at most ${MAX_EVIDENCE_LENGTH} characters` };
   }
+  const status = normalizePrFixStatus(input.status) as PrFixStatus;
+  if (input.outcome !== undefined && input.outcome !== null) {
+    if (typeof input.outcome !== "string" || !normalizePrFixOutcome(input.outcome)) {
+      return { error: "Invalid outcome" };
+    }
+  }
+  const decisionResult = parseDecisionContext(input.decision);
+  if (decisionResult.error) return { error: decisionResult.error };
+  const explicitOutcome = typeof input.outcome === "string" ? normalizePrFixOutcome(input.outcome) : null;
+  const outcome = resolvePrFixOutcome(status, explicitOutcome);
   return {
     repo: input.repo.trim(),
     pr: Number(input.pr),
-    status: normalizePrFixStatus(input.status) as PrFixStatus,
+    status,
     note: typeof input.note === "string" ? input.note : null,
     expectedGeneration:
       typeof input.generation === "number" && input.generation !== null ? input.generation : undefined,
     attemptHeadSha: typeof input.attemptHeadSha === "string" ? input.attemptHeadSha.trim() : null,
     ...(alreadyAddressed ? { alreadyAddressed: true } : {}),
     ...(evidence ? { evidence } : {}),
+    ...(outcome ? { outcome } : {}),
+    ...(decisionResult.decision ? { decision: decisionResult.decision } : {}),
   };
 }
 
@@ -331,25 +408,26 @@ function laneLabel(lane: string | null | undefined): string {
 }
 
 /**
- * Build the surfacing context for a BLOCKED item from data Dispatch actually has:
- * the item's feedback (one entry per enqueue/attempt proxy — the latest is the
- * best available last-attempt context) and its history rows. All fields are
- * optional/fallback-safe so historical rows and old callers still surface
- * something useful. Never throws.
+ * Build the surfacing context for a BLOCKED/PARKED item from data Dispatch
+ * actually has: the item's worker-execution count (`fixAttempts`), its feedback
+ * (the latest is the best available last-attempt context) and its history rows.
+ * All fields are optional/fallback-safe so historical rows and old callers
+ * still surface something useful. Never throws.
+ *
+ * Metrics truthfulness (#1218): `workerExecutions` is the dispatchable attempt
+ * count and `enqueueRows` is the enqueue/evidence row count; the enqueue count
+ * is deliberately NOT emitted as `totalAttempts`.
  */
 export async function buildPrFixBlockedContext(
   client: PrFixQueueClient,
-  item: { repo: string; pr: number; feedback?: string[] | null },
+  item: { repo: string; pr: number; feedback?: string[] | null; fixAttempts?: number | null },
 ): Promise<import("./pr-fix-surfacing").PrFixSurfaceContext> {
   const context: import("./pr-fix-surfacing").PrFixSurfaceContext = {};
 
   const feedback = Array.isArray(item.feedback) ? item.feedback : [];
-  const totalAttempts = feedback.length > 0 ? feedback.length : undefined;
-  if (typeof totalAttempts === "number") context.totalAttempts = totalAttempts;
 
   const links: string[] = [];
   let lastAttemptSummary: string | null = null;
-  let historyLoaded = false;
   for (const entry of feedback) {
     if (!entry) continue;
     lastAttemptSummary = entry;
@@ -359,15 +437,20 @@ export async function buildPrFixBlockedContext(
   if (links.length > 0) context.failingRunLinks = links;
   if (lastAttemptSummary) context.lastAttemptSummary = lastAttemptSummary;
 
-  // Attempts grouped by lane, plus the final failure signature from the BLOCKED
-  // tombstone note. Historical rows without a lane are counted under "unknown".
+  // Worker executions are the real bound; report them explicitly, never as the
+  // enqueue row count (#1218).
+  if (typeof item.fixAttempts === "number") context.workerExecutions = item.fixAttempts;
+  else context.workerExecutions = null;
+
+  // Enqueue rows grouped by lane, plus the final failure signature from the
+  // latest BLOCKED or PARKED tombstone note. Historical rows without a lane are
+  // counted under "unknown".
   try {
     if (client.prFixHistory?.findMany) {
       const history = await client.prFixHistory.findMany({
         where: { item: { repo: item.repo, pr: item.pr } },
         orderBy: { at: "desc" },
       });
-      historyLoaded = true;
 
       const attemptsByLane: Record<string, number> = {};
       let enqueueCount = 0;
@@ -377,18 +460,16 @@ export async function buildPrFixBlockedContext(
         const lane = laneLabel(h.lane);
         attemptsByLane[lane] = (attemptsByLane[lane] ?? 0) + 1;
       }
-      if (enqueueCount > 0) context.totalAttempts = enqueueCount;
+      context.enqueueRows = enqueueCount;
       if (Object.keys(attemptsByLane).length > 0) context.attemptsByLane = attemptsByLane;
 
-      const blocked = history.find((h) => h.action === "mark" && h.status === "BLOCKED" && h.note);
-      if (blocked?.note) context.finalFailureSignature = blocked.note;
+      const terminal = history.find(
+        (h) => h.action === "mark" && (h.status === "BLOCKED" || h.status === "PARKED") && h.note,
+      );
+      if (terminal?.note) context.finalFailureSignature = terminal.note;
     }
   } catch {
     // Failure to load history is non-fatal; we still surface with the rest.
-  }
-
-  if (!historyLoaded && typeof totalAttempts === "number") {
-    context.totalAttempts = totalAttempts;
   }
 
   return context;
@@ -800,12 +881,14 @@ export async function reclaimStalePrFixHandouts(
           continue;
         }
 
-        // PR is open. Past the reclaim cap, hand the item to a human.
+        // PR is open. Past the reclaim cap, PARK the item (#1218): repeated
+        // unacknowledged hand-outs are bounded no-progress exhaustion, not a
+        // human decision, so it must not carry the needs-human label.
         const reclaimCount = item.handoutReclaims ?? 0;
         if (reclaimCount >= maxReclaims) {
-          // Same ack-list pin (#1211 review): the terminal BLOCKED write
+          // Same ack-list pin (#1211 review): the terminal PARKED write
           // would otherwise wipe a freshly-acknowledged live attempt off
-          // NEEDS_HUMAN, never to be reclaimed again.
+          // the parked state, never to be reclaimed again.
           const acksBeforeBlock: string[] = Array.isArray(item.handoutAcks) ? item.handoutAcks : [];
           const { count } = await client.$transaction(async (tx) => {
             const result = await tx.prFixQueueItem.updateMany({
@@ -816,8 +899,10 @@ export async function reclaimStalePrFixHandouts(
                 handoutAcks: { equals: acksBeforeBlock },
               },
               data: {
-                status: "BLOCKED",
-                lane: "NEEDS_HUMAN",
+                status: "PARKED",
+                lane: "NORMAL",
+                outcome: "no_progress",
+                decisionDetail: null,
                 agentHandouts: [],
                 handoutAcks: [],
                 dispatchedGeneration: null,
@@ -829,9 +914,10 @@ export async function reclaimStalePrFixHandouts(
                 data: {
                   itemId: item.id,
                   action: "mark",
-                  status: "BLOCKED",
-                  lane: "NEEDS_HUMAN",
-                  note: `Hand-out reclaimed ${reclaimCount} times without acknowledgement (PR_FIX_MAX_RECLAIMS=${maxReclaims}); routed to a human (#1211).`,
+                  status: "PARKED",
+                  lane: "NORMAL",
+                  outcome: "no_progress",
+                  note: `Hand-out reclaimed ${reclaimCount} times without acknowledgement (PR_FIX_MAX_RECLAIMS=${maxReclaims}); parked (#1211).`,
                 },
               });
             }
@@ -942,22 +1028,29 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           snapshot.headSha === input.headSha;
         const reopenFixStale = isKnownEvidence && headShaUnchanged;
 
-        // Terminal states are sticky. Once an item is STALE (its PR merged or
-        // closed) or IGNORED, re-observed evidence must NOT resurrect it to
-        // QUEUED — the only way back is an explicit requeue, which refuses
-        // merged/closed PRs. Without this the per-sync reap that stales a
-        // merged PR is immediately undone by the next fresh review/check event,
-        // looping a coder forever on a PR that no longer exists (#1000;
-        // observed on pr-reviewer-action #593/#595).
-        const isTerminalStatus = snapshot.status === "STALE" || snapshot.status === "IGNORED";
+        // Human-decision BLOCKED and operational PARKED states are sticky too
+        // (#1218): a fresh enqueue must not auto-reopen either. Only an
+        // explicit operator requeue (or a mark to QUEUED) releases them. A
+        // FIXED tombstone keeps its existing reopen paths (#940 + new evidence).
+        const isTerminalStatus =
+          snapshot.status === "STALE" ||
+          snapshot.status === "IGNORED" ||
+          snapshot.status === "BLOCKED" ||
+          snapshot.status === "PARKED";
 
         const nextEvidenceKeys = uniqueAppend(snapshot.evidenceKeys ?? [], input.evidenceKey, 40);
 
         let resolvedStatus: PrFixStatus;
         let resolvedLane: PrFixLane = lane;
         let statusNote: string | null = null;
+        let resolvedOutcome: PrFixOutcome | null = null;
+        let resolvedDecision: PrFixDecisionContext | null = null;
         if (isTerminalStatus) {
           resolvedStatus = snapshot.status; // sticky — never resurrect a gone PR
+          // Preserve the stored lane: a sticky BLOCKED must stay NEEDS_HUMAN
+          // and a sticky PARKED must stay NORMAL, regardless of the enqueue's
+          // lane argument (#1218).
+          resolvedLane = snapshot.lane ?? resolvedLane;
         } else if (reopenFixStale) {
           resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
         } else if (isKnownEvidence) {
@@ -969,18 +1062,31 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         // Bound the fix loop (#1001). Only a transition back to QUEUED opens a
         // new attempt — more evidence on already-QUEUED work (the rest of one
         // review's inline comments) is the same attempt and never counts
-        // (#1103). Past the cap, stop re-queuing and hand the PR to a human —
-        // otherwise a human CHANGES_REQUESTED that N automated fixes never
-        // satisfy loops forever.
+        // (#1103). Past the cap, stop re-queuing and PARK the PR (#1218): this
+        // is bounded exhaustion, not a human decision, so it must not carry the
+        // needs-human label. Otherwise a human CHANGES_REQUESTED that N
+        // automated fixes never satisfy loops forever.
         const priorAttempts = snapshot.fixAttempts ?? 1;
         if (
           resolvedStatus === "QUEUED" &&
           snapshot.status !== "QUEUED" &&
           priorAttempts >= maxPrFixAttempts()
         ) {
-          resolvedStatus = "BLOCKED";
-          resolvedLane = "NEEDS_HUMAN";
-          statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1001).`;
+          resolvedStatus = "PARKED";
+          resolvedLane = "NORMAL";
+          resolvedOutcome = normalizePrFixOutcome(input.outcome) ?? "no_progress";
+          statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked instead of re-queuing (#1001).`;
+        }
+
+        if (resolvedStatus === "BLOCKED") {
+          resolvedOutcome = "human_decision";
+          resolvedDecision = input.decision ?? snapshot.decisionDetail ?? null;
+        } else if (resolvedStatus === "PARKED") {
+          resolvedOutcome =
+            resolvedOutcome ??
+            normalizePrFixOutcome(input.outcome) ??
+            normalizePrFixOutcome(snapshot.outcome) ??
+            "no_progress";
         }
 
         // A transition from a non-QUEUED status back to QUEUED is a fresh
@@ -1054,6 +1160,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           ...(isFreshAttempt
             ? { postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [] }
             : {}),
+          // Structured outcome (#1218): recorded on the same write as the
+          // status. Only BLOCKED/PARKED carry one; decisionDetail is persisted
+          // only for a human-decision BLOCKED.
+          ...(resolvedOutcome ? { outcome: resolvedOutcome } : {}),
+          ...(resolvedStatus === "BLOCKED" && resolvedDecision ? { decisionDetail: resolvedDecision } : {}),
           ...metadataPatch(input),
         };
 
@@ -1061,6 +1172,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           data,
           statusNote,
           reopenFixStale,
+          outcome: resolvedOutcome,
           // #1134: the append above is computed from THIS snapshot's key list,
           // so the write must be pinned on exactly that list. The
           // isFreshAttempt reset-to-[] is mutually exclusive with the append
@@ -1133,6 +1245,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         reason: input.reason,
         evidenceKey: input.evidenceKey,
       };
+      if (decided.outcome) historyData.outcome = decided.outcome;
       if (decided.reopenFixStale) {
         historyData.note = `Reopened: PR head SHA unchanged since FIXED (${snapshot.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
       } else if (decided.statusNote) {
@@ -1158,20 +1271,50 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         // A brand-new item is a fresh attempt: capture the head the sync
         // observed now as its immutable per-attempt baseline (#1074).
         attemptHeadSha: input.headSha ?? null,
+        // A brand-new NEEDS_HUMAN enqueue is a genuine human decision (#1218).
+        ...(nextStatus === "BLOCKED"
+          ? { outcome: "human_decision", ...(input.decision ? { decisionDetail: input.decision } : {}) }
+          : {}),
         ...metadataPatch(input),
       },
     });
     await tx.prFixHistory.create({
-      data: { itemId: created.id, action: "enqueue", lane: created.lane, reason: input.reason, evidenceKey: input.evidenceKey },
+      data: {
+        itemId: created.id,
+        action: "enqueue",
+        lane: created.lane,
+        reason: input.reason,
+        evidenceKey: input.evidenceKey,
+        ...(nextStatus === "BLOCKED" ? { outcome: "human_decision" } : {}),
+      },
     });
     return created;
   });
 
-  if (previousStatus !== "BLOCKED" && item.status === "BLOCKED") {
+  const wasBlocked = previousStatus === "BLOCKED";
+  const wasParked = previousStatus === "PARKED";
+  if (item.status === "BLOCKED" && !wasBlocked) {
     const context = await buildPrFixBlockedContext(client, item);
-    await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: item.reason, latestNote: null, context });
-  } else if (previousStatus === "BLOCKED" && item.status === "QUEUED") {
-    await retractNeedsHuman(input.repo, input.pr, "requeued", "New evidence reopened this item.");
+    await surfacePrFixBlocked({
+      repo: input.repo,
+      pr: input.pr,
+      reason: item.reason,
+      latestNote: null,
+      context,
+      decision: item.decisionDetail ?? input.decision ?? null,
+    });
+  } else if (item.status === "PARKED" && !wasParked) {
+    const context = await buildPrFixBlockedContext(client, item);
+    await surfacePrFixParked({
+      repo: input.repo,
+      pr: input.pr,
+      reason: item.reason,
+      outcome: item.outcome ?? "no_progress",
+      latestNote: null,
+      context,
+    });
+  } else if ((wasBlocked || wasParked) && (item.status === "QUEUED" || item.status === "FIXED")) {
+    await retractNeedsHuman(input.repo, input.pr, item.status === "FIXED" ? "resolved" : "requeued", "New evidence reopened this item.");
   }
   return item;
 }
@@ -1241,7 +1384,7 @@ export async function createLinkedPrFixItem(
 
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
   const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
-  const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED"] } : "QUEUED";
+  const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED", "PARKED"] } : "QUEUED";
 
   const items = await client.prFixQueueItem.findMany({
     where: { status, ...(lane ? { lane } : {}) },
@@ -1361,9 +1504,10 @@ export async function markPrFixItem(
   const existing = await client.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
   if (!existing) return { mutated: false, reason: "not-found" };
 
-  // Give-up: BLOCKED items always land in NEEDS_HUMAN so the existing red
-  // badge actually means something and so the bridge's ACTIONABLE_LANES
-  // filter continues to skip them. See bridge/prfix.py ACTIONABLE_LANES.
+  // BLOCKED is reserved for a genuine human decision (#1218): lane NEEDS_HUMAN,
+  // outcome human_decision, surfaced with the needs-human label + marker. PARKED
+  // is bounded exhaustion or an operational failure: lane NORMAL, no
+  // needs-human label. The bridge's ACTIONABLE_LANES filter skips BLOCKED.
   const data: Record<string, unknown> = { status: nextStatus };
 
   // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
@@ -1379,13 +1523,23 @@ export async function markPrFixItem(
   const writeReopen = async (tx: any, row: any, noteSuffix = ""): Promise<any | null> => {
     const reopenCapped = (row.fixAttempts ?? 1) >= maxPrFixAttempts();
     const reopenData: Record<string, unknown> = reopenCapped
-      ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [] }
+      ? {
+          status: "PARKED",
+          lane: "NORMAL",
+          outcome: "no_progress",
+          decisionDetail: null,
+          postDispatchEvidenceKeys: [],
+          agentHandouts: [],
+          handoutAcks: [],
+        }
       : {
           status: "QUEUED",
           lane: "NORMAL",
           ...freshAttemptGeneration(),
           fixAttempts: { increment: 1 },
           attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
+          outcome: null,
+          decisionDetail: null,
           postDispatchEvidenceKeys: [],
           // Fresh attempt: per-agent hand-out records for the consumed
           // generation must not suppress its re-dispatch (#1133), and the
@@ -1408,9 +1562,10 @@ export async function markPrFixItem(
         action: "mark",
         status: reopenData.status,
         lane: reopenData.lane,
+        outcome: reopenCapped ? "no_progress" : null,
         note:
           (reopenCapped
-            ? `New evidence arrived after this attempt was handed out, but bounded at ${row.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+            ? `New evidence arrived after this attempt was handed out, but bounded at ${row.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked (#1119).`
             : `New evidence arrived after this attempt was handed out; reopened as a fresh attempt at the current head (#1119).`) + noteSuffix,
       },
     });
@@ -1419,9 +1574,16 @@ export async function markPrFixItem(
 
   const surfaceReopen = async (before: any, reopened: any) => {
     const reopenCapped = (before.fixAttempts ?? 1) >= maxPrFixAttempts();
-    if (reopenCapped && before.status !== "BLOCKED") {
+    if (reopenCapped && before.status !== "BLOCKED" && before.status !== "PARKED") {
       const context = await buildPrFixBlockedContext(client, reopened);
-      await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: reopened.reason, latestNote: input.note ?? null, context });
+      await surfacePrFixParked({
+        repo: input.repo,
+        pr: input.pr,
+        reason: reopened.reason,
+        outcome: "no_progress",
+        latestNote: input.note ?? null,
+        context,
+      });
     } else if (!reopenCapped) {
       // Leaving (a would-be) settlement back to a live QUEUED attempt: make sure a
       // needs-human marker is not left behind and surface the new attempt (#1119).
@@ -1429,15 +1591,15 @@ export async function markPrFixItem(
     }
   };
 
-  // A settlement (FIXED/BLOCKED) on an item whose post-dispatch evidence list
-  // still holds an actionable entry must NOT absorb that evidence: reopen as a
-  // fresh dispatchable attempt so a worker actually runs on it (#1119).
+  // A settlement (FIXED/BLOCKED/PARKED) on an item whose post-dispatch evidence
+  // list still holds an actionable entry must NOT absorb that evidence: reopen
+  // as a fresh dispatchable attempt so a worker actually runs on it (#1119).
   // Evaluated only for settlements, so a non-settle mark never triggers a head
-  // fetch. A capped item still gives up to a human, matching the other
+  // fetch. A capped item still gives up (PARKED, #1218), matching the other
   // fresh-attempt caps. The head fetch inside the actionability check always
   // runs OUTSIDE any transaction: Prisma's ~5s interactive-transaction
   // timeout must never have to span a GitHub round-trip (#1124 review).
-  const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED";
+  const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED" || nextStatus === "PARKED";
   const reopenOnPostDispatch =
     settlesAttempt &&
     (await hasActionablePostDispatchEvidence(existing.postDispatchEvidenceKeys ?? [], input.repo, input.pr));
@@ -1457,8 +1619,18 @@ export async function markPrFixItem(
 
   if (nextStatus === "BLOCKED") {
     data.lane = "NEEDS_HUMAN";
+    data.outcome = "human_decision";
+    if (input.decision) data.decisionDetail = input.decision;
+  } else if (nextStatus === "PARKED") {
+    data.lane = "NORMAL";
+    data.outcome = resolvePrFixOutcome("PARKED", input.outcome);
+    data.decisionDetail = null;
   } else if (nextStatus === "QUEUED") {
     data.lane = "NORMAL";
+    // A mark back to QUEUED releases a BLOCKED/PARKED item: clear the outcome
+    // and human-decision payload (#1218).
+    data.outcome = null;
+    data.decisionDetail = null;
     // Marking a non-QUEUED item back to QUEUED creates a fresh dispatchable
     // attempt (same semantics as requeuePrFixItem) — bump the generation
     // alongside the status flip so the work identity changes (#1044).
@@ -1481,6 +1653,13 @@ export async function markPrFixItem(
   } else if (nextStatus === "STALE" || nextStatus === "IGNORED") {
     // Terminal: the recorded entries are moot; clear them (#1119).
     data.postDispatchEvidenceKeys = [];
+    data.outcome = null;
+    data.decisionDetail = null;
+  } else {
+    // FIXED (and any other status): a settled item carries no BLOCKED/PARKED
+    // classification.
+    data.outcome = null;
+    data.decisionDetail = null;
   }
 
   // No-progress guard (#940, rebuilt in #1074): run it BEFORE any write,
@@ -1499,18 +1678,28 @@ export async function markPrFixItem(
       // why we rejected. No FIXED row is ever written.
       //
       // The refused run was a spent attempt, so it counts toward the cap;
-      // past it, hand the PR to a human instead of re-running a worker that
-      // keeps pushing nothing (#1103). The retry keeps the refused baseline:
-      // the head is unchanged, so it is still the newest observed (#1104).
+      // past it, PARK the PR instead of re-running a worker that keeps pushing
+      // nothing (#1103, #1218). The retry keeps the refused baseline: the head
+      // is unchanged, so it is still the newest observed (#1104).
       const refusalCapped = (existing.fixAttempts ?? 1) >= maxPrFixAttempts();
       const refusalData: Record<string, unknown> = refusalCapped
-        ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [] }
+        ? {
+            status: "PARKED",
+            lane: "NORMAL",
+            outcome: "no_progress",
+            decisionDetail: null,
+            postDispatchEvidenceKeys: [],
+            agentHandouts: [],
+            handoutAcks: [],
+          }
         : {
             status: "QUEUED",
             lane: "NORMAL",
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: input.attemptHeadSha ?? baseline ?? null,
+            outcome: null,
+            decisionDetail: null,
             // The generation bump invalidates any recorded entries and proves
             // no stale post-dispatch list on the fresh attempt (#1119).
             postDispatchEvidenceKeys: [],
@@ -1535,18 +1724,26 @@ export async function markPrFixItem(
             action: "mark",
             status: refusalData.status,
             lane: refusalData.lane,
+            outcome: refusalCapped ? "no_progress" : null,
             note: refusalCapped
-              ? `${refusedNote} Bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human instead of re-queuing (#1103).`
+              ? `${refusedNote} Bounded at ${existing.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked instead of re-queuing (#1103).`
               : refusedNote,
           },
         });
         return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
       });
       if (!refusal) return { mutated: false, reason: "generation-mismatch" };
-      if (refusalCapped && existing.status !== "BLOCKED") {
+      if (refusalCapped && existing.status !== "BLOCKED" && existing.status !== "PARKED") {
         const context = await buildPrFixBlockedContext(client, refusal);
-        await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: refusal.reason, latestNote: input.note ?? null, context });
-      } else if (!refusalCapped && existing.status === "BLOCKED") {
+        await surfacePrFixParked({
+          repo: input.repo,
+          pr: input.pr,
+          reason: refusal.reason,
+          outcome: "no_progress",
+          latestNote: input.note ?? null,
+          context,
+        });
+      } else if (!refusalCapped && (existing.status === "BLOCKED" || existing.status === "PARKED")) {
         await retractNeedsHuman(input.repo, input.pr, "requeued", input.note);
       }
       return { mutated: true, item: refusal };
@@ -1556,12 +1753,32 @@ export async function markPrFixItem(
   // Shared tail for every successful mark write — settlement and non-settle
   // marks alike.
   const finishMarked = async (row: any): Promise<MarkPrFixResult> => {
-    // Only surface a blocked notification when THIS mark is what first puts
-    // the item into BLOCKED (from a non-BLOCKED status).
+    // Only surface a terminal notification when THIS mark is what first puts
+    // the item into BLOCKED/PARKED (from a different status).
     if (nextStatus === "BLOCKED" && existing.status !== "BLOCKED") {
       const context = await buildPrFixBlockedContext(client, row);
-      await surfacePrFixBlocked({ repo: input.repo, pr: input.pr, reason: row.reason, latestNote: input.note ?? null, context });
-    } else if (existing.status === "BLOCKED" && (nextStatus === "QUEUED" || nextStatus === "FIXED")) {
+      await surfacePrFixBlocked({
+        repo: input.repo,
+        pr: input.pr,
+        reason: row.reason,
+        latestNote: input.note ?? null,
+        context,
+        decision: row.decisionDetail ?? input.decision ?? null,
+      });
+    } else if (nextStatus === "PARKED" && existing.status !== "PARKED") {
+      const context = await buildPrFixBlockedContext(client, row);
+      await surfacePrFixParked({
+        repo: input.repo,
+        pr: input.pr,
+        reason: row.reason,
+        outcome: row.outcome ?? resolvePrFixOutcome("PARKED", input.outcome) ?? "no_progress",
+        latestNote: input.note ?? null,
+        context,
+      });
+    } else if (
+      (existing.status === "BLOCKED" || existing.status === "PARKED") &&
+      (nextStatus === "QUEUED" || nextStatus === "FIXED")
+    ) {
       await retractNeedsHuman(input.repo, input.pr, nextStatus === "FIXED" ? "resolved" : "requeued", input.note);
     }
     return { mutated: true, item: row };
@@ -1592,7 +1809,14 @@ export async function markPrFixItem(
       if (count !== 1) return null;
       const row = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
       await tx.prFixHistory.create({
-        data: { itemId: row.id, action: "mark", status: nextStatus, lane: row.lane, note: input.alreadyAddressed ? alreadyAddressedHistoryNote(input) : input.note ?? undefined },
+        data: {
+          itemId: row.id,
+          action: "mark",
+          status: nextStatus,
+          lane: row.lane,
+          outcome: row.outcome ?? resolvePrFixOutcome(nextStatus, input.outcome),
+          note: input.alreadyAddressed ? alreadyAddressedHistoryNote(input) : input.note ?? undefined,
+        },
       });
       return row;
     });
@@ -1659,6 +1883,7 @@ export async function markPrFixItem(
           action: "mark",
           status: nextStatus,
           lane: row.lane,
+          outcome: row.outcome ?? resolvePrFixOutcome(nextStatus, input.outcome),
           note: [
             input.alreadyAddressed ? alreadyAddressedHistoryNote(input) : input.note,
             "Recorded post-dispatch evidence no longer applies (intermediate head); cleared (#1119).",
@@ -1682,13 +1907,23 @@ export async function markPrFixItem(
   // WITHOUT the keys pin, so racing evidence cannot block it.
   const forceCapped = (lastFresh.fixAttempts ?? 1) >= maxPrFixAttempts();
   const forceData: Record<string, unknown> = forceCapped
-    ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [] }
+    ? {
+        status: "PARKED",
+        lane: "NORMAL",
+        outcome: "no_progress",
+        decisionDetail: null,
+        postDispatchEvidenceKeys: [],
+        agentHandouts: [],
+        handoutAcks: [],
+      }
     : {
         status: "QUEUED",
         lane: "NORMAL",
         ...freshAttemptGeneration(),
         fixAttempts: { increment: 1 },
         attemptHeadSha: lastFresh.headSha ?? lastFresh.attemptHeadSha ?? null,
+        outcome: null,
+        decisionDetail: null,
         postDispatchEvidenceKeys: [],
         // Fresh attempt: per-agent hand-out records for the consumed
         // generation must not suppress its re-dispatch (#1133), and the
@@ -1711,12 +1946,13 @@ export async function markPrFixItem(
         action: "mark",
         status: forceData.status,
         lane: forceData.lane,
+        outcome: forceCapped ? "no_progress" : null,
         // Preserve the caller's note alongside the canned forced-fallback text
         // (same join style as the stale-clear settle branch).
         note: [
           input.note,
           forceCapped
-            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); routed to a human (#1119).`
+            ? `Post-dispatch evidence kept landing while this settlement was in flight, but bounded at ${lastFresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked (#1119).`
             : `Post-dispatch evidence kept landing while this settlement was in flight; forced a fresh attempt so the racing evidence is not absorbed (#1119).`,
         ]
           .filter(Boolean)
@@ -1762,7 +1998,7 @@ export async function reconcileStalePrFixItems(
       where: {
         repo,
         pr: { in: Array.from(prNumbers) },
-        status: { in: ["QUEUED", "BLOCKED"] },
+        status: { in: ["QUEUED", "BLOCKED", "PARKED"] },
       },
     });
     checked += staleCandidates.length;
@@ -1823,7 +2059,7 @@ export async function reconcileArchivedRepoPrFixItems(
   let markedStale = 0;
   let errored = 0;
 
-  const active = await client.prFixQueueItem.findMany({ where: { status: { in: ["QUEUED", "BLOCKED"] } } });
+  const active = await client.prFixQueueItem.findMany({ where: { status: { in: ["QUEUED", "BLOCKED", "PARKED"] } } });
   const byRepo = new Map<string, any[]>();
   for (const item of active) byRepo.set(item.repo, [...(byRepo.get(item.repo) ?? []), item]);
 
@@ -1928,6 +2164,7 @@ export function toAgentQueuePrFixItem(item: any) {
     title: item.title,
     lane: item.lane,
     status: item.status,
+    outcome: item.outcome ?? null,
     reason: item.reason,
     feedback: item.feedback ?? [],
     evidenceKeys: item.evidenceKeys ?? [],
@@ -1971,11 +2208,11 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
   const item = await client.$transaction(async (tx) => {
     const existing = await tx.prFixQueueItem.findUnique({ where: { repo_pr: { repo: input.repo, pr: input.pr } } });
     if (!existing) return null;
-    // Requeue acts on both BLOCKED (the original case) and FIXED (recovery
-    // from a no-progress tombstone, #940). STALE is rejected because the
-    // upstream PR is gone.
-    if (existing.status !== "BLOCKED" && existing.status !== "FIXED") {
-      throw new Error(`Cannot requeue: item is ${existing.status}, not BLOCKED or FIXED`);
+    // Requeue acts on BLOCKED (a human decision), PARKED (bounded exhaustion
+    // or an operational failure, #1218) and FIXED (recovery from a no-progress
+    // tombstone, #940). STALE is rejected because the upstream PR is gone.
+    if (existing.status !== "BLOCKED" && existing.status !== "PARKED" && existing.status !== "FIXED") {
+      throw new Error(`Cannot requeue: item is ${existing.status}, not BLOCKED, PARKED, or FIXED`);
     }
     const reopenedFrom = existing.status;
     const updated = await tx.prFixQueueItem.update({
@@ -1990,6 +2227,9 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
       data: {
         status: "QUEUED",
         lane: "NORMAL",
+        // The operator release clears the BLOCKED/PARKED classification (#1218).
+        outcome: null,
+        decisionDetail: null,
         ...freshAttemptGeneration(),
         fixAttempts: 1,
         attemptHeadSha: existing.headSha ?? null,
@@ -2012,7 +2252,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         lane: "NORMAL",
         note:
           (input.note ? `${input.note} (reopened from ${reopenedFrom})` : `operator requeue from ${reopenedFrom}`) +
-          (reopenedFrom === "FIXED" ? " — #940 recovery" : ""),
+          (reopenedFrom === "FIXED" ? " — #940 recovery" : reopenedFrom === "PARKED" ? " — operator release of a parked item" : ""),
       },
     });
     return updated;
@@ -2072,6 +2312,11 @@ export interface ResolvePrFixFromAgentReportInput {
   summary?: string | null;
   // #1121 evidence string (commit SHAs/paths) carried by an `already_addressed` report.
   evidence?: string | null;
+  // #1218: for a `blocked` report, the structured reason. `human_decision`
+  // marks BLOCKED with the decision payload; anything else (or a bare
+  // give-up) marks PARKED — a bare give-up is NOT a human decision.
+  blockReason?: string | null;
+  decision?: PrFixDecisionContext | null;
   client?: PrFixQueueClient;
   // #1074: required for queue settlement. When present, the report settles
   // exactly the item + generation the token identifies; when absent (legacy
@@ -2081,7 +2326,7 @@ export interface ResolvePrFixFromAgentReportInput {
 
 export interface ResolvePrFixFromAgentReportResult {
   matched: boolean;
-  action: "none" | "blocked" | "fixed" | "deferred" | "requeued" | "skipped";
+  action: "none" | "blocked" | "parked" | "fixed" | "deferred" | "requeued" | "skipped";
   itemId?: number | null;
   reason: string;
   // Echoes the attempt generation the report carried (null when the report
@@ -2214,12 +2459,21 @@ export async function resolvePrFixFromAgentReport(
   const expectedGeneration = attempt?.generation ?? undefined;
 
   if (input.outcome === "blocked") {
+    // #1218: a `blocked` report is a genuine human decision only when it
+    // carries a `human_decision` blockReason. A bare give-up (or any other
+    // outcome) is bounded no-progress exhaustion → PARKED, never labeled
+    // needs-human.
+    const resolved = normalizePrFixOutcome(input.blockReason) ?? "no_progress";
+    const isHumanDecision = resolved === "human_decision";
     const markResult = await markPrFixItem(client as PrFixQueueClient, {
       repo,
       pr,
-      status: "BLOCKED",
+      status: isHumanDecision ? "BLOCKED" : "PARKED",
       note: input.summary ?? null,
       expectedGeneration,
+      ...(isHumanDecision
+        ? { outcome: "human_decision", ...(input.decision ? { decision: input.decision } : {}) }
+        : { outcome: resolved }),
     });
     if (!markResult.mutated) {
       return {
@@ -2232,9 +2486,9 @@ export async function resolvePrFixFromAgentReport(
     }
     return {
       matched: true,
-      action: "blocked",
+      action: isHumanDecision ? "blocked" : "parked",
       itemId: existing.id ?? null,
-      reason: "agent reported blocked",
+      reason: isHumanDecision ? "agent reported blocked (human decision)" : `agent reported blocked; parked (${resolved})`,
       attemptGeneration: attempt?.generation ?? null,
     };
   }
@@ -2276,13 +2530,23 @@ export async function resolvePrFixFromAgentReport(
       if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) break;
       const capped = (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
       const data: Record<string, unknown> = capped
-        ? { status: "BLOCKED", lane: "NEEDS_HUMAN", postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [] }
+        ? {
+            status: "PARKED",
+            lane: "NORMAL",
+            outcome: "no_progress",
+            decisionDetail: null,
+            postDispatchEvidenceKeys: [],
+            agentHandouts: [],
+            handoutAcks: [],
+          }
         : {
             status: "QUEUED",
             lane: "NORMAL",
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: fresh.headSha ?? fresh.attemptHeadSha ?? null,
+            outcome: null,
+            decisionDetail: null,
             postDispatchEvidenceKeys: [],
             // Fresh attempt: the consumed generation's hand-out records must
             // not suppress the item's re-dispatch (#1133), and its
@@ -2311,10 +2575,11 @@ export async function resolvePrFixFromAgentReport(
             action: "mark",
             status: data.status,
             lane: data.lane,
+            outcome: capped ? "no_progress" : null,
             note: [
               input.summary ?? null,
               capped
-                ? `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), routed to a human instead of re-queuing (#1133).`
+                ? `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), parked instead of re-queuing (#1133).`
                 : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
             ]
               .filter(Boolean)
@@ -2339,16 +2604,23 @@ export async function resolvePrFixFromAgentReport(
         attemptGeneration: attempt?.generation ?? null,
       };
     }
-    if (settled.capped && existing.status !== "BLOCKED") {
+    if (settled.capped && existing.status !== "BLOCKED" && existing.status !== "PARKED") {
       const context = await buildPrFixBlockedContext(client, settled.row);
-      await surfacePrFixBlocked({ repo, pr, reason: settled.row.reason, latestNote: input.summary ?? null, context });
+      await surfacePrFixParked({
+        repo,
+        pr,
+        reason: settled.row.reason,
+        outcome: "no_progress",
+        latestNote: input.summary ?? null,
+        context,
+      });
     }
     return {
       matched: true,
-      action: settled.capped ? "blocked" : "requeued",
+      action: settled.capped ? "parked" : "requeued",
       itemId: existing.id ?? null,
       reason: settled.capped
-        ? "agent reported failed; past the fix-attempt cap, routed to a human"
+        ? "agent reported failed; past the fix-attempt cap, parked"
         : "agent reported failed; reopened as a fresh attempt at the next generation",
       attemptGeneration: attempt?.generation ?? null,
     };

@@ -11,7 +11,8 @@ Each item is deduped by `(repo, pr)` and stores:
 - `repo`, `pr`, `branch`, `url`, `title`
 - optional source `issue` (extracted from PR title/body)
 - `lane`: `NORMAL`, `ESCALATED`, or `NEEDS_HUMAN`
-- `status`: `QUEUED`, `FIXED`, `BLOCKED`, `STALE`, or `IGNORED`
+- `status`: `QUEUED`, `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `IGNORED`
+- `outcome`: `human_decision`, `no_progress`, `infra_failure`, or `security_failure`; human decisions may also store `decisionDetail`
 - `reason`, `feedback[]`, `evidenceKeys[]`
 - `headSha` and `author` metadata
 - `generation` — Dispatch-owned work generation (see below)
@@ -63,7 +64,8 @@ signature-verification model (see the `WEBHOOK_SECRET` row in the README).
 Incoming feedback is classified as **actionable** or **needs_human**:
 
 - **Actionable** → `NORMAL` lane: specific error messages, test failures, code-level fixes, lint complaints
-- **Needs human** → `NEEDS_HUMAN` lane: vague requests, missing context, security-sensitive changes without specifics
+- **Human decision** → `NEEDS_HUMAN` lane: an unresolved design, scope, authorization, or conflicting-requirements decision that automation cannot safely make
+- **Insufficient information or operational failure** → do not classify as a human decision solely for being vague or security-sensitive; bounded no-progress, infrastructure/auth, and security failures park as `PARKED` in the `NORMAL` lane
 
 Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from the normal agent queue unless `include_blocked=true`.
 
@@ -91,7 +93,7 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
 
 ### Mark item status
 
-`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `STALE`, or `IGNORED` and records a history event. Requires auth.
+`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `IGNORED` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision.
 
 **Request body:**
 ```json
@@ -105,6 +107,8 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
 ```
 
 `generation` is **required for bearer (agent/bridge) marks** — a bearer request without it is rejected with `400` (`generation is required for agent/bridge marks (#1074)`) — and optional for operator paths (OIDC session, basic auth, disabled mode), which keep the unconditional behavior for compatibility. When supplied, the write is generation-conditional: if the item's current generation no longer matches, the request is rejected with `409` and nothing is mutated (the caller's read predates a re-issued attempt). A `FIXED` mark additionally re-reads the item's per-attempt `attemptHeadSha` baseline before writing; if the PR head has not moved since the attempt was recorded, the item is refused `FIXED` (back to `QUEUED`, or `BLOCKED` once the attempt cap is spent) — and the refusal never transiently stores `FIXED`. Every fresh attempt (enqueue reopen, requeue, mark back to `QUEUED`, refusal) records its baseline from the newest head Dispatch has observed, so a sync that sees the worker's push before its report cannot turn a real fix into a refusal. A mark for an unknown item returns `404`.
+
+`POST /api/agents/{agentName}/tasks/report` accepts optional `blockReason` and `decision` fields for a blocked follow-up report. `blockReason` is one of `human_decision`, `no_progress`, `infra_failure`, or `security_failure`; `decision` may include `question`, `options`, and `evidence`. A bare `outcome: "blocked"` without `blockReason` is classified as `no_progress` and parks the item rather than declaring a human decision.
 
 ## Assignment queue behavior
 
@@ -225,16 +229,21 @@ until a health reconcile observes the PR closed.
 
 ```
 QUEUED → FIXED (completed)
-QUEUED → BLOCKED (needs human review)
+QUEUED → BLOCKED (genuine human decision)
+QUEUED → PARKED (bounded exhaustion, infrastructure/auth failure, or security failure)
 QUEUED → STALE (no longer relevant)
 QUEUED → IGNORED (deliberately skipped)
 ```
 
-`NEEDS_HUMAN` lane items start with `BLOCKED` status and require explicit marking to change state.
+`BLOCKED` in the `NEEDS_HUMAN` lane is reserved for genuine unresolved design, scope, authorization, or conflicting-requirements decisions. It is surfaced with the `needs-human` label and a `<!-- dispatch-pr-fix-blocked -->` marker comment that renders the decision question, options, and evidence. Bounded retry/no-progress exhaustion, infrastructure/auth failures, and security failures instead become `PARKED` in the `NORMAL` lane, with a diagnostic `<!-- dispatch-pr-fix-parked -->` comment and no `needs-human` label. Both outcomes remain sticky to automatic enqueue/evidence; explicit operator requeue (or a maintainer mark to `QUEUED`) releases them.
 
 ### Attempt cap
 
-`PR_FIX_MAX_ATTEMPTS` (default 5) bounds dispatched fix attempts per item, tracked as `fixAttempts`. An item starts at attempt 1; each return to `QUEUED` (new evidence after a fix, the #940 no-progress reopen, a mark back to `QUEUED`, a refused no-push `FIXED`) is another attempt. Once the count reaches the cap, the next return goes to `BLOCKED` in the `NEEDS_HUMAN` lane instead. Evidence that lands while the item is already `QUEUED`, such as the other inline comments of the same review, is the same attempt and never counts. `POST /api/pr-fix-queue/requeue` resets the count to 1.
+`PR_FIX_MAX_ATTEMPTS` (default 5) bounds dispatched fix attempts per item, tracked as `fixAttempts`. An item starts at attempt 1; each return to `QUEUED` (new evidence after a fix, the #940 no-progress reopen, a mark back to `QUEUED`, a refused no-push `FIXED`) is another attempt. Hitting the cap parks the item as `PARKED` with outcome `no_progress`; it does not add the `needs-human` label. Evidence that lands while the item is already `QUEUED`, such as the other inline comments of the same review, is the same attempt and never counts. `POST /api/pr-fix-queue/requeue` resets the count to 1.
+
+## Outcome classification
+
+`BLOCKED` is for genuine human decisions; `PARKED` is for bounded exhaustion and fail-closed operational/security failures. See [PR-fix outcome policy](pr-fix-outcome-policy.md) for the classification, surfacing, budgets, and operator recovery contract.
 
 ## Hand-out acknowledgement and reclamation (#1211)
 
@@ -297,9 +306,9 @@ as the `pr-fix-sweep` job:
 - A **merged or closed** PR goes `STALE` (nothing left to fix).
 - **Unknown PR state** defers the item (`unknownState`): a possibly-closed PR is
   never reclaimed into a fresh attempt.
-- Past `PR_FIX_MAX_RECLAIMS` (default 3) the item goes `BLOCKED` in the
-  `NEEDS_HUMAN` lane instead of being reclaimed again. Operator requeue
-  resets the recovery budget.
+- Past `PR_FIX_MAX_RECLAIMS` (default 3) the item parks as `PARKED` with
+  outcome `no_progress`; it does not become `BLOCKED` or enter the
+  `NEEDS_HUMAN` lane. Operator requeue resets the recovery budget.
 
 ### Migration handling for pre-existing stamped rows
 

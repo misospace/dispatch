@@ -30,10 +30,16 @@ export async function POST(request: Request) {
     const input = parseMarkPrFixInput(body);
     if ("error" in input) return errorResponse(input.error, 400);
 
-    // Worker tokens may only settle attempts (FIXED/BLOCKED/STALE): moving
-    // an item back to QUEUED or IGNORED changes routing and requires a
-    // maintainer token (#1111).
-    if ((input.status === "QUEUED" || input.status === "IGNORED") && auth.type === "bearer" && auth.tier === "worker") {
+    // Worker tokens may only settle attempts (FIXED/BLOCKED/PARKED/STALE):
+    // PARKED lets a worker report bounded exhaustion or an operational
+    // failure (#1218). Moving an item back to QUEUED or IGNORED changes
+    // routing and requires a maintainer token (#1111).
+    const WORKER_SETTLE_STATUSES = ["FIXED", "BLOCKED", "PARKED", "STALE"];
+    if (
+      auth.type === "bearer" &&
+      auth.tier === "worker" &&
+      !WORKER_SETTLE_STATUSES.includes(input.status)
+    ) {
       try {
         await prisma.auditLog.create({
           data: {
