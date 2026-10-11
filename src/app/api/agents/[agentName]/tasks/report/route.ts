@@ -29,6 +29,7 @@ const VALID_OUTCOMES = [
   "no_changes_needed",
   "already_addressed",
   "already_done",
+  "handed-off",
 ] as const;
 type ValidOutcome = (typeof VALID_OUTCOMES)[number];
 
@@ -62,6 +63,7 @@ export interface TaskReportBody {
 }
 
 function deriveStatus(outcome: ValidOutcome): string {
+  if (outcome === "handed-off") return "handed-off";
   if (outcome === "failed") return "failed";
   if (outcome === "blocked") return "blocked";
   return "completed";

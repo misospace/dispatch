@@ -1,5 +1,15 @@
 # Worker Execution Contract
 
+## Consumed PR-fix exclusions (#1225)
+
+`GET /api/agents/{agentName}/next-task` accepts up to 32 repeated `exclude_pr_fix` query parameters when accompanied by `exclude_pr_fix_version=1`. Each value is `<owner/repo>#<pull-request-number>@<generation>`, for example `org/repo#42@3`. Repo identity is case-insensitive/canonicalized; PR and generation are positive safe integers. The generation is the `prFixItem.generation` token returned with a `followup-pr` task. Exclusions only skip the exact canonical PR and generation; a later generation remains eligible. Malformed, oversized, repeated unsupported-version inputs fail with HTTP 400 before queue reads or mutations.
+
+Every successful opt-in response includes `prFixExclusions: { version: 1, skipped: [...] }`. Each skipped entry contains `repoFullName`, `pullRequestNumber`, `generation`, `phase` (Dispatch queue status or `linked` before materialization), and `reason: "client-excluded"`. The list is deduplicated and bounded by the 32 request entries. Empty `skipped` means none of the supplied identities were encountered, not that those PRs are complete. An idle response mentioning client exclusions distinguishes skipped work from an empty queue; queue metrics and stored eligibility are not changed.
+
+Clients must enable this contract only when deployment configuration confirms server support. Do not probe an unknown server by sending exclusions to `next-task`: an older server may ignore them and stamp excluded work before returning. For older/unknown servers, retain the old polling contract and stop on a consumed head rather than repeatedly polling or clearing/requeueing it. A missing acknowledgement is a protocol mismatch: stop discovery, do not retry blindly. Bound a discovery pass to one request with at most 32 consumed identities; if more identities are retained, stop and surface that limit rather than cycling requests.
+
+Exclusions never clear/requeue parked work, change attempt limits, alter lane eligibility, or assert that an open PR is done. Courier phases (`Failed`, `NeedsHuman`, `AwaitingReview`, running or pending) are client-owned: clients explicitly exclude the exact Dispatch generation associated with a consumed head, regardless of its retained Courier phase. Keep the original opaque lifecycle/source ID and `immutableSourceAgent`; canonical repo/PR identity is only the exclusion key, not a replacement source ID. Dispatch does not create Courier CoderRuns. Unique repo/PR materialization remains transactional; conditional per-agent generation handout recording fences concurrent polls by the same agent. Different agents retain existing handout semantics; Courier must atomically deduplicate its own canonical run creation across them.
+
 > **Issue:** [misospace/dispatch#65](https://github.com/misospace/dispatch/issues/65)
 > **Date:** 2026-05-16
 

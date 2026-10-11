@@ -314,6 +314,7 @@ The `tasks/report` endpoint accepts these outcomes:
 | `failed` | The task failed unexpectedly |
 | `no_changes_needed` | No action was required |
 | `already_addressed` | A PR-fix attempt whose feedback was already handled — settles the queue item with an optional evidence string (commit SHAs/paths) and no new push (#1121). Still gated on PR merge state; a repeated same-evidence disagreement with an unchanged head reopens via #940 and bounds to BLOCKED at `PR_FIX_MAX_ATTEMPTS`. |
+| `handed-off` | The worker accepted the task but handed it to another process; records a neutral terminal run status and preserves supplied issue/PR identity without settling the PR-fix queue. Independent pr-followup sync owns ingestion. |
 
 Queue-backed `followup-pr` reports must echo the `prFixItem.{id, generation}` token issued by `next-task` on the task. Reports without it still record the AgentRun, but never settle PR-fix queue state — the item stays queued and the report is a no-op against the queue (#1074).
 

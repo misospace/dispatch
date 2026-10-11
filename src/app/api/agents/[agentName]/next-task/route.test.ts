@@ -229,6 +229,206 @@ function linkedIssue(number: number, pr: number, overrides: Record<string, unkno
 }
 
 describe("GET /api/agents/[agentName]/next-task", () => {
+  it("rejects malformed or unsupported exclusions before reading queues", async () => {
+    const before = mocks.issueFindMany.mock.calls.length;
+    for (const url of [
+      "/api/agents/example-agent/next-task?exclude_pr_fix=org/repo%231%401",
+      "/api/agents/example-agent/next-task?exclude_pr_fix_version=2&exclude_pr_fix=org/repo%231%401",
+      "/api/agents/example-agent/next-task?exclude_pr_fix_version=1&exclude_pr_fix=bad",
+    ]) {
+      const response = await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+      expect(response.status).toBe(400);
+    }
+    expect(mocks.issueFindMany).toHaveBeenCalledTimes(before);
+    expect(mocks.prFixFindMany).not.toHaveBeenCalled();
+  });
+
+  function exclusionUrl(entries = ["org/repo#12@2"]): string {
+    const params = new URLSearchParams({ lane: "local", exclude_pr_fix_version: "1" });
+    for (const entry of entries) params.append("exclude_pr_fix", entry);
+    return `/api/agents/example-agent/next-task?${params}`;
+  }
+
+  function prFixRow(pr = 12, generation = 2) {
+    return {
+      id: `prfix-${pr}`, repo: "org/repo", pr, issue: null,
+      url: `https://github.com/org/repo/pull/${pr}`, lane: "NORMAL", status: "QUEUED",
+      reason: "checks failing", feedback: [], evidenceKeys: [], author: "bot",
+      generation, agentHandouts: [],
+    };
+  }
+
+  it("skips active A and returns PR-fix B without touching A", async () => {
+    const a = { ...prFixRow(), agentHandouts: ["other-agent:2"] };
+    const b = prFixRow(13);
+    mocks.prFixFindMany.mockResolvedValue([a, b]);
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => where.id === b.id ? b : a);
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.pullRequest.number).toBe(13);
+    expect(body.prFixItem.id).toBe(b.id);
+    expect(mocks.prFixUpdateMany.mock.calls.every(([args]) => args.where.id === b.id)).toBe(true);
+  });
+
+  it("skips linked generation 1 before materialization or GitHub reads", async () => {
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 12), independentIssue(99)]);
+    const body = await (await GET(request(exclusionUrl(["org/repo#12@1"])), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(body.prFixExclusions.skipped[0].phase).toBe("linked");
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+    expect(mocks.prFixHistoryCreate).not.toHaveBeenCalled();
+    expect(mocks.fetchPullRequestLabels).not.toHaveBeenCalled();
+    expect(mocks.fetchPullRequestHeadSha).not.toHaveBeenCalled();
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it.each(["BLOCKED", "FIXED", "QUEUED"])("preserves retained %s ownership and skips to independent work", async (status) => {
+    const row = { ...prFixRow(), issue: 42, status };
+    mocks.linkedRows = [row];
+    mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 12), independentIssue(99)]);
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(body.prFixExclusions.skipped[0].phase).toBe(status);
+    expect(row.status).toBe(status);
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.prFixCreate).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes exclusion idle from genuinely empty work", async () => {
+    mocks.prFixFindMany.mockResolvedValue([prFixRow()]);
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    expect(body.reason).toContain("client exclusion");
+    expect(body.prFixExclusions.skipped).toHaveLength(1);
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not stamp an excluded generation discovered during confirmation", async () => {
+    const row = prFixRow(12, 1);
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockResolvedValue({ ...row, generation: 2 });
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    expect(mocks.prFixUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.prFixUpdateMany.mock.calls[0][0].where.generation).toBe(1);
+    expect(body.prFixExclusions.skipped[0].generation).toBe(2);
+  });
+
+  it("fences concurrent polls for the same agent and generation", async () => {
+    const row = prFixRow();
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockResolvedValue(row);
+    let claimed = false;
+    mocks.prFixUpdateMany.mockImplementation(async ({ where }: any) => {
+      if (!where.NOT) return { count: 1 };
+      if (claimed) return { count: 0 };
+      claimed = true;
+      return { count: 1 };
+    });
+    const poll = () => GET(request(exclusionUrl([])), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    }).then((response) => response.json());
+    const bodies = await Promise.all([poll(), poll()]);
+    expect(bodies.filter((body) => body.type === "followup-pr")).toHaveLength(1);
+    expect(bodies.filter((body) => body.type === "idle")).toHaveLength(1);
+  });
+
+  it("keeps auth and lane validation with exclusions", async () => {
+    const unauthorized = await GET(request(exclusionUrl(), "example-agent", false), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+    expect(unauthorized.status).toBe(401);
+    const wrongAgent = await GET(authedRequest(`http://localhost${exclusionUrl()}`, { token: "bound-token" }), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+    expect(wrongAgent.status).toBe(403);
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+    const invalidLane = await GET(request(exclusionUrl().replace("lane=local", "lane=not-configured")), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    });
+    expect(invalidLane.status).toBe(400);
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("preserves old-client response shape", async () => {
+    const body = await (await GET(request("/api/agents/example-agent/next-task"), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.prFixExclusions).toBeUndefined();
+  });
+
+  it("rejects bounded-contract violations before reads or writes", async () => {
+    const urls = [
+      exclusionUrl(Array.from({ length: 33 }, (_, i) => `org/repo#${i + 1}@1`)),
+      exclusionUrl(["a".repeat(301)]),
+      exclusionUrl(["org/repo#9007199254740992@1"]),
+      exclusionUrl(["org/re po#12@2"]),
+      exclusionUrl() + "&exclude_pr_fix_version=1",
+    ];
+    for (const url of urls) {
+      const response = await GET(request(url), { params: Promise.resolve({ agentName: "example-agent" }) });
+      expect(response.status).toBe(400);
+    }
+    expect(mocks.issueFindMany).not.toHaveBeenCalled();
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("skips only the exactly excluded PR-fix generation and reports it", async () => {
+    const excludedItem = {
+      id: "prfix-1", repo: "Org/Repo", pr: 12, issue: null, branch: "fix/x",
+      url: "https://github.com/Org/Repo/pull/12", title: "Excluded fix", lane: "NORMAL",
+      status: "QUEUED", reason: "review requested changes", feedback: [],
+      evidenceKeys: [], author: "bot", generation: 2,
+    };
+    mocks.prFixFindMany.mockResolvedValue([excludedItem]);
+    mocks.issueFindMany.mockResolvedValue([independentIssue(99)]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&exclude_pr_fix_version=1&exclude_pr_fix=org%2Frepo%2312%402"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(99);
+    expect(body.prFixExclusions).toEqual({
+      version: 1,
+      skipped: [{ repoFullName: "org/repo", pullRequestNumber: 12, generation: 2, phase: "QUEUED", reason: "client-excluded" }],
+    });
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not exclude a different generation of the same PR", async () => {
+    mocks.prFixFindMany.mockResolvedValue([{
+      id: "prfix-1", repo: "org/repo", pr: 12, issue: null, branch: "fix/x",
+      url: "https://github.com/org/repo/pull/12", title: "Fix", lane: "NORMAL",
+      status: "QUEUED", reason: "review requested changes", feedback: [],
+      evidenceKeys: [], author: "bot", generation: 3,
+    }]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&exclude_pr_fix_version=1&exclude_pr_fix=org%2Frepo%2312%402"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 3 });
+    expect(body.prFixExclusions).toEqual({ version: 1, skipped: [] });
+  });
+
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
     resetAuthCaches();
@@ -1212,7 +1412,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       postDispatchEvidenceKeys: [],
     };
     mocks.prFixFindMany.mockResolvedValue([item]);
-    mocks.prFixUpdateMany.mockRejectedValue(new Error("db down"));
+    mocks.prFixUpdateMany.mockRejectedValueOnce(new Error("db down"));
 
     const res = await GET(
       request("/api/agents/example-agent/next-task?lane=local"),
@@ -1581,7 +1781,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
     expect(mocks.prFixHistoryCreate).toHaveBeenCalledTimes(1);
     expect(mocks.prFixUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: "linked-prfix", generation: 1, status: "QUEUED" },
+      where: expect.objectContaining({
+        id: "linked-prfix", generation: 1, status: "QUEUED",
+        NOT: { agentHandouts: { has: "example-agent@1" } },
+      }),
       data: { agentHandouts: { push: ["example-agent@1"] } },
     }));
   });
