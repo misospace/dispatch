@@ -8,7 +8,7 @@ import { getConfiguredLanes, getDefaultClaimableLane, resolveLaneId } from "@/li
 import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 
 type WorkSummaryLaneCounts = { queued: number; inProgress: number };
-type PrFixLaneCounts = { total: number; blocked: number };
+type PrFixLaneCounts = { total: number; blocked: number; parked: number };
 
 interface WorkSummaryResponse {
   agentName: string;
@@ -97,7 +97,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
     const prFixLaneKeys: Record<string, string> = { NORMAL: "local", ESCALATED: "frontier", NEEDS_HUMAN: "needsHuman" };
     const prFixCounts: Record<string, PrFixLaneCounts> = {};
     for (const key of Object.values(prFixLaneKeys)) {
-      prFixCounts[key] = { total: 0, blocked: 0 };
+      prFixCounts[key] = { total: 0, blocked: 0, parked: 0 };
     }
 
     for (const item of prFixItems) {
@@ -108,6 +108,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ agen
       prFixCounts[laneKey].total++;
       if (item.status === "BLOCKED") {
         prFixCounts[laneKey].blocked++;
+      } else if (item.status === "PARKED") {
+        prFixCounts[laneKey].parked++;
       }
     }
 

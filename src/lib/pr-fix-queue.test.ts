@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -9,6 +9,7 @@ function mutatedItem(result: MarkPrFixResult): any {
 const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
   surfacingMocks: {
     surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] }),
+    surfacePrFixParked: vi.fn().mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] }),
     surfacePrFixRequeued: vi.fn().mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] }),
     surfacePrFixUnblocked: vi.fn().mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] }),
     extractUrlsFromText: vi.fn((text: string) => {
@@ -28,6 +29,7 @@ const { surfacingMocks, lessonFeedMocks, githubPrsMocks } = vi.hoisted(() => ({
 
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: surfacingMocks.surfacePrFixBlocked,
+  surfacePrFixParked: surfacingMocks.surfacePrFixParked,
   surfacePrFixRequeued: surfacingMocks.surfacePrFixRequeued,
   surfacePrFixUnblocked: surfacingMocks.surfacePrFixUnblocked,
   extractUrlsFromText: surfacingMocks.extractUrlsFromText,
@@ -126,6 +128,10 @@ function makeClient(): PrFixQueueClient & {
           // so a freshly created row reads back as "no ack, never reclaimed".
           handoutAcks: [], // mirrors the column's @default([])
           handoutReclaims: 0, // mirrors the column's @default(0)
+          // #1218 outcome classification columns: default to null so a freshly
+          // created row reads back as "no outcome / no decision".
+          outcome: null,
+          decisionDetail: null,
           queuedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           updatedAt: new Date(Date.UTC(2026, 0, 1, 0, seq)),
           ...data,
@@ -286,6 +292,8 @@ describe("PR review-fix queue", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixRequeued.mockReset();
     surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
   });
@@ -377,7 +385,7 @@ describe("PR review-fix queue", () => {
     expect(await listQueuedPrFixItems(client, { includeBlocked: true })).toEqual([]);
   });
 
-  it("blocks a REVIEW_FEEDBACK item after PR_FIX_MAX_ATTEMPTS fix attempts (#1001)", async () => {
+  it("parks a REVIEW_FEEDBACK item after PR_FIX_MAX_ATTEMPTS fix attempts (#1001, #1218)", async () => {
     const prev = process.env.PR_FIX_MAX_ATTEMPTS;
     process.env.PR_FIX_MAX_ATTEMPTS = "3";
     try {
@@ -390,12 +398,14 @@ describe("PR review-fix queue", () => {
         const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 9, status: "fixed" });
         expect(mutatedItem(fixed)?.status).toBe("FIXED");
       }
-      // The 4th attempt exceeds the cap → hand to a human instead of
-      // re-queuing (the human-review-forever case).
-      const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: "f4", evidenceKey: "review:4" });
-      expect(blocked.status).toBe("BLOCKED");
-      expect(blocked.lane).toBe("NEEDS_HUMAN");
-      expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+      // The 4th attempt exceeds the cap → bounded exhaustion PARKS the item
+      // (#1218) instead of re-queuing or labeling it needs-human.
+      const parked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 9, lane: "NORMAL", reason: "review", feedback: "f4", evidenceKey: "review:4" });
+      expect(parked.status).toBe("PARKED");
+      expect(parked.lane).toBe("NORMAL");
+      expect(parked.outcome).toBe("no_progress");
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
     } finally {
       if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
       else process.env.PR_FIX_MAX_ATTEMPTS = prev;
@@ -410,6 +420,8 @@ describe("item URL is identity, write-once (#1098)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
   });
 
   it("keeps the PR URL when a CI-failure re-enqueue carries a job URL", async () => {
@@ -531,6 +543,8 @@ describe("work generation identity (#1044)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixRequeued.mockReset();
     surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
@@ -788,6 +802,8 @@ describe("pr-fix surfacing integration", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixRequeued.mockReset();
     surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
   });
@@ -1088,12 +1104,15 @@ describe("enqueuePrFixItem evidence dedupe", () => {
 });
 
 describe("buildPrFixBlockedContext", () => {
-  it("derives totalAttempts and lastAttemptSummary from feedback", async () => {
+  it("derives workerExecutions and lastAttemptSummary from the item/feedback", async () => {
     const client = makeClient();
-    const item = { repo: "org/repo", pr: 7, feedback: ["first attempt", "final attempt"] };
+    const item = { repo: "org/repo", pr: 7, feedback: ["first attempt", "final attempt"], fixAttempts: 4 };
     const context = await buildPrFixBlockedContext(client, item);
-    expect(context.totalAttempts).toBe(2);
+    expect(context.workerExecutions).toBe(4);
+    expect(context.enqueueRows).toBe(0);
     expect(context.lastAttemptSummary).toBe("final attempt");
+    // The enqueue/feedback row count is never emitted as totalAttempts (#1218).
+    expect(context.totalAttempts).toBeUndefined();
   });
 
   it("records the BLOCKED mark note as the final failure signature and groups attempts by lane", async () => {
@@ -1109,6 +1128,8 @@ describe("buildPrFixBlockedContext", () => {
     const context = await buildPrFixBlockedContext(client, item);
     expect(context.finalFailureSignature).toBe("tests failed after 3 attempts");
     expect(context.attemptsByLane).toEqual({ NORMAL: 1, ESCALATED: 1 });
+    expect(context.enqueueRows).toBe(2);
+    expect(context.workerExecutions).toBe(item.fixAttempts);
   });
 
   it("extracts and dedupes failing run links from feedback", async () => {
@@ -1125,10 +1146,10 @@ describe("buildPrFixBlockedContext", () => {
     expect(context.failingRunLinks).toEqual(["https://github.com/org/repo/actions/runs/1"]);
   });
 
-  it("uses uncapped history for totalAttempts", async () => {
+  it("uses the history enqueue count for enqueueRows, never totalAttempts", async () => {
     // Raise the attempt cap out of the way — this test exercises history-based
-    // attempt counting, not the #1001 bound (which would otherwise re-lane the
-    // later attempts to NEEDS_HUMAN).
+    // enqueue counting, not the #1001 bound (which would otherwise park the
+    // later attempts).
     const prev = process.env.PR_FIX_MAX_ATTEMPTS;
     process.env.PR_FIX_MAX_ATTEMPTS = "100";
     try {
@@ -1145,8 +1166,9 @@ describe("buildPrFixBlockedContext", () => {
       }
 
       const context = await buildPrFixBlockedContext(client, client.items.find((item) => item.pr === 8));
-      expect(context.totalAttempts).toBe(13);
+      expect(context.enqueueRows).toBe(13);
       expect(context.attemptsByLane).toEqual({ NORMAL: 13 });
+      expect(context.totalAttempts).toBeUndefined();
     } finally {
       if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
       else process.env.PR_FIX_MAX_ATTEMPTS = prev;
@@ -1156,7 +1178,7 @@ describe("buildPrFixBlockedContext", () => {
   it("returns no per-lane/signature data when absent (backwards compatible)", async () => {
     const client = makeClient();
     const context = await buildPrFixBlockedContext(client, { repo: "org/repo", pr: 1, feedback: [] });
-    expect(context.totalAttempts).toBeUndefined();
+    expect(context.workerExecutions).toBeNull();
     expect(context.finalFailureSignature).toBeUndefined();
     expect(context.lastAttemptSummary).toBeUndefined();
     expect(context.failingRunLinks).toBeUndefined();
@@ -1208,7 +1230,7 @@ describe("requeuePrFixItem surface cleanup", () => {
     surfacingMocks.surfacePrFixRequeued.mockClear();
 
     await expect(requeuePrFixItem(client, { repo: "org/repo", pr: 72 }))
-      .rejects.toThrow("not BLOCKED or FIXED");
+      .rejects.toThrow("not BLOCKED, PARKED, or FIXED");
     expect(surfacingMocks.surfacePrFixRequeued).not.toHaveBeenCalled();
   });
 
@@ -1390,6 +1412,8 @@ describe("#1121 already_addressed settlement", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixRequeued.mockReset();
     surfacingMocks.surfacePrFixRequeued.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
@@ -1456,7 +1480,7 @@ describe("#1121 already_addressed settlement", () => {
     expect(reopened.fixAttempts).toBe(2);
   });
 
-  it("a repeated already_addressed disagreement with an unchanged head is bounded to BLOCKED at the cap", async () => {
+  it("a repeated already_addressed disagreement with an unchanged head is bounded to PARKED at the cap (#1218)", async () => {
     const prevCap = process.env.PR_FIX_MAX_ATTEMPTS;
     process.env.PR_FIX_MAX_ATTEMPTS = "3";
     try {
@@ -1473,16 +1497,17 @@ describe("#1121 already_addressed settlement", () => {
           repo: "acme/widgets", pr: 1121, lane: "NORMAL", reason: "r", feedback: "f",
           evidenceKey: "k1", headSha: "h",
         });
-        if (enq.status === "BLOCKED") break;
+        if (enq.status === "PARKED") break;
         await markPrFixItem(fresh, {
           repo: "acme/widgets", pr: 1121, status: "FIXED", alreadyAddressed: true,
         });
       }
 
-      expect(enq.status).toBe("BLOCKED");
+      expect(enq.status).toBe("PARKED");
       const row = await fresh.prFixQueueItem.findUnique({ where: { repo_pr: { repo: "acme/widgets", pr: 1121 } } });
-      expect(row.status).toBe("BLOCKED");
-      expect(row.lane).toBe("NEEDS_HUMAN");
+      expect(row.status).toBe("PARKED");
+      expect(row.lane).toBe("NORMAL");
+      expect(row.outcome).toBe("no_progress");
     } finally {
       if (prevCap === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
       else process.env.PR_FIX_MAX_ATTEMPTS = prevCap;
@@ -1497,6 +1522,8 @@ describe("attempt baseline + generation-conditional writes (#1074)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
     // Default to "head moved" so the guard passes unless a test overrides.
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
@@ -1600,6 +1627,8 @@ describe("settlement races and baseline fallback (#1074)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
     githubPrsMocks.fetchPullRequestMergeState.mockReset();
@@ -1885,6 +1914,8 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     process.env.PR_FIX_MAX_ATTEMPTS = "2";
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
   });
@@ -1917,8 +1948,8 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
     await markPrFixItem(client, { repo: "org/repo", pr: 2, status: "fixed" });
-    const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f3", evidenceKey: "review:3", headSha: "H3" });
-    expect(blocked.status).toBe("BLOCKED");
+    const parked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 2, lane: "NORMAL", reason: "r", feedback: "f3", evidenceKey: "review:3", headSha: "H3" });
+    expect(parked.status).toBe("PARKED");
 
     const requeued = await requeuePrFixItem(client, { repo: "org/repo", pr: 2 });
     expect(requeued.fixAttempts).toBe(1);
@@ -1928,7 +1959,7 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     expect(reopened.fixAttempts).toBe(2);
   });
 
-  it("counts refused no-push runs and hands the PR to a human past the cap", async () => {
+  it("counts refused no-push runs and parks the PR past the cap (#1218)", async () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 3, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" });
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
 
@@ -1937,13 +1968,15 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     expect(mutatedItem(retried).fixAttempts).toBe(2);
 
     const capped = await markPrFixItem(client, { repo: "org/repo", pr: 3, status: "FIXED", expectedGeneration: 2 });
-    expect(mutatedItem(capped).status).toBe("BLOCKED");
-    expect(mutatedItem(capped).lane).toBe("NEEDS_HUMAN");
+    expect(mutatedItem(capped).status).toBe("PARKED");
+    expect(mutatedItem(capped).lane).toBe("NORMAL");
+    expect(mutatedItem(capped).outcome).toBe("no_progress");
     expect(mutatedItem(capped).generation).toBe(2);
-    expect(client.history.at(-1)).toMatchObject({ status: "BLOCKED", lane: "NEEDS_HUMAN" });
+    expect(client.history.at(-1)).toMatchObject({ status: "PARKED", lane: "NORMAL", outcome: "no_progress" });
     expect(client.history.at(-1).note).toContain("Refused FIXED");
     expect(client.history.at(-1).note).toContain("Bounded at 2 fix attempts");
-    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
   });
 
   it("counts a mark back to QUEUED as an attempt without resetting the budget", async () => {
@@ -1954,14 +1987,14 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     expect(queued.status).toBe("QUEUED");
     expect(queued.fixAttempts).toBe(2);
 
-    // The budget is spent, so the next return goes to a human.
+    // The budget is spent, so the next return is parked.
     expect(mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 4, status: "fixed" })).status).toBe("FIXED");
-    const blocked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
-    expect(blocked.status).toBe("BLOCKED");
-    expect(blocked.lane).toBe("NEEDS_HUMAN");
+    const parked = await enqueuePrFixItem(client, { repo: "org/repo", pr: 4, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+    expect(parked.status).toBe("PARKED");
+    expect(parked.lane).toBe("NORMAL");
   });
 
-  it("caps the #940 no-progress tombstone reopen like any other return to QUEUED", async () => {
+  it("parks the #940 no-progress tombstone reopen past the cap (#1218)", async () => {
     const input = { repo: "org/repo", pr: 5, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "review:1", headSha: "H1" };
     await enqueuePrFixItem(client, input);
     expect(mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed" })).status).toBe("FIXED");
@@ -1971,11 +2004,11 @@ describe("attempt cap counts fix attempts, not evidence (#1103)", () => {
     expect(reopened.status).toBe("QUEUED");
     expect(reopened.fixAttempts).toBe(2);
 
-    // Past the cap the reopen hands the PR to a human instead.
+    // Past the cap the reopen is parked instead.
     expect(mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 5, status: "fixed" })).status).toBe("FIXED");
     const capped = await enqueuePrFixItem(client, input);
-    expect(capped.status).toBe("BLOCKED");
-    expect(capped.lane).toBe("NEEDS_HUMAN");
+    expect(capped.status).toBe("PARKED");
+    expect(capped.lane).toBe("NORMAL");
   });
 });
 
@@ -1986,6 +2019,8 @@ describe("fresh attempts always get a head baseline (#1104)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
   });
 
@@ -2035,7 +2070,9 @@ describe("fresh attempts always get a head baseline (#1104)", () => {
 
   it("an enqueue reopen without a head observation keeps the last observed head", async () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1" });
-    await markPrFixItem(client, { repo: "org/repo", pr: 7, status: "blocked" });
+    // FIXED (not BLOCKED) so new evidence reopens: BLOCKED/PARKED are sticky
+    // and would not reopen (#1218).
+    await markPrFixItem(client, { repo: "org/repo", pr: 7, status: "fixed" });
     const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 7, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2" });
     expect(reopened.status).toBe("QUEUED");
     expect(reopened.attemptHeadSha).toBe("H1");
@@ -2062,6 +2099,8 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixUnblocked.mockReset();
     surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
@@ -2072,7 +2111,7 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
   });
 
   it("folds to a resolved notice when a mark settles the item FIXED", async () => {
-    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", note: "fixed by hand" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", note: "fixed by hand", actorTier: "maintainer" });
     expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "resolved", "fixed by hand");
   });
 
@@ -2081,15 +2120,16 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
     expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", undefined);
   });
 
-  it("folds to a requeued notice when new evidence reopens the item", async () => {
-    const reopened = await enqueuePrFixItem(client, { repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
-    expect(reopened.status).toBe("QUEUED");
-    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", expect.stringContaining("New evidence"));
+  it("does NOT reopen a BLOCKED item on new evidence (sticky, #1218) and does not retract", async () => {
+    const after = await enqueuePrFixItem(client, { repo: "org/repo", pr: 1, lane: "NORMAL", reason: "r", feedback: "f2", evidenceKey: "review:2", headSha: "H2" });
+    expect(after.status).toBe("BLOCKED");
+    expect(after.lane).toBe("NEEDS_HUMAN");
+    expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
   });
 
   it("folds to a requeued notice when a FIXED mark is refused back to QUEUED", async () => {
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
-    const refused = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" }));
+    const refused = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", actorTier: "maintainer" }));
     expect(refused.status).toBe("QUEUED");
     expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", undefined);
   });
@@ -2104,7 +2144,7 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
 
   it("never lets a cleanup failure break the transition", async () => {
     surfacingMocks.surfacePrFixUnblocked.mockRejectedValue(new Error("network down"));
-    const result = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" });
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", actorTier: "maintainer" });
     expect(mutatedItem(result).status).toBe("FIXED");
   });
 });
@@ -2116,6 +2156,8 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixUnblocked.mockReset();
     surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
@@ -2143,7 +2185,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(client.items[0].evidenceKeys).toEqual(["review:1", "review:2"]);
   });
 
-  it("evidence after hand-out turns a BLOCKED settlement into a fresh QUEUED attempt", async () => {
+  it("a BLOCKED settlement is sticky on fresh post-dispatch evidence (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 22, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2162,16 +2204,27 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 22, status: "BLOCKED",
+      decision: { question: "needs a human decision", evidence: "fresh feedback" },
       expectedGeneration: 1,
     });
 
     expect(result.mutated).toBe(true);
-    const reopened = mutatedItem(result);
-    expect(reopened.status).toBe("QUEUED");
-    expect(reopened.generation).toBe(2);
-    expect(reopened.fixAttempts).toBe(2);
-    expect(reopened.lane).toBe("NORMAL");
-    expect(reopened.postDispatchEvidenceKeys).toEqual([]);
+    const settled = mutatedItem(result);
+    // BLOCKED is sticky (#1218): fresh post-dispatch evidence must not flip the
+    // row back to QUEUED. The new evidence is absorbed by the BLOCKED
+    // settlement and stays recorded on the row for operator visibility.
+    expect(settled.status).toBe("BLOCKED");
+    expect(settled.lane).toBe("NEEDS_HUMAN");
+    expect(settled.outcome).toBe("human_decision");
+    expect(settled.decisionDetail).toEqual({
+      question: "needs a human decision",
+      evidence: "fresh feedback",
+    });
+    expect(settled.generation).toBe(1);
+    expect(settled.fixAttempts).toBe(1);
+    // Only the keys-clear write touched the post-dispatch field; the keys are
+    // absorbed by the BLOCKED settlement.
+    expect(settled.postDispatchEvidenceKeys).toEqual([]);
   });
 
   it("evidence after hand-out turns a FIXED settlement into a fresh QUEUED attempt (regardless of head movement)", async () => {
@@ -2267,7 +2320,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(marked.postDispatchEvidenceKeys).toEqual([]);
   });
 
-  it("post-dispatch evidence past the attempt cap gives up to a human", async () => {
+  it("a BLOCKED settlement past the attempt cap stays sticky and never reopens (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 26, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2285,17 +2338,21 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 26, status: "BLOCKED",
+      decision: { question: "needs a human decision" },
       expectedGeneration: 1,
     });
 
     expect(result.mutated).toBe(true);
-    const capped = mutatedItem(result);
-    expect(capped.status).toBe("BLOCKED");
-    expect(capped.lane).toBe("NEEDS_HUMAN");
-    expect(capped.postDispatchEvidenceKeys).toEqual([]);
-    // Gave up: no generation bump, no attempt increment.
-    expect(capped.generation).toBe(1);
-    expect(capped.fixAttempts).toBe(5);
+    const settled = mutatedItem(result);
+    // BLOCKED is sticky even past the cap (#1218): the cap is a fresh-attempt
+    // guard, not a release-from-BLOCKED guard. Only an explicit operator
+    // requeue or maintainer mark to QUEUED releases it.
+    expect(settled.status).toBe("BLOCKED");
+    expect(settled.lane).toBe("NEEDS_HUMAN");
+    expect(settled.outcome).toBe("human_decision");
+    expect(settled.postDispatchEvidenceKeys).toEqual([]);
+    expect(settled.generation).toBe(1);
+    expect(settled.fixAttempts).toBe(5);
   });
 
   it("a stale settlement token cannot reopen on post-dispatch evidence", async () => {
@@ -2680,7 +2737,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(client.history.at(-1).note).toContain("forced a fresh attempt");
   });
 
-  it("the forced fallback gives up to a human when the item is at the cap (#1124)", async () => {
+  it("the forced fallback parks the item when it is at the cap (#1124, #1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 38, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2706,18 +2763,22 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     expect(result.mutated).toBe(true);
     const item = client.items[0];
-    // Capped: the forced fallback routes to a human instead of a fresh run.
-    expect(item.status).toBe("BLOCKED");
-    expect(item.lane).toBe("NEEDS_HUMAN");
+    // Capped: the forced fallback parks the item instead of a fresh run.
+    expect(item.status).toBe("PARKED");
+    expect(item.lane).toBe("NORMAL");
+    expect(item.outcome).toBe("no_progress");
     expect(item.generation).toBe(1);
     expect(item.fixAttempts).toBe(5);
     expect(item.postDispatchEvidenceKeys).toEqual([]);
-    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalled();
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalled();
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
     // Evidence landed on the fast path, every loop iteration, AND the forced
     // fallback write — strictly more than the 3-iteration loop allows.
     expect(landCount).toBeGreaterThan(3);
-    // The capped forced-fallback history row names the human hand-off.
-    expect(client.history.at(-1).note).toContain("routed to a human (#1119)");
+    // The capped forced-fallback history row names the parked hand-off. The
+    // note was retagged from #1119 to #1218 when the same fallback also
+    // covers the sticky BLOCKED/PARKED settlements.
+    expect(client.history.at(-1).note).toContain("parked (#1218)");
   });
 
   it("a post-dispatch check encoded from an `@`-bearing headSha degrades to an unknown head and still reopens", async () => {
@@ -2827,7 +2888,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(settled.postDispatchEvidenceKeys).toEqual([]);
   });
 
-  it("a post-dispatch reopen retracts the needs-human marker (surfacePrFixUnblocked)", async () => {
+  it("a BLOCKED settlement with post-dispatch evidence stays sticky and never retracts (#1218)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 44, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2841,13 +2902,17 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 44, status: "BLOCKED",
+      decision: { question: "needs a human decision", evidence: "fresh feedback" },
       expectedGeneration: 1,
     });
 
-    // The initial post-dispatch reopen leaves the would-be settlement: the
-    // needs-human marker must be folded back into a requeued notice.
-    expect(mutatedItem(result).status).toBe("QUEUED");
-    expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 44, "requeued", undefined);
+    // BLOCKED is sticky on fresh post-dispatch evidence (#1218): the row
+    // stays BLOCKED with the operator-facing decision payload. Only an
+    // explicit operator requeue releases it; surfacePrFixUnblocked must NOT
+    // be called (no needs-human retraction happened).
+    expect(mutatedItem(result).status).toBe("BLOCKED");
+    expect(mutatedItem(result).lane).toBe("NEEDS_HUMAN");
+    expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
   });
 
   it("a gap-loop post-dispatch reopen retracts the needs-human marker too", async () => {
@@ -2873,7 +2938,7 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 45, "requeued", undefined);
   });
 
-  it("a capped post-dispatch reopen surfaces the block when the item was not already BLOCKED", async () => {
+  it("a capped post-dispatch reopen surfaces the parked notice when the item was not already parked", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 46, lane: "NORMAL", reason: "r", feedback: "f1",
       evidenceKey: "review:1", headSha: "H1",
@@ -2885,19 +2950,20 @@ describe("post-dispatch evidence reopens the attempt (#1119)", () => {
     });
     // At the attempt cap (maxPrFixAttempts defaults to 5).
     client.items[0].fixAttempts = 5;
-    surfacingMocks.surfacePrFixBlocked.mockClear();
+    surfacingMocks.surfacePrFixParked.mockClear();
 
     const result = await markPrFixItem(client, {
       repo: "org/repo", pr: 46, status: "FIXED",
       expectedGeneration: 1,
     });
 
-    // The give-up routes to a human; the item was QUEUED (not BLOCKED), so
-    // the block must be surfaced.
+    // The give-up parks the item; it was QUEUED (not parked), so the parked
+    // notice must be surfaced — with no needs-human label.
     const capped = mutatedItem(result);
-    expect(capped.status).toBe("BLOCKED");
-    expect(capped.lane).toBe("NEEDS_HUMAN");
-    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+    expect(capped.status).toBe("PARKED");
+    expect(capped.lane).toBe("NORMAL");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
   });
 
   it("a stale post-dispatch check settles with the 'no longer applies' history note", async () => {
@@ -3044,6 +3110,8 @@ describe("enqueue post-dispatch append pinning (#1134)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixUnblocked.mockReset();
     surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
     githubPrsMocks.fetchPullRequestHeadSha.mockReset();
@@ -3391,6 +3459,8 @@ describe("reclaim stale hand-outs (#1211)", () => {
     client = makeClient();
     surfacingMocks.surfacePrFixBlocked.mockReset();
     surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
     surfacingMocks.surfacePrFixUnblocked.mockReset();
     surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
     githubPrsMocks.fetchPullRequestState.mockReset();
@@ -3486,37 +3556,83 @@ describe("reclaim stale hand-outs (#1211)", () => {
     expect(client.history.length).toBe(historyBefore);
   });
 
-  it("routes to a human (BLOCKED/NEEDS_HUMAN) once the reclaim cap is reached", async () => {
+  it("parks (PARKED/NORMAL) once the reclaim cap is reached (#1218)", async () => {
     const prev = process.env.PR_FIX_MAX_RECLAIMS;
     process.env.PR_FIX_MAX_RECLAIMS = "3";
     try {
       const row = await seedStaleUnacked(205);
       row.handoutReclaims = 3;
+      surfacingMocks.surfacePrFixParked.mockClear();
       const report = await reclaimStalePrFixHandouts(client, {
         now: STALE_NOW,
         isPrMergedOrClosed: async () => false,
       });
+      // Both `parked` and `blocked` count the reclaim-cap transition (#1218):
+      // `blocked` is the legacy alias for backwards-compatible dashboards,
+      // `parked` is the truthful name going forward.
+      expect(report.parked).toBe(1);
       expect(report.blocked).toBe(1);
       expect(report.reclaimed).toBe(0);
       const after = client.items[0];
-      expect(after.status).toBe("BLOCKED");
-      expect(after.lane).toBe("NEEDS_HUMAN");
+      expect(after.status).toBe("PARKED");
+      expect(after.lane).toBe("NORMAL");
+      expect(after.outcome).toBe("no_progress");
       expect(after.generation).toBe(1); // terminal: no identity bump
       expect(after.agentHandouts).toEqual([]);
       expect(after.handoutAcks).toEqual([]);
       expect(after.dispatchedGeneration).toBeNull();
       expect(after.dispatchedAt).toBeNull();
       const last = client.history.at(-1);
-      expect(last).toMatchObject({ action: "mark", status: "BLOCKED", lane: "NEEDS_HUMAN" });
+      expect(last).toMatchObject({ action: "mark", status: "PARKED", lane: "NORMAL", outcome: "no_progress" });
       expect(last.note).toContain("PR_FIX_MAX_RECLAIMS=3");
       expect(last.note).toContain("1211");
+      // The reclaim cap never applies the needs-human label/marker (#1218).
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      // The reclaim cap posts the parked diagnostic (#1218), matching the
+      // other cap paths so operators see every PARKED item in one place.
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repo: "org/repo",
+          pr: 205,
+          outcome: "no_progress",
+          latestNote: expect.stringContaining("1211"),
+        }),
+      );
     } finally {
       if (prev === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
       else process.env.PR_FIX_MAX_RECLAIMS = prev;
     }
   });
 
-  it("accumulates the reclaim bound across repeated sweeps until the cap routes to a human", async () => {
+  it("a concurrent re-issue no-ops the terminal PARKED write at the reclaim cap (#1218)", async () => {
+    const row = await seedStaleUnacked(230);
+    // At the reclaim cap: the sweep's terminal write would PARK this item.
+    row.handoutReclaims = 3;
+    const historyBefore = client.history.length;
+    // A concurrent re-issue bumps the generation between the sweep's read and
+    // its terminal write, so the generation pin must make the PARKED write a
+    // no-op rather than parking a row a newer generation now owns.
+    client.hooks.beforeUpdateMany = () => {
+      client.items[0].generation = client.items[0].generation + 1;
+    };
+    const report = await reclaimStalePrFixHandouts(client, {
+      now: STALE_NOW,
+      maxReclaims: 3,
+      isPrMergedOrClosed: async () => false,
+    });
+
+    expect(report.blocked).toBe(0);
+    expect(report.staled).toBe(0);
+    expect(report.reclaimed).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(2);
+    expect(client.history.length).toBe(historyBefore);
+    expect(client.history.some((h) => h.status === "PARKED")).toBe(false);
+  });
+
+  it("accumulates the reclaim bound across repeated sweeps until the cap parks the item", async () => {
     await seedStaleUnacked(215);
     // The sweep clears the stamp on each reclaim, so a further sweep only sees
     // a stale hand-out once the item is re-stamped stale — mirroring next-task
@@ -3542,7 +3658,7 @@ describe("reclaim stale hand-outs (#1211)", () => {
     }
     expect(generations).toEqual([2, 3, 4]);
 
-    // The 4th sweep is past the cap: BLOCKED / NEEDS_HUMAN, no further bump.
+    // The 4th sweep is past the cap: PARKED / NORMAL, no further bump.
     restampStale();
     const finalReport = await reclaimStalePrFixHandouts(client, {
       now: STALE_NOW,
@@ -3551,8 +3667,8 @@ describe("reclaim stale hand-outs (#1211)", () => {
     });
     expect(finalReport.blocked).toBe(1);
     expect(finalReport.reclaimed).toBe(0);
-    expect(client.items[0].status).toBe("BLOCKED");
-    expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+    expect(client.items[0].status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
     expect(client.items[0].generation).toBe(4);
   });
 
@@ -3991,5 +4107,713 @@ describe("reclaim stale hand-outs (#1211)", () => {
       if (prevReclaims === undefined) delete process.env.PR_FIX_MAX_RECLAIMS;
       else process.env.PR_FIX_MAX_RECLAIMS = prevReclaims;
     }
+  });
+});
+
+// Issue #1218: genuine human decisions (BLOCKED + NEEDS_HUMAN) are separated
+// from bounded retry/no-progress exhaustion and operational failures (PARKED).
+describe("PR-fix outcome separation (#1218)", () => {
+  let client: ReturnType<typeof makeClient>;
+
+  beforeEach(() => {
+    client = makeClient();
+    surfacingMocks.surfacePrFixBlocked.mockReset();
+    surfacingMocks.surfacePrFixBlocked.mockResolvedValue({ labelApplied: true, commentPosted: true, errors: [] });
+    surfacingMocks.surfacePrFixParked.mockReset();
+    surfacingMocks.surfacePrFixParked.mockResolvedValue({ commentPosted: true, commentUpdated: false, skippedTerminal: false, errors: [] });
+    surfacingMocks.surfacePrFixUnblocked.mockReset();
+    surfacingMocks.surfacePrFixUnblocked.mockResolvedValue({ labelRemoved: true, commentUpdated: true, errors: [] });
+    githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("movedsha");
+    githubPrsMocks.fetchPullRequestMergeState.mockReset();
+    githubPrsMocks.fetchPullRequestMergeState.mockResolvedValue({ mergeableState: null, mergeable: null });
+  });
+
+  it("parks a failed report past the fix-attempt cap and never labels it human", async () => {
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "1";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 301, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k301", headSha: "H1",
+      });
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 301,
+        outcome: "failed",
+        summary: "worker failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("parked");
+      const row = client.items[0];
+      expect(row.status).toBe("PARKED");
+      expect(row.lane).toBe("NORMAL");
+      expect(row.outcome).toBe("no_progress");
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("marks BLOCKED + NEEDS_HUMAN and surfaces the decision on a human_decision blocked report", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 302, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k302",
+    });
+    const decision = {
+      question: "Keep the legacy endpoint?",
+      options: ["Keep it", "Remove it"],
+      evidence: "Breaking change to the public API.",
+    };
+
+    const result = await resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient,
+      repoFullName: "org/repo",
+      pullRequestNumber: 302,
+      outcome: "blocked",
+      summary: "needs a design call",
+      blockReason: "human_decision",
+      decision,
+      attempt: { itemId: client.items[0].id, generation: 1 },
+    });
+
+    expect(result.action).toBe("blocked");
+    const row = client.items[0];
+    expect(row.status).toBe("BLOCKED");
+    expect(row.lane).toBe("NEEDS_HUMAN");
+    expect(row.outcome).toBe("human_decision");
+    expect(row.decisionDetail).toEqual(decision);
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+    const surfaceInput = surfacingMocks.surfacePrFixBlocked.mock.calls[0][0] as { decision?: unknown };
+    expect(surfaceInput.decision).toEqual(decision);
+    expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+  });
+
+  it("parks a bare blocked report (a give-up is NOT a human decision)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 303, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k303",
+    });
+    const result = await resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient,
+      repoFullName: "org/repo",
+      pullRequestNumber: 303,
+      outcome: "blocked",
+      summary: "gave up",
+      attempt: { itemId: client.items[0].id, generation: 1 },
+    });
+
+    expect(result.action).toBe("parked");
+    const row = client.items[0];
+    expect(row.status).toBe("PARKED");
+    expect(row.lane).toBe("NORMAL");
+    expect(row.outcome).toBe("no_progress");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("parks an explicit infra_failure blocked report without a needs-human label", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 304, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k304",
+    });
+    const result = await resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient,
+      repoFullName: "org/repo",
+      pullRequestNumber: 304,
+      outcome: "blocked",
+      blockReason: "infra_failure",
+      attempt: { itemId: client.items[0].id, generation: 1 },
+    });
+
+    expect(result.action).toBe("parked");
+    expect(client.items[0].status).toBe("PARKED");
+    expect(client.items[0].outcome).toBe("infra_failure");
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("reopens to QUEUED as a fresh attempt on fresh feedback after a productive FIXED push", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 305, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1",
+    });
+    githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H2");
+    const fixed = await markPrFixItem(client, { repo: "org/repo", pr: 305, status: "FIXED", expectedGeneration: 1 });
+    expect(mutatedItem(fixed).status).toBe("FIXED");
+    const budgetBefore = client.items[0].fixAttempts;
+
+    const reopened = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 305, lane: "NORMAL", reason: "new review round", feedback: "f2", evidenceKey: "review:2", headSha: "H2",
+    });
+    expect(reopened.status).toBe("QUEUED");
+    expect(reopened.generation).toBe(2);
+    expect(reopened.fixAttempts).toBe(budgetBefore + 1);
+  });
+
+  it("consumes no budget and does not flip status on re-observed known feedback", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 306, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1",
+    });
+    const before = { status: client.items[0].status, fixAttempts: client.items[0].fixAttempts, generation: client.items[0].generation };
+
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 306, lane: "NORMAL", reason: "r", feedback: "f1", evidenceKey: "review:1", headSha: "H1",
+    });
+    expect(after.status).toBe(before.status);
+    expect(after.fixAttempts).toBe(before.fixAttempts);
+    expect(after.generation).toBe(before.generation);
+  });
+
+  it("a late worker generation cannot overwrite a human-decision outcome", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 307, lane: "NEEDS_HUMAN", reason: "needs decision", feedback: "f", evidenceKey: "k307",
+    });
+    expect(client.items[0].status).toBe("BLOCKED");
+    expect(client.items[0].outcome).toBe("human_decision");
+    // A concurrent re-issue bumps the row; the late worker still holds gen 1.
+    client.items[0].generation = 2;
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 307, status: "FIXED", expectedGeneration: 1,
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    expect(client.items[0].status).toBe("BLOCKED");
+    expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+    expect(client.items[0].outcome).toBe("human_decision");
+  });
+
+  it("a late worker generation cannot overwrite a parked outcome", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 308, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k308",
+    });
+    const parked = await markPrFixItem(client, { repo: "org/repo", pr: 308, status: "PARKED", outcome: "no_progress", expectedGeneration: 1 });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    client.items[0].generation = 2;
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 308, status: "FIXED", expectedGeneration: 1,
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    expect(client.items[0].status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("no_progress");
+  });
+
+  it("keeps the attempt cap and the reclaim cap independent: a reclaim does not consume the attempt budget", async () => {
+    const prevCap = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "2";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 309, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k309", headSha: "H1",
+      });
+      const row = client.items[0];
+      // At the attempt cap, but with zero reclaims — the reclaim brake is a
+      // separate budget and must still fire.
+      row.fixAttempts = 2;
+      row.dispatchedGeneration = row.generation;
+      row.dispatchedAt = new Date("2026-01-01T00:00:00Z");
+      row.agentHandouts = [`courier@${row.generation}`];
+      row.handoutAcks = [];
+      row.handoutReclaims = 0;
+
+      const report = await reclaimStalePrFixHandouts(client, {
+        now: new Date("2026-01-01T01:00:00Z"),
+        maxReclaims: 3,
+        isPrMergedOrClosed: async () => false,
+      });
+
+      expect(report.reclaimed).toBe(1);
+      expect(client.items[0].status).toBe("QUEUED");
+      // The reclaim bumped the reclaim budget, never the worker-execution budget.
+      expect(client.items[0].handoutReclaims).toBe(1);
+      expect(client.items[0].fixAttempts).toBe(2);
+      expect(client.items[0].generation).toBe(2);
+    } finally {
+      if (prevCap === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prevCap;
+    }
+  });
+
+  it("parses and validates outcome/decision on enqueue and mark inputs", () => {
+    // Enqueue: valid outcome + decision round-trip.
+    const enq = parseEnqueuePrFixInput({
+      repo: "o/r", pr: 1, reason: "r", feedback: "f", evidenceKey: "e",
+      outcome: "infra_failure",
+      decision: { question: "q", options: ["a", "b"], evidence: "ev" },
+    });
+    if ("error" in enq) throw new Error(enq.error);
+    expect(enq.outcome).toBe("infra_failure");
+    expect(enq.decision).toEqual({ question: "q", options: ["a", "b"], evidence: "ev" });
+
+    // Enqueue: invalid outcome.
+    expect(parseEnqueuePrFixInput({
+      repo: "o/r", pr: 1, reason: "r", feedback: "f", evidenceKey: "e", outcome: "nonsense",
+    })).toEqual({ error: "Invalid outcome" });
+
+    // Enqueue: malformed decision.
+    expect(parseEnqueuePrFixInput({
+      repo: "o/r", pr: 1, reason: "r", feedback: "f", evidenceKey: "e", decision: { options: [1] },
+    })).toEqual({ error: expect.stringContaining("decision.options") });
+
+    // Mark: BLOCKED defaults to human_decision; PARKED defaults to no_progress.
+    const blocked = parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "BLOCKED" });
+    if ("error" in blocked) throw new Error(blocked.error);
+    expect(blocked.outcome).toBe("human_decision");
+
+    const parked = parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "PARKED" });
+    if ("error" in parked) throw new Error(parked.error);
+    expect(parked.outcome).toBe("no_progress");
+
+    const parkedExplicit = parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "PARKED", outcome: "security_failure" });
+    if ("error" in parkedExplicit) throw new Error(parkedExplicit.error);
+    expect(parkedExplicit.outcome).toBe("security_failure");
+
+    expect(parseMarkPrFixInput({ repo: "o/r", pr: 1, status: "PARKED", outcome: "bogus" })).toEqual({ error: "Invalid outcome" });
+  });
+
+  it("exposes outcome on the agent-queue item and PARKED in the queue listing", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 310, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k310",
+    });
+    await markPrFixItem(client, { repo: "org/repo", pr: 310, status: "PARKED", outcome: "security_failure" });
+
+    const listed = await listQueuedPrFixItems(client, { includeBlocked: true });
+    expect(listed.map((i) => i.pr)).toContain(310);
+    const parkedRow = listed.find((i) => i.pr === 310)!;
+    expect(toAgentQueuePrFixItem(parkedRow).outcome).toBe("security_failure");
+    // PARKED is excluded from the default (QUEUED-only) listing.
+    expect((await listQueuedPrFixItems(client)).map((i) => i.pr)).not.toContain(310);
+  });
+
+  it("retracts the needs-human label when a BLOCKED item is later parked by an operator reclassification (#1218 review)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 311, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k311",
+    });
+    const blocked = await markPrFixItem(client, { repo: "org/repo", pr: 311, status: "BLOCKED" });
+    expect(mutatedItem(blocked).status).toBe("BLOCKED");
+    // The BLOCKED transition is what applied the needs-human label.
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+    surfacingMocks.surfacePrFixParked.mockClear();
+
+    // #1218 review: explicit operator reclassification — only honored for
+    // maintainer-tier callers with `allowStickyReclassify`. Worker calls at
+    // the same generation must no-op (see the regression tests below).
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo",
+      pr: 311,
+      status: "PARKED",
+      outcome: "no_progress",
+      actorTier: "maintainer",
+      allowStickyReclassify: true,
+    });
+
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("no_progress");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ removeNeedsHumanLabel: true, outcome: "no_progress" }),
+    );
+    // The prior surface was the BLOCKED one that applied the label.
+    expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retract the label when a QUEUED item parks directly", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 315, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k315",
+    });
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 315, status: "PARKED", outcome: "no_progress",
+    });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ removeNeedsHumanLabel: false }),
+    );
+  });
+
+  it("surfaces infra_failure through the mark park path without a needs-human label", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 312, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k312",
+    });
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 312, status: "PARKED", outcome: "infra_failure",
+    });
+
+    expect(mutatedItem(result).status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("infra_failure");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "infra_failure" }),
+    );
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("surfaces security_failure through the mark park path without a needs-human label", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 313, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k313",
+    });
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 313, status: "PARKED", outcome: "security_failure",
+    });
+
+    expect(mutatedItem(result).status).toBe("PARKED");
+    expect(client.items[0].lane).toBe("NORMAL");
+    expect(client.items[0].outcome).toBe("security_failure");
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+    expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "security_failure" }),
+    );
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("does NOT reopen a PARKED item on new evidence (sticky, #1218)", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 316, lane: "NORMAL", reason: "r", feedback: "f1",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 316, status: "PARKED", outcome: "no_progress",
+    });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    surfacingMocks.surfacePrFixParked.mockClear();
+    surfacingMocks.surfacePrFixBlocked.mockClear();
+    surfacingMocks.surfacePrFixUnblocked.mockClear();
+
+    // A fresh automated review lands after the park (a new evidence key).
+    const after = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 316, lane: "NORMAL", reason: "r", feedback: "f2",
+      evidenceKey: "review:2", headSha: "H2",
+    });
+
+    expect(after.status).toBe("PARKED");
+    expect(after.lane).toBe("NORMAL");
+    expect(after.outcome).toBe("no_progress");
+    expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+  });
+
+  it("a stale generation cannot reopen a PARKED item via post-dispatch evidence", async () => {
+    await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 317, lane: "NORMAL", reason: "r", feedback: "f",
+      evidenceKey: "review:1", headSha: "H1",
+    });
+    const parked = await markPrFixItem(client, {
+      repo: "org/repo", pr: 317, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+    });
+    expect(mutatedItem(parked).status).toBe("PARKED");
+    // A current, actionable post-dispatch entry sits on the parked row (a
+    // review entry is actionable with no GitHub call).
+    client.items[0].postDispatchEvidenceKeys = ["review:2@H2"];
+    // A concurrent re-issue bumps the row; the late worker still holds gen 1.
+    client.items[0].generation = 2;
+    const historyBefore = client.history.length;
+
+    const result = await markPrFixItem(client, {
+      repo: "org/repo", pr: 317, status: "FIXED", expectedGeneration: 1,
+    });
+
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    expect(client.items[0].status).toBe("PARKED");
+    expect(client.items[0].generation).toBe(2);
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual(["review:2@H2"]);
+    expect(client.history.length).toBe(historyBefore);
+  });
+
+  // #1218 review: same-generation second worker marks must not erase a
+  // recorded human decision or parked classification. These cover both
+  // sequential marks (separate calls, same expectedGeneration) and the
+  // read→write gap (the row already records the prior settlement when the
+  // mark is issued, so the live status pin catches it at commit time).
+  describe("status pin prevents worker erase of a recorded decision (#1218 review)", () => {
+    it("a sequential worker mark BLOCKED -> PARKED at unchanged generation no-ops", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 318, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k318",
+      });
+      const decision = {
+        question: "Which behavior?",
+        options: ["A", "B"],
+        evidence: "spec mismatch",
+      };
+      const blocked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 318, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(mutatedItem(blocked).status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
+      // The same worker holds generation 1 and now reports PARKED — the prior
+      // BLOCKED is sticky. The mark must no-op, not park it.
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 318, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      // The original decision and label are intact.
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      // No history row was appended (the mark was a no-op).
+      expect(client.history.length).toBe(historyAfterBlocked);
+      // The parked surface must not fire — there is no parked classification.
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      // The blocked surface must not fire either — the decision was already
+      // surfaced on the prior call.
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    it("a sequential worker mark PARKED -> BLOCKED at unchanged generation no-ops", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 319, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k319",
+      });
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(mutatedItem(parked).status).toBe("PARKED");
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].outcome).toBe("no_progress");
+      const historyAfterParked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
+      // Worker tries to escalate back to BLOCKED at the same generation —
+      // the sticky state pin must refuse, since PARKED was a real cap and
+      // only operator reclassification or requeue should release it.
+      const escalation = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "BLOCKED", decision: { question: "?" }, expectedGeneration: 1,
+      });
+
+      expect(escalation).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0].status).toBe("PARKED");
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].outcome).toBe("no_progress");
+      expect(client.items[0].decisionDetail).toBeNull();
+      expect(client.history.length).toBe(historyAfterParked);
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    // Commit-time revalidation: the row is already BLOCKED in the DB when the
+    // worker's PARKED settlement runs its updateMany (whether because the
+    // worker just read it as BLOCKED in pre-read, or because a concurrent
+    // same-generation settle landed between read and write). The status pin
+    // catches both at the commit boundary.
+    it("a worker PARKED settle no-ops at commit time when the DB row is already BLOCKED at the same generation", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 320, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k320",
+      });
+      const decision = { question: "Keep legacy?", options: ["Yes", "No"] };
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 320, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(client.items[0].status).toBe("BLOCKED");
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
+      // Worker holds generation 1 and reports PARKED. The status pin must
+      // refuse because the row already records a human decision at the
+      // same generation — both the worker's pre-read and the DB row see
+      // BLOCKED, so the commit-time updateMany matches nothing.
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 320, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      // Decision, label, and outcome remain intact.
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      expect(client.history.length).toBe(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { name: "FIXED with head moved", body: { status: "FIXED", note: "pushed" }, headSha: "live-head" },
+      { name: "FIXED via alreadyAddressed (guard bypassed)", body: { status: "FIXED", alreadyAddressed: true, note: "handled" }, headSha: null },
+      { name: "STALE", body: { status: "STALE", note: "stale" }, headSha: null },
+    ])("a sequential worker mark BLOCKED -> $name at unchanged generation no-ops", async ({ body, headSha }) => {
+      const decision = { question: "Which behavior?", options: ["A", "B"], evidence: "conflict" };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 322, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k322",
+      });
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 322, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(client.items[0].status).toBe("BLOCKED");
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+      githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(headSha);
+
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 322, expectedGeneration: 1, ...body,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", generation: 1, lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision,
+      });
+      expect(client.history).toHaveLength(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
+    it("a sequential worker mark BLOCKED -> FIXED with head unchanged no-ops instead of re-queuing", async () => {
+      const decision = { question: "Which behavior?", options: ["A", "B"], evidence: "conflict" };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 323, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k323", headSha: "baseline-sha",
+      });
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 323, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+      githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("baseline-sha");
+
+      // Head unchanged: without the status pin the refusal fallback would
+      // bump a fresh QUEUED attempt (or PARK at cap) and erase the decision.
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 323, status: "FIXED", note: "pushed nothing", expectedGeneration: 1,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", generation: 1, lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision,
+      });
+      expect(client.history).toHaveLength(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
+    it.each(["FIXED", "STALE"])("a worker %s settle no-ops at commit time when the row flips to BLOCKED mid-gap", async (status) => {
+      const decision = { question: "Which behavior?", options: ["A", "B"], evidence: "conflict" };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 324, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k324",
+      });
+      const historyLength = client.history.length;
+      client.hooks.beforeUpdateMany = () => {
+        Object.assign(client.items[0], { status: "BLOCKED", lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision });
+      };
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+      githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+
+      const raced = await markPrFixItem(client, {
+        repo: "org/repo", pr: 324, status: status as any, note: "raced", expectedGeneration: 1,
+      });
+
+      expect(raced).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", generation: 1, decisionDetail: decision, lane: "NEEDS_HUMAN",
+      });
+      expect(client.history).toHaveLength(historyLength);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
+    it("a maintainer BLOCKED -> PARKED without allowStickyReclassify no-ops", async () => {
+      const decision = { question: "Which?", options: ["A", "B"] };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 325, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k325",
+      });
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 325, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(client.items[0].status).toBe("BLOCKED");
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+
+      // Maintainer tier alone must not be enough: overwriting a recorded
+      // human decision requires the explicit allowStickyReclassify opt-in.
+      const downgrade = await markPrFixItem(client, {
+        repo: "org/repo", pr: 325, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+        actorTier: "maintainer",
+      });
+
+      expect(downgrade).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision,
+      });
+      expect(client.history).toHaveLength(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    });
+
+    it("an operator reclassification can downgrade BLOCKED -> PARKED with allowStickyReclassify", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 321, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k321",
+      });
+      const decision = { question: "Which?", options: ["A", "B"] };
+      const blocked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 321, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(mutatedItem(blocked).status).toBe("BLOCKED");
+      surfacingMocks.surfacePrFixParked.mockClear();
+
+      // Operator explicitly opts in to reclassify — the status pin is
+      // relaxed for this single call. The prior BLOCKED's outcome is
+      // overwritten with `no_progress`; decisionDetail clears as a side
+      // effect of the reclassify.
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo",
+        pr: 321,
+        status: "PARKED",
+        outcome: "no_progress",
+        expectedGeneration: 1,
+        actorTier: "maintainer",
+        allowStickyReclassify: true,
+      });
+
+      expect(mutatedItem(parked).status).toBe("PARKED");
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].outcome).toBe("no_progress");
+      expect(client.items[0].decisionDetail).toBeNull();
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+        expect.objectContaining({ removeNeedsHumanLabel: true, outcome: "no_progress" }),
+      );
+    });
+
+    it("a worker caller cannot bypass the pin by sending allowStickyReclassify=true (fail-closed)", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 322, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k322",
+      });
+      const blocked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 322, status: "BLOCKED", expectedGeneration: 1,
+      });
+      expect(mutatedItem(blocked).status).toBe("BLOCKED");
+      const historyBefore = client.history.length;
+
+      // Worker sends allowStickyReclassify=true; without a maintainer tier
+      // the pin is honored (fail-closed).
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo",
+        pr: 322,
+        status: "PARKED",
+        outcome: "no_progress",
+        expectedGeneration: 1,
+        allowStickyReclassify: true,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.history.length).toBe(historyBefore);
+    });
   });
 });

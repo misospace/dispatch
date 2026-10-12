@@ -37,6 +37,7 @@ vi.mock("./github-prs", () => ({
 // feed wiring — there is no longer anything to mock from this surface.
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn(async () => null),
+  surfacePrFixParked: vi.fn(async () => null),
   surfacePrFixRequeued: vi.fn(async () => null),
   surfacePrFixUnblocked: vi.fn(async () => null),
   extractUrlsFromText: vi.fn(() => []),
@@ -245,18 +246,51 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(prisma.prFixQueueItem.update).not.toHaveBeenCalled();
   });
 
-  it("marks the item BLOCKED immediately on a `blocked` outcome (no PR check)", async () => {
+  it("parks the item immediately on a bare `blocked` outcome (no PR check)", async () => {
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FIXTURE_ITEM });
 
     const result = await resolvePrFixFromAgentReport(baseInput({
       outcome: "blocked",
       attempt: ATTEMPT,
     }));
-    expect(result.action).toBe("blocked");
+    // #1218: a bare give-up is bounded no-progress exhaustion, not a human
+    // decision — it is PARKED, never labeled needs-human.
+    expect(result.action).toBe("parked");
+    expect(result.reason).toContain("parked");
     // No need to hit GitHub for a hard block — the agent hit a wall.
     expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
     // #1074: generation-conditional write.
-    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalled();
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "PARKED", lane: "NORMAL", outcome: "no_progress" }),
+      }),
+    );
+  });
+
+  it("marks the item BLOCKED when a `blocked` outcome carries a human_decision reason", async () => {
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FIXTURE_ITEM });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const decision = { question: "Which behavior is intended?", options: ["A", "B"], evidence: "see thread" };
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      attempt: ATTEMPT,
+      blockReason: "human_decision",
+      decision,
+    }));
+    expect(result.action).toBe("blocked");
+    // No need to hit GitHub for a hard block — the agent hit a wall.
+    expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "BLOCKED",
+          lane: "NEEDS_HUMAN",
+          outcome: "human_decision",
+          decisionDetail: decision,
+        }),
+      }),
+    );
   });
 
   it("reopens a fresh attempt on a `failed` outcome (#1133)", async () => {
@@ -290,25 +324,27 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
   });
 
-  it("routes a `failed` outcome to a human past the fix-attempt cap (#1133)", async () => {
+  it("parks a `failed` outcome past the fix-attempt cap (#1133, #1218)", async () => {
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FIXTURE_ITEM,
       fixAttempts: 5,
     });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
 
     const result = await resolvePrFixFromAgentReport(baseInput({
       outcome: "failed",
       attempt: ATTEMPT,
     }));
     expect(result.matched).toBe(true);
-    expect(result.action).toBe("blocked");
+    expect(result.action).toBe("parked");
     expect(result.reason).toContain("cap");
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "item-42", status: "QUEUED", generation: 1 },
         data: expect.objectContaining({
-          status: "BLOCKED",
-          lane: "NEEDS_HUMAN",
+          status: "PARKED",
+          lane: "NORMAL",
+          outcome: "no_progress",
         }),
       }),
     );
@@ -530,9 +566,9 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(fetchPullRequestMergeStateMock).toHaveBeenCalledTimes(1);
   });
 
-  it("writes no BLOCKED state when a blocked report hits a concurrent re-issue at commit time", async () => {
+  it("writes no parked state when a blocked report hits a concurrent re-issue at commit time", async () => {
     // Same faithful re-issue chain as the FIXED case above (#1119): the
-    // guarded BLOCKED write must not retry once the re-read shows the row
+    // guarded parked write must not retry once the re-read shows the row
     // moved — exactly one updateMany call.
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({ ...FIXTURE_ITEM })
@@ -548,13 +584,16 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(result.matched).toBe(true);
     expect(result.action).toBe("skipped");
     expect(result.reason).toContain("generation-mismatch");
-    // The BLOCKED write was generation-conditional (and, for a settlement,
+    // The parked write was generation-conditional (and, for a settlement,
     // guarded on the post-dispatch evidence list being empty, #1119) and
     // matched nothing.
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    // #1218 review: the worker-tier PARKED settle is also guarded on the row
+    // being QUEUED, so a stale generation pins status: QUEUED alongside the
+    // post-dispatch evidence guard (#1119) and id/generation (#1074).
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith({
-      where: { id: "item-42", generation: 1, postDispatchEvidenceKeys: { equals: [] } },
-      data: expect.objectContaining({ status: "BLOCKED" }),
+      where: { id: "item-42", generation: 1, postDispatchEvidenceKeys: { equals: [] }, status: "QUEUED" },
+      data: expect.objectContaining({ status: "PARKED" }),
     });
     expect(prisma.prFixQueueItem.update).not.toHaveBeenCalled();
     expect(prisma.prFixHistory.create).not.toHaveBeenCalled();
@@ -626,5 +665,51 @@ describe("resolvePrFixFromAgentReport", () => {
     // The already_addressed settlement is gated on the PR merge state before
     // it settles (a red PR is never marked FIXED off an unverified report).
     expect(fetchPullRequestMergeStateMock).toHaveBeenCalledWith("acme/widgets", 1234);
+  });
+
+  it("keeps a human_decision report sticky even with actionable post-dispatch evidence (#1218)", async () => {
+    // A dispatched worker reports `blocked` carrying a `human_decision`
+    // reason while a fresh review arrived after hand-out. The pre-#1218
+    // reopen path silently flipped the row back to QUEUED (or PARKED at
+    // cap), cleared the decision payload, and re-dispatched without an
+    // operator. The fix: a BLOCKED settlement is sticky — fresh evidence
+    // is absorbed by the BLOCKED, the operator-facing decision payload is
+    // preserved, and only an explicit operator requeue releases it.
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FIXTURE_ITEM,
+      postDispatchEvidenceKeys: ["review:fresh@H1"],
+    });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const decision = { question: "needs a human decision", evidence: "fresh review" };
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      attempt: ATTEMPT,
+      blockReason: "human_decision",
+      decision,
+    }));
+
+    expect(result.action).toBe("blocked");
+    expect(result.matched).toBe(true);
+    // Sticky: the settlement write is status=BLOCKED with the decision
+    // payload preserved, NOT a reopen write that would set status=QUEUED.
+    const calls = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastWrite = calls.at(-1)?.[0];
+    expect(lastWrite).toMatchObject({
+      where: expect.objectContaining({ id: "item-42", generation: 1 }),
+      data: expect.objectContaining({
+        status: "BLOCKED",
+        lane: "NEEDS_HUMAN",
+        outcome: "human_decision",
+        decisionDetail: decision,
+      }),
+    });
+    // No FIXED-redirect reopen was attempted: no fresh generation bump, no
+    // attempt increment, no queued reset.
+    expect(lastWrite?.data).not.toMatchObject({ generation: expect.anything() });
+    expect(lastWrite?.data).not.toMatchObject({ fixAttempts: expect.anything() });
+    // The merge-state probe was skipped — a hard block never reaches GitHub.
+    expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
   });
 });

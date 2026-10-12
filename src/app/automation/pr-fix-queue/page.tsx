@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { AlertTriangle, ExternalLink, RefreshCw } from "lucide-react";
+import { AlertTriangle, ExternalLink, PauseCircle, RefreshCw } from "lucide-react";
 
 interface PrFixItem {
   id: string;
@@ -18,7 +18,16 @@ interface PrFixItem {
   title: string | null;
   url: string | null;
   queuedAt: string;
+  outcome?: string | null;
+  fixAttempts?: number | null;
 }
+
+const PARKED_OUTCOME_LABELS: Record<string, string> = {
+  no_progress: "no progress",
+  infra_failure: "infra / auth failure",
+  security_failure: "security failure",
+  human_decision: "human decision",
+};
 
 function formatTime(isoString: string): string {
   return new Date(isoString).toLocaleString();
@@ -30,6 +39,12 @@ function prLink(item: PrFixItem): string {
 
 function prTitle(item: PrFixItem): string {
   return item.title ?? `${item.repo}#${item.pr}`;
+}
+
+function parkedReason(item: PrFixItem): string {
+  const outcome = PARKED_OUTCOME_LABELS[item.outcome ?? ""] ?? item.outcome ?? "no progress";
+  const attempts = typeof item.fixAttempts === "number" ? item.fixAttempts : null;
+  return attempts != null ? `${outcome} (after ${attempts} attempt${attempts === 1 ? "" : "s"})` : outcome;
 }
 
 export default function PrFixQueuePage() {
@@ -60,7 +75,7 @@ export default function PrFixQueuePage() {
     fetchData();
   }, [fetchData]);
 
-  const requeueBlocked = useCallback(async (item: PrFixItem) => {
+  const requeue = useCallback(async (item: PrFixItem) => {
     const key = `${item.repo}#${item.pr}`;
     setRequeueingKey(key);
     setRequeueError("");
@@ -99,6 +114,7 @@ export default function PrFixQueuePage() {
   }, [fetchData]);
 
   const blocked = items.filter((i) => i.status === "BLOCKED");
+  const parked = items.filter((i) => i.status === "PARKED");
   const queued = items.filter((i) => i.status === "QUEUED");
 
   if (loading) {
@@ -110,7 +126,10 @@ export default function PrFixQueuePage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">PR Fix Queue</h1>
-          <p className="text-muted-foreground">BLOCKED items need human attention; QUEUED items are waiting on automation.</p>
+          <p className="text-muted-foreground">
+            BLOCKED items need human attention. PARKED items are bounded exhaustion or
+            operational failures and can be requeued once the underlying cause is fixed.
+          </p>
         </div>
         <Button variant="outline" onClick={fetchData} disabled={loading}>
           <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
@@ -165,7 +184,7 @@ export default function PrFixQueuePage() {
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => requeueBlocked(item)}
+                        onClick={() => requeue(item)}
                         disabled={requeueingKey === `${item.repo}#${item.pr}`}
                         className="mb-1"
                       >
@@ -179,6 +198,79 @@ export default function PrFixQueuePage() {
                       <Badge variant="secondary" className={item.lane === "NEEDS_HUMAN" ? "bg-red-100 text-red-700" : ""}>
                         {item.lane}
                       </Badge>
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">{formatTime(item.queuedAt)}</TableCell>
+                    <TableCell>
+                      <a
+                        href={prLink(item)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-muted-foreground hover:text-primary"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                      </a>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className={parked.length > 0 ? "border-yellow-400" : ""}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <PauseCircle className="h-5 w-5 text-yellow-600" />
+            Parked — bounded exhaustion / operational failure
+            {parked.length > 0 && (
+              <Badge className="ml-2 bg-yellow-100 text-yellow-700">{parked.length}</Badge>
+            )}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {parked.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-muted-foreground">No parked items.</p>
+              <p className="text-sm text-muted-foreground mt-1">
+                PARKED items appear here when automation reached its bound (no-progress,
+                infra failure, security failure). They are not labeled needs-human.
+              </p>
+            </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Repo / PR</TableHead>
+                  <TableHead>Reason</TableHead>
+                  <TableHead>Outcome</TableHead>
+                  <TableHead>Lane</TableHead>
+                  <TableHead>Queued At</TableHead>
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {parked.map((item) => (
+                  <TableRow key={item.id}>
+                    <TableCell>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => requeue(item)}
+                        disabled={requeueingKey === `${item.repo}#${item.pr}`}
+                        className="mb-1"
+                      >
+                        {requeueingKey === `${item.repo}#${item.pr}` ? "Requeueing…" : "Requeue"}
+                      </Button>
+                      <div className="font-medium text-sm">{prTitle(item)}</div>
+                      <div className="text-xs text-muted-foreground">{item.repo}</div>
+                    </TableCell>
+                    <TableCell className="text-sm max-w-xs truncate">{item.reason}</TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {parkedReason(item)}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="secondary">{item.lane}</Badge>
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">{formatTime(item.queuedAt)}</TableCell>
                     <TableCell>

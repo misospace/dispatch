@@ -131,6 +131,7 @@ enum PrFixStatus {
   QUEUED
   FIXED
   BLOCKED
+  PARKED
   STALE
   IGNORED
 }
@@ -155,6 +156,13 @@ model PrFixQueueItem {
   feedback     String[]       @default([])
   evidenceKeys String[]       @default([])
   status       PrFixStatus    @default(QUEUED)
+  // Structured outcome classification (#1218): why the item is in its current
+  // non-active terminal-ish state. Only meaningful for BLOCKED (human_decision)
+  // and PARKED (no_progress | infra_failure | security_failure).
+  outcome      String?
+  // Human-decision payload for a BLOCKED item (#1218): the question, options,
+  // and evidence an operator needs to make the call. Null for non-human states.
+  decisionDetail Json?
   // Dispatch-owned work generation (#1044): 1 on creation, bumped when a
   // non-QUEUED item becomes dispatchable again as a fresh attempt. Workers
   // consume (id, generation) as an opaque work identity via next-task.
@@ -206,7 +214,10 @@ model PrFixQueueItem {
   // Bounded automatic reclamations of stale unacknowledged hand-outs (#1211):
   // counts how many times the reclaimer has reopened this item because a
   // stamped hand-out was never acknowledged. Past PR_FIX_MAX_RECLAIMS the item
-  // goes to BLOCKED in the NEEDS_HUMAN lane instead of being reclaimed again.
+  // parks as PARKED in the NORMAL lane with outcome=`no_progress` (#1218) —
+  // bounded no-progress exhaustion, never a human decision, so the
+  // `needs-human` label is never applied. Release requires an explicit
+  // operator requeue or a maintainer mark to QUEUED.
   handoutReclaims Int @default(0)
   author       String?
   history      PrFixHistory[]
@@ -231,6 +242,7 @@ model PrFixHistory {
   reason      String?        @db.Text
   note        String?        @db.Text
   evidenceKey String?
+  outcome     String?
 
   @@index([itemId])
   @@index([at])

@@ -6,14 +6,25 @@ import {
   removeIssueLabel,
   updateIssueComment,
 } from "@/lib/github";
+import { normalizePrFixOutcome, type PrFixDecisionContext, type PrFixOutcome } from "@/types";
 
 export const NEEDS_HUMAN_LABEL = "needs-human";
 export const NEEDS_HUMAN_COMMENT_MARKER = "<!-- dispatch-pr-fix-blocked -->";
+export const PARKED_COMMENT_MARKER = "<!-- dispatch-pr-fix-parked -->";
 
 export interface PrFixSurfaceContext {
-  /** Total number of fix attempts observed, when known. */
-  totalAttempts?: number | null;
-  /** Fix attempts grouped by lane, keyed by lane name (or "unknown"). */
+  /**
+   * Dispatchable worker executions for this item (`PrFixQueueItem.fixAttempts`).
+   * This — not the enqueue/feedback row count — is the number that actually
+   * bounds the loop.
+   */
+  workerExecutions?: number | null;
+  /**
+   * Number of `enqueue` history rows (evidence observations), reported
+   * separately from worker executions so the two are never conflated (#1218).
+   */
+  enqueueRows?: number | null;
+  /** Enqueue rows grouped by lane, keyed by lane name (or "unknown"). */
   attemptsByLane?: Record<string, number>;
   /** Concise description of the final failure once the loop gave up. */
   finalFailureSignature?: string | null;
@@ -21,6 +32,8 @@ export interface PrFixSurfaceContext {
   failingRunLinks?: string[];
   /** Summary/context from the last attempt, when any data is available. */
   lastAttemptSummary?: string | null;
+  /** Retained for back-compat; do NOT render it as "attempts" (#1218). */
+  totalAttempts?: number | null;
 }
 
 export interface SurfacePrFixBlockedInput {
@@ -29,6 +42,34 @@ export interface SurfacePrFixBlockedInput {
   reason: string;
   latestNote?: string | null;
   context?: PrFixSurfaceContext | null;
+  decision?: PrFixDecisionContext | null;
+}
+
+export interface SurfacePrFixParkedInput {
+  repo: string;
+  pr: number;
+  reason: string;
+  outcome?: string | null;
+  latestNote?: string | null;
+  context?: PrFixSurfaceContext | null;
+  /**
+   * Best-effort retraction of the `needs-human` label (#1218). A BLOCKED item
+   * that later parks (bounded exhaustion / infra / security) must not keep the
+   * label that claims a human decision is pending. Off by default.
+   */
+  removeNeedsHumanLabel?: boolean;
+}
+
+export interface SurfacePrFixParkedResult {
+  /** True when the `needs-human` label was removed (only when requested). */
+  labelRemoved: boolean;
+  /** True when a fresh marker comment was posted. */
+  commentPosted: boolean;
+  /** True when an existing marker comment was PATCHed in place. */
+  commentUpdated: boolean;
+  /** True when the PR was already merged or closed, so nothing was written. */
+  skippedTerminal: boolean;
+  errors: string[];
 }
 
 export interface SurfacePrFixBlockedResult {
@@ -45,15 +86,43 @@ export interface SurfacePrFixBlockedResult {
 function formatLaneAttempts(context: PrFixSurfaceContext): string | null {
   if (!context.attemptsByLane || Object.keys(context.attemptsByLane).length === 0) return null;
   const parts = Object.entries(context.attemptsByLane)
-    .map(([lane, count]) => `- **${lane}:** ${count} attempt${count === 1 ? "" : "s"}`)
+    .map(([lane, count]) => `- **${lane}:** ${count}`)
     .join("\n");
-  return `\n**Attempts by lane:**\n${parts}`;
+  return `\n**Enqueues by lane:**\n${parts}`;
 }
 
 function formatFailingRunLinks(links: string[] | undefined): string | null {
   const list = (links ?? []).filter((u) => u && typeof u === "string");
   if (list.length === 0) return null;
   return `\n**Failing run(s):**\n${list.map((u) => `- ${u}`).join("\n")}`;
+}
+
+/**
+ * Metrics truthfulness (#1218): report the worker-execution count and the
+ * enqueue/evidence row count as two distinct numbers. Neither is labelled
+ * "attempts" — conflating them is exactly what made exhaustion look like a
+ * design decision.
+ */
+function formatMetrics(context: PrFixSurfaceContext): string[] {
+  const lines: string[] = [];
+  if (typeof context.workerExecutions === "number") {
+    lines.push(`**Worker executions:** ${context.workerExecutions}`);
+  }
+  if (typeof context.enqueueRows === "number") {
+    lines.push(`**Enqueue rows:** ${context.enqueueRows}`);
+  }
+  return lines;
+}
+
+function formatDecision(decision: PrFixDecisionContext | null | undefined): string[] {
+  if (!decision) return [];
+  const lines: string[] = [];
+  if (decision.question) lines.push("", `**Decision needed:** ${decision.question}`);
+  if (Array.isArray(decision.options) && decision.options.length > 0) {
+    lines.push("", "**Options:**", ...decision.options.map((o) => `- ${o}`));
+  }
+  if (decision.evidence) lines.push("", `**Evidence:** ${decision.evidence}`);
+  return lines;
 }
 
 /**
@@ -73,10 +142,66 @@ export function buildNeedsHumanComment(input: SurfacePrFixBlockedInput): string 
     `**Reason:** ${input.reason}`,
   ];
 
-  const totalAttempts = context.totalAttempts;
-  if (typeof totalAttempts === "number" && totalAttempts > 0) {
-    lines.push("", `**Total attempts:** ${totalAttempts}`);
+  for (const metric of formatMetrics(context)) lines.push("", metric);
+
+  const laneText = formatLaneAttempts(context);
+  if (laneText) lines.push("", laneText);
+
+  if (context.finalFailureSignature) {
+    lines.push("", `**Final failure:** ${context.finalFailureSignature}`);
   }
+
+  const runLinks = formatFailingRunLinks(context.failingRunLinks);
+  if (runLinks) lines.push("", runLinks);
+
+  if (context.lastAttemptSummary) {
+    lines.push("", `**Last attempt:** ${context.lastAttemptSummary}`);
+  }
+
+  lines.push(...formatDecision(input.decision));
+
+  if (input.latestNote) {
+    lines.push("", `**Latest note:** ${input.latestNote}`);
+  }
+
+  lines.push(
+    "",
+    `Posted automatically by Dispatch on ${new Date().toISOString()}`,
+  );
+
+  return lines.join("\n");
+}
+
+const PARKED_HEADLINES: Record<PrFixOutcome, string> = {
+  no_progress:
+    "> ⏸️ This PR fix item is **PARKED** after repeated attempts without progress. It is not waiting on a human decision; an operator can requeue it to retry.",
+  infra_failure:
+    "> ⏸️ This PR fix item is **PARKED** after an infrastructure or authentication failure. An operator can requeue it once the environment is healthy.",
+  security_failure:
+    "> ⏸️ This PR fix item is **PARKED** after a security failure. An operator must investigate before requeuing.",
+  human_decision:
+    "> ⏸️ This PR fix item is **PARKED**. An operator can requeue it to retry.",
+};
+
+/**
+ * Build the markdown comment body for a PARKED PR-fix item (#1218). Mirrors
+ * `buildNeedsHumanComment` but carries no needs-human claim: a parked item is
+ * bounded exhaustion or an operational failure, not a design decision.
+ */
+export function buildParkedComment(input: SurfacePrFixParkedInput): string {
+  const context = input.context ?? {};
+  const outcome = normalizePrFixOutcome(input.outcome) ?? "no_progress";
+  const lines: string[] = [
+    PARKED_COMMENT_MARKER,
+    "",
+    PARKED_HEADLINES[outcome],
+    "",
+    `**Reason:** ${input.reason}`,
+    "",
+    `**Outcome:** ${outcome}`,
+  ];
+
+  for (const metric of formatMetrics(context)) lines.push("", metric);
 
   const laneText = formatLaneAttempts(context);
   if (laneText) lines.push("", laneText);
@@ -123,8 +248,21 @@ function isTerminalState(prState: { state: string | null; mergedAt: string | nul
   return prState.state === null || prState.state === "closed" || Boolean(prState.mergedAt);
 }
 
+/**
+ * The marker a Dispatch-owned comment starts with, if any (#1218). A BLOCKED
+ * item writes the needs-human marker; a PARKED item writes the parked marker.
+ * Both surfaces recognize EITHER marker so a re-surface (or an unblock) folds
+ * the single existing comment in place instead of posting a duplicate.
+ */
+function detectDispatchMarker(body: string | null | undefined): string | null {
+  const trimmed = (body ?? "").trimStart();
+  if (trimmed.startsWith(NEEDS_HUMAN_COMMENT_MARKER)) return NEEDS_HUMAN_COMMENT_MARKER;
+  if (trimmed.startsWith(PARKED_COMMENT_MARKER)) return PARKED_COMMENT_MARKER;
+  return null;
+}
+
 function isDispatchMarkerComment(body: string | null | undefined): boolean {
-  return (body ?? "").trimStart().startsWith(NEEDS_HUMAN_COMMENT_MARKER);
+  return detectDispatchMarker(body) !== null;
 }
 
 /**
@@ -196,6 +334,75 @@ export async function surfacePrFixBlocked(input: SurfacePrFixBlockedInput): Prom
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`pr-fix-surfacing comment error for ${input.repo}#${input.pr}:`, error);
+    result.errors.push(`comment: ${message}`);
+  }
+
+  return result;
+}
+
+/**
+ * Surface a PARKED PR-fix item on GitHub (#1218): post (or update in place) an
+ * explanatory marker comment. Unlike `surfacePrFixBlocked` it applies NO label
+ * — a parked item is bounded exhaustion or an operational failure, not a
+ * request for a human design decision. Best-effort — never throws, never writes
+ * to a terminal/unknown PR.
+ */
+export async function surfacePrFixParked(input: SurfacePrFixParkedInput): Promise<SurfacePrFixParkedResult> {
+  const result: SurfacePrFixParkedResult = {
+    labelRemoved: false,
+    commentPosted: false,
+    commentUpdated: false,
+    skippedTerminal: false,
+    errors: [],
+  };
+
+  let prState: { state: string | null; mergedAt: string | null };
+  try {
+    prState = await fetchPullRequestState(input.repo, input.pr);
+  } catch (error) {
+    console.error(`pr-fix-surfacing parked PR state error for ${input.repo}#${input.pr}:`, error);
+    prState = { state: null, mergedAt: null };
+  }
+  if (isTerminalState(prState)) {
+    result.skippedTerminal = true;
+    console.warn(
+      `pr-fix-surfacing: skipping parked surface for ${input.repo}#${input.pr} — PR state=${prState.state ?? "unknown"}` +
+        `${prState.mergedAt ? ` merged=${prState.mergedAt}` : ""}; not commenting on a finished PR`,
+    );
+    return result;
+  }
+
+  // A BLOCKED item that parks is no longer awaiting a human decision (#1218):
+  // retract the needs-human label before writing the parked notice so the two
+  // never disagree. Best-effort — a failed retraction is recorded, never thrown.
+  if (input.removeNeedsHumanLabel === true) {
+    try {
+      await removeIssueLabel(input.repo, input.pr, NEEDS_HUMAN_LABEL);
+      result.labelRemoved = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`pr-fix-surfacing parked label error for ${input.repo}#${input.pr}:`, error);
+      result.errors.push(`label: ${message}`);
+    }
+  }
+
+  try {
+    const existing = await fetchIssueComments(input.repo, input.pr, 100, "desc");
+    const marker = existing.find((c) => isDispatchMarkerComment(c.body));
+    const body = buildParkedComment(input);
+
+    if (marker) {
+      if (typeof marker.id === "number") {
+        await updateIssueComment(input.repo, marker.id, body);
+        result.commentUpdated = true;
+      }
+    } else {
+      await addIssueComment(input.repo, input.pr, body);
+      result.commentPosted = true;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`pr-fix-surfacing parked comment error for ${input.repo}#${input.pr}:`, error);
     result.errors.push(`comment: ${message}`);
   }
 
@@ -277,16 +484,20 @@ export async function surfacePrFixUnblocked(
 
   try {
     const existing = await fetchIssueComments(repo, pr, 100, "desc");
-    const marker = existing.find((c) => isDispatchMarkerComment(c.body));
-    if (marker && typeof marker.id === "number") {
+    const markerComment = existing.find((c) => isDispatchMarkerComment(c.body));
+    if (markerComment && typeof markerComment.id === "number") {
+      // Preserve whichever marker the existing comment carried (needs-human or
+      // parked, #1218) so the folded notice stays recognizable and no second
+      // marker comment is created.
+      const marker = detectDispatchMarker(markerComment.body) ?? NEEDS_HUMAN_COMMENT_MARKER;
       const lines = [
-        NEEDS_HUMAN_COMMENT_MARKER,
+        marker,
         "",
         UNBLOCK_HEADLINES[outcome],
       ];
       if (notice) lines.push("", `**Note:** ${notice}`);
       lines.push("", `Updated automatically by Dispatch on ${new Date().toISOString()}`);
-      await updateIssueComment(repo, marker.id, lines.join("\n"));
+      await updateIssueComment(repo, markerComment.id, lines.join("\n"));
       result.commentUpdated = true;
     }
   } catch (error) {

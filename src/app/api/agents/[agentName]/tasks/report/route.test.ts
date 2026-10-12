@@ -479,6 +479,111 @@ describe("POST /api/agents/[agentName]/tasks/report — validation", () => {
   });
 });
 
+describe("POST /api/agents/[agentName]/tasks/report — structured block outcome (#1218)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+  });
+
+  const blockedReport = {
+    taskType: "followup-pr",
+    outcome: "blocked",
+    repoFullName: "o/r",
+    pullRequestNumber: 5,
+    prFixItem: { id: "item-1", generation: 1 },
+  };
+
+  it("passes a human_decision blockReason and decision payload through to the resolver", async () => {
+    const decision = { question: "Which behavior?", options: ["keep", "change"], evidence: "see thread" };
+    const res = await postRequest({
+      ...blockedReport,
+      blockReason: "human_decision",
+      decision,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.report.blockReason).toBe("human_decision");
+    expect(body.report.decision).toEqual(decision);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: "blocked",
+        blockReason: "human_decision",
+        decision,
+      }),
+    );
+  });
+
+  it("accepts a blocked report without a blockReason (bare give-up → parked)", async () => {
+    const res = await postRequest({ ...blockedReport });
+
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "blocked", blockReason: undefined }),
+    );
+  });
+
+  it("returns 400 for an invalid blockReason", async () => {
+    const res = await postRequest({ ...blockedReport, blockReason: "not-a-real-outcome" });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/blockReason/);
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+    expect(prFixResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when blockReason is not a string", async () => {
+    const res = await postRequest({ ...blockedReport, blockReason: 42 });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/blockReason/);
+  });
+
+  it("returns 400 when decision is not a non-array object", async () => {
+    const asString = await postRequest({ ...blockedReport, decision: "nope" });
+    expect(asString.status).toBe(400);
+    expect((await asString.json()).error).toMatch(/decision must be an object/);
+
+    const asArray = await postRequest({ ...blockedReport, decision: ["a", "b"] });
+    expect(asArray.status).toBe(400);
+    expect((await asArray.json()).error).toMatch(/decision must be an object/);
+  });
+
+  it("returns 400 when decision fields are malformed", async () => {
+    const badQuestion = await postRequest({ ...blockedReport, decision: { question: 123 } });
+    expect(badQuestion.status).toBe(400);
+    expect((await badQuestion.json()).error).toMatch(/decision\.question/);
+
+    const badOptions = await postRequest({ ...blockedReport, decision: { options: "not-an-array" } });
+    expect(badOptions.status).toBe(400);
+    expect((await badOptions.json()).error).toMatch(/decision\.options/);
+
+    const nonStringOptions = await postRequest({ ...blockedReport, decision: { options: ["ok", 5] } });
+    expect(nonStringOptions.status).toBe(400);
+    expect((await nonStringOptions.json()).error).toMatch(/decision\.options/);
+
+    const badEvidence = await postRequest({ ...blockedReport, decision: { evidence: 5 } });
+    expect(badEvidence.status).toBe(400);
+    expect((await badEvidence.json()).error).toMatch(/decision\.evidence/);
+  });
+
+  it("normalizes a valid decision payload (trims strings, drops empty options)", async () => {
+    const res = await postRequest({
+      ...blockedReport,
+      blockReason: "human_decision",
+      decision: { question: "  Which?  ", options: ["  A  ", "", "B"], evidence: "  ctx  " },
+    });
+
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        decision: { question: "Which?", options: ["A", "B"], evidence: "ctx" },
+      }),
+    );
+  });
+});
+
 describe("POST /api/agents/[agentName]/tasks/report — AgentRun persistence", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;

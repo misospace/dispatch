@@ -79,6 +79,19 @@ describe("GET /api/pr-fix-queue/queued", () => {
     expect(call.includeBlocked).toBe(true);
   });
 
+  it("returns PARKED items when include_blocked=true (#1218)", async () => {
+    mocks.listQueuedPrFixItems.mockResolvedValue([
+      { id: "fix-1", repo: "org/repo", pr: 42, status: "PARKED" },
+    ]);
+
+    const res = await GET(request("http://localhost/api/pr-fix-queue/queued?include_blocked=true"));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0]).toMatchObject({ id: "fix-1", status: "PARKED" });
+    expect(mocks.listQueuedPrFixItems.mock.calls[0][1].includeBlocked).toBe(true);
+  });
+
   it("returns 400 for invalid lane", async () => {
     const res = await GET(request("http://localhost/api/pr-fix-queue/queued?lane=invalid-lane"));
 

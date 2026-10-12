@@ -121,9 +121,9 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
       backlog: { queued: 0, inProgress: 0 },
     });
     expect(body.prFixes).toEqual({
-      local: { total: 0, blocked: 0 },
-      frontier: { total: 0, blocked: 0 },
-      needsHuman: { total: 0, blocked: 0 },
+      local: { total: 0, blocked: 0, parked: 0 },
+      frontier: { total: 0, blocked: 0, parked: 0 },
+      needsHuman: { total: 0, blocked: 0, parked: 0 },
     });
   });
 
@@ -181,9 +181,27 @@ describe("GET /api/agents/[agentName]/work-summary", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.prFixes.local).toEqual({ total: 3, blocked: 1 });
-    expect(body.prFixes.frontier).toEqual({ total: 1, blocked: 0 });
-    expect(body.prFixes.needsHuman).toEqual({ total: 2, blocked: 2 });
+    expect(body.prFixes.local).toEqual({ total: 3, blocked: 1, parked: 0 });
+    expect(body.prFixes.frontier).toEqual({ total: 1, blocked: 0, parked: 0 });
+    expect(body.prFixes.needsHuman).toEqual({ total: 2, blocked: 2, parked: 0 });
+  });
+
+  it("counts PARKED items under parked, not blocked (#1218)", async () => {
+    mocks.prFixFindMany.mockResolvedValue([
+      { lane: "NORMAL", status: "PARKED" },
+      { lane: "NORMAL", status: "PARKED" },
+      { lane: "NORMAL", status: "BLOCKED" },
+      { lane: "NORMAL", status: "QUEUED" },
+    ]);
+
+    const res = await makeRequest(
+      `http://localhost/api/agents/${TEST_AGENT}/work-summary`,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Total counts every surfaced item; parked and blocked are disjoint.
+    expect(body.prFixes.local).toEqual({ total: 4, blocked: 1, parked: 2 });
   });
 
   it("defaults missing lane to NORMAL for PR fixes", async () => {

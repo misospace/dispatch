@@ -6,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
+import { isValidPrFixOutcome, VALID_PR_FIX_OUTCOMES, type PrFixDecisionContext } from "@/types";
 import {
   resolveAlreadyDoneFromAgentReport,
   type ReportCloseCriterion,
@@ -47,6 +48,12 @@ export interface TaskReportBody {
   error?: string;
   // #1121: evidence string (commit SHAs / paths) carried by an already_addressed report; recorded in settlement history.
   evidence?: string;
+  // #1218: for a `blocked` report, the structured reason. `human_decision`
+  // marks BLOCKED with the decision payload; anything else (or a bare give-up)
+  // marks PARKED. Validated against PrFixOutcome.
+  blockReason?: string;
+  // #1218: the human-decision payload attached to a `human_decision` block.
+  decision?: PrFixDecisionContext;
   // #1143: the already_done close proposal. The worker supplies per-criterion
   // pinned excerpts; Dispatch re-derives the catalog and applies the shared
   // close policy. Not close authorization on its own.
@@ -282,6 +289,50 @@ export async function POST(
     }
   }
 
+  // #1218: a `blocked` report may carry a structured reason and a
+  // human-decision payload. Validate both here so a malformed value is a 400
+  // rather than a silently-ignored field. They are only meaningful for a
+  // `blocked` outcome; the resolver ignores them otherwise.
+  let blockReason: string | undefined;
+  if (raw.blockReason !== undefined) {
+    if (typeof raw.blockReason !== "string" || !isValidPrFixOutcome(raw.blockReason.trim())) {
+      return errorResponse(
+        `blockReason must be one of: ${VALID_PR_FIX_OUTCOMES.join(", ")}`,
+        400,
+      );
+    }
+    blockReason = raw.blockReason.trim();
+  }
+
+  let decision: PrFixDecisionContext | undefined;
+  if (raw.decision !== undefined && raw.decision !== null) {
+    if (typeof raw.decision !== "object" || Array.isArray(raw.decision)) {
+      return errorResponse("decision must be an object", 400);
+    }
+    const rawDecision = raw.decision as Record<string, unknown>;
+    const parsedDecision: PrFixDecisionContext = {};
+    if (rawDecision.question !== undefined && rawDecision.question !== null) {
+      if (typeof rawDecision.question !== "string") {
+        return errorResponse("decision.question must be a string", 400);
+      }
+      if (rawDecision.question.trim()) parsedDecision.question = rawDecision.question.trim();
+    }
+    if (rawDecision.options !== undefined && rawDecision.options !== null) {
+      if (!Array.isArray(rawDecision.options) || rawDecision.options.some((o) => typeof o !== "string")) {
+        return errorResponse("decision.options must be an array of strings", 400);
+      }
+      const options = (rawDecision.options as string[]).map((o) => o.trim()).filter(Boolean);
+      if (options.length > 0) parsedDecision.options = options;
+    }
+    if (rawDecision.evidence !== undefined && rawDecision.evidence !== null) {
+      if (typeof rawDecision.evidence !== "string") {
+        return errorResponse("decision.evidence must be a string", 400);
+      }
+      if (rawDecision.evidence.trim()) parsedDecision.evidence = rawDecision.evidence.trim();
+    }
+    decision = parsedDecision;
+  }
+
   // #1121/#1143: evidence is meaningful for an already_addressed settlement and
   // for an already_done close — it is trimmed, bounded, and recorded in the
   // settlement/close history. On any other outcome it is ignored (never hashed,
@@ -432,6 +483,10 @@ export async function POST(
     summary: raw.summary as string | undefined,
     error: raw.error as string | undefined,
     evidence,
+    // #1218: structured block classification; participates in the idempotency
+    // payload hash like the other report fields.
+    blockReason,
+    decision,
     close: closeCriteria ? { criteria: closeCriteria } : undefined,
     // #1120: normalized worker start time; undefined → report time (now).
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
@@ -536,6 +591,10 @@ export async function POST(
         outcome: report.outcome,
         summary: report.summary,
         evidence: report.evidence,
+        // #1218: a `blocked` report's structured reason / decision payload;
+        // the resolver ignores both for any other outcome.
+        blockReason: report.blockReason,
+        decision: report.decision,
         // #1074: settlement is authorized by the attempt token the worker was
         // issued; a report without one never mutates the queue.
         attempt: prFixItem ? { itemId: prFixItem.id, generation: prFixItem.generation } : null,

@@ -140,9 +140,11 @@ describe("POST /api/pr-fix-queue/mark", () => {
 
     expect(res.status).toBe(200);
     // No expectedGeneration on the input: the operator mark is unconditional.
-    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), {
-      repo: "org/repo", pr: 42, status: "DONE",
-    });
+    // #1218 review: the route forwards the auth tier so markPrFixItem can
+    // honor the commit-time status pin correctly.
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      repo: "org/repo", pr: 42, status: "DONE", actorTier: "maintainer",
+    }));
   });
 
   it("allows an operator mark without a generation (basic mode)", async () => {
@@ -165,9 +167,9 @@ describe("POST /api/pr-fix-queue/mark", () => {
 
     expect(res.status).toBe(200);
     // No expectedGeneration on the input: the operator mark is unconditional.
-    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), {
-      repo: "org/repo", pr: 42, status: "DONE",
-    });
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      repo: "org/repo", pr: 42, status: "DONE", actorTier: "maintainer",
+    }));
   });
 
   it("returns 404 when item not found", async () => {
