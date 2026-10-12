@@ -23,7 +23,10 @@ function clientFor(item: any, hooks: { beforeUpdate?: (where: any, data: any) =>
         return { count: 1 };
       },
     },
-    prFixHistory: { create: async ({ data }: any) => { history.push(data); } },
+    prFixHistory: {
+      create: async ({ data }: any) => { history.push(data); },
+      findMany: async ({ where, orderBy }: any) => history.filter((entry) => where.itemId.in.includes(item.id) && entry.status === where.status && entry.action === where.action).reverse(),
+    },
     $transaction: async (fn: any) => fn(client),
   };
   return { client: client as PrFixQueueClient, history };
@@ -114,16 +117,29 @@ describe("external prerequisite waits (#1231)", () => {
     const row = item();
     const { client, history } = clientFor(row);
     if (order === "report-first") {
-      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, client });
-      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
+      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: "missing prerequisite: X", attempt: { itemId: row.id, generation: 4 }, client });
+      expect(history).toHaveLength(1);
+      expect(history[0].note).toBe("missing prerequisite: X");
+      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "actual mark note" });
     } else {
-      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
-      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, client });
+      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "actual mark note" });
+      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: "missing prerequisite: X", attempt: { itemId: row.id, generation: 4 }, client });
     }
     const deadline = row.retryAt;
     await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, client });
     expect(row.retryAt).toBe(deadline);
     expect(history).toHaveLength(1);
+    expect(history[0].note).toBe(order === "report-first" ? "missing prerequisite: X" : "actual mark note");
+  });
+
+  it("sanitizes and bounds the stored external-wait note", async () => {
+    const row = item();
+    const { client, history } = clientFor(row);
+    const secretError = `token=${"s".repeat(700)}`;
+    await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: secretError, attempt: { itemId: row.id, generation: 4 }, client });
+    expect(history[0].note).toContain("token=");
+    expect(history[0].note.length).toBeLessThanOrEqual(500);
+    expect(history[0].note).not.toContain("s".repeat(700));
   });
 
   it("preserves a concurrent BLOCKED transition", async () => {

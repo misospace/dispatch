@@ -197,6 +197,10 @@ function makeClient(): PrFixQueueClient & {
             : result.filter((i) => i.status === where.status);
         }
         if (where?.lane) result = result.filter((i) => i.lane === where.lane);
+        if (where?.retryAt?.lte) {
+          const cutoff = new Date(where.retryAt.lte).getTime();
+          result = result.filter((i) => i.retryAt != null && new Date(i.retryAt).getTime() <= cutoff);
+        }
         if (where?.dispatchedAt) {
           // Mirror Prisma's `dispatchedAt: { lt: dueBefore }` only — the
           // reclaimer query (#1211 review) is the only consumer today and
@@ -357,6 +361,22 @@ describe("PR review-fix queue", () => {
     expect((await listQueuedPrFixItems(client, { lane: "ESCALATED" })).map((i) => i.pr)).toEqual([2]);
     expect(await listQueuedPrFixItems(client, { lane: "needs-human" })).toEqual([]);
     expect((await listQueuedPrFixItems(client, { lane: "needs-human", includeBlocked: true })).map((i) => i.pr)).toEqual([3]);
+  });
+
+  it("includes future external waits only when requested, with the latest note and deadline", async () => {
+    const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 45, lane: "NORMAL", reason: "CI blocked", feedback: "wait", evidenceKey: "wait:1" });
+    await markPrFixItem(client, { repo: item.repo, pr: item.pr, status: "WAITING_EXTERNAL", expectedGeneration: item.generation, note: "older note" });
+    const deadline = new Date(Date.now() + 60 * 60_000);
+    item.retryAt = deadline;
+    client.history.push({ itemId: item.id, action: "mark", status: "WAITING_EXTERNAL", note: "latest note", at: new Date(Date.now() + 1) });
+
+    const ordinary = await listQueuedPrFixItems(client);
+    expect(ordinary).toEqual([]);
+    const included = await listQueuedPrFixItems(client, { includeBlocked: true });
+    expect(included).toHaveLength(1);
+    expect(included[0]).toMatchObject({ status: "WAITING_EXTERNAL", latestNote: "latest note" });
+    expect(included[0].retryAt).toBeTruthy();
+    expect(client.items.find((candidate) => candidate.id === item.id)?.status).toBe("WAITING_EXTERNAL");
   });
 
   it("supports status transitions with history", async () => {

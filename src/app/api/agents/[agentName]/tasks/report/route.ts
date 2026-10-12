@@ -592,6 +592,7 @@ export async function POST(
         pullRequestUrl: report.pullRequestUrl,
         outcome: report.outcome,
         summary: report.summary,
+        error: report.error,
         evidence: report.evidence,
         // #1218: a `blocked` report's structured reason / decision payload;
         // the resolver ignores both for any other outcome.

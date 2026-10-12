@@ -3,6 +3,7 @@ import { surfacePrFixBlocked, surfacePrFixParked, surfacePrFixRequeued, surfaceP
 import { prisma } from "@/lib/prisma";
 import { fetchPullRequestMergeState, fetchPullRequestHeadSha, fetchPullRequestState } from "./github-prs";
 import { fetchRepositoryMetadata } from "./github-code-search";
+import { sanitizeForStorage } from "./groomer/sanitize";
 
 export type PrFixQueueClient = {
   issue: {
@@ -1467,7 +1468,7 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
   const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
   const now = new Date();
   await reactivateDueExternalWaits(client, now);
-  const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED", "PARKED"] } : "QUEUED";
+  const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED", "PARKED", "WAITING_EXTERNAL"] } : "QUEUED";
 
   const items = await client.prFixQueueItem.findMany({
     where: { status, ...(lane ? { lane } : {}) },
@@ -1484,6 +1485,16 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
     });
   } else {
     items.sort((a, b) => new Date(a.queuedAt).getTime() - new Date(b.queuedAt).getTime());
+  }
+
+  if (options.includeBlocked && items.some((item) => item.status === "WAITING_EXTERNAL") && client.prFixHistory.findMany) {
+    const waits = await client.prFixHistory.findMany({
+      where: { itemId: { in: items.filter((item) => item.status === "WAITING_EXTERNAL").map((item) => item.id) }, status: "WAITING_EXTERNAL", action: "mark" },
+      orderBy: { at: "desc" },
+    });
+    const latestNotes = new Map<string, string | null>();
+    for (const row of waits) if (!latestNotes.has(row.itemId)) latestNotes.set(row.itemId, row.note ?? null);
+    for (const item of items) if (item.status === "WAITING_EXTERNAL") item.latestNote = latestNotes.get(item.id) ?? null;
   }
 
   return items;
@@ -2523,6 +2534,7 @@ export interface ResolvePrFixFromAgentReportInput {
   pullRequestUrl?: string | null;
   outcome: AgentReportOutcome;
   summary?: string | null;
+  error?: string | null;
   // #1121 evidence string (commit SHAs/paths) carried by an `already_addressed` report.
   evidence?: string | null;
   // #1218: for a `blocked` report, the structured reason. `human_decision`
@@ -2706,7 +2718,7 @@ export async function resolvePrFixFromAgentReport(
       return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "waiting-external requires a prFixItem attempt token" };
     }
     const marked = await markPrFixItem(client as PrFixQueueClient, {
-      repo, pr, status: "WAITING_EXTERNAL", note: input.summary ?? null, expectedGeneration,
+      repo, pr, status: "WAITING_EXTERNAL", note: sanitizeForStorage(input.summary?.trim() || input.error || "", 500) || null, expectedGeneration,
     });
     return {
       matched: true,

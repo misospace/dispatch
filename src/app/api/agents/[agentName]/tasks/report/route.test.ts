@@ -1618,10 +1618,10 @@ describe("POST /api/agents/[agentName]/tasks/report — prFixItem attempt token 
   });
 
   it.each(["implement", "followup-pr"] as const)("accepts waiting-external for %s and records a neutral run", async (taskType) => {
-    const body = { ...validReport, taskType, outcome: "waiting-external", ...(taskType === "followup-pr" ? { prFixItem: { id: "cktz-abc", generation: 2 } } : {}) };
+    const body = { ...validReport, taskType, outcome: "waiting-external", error: "missing prerequisite: X", ...(taskType === "followup-pr" ? { prFixItem: { id: "cktz-abc", generation: 2 } } : {}) };
     const res = await postRequest(body);
     expect(res.status).toBe(200);
-    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({ outcome: "waiting-external", attempt: taskType === "followup-pr" ? { itemId: "cktz-abc", generation: 2 } : null }));
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({ outcome: "waiting-external", error: "missing prerequisite: X", attempt: taskType === "followup-pr" ? { itemId: "cktz-abc", generation: 2 } : null }));
     expect(mockAgentRun.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "waiting-external" }) }));
   });
 
