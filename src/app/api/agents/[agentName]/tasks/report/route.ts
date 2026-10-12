@@ -289,6 +289,9 @@ export async function POST(
   // stringFields validation.
   const isAlreadyAddressed = (outcome as ValidOutcome) === "already_addressed";
   const isAlreadyDone = (outcome as ValidOutcome) === "already_done";
+  if (isAlreadyDone && (taskType !== "implement" || (raw.prFixItem !== undefined && raw.prFixItem !== null))) {
+    return errorResponse("already_done is only valid for implement reports without prFixItem", 400);
+  }
   const evidence =
     (isAlreadyAddressed || isAlreadyDone) && typeof raw.evidence === "string"
       ? raw.evidence.trim()
