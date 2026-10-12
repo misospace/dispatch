@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - charts/dispatch/**
+      - scripts/check-helm-probes.py
       - .github/workflows/helm-lint.yaml
 
 jobs:
@@ -27,7 +28,12 @@ jobs:
         run: helm lint charts/dispatch
 
       - name: Template chart (default values)
-        run: helm template dispatch charts/dispatch
+        run: helm template dispatch charts/dispatch > /tmp/dispatch-rendered.yaml
+
+      - name: Check rendered probes
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          python3 scripts/check-helm-probes.py /tmp/dispatch-rendered.yaml
 
       - name: Template chart (custom values)
         run: |
