@@ -296,6 +296,10 @@ model AgentReportDedupe {
   agentRunId      String?
   agentRun        AgentRun? @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
   prFixResolution Json?
+  // #1143: the `already_done` close resolution (action/reasons/head SHA/evidence
+  // digest), persisted so an idempotent retry replays the close outcome instead
+  // of re-running the GitHub close.
+  closeResolution Json?
   createdAt       DateTime @default(now())
 
   @@unique([agentName, idempotencyKey])

@@ -3,9 +3,18 @@ import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
+import {
+  resolveAlreadyDoneFromAgentReport,
+  type ReportCloseCriterion,
+  type ResolveAlreadyDoneResult,
+} from "@/lib/report-close";
+import { asRepoFilePath } from "@/lib/groomer/close-grounding";
+import { PLAN_LIMITS } from "@/lib/groomer/plan";
+import { getLiveIssueLabels } from "@/lib/claim-gate";
+import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -19,9 +28,13 @@ const VALID_OUTCOMES = [
   "failed",
   "no_changes_needed",
   "already_addressed",
+  "already_done",
   "handed-off",
 ] as const;
 type ValidOutcome = (typeof VALID_OUTCOMES)[number];
+
+/** Internal signal for a malformed already_done close proposal; mapped to 400. */
+class CloseValidationError extends Error {}
 
 export interface TaskReportBody {
   taskType: ValidTaskType;
@@ -34,6 +47,10 @@ export interface TaskReportBody {
   error?: string;
   // #1121: evidence string (commit SHAs / paths) carried by an already_addressed report; recorded in settlement history.
   evidence?: string;
+  // #1143: the already_done close proposal. The worker supplies per-criterion
+  // pinned excerpts; Dispatch re-derives the catalog and applies the shared
+  // close policy. Not close authorization on its own.
+  close?: { criteria: ReportCloseCriterion[] };
   // #1120: worker-reported task start time (ISO 8601). Accepted only when
   // parseable, not in the future, and within 24h of the report; otherwise
   // omitted and the report time is used. It participates in the idempotency
@@ -95,6 +112,77 @@ async function resolveIssueId(
   });
 
   return issue?.id ?? null;
+}
+
+/**
+ * Worker-tier scope check for an `already_done` close (dispatch#1143 review of
+ * #1219): the close can ONLY target one concrete issue that is both
+ *
+ *   (a) tracked in Dispatch's cache (so the close's Prisma mirror update is
+ *       not a no-op on a ghost issue), AND
+ *   (b) live-assigned to the token-derived worker (`agent/<bound name>` is
+ *       present in GitHub's live label set for the issue).
+ *
+ * The check hits GitHub for the live label set — the Prisma cache can lag a
+ * claim made directly on GitHub (#1037), so a stale `agent/<bound>` in cache
+ * would let a worker close an issue Dispatch thinks is theirs but another
+ * agent actually owns on the forge. Maintainer-tier callers (basic / OIDC /
+ * maintainer bearer / auth-disabled) bypass the gate; the close proceeds even
+ * for an untracked issue. Errors thrown by the live fetch surface as 503 with
+ * a fail-closed refusal — the close never lands on an unreadable assignment.
+ *
+ * Returns a `NextResponse` to return when the gate denies, or `null` when the
+ * gate allows.
+ */
+async function enforceAlreadyDoneWorkerScope(
+  auth: Awaited<ReturnType<typeof authorizeRequest>>,
+  repoFullName: string,
+  issueNumber: number,
+): Promise<NextResponse<{ error: string }> | null> {
+  // Maintainer / OIDC / basic / auth-disabled callers are unconstrained —
+  // the route's agent-name URL gate already passed.
+  if (!auth.authorized) return null;
+  if (auth.type !== "bearer" || auth.tier !== "worker") return null;
+
+  const bound = getBoundWorkerAgent(auth);
+  // An unbound legacy worker token has no agent identity to scope against —
+  // it cannot close a tracked issue on someone else's behalf; deny.
+  if (!bound) {
+    return errorResponse(
+      "Worker token is not bound to an agent; an already_done close requires a bound worker credential or a maintainer token",
+      403,
+    );
+  }
+
+  const issueId = await resolveIssueId(repoFullName, issueNumber);
+  if (!issueId) {
+    return errorResponse(
+      `Worker token is bound to agent "${bound}" and may only close issues Dispatch tracks; ${repoFullName}#${issueNumber} is not tracked`,
+      403,
+    );
+  }
+
+  // The labels GitHub currently has are authoritative for the assignment
+  // decision (matches the issue-status and claim gates — #1037).
+  let liveLabels: string[];
+  try {
+    liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return errorResponse(
+      `Could not verify live GitHub labels for ${repoFullName}#${issueNumber}: ${message}`,
+      503,
+    );
+  }
+
+  if (getAgentFromLabels(liveLabels) !== `${AGENT_PREFIX}${bound}`) {
+    return errorResponse(
+      `Worker token is bound to agent "${bound}" and may only close issues live-assigned to it; ${repoFullName}#${issueNumber} is not assigned to that agent`,
+      403,
+    );
+  }
+
+  return null;
 }
 
 function buildTouchedUrls(
@@ -194,15 +282,76 @@ export async function POST(
     }
   }
 
-  // #1121: evidence is only meaningful for an already_addressed settlement — it
-  // is trimmed, bounded, and recorded in the PR-fix settlement history. On any
-  // other outcome it is ignored (never hashed, never persisted). A non-string
-  // evidence is rejected above by the stringFields validation.
+  // #1121/#1143: evidence is meaningful for an already_addressed settlement and
+  // for an already_done close — it is trimmed, bounded, and recorded in the
+  // settlement/close history. On any other outcome it is ignored (never hashed,
+  // never persisted). A non-string evidence is rejected above by the
+  // stringFields validation.
   const isAlreadyAddressed = (outcome as ValidOutcome) === "already_addressed";
+  const isAlreadyDone = (outcome as ValidOutcome) === "already_done";
   const evidence =
-    isAlreadyAddressed && typeof raw.evidence === "string" ? raw.evidence.trim() : undefined;
+    (isAlreadyAddressed || isAlreadyDone) && typeof raw.evidence === "string"
+      ? raw.evidence.trim()
+      : undefined;
   if (evidence && evidence.length > MAX_EVIDENCE_LENGTH) {
     return errorResponse(`evidence must be at most ${MAX_EVIDENCE_LENGTH} characters`, 400);
+  }
+
+  // #1143: the already_done close proposal. The worker supplies per-criterion
+  // pinned excerpts; the server re-derives the catalog and applies the shared
+  // close policy. Only parsed for already_done; ignored otherwise (like
+  // evidence). Paths are normalized through the same conservative
+  // `asRepoFilePath` the groomer uses.
+  let closeCriteria: ReportCloseCriterion[] | undefined;
+  if (isAlreadyDone) {
+    if (raw.close === undefined || raw.close === null || typeof raw.close !== "object" || Array.isArray(raw.close)) {
+      return errorResponse("close must be an object for an already_done report", 400);
+    }
+    const rawClose = raw.close as Record<string, unknown>;
+    const rawCriteria = rawClose.criteria;
+    if (!Array.isArray(rawCriteria)) {
+      return errorResponse("close.criteria must be an array", 400);
+    }
+    if (rawCriteria.length === 0 || rawCriteria.length > PLAN_LIMITS.closeCriteria) {
+      return errorResponse(
+        `close.criteria must have between 1 and ${PLAN_LIMITS.closeCriteria} items`,
+        400,
+      );
+    }
+    try {
+      closeCriteria = rawCriteria.map((item, i) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          throw new CloseValidationError(`close.criteria[${i}] must be an object`);
+        }
+        const entry = item as Record<string, unknown>;
+        if (
+          typeof entry.criterion !== "string" ||
+          entry.criterion.trim().length === 0 ||
+          entry.criterion.trim().length > PLAN_LIMITS.shortText
+        ) {
+          throw new CloseValidationError(
+            `close.criteria[${i}].criterion must be a non-empty string of at most ${PLAN_LIMITS.shortText} characters`,
+          );
+        }
+        const path = typeof entry.path === "string" ? asRepoFilePath(entry.path) : null;
+        if (!path) {
+          throw new CloseValidationError(`close.criteria[${i}].path must be a repository file path`);
+        }
+        if (
+          typeof entry.excerpt !== "string" ||
+          entry.excerpt.trim().length === 0 ||
+          entry.excerpt.length > PLAN_LIMITS.excerpt
+        ) {
+          throw new CloseValidationError(
+            `close.criteria[${i}].excerpt must be a non-empty string of at most ${PLAN_LIMITS.excerpt} characters`,
+          );
+        }
+        return { criterion: entry.criterion.trim(), path, excerpt: entry.excerpt };
+      });
+    } catch (err) {
+      if (err instanceof CloseValidationError) return errorResponse(err.message, 400);
+      throw err;
+    }
   }
 
   // Optional attempt token for PR-fix queue settlement (#1074). The worker
@@ -238,6 +387,26 @@ export async function POST(
     return errorResponse(`idempotencyKey must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`, 400);
   }
 
+  // #1143: an already_done close targets one concrete issue and must carry a
+  // report-scoped idempotency key (the compare-and-swap token that keeps a
+  // retried report from executing the close twice).
+  if (isAlreadyDone) {
+    const reportRepo = raw.repoFullName;
+    const reportIssue = raw.issueNumber;
+    if (typeof reportRepo !== "string" || reportRepo.trim().length === 0 || reportIssue === undefined) {
+      return errorResponse("repoFullName and issueNumber are required for an already_done report", 400);
+    }
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(reportRepo.trim())) {
+      return errorResponse("repoFullName must be an owner/repo slug for an already_done report", 400);
+    }
+    if (typeof idempotencyKey !== "string") {
+      return errorResponse(
+        "an already_done report requires an idempotencyKey so the close is not applied twice",
+        400,
+      );
+    }
+  }
+
   const prFixItem =
     raw.prFixItem && typeof raw.prFixItem === "object" && !Array.isArray(raw.prFixItem)
       ? {
@@ -253,13 +422,14 @@ export async function POST(
   const report: TaskReportBody = {
     taskType: taskType as ValidTaskType,
     outcome: outcome as ValidOutcome,
-    repoFullName: raw.repoFullName as string | undefined,
+    repoFullName: typeof raw.repoFullName === "string" ? raw.repoFullName.trim() : undefined,
     issueNumber: raw.issueNumber as number | undefined,
     pullRequestNumber: raw.pullRequestNumber as number | undefined,
     pullRequestUrl: raw.pullRequestUrl as string | undefined,
     summary: raw.summary as string | undefined,
     error: raw.error as string | undefined,
     evidence,
+    close: closeCriteria ? { criteria: closeCriteria } : undefined,
     // #1120: normalized worker start time; undefined → report time (now).
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
     prFixItem,
@@ -289,6 +459,7 @@ export async function POST(
     let run: { id: string };
     let duplicate = false;
     let storedResolution: ResolvePrFixFromAgentReportResult | undefined;
+    let storedCloseResolution: ResolveAlreadyDoneResult | undefined;
 
     if (typeof idempotencyKey === "string") {
       // Idempotent reporting (#1044): claim the key and create the AgentRun in
@@ -333,6 +504,8 @@ export async function POST(
         run = { id: existing.agentRunId };
         storedResolution =
           (existing.prFixResolution as ResolvePrFixFromAgentReportResult | null) ?? undefined;
+        storedCloseResolution =
+          (existing.closeResolution as ResolveAlreadyDoneResult | null) ?? undefined;
       }
     } else {
       run = await prisma.agentRun.create({ data: runData });
@@ -379,12 +552,74 @@ export async function POST(
       }
     }
 
+    // #1143: an already_done report closes the issue through the shared close
+    // policy, evaluated against a server-built, revision-pinned catalog. The
+    // resolution is persisted like the PR-fix one, so a retried report with the
+    // same idempotency key replays the close outcome instead of re-executing it.
+    let closeResolution: ResolveAlreadyDoneResult | undefined;
+    if (isAlreadyDone) {
+      if (duplicate) {
+        // Idempotent replay: the original attempt already passed the
+        // worker-tier scope gate, the close policy, and the freshness re-check
+        // (or recorded a refusal). A retry re-runs none of those, and the
+        // stored resolution carries the audit-worthy outcome.
+        closeResolution = storedCloseResolution ?? {
+          matched: true,
+          action: "skipped",
+          reason:
+            "duplicate report (idempotency key already processed); the already_done close was not re-run — the outcome was not recorded, so verify the issue state and audit log before retrying",
+          reasons: [],
+          repoFullName: report.repoFullName!,
+          issueNumber: report.issueNumber!,
+          headSha: null,
+          evidenceDigest: null,
+          criteria: [],
+        };
+      } else {
+        // #1143 review (Blocker 1): a bound worker may only close issues that
+        // are tracked AND live-assigned to the token-derived agent. Enforce
+        // before any GitHub close or status-label write so an unauthorized
+        // close cannot reach the apply path. Maintainer / OIDC / basic /
+        // auth-disabled callers are unconstrained — the gate is a no-op for
+        // them.
+        const scopeDenial = await enforceAlreadyDoneWorkerScope(
+          auth,
+          report.repoFullName!,
+          report.issueNumber!,
+        );
+        if (scopeDenial) return scopeDenial;
+
+        closeResolution = await resolveAlreadyDoneFromAgentReport({
+          repoFullName: report.repoFullName!,
+          issueNumber: report.issueNumber!,
+          criteria: report.close!.criteria,
+          evidence: report.evidence,
+          actor: agentName,
+          issueId,
+          client: prisma,
+          // #1143 review of #1219 P1: the bound agent closes the snapshot-vs-
+          // final-read window — the apply-time freshness re-check also requires
+          // the FINAL live issue labels to still assign the issue to
+          // `agent/<boundAgent>`. Maintainer / OIDC / basic / auth-disabled
+          // callers leave this undefined so no extra constraint applies.
+          boundAgent: getBoundWorkerAgent(auth),
+        });
+        if (typeof idempotencyKey === "string") {
+          await prisma.agentReportDedupe.update({
+            where: { agentName_idempotencyKey: { agentName, idempotencyKey } },
+            data: { closeResolution: closeResolution as unknown as Prisma.InputJsonValue },
+          });
+        }
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       agentName,
       report,
       agentRunId: run.id,
       prFixResolution,
+      ...(closeResolution ? { closeResolution } : {}),
       ...(duplicate ? { duplicate: true } : {}),
     });
   } catch (error) {
