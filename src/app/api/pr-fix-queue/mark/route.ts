@@ -59,6 +59,21 @@ export async function POST(request: Request) {
       return errorResponse("Marking an item QUEUED or IGNORED requires a maintainer token", 403);
     }
 
+    // #1218 review: the mark's commit-time status pin (status === "QUEUED" for
+    // BLOCKED/PARKED settlements) must be honored for worker callers — a
+    // same-generation second mark cannot erase a recorded human decision.
+    // Operators can opt in to reclassify via `allowStickyReclassify`; workers
+    // have no equivalent. The tier value is sourced from `auth` here rather
+    // than the request body so a worker cannot forge a maintainer tier to
+    // bypass the pin. Strip any body-supplied `allowStickyReclassify` for
+    // worker requests for defense in depth.
+    const actorTier: "worker" | "maintainer" =
+      auth.tier === "maintainer" ? "maintainer" : "worker";
+    const allowStickyReclassify =
+      actorTier === "maintainer" && body && typeof body === "object" && !Array.isArray(body)
+        ? (body as Record<string, unknown>).allowStickyReclassify === true
+        : false;
+
     // #1074: bearer (agent/bridge) marks must settle a specific attempt, so
     // the generation token is required. Operator paths (oidc session, basic,
     // disabled) keep the optional behavior for compatibility.
@@ -118,7 +133,11 @@ export async function POST(request: Request) {
       }
     }
 
-    const result = await markPrFixItem(asPrFixQueueClient(prisma), input);
+    const result = await markPrFixItem(asPrFixQueueClient(prisma), {
+      ...input,
+      actorTier,
+      ...(allowStickyReclassify ? { allowStickyReclassify: true } : {}),
+    });
     if (!result.mutated) {
       if (result.reason === "generation-mismatch") {
         // The item moved to a newer attempt between the caller's read and
@@ -141,7 +160,7 @@ export async function POST(request: Request) {
         success: true,
         beforeLabels: [],
         afterLabels: [],
-        notes: `pr=${input.pr} status=${item.status}${input.note ? ` note=${input.note}` : ""}`,
+        notes: `pr=${input.pr} status=${item.status}${allowStickyReclassify ? " reclassify=true" : ""}${input.note ? ` note=${input.note}` : ""}`,
       },
     });
 

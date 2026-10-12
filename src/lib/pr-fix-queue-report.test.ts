@@ -588,8 +588,11 @@ describe("resolvePrFixFromAgentReport", () => {
     // guarded on the post-dispatch evidence list being empty, #1119) and
     // matched nothing.
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    // #1218 review: the worker-tier PARKED settle is also guarded on the row
+    // being QUEUED, so a stale generation pins status: QUEUED alongside the
+    // post-dispatch evidence guard (#1119) and id/generation (#1074).
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledWith({
-      where: { id: "item-42", generation: 1, postDispatchEvidenceKeys: { equals: [] } },
+      where: { id: "item-42", generation: 1, postDispatchEvidenceKeys: { equals: [] }, status: "QUEUED" },
       data: expect.objectContaining({ status: "PARKED" }),
     });
     expect(prisma.prFixQueueItem.update).not.toHaveBeenCalled();

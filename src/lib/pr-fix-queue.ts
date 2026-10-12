@@ -111,6 +111,28 @@ export interface MarkPrFixInput {
   outcome?: string | null;
   /** Human-decision payload persisted when the mark resolves to BLOCKED (#1218). */
   decision?: PrFixDecisionContext | null;
+  /**
+   * Caller's auth tier (#1218 review): used to gate the BLOCKED/PARKED status
+   * pin at commit time. A worker-tier mark to BLOCKED/PARKED on an already
+   * recorded BLOCKED/PARKED/FIXED row must no-op (return `generation-mismatch`)
+   * so a same-generation second mark cannot erase a genuine human decision.
+   * Defaults to `"worker"` (fail-closed): callers that don't explicitly assert
+   * a maintainer tier cannot bypass the pin. The route handler is the only
+   * trusted source of this value — `parseMarkPrFixInput` does not accept it
+   * from a request body, so a worker cannot forge a maintainer tier.
+   */
+  actorTier?: "worker" | "maintainer";
+  /**
+   * Explicit reclassification opt-in (#1218 review). When `true` AND
+   * `actorTier === "maintainer"`, the BLOCKED/PARKED status pin is relaxed
+   * for a single mark so an operator can correct a recorded classification
+   * (BLOCKED → PARKED for an outdated decision, or vice versa). Honored only
+   * for non-worker callers; a worker request that sets this is silently
+   * ignored (fail-closed). Intended for explicit operator reclassification —
+   * it is NEVER the path used by routine worker settlement, which always
+   * settles QUEUED → BLOCKED/PARKED.
+   */
+  allowStickyReclassify?: boolean;
 }
 
 export interface RequeuePrFixInput {
@@ -1547,6 +1569,19 @@ export async function markPrFixItem(
   // needs-human label. The bridge's ACTIONABLE_LANES filter skips BLOCKED.
   const data: Record<string, unknown> = { status: nextStatus };
 
+  // #1218 review: a recorded human decision (BLOCKED) and a recorded operator
+  // PARKED are sticky to worker settlements — the commit-time status pin below
+  // refuses a worker-tier BLOCKED/PARKED mark on a row that already records
+  // BLOCKED/PARKED/FIXED, so a same-generation second mark (or a read→write
+  // gap that flipped the row) cannot erase the decision. Reclassification by
+  // an operator is a separate, explicitly-authenticated path (`allowStickyReclassify`
+  // honored only when `actorTier === "maintainer"`); worker callers cannot
+  // bypass the pin.
+  const isOperatorReclassify =
+    input.actorTier === "maintainer" && input.allowStickyReclassify === true;
+  const pinToQueuedForStickySettlement =
+    (nextStatus === "BLOCKED" || nextStatus === "PARKED") && !isOperatorReclassify;
+
   // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
   // the guarded write, the cap give-up, and the history row, all inside one
   // tiny transaction the caller passes in. Pinned on the row's id, its
@@ -1840,12 +1875,19 @@ export async function markPrFixItem(
   // `data`: it would let a stale write clobber a concurrently recorded
   // entry. Unqualified marks take the same guarded updateMany path (no
   // generation clause) so the settle-gap guard applies to them too.
+  // #1218 review: a worker-tier BLOCKED/PARKED settlement additionally
+  // requires `status: "QUEUED"` at the row's pinned page — a same-generation
+  // second mark cannot downgrade a recorded human decision or parked
+  // classification, and a read→write-gap that flipped the row to BLOCKED
+  // also no-ops the write. Operator reclassification explicitly opts in
+  // via `allowStickyReclassify` to bypass the pin.
   if (!reopenPinnedMissed) {
     const settledRow = await client.$transaction(async (tx) => {
       const settleWhere: Record<string, unknown> = {
         id: existing.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
         ...(settlesAttempt ? { postDispatchEvidenceKeys: { equals: [] } } : {}),
+        ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
       };
       const { count } = await tx.prFixQueueItem.updateMany({ where: settleWhere, data });
       if (count !== 1) return null;
@@ -1911,13 +1953,17 @@ export async function markPrFixItem(
     // normally, clear them, and say so in the history (#1119). The write is
     // pinned to the exact keys snapshot this no-reopen decision was made on,
     // so an entry landing during the head fetch above no-ops the write
-    // instead of being cleared and absorbed.
+    // instead of being cleared and absorbed. #1218 review: also pin
+    // `status: QUEUED` for a worker-tier BLOCKED/PARKED settle so a row that
+    // already flipped into BLOCKED/PARKED during the gap cannot be downgraded
+    // by a stale settle.
     const clearedRow = await client.$transaction(async (tx) => {
       const { count } = await tx.prFixQueueItem.updateMany({
         where: {
           id: fresh.id,
           ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
           postDispatchEvidenceKeys: { equals: freshKeys },
+          ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
         },
         data: { ...data, postDispatchEvidenceKeys: [] },
       });
@@ -1959,11 +2005,15 @@ export async function markPrFixItem(
     // data already encodes lane/outcome/decisionDetail for the requested
     // status; writing the cleared-keys update is what the gap-reopen loop's
     // "no-reopen" branch would have done if it had won the keys pin.
+    // #1218 review: also pin `status: QUEUED` for a worker-tier BLOCKED/PARKED
+    // force so a row that already recorded a decision during the gap cannot
+    // be downgraded.
     const stickyRow = await client.$transaction(async (tx) => {
       const { count } = await tx.prFixQueueItem.updateMany({
         where: {
           id: existing.id,
           ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+          ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
         },
         data: { ...data, postDispatchEvidenceKeys: [] },
       });

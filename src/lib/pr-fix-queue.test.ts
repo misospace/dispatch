@@ -4386,7 +4386,7 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect((await listQueuedPrFixItems(client)).map((i) => i.pr)).not.toContain(310);
   });
 
-  it("retracts the needs-human label when a BLOCKED item is later parked", async () => {
+  it("retracts the needs-human label when a BLOCKED item is later parked by an operator reclassification (#1218 review)", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 311, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k311",
     });
@@ -4396,8 +4396,16 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
     surfacingMocks.surfacePrFixParked.mockClear();
 
+    // #1218 review: explicit operator reclassification — only honored for
+    // maintainer-tier callers with `allowStickyReclassify`. Worker calls at
+    // the same generation must no-op (see the regression tests below).
     const parked = await markPrFixItem(client, {
-      repo: "org/repo", pr: 311, status: "PARKED", outcome: "no_progress",
+      repo: "org/repo",
+      pr: 311,
+      status: "PARKED",
+      outcome: "no_progress",
+      actorTier: "maintainer",
+      allowStickyReclassify: true,
     });
 
     expect(mutatedItem(parked).status).toBe("PARKED");
@@ -4511,5 +4519,182 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(client.items[0].generation).toBe(2);
     expect(client.items[0].postDispatchEvidenceKeys).toEqual(["review:2@H2"]);
     expect(client.history.length).toBe(historyBefore);
+  });
+
+  // #1218 review: same-generation second worker marks must not erase a
+  // recorded human decision or parked classification. These cover both
+  // sequential marks (separate calls, same expectedGeneration) and the
+  // read→write gap (the row already records the prior settlement when the
+  // mark is issued, so the live status pin catches it at commit time).
+  describe("status pin prevents worker erase of a recorded decision (#1218 review)", () => {
+    it("a sequential worker mark BLOCKED -> PARKED at unchanged generation no-ops", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 318, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k318",
+      });
+      const decision = {
+        question: "Which behavior?",
+        options: ["A", "B"],
+        evidence: "spec mismatch",
+      };
+      const blocked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 318, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(mutatedItem(blocked).status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
+      // The same worker holds generation 1 and now reports PARKED — the prior
+      // BLOCKED is sticky. The mark must no-op, not park it.
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 318, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      // The original decision and label are intact.
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      // No history row was appended (the mark was a no-op).
+      expect(client.history.length).toBe(historyAfterBlocked);
+      // The parked surface must not fire — there is no parked classification.
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      // The blocked surface must not fire either — the decision was already
+      // surfaced on the prior call.
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    it("a sequential worker mark PARKED -> BLOCKED at unchanged generation no-ops", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 319, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k319",
+      });
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(mutatedItem(parked).status).toBe("PARKED");
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].outcome).toBe("no_progress");
+      const historyAfterParked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
+      // Worker tries to escalate back to BLOCKED at the same generation —
+      // the sticky state pin must refuse, since PARKED was a real cap and
+      // only operator reclassification or requeue should release it.
+      const escalation = await markPrFixItem(client, {
+        repo: "org/repo", pr: 319, status: "BLOCKED", decision: { question: "?" }, expectedGeneration: 1,
+      });
+
+      expect(escalation).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0].status).toBe("PARKED");
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].outcome).toBe("no_progress");
+      expect(client.items[0].decisionDetail).toBeNull();
+      expect(client.history.length).toBe(historyAfterParked);
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    // Commit-time revalidation: the row is already BLOCKED in the DB when the
+    // worker's PARKED settlement runs its updateMany (whether because the
+    // worker just read it as BLOCKED in pre-read, or because a concurrent
+    // same-generation settle landed between read and write). The status pin
+    // catches both at the commit boundary.
+    it("a worker PARKED settle no-ops at commit time when the DB row is already BLOCKED at the same generation", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 320, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k320",
+      });
+      const decision = { question: "Keep legacy?", options: ["Yes", "No"] };
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 320, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(client.items[0].status).toBe("BLOCKED");
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+
+      // Worker holds generation 1 and reports PARKED. The status pin must
+      // refuse because the row already records a human decision at the
+      // same generation — both the worker's pre-read and the DB row see
+      // BLOCKED, so the commit-time updateMany matches nothing.
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 320, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      // Decision, label, and outcome remain intact.
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.items[0].decisionDetail).toEqual(decision);
+      expect(client.history.length).toBe(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    it("an operator reclassification can downgrade BLOCKED -> PARKED with allowStickyReclassify", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 321, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k321",
+      });
+      const decision = { question: "Which?", options: ["A", "B"] };
+      const blocked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 321, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(mutatedItem(blocked).status).toBe("BLOCKED");
+      surfacingMocks.surfacePrFixParked.mockClear();
+
+      // Operator explicitly opts in to reclassify — the status pin is
+      // relaxed for this single call. The prior BLOCKED's outcome is
+      // overwritten with `no_progress`; decisionDetail clears as a side
+      // effect of the reclassify.
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo",
+        pr: 321,
+        status: "PARKED",
+        outcome: "no_progress",
+        expectedGeneration: 1,
+        actorTier: "maintainer",
+        allowStickyReclassify: true,
+      });
+
+      expect(mutatedItem(parked).status).toBe("PARKED");
+      expect(client.items[0].lane).toBe("NORMAL");
+      expect(client.items[0].outcome).toBe("no_progress");
+      expect(client.items[0].decisionDetail).toBeNull();
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledWith(
+        expect.objectContaining({ removeNeedsHumanLabel: true, outcome: "no_progress" }),
+      );
+    });
+
+    it("a worker caller cannot bypass the pin by sending allowStickyReclassify=true (fail-closed)", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 322, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k322",
+      });
+      const blocked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 322, status: "BLOCKED", expectedGeneration: 1,
+      });
+      expect(mutatedItem(blocked).status).toBe("BLOCKED");
+      const historyBefore = client.history.length;
+
+      // Worker sends allowStickyReclassify=true; without a maintainer tier
+      // the pin is honored (fail-closed).
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo",
+        pr: 322,
+        status: "PARKED",
+        outcome: "no_progress",
+        expectedGeneration: 1,
+        allowStickyReclassify: true,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      expect(client.history.length).toBe(historyBefore);
+    });
   });
 });
