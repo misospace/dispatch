@@ -1762,6 +1762,20 @@ describe("POST /api/agents/[agentName]/tasks/report — already_done close (#114
     });
   }
 
+  it.each([
+    { taskType: "followup-pr", prFixItem: undefined },
+    { taskType: "followup-pr", prFixItem: { id: "item-1", generation: 1 } },
+    { taskType: "implement", prFixItem: { id: "item-1", generation: 1 } },
+  ])("rejects already_done for $taskType with invalid task/token combination before side effects", async ({ taskType, prFixItem }) => {
+    const res = await postRequest({ ...validBody, taskType, ...(prFixItem ? { prFixItem } : {}) });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/only valid for implement reports without prFixItem/);
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+    expect(mockDedupe.create).not.toHaveBeenCalled();
+    expect(prFixResolveMock).not.toHaveBeenCalled();
+    expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+
   it("returns 400 when already_done has no idempotencyKey", async () => {
     const { idempotencyKey: _omit, ...body } = validBody;
     const res = await postRequest(body);
@@ -1893,6 +1907,22 @@ describe("POST /api/agents/[agentName]/tasks/report — already_done close (#114
     expect(body.closeResolution.action).toBe("closed");
     // The close resolver ran only for the first report, never the replay.
     expect(closeResolveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("settles followup-pr already_addressed with its generation token", async () => {
+    const res = await postRequest({
+      taskType: "followup-pr",
+      outcome: "already_addressed",
+      repoFullName: "o/r",
+      pullRequestNumber: 5,
+      evidence: "done",
+      prFixItem: { id: "item-1", generation: 2 },
+    });
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: "already_addressed",
+      attempt: { itemId: "item-1", generation: 2 },
+    }));
   });
 
   it("does not route already_addressed through the close resolver", async () => {
