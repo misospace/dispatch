@@ -42,6 +42,7 @@ vi.mock("@/lib/prisma", () => ({
       prFixQueueItem: {
         create: mocks.prFixCreate,
         findUnique: mocks.prFixFindUniqueByRepo,
+        updateMany: mocks.prFixUpdateMany,
       },
       prFixHistory: { create: mocks.prFixHistoryCreate },
     }),
@@ -643,6 +644,71 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(secondBody.type).toBe("followup-pr");
     expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
     expect(secondBody.prFixItem.id).toBe(firstBody.prFixItem.id);
+  });
+
+  it("withholds future external waits and lazily hands out due retries at a new generation (#1231)", async () => {
+    const client = makeQueueStore();
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      client.prFixQueueItem.findMany({ where }),
+    );
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      client.items.find((row: any) => row.id === where.id) ?? null,
+    );
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      const row = client.items.find((candidate: any) =>
+        candidate.id === where.id && candidate.generation === where.generation &&
+        (where.status === undefined || candidate.status === where.status) &&
+        (where.retryAt === undefined || candidate.retryAt?.getTime() === where.retryAt.getTime()) &&
+        (!where.OR || where.OR.some((condition: any) =>
+          condition.dispatchedGeneration === null
+            ? candidate.dispatchedGeneration == null
+            : candidate.dispatchedGeneration !== condition.dispatchedGeneration.not,
+        )),
+      );
+      if (!row) return { count: 0 };
+      const patch: Record<string, any> = { ...data };
+      for (const [key, value] of Object.entries(patch)) {
+        if (value && typeof value === "object" && Array.isArray((value as any).push)) {
+          patch[key] = [...(row[key] ?? []), ...(value as any).push];
+        } else if (value && typeof value === "object" && typeof (value as any).increment === "number") {
+          patch[key] = (row[key] ?? 0) + (value as any).increment;
+        }
+      }
+      Object.assign(row, patch);
+      return { count: 1 };
+    });
+    const item = await enqueuePrFixItem(client, {
+      repo: "org/repo", pr: 123, lane: "NORMAL", reason: "review changes requested",
+      feedback: "please update tests", evidenceKey: "review:123",
+    });
+    await markPrFixItem(client, {
+      repo: "org/repo", pr: 123, status: "WAITING_EXTERNAL",
+      expectedGeneration: item.generation, note: "waiting on prerequisite",
+    });
+    const waiting = client.items[0];
+    const issuedGeneration = waiting.generation;
+    expect(waiting.retryAt.getTime()).toBeGreaterThan(Date.now());
+
+    const poll = async () => GET(
+      request("/api/agents/example-agent/next-task"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const early = await poll();
+    expect((await early.json()).type).toBe("idle");
+    expect(waiting.status).toBe("WAITING_EXTERNAL");
+
+    waiting.retryAt = new Date(Date.now() - 1_000);
+    const due = await poll();
+    const body = await due.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toEqual({ id: waiting.id, generation: issuedGeneration + 1 });
+    expect(waiting.status).toBe("QUEUED");
+    expect(waiting.generation).toBeGreaterThan(issuedGeneration);
+    expect(waiting.fixAttempts).toBeUndefined();
+    expect(waiting.dispatchedGeneration).toBe(waiting.generation);
+
+    const repeat = await poll();
+    expect((await repeat.json()).type).toBe("idle");
   });
 
   it("serves the bumped generation through the production requeue path", async () => {

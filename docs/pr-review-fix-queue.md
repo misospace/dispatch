@@ -11,8 +11,8 @@ Each item is deduped by `(repo, pr)` and stores:
 - `repo`, `pr`, `branch`, `url`, `title`
 - optional source `issue` (extracted from PR title/body)
 - `lane`: `NORMAL`, `ESCALATED`, or `NEEDS_HUMAN`
-- `status`: `QUEUED`, `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `IGNORED`
-- `outcome`: `human_decision`, `no_progress`, `infra_failure`, or `security_failure`; human decisions may also store `decisionDetail`
+- `status`: `QUEUED`, `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL`
+- `outcome`: `human_decision`, `no_progress`, `infra_failure`, or `security_failure`; human decisions may also store `decisionDetail`. External waits use report outcome `waiting-external` and status `WAITING_EXTERNAL`, with a bounded cooldown before a fresh generation checks readiness.
 - `reason`, `feedback[]`, `evidenceKeys[]`
 - `headSha` and `author` metadata
 - `generation` — Dispatch-owned work generation (see below)
@@ -93,7 +93,7 @@ Items in the `NEEDS_HUMAN` lane receive `BLOCKED` status and are excluded from t
 
 ### Mark item status
 
-`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `IGNORED` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision.
+`POST /api/pr-fix-queue/mark` — Marks an item `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, or `WAITING_EXTERNAL` and records a history event. Requires auth. The body may include an `outcome` (`human_decision`, `no_progress`, `infra_failure`, or `security_failure`) and a `decision` object (`question`, `options`, and `evidence`) when recording a human decision.
 
 **Request body:**
 ```json

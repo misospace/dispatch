@@ -249,10 +249,10 @@ export function isValidEscalatedOutcome(outcome: string): outcome is EscalatedOu
 // ─── PR Review-Fix Queue Constants and Helpers ───────────────────────────────
 
 export type PrFixLane = "NORMAL" | "ESCALATED" | "NEEDS_HUMAN";
-export type PrFixStatus = "QUEUED" | "FIXED" | "BLOCKED" | "PARKED" | "STALE" | "IGNORED";
+export type PrFixStatus = "QUEUED" | "FIXED" | "BLOCKED" | "PARKED" | "STALE" | "IGNORED" | "WAITING_EXTERNAL";
 
 export const VALID_PR_FIX_LANES: PrFixLane[] = ["NORMAL", "ESCALATED", "NEEDS_HUMAN"];
-export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED", "PARKED", "STALE", "IGNORED"];
+export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED", "PARKED", "STALE", "IGNORED", "WAITING_EXTERNAL"];
 
 // ─── PR Fix Outcome Constants ────────────────────────────────────────────────
 //

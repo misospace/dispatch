@@ -134,6 +134,7 @@ enum PrFixStatus {
   PARKED
   STALE
   IGNORED
+  WAITING_EXTERNAL
 }
 
 enum PrFixType {
@@ -219,6 +220,8 @@ model PrFixQueueItem {
   // `needs-human` label is never applied. Release requires an explicit
   // operator requeue or a maintainer mark to QUEUED.
   handoutReclaims Int @default(0)
+  // Cooldown deadline for external dependency waits; due items are reissued lazily.
+  retryAt DateTime?
   author       String?
   history      PrFixHistory[]
 

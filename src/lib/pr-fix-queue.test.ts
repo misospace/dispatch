@@ -128,6 +128,7 @@ function makeClient(): PrFixQueueClient & {
           // so a freshly created row reads back as "no ack, never reclaimed".
           handoutAcks: [], // mirrors the column's @default([])
           handoutReclaims: 0, // mirrors the column's @default(0)
+          retryAt: null,
           // #1218 outcome classification columns: default to null so a freshly
           // created row reads back as "no outcome / no decision".
           outcome: null,
@@ -171,6 +172,7 @@ function makeClient(): PrFixQueueClient & {
             (where.id === undefined || i.id === where.id) &&
             (where.generation === undefined || i.generation === where.generation) &&
             (where.status === undefined || i.status === where.status) &&
+            (where.retryAt === undefined || (where.retryAt.lte && i.retryAt != null && new Date(i.retryAt).getTime() <= new Date(where.retryAt.lte).getTime()) || i.retryAt === where.retryAt) &&
             (where.postDispatchEvidenceKeys === undefined ||
               JSON.stringify(i.postDispatchEvidenceKeys ?? []) ===
                 JSON.stringify(where.postDispatchEvidenceKeys.equals ?? [])) &&

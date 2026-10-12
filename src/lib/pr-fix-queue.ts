@@ -550,6 +550,24 @@ export function maxPrFixAttempts(): number {
   return Number.isInteger(n) && n > 0 ? n : 5;
 }
 
+export function externalWaitCooldownMs(): number {
+  const n = Number(process.env.PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS);
+  return Number.isInteger(n) && n >= 60_000 && n <= 7 * 24 * 60 * 60 * 1000 ? n : 6 * 60 * 60 * 1000;
+}
+
+async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): Promise<void> {
+  const due = await client.prFixQueueItem.findMany({ where: { status: "WAITING_EXTERNAL", retryAt: { lte: now } }, take: 100 });
+  for (const row of due.filter((candidate) => candidate.status === "WAITING_EXTERNAL" && candidate.retryAt && new Date(candidate.retryAt).getTime() <= now.getTime())) {
+    await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
+        data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [] },
+      });
+      if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
+    });
+  }
+}
+
 /**
  * How long a stamped hand-out may sit unacknowledged before the reclaimer
  * treats it as abandoned (#1211). A worker that durably materialized its
@@ -1098,7 +1116,8 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           snapshot.status === "STALE" ||
           snapshot.status === "IGNORED" ||
           snapshot.status === "BLOCKED" ||
-          snapshot.status === "PARKED";
+          snapshot.status === "PARKED" ||
+          snapshot.status === "WAITING_EXTERNAL";
 
         const nextEvidenceKeys = uniqueAppend(snapshot.evidenceKeys ?? [], input.evidenceKey, 40);
 
@@ -1446,6 +1465,8 @@ export async function createLinkedPrFixItem(
 
 export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { lane?: string | null; includeBlocked?: boolean; prioritizeByType?: boolean } = {}) {
   const lane = options.lane ? normalizePrFixLane(options.lane) : undefined;
+  const now = new Date();
+  await reactivateDueExternalWaits(client, now);
   const status = options.includeBlocked ? { in: ["QUEUED", "BLOCKED", "PARKED"] } : "QUEUED";
 
   const items = await client.prFixQueueItem.findMany({
@@ -1554,6 +1575,9 @@ export async function markPrFixItem(
   const input: MarkPrFixInput = { ...rawInput, repo: normalizeQueueRepo(rawInput.repo) };
   const nextStatus = normalizePrFixStatus(input.status) as PrFixStatus | null;
   if (!nextStatus) throw new Error("Invalid status");
+  if (nextStatus === "WAITING_EXTERNAL" && (input.expectedGeneration === undefined || input.expectedGeneration === null)) {
+    throw new Error("generation is required for WAITING_EXTERNAL");
+  }
 
   const expectedGeneration =
     input.expectedGeneration !== undefined && input.expectedGeneration !== null
@@ -1571,6 +1595,20 @@ export async function markPrFixItem(
   // is bounded exhaustion or an operational failure: lane NORMAL, no
   // needs-human label. The bridge's ACTIONABLE_LANES filter skips BLOCKED.
   const data: Record<string, unknown> = { status: nextStatus };
+  if (nextStatus === "WAITING_EXTERNAL") {
+    if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
+      return { mutated: true, item: existing };
+    }
+    if (existing.status !== "QUEUED") return { mutated: false, reason: "generation-mismatch" };
+    data.retryAt = new Date(Date.now() + externalWaitCooldownMs());
+    data.outcome = null;
+    data.decisionDetail = null;
+    data.postDispatchEvidenceKeys = [];
+    data.dispatchedGeneration = null;
+    data.dispatchedAt = null;
+    data.agentHandouts = [];
+    data.handoutAcks = [];
+  }
 
   // #1218 review: a recorded human decision (BLOCKED) and a recorded operator
   // PARKED are sticky to worker settlements — the commit-time status pin below
@@ -1601,6 +1639,22 @@ export async function markPrFixItem(
       (nextStatus === "FIXED" || nextStatus === "STALE") &&
       input.actorTier !== "maintainer"
     );
+
+  if (nextStatus === "WAITING_EXTERNAL") {
+    const result = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: { id: existing.id, status: "QUEUED", generation: expectedGeneration },
+        data,
+      });
+      if (count !== 1) return null;
+      await tx.prFixHistory.create({ data: { itemId: existing.id, action: "mark", status: "WAITING_EXTERNAL", lane: existing.lane, note: input.note ?? null } });
+      return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    });
+    if (result) return { mutated: true, item: result };
+    const latest = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+    if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) return { mutated: true, item: latest };
+    return { mutated: false, reason: "generation-mismatch" };
+  }
 
   // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
   // the guarded write, the cap give-up, and the history row, all inside one
@@ -2153,7 +2207,7 @@ export async function reconcileStalePrFixItems(
       where: {
         repo,
         pr: { in: Array.from(prNumbers) },
-        status: { in: ["QUEUED", "BLOCKED", "PARKED"] },
+        status: { in: ["QUEUED", "BLOCKED", "PARKED", "WAITING_EXTERNAL"] },
       },
     });
     checked += staleCandidates.length;
@@ -2214,7 +2268,7 @@ export async function reconcileArchivedRepoPrFixItems(
   let markedStale = 0;
   let errored = 0;
 
-  const active = await client.prFixQueueItem.findMany({ where: { status: { in: ["QUEUED", "BLOCKED", "PARKED"] } } });
+  const active = await client.prFixQueueItem.findMany({ where: { status: { in: ["QUEUED", "BLOCKED", "PARKED", "WAITING_EXTERNAL"] } } });
   const byRepo = new Map<string, any[]>();
   for (const item of active) byRepo.set(item.repo, [...(byRepo.get(item.repo) ?? []), item]);
 
@@ -2449,6 +2503,7 @@ export type AgentReportOutcome =
   | "blocked"
   | "failed"
   | "already_addressed"
+  | "waiting-external"
   // #1143: an issue close, not a PR-fix settlement; never touches the queue.
   | "already_done"
   | "handed-off";
@@ -2626,6 +2681,13 @@ export async function resolvePrFixFromAgentReport(
   }
 
   const currentStatus = normalizePrFixStatus(existing.status) as PrFixStatus | null;
+  if (
+    input.outcome === "waiting-external" &&
+    currentStatus === "WAITING_EXTERNAL" &&
+    attempt?.generation === existing.generation
+  ) {
+    return { matched: true, action: "deferred", itemId: existing.id ?? null, reason: "external wait already recorded for this generation", attemptGeneration: attempt.generation };
+  }
   if (!currentStatus || currentStatus !== "QUEUED") {
     // Already settled (FIXED / BLOCKED / STALE). Idempotent — nothing to do.
     return {
@@ -2638,6 +2700,22 @@ export async function resolvePrFixFromAgentReport(
   }
 
   const expectedGeneration = attempt?.generation ?? undefined;
+
+  if (input.outcome === "waiting-external") {
+    if (expectedGeneration === undefined) {
+      return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "waiting-external requires a prFixItem attempt token" };
+    }
+    const marked = await markPrFixItem(client as PrFixQueueClient, {
+      repo, pr, status: "WAITING_EXTERNAL", note: input.summary ?? null, expectedGeneration,
+    });
+    return {
+      matched: true,
+      action: marked.mutated ? "deferred" : "skipped",
+      itemId: existing.id ?? null,
+      reason: marked.mutated ? "worker is waiting for an external prerequisite" : `wait transition skipped: ${marked.reason}`,
+      attemptGeneration: attempt?.generation ?? null,
+    };
+  }
 
   if (input.outcome === "blocked") {
     // #1218: a `blocked` report is a genuine human decision only when it

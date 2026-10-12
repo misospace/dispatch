@@ -31,6 +31,7 @@ const VALID_OUTCOMES = [
   "already_addressed",
   "already_done",
   "handed-off",
+  "waiting-external",
 ] as const;
 type ValidOutcome = (typeof VALID_OUTCOMES)[number];
 
@@ -73,6 +74,7 @@ function deriveStatus(outcome: ValidOutcome): string {
   if (outcome === "handed-off") return "handed-off";
   if (outcome === "failed") return "failed";
   if (outcome === "blocked") return "blocked";
+  if (outcome === "waiting-external") return "waiting-external";
   return "completed";
 }
 
