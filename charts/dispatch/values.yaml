@@ -42,15 +42,14 @@ controllers:
           - secretRef:
               name: dispatch
         probes:
-          # Probes target /api/health (public, excluded from the auth
-          # middleware) so basic-auth deployments pass them and readiness
-          # reflects real DB health (503 when the database is unreachable).
+          # TCP liveness checks that the server process is accepting connections
+          # without coupling restarts to database availability. Readiness targets
+          # /api/health (public, excluded from auth middleware) and reflects DB health.
           liveness:
             enabled: true
             custom: true
             spec:
-              httpGet:
-                path: /api/health
+              tcpSocket:
                 port: 3000
               initialDelaySeconds: 10
               periodSeconds: 10
