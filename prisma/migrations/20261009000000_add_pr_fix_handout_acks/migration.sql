@@ -11,9 +11,11 @@
 -- attempt clears the list.
 --
 -- `handoutReclaims` counts bounded automatic reclamations of stale
--- unacknowledged hand-outs. Past PR_FIX_MAX_RECLAIMS the item goes to BLOCKED
--- in the NEEDS_HUMAN lane instead of being reclaimed again. No backfill: a row
--- that was never acknowledged simply starts empty, and an already-handled row
--- starts at zero.
+-- unacknowledged hand-outs. Past PR_FIX_MAX_RECLAIMS the item parks as PARKED
+-- in the NORMAL lane with outcome=`no_progress` (#1218) — bounded
+-- no-progress exhaustion, not a human decision, so the `needs-human` label is
+-- never applied. Release requires an explicit operator requeue or a
+-- maintainer mark to QUEUED. No backfill: a row that was never acknowledged
+-- simply starts empty, and an already-handled row starts at zero.
 ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "handoutAcks" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
 ALTER TABLE "PrFixQueueItem" ADD COLUMN IF NOT EXISTS "handoutReclaims" INTEGER NOT NULL DEFAULT 0;

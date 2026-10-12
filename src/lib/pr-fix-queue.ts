@@ -780,7 +780,10 @@ async function defaultIsPrMergedOrClosed(repo: string, pr: number): Promise<bool
  *
  * - merged/closed PR → STALE (nothing left to fix);
  * - unknown PR state → deferred (`unknownState`), never reclaimed;
- * - past PR_FIX_MAX_RECLAIMS → BLOCKED + NEEDS_HUMAN (terminal hand-off);
+ * - past PR_FIX_MAX_RECLAIMS → PARKED + NORMAL with outcome=`no_progress`
+ *   (#1218); bounded exhaustion, not a human decision, so `needs-human` is
+ *   never applied. Release requires an explicit operator requeue or a
+ *   maintainer mark to QUEUED.
  * - otherwise → reopen as a fresh generation (a new work identity) and count
  *   the reclaim. The ack-list pin makes an acknowledgement landing in the
  *   read→write gap a no-op, so a live worker is never clobbered.

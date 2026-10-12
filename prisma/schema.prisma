@@ -214,7 +214,10 @@ model PrFixQueueItem {
   // Bounded automatic reclamations of stale unacknowledged hand-outs (#1211):
   // counts how many times the reclaimer has reopened this item because a
   // stamped hand-out was never acknowledged. Past PR_FIX_MAX_RECLAIMS the item
-  // goes to BLOCKED in the NEEDS_HUMAN lane instead of being reclaimed again.
+  // parks as PARKED in the NORMAL lane with outcome=`no_progress` (#1218) —
+  // bounded no-progress exhaustion, never a human decision, so the
+  // `needs-human` label is never applied. Release requires an explicit
+  // operator requeue or a maintainer mark to QUEUED.
   handoutReclaims Int @default(0)
   author       String?
   history      PrFixHistory[]
