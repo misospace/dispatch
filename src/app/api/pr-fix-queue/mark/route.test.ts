@@ -264,6 +264,22 @@ describe("POST /api/pr-fix-queue/mark — worker tier (#1111)", () => {
     );
   }
 
+  it("allows a worker to mark an item WAITING_EXTERNAL with the exact generation", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL", expectedGeneration: 2 });
+    mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "WAITING_EXTERNAL" } });
+    const res = await workerPost({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL", generation: 2 });
+    expect(res.status).toBe(200);
+    expect(mocks.markPrFixItem).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ status: "WAITING_EXTERNAL", expectedGeneration: 2 }));
+  });
+
+  it("rejects a worker external wait without a generation", async () => {
+    mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL" });
+    const res = await workerPost({ repo: "org/repo", pr: 42, status: "WAITING_EXTERNAL" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("generation is required for WAITING_EXTERNAL");
+    expect(mocks.markPrFixItem).not.toHaveBeenCalled();
+  });
+
   it("allows a worker to mark an item FIXED with a generation", async () => {
     mocks.parseMarkPrFixInput.mockReturnValue({ repo: "org/repo", pr: 42, status: "FIXED", expectedGeneration: 2 });
     mocks.markPrFixItem.mockResolvedValue({ mutated: true, item: { id: "fix-1", status: "FIXED" } });

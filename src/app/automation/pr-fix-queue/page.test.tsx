@@ -36,6 +36,21 @@ describe("PR Fix Queue page", () => {
     expect(screen.getByText(/ci failure/)).toBeInTheDocument();
   });
 
+  it("shows external waits as read-only with their note and retry deadline", async () => {
+    const retryAt = "2026-01-03T12:00:00Z";
+    mockAuthedFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { id: "wait-1", repo: "org/repo", pr: 44, status: "WAITING_EXTERNAL", lane: "NORMAL", reason: "CI prerequisite", latestNote: "missing prerequisite: X", retryAt, title: "Wait for CI", url: null, queuedAt: "2026-01-02T00:00:00Z" },
+      ],
+    });
+    render(<PrFixQueuePage />);
+    await waitFor(() => expect(screen.getByText(/Waiting on external prerequisite/i)).toBeInTheDocument());
+    expect(screen.getByText("missing prerequisite: X")).toBeInTheDocument();
+    expect(screen.getByText(new Date(retryAt).toLocaleString())).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /requeue/i })).not.toBeInTheDocument();
+  });
+
   it("shows empty state when no items", async () => {
     mockAuthedFetch.mockResolvedValueOnce({
       ok: true,

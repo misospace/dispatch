@@ -38,7 +38,7 @@ Dispatch bearer tokens have two tiers. A **worker** token may call exactly:
 - `POST /api/issues/claim` (without `force`) and `POST /api/issues/unclaim` (for the caller's own agent)
 - `GET /api/issues/state`, `POST /api/issues/status` (status only for issues assigned to the caller's own agent)
 - `GET /api/issues`, `GET /api/pr-fix-queue/queued`, `GET /api/pr-fix-queue/history`
-- `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, or `STALE` (generation required, as today)
+- `POST /api/pr-fix-queue/mark` with `FIXED`, `BLOCKED`, `PARKED`, `STALE`, or `WAITING_EXTERNAL` (generation required)
 - `POST /api/pr-fix-queue/ack` (the durable hand-out acknowledgement, see "Hand-out acknowledgement" below)
 
 The **maintainer** token (`DISPATCH_AGENT_TOKEN`, or the `DISPATCH_MAINTAINER_TOKEN` alias) keeps full rights and acts on any agent's behalf. A worker token calling a maintainer-only route gets an HTTP 403 naming the required tier: force claims, `QUEUED`/`IGNORED` marks, `POST /api/pr-fix-queue/requeue`, and the `POST /api/pr-fix-queue/sweep` reclaim job are maintainer-only. Unclaim is not tier-gated — the target agent is bound to the caller and is only bounded by the assignment check; the legacy `DISPATCH_WORKER_TOKEN` falls back to the request body, but `DISPATCH_WORKER_TOKENS` overrides that with a token-derived identity. A `DISPATCH_WORKER_TOKEN` value that duplicates a maintainer token resolves to the lower worker tier (fail-closed) and logs a one-time boot warning — set it to a distinct value.
@@ -224,7 +224,7 @@ curl -s -X POST "DISPATCH_URL/api/pr-fix-queue/mark" \
   -d '{"repo":"org/repo","pr":42,"status":"fixed"}'
 ```
 
-Valid statuses: `FIXED`, `BLOCKED`, `STALE`, `IGNORED`.
+Valid statuses: `FIXED`, `BLOCKED`, `PARKED`, `STALE`, `IGNORED`, `WAITING_EXTERNAL`. `WAITING_EXTERNAL` defers the consumed generation for the configured cooldown; it neither charges an attempt nor signals prerequisite readiness.
 
 ### Normal Lane
 

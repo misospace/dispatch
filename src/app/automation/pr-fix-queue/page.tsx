@@ -18,6 +18,8 @@ interface PrFixItem {
   title: string | null;
   url: string | null;
   queuedAt: string;
+  retryAt?: string | null;
+  latestNote?: string | null;
   outcome?: string | null;
   fixAttempts?: number | null;
 }
@@ -116,6 +118,7 @@ export default function PrFixQueuePage() {
   const blocked = items.filter((i) => i.status === "BLOCKED");
   const parked = items.filter((i) => i.status === "PARKED");
   const queued = items.filter((i) => i.status === "QUEUED");
+  const waiting = items.filter((i) => i.status === "WAITING_EXTERNAL");
 
   if (loading) {
     return <div className="flex items-center justify-center h-64">Loading...</div>;
@@ -286,6 +289,27 @@ export default function PrFixQueuePage() {
                   </TableRow>
                 ))}
               </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="border-blue-200">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            Waiting on external prerequisite
+            {waiting.length > 0 && <Badge className="ml-2">{waiting.length}</Badge>}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {waiting.length === 0 ? <p className="text-center py-8 text-muted-foreground">No external waits.</p> : (
+            <Table>
+              <TableHeader><TableRow><TableHead>Repo / PR</TableHead><TableHead>Last-known explanation</TableHead><TableHead>Retry At</TableHead></TableRow></TableHeader>
+              <TableBody>{waiting.map((item) => <TableRow key={item.id}>
+                <TableCell><a href={prLink(item)} target="_blank" rel="noopener noreferrer" className="font-medium hover:underline">{prTitle(item)}</a><div className="text-xs text-muted-foreground">{item.repo}</div></TableCell>
+                <TableCell className="text-sm">{item.latestNote || item.reason}</TableCell>
+                <TableCell className="text-sm text-muted-foreground">{item.retryAt ? formatTime(item.retryAt) : "Not scheduled"}</TableCell>
+              </TableRow>)}</TableBody>
             </Table>
           )}
         </CardContent>
