@@ -2111,7 +2111,7 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
   });
 
   it("folds to a resolved notice when a mark settles the item FIXED", async () => {
-    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", note: "fixed by hand" });
+    await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", note: "fixed by hand", actorTier: "maintainer" });
     expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "resolved", "fixed by hand");
   });
 
@@ -2129,7 +2129,7 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
 
   it("folds to a requeued notice when a FIXED mark is refused back to QUEUED", async () => {
     githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("H1");
-    const refused = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" }));
+    const refused = mutatedItem(await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", actorTier: "maintainer" }));
     expect(refused.status).toBe("QUEUED");
     expect(surfacingMocks.surfacePrFixUnblocked).toHaveBeenCalledWith("org/repo", 1, "requeued", undefined);
   });
@@ -2144,7 +2144,7 @@ describe("needs-human cleanup on every exit from BLOCKED (#1105)", () => {
 
   it("never lets a cleanup failure break the transition", async () => {
     surfacingMocks.surfacePrFixUnblocked.mockRejectedValue(new Error("network down"));
-    const result = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed" });
+    const result = await markPrFixItem(client, { repo: "org/repo", pr: 1, status: "fixed", actorTier: "maintainer" });
     expect(mutatedItem(result).status).toBe("FIXED");
   });
 });
@@ -4632,6 +4632,98 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(client.history.length).toBe(historyAfterBlocked);
       expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
       expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { name: "FIXED with head moved", body: { status: "FIXED", note: "pushed" }, headSha: "live-head" },
+      { name: "FIXED via alreadyAddressed (guard bypassed)", body: { status: "FIXED", alreadyAddressed: true, note: "handled" }, headSha: null },
+      { name: "STALE", body: { status: "STALE", note: "stale" }, headSha: null },
+    ])("a sequential worker mark BLOCKED -> $name at unchanged generation no-ops", async ({ body, headSha }) => {
+      const decision = { question: "Which behavior?", options: ["A", "B"], evidence: "conflict" };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 322, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k322",
+      });
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 322, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(client.items[0].status).toBe("BLOCKED");
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+      githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(headSha);
+
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 322, expectedGeneration: 1, ...body,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", generation: 1, lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision,
+      });
+      expect(client.history).toHaveLength(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
+    it("a sequential worker mark BLOCKED -> FIXED with head unchanged no-ops instead of re-queuing", async () => {
+      const decision = { question: "Which behavior?", options: ["A", "B"], evidence: "conflict" };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 323, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k323", headSha: "baseline-sha",
+      });
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 323, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+      githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue("baseline-sha");
+
+      // Head unchanged: without the status pin the refusal fallback would
+      // bump a fresh QUEUED attempt (or PARK at cap) and erase the decision.
+      const secondMark = await markPrFixItem(client, {
+        repo: "org/repo", pr: 323, status: "FIXED", note: "pushed nothing", expectedGeneration: 1,
+      });
+
+      expect(secondMark).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", generation: 1, lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision,
+      });
+      expect(client.history).toHaveLength(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
+    it.each(["FIXED", "STALE"])("a worker %s settle no-ops at commit time when the row flips to BLOCKED mid-gap", async (status) => {
+      const decision = { question: "Which behavior?", options: ["A", "B"], evidence: "conflict" };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 324, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k324",
+      });
+      const historyLength = client.history.length;
+      client.hooks.beforeUpdateMany = () => {
+        Object.assign(client.items[0], { status: "BLOCKED", lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision });
+      };
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+      githubPrsMocks.fetchPullRequestHeadSha.mockReset();
+      githubPrsMocks.fetchPullRequestHeadSha.mockResolvedValue(null);
+
+      const raced = await markPrFixItem(client, {
+        repo: "org/repo", pr: 324, status: status as any, note: "raced", expectedGeneration: 1,
+      });
+
+      expect(raced).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", generation: 1, decisionDetail: decision, lane: "NEEDS_HUMAN",
+      });
+      expect(client.history).toHaveLength(historyLength);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
     });
 
     it("an operator reclassification can downgrade BLOCKED -> PARKED with allowStickyReclassify", async () => {

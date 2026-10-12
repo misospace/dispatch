@@ -1582,8 +1582,17 @@ export async function markPrFixItem(
   // bypass the pin.
   const isOperatorReclassify =
     input.actorTier === "maintainer" && input.allowStickyReclassify === true;
+  // #1218 review (follow-up): the pin covers every terminal outcome a worker
+  // token may submit — FIXED and STALE as well as BLOCKED/PARKED. A recorded
+  // BLOCKED/PARKED settlement never bumps the generation, so a same-generation
+  // worker FIXED (happy path, refused-head rollback, evidence reopen/force) or
+  // STALE mark could otherwise release or erase the recorded decision.
+  // Maintainer-tier callers (operator requeue/reclassification, internal
+  // reconciliation) keep their broader transitions.
   const pinToQueuedForStickySettlement =
-    (nextStatus === "BLOCKED" || nextStatus === "PARKED") && !isOperatorReclassify;
+    input.actorTier !== "maintainer" &&
+    (nextStatus === "FIXED" || nextStatus === "BLOCKED" || nextStatus === "PARKED" || nextStatus === "STALE") &&
+    !isOperatorReclassify;
 
   // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
   // the guarded write, the cap give-up, and the history row, all inside one
@@ -1626,6 +1635,7 @@ export async function markPrFixItem(
       where: {
         id: row.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
         postDispatchEvidenceKeys: { equals: row.postDispatchEvidenceKeys ?? [] },
       },
       data: reopenData,
@@ -1790,6 +1800,7 @@ export async function markPrFixItem(
           where: {
             id: existing.id,
             ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+            ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
           },
           data: refusalData,
         });
@@ -1878,12 +1889,12 @@ export async function markPrFixItem(
   // `data`: it would let a stale write clobber a concurrently recorded
   // entry. Unqualified marks take the same guarded updateMany path (no
   // generation clause) so the settle-gap guard applies to them too.
-  // #1218 review: a worker-tier BLOCKED/PARKED settlement additionally
-  // requires `status: "QUEUED"` at the row's pinned page — a same-generation
-  // second mark cannot downgrade a recorded human decision or parked
-  // classification, and a read→write-gap that flipped the row to BLOCKED
-  // also no-ops the write. Operator reclassification explicitly opts in
-  // via `allowStickyReclassify` to bypass the pin.
+  // #1218 review: a worker-tier terminal settlement (FIXED/BLOCKED/PARKED/
+  // STALE) additionally requires `status: "QUEUED"` at the row's pinned
+  // page — a same-generation second mark cannot release or downgrade a
+  // recorded human decision or parked classification, and a read→write-gap
+  // that flipped the row also no-ops the write. Operator reclassification
+  // explicitly opts in via `allowStickyReclassify` to bypass the pin.
   if (!reopenPinnedMissed) {
     const settledRow = await client.$transaction(async (tx) => {
       const settleWhere: Record<string, unknown> = {
@@ -1957,9 +1968,9 @@ export async function markPrFixItem(
     // pinned to the exact keys snapshot this no-reopen decision was made on,
     // so an entry landing during the head fetch above no-ops the write
     // instead of being cleared and absorbed. #1218 review: also pin
-    // `status: QUEUED` for a worker-tier BLOCKED/PARKED settle so a row that
-    // already flipped into BLOCKED/PARKED during the gap cannot be downgraded
-    // by a stale settle.
+    // `status: QUEUED` for a worker-tier terminal settle so a row that
+    // already flipped into a recorded settlement during the gap cannot be
+    // overwritten by a stale settle.
     const clearedRow = await client.$transaction(async (tx) => {
       const { count } = await tx.prFixQueueItem.updateMany({
         where: {
@@ -2008,9 +2019,9 @@ export async function markPrFixItem(
     // data already encodes lane/outcome/decisionDetail for the requested
     // status; writing the cleared-keys update is what the gap-reopen loop's
     // "no-reopen" branch would have done if it had won the keys pin.
-    // #1218 review: also pin `status: QUEUED` for a worker-tier BLOCKED/PARKED
-    // force so a row that already recorded a decision during the gap cannot
-    // be downgraded.
+    // #1218 review: also pin `status: QUEUED` for a worker-tier terminal
+    // force so a row that already recorded a settlement during the gap
+    // cannot be overwritten.
     const stickyRow = await client.$transaction(async (tx) => {
       const { count } = await tx.prFixQueueItem.updateMany({
         where: {
@@ -2071,6 +2082,7 @@ export async function markPrFixItem(
       where: {
         id: existing.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
+        ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
       },
       data: forceData,
     });
