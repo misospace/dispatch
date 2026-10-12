@@ -2376,6 +2376,8 @@ export type AgentReportOutcome =
   | "blocked"
   | "failed"
   | "already_addressed"
+  // #1143: an issue close, not a PR-fix settlement; never touches the queue.
+  | "already_done"
   | "handed-off";
 
 /**
@@ -2462,6 +2464,16 @@ export interface ResolvePrFixFromAgentReportResult {
 export async function resolvePrFixFromAgentReport(
   input: ResolvePrFixFromAgentReportInput,
 ): Promise<ResolvePrFixFromAgentReportResult> {
+  // #1143: `already_done` resolves a GitHub issue through the close policy; it
+  // is never a PR-fix settlement and must not mutate the PR-fix queue.
+  if (input.outcome === "already_done") {
+    return {
+      matched: false,
+      action: "none",
+      reason: "already_done is an issue close, not a pr-fix settlement",
+    };
+  }
+
   const repo = input.repoFullName ? normalizeQueueRepo(input.repoFullName) : undefined;
   const pr =
     typeof input.pullRequestNumber === "number" && Number.isInteger(input.pullRequestNumber)
