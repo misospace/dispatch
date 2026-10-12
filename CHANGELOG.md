@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.5.69](https://github.com/misospace/dispatch/compare/v0.5.68...v0.5.69) (2026-10-12)
+
+
+### Features
+
+* **auth:** bind worker bearer tokens to agent names ([#1129](https://github.com/misospace/dispatch/issues/1129)) ([#1207](https://github.com/misospace/dispatch/issues/1207)) ([616dbd1](https://github.com/misospace/dispatch/commit/616dbd1e220abdf6b75b178e54f023a7577c0790))
+* **deps:** update dependency @radix-ui/react-slot (1.4.0 → 1.5.0) ([#1228](https://github.com/misospace/dispatch/issues/1228)) ([38ca2c7](https://github.com/misospace/dispatch/commit/38ca2c76574e238b24bac7a2499daa5771fafb9d))
+* **deps:** update dependency lucide-react (1.52.0 → 1.53.0) ([#1196](https://github.com/misospace/dispatch/issues/1196)) ([99c93f5](https://github.com/misospace/dispatch/commit/99c93f52953b3bcdd7c1c5d27064dfc1d06e6cb9))
+* **deps:** update dependency lucide-react (1.53.0 → 1.54.0) ([#1208](https://github.com/misospace/dispatch/issues/1208)) ([7ee3e66](https://github.com/misospace/dispatch/commit/7ee3e66d77d1804738dea269a96b59eb82efbf9c))
+* **deps:** update dependency lucide-react (1.54.0 → 1.55.0) ([#1213](https://github.com/misospace/dispatch/issues/1213)) ([ab41eac](https://github.com/misospace/dispatch/commit/ab41eacdc64bb835ba277328019226b25a644b71))
+* **helm:** update chart common (5.2.1 → 5.3.0) ([#1216](https://github.com/misospace/dispatch/issues/1216)) ([3c61ef8](https://github.com/misospace/dispatch/commit/3c61ef8a35fe33d41887d8c2f9116f12232a643e))
+* **pr-fix:** accept external waits without charging fix attempts ([#1233](https://github.com/misospace/dispatch/issues/1233)) ([6888ff3](https://github.com/misospace/dispatch/commit/6888ff30f828331a9a2a52f21f6f194e73419f5d))
+* **report:** accept already_done that closes an issue via the close policy ([#1143](https://github.com/misospace/dispatch/issues/1143)) ([#1219](https://github.com/misospace/dispatch/issues/1219)) ([7ae2b38](https://github.com/misospace/dispatch/commit/7ae2b380df519dd9cbd77b993153a05054c62940))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @types/node (24.19.1 → 24.19.2) ([#1209](https://github.com/misospace/dispatch/issues/1209)) ([7ae16a4](https://github.com/misospace/dispatch/commit/7ae16a4eda80454242d51d0cf97dc5cd63cefe33))
+* **deps:** update dependency zod (4.6.5 → 4.6.6) ([#1223](https://github.com/misospace/dispatch/issues/1223)) ([f1a3058](https://github.com/misospace/dispatch/commit/f1a305833eaf8c6fc31dc60e54304eff0f34aa97))
+* **deps:** update dependency zod (4.6.6 → 4.6.7) ([#1234](https://github.com/misospace/dispatch/issues/1234)) ([9d59419](https://github.com/misospace/dispatch/commit/9d594191f1c660675f4f47d73a68d86d609f7fcc))
+* **deps:** update vitest monorepo (5.0.3 → 5.0.4) ([#1232](https://github.com/misospace/dispatch/issues/1232)) ([b5f69da](https://github.com/misospace/dispatch/commit/b5f69da9b42c2a2d952dc64e8095bc00b2e2703a))
+* **dispatch:** retire external groom task dispatch ([#1200](https://github.com/misospace/dispatch/issues/1200)) ([#1201](https://github.com/misospace/dispatch/issues/1201)) ([e7ac005](https://github.com/misospace/dispatch/commit/e7ac005243810534d1ac24a0a2d5b338d512120f))
+* **groomer:** gate contributor-facing replies to external users ([#1198](https://github.com/misospace/dispatch/issues/1198)) ([#1199](https://github.com/misospace/dispatch/issues/1199)) ([b42cecf](https://github.com/misospace/dispatch/commit/b42cecfbe291091edaf5b20c9c50dbe01a44a5fb))
+* **groomer:** guard already_done closes against reopen/regression evidence ([#1204](https://github.com/misospace/dispatch/issues/1204)) ([89e1b78](https://github.com/misospace/dispatch/commit/89e1b78413a440b87530eb6b4eb6f1f30d96a783))
+* **groomer:** sanitize GitHub-authored error text at mutation errorMessage helpers ([#1164](https://github.com/misospace/dispatch/issues/1164)) ([#1215](https://github.com/misospace/dispatch/issues/1215)) ([366edf9](https://github.com/misospace/dispatch/commit/366edf9f14afbe63982c23da357b3eb752865bd8))
+* **helm:** decouple liveness from database availability ([#1171](https://github.com/misospace/dispatch/issues/1171)) ([#1235](https://github.com/misospace/dispatch/issues/1235)) ([c8d9b93](https://github.com/misospace/dispatch/commit/c8d9b93a096f7771b2728c6e84d70c07ba21dd2a))
+* **pr-fix:** reclaim unacknowledged hand-outs safely ([#1211](https://github.com/misospace/dispatch/issues/1211)) ([#1212](https://github.com/misospace/dispatch/issues/1212)) ([8a9b642](https://github.com/misospace/dispatch/commit/8a9b642420d56359c0ba200a1628b4b6c5b41627))
+* **pr-fix:** separate human decisions from retry exhaustion ([#1218](https://github.com/misospace/dispatch/issues/1218)) ([#1221](https://github.com/misospace/dispatch/issues/1221)) ([60c8213](https://github.com/misospace/dispatch/commit/60c821332f75eb68a5f2512d3bbc8078435197ce))
+* **pr-fix:** skip explicitly consumed generations ([#1225](https://github.com/misospace/dispatch/issues/1225)) ([#1227](https://github.com/misospace/dispatch/issues/1227)) ([bf090c3](https://github.com/misospace/dispatch/commit/bf090c392855307cdeeae36b6111a64de18a1f43))
+* **report:** restrict already_done to issue implementation ([#1229](https://github.com/misospace/dispatch/issues/1229)) ([#1230](https://github.com/misospace/dispatch/issues/1230)) ([fd6bc88](https://github.com/misospace/dispatch/commit/fd6bc88996b41158c05a81841a3c6a12b0d95a4d))
+* **tasks:** accept neutral handed-off reports ([#1224](https://github.com/misospace/dispatch/issues/1224)) ([#1226](https://github.com/misospace/dispatch/issues/1226)) ([685fcd2](https://github.com/misospace/dispatch/commit/685fcd24f6a649bf420e31bd9ae504357fb866c6))
+
 ## [0.5.68](https://github.com/misospace/dispatch/compare/v0.5.67...v0.5.68) (2026-10-08)
 
 
