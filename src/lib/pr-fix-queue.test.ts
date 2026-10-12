@@ -4726,6 +4726,33 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
     });
 
+    it("a maintainer BLOCKED -> PARKED without allowStickyReclassify no-ops", async () => {
+      const decision = { question: "Which?", options: ["A", "B"] };
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 325, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k325",
+      });
+      await markPrFixItem(client, {
+        repo: "org/repo", pr: 325, status: "BLOCKED", decision, expectedGeneration: 1,
+      });
+      expect(client.items[0].status).toBe("BLOCKED");
+      const historyAfterBlocked = client.history.length;
+      surfacingMocks.surfacePrFixParked.mockClear();
+
+      // Maintainer tier alone must not be enough: overwriting a recorded
+      // human decision requires the explicit allowStickyReclassify opt-in.
+      const downgrade = await markPrFixItem(client, {
+        repo: "org/repo", pr: 325, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+        actorTier: "maintainer",
+      });
+
+      expect(downgrade).toEqual({ mutated: false, reason: "generation-mismatch" });
+      expect(client.items[0]).toMatchObject({
+        status: "BLOCKED", lane: "NEEDS_HUMAN", outcome: "human_decision", decisionDetail: decision,
+      });
+      expect(client.history).toHaveLength(historyAfterBlocked);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    });
+
     it("an operator reclassification can downgrade BLOCKED -> PARKED with allowStickyReclassify", async () => {
       await enqueuePrFixItem(client, {
         repo: "org/repo", pr: 321, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k321",

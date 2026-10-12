@@ -1587,12 +1587,20 @@ export async function markPrFixItem(
   // BLOCKED/PARKED settlement never bumps the generation, so a same-generation
   // worker FIXED (happy path, refused-head rollback, evidence reopen/force) or
   // STALE mark could otherwise release or erase the recorded decision.
-  // Maintainer-tier callers (operator requeue/reclassification, internal
-  // reconciliation) keep their broader transitions.
+  // BLOCKED/PARKED keep the explicit opt-in contract from the previous
+  // review: even a maintainer must pass allowStickyReclassify to overwrite a
+  // recorded BLOCKED/PARKED classification. FIXED/STALE are pinned for every
+  // non-maintainer caller; maintainer-tier transitions (operator resolution
+  // of a blocked item, internal reconciliation) stay unpinned.
   const pinToQueuedForStickySettlement =
-    input.actorTier !== "maintainer" &&
-    (nextStatus === "FIXED" || nextStatus === "BLOCKED" || nextStatus === "PARKED" || nextStatus === "STALE") &&
-    !isOperatorReclassify;
+    (
+      (nextStatus === "BLOCKED" || nextStatus === "PARKED") &&
+      !isOperatorReclassify
+    ) ||
+    (
+      (nextStatus === "FIXED" || nextStatus === "STALE") &&
+      input.actorTier !== "maintainer"
+    );
 
   // Reopen a settlement as a fresh attempt on post-dispatch evidence (#1119):
   // the guarded write, the cap give-up, and the history row, all inside one
