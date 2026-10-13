@@ -84,7 +84,7 @@ the presence of the following fields through the configured capability.
 | `review` | review id | `state`, `commit_id`, `submitted_at` | `CHANGES_REQUESTED` (and only while it is the review's current state) |
 | `review_comment` | comment id | `commit_id`, `updated_at`, resolution/outdated state (**Proposed** read) | unresolved comment on the current or a newer head |
 | `comment` | comment id | `updated_at`, author association | non-bot comment on the PR |
-| `check_run` | check run id | `head_sha`, `status`, `conclusion` | `failure`/`timed_out`/`action_required`/`cancelled` on the current or a newer head |
+| `check_run` | check run id | `head_sha`, `status`, `conclusion`, `completed_at` | `failure`/`timed_out`/`action_required`/`cancelled` on the current or a newer head |
 | `merge_state` | derived from the state string | the state string + head | a **persistent** problematic state (`behind`, `dirty`, `unstable`, `has_hooks`) |
 | `merge_conflict` | derived (`conflicting`) | `mergeable` | `CONFLICTING` persists |
 
@@ -233,11 +233,12 @@ hold:
    (anti-repetition);
 4. `(o.identity, o.version)` differs from `disposedEvidence` (the evidence that
    triggered the current disposition), **and** `o.observedAt > d` where a
-   forge-side event timestamp exists. This is what handles a key evicted from
-   the bounded cache: an old key either equals `disposedEvidence` or has a
-   forge timestamp `<= d`, so it is not fresh even when re-read now. For
-   condition kinds with no forge event timestamp, only the durable
-   `(identity, version)` comparison applies.
+   forge-side event timestamp exists (and `> recoveryAppliedAt` for a repeat
+   after a reactivation). This is what handles a key evicted from the bounded
+   cache: an old key either equals `disposedEvidence` or has a forge timestamp
+   `<= d`, so it is not fresh even when re-read now. For condition kinds with no
+   forge event timestamp, only the durable `(identity, version)` comparison
+   applies.
 
 **Unknown evidence** is handled separately (see
 [Unknown-evidence behavior](#unknown-evidence-behavior)); it never silently
@@ -286,8 +287,10 @@ charged attempt (row 13), consistent with `FIXED` reopening on new evidence.
 ### Event-driven
 
 1. The configured forge capability delivers an observation (webhook or pull
-   sync). Ingestion computes `(identity, version, contentSignature, observedAt)`
-   and calls the enqueue path.
+   sync). Ingestion derives `(identity, version, contentSignature)` and
+   populates `observedAt` from the forge payload (see
+   [watermark lifetime](#evidence-watermark-lifetime)), and calls the enqueue
+   path.
 2. Enqueue is a **commit-time decision** pinned on the row's current
    `generation` and evidence watermark. It appends the observation, then
    re-derives the transition from the same snapshot the write is pinned on, so
@@ -323,7 +326,8 @@ reaping closed PRs.
 
 - **Identity+version dedupe** makes replays and repeated reads no-ops.
 - **Content signature** makes repeated review text no-ops.
-- **`disposedAt` boundary** makes cache eviction harmless (see
+- **`disposedEvidence` durable comparison** (plus `disposedAt` for
+  timestamped kinds) makes cache eviction harmless (see
   [watermark lifetime](#evidence-watermark-lifetime)).
 - **Cooldown** (`PR_FIX_RECOVERY_COOLDOWN_MS`, **Proposed**; default 6 h,
   matching the external-wait cooldown) paces evidence-driven reactivation of
@@ -447,8 +451,8 @@ These are the invariants implementation tests must pin:
    equals `disposedEvidence`, or its forge-side `observedAt <= disposedAt`.
 9. **Watermark reset** at a fresh attempt → the prior attempt's reason survives
    in history; no re-open of already-settled evidence.
-9b. **`FIXED` reopened at the attempt cap** → lands `PARKED`/`no_progress` **with**
-   the stale-disposition flag (row 9), never a silent park.
+   - **`FIXED` reopened at the attempt cap** → lands `PARKED`/`no_progress`
+     **with** the stale-disposition flag (row 9), never a silent park.
 10. **Old worker settle** at a superseded generation → `skipped`, no mutation.
 11. **Reclaim vs ack race** — an ack landing in the read→write gap no-ops the
     reclaim; a healthy owner's lease is never cleared.
