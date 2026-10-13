@@ -22,7 +22,7 @@ The structured outcome is stored on `PrFixQueueItem` and `PrFixHistory`; human d
 
 An `outcome: "waiting-external"` report (or `WAITING_EXTERNAL` mark with the issued generation) parks work temporarily without implying prerequisite readiness. Queue listings exclude it by default; `include_blocked=true` includes pending external waits as read-only entries with the latest wait note and retry deadline, and does not make them claimable or signal readiness. The bounded `PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS` setting defaults to six hours (accepted range: one minute to seven days). When due, queue discovery conditionally reissues it as a new generation; the next worker rechecks the prerequisite. This does not increment `fixAttempts` or enforce its cap. Repeated report/mark for the same waiting generation is idempotent and does not extend the cooldown. Late marks cannot change the generation.
 
-Automatic enqueue/evidence does not release `BLOCKED` or `PARKED`. An operator explicitly requeues either status, or a maintainer marks the item back to `QUEUED`; requeue releases the parked/blocked state. `FIXED` retains its existing #940 and new-evidence reopen paths.
+Automatic enqueue/evidence does not release `BLOCKED` or `PARKED`. An operator explicitly requeues either status, or a maintainer marks the item back to `QUEUED`; requeue releases the parked/blocked state. `FIXED` retains its existing #940 and new-evidence reopen paths. Fresh-evidence freshness, reactivation of operational holds, and the `WAITING_EXTERNAL` dependency contract are specified in [PR-fix recovery on fresh evidence](pr-fix-recovery-policy.md).
 
 ## Safety and reporting
 
