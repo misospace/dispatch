@@ -114,6 +114,14 @@ freshness, or settlement outcomes as signals. This document specifies them.
   monotonic**. Model them either as gauges or as windowed deltas computed by the
   exporter; document which. Counters derived from the DB do **not** reset on
   process restart, unlike a conventional process counter.
+- **`increase()` and `rate()` are counter-only.** They assume a monotonically
+  increasing series with well-defined resets. DB-derived totals in this document
+  are **windowed deltas**, not counters, so evaluators must query them via
+  `delta()`-style window deltas or, where the question is "did anything happen
+  in the last N", via an as-of-scrape gauge such as
+  `dispatch_<...>_in_window{..., window="<seconds>"}` (see §4.10). Using
+  `increase()` on a gauge-derived series produces false negatives and positives
+  as the window rolls.
 - **Timestamp semantics:** gauges are "as of scrape". Event-derived totals use
   the row's own timestamp (`createdAt`, `at`, `startedAt`/`completedAt`) and are
   windowed by the exporter (e.g. `[5m]`, `[1h]`).
@@ -186,7 +194,8 @@ are independent.
 | `dispatch_pr_fix_oldest_queued_seconds` | gauge | seconds | `now - queuedAt` for `QUEUED` | `lane` | Head-of-line wait |
 | `dispatch_pr_fix_fix_attempts` | histogram | count | `PrFixQueueItem.fixAttempts` | `lane` | Attempts per item |
 | `dispatch_pr_fix_handout_age_seconds` | histogram | seconds | `now - dispatchedAt` for stamped `QUEUED` | `lane` | Unacknowledged hand-out age |
-| `dispatch_pr_fix_unacked_handouts` | gauge | count | `QUEUED`, `dispatchedGeneration = generation`, no matching ack | `lane` | Hand-outs that may be stranded |
+| `dispatch_pr_fix_unacked_handouts` | gauge | count | `QUEUED`, `dispatchedGeneration = generation`, no matching ack | `lane` | Hand-outs that may be stranded (aggregate, includes both fresh and overdue) |
+| `dispatch_pr_fix_overdue_unacked` | gauge | count | subset of unacked where `now - dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS` | `lane` | **Age-tied** overdue hand-outs: items past the configured timeout still waiting on an ack. Use this for A7 ([§6](#6-alert-catalogue)) — the aggregate `dispatch_pr_fix_unacked_handouts` is intended for the dashboard view, not for firing alerts, because steady churn keeps it above zero indefinitely even when every hand-out is acknowledged quickly |
 | `dispatch_pr_fix_reclaims_total` | gauge | count | `PrFixHistory.action = reclaim` | — | Reopens of stamped-unacked hand-outs |
 | `dispatch_pr_fix_handout_reclaims` | histogram | count | `PrFixQueueItem.handoutReclaims` | — | Per-item reclaim count vs cap |
 
@@ -198,7 +207,8 @@ Hand-out timeout `PR_FIX_HANDOUT_TIMEOUT_MS` default 30 min; reclaim cap
 `PR_FIX_MAX_RECLAIMS` default 3 (`pr-fix-queue.ts:579-597`). Past the cap the
 item is **PARKED + `no_progress`** — bounded exhaustion, never a human decision
 (`pr-fix-queue.ts:937-1010`). The `pr-fix-sweep` scheduler job is
-default-disabled, so reclaim may be absent in a default deployment.
+default-disabled, so reclaim may be absent in a default deployment, and the
+overdue signal can rise without an automated sweeper to drain it — see A7.
 
 ### 4.6 PR-fix settlement
 
@@ -276,13 +286,16 @@ restart, so a freshly started process reports `null` until the first tick.
 | Signal | Kind | Unit | Source | Dimensions | Semantics |
 |---|---|---|---|---|---|
 | `dispatch_audit_failures_total` | gauge (windowed) | count | `AuditLog.success = false` | `action` (allowlisted) | Failed mutations |
-| `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Run throughput/outcomes |
+| `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Outcome distribution across `AgentRun` rows. **Windowed delta only**: the rows are append-only and the window is the reset, so the exporter computes rates over the chosen window (e.g. `[5m]`, `[1h]`). It is **not** process-monotonic and **must not** be evaluated with `increase()`-style rate functions |
+| `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Number of runs that **started in the previous N seconds**, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Distinguishes "no starts" from "no windowed total", and survives process restarts because it is derived from the row timestamp |
 | `dispatch_agent_run_failures_total` | gauge (windowed) | count | `AgentRun.status = failed` | `run_type` | Hard run failures |
 | `dispatch_scheduler_job_errors_total` | gauge (windowed) | count | job HTTP non-2xx/409 (logs today) | `job` | Requires a future counter; **unknown** today |
 
 `AuditLog.action`, `AgentRun.status`, and `AgentRun.runType` are free strings.
 Allowlist the observed values and bucket the rest as `unknown`; never label by
-`errorMessage`.
+`errorMessage`. The default `window` allowlist for `dispatch_agent_runs_started_in_window`
+covers the alerting needs in [§6](#6-alert-catalogue); consumers may add other
+windows but must keep cardinality bounded.
 
 ---
 
@@ -337,15 +350,15 @@ recommendation; the consumer maps it.
 | A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
 | A2 | No successful sync | `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` | critical | 5m | Supply is stale; issues will not enter the queue | Check `IssueSyncRun` errors and GitHub reachability |
 | A3 | Health/DB down | `dispatch_health_up == 0` | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
-| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `increase(dispatch_agent_runs_total{run_type="implement"}[30m]) == 0` **and** `dispatch_scheduler_healthy == 1` | warning | 30m | Work exists and the pipeline is healthy, but no implement runs start — supply is not reaching workers. Suppressed while A1/A2 fire, so a stopped pipeline is not misreported as a worker problem | Check worker availability/credentials; confirm `next-task` returns `implement` |
+| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_agent_runs_started_in_window{run_type="implement", window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | warning | 30m | Work exists **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent, yet no implement run has started in the last 30 minutes — supply is not reaching workers. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement` |
 | A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
 | A6 | Assigned without execution | `dispatch_assigned_without_execution > 0` | warning | 30m | Assigned but never picked up; invisible in a queue-depth-only view | Verify the worker polls its lane; check admission withholding |
-| A7 | Unacknowledged hand-outs | `dispatch_pr_fix_unacked_handouts > 0` for > hand-out timeout | warning | 35m | A worker may have died before materializing its run; item is stranded | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
+| A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
 | A8 | PR-fix head-of-line | `dispatch_pr_fix_oldest_queued_seconds > threshold` | warning | 30m | Work is queued but not draining | Check worker concurrency, lane routing, and `fixAttempts` saturation |
 | A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | info/warning | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
 | A10 | Admission withholding | `dispatch_queue_withheld{reason="grooming_unknown"}` or `{reason="grooming_stale"}` sustained | warning | 1h | The admission gate is starving the queue on missing/stale grooming | Fix grooming pipeline; or operator admission override for a specific issue |
 | A11 | Grooming backoff | `dispatch_grooming_backoff > 0` sustained | warning | 30m | Upstream GitHub reads are failing; issues cannot be groomed | Check GitHub reachability/rate limits |
-| A12 | Audit failures | `increase(dispatch_audit_failures_total[15m]) > 0` | warning | 5m | Mutations are failing (labels/claims) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
+| A12 | Audit failures | `delta(dispatch_audit_failures_total[15m]) > 0` | warning | 5m | Mutations are failing (labels/claims). The predicate uses a window-delta evaluator (per §4.1) because `dispatch_audit_failures_total` is a gauge-derived total, not a monotonic counter | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
 | A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` **or** `dispatch_grooming_backoff > 0` | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
 
 ### Normal inactivity must NOT alert
@@ -354,6 +367,10 @@ recommendation; the consumer maps it.
   An idle fleet is healthy.
 - Empty PR-fix listing: **no alert**. It is independent of the issue queue.
 - `dispatch_agent_runs_total == 0` when there is no eligible work: **no alert**.
+- PR-fix steady-churn where every hand-out is acknowledged within the timeout:
+  **no alert** for A7 even though `dispatch_pr_fix_unacked_handouts > 0` — the
+  age-tied `dispatch_pr_fix_overdue_unacked` is zero. Aggregate unacked is
+  surfaced on the dashboard only.
 - No `BLOCKED` items: **no alert**. Absence of a human decision is good.
 - No `status/ready` issue with `unknown` freshness (no issue withheld as
   `grooming_unknown`): **no alert**. Never-groomed backlog is not a fault.
@@ -361,7 +378,9 @@ recommendation; the consumer maps it.
   least one interval has elapsed.
 
 Alerts must be gated on **eligible work existing** (A4, A6) or on a **pipeline
-that should have run** (A1–A3, A13). "Nothing happened" is not a failure.
+that should have run** (A1–A3, A13) or on an **overdue age** (A7, A8, A9, A11).
+"Nothing happened" is not a failure, and "something exists right now" is not
+a failure when nothing is past its timeout.
 
 ---
 
@@ -373,7 +392,7 @@ choices at composition time.
 
 | Approach | Transport | State source | Dashboard choice | Evaluator choice | Cardinality control | Notes / gaps |
 |---|---|---|---|---|---|---|
-| **A. Pull exporter (Prometheus / VictoriaMetrics)** | HTTP `/metrics` scrape | Read-only DB queries (state gauges) + windowed totals from append-only tables | Any (Grafana, VM UI, custom) | Prometheus rules / vmalert / custom | Enforce label allowlists at the exporter | Needs a new read-only exporter; no in-process counters exist, so totals are windowed DB deltas |
+| **A. Pull exporter (Prometheus / VictoriaMetrics)** | HTTP `/metrics` scrape | Read-only DB queries (state gauges, as-of-scrape windowed gauges, windowed deltas over append-only tables) | Any (Grafana, VM UI, custom) | Prometheus rules / vmalert / custom | Enforce label allowlists at the exporter | Needs a new read-only exporter; no in-process counters exist, so totals are windowed DB deltas. Use `delta()` (or direct comparison of `_in_window` as-of-scrape gauges) for "did anything happen in the last N" predicates — never `increase()` per §4.1 |
 | **B. OTel push metrics** | OTLP push | Same as A, emitted as OTel instruments | Any OTel-compatible backend | OTel-native or downstream | Use OTel attribute allowlists; avoid high-cardinality attributes | Adds an OTel SDK/dependency; exporter/collector choice deferred |
 | **C. OTel logs/events** | OTLP logs | `AuditLog`, `PrFixHistory`, `AgentRun`, `IssueSyncRun` as events | Any log backend | Backend rules | Event attributes may carry IDs; **keep them out of metric labels** | Good for drill-down; not a substitute for gauges |
 | **D. Snapshot API** | HTTP JSON | A read-only `GET` that returns the catalogue as JSON | Any | Any | Consumer controls | Optional convenience; would be a small, separately-scoped implementation |
@@ -436,34 +455,52 @@ dispatch_scheduler_up                               1
 dispatch_scheduler_job_overdue{job="sync"}          1     # last tick 45m ago, interval 15m
 dispatch_sync_last_success_timestamp_seconds        (45m ago)
 dispatch_issues_open_claimable                      20
-dispatch_agent_runs_total{run_type="implement"}     0     # nothing starting
+dispatch_agent_runs_started_in_window{run_type="implement", window="1800s"}  0     # nothing starting
 dispatch_leases_expired                             2
 dispatch_agent_work{state="STALE"}                  2
 dispatch_queue_withheld{reason="grooming_unknown"}  6
 ```
 **Read:** A1 (scheduler overdue) and A2 (no sync) fire first. A4 does **not**
 fire here: its `dispatch_scheduler_healthy == 1` guard is false while A1 is
-active, so a stopped pipeline is not misreported as a worker problem. A5 fires
-on the expired leases/stale work. A10 fires on sustained `grooming_unknown`
-withholding. The operator checks the scheduler logs, then the grooming pipeline.
+active, **and** the fresh-sync guard `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` fails because the last sync is 45m ago against a 15m interval. A stopped pipeline is therefore routed to A2 (sync freshness) and never to A4, so it is not misreported as a worker problem. A5 fires on the expired leases/stale work. A10 fires on sustained `grooming_unknown` withholding. The operator checks the scheduler logs, then the grooming pipeline.
 Recovery is `sync` re-arming; the stale sweep recovers ownership. Once the
-scheduler is healthy again, A4 becomes the relevant signal if runs still do not
-start.
+scheduler is healthy again AND the sync is fresh, A4 becomes the relevant
+signal if runs still do not start.
 
 ### 8.4 Degraded — worker hand-outs stranded (PR-fix)
 
 ```
 dispatch_pr_fix_items{status="QUEUED"}              8
 dispatch_pr_fix_unacked_handouts                    5
+dispatch_pr_fix_overdue_unacked                     5
 dispatch_pr_fix_handout_age_seconds{quantile="0.5"} 2400   # 40m > 30m timeout
 dispatch_pr_fix_reclaims_total                      2
 dispatch_agent_runs_total{run_type="followup-pr"}   1
 ```
-**Read:** A7 fires — hand-outs older than the 30m timeout without an ack. Either
+**Read:** A7 fires — the **age-tied** `dispatch_pr_fix_overdue_unacked` is 5
+(the same items the histogram counts above the timeout). Either
 workers are not acknowledging (they should after durably materializing a run),
 or the reclaim sweep is disabled (default). Recovery: enable the reclaim sweep
 or have an operator requeue. This is distinct from A8 (head-of-line age) and
 from A9 (a human decision).
+
+### 8.5 Healthy — PR-fix steady churn (A7 must NOT fire)
+
+```
+dispatch_pr_fix_items{status="QUEUED"}              3
+dispatch_pr_fix_unacked_handouts                    2     # recent hand-outs exist
+dispatch_pr_fix_overdue_unacked                     0     # none past timeout
+dispatch_pr_fix_handout_age_seconds{quantile="0.5"} 30    # < 60s old
+dispatch_pr_fix_reclaims_total                      0
+dispatch_agent_runs_total{run_type="followup-pr"}   47
+```
+**Read:** workers are acknowledging quickly and there is no stranded work. A7
+must **not** fire even though `dispatch_pr_fix_unacked_handouts > 0`. The
+earlier counter-style predicate was hazardous for exactly this steady-churn
+state — the aggregate held above zero whenever any item was recently handed
+out, even with every individual hand-out acknowledged within seconds. The
+age-tied `dispatch_pr_fix_overdue_unacked` is zero, so A7 stays silent and the
+unacked aggregate is correctly surfaced on the dashboard only.
 
 ---
 
