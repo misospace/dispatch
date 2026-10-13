@@ -14,13 +14,21 @@ function readDockerfile() {
 /**
  * Split the Dockerfile into per-stage sections keyed by the stage name
  * declared after each `FROM ... AS <name>` directive.
+ *
+ * A `FROM` instruction may carry leading flags (e.g. `--platform=linux/amd64`)
+ * before the image reference, and a stage name only ever follows an explicit
+ * `AS <name>` clause. Capture the image separately from the optional name so a
+ * `FROM --platform=... base AS builder` line registers stage `builder`, not
+ * `--platform=...` or the base image (issue #1178). An unnamed `FROM` still
+ * starts a fresh section (so its body is not mis-attributed to the previous
+ * stage) but is not itself keyed.
  */
 function splitIntoStages(dockerfile: string): Map<string, string> {
   const stages = new Map<string, string>();
   const lines = dockerfile.split("\n");
   let currentName: string | null = null;
   let buffer: string[] = [];
-  const fromRe = /^\s*FROM\s+\S+\s+(?:AS\s+)?(\S+)/i;
+  const fromRe = /^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?/i;
   const flush = () => {
     if (currentName !== null) {
       stages.set(currentName, buffer.join("\n"));
@@ -30,7 +38,7 @@ function splitIntoStages(dockerfile: string): Map<string, string> {
     const match = line.match(fromRe);
     if (match) {
       flush();
-      currentName = match[1];
+      currentName = match[2] ?? null;
       buffer = [];
     } else if (currentName !== null) {
       buffer.push(line);
@@ -117,5 +125,52 @@ describe("Dockerfile MCP image wiring", () => {
       mcpDeps,
       "mcp-deps stage must not set ENV DATABASE_URL (belt for issue #533)",
     ).not.toMatch(/^ENV\s+DATABASE_URL\b/m);
+  });
+});
+
+/**
+ * Regression tests for issue #1178: `splitIntoStages` captured the first token
+ * after `FROM` as the base image and made the `AS` keyword optional, so a
+ * `FROM --platform=... base AS name` line was registered under the wrong key
+ * (the platform flag, or the base image) instead of its real stage name. Any
+ * stage-scoped assertion then silently read the wrong section.
+ */
+describe("Dockerfile stage splitting with FROM flags", () => {
+  it("keys a --platform stage by its AS name, not the flag or base image", () => {
+    const dockerfile = [
+      "FROM --platform=linux/amd64 node:24 AS foo",
+      "WORKDIR /app",
+      "RUN echo foo",
+    ].join("\n");
+    const stages = splitIntoStages(dockerfile);
+
+    expect(stages.has("foo"), "stage must be keyed by its AS name").toBe(true);
+    expect(stages.get("foo")).toContain("WORKDIR /app");
+    expect(stages.get("foo")).toContain("RUN echo foo");
+    expect(stages.has("--platform=linux/amd64")).toBe(false);
+    expect(stages.has("node:24")).toBe(false);
+  });
+
+  it("resolves a downstream stage that builds on a --platform stage", () => {
+    const dockerfile = [
+      "FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS builder",
+      "ENV BUILDER=1",
+      "FROM builder AS runner",
+      "ENV RUNNER=1",
+    ].join("\n");
+    const stages = splitIntoStages(dockerfile);
+
+    expect(stages.get("builder")).toContain("ENV BUILDER=1");
+    expect(stages.get("builder")).not.toContain("ENV RUNNER=1");
+    expect(stages.get("runner")).toContain("ENV RUNNER=1");
+    expect(stages.get("runner")).not.toContain("ENV BUILDER=1");
+    expect(stages.has("--platform=$BUILDPLATFORM")).toBe(false);
+  });
+
+  it("still parses plain named stages without a flag", () => {
+    const stages = splitIntoStages(readDockerfile());
+    for (const name of ["base", "deps", "prod-deps", "mcp-deps", "builder", "runner", "mcp"]) {
+      expect(stages.has(name), `expected a \`${name}\` stage`).toBe(true);
+    }
   });
 });
