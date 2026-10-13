@@ -169,10 +169,18 @@ referenced issue is missing at `src/lib/lease.ts:191-204`.
 worker involvement (`upsertLease({ agentName: "hosted-groomer", … })`,
 `src/lib/groomer/run.ts:250-254`) on its normal schedule, and it writes
 `AgentRun` rows with `runType: "groom"` as internal bookkeeping
-(`src/lib/groomer/run.ts:1196-1200`). Groomer leases and `groom` runs must be
-excluded from `dispatch_execution_active`, `dispatch_work_pickups_in_window`, and
-`dispatch_agent_runs_reported_in_window` — otherwise a running groomer makes the
-fleet look permanently busy. The exclusion is an exporter-side filter on
+(`src/lib/groomer/run.ts:1196-1200`). The heartbeat endpoint likewise writes an
+`AgentRun` row per poll with `runType: "heartbeat"`
+(`src/app/api/agents/[agentName]/heartbeat/route.ts:100-104`) for the worker's
+own identity, and the legacy ingestion route accepts client-supplied run types
+(`src/app/api/agent-runs/route.ts:78`). These are not task flow: groomer leases
+and every non-task `AgentRun` row must be excluded from
+`dispatch_execution_active`, `dispatch_work_pickups_in_window`, and
+`dispatch_agent_runs_reported_in_window` — the last by **allowlisting task run
+types** (`implement`, `followup-pr`) rather than subtracting `groom`, so a
+heartbeat-only, zero-delivery fleet cannot keep the reported gauge above zero.
+Otherwise a running groomer or a merely polling fleet makes the fleet look
+permanently busy. The exclusion is an exporter-side filter on
 `agentName`/`runType`, never a metric label (§9).
 
 ### 4.4 AgentWork lifecycle
@@ -312,7 +320,7 @@ the backstop for them.
 | `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Outcome distribution across `AgentRun` rows. **Windowed delta only**: the rows are append-only and the window is the reset, so the exporter computes rates over the chosen window (e.g. `[5m]`, `[1h]`). It is **not** process-monotonic and **must not** be evaluated with `increase()`-style rate functions |
 | `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Number of runs whose **reported start time** falls in the previous N seconds, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Survives process restarts because it is derived from the row timestamp. **Blind spot:** `AgentRun` rows are inserted by `tasks/report` when work *finishes* (`src/app/api/agents/[agentName]/tasks/report/route.ts:571`), and `startedAt` is a retrospective optional field defaulting to report time. A worker still mid-task (running longer than the window) is invisible to this gauge until it reports. It measures *reported starts*, not real-time pickups — do not use it alone to detect "nothing being handed out"; use `dispatch_work_pickups_in_window` / `dispatch_agent_runs_reported_in_window` for that |
 | `dispatch_work_pickups_in_window` | gauge (as-of-scrape) | count | new `AgentWork` rows (`AgentWork.createdAt >= now() - window`) **or** newly created `Lease` rows (`Lease.createdAt >= now() - window`), worker identities only (system-emitter exclusion, §4.3) | `window` (allowlisted: `1800s`, `3600s`) | Work **picked up** in the previous N seconds, recorded at pickup time: `AgentWork` rows are created by `POST /api/agent-work/start` (`src/lib/agent-work.ts:186`) and `Lease` rows by claim via `upsertLease` (`src/lib/lease.ts:69`, `createdAt = DB now()`). Lease *renewals* do not count (they reuse the original `createdAt`) |
-| `dispatch_agent_runs_reported_in_window` | gauge (as-of-scrape) | count | `AgentRun.createdAt >= now() - window` (row insertion by `tasks/report`), worker run types only — `groom` runs from the hosted groomer are excluded (§4.3) | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Completed tasks **reported** in the previous N seconds. Throughput evidence for the canonical loop (next-task → execute → report), which — unlike claim/agent-work — writes no pickup row, so pickups alone under-count a fleet that delivers without materializing a lease. A row lands only at finish, so this gauge cannot see a single task still in flight; that is what `dispatch_execution_active` covers |
+| `dispatch_agent_runs_reported_in_window` | gauge (as-of-scrape) | count | task `AgentRun` rows (`AgentRun.createdAt >= now() - window`, `runType` allowlisted to the task types `implement`/`followup-pr` — heartbeat/groom/legacy rows excluded, §4.3) | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Completed tasks **reported** in the previous N seconds. Throughput evidence for the canonical loop (next-task → execute → report), which — unlike claim/agent-work — writes no pickup row, so pickups alone under-count a fleet that delivers without materializing a lease. A row lands only at finish, so this gauge cannot see a single task still in flight; that is what `dispatch_execution_active` covers |
 | `dispatch_agent_run_failures_total` | gauge (windowed) | count | `AgentRun.status = failed` | `run_type` | Hard run failures |
 | `dispatch_scheduler_job_errors_total` | gauge (windowed) | count | job HTTP non-2xx/409 (logs today) | `job` | Requires a future counter; **unknown** today |
 
@@ -403,10 +411,12 @@ recommendation; the consumer maps it.
   `grooming_unknown`): **no alert**. Never-groomed backlog is not a fault.
 - `lastRunAt == null` immediately after process start: **no alert** until at
   least one interval has elapsed.
-- One or more workers mid-task: **no alert** for A4. In-flight work keeps
-  `dispatch_execution_active == 1` (live lease or active `AgentWork` row) for
-  the whole task, independent of when — or whether — the worker reports; see
-  §8.6. A hung task is caught by A5 and the heartbeat-age signal, not A4.
+- Workers mid-task **with the work materialized** (live lease or active
+  `AgentWork` row): **no alert** for A4 — in-flight work keeps
+  `dispatch_execution_active == 1` for the whole task, independent of when — or
+  whether — the worker reports; see §8.6. A claim-less canonical-loop worker
+  mid-single-task is the documented blind spot in A4, not this case. A hung
+  materialized task is caught by A5 and the heartbeat-age signal, not A4.
 
 Alerts must be gated on **eligible work existing** (A4, A6) or on a **pipeline
 that should have run** (A1–A3, A13) or on an **overdue age** (A7, A8, A9, A11).
