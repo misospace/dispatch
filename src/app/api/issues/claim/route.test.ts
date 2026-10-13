@@ -6,6 +6,8 @@ const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn(), updateIssue: vi.fn(), createAuditLog: vi.fn(),
+    createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
+    upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     addIssueLabel: vi.fn(), removeIssueLabel: vi.fn(),
     leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
@@ -15,7 +17,17 @@ const { mocks } = vi.hoisted(() => ({
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
     transaction: vi.fn((arg: any) => {
       if (typeof arg === "function") {
-        return Promise.resolve(arg({ agentWork: { update: mocks.agentWorkUpdate }, agentWorkHistory: { create: vi.fn().mockResolvedValue({}) } }));
+        return Promise.resolve(
+          arg({
+            issue: { update: mocks.updateIssue },
+            issueLifecycleEvent: {
+              create: mocks.createLifecycleEvent,
+              upsert: mocks.upsertLifecycleEvent,
+            },
+            agentWork: { update: mocks.agentWorkUpdate },
+            agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+          }),
+        );
       }
       return Promise.all(arg.map((op: any) => op));
     }),
@@ -32,6 +44,10 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
     auditLog: { create: mocks.createAuditLog },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
+    },
     lease: { 
       findMany: mocks.leaseFindMany, 
       deleteMany: mocks.leaseDeleteMany, 
@@ -618,6 +634,88 @@ describe("POST /api/issues/claim — cross-issue identity invariant (#1129 revie
         issueNumber: 42,
         success: true,
       }),
+    });
+  });
+});
+
+describe("POST /api/issues/claim — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    resetRateLimits();
+  });
+
+  it("records the claim with its source, actor and transition", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready", "type/feature"]);
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "claim",
+        source: "api:claim",
+        actor: "test-agent",
+        agentName: "test-agent",
+        fromStatus: "status/ready",
+        toStatus: "status/in-progress",
+      }),
+    });
+  });
+
+  it("records nothing for a redelivered claim of an already-claimed issue", async () => {
+    // Live GitHub already shows this agent holding the issue as in-progress,
+    // which is exactly what a replayed claim request looks like.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress", "agent/test-agent"]);
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("records a force-claim that only changes ownership", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress", "agent/other-agent"]);
+
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        kind: "claim",
+        actor: "test-agent",
+        fromStatus: "status/in-progress",
+        toStatus: "status/in-progress",
+        metadata: {
+          force: true,
+          claimedFrom: "agent/other-agent",
+          claimedTo: "agent/test-agent",
+          note: "ownership changed without a status transition",
+        },
+      }),
+    });
+  });
+
+  it("fails the claim when the evidence write fails, instead of recording nothing", async () => {
+    // The cache write and the event share a transaction: a claim that landed
+    // without its evidence row would silently drop an attempt.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready"]);
+    mocks.createLifecycleEvent.mockRejectedValueOnce(new Error("lifecycle write failed"));
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(500);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "claim_issue", success: false }),
     });
   });
 });

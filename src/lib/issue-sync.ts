@@ -4,6 +4,7 @@ import { isEscalationLabel } from "@/lib/issue-lane";
 import { prisma } from "@/lib/prisma";
 import { fetchIssues } from "@/lib/github";
 import { getDefaultClaimableLane, getEscalationLane } from "@/lib/lane-config";
+import { recordSyncedIssueEvents } from "@/lib/issue-lifecycle";
 
 export interface SyncRepo {
   id: string;
@@ -58,9 +59,22 @@ export interface SyncedIssueData {
   nativeBlockedBy?: string[];
 }
 
+/**
+ * The cached state a sync write is replacing. Passed alongside the write so a
+ * store can record what the sync changed without re-reading the row it just
+ * overwrote.
+ */
+export interface IssueSyncSnapshot {
+  labels: string[];
+  state?: string | null;
+}
+
 export interface IssueStore {
-  findIssue(repositoryId: string, number: number): Promise<{ id: string; labels: string[] } | null>;
-  updateIssue(id: string, data: SyncedIssueData): Promise<void>;
+  findIssue(
+    repositoryId: string,
+    number: number,
+  ): Promise<{ id: string; labels: string[]; state?: string } | null>;
+  updateIssue(id: string, data: SyncedIssueData, previous?: IssueSyncSnapshot | null): Promise<void>;
   createIssue(repositoryId: string, data: SyncedIssueData): Promise<void>;
 }
 
@@ -193,7 +207,10 @@ export async function syncIssuesForRepos(
           if (existingIssue.labels.length > 0) {
             issueData.labels = mergeLabels(issueData.labels, existingIssue.labels);
           }
-          await store.updateIssue(existingIssue.id, issueData);
+          await store.updateIssue(existingIssue.id, issueData, {
+            labels: existingIssue.labels,
+            state: existingIssue.state ?? null,
+          });
         } else {
           await store.createIssue(repo.id, issueData);
         }
@@ -241,7 +258,11 @@ export async function reconcileClosedIssues(
   fetchIssueFn: (repoFullName: string, issueNumber: number) => Promise<GitHubIssue>,
   store: {
     findActiveCachedIssues(repositoryId: string): Promise<Array<{ id: string; number: number; labels: string[]; state: string }>>;
-    updateIssue(id: string, data: { labels: string[]; state: string; closedAt: Date | null }): Promise<void>;
+    updateIssue(
+      id: string,
+      data: { labels: string[]; state: string; closedAt: Date | null },
+      previous?: IssueSyncSnapshot | null,
+    ): Promise<void>;
   },
 ): Promise<ClosedIssueReconcileResponse> {
   const results: ReconcileClosedIssueResult[] = [];
@@ -267,11 +288,15 @@ export async function reconcileClosedIssues(
           if (ghIssue.state === "closed") {
             // Case 1: Issue has status/done but stale open state — just fix the state
             if (hasDoneLabelButOpenState) {
-              await store.updateIssue(cached.id, {
-                labels: cached.labels,
-                state: "closed",
-                closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
-              });
+              await store.updateIssue(
+                cached.id,
+                {
+                  labels: cached.labels,
+                  state: "closed",
+                  closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
+                },
+                { labels: cached.labels, state: cached.state },
+              );
 
               repoReconciled++;
               results.push({
@@ -287,11 +312,15 @@ export async function reconcileClosedIssues(
                 .filter((l) => !RECONCILABLE_STATUS_LABELS.includes(l as typeof RECONCILABLE_STATUS_LABELS[number]))
                 .concat(["status/done"]);
 
-              await store.updateIssue(cached.id, {
-                labels: newLabels,
-                state: "closed",
-                closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
-              });
+              await store.updateIssue(
+                cached.id,
+                {
+                  labels: newLabels,
+                  state: "closed",
+                  closedAt: ghIssue.closed_at ? new Date(ghIssue.closed_at) : new Date(),
+                },
+                { labels: cached.labels, state: cached.state },
+              );
 
               repoReconciled++;
               results.push({
@@ -428,18 +457,47 @@ export const fetchAllStateIssues = async (repo: SyncRepo): Promise<GitHubIssue[]
 /**
  * Prisma-backed IssueStore for syncIssuesForRepos. findIssue returns the
  * cached labels so the sync core can merge agent/* labels without a second
- * lookup per issue.
+ * lookup per issue, and the cached state so the store can record what the sync
+ * changed once it lands (#1202).
  */
 export function makePrismaIssueStore(): IssueStore {
+  // The repo full name an issue belongs to, taken from the same findIssue the
+  // core always calls immediately before updateIssue. Holding it here costs
+  // no extra query per synced issue; the entry is consumed (and dropped) by the
+  // update, so the map never holds more than the issue being synced.
+  const repoByIssueId = new Map<string, string>();
+
   return {
     findIssue(repositoryId: string, number: number) {
       return prisma.issue.findUnique({
         where: { repositoryId_number: { repositoryId, number } },
-        select: { id: true, labels: true },
+        select: { id: true, labels: true, state: true, repository: { select: { fullName: true } } },
+      }).then((issue) => {
+        if (issue) repoByIssueId.set(issue.id, issue.repository.fullName);
+        return issue;
       });
     },
-    async updateIssue(id: string, data: SyncedIssueData) {
+    async updateIssue(id: string, data: SyncedIssueData, previous?: IssueSyncSnapshot | null) {
       await prisma.issue.update({ where: { id }, data });
+
+      const repoFullName = repoByIssueId.get(id);
+      repoByIssueId.delete(id);
+      // The write landed even if the lookup above never ran, so a missing repo
+      // name costs the event, not the sync.
+      if (!repoFullName || !previous) return;
+
+      await recordSyncedIssueEvents(prisma, {
+        issueId: id,
+        repoFullName,
+        issueNumber: data.number,
+        before: { labels: previous.labels, state: previous.state ?? null },
+        after: {
+          labels: data.labels,
+          state: data.state,
+          updatedAt: data.updatedAt,
+          closedAt: data.closedAt,
+        },
+      });
     },
     async createIssue(repositoryId: string, data: SyncedIssueData) {
       // Stamp the configured default claimable lane so a freshly-ingested,
@@ -488,6 +546,42 @@ export function findActiveCachedIssuesForReconcile(
     },
     select: { id: true, number: true, labels: true, state: true },
   });
+}
+
+/**
+ * Prisma-backed store for reconcileClosedIssues (closed-issue reconciliation),
+ * shared by the scheduled sync route and the heartbeat orchestrator so both
+ * record the same lifecycle evidence for the same writes.
+ */
+export function makePrismaReconcileIssueStore(): {
+  findActiveCachedIssues: typeof findActiveCachedIssuesForReconcile;
+  updateIssue(
+    id: string,
+    data: { labels: string[]; state: string; closedAt: Date | null },
+    previous?: IssueSyncSnapshot | null,
+  ): Promise<void>;
+} {
+  return {
+    findActiveCachedIssues: findActiveCachedIssuesForReconcile,
+    async updateIssue(id, data, previous) {
+      await prisma.issue.update({ where: { id }, data });
+      if (!previous) return;
+
+      const repo = await prisma.issue.findUnique({
+        where: { id },
+        select: { number: true, repository: { select: { fullName: true } } },
+      });
+      if (!repo) return;
+
+      await recordSyncedIssueEvents(prisma, {
+        issueId: id,
+        repoFullName: repo.repository.fullName,
+        issueNumber: repo.number,
+        before: { labels: previous.labels, state: previous.state ?? null },
+        after: { labels: data.labels, state: data.state, closedAt: data.closedAt },
+      });
+    },
+  };
 }
 
 export async function refreshSingleIssue(

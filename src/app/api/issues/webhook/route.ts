@@ -5,6 +5,24 @@ import { prisma } from "@/lib/prisma";
 import { getSignatureVerificationMode, verifyWebhookSignature } from "@/lib/webhook-signature";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { invalidateGroomingForComment } from "@/lib/groomer/freshness-invalidation";
+import {
+  lifecycleDedupeKey,
+  lifecycleStatusLabel,
+  recordLifecycleEventQuietly,
+} from "@/lib/issue-lifecycle";
+
+/** Parse a GitHub ISO timestamp, ignoring absent or unparseable values. */
+function parseGithubTimestamp(value: unknown): Date | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+/** Who GitHub says caused the change — the sender, not the authenticated caller. */
+function deliveryActor(body: Record<string, any>): string {
+  const sender = body.sender?.login;
+  return typeof sender === "string" && sender ? sender : "github";
+}
 
 /**
  * GitHub Webhook Handler for Issue Label Events
@@ -32,6 +50,11 @@ export async function POST(request: Request) {
     if (!githubEvent) {
       return errorResponse("Missing x-github-event header", 400);
     }
+
+    // GitHub's own identity for this delivery. Present on every real
+    // delivery and absent only from hand-rolled replays, which is exactly the
+    // distinction the lifecycle event's dedupe key needs (#1202).
+    const deliveryId = request.headers.get("x-github-delivery")?.trim() || null;
 
     // Read raw body before authorization so that if authorizeRequest ever
     // consumes the body stream, HMAC verification still operates on the real payload.
@@ -163,6 +186,51 @@ export async function POST(request: Request) {
       where: { repositoryId_number: { repositoryId: repo.id, number: issueNumber } },
       data: { labels: nextLabels, lastSyncedAt: new Date() },
     });
+
+    // A status label moving on GitHub is a transition in the lifecycle stream
+    // with GitHub, not Dispatch, as its source (#1202).
+    //
+    // The from/to values come from the delivery's own label rather than from
+    // diffing the cached label sets: GitHub fires one event per label, so a
+    // status swap reaches the cache as "labeled new" while the old label is
+    // still on it, and a set diff would read that as no transition at all.
+    // The route's own no-op handling (adding a label that is already present,
+    // removing one that is absent leaves `nextLabels` equal to `currentLabels`)
+    // is what makes a repeat delivery a no-op here. The delivery id is GitHub's
+    // identity for the event, so a redelivery upserts the row it already wrote
+    // instead of counting as a second move.
+    //
+    // GitHub sends no per-label timestamp, so the issue's own updated_at
+    // stands in as the occurrence time and is labelled as such in metadata —
+    // the observation time is never backdated to it.
+    if (labelName.startsWith("status/") && nextLabels !== currentLabels) {
+      const statusUpdatedAt = parseGithubTimestamp(body.issue?.updated_at);
+      const added = action === "labeled";
+      await recordLifecycleEventQuietly(
+        prisma,
+        {
+          issueId: cachedIssue.id,
+          repoFullName,
+          issueNumber,
+          kind: "status_changed",
+          source: "webhook",
+          actor: deliveryActor(body),
+          fromStatus: added ? lifecycleStatusLabel(currentLabels) : labelName,
+          toStatus: added ? labelName : lifecycleStatusLabel(nextLabels),
+          sourceEventId: deliveryId,
+          dedupeKey: deliveryId
+            ? lifecycleDedupeKey("webhook", repoFullName, issueNumber, deliveryId, labelName)
+            : null,
+          occurredAt: statusUpdatedAt,
+          metadata: {
+            action,
+            label: labelName,
+            ...(statusUpdatedAt ? { occurredAtSource: "issue.updated_at" } : {}),
+          },
+        },
+        "issues webhook",
+      );
+    }
 
     return NextResponse.json({
       message: `Issue label cache updated: ${repoFullName}#${issueNumber}`,

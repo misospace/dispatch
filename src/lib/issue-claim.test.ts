@@ -407,3 +407,123 @@ describe("releaseIssueClaim — guards", () => {
     expect(update).not.toHaveBeenCalled();
   });
 });
+
+describe("releaseIssueClaim — lifecycle evidence (#1202)", () => {
+  /** A client that records lifecycle events, with a real transaction shape. */
+  function makeLifecyclePrisma(overrides: Partial<{ labels: string[] }> = {}) {
+    const base = makePrisma(overrides);
+    const createEvent = vi.fn().mockResolvedValue({ id: "evt-1" });
+    const upsertEvent = vi.fn().mockResolvedValue({ id: "evt-1" });
+    const client: IssueClaimClient = {
+      issue: base.client.issue,
+      issueLifecycleEvent: { create: createEvent, upsert: upsertEvent },
+      $transaction: (fn: any) => Promise.resolve(fn({
+        issue: base.client.issue,
+        issueLifecycleEvent: { create: createEvent, upsert: upsertEvent },
+      })),
+    };
+    return { client, createEvent, upsertEvent, update: base.update };
+  }
+
+  it("records the release with the status it left behind", async () => {
+    const { client, createEvent } = makeLifecyclePrisma();
+
+    await callRelease(client, ["agent/alpha", "status/in-progress"], {});
+
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: REPO,
+        issueNumber: ISSUE_NUMBER,
+        kind: "claim_released",
+        source: "api:unclaim",
+        actor: "alpha",
+        agentName: "alpha",
+        fromStatus: "status/in-progress",
+        toStatus: "status/ready",
+      }),
+    });
+  });
+
+  it("records the release even when the status is deliberately retained", async () => {
+    const { client, createEvent } = makeLifecyclePrisma();
+
+    await callRelease(
+      client,
+      ["agent/alpha", "status/in-review"],
+      { releaseOptions: { preserveStatus: true } },
+    );
+
+    // A release that keeps in-review still happened, and the unchanged status
+    // is what makes it distinguishable from a finished attempt.
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        kind: "claim_released",
+        fromStatus: "status/in-review",
+        toStatus: "status/in-review",
+      }),
+    });
+  });
+
+  it("attributes a stale sweep's release to the sweep, not to the abandoned agent", async () => {
+    const { client, createEvent } = makeLifecyclePrisma();
+
+    await callRelease(
+      client,
+      ["agent/alpha", "status/in-progress"],
+      {
+        releaseOptions: {
+          allowMissingAgent: true,
+          preserveStatus: true,
+          source: "stale-recovery",
+          actor: "system",
+        },
+      },
+    );
+
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        kind: "claim_released",
+        source: "stale-recovery",
+        actor: "system",
+        agentName: "alpha",
+      }),
+    });
+  });
+
+  it("de-duplicates the already-released repair a repeated sweep performs", async () => {
+    const { client, createEvent, upsertEvent } = makeLifecyclePrisma({ labels: ["status/in-progress"] });
+
+    const options = { allowMissingAgent: true, source: "stale-recovery", actor: "system" } as const;
+    await callRelease(client, ["status/in-progress"], { releaseOptions: options });
+    await callRelease(client, ["status/in-progress"], { releaseOptions: options });
+
+    // A sweep that dies mid-release retries the same repair; it must not
+    // inflate the release count.
+    expect(upsertEvent).toHaveBeenCalledTimes(2);
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(upsertEvent.mock.calls[0][0].create.dedupeKey).toBe(
+      upsertEvent.mock.calls[1][0].create.dedupeKey,
+    );
+  });
+
+  it("records nothing when the claim belongs to another agent", async () => {
+    const { client, createEvent, update } = makeLifecyclePrisma();
+
+    await callRelease(client, ["agent/beta", "status/in-progress"], { agentName: "alpha" });
+
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("records nothing for a narrow client that cannot record events", async () => {
+    // Callers that pass only an issue surface (test fakes, partial clients)
+    // keep working: the release still lands, it just has no evidence row.
+    const { client, update } = makePrisma();
+
+    const result = await callRelease(client, ["agent/alpha", "status/in-progress"], {});
+
+    expect(result.released).toBe(true);
+    expect(update).toHaveBeenCalled();
+  });
+});

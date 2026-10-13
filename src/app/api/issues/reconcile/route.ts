@@ -9,7 +9,15 @@ import {
   classifyLaneByHeuristics,
   shouldReclassifyStaleBacklog,
   executeActions,
+  type ReconciliationAction,
 } from "@/lib/issue-reconciliation";
+import {
+  lifecycleDedupeKey,
+  lifecycleStatusLabel,
+  recordLifecycleEvent,
+  recordStatusTransition,
+  type LifecycleEventClient,
+} from "@/lib/issue-lifecycle";
 import { isBacklogLane } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
@@ -20,14 +28,113 @@ import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 /**
+ * Record the lifecycle evidence for one executed reconciliation action.
+ *
+ * The reconciler reacts to what it observed on GitHub, so its events carry
+ * the observation's own identity rather than Dispatch's clock: a merged PR is
+ * identified by the PR's number and `merged_at`, and a status swap by the PR
+ * that caused it plus the labels it moved between. A later reconcile pass
+ * that re-derives the same conclusion upserts the row that already exists
+ * instead of recording a second merge.
+ *
+ * Failures are logged, never thrown: the reconcile pass has already done its
+ * GitHub work and recorded its audit row by this point, so an evidence-row
+ * problem must not abort the remaining issues.
+ */
+export async function recordReconciledAction(input: {
+  repo: { id: string; fullName: string };
+  issueNumber: number;
+  existingIssue: { id: string } | undefined;
+  /** The PR whose state drove the action, when the action came from one. */
+  mergedPr: { number: number; merged_at?: string | null } | null;
+  executed: {
+    action: ReconciliationAction;
+    success: boolean;
+    error?: string;
+    beforeLabels: string[];
+    afterLabels: string[];
+  };
+  client: LifecycleEventClient;
+}): Promise<void> {
+  const { repo, issueNumber, existingIssue, executed, client } = input;
+  if (!existingIssue || !executed.success) return;
+
+  const identity = lifecycleDedupeKey("reconciler", repo.fullName, issueNumber);
+  const mergedPr = input.mergedPr;
+  const prIdentity = mergedPr
+    ? lifecycleDedupeKey(mergedPr.number, mergedPr.merged_at ?? "unknown")
+    : null;
+
+  try {
+    if (executed.action.type === "close_issue") {
+      // A merge is recorded separately from the close it causes: "the PR
+      // merged" and "someone closed the issue" are different facts, and a
+      // worker reporting success must never be able to assert either.
+      if (mergedPr && prIdentity) {
+        await recordLifecycleEvent(client, {
+          issueId: existingIssue.id,
+          repoFullName: repo.fullName,
+          issueNumber,
+          kind: "pr_merged",
+          source: "reconciler",
+          actor: "reconciler",
+          fromStatus: lifecycleStatusLabel(executed.beforeLabels),
+          toStatus: lifecycleStatusLabel(executed.afterLabels),
+          sourceEventId: `pr-${mergedPr.number}`,
+          dedupeKey: lifecycleDedupeKey(identity, "pr_merged", prIdentity),
+          occurredAt: mergedPr.merged_at ? new Date(mergedPr.merged_at) : undefined,
+          metadata: { pullRequestNumber: mergedPr.number },
+        });
+      }
+
+      await recordLifecycleEvent(client, {
+        issueId: existingIssue.id,
+        repoFullName: repo.fullName,
+        issueNumber,
+        kind: "issue_closed",
+        source: "reconciler",
+        actor: "reconciler",
+        fromStatus: lifecycleStatusLabel(executed.beforeLabels),
+        toStatus: lifecycleStatusLabel(executed.afterLabels),
+        dedupeKey: lifecycleDedupeKey(identity, "issue_closed", prIdentity ?? "reconciler-close"),
+        metadata: prIdentity ? { pullRequestNumber: mergedPr!.number } : null,
+      });
+      return;
+    }
+
+    if (executed.action.type === "set_status") {
+      await recordStatusTransition(client, {
+        issueId: existingIssue.id,
+        repoFullName: repo.fullName,
+        issueNumber,
+        kind: "status_changed",
+        source: "reconciler",
+        actor: "reconciler",
+        before: executed.beforeLabels,
+        after: executed.afterLabels,
+        // Without a PR to key on, the label pair itself is the identity: the
+        // same swap re-derived on a later pass is the same conclusion.
+        dedupeKey: prIdentity
+          ? lifecycleDedupeKey(identity, "status_changed", prIdentity)
+          : lifecycleDedupeKey(identity, "status_changed", executed.beforeLabels.join(","), executed.afterLabels.join(",")),
+        metadata: prIdentity ? { pullRequestNumber: mergedPr!.number } : null,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`reconciler lifecycle evidence for ${repo.fullName}#${issueNumber} was not recorded: ${message}`);
+  }
+}
+
+/**
  * Reconcile issue state against PR state for all tracked repos.
- * 
+ *
  * This endpoint replaces the grooming logic that previously lived in
  * Saffron's project_groom.py scripts. It:
  * 1. Detects merged PRs that fix issues → closes them on GitHub
  * 2. Detects open PRs and checks their health → applies labels via GitHub API
  * 3. Classifies lanes using heuristics when model calls are unavailable
- * 
+ *
  * Dispatch calls this periodically (e.g., every 5 minutes) to keep issue
  * state current without relying on GitHub ProjectV2 columns.
  */
@@ -176,6 +283,10 @@ export async function POST(request: Request) {
           if (issue.state !== "open") continue;
 
           const currentLabels = issue.labels.map((l) => l.name);
+          // Resolved before the action loop so a reconciled action can be
+          // attributed to the cached issue row, and reused below for lane and
+          // linked-PR bookkeeping.
+          const existingIssue = existingIssueByNumber.get(issue.number);
           const result = reconcileIssue(
             {
               number: issue.number,
@@ -223,12 +334,22 @@ export async function POST(request: Request) {
               if (exec.action.type === "close_issue" && exec.success) {
                 totalIssuesClosed++;
               }
+
+              await recordReconciledAction({
+                repo,
+                issueNumber: exec.action.issueNumber,
+                existingIssue,
+                mergedPr:
+                  mergedFixingIssues.get(exec.action.issueNumber) ??
+                  openPrToIssue.get(exec.action.issueNumber) ??
+                  null,
+                executed: exec,
+                client: prisma,
+              });
             }
           }
 
           // Classify lane using heuristics — first-time set, or stale-backlog reclassification.
-          const existingIssue = existingIssueByNumber.get(issue.number);
-
           if (existingIssue && !existingIssue.currentLane) {
             // First-time classification: lane was never set.
             const classification = classifyLaneByHeuristics(

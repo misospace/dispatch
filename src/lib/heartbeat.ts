@@ -5,14 +5,13 @@
  * the agent-agnostic heartbeat endpoint and any future orchestrator.
  */
 
-import { prisma } from "@/lib/prisma";
 import { fetchIssue, syncStatusLabels } from "@/lib/github";
 import { getSyncRepos, parseExcludedLabels } from "@/lib/config";
 import {
   syncIssuesForRepos,
   reconcileClosedIssues,
   makePrismaIssueStore,
-  findActiveCachedIssuesForReconcile,
+  makePrismaReconcileIssueStore,
   fetchAllStateIssues,
 } from "@/lib/issue-sync";
 
@@ -104,12 +103,7 @@ export async function runReconcileBestEffort(): Promise<ReconcileStepResult> {
       return { issuesReconciled: 0, issuesChecked: 0, reposProcessed: 0, warnings, errors };
     }
 
-    const result = await reconcileClosedIssues(repos, fetchIssue, {
-      findActiveCachedIssues: findActiveCachedIssuesForReconcile,
-      async updateIssue(id: string, data: { labels: string[]; state: string; closedAt: Date | null }) {
-        await prisma.issue.update({ where: { id }, data });
-      },
-    });
+    const result = await reconcileClosedIssues(repos, fetchIssue, makePrismaReconcileIssueStore());
 
     for (const r of result.results) {
       if (r.error && !r.reconciled) {

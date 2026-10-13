@@ -28,6 +28,7 @@ import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRe
 import { explorationCallsForFreshness } from "./freshness";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
 import { compareCommits, searchRepositoryCode } from "@/lib/github-code-search";
+import { lifecycleStatusLabel, recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
 import { fetchCommitDate } from "@/lib/github-ci";
 import { validateApplyPreconditions, type LiveComment, type PreconditionReader } from "./mutation-validator";
 import {
@@ -1220,6 +1221,30 @@ async function executeGroomerRun(
         ...(partialMessage ? { errorMessage: partialMessage } : {}),
       },
     });
+
+    // Record the status move the grooming plan actually made (#1202). The
+    // labels only reach the issue cache on the next sync, so without this the
+    // groomer's own transition would first be observable as a `sync` event and
+    // a claim-to-merge read could not tell who moved the card. Quiet by
+    // design: a grooming run that already landed its mutations must not fail
+    // over an evidence row, and a replayed application records nothing because
+    // this branch is only reached the first time the application key lands.
+    await recordLifecycleEventQuietly(
+      deps.prisma,
+      {
+        issueId: candidate.id,
+        repoFullName: candidate.repoFullName,
+        issueNumber: candidate.number,
+        kind: "status_changed",
+        source: "hosted-groomer",
+        actor: "hosted-groomer",
+        fromStatus: lifecycleStatusLabel(analyzed.labels),
+        toStatus: lifecycleStatusLabel(applied.labels),
+        occurredAt: new Date(),
+        metadata: { groomingRunId: groomingRun.id, applicationKey },
+      },
+      "hosted-groomer",
+    );
 
     // Complete GroomingRun. A partial application is explicit in history
     // and retryable: every landed step is recorded, so a retry of the same

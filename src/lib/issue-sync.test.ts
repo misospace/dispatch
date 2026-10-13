@@ -5,6 +5,11 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     fetchIssues: vi.fn(),
     issueAggregate: vi.fn(),
+    issueFindUnique: vi.fn(),
+    issueUpdate: vi.fn(),
+    issueCreate: vi.fn(),
+    createLifecycleEvent: vi.fn(),
+    upsertLifecycleEvent: vi.fn(),
   },
 }));
 
@@ -16,17 +21,26 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       aggregate: mocks.issueAggregate,
+      findUnique: mocks.issueFindUnique,
+      update: mocks.issueUpdate,
+      create: mocks.issueCreate,
+    },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
     },
   },
 }));
 
 import {
   IssueStore,
+  type SyncedIssueData,
   syncIssuesForRepos,
   mergeLabels,
   reconcileClosedIssues,
   closedIssueStatusFix,
   fetchAllStateIssues,
+  makePrismaIssueStore,
   defaultCurrentLane,
   currentLaneForLabels,
   SYNC_OVERLAP_BUFFER_MS,
@@ -204,7 +218,13 @@ describe("syncIssuesForRepos", () => {
     );
 
     expect(findMock).toHaveBeenCalledTimes(2);
-    expect(updateMock).toHaveBeenCalledWith("existing-1", expect.objectContaining({ number: 1 }));
+    expect(updateMock).toHaveBeenCalledWith(
+      "existing-1",
+      expect.objectContaining({ number: 1 }),
+      // The cached state is handed to the store alongside the write so it can
+      // record what the sync changed (#1202).
+      expect.objectContaining({ labels: [] }),
+    );
     expect(createMock).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 2 }));
   });
 
@@ -225,6 +245,9 @@ describe("syncIssuesForRepos", () => {
     expect(store.updateIssue).toHaveBeenCalledWith(
       "existing-1",
       expect.objectContaining({ labels: ["type/bug", "agent/saffron"] }),
+      expect.objectContaining({
+        labels: ["agent/saffron", "status/in-progress"],
+      }),
     );
   });
 
@@ -598,5 +621,111 @@ describe("currentLaneForLabels (dispatch#988)", () => {
     // No lane carries role=escalation, so an escalation-labeled issue must not
     // vanish — it falls back to the default claimable lane.
     expect(currentLaneForLabels(["needs-escalation"])).toBe("work");
+  });
+});
+
+describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
+  const updatedAt = new Date("2026-10-02T08:00:00.000Z");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.issueUpdate.mockResolvedValue({ id: "issue-1" });
+    mocks.issueCreate.mockResolvedValue({ id: "issue-1" });
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      labels: ["status/ready"],
+      state: "open",
+      repository: { fullName: "org/repo" },
+    });
+    mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+  });
+
+  function syncData(overrides: Partial<SyncedIssueData> = {}): SyncedIssueData {
+    return {
+      number: 42,
+      title: "Issue 42",
+      body: null,
+      url: "https://github.com/org/repo/issues/42",
+      labels: ["status/in-review"],
+      assignees: [],
+      commentsCount: 0,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt,
+      closedAt: null,
+      lastSyncedAt: updatedAt,
+      state: "open",
+      ...overrides,
+    };
+  }
+
+  it("records the status move the sync mirrored, with GitHub's timestamp as the occurrence time", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "sync|org/repo|42|status_changed|status/ready|status/in-review|2026-10-02T08:00:00.000Z" },
+      create: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "status_changed",
+        source: "sync",
+        fromStatus: "status/ready",
+        toStatus: "status/in-review",
+        occurredAt: updatedAt,
+      }),
+      update: {},
+    });
+  });
+
+  it("records a close GitHub reported, separately from the status label moving to done", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue(
+      "issue-1",
+      syncData({ labels: ["status/done"], state: "closed", closedAt: updatedAt }),
+      { labels: ["status/in-progress"], state: "open" },
+    );
+
+    const kinds = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].create.kind);
+    expect(kinds).toEqual(["status_changed", "issue_closed"]);
+  });
+
+  it("records nothing when the synced issue did not change", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData({ labels: ["status/ready"] }), { labels: ["status/ready"], state: "open" });
+
+    expect(mocks.issueUpdate).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("collapses a repeated sync over the same GitHub state onto one row", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+
+    const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it("keeps a failed event write from failing the sync it observed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.upsertLifecycleEvent.mockRejectedValue(new Error("db down"));
+    const store = makePrismaIssueStore();
+
+    await store.findIssue("repo-1", 42);
+    await expect(
+      store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" }),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issueUpdate).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
   });
 });

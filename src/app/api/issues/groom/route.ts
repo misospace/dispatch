@@ -5,6 +5,7 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getEscalationLane, getDefaultClaimableLane, isClaimableLane } from "@/lib/lane-config";
 import { resolveActor } from "@/lib/resolve-actor";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { recordStatusTransition } from "@/lib/issue-lifecycle";
 import { refreshSingleIssue } from "@/lib/issue-sync";
 import { fetchIssue as fetchIssueFromGitHub } from "@/lib/github";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -190,9 +191,27 @@ export async function POST(request: Request) {
 
       // Update GitHub labels if status changed; always refresh lastSyncedAt
       if (action === "promote_to_ready") {
-        await prisma.issue.update({
-          where: { id: effectiveIssueId },
-          data: { ...groomingData, labels: afterLabels, lastSyncedAt: new Date() },
+        // The promotion and its lifecycle event commit together, attributed to
+        // whoever groomed it — a groomer status change is a transition like any
+        // other and must not be invisible to the event stream (#1202). A groom
+        // that re-promotes an already-ready issue moves no status label and
+        // records nothing.
+        await prisma.$transaction(async (tx) => {
+          await tx.issue.update({
+            where: { id: effectiveIssueId },
+            data: { ...groomingData, labels: afterLabels, lastSyncedAt: new Date() },
+          });
+
+          await recordStatusTransition(tx, {
+            issueId: effectiveIssueId,
+            repoFullName: effectiveRepo,
+            issueNumber: effectiveNumber,
+            kind: "status_changed",
+            source: "api:groom",
+            actor: auditActor,
+            before: beforeLabels,
+            after: afterLabels,
+          });
         });
 
         // Refresh the cached row from GitHub so the board and the selector's

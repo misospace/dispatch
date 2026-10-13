@@ -9,6 +9,8 @@ const { mocks } = vi.hoisted(() => ({
     findFirstIssue: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
+    createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
+    upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     fetchIssue: vi.fn().mockResolvedValue(undefined),
@@ -26,6 +28,23 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: {
       create: mocks.createAuditLog,
     },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
+    },
+    // The promotion and its lifecycle event commit together (#1202).
+    $transaction: (arg: any) =>
+      Promise.resolve(
+        typeof arg === "function"
+          ? arg({
+              issue: { update: mocks.updateIssue },
+              issueLifecycleEvent: {
+                create: mocks.createLifecycleEvent,
+                upsert: mocks.upsertLifecycleEvent,
+              },
+            })
+          : Promise.all(arg),
+      ),
   },
 }));
 
@@ -919,5 +938,54 @@ describe("POST /api/issues/groom — auth modes", () => {
 
     const auditCall = mocks.createAuditLog.mock.calls[0][0];
     expect(auditCall.data.actor).toBe("body-agent");
+  });
+});
+
+describe("POST /api/issues/groom — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRateLimits();
+    mocks.findFirstIssue.mockResolvedValue(null);
+    process.env.DISPATCH_AGENT_TOKEN = "test-token";
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+    mockIssue();
+    mocks.updateIssue.mockResolvedValue({ id: "issue-1", number: 42, labels: ["status/ready"] });
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+  });
+
+  afterEach(() => {
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+  });
+
+  it("records the promotion with the groomer as its source", async () => {
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready", actor: "my-agent" });
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "misospace/dispatch",
+        issueNumber: 42,
+        kind: "status_changed",
+        source: "api:groom",
+        actor: "my-agent",
+        fromStatus: "status/backlog",
+        toStatus: "status/ready",
+      }),
+    });
+  });
+
+  it("records nothing for a groom action that leaves the status alone", async () => {
+    const res = await groomRequest({
+      issueId: "i1",
+      repoFullName: "r/r",
+      issueNumber: 42,
+      action: "escalate",
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
   });
 });

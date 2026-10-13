@@ -6,6 +6,7 @@ import { authorizeRequest, getAuthorizedActor, getBoundWorkerAgent, authErrorRes
 import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identity";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
+import { recordStatusTransition } from "@/lib/issue-lifecycle";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -122,16 +123,33 @@ export async function POST(request: Request) {
       // Base is the live GitHub label set (authoritative — #1037).
       const labelsToSet = await transitionIssueStatus(effectiveRepo, effectiveNumber, liveLabels, targetLabel);
 
-      // Update local cache
-      await prisma.issue.update({
-        where: { id: issueId as string },
-        data: {
-          labels: labelsToSet,
-          lastSyncedAt: new Date(),
-          ...(targetLabel === "status/blocked"
-            ? { blockedReason: (blockedReason as string).trim() }
-            : { blockedReason: null }),
-        },
+      // The cached label write and the lifecycle event commit together, so a manual
+      // or agent-driven status change is never visible without its evidence row
+      // (#1202). Setting the status an issue already carries records nothing.
+      await prisma.$transaction(async (tx) => {
+        await tx.issue.update({
+          where: { id: issueId as string },
+          data: {
+            labels: labelsToSet,
+            lastSyncedAt: new Date(),
+            ...(targetLabel === "status/blocked"
+              ? { blockedReason: (blockedReason as string).trim() }
+              : { blockedReason: null }),
+          },
+        });
+
+        await recordStatusTransition(tx, {
+          issueId: issueId as string,
+          repoFullName: effectiveRepo,
+          issueNumber: effectiveNumber,
+          kind: "status_changed",
+          source: "api:status",
+          actor: actorName,
+          agentName: typeof agentName === "string" ? agentName : null,
+          before: liveLabels,
+          after: labelsToSet,
+          metadata: targetLabel === "status/blocked" ? { blocked: true } : null,
+        });
       });
 
       // Write audit log

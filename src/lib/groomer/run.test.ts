@@ -52,6 +52,7 @@ const { mocks } = vi.hoisted(() => ({
       groomingChildClaim: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
       groomerPendingReply: { updateMany: vi.fn(), upsert: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
+      issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
       auditLog: { create: vi.fn() },
@@ -934,6 +935,34 @@ describe("runHostedGroomer", () => {
         }),
       }),
     );
+  });
+
+  it("write mode records the status move the grooming plan made (#1202)", async () => {
+    await runHostedGroomer();
+
+    // The groomer writes labels to GitHub; the issue cache only catches up on
+    // the next sync. Recording the move here is what keeps the transition
+    // attributable to the groomer instead of to whatever sync ran next.
+    const event = mocks.prisma.issueLifecycleEvent.create.mock.calls.at(-1)?.[0]?.data;
+    expect(event).toMatchObject({
+      issueId: "issue-42",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      kind: "status_changed",
+      source: "hosted-groomer",
+      actor: "hosted-groomer",
+    });
+  });
+
+  it("keeps the run successful when the lifecycle write fails", async () => {
+    mocks.prisma.issueLifecycleEvent.create.mockRejectedValue(new Error("db down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await runHostedGroomer();
+
+    expect(result).toBeTruthy();
+    expect(mocks.prisma.auditLog.create).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
   });
 
   it("passes untrusted commenter trust decisions into the prompt", async () => {

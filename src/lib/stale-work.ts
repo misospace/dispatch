@@ -143,13 +143,22 @@ export async function sweepStaleWork(
       }
 
       if (work.issue) {
+        // The release is attributed to the sweep, not to the abandoned agent:
+        // nobody chose to let this claim go, and a claim-to-merge read must be
+        // able to tell a recovered stall apart from a worker's own unclaim
+        // (#1202).
         await releaseIssueClaim({
           prisma: client,
           issue: work.issue,
           repoFullName: work.issue.repository.fullName,
           issueNumber: work.issue.number,
           agentName: work.agentName,
-          options: { allowMissingAgent: true, preserveStatus: true },
+          options: {
+            allowMissingAgent: true,
+            preserveStatus: true,
+            source: "stale-recovery",
+            actor: "system",
+          },
         });
       }
 
