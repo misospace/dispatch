@@ -1,0 +1,491 @@
+# Ownership Reconciliation Design
+
+> **Status:** Design only — not implemented. No claim release, label cleanup,
+> requeue, worker-credential migration, or deployment change is authorised by
+> this document.
+>
+> **Issue:** [misospace/dispatch#1245](https://github.com/misospace/dispatch/issues/1245)
+> **Date:** 2026-10-13
+
+## 1. Problem
+
+Persisted assignment labels and local claims can exclude otherwise eligible
+work after the original worker disappears or its identity changes. The observed
+case (2026-10-13): `windowstead#398`, `pinchflat#109`, and Courier `#243` carried
+legacy `agent/courier` assignments while the configured frontier consumer was
+`courier-frontier`. The default queue filter treats any `agent/*` label as a
+claim and excludes it for other identities
+(`src/lib/agent-queue.ts:296-309`), so the work was stranded until an operator
+released the three claims by hand.
+
+The hard part is that **a claim is not proof of active execution, and the
+absence of a Courier `CoderRun` is not proof of abandonment either**. A worker
+that is mid-model-call, a review-owned PR, an external dependency wait, a
+deliberate human assignment, and a dead process can all present the same
+surface: a label and no recent telemetry. Any automatic recovery must therefore
+be evidence-driven, bounded, fenced, and conservative.
+
+This document inventories the mechanisms that already exist, defines an
+ownership state model and evidence hierarchy, and specifies a bounded
+reconciliation transition table, an optional worker capability, a
+compatibility/migration policy, an operator escape hatch, and the race/failure
+cases that constrain all of it. It deliberately **improves the existing lease /
+AgentWork / PR-fix-ack machinery** rather than inventing a parallel lease
+system.
+
+## 2. Non-goals
+
+- Releasing claims, blanket label cleanup, or requeue as part of this issue.
+- Worker credential migration or deployment/scheduler changes.
+- Replacing GitHub Issues/PRs as the source of truth. Dispatch's Postgres is a
+  cache (see [AGENTS.md](../AGENTS.md#source-of-truth)).
+- Aliasing every `agent/courier*` identity, stealing another consumer's
+  assignment, or assuming one app owns a whole label family.
+- Treating Courier's local run retention
+  ([courier#287](https://github.com/misospace/courier/issues/287)) or model
+  exhaustion/quota reset ([courier#320](https://github.com/misospace/courier/issues/320))
+  as Dispatch's recovery algorithm.
+- Auto-resolving genuine human decisions (explicit holds, deliberate blocks).
+
+## 3. Current mechanisms (inventory)
+
+Dispatch already carries three overlapping ownership structures plus one
+per-hand-out acknowledgement. The design builds on these.
+
+### 3.1 Ownership signals
+
+| Signal | Where | Meaning today | Failure mode |
+|---|---|---|---|
+| `agent/<name>` label | GitHub, cached on `Issue.labels` | The only queue-level claim filter; "one agent label at a time" (`docs/assignment-conflict-policy.md`) | Shared, mutable, no expiry; label present ≠ process alive; label absent ≠ not working |
+| `owner/<name>` label | GitHub, cached | Human/board ownership, independent of agent (`src/lib/assignment-conflicts.ts`) | Never blocks a claim; not a liveness signal |
+| `status/*` label | GitHub, cached | Lifecycle column (`ready`/`in-progress`/`in-review`/`blocked`/`done`); `blocked` parks the issue (`src/lib/agent-queue.ts:186-198`) | `blocked` without `blockedReason` is ambiguous |
+| `Issue.blockedReason` | Postgres (`prisma/schema.prisma:65`) | Distinguishes a deliberate block from an unexplained one; consumed by the release policy (`src/lib/issue-claim.ts:126-137`) | Only set by grooming/ops paths |
+| `Issue.linkedPr*` snapshot | Postgres (`prisma/schema.prisma:105-112`) | Linked PR identity + health, split across `linkedPrNumber/Url/NeedsFollowup/FollowupReasons/ReviewDecision/MergeState/HealthCheckedAt` | Refreshed on reconcile cadence; can lag |
+| `PrFixQueueItem` | Postgres | Owns PR-fix/PR-followup work per `(repo, pr)`, incl. hand-out + ack state | Separate ownership domain; not issue assignment |
+
+### 3.2 `Lease` (durable ownership checkpoint)
+
+`prisma/schema.prisma:798-814`; helpers in `src/lib/lease.ts`.
+
+- Unique `(agentName, issueId)`; absolute `expiredAt`; `renewedAt`; `checkpoint`,
+  `branch`, `prUrl`.
+- Default TTL **30 min** (`DEFAULT_LEASE_TTL_MS`, `src/lib/lease.ts:18`).
+- Created/renewed **only** on claim (`src/app/api/issues/claim/route.ts:220`) and
+  by the hosted groomer (`src/lib/groomer/run.ts:250`, 10-min TTL). The 5-minute
+  `AgentWork` checkpoint loop does **not** renew it.
+- Active (non-expired) leases from other agents exclude the issue from the queue
+  (`findLeasedIssueIds`, `src/lib/lease.ts:226`; filtered at
+  `src/lib/agent-queue-fetch.ts:144,152`).
+- `resolveActiveWork` releases orphaned/corrupt leases lazily on read
+  (`src/lib/lease.ts:155`).
+
+**Gap:** the 30-minute lease and the 5-minute AgentWork heartbeat are separate
+clocks. A legitimately long-running worker that checkpoints every few minutes
+still lets its `Lease` lapse, while the queue keeps excluding the issue because
+the `agent/*` label is what actually filters the queue. The lease and the label
+disagree.
+
+### 3.3 `AgentWork` (execution state machine)
+
+`prisma/schema.prisma:751-773`; helpers in `src/lib/agent-work.ts`.
+
+- States `CLAIMED | IN_PROGRESS | BLOCKED | DONE | RELEASED | STALE`
+  (`schema.prisma:731-738`) plus a finer `checkpoint` enum
+  (`schema.prisma:740-749`).
+- `leaseExpiresAt` set to **now + 5 min** on start and every checkpoint
+  (`src/lib/agent-work.ts:166-169,207-221`); `lastHeartbeatAt` updated on
+  checkpoint; `blockerReason` set on `BLOCKED`.
+- One active `AgentWork` per agent (a new `start` releases the prior one,
+  `src/lib/agent-work.ts:171-184`).
+- `AgentWorkHistory` records each transition.
+
+**Gap:** `AgentWork` is per-agent, not per-issue-claim, and a worker that never
+calls `checkpoint` (crash, gateway restart, pre-run failure) leaves a `CLAIMED`
+row with a stale `lastHeartbeatAt`. Its presence is weak liveness evidence.
+
+### 3.4 Claim / unclaim
+
+- `POST /api/issues/claim` (`src/app/api/issues/claim/route.ts`) makes the
+  decision against **live GitHub labels** (#1037, `src/lib/claim-gate.ts`),
+  refuses closed/done issues, refuses a live lease held by another agent unless
+  `force=true` (maintainer-only), upserts the lease, and moves the issue to
+  `status/in-progress`.
+- `POST /api/issues/unclaim` (`src/app/api/issues/unclaim/route.ts`) removes the
+  label via the shared `releaseIssueClaim` core, releases the lease, and (for
+  operators) releases `AgentWork`. `releaseIssueClaim`
+  (`src/lib/issue-claim.ts:44`) **already refuses to remove a newer agent's
+  label** (`currentAgent !== agentLabel` → skip) and keeps an in-review issue
+  in-review while its linked PR is open.
+
+### 3.5 Stale-work sweep
+
+`src/lib/stale-work.ts` + `src/app/api/agent-work/sweep/route.ts`, scheduled
+every 5 min when the in-process scheduler is enabled
+(`src/lib/scheduler.ts:129-133`).
+
+- Candidates: `AgentWork` in `CLAIMED/IN_PROGRESS/BLOCKED` whose
+  `lastHeartbeatAt` or `leaseExpiresAt` is older than **5 min**
+  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:4`).
+- Two-phase, crash-safe: mark `STALE` + `staleClaimReleasePending` in one
+  transaction (also deleting the `Lease`), then release the GitHub claim via
+  `releaseIssueClaim` with `allowMissingAgent` + `preserveStatus`, then clear
+  the pending flag.
+- `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:350`) deletes
+  `AgentWork` rows with no matching active lease during a claim.
+
+**Gap:** the sweep's only liveness input is a 5-minute heartbeat age. A worker
+whose model call or test run exceeds 5 minutes, or that is disconnected but not
+dead, is released on the next tick. There is no confirmation, no grace
+escalation, no fencing against a concurrent renewal, and the release is driven
+by `AgentWork` age even though the queue filter is the label.
+
+### 3.6 Operator controls (escape hatch today)
+
+- `POST /api/agent-work` with `action: "release"` — by `workId`, `leaseId`, or
+  `agentName` (+ `issueId` or `releaseAll`) (`src/app/api/agent-work/route.ts:173`).
+- `POST /api/agent-work` with `action: "reassign"` — move a `workId` to a new
+  agent (`src/app/api/agent-work/route.ts:364`).
+- `POST /api/issues/unclaim` by an operator (releases label + lease + AgentWork).
+- All are maintainer-only and audit-logged.
+
+### 3.7 PR-fix hand-out acknowledgement (closest existing pattern)
+
+`src/lib/pr-fix-queue.ts`, #1211. This is the pattern the issue model should
+mirror:
+
+- Hand-out stamps `dispatchedGeneration` + `agentHandouts` (`<agent>@<gen>`).
+- A worker that durably materialised its run calls `POST /api/pr-fix-queue/ack`;
+  the ack is generation-pinned, idempotent, and recorded in `handoutAcks`.
+- An unacknowledged hand-out older than `PR_FIX_HANDOUT_TIMEOUT_MS` (30 min) is
+  reclaimed, bounded by `PR_FIX_MAX_RECLAIMS` (3) → `PARKED` + `no_progress`.
+- Reclaim is **default-disabled** in the scheduler
+  (`DEFAULT_PR_FIX_SWEEP_INTERVAL_MS = 0`, `src/lib/scheduler.ts:62`) precisely
+  because a worker that cannot ack would be swept.
+
+### 3.8 Worker identity
+
+`src/lib/worker-identity.ts`, `DISPATCH_WORKER_TOKENS` (#1129): a bound token
+derives the agent identity from the token, never from a header/body. This is the
+trust anchor any ownership record must key on.
+
+### 3.9 Gap summary
+
+1. **Evidence conflation.** A label (persisted assignment), a lease (TTL
+   ownership), and `AgentWork` (execution heartbeat) are treated as one
+   "ownership" signal. None individually proves liveness or abandonment.
+2. **Two clocks disagree.** 30-min lease vs 5-min AgentWork; neither renews the
+   other; the queue filters on the label, not either.
+3. **No confirmation before release.** The sweep releases on a single stale
+   timestamp with no second look and no fencing.
+4. **No "unknown"/conflict state.** Cache/GitHub divergence or multiple agent
+   labels have no first-class representation; the queue silently excludes.
+5. **Legacy identity is undefined.** `agent/courier` vs `courier-frontier` has
+   no migration policy; the safe default today is "stranded until an operator
+   looks."
+6. **Release target is hard-coded-ish.** `releaseIssueClaim` has a good
+   status-preserving policy but no notion of selecting the *next eligible
+   state* from an explicit hold/external-wait/review taxonomy.
+
+## 4. Ownership state model
+
+Ownership is **derived**, never stored as a single truth. Two layers:
+
+- **Authoritative facts** (source of truth): GitHub issue/PR state, labels,
+  linked-PR merge/review state, and the worker's bound identity.
+- **Dispatch observations** (evidence): `Lease`, `AgentWork` +
+  `AgentWorkHistory`, PR-fix hand-out/ack rows, `AuditLog`, reconcile snapshots.
+
+Derived ownership state per `(repo, issue)`:
+
+| State | Definition | Queue effect |
+|---|---|---|
+| `UNOWNED` | No `agent/*` label, no active lease, no active `AgentWork`. | Eligible (subject to status). |
+| `CLAIMED_ACTIVE` | Live claim + recent renewal/checkpoint evidence within the active window. | Excluded for other identities. |
+| `CLAIMED_LONG_RUNNING` | Live claim, renewal older than the active window but within the long-run grace, with at least one durable run/checkpoint anchor. | Excluded; eligible for *escalation*, not release. |
+| `REVIEW_OWNED` | Claim present **or** `status/in-review` with an open linked PR (or an open PR-fix queue row for the issue). | Excluded; PR-fix queue is the owner. |
+| `EXTERNAL_WAIT` | Claim present with a recorded external-wait / retry-after marker. | Excluded until the wait elapses. |
+| `HELD` | Explicit operator hold, or `status/blocked` **with** `blockedReason`, or a `needs-human` verdict. | Excluded; **never** auto-released. |
+| `ABANDONED_CANDIDATE` | Claim present but evidence says the owner is gone **and** no hold/review/external-wait applies. | Excluded until confirmed; then released. |
+| `CONFLICTED` | More than one `agent/*` label, or cache disagrees with GitHub, or lease/`AgentWork` owner ≠ label owner. | Excluded; surfaced as unknown; operator-only. |
+| `RELEASED` | Ownership removed by unclaim/reconcile; `AgentWork` terminal. | Eligible per the selected next status. |
+
+`HELD` and `REVIEW_OWNED` are **terminal for reconciliation**: the reconciler
+must never move them. `CONFLICTED` is never auto-resolved.
+
+Storage note: the `EXTERNAL_WAIT` marker has **no issue-level home today**
+(`WAITING_EXTERNAL` is a `PrFixQueueItem.status` only, a different domain). Until
+the §6 capability records one, `EXTERNAL_WAIT` is unreachable for issue
+ownership and the reconciler treats a claim with no wait marker by the ordinary
+evidence ladder. `HELD` similarly needs an explicit marker (§9) before it can be
+distinguished from an unexplained `status/blocked`.
+
+## 5. Evidence hierarchy
+
+Ordered strongest → weakest. Higher tiers override lower ones.
+
+1. **Explicit human/operator action** — an unclaim, a hold, an assignment made
+   on GitHub by a maintainer, a `needs-human`/`blocked` verdict with reason.
+   Authoritative; the reconciler defers.
+2. **GitHub live state** — current labels, issue open/closed, linked PR
+   open/merged/review state (read through the configured forge adapter, §7).
+3. **Durable worker capability evidence** (§6) — a client-registered owner
+   record with an unexpired renewal and, when present, a terminal disposition.
+   This is the *only* signal that can positively prove liveness.
+4. **Dispatch local execution evidence** — `AgentWork` recent
+   `lastHeartbeatAt`, a live `Lease` within TTL, an acknowledged PR-fix
+   hand-out. Proves *some* activity but is per-agent, not per-issue.
+5. **Reconcile/health snapshots** — `Issue.linkedPr*`, `lastSyncedAt`.
+   Advisory and lagging.
+6. **Absence of evidence** — no lease, no heartbeat, no run. **Never sufficient
+   on its own** to declare abandonment; it can only raise an
+   `ABANDONED_CANDIDATE` for confirmation.
+
+Rule: **abandonment requires positive evidence the owner is gone (terminal
+disposition, or an expired durable registration, or a confirmed-dead identity),
+or the exhaustion of a bounded confirmation ladder — never merely missing
+telemetry.**
+
+## 6. Optional worker client capability
+
+Workers are heterogeneous (Courier, OpenClaw, Codex, Claude Code, shell cron).
+Ownership durability must be **optional and additive**, keyed to the bound
+identity from §3.8.
+
+### 6.1 Capability: durable ownership registration
+
+An optional `ownership` capability with three operations, all generation/attempt
+pinned and idempotent:
+
+| Operation | Semantics |
+|---|---|
+| `register` | On claim/start, the worker records a durable owner identity: `(agent, issue, attemptToken, runRef)`. Establishes that a real process intends to own the work. |
+| `renew` | Periodic heartbeat extending a **single** ownership TTL. Distinct from `checkpoint` because it must not require progress. |
+| `disposition` | Terminal record: `completed | released | blocked | handed_off`, with an optional successor/PR link. Lets a worker say "I'm done" or "I died cleanly" even after a restart. |
+
+Design notes:
+
+- The record is keyed by the **token-derived identity**, so a rotated token for
+  the same agent keeps ownership; a different agent cannot renew it.
+- `attemptToken` (monotonic, Dispatch-issued at hand-out, mirroring
+  `PrFixQueueItem.generation`) is the **fencing token**: a renew/disposition
+  carrying a stale token is rejected, so a restarted owner cannot revive a claim
+  a reconciler already released, and a reconciler cannot release a claim a
+  newer attempt renewed.
+- This capability can reuse the existing `Lease`/`AgentWork` storage rather than
+  a new table (see §11): `renew` maps to extending `Lease.expiredAt` **and**
+  writing an `AgentWorkHistory` heartbeat; `disposition` maps to
+  `finishAgentWork` + lease release. The `attemptToken` itself is a **new column
+  on `Lease`** (the row that already owns `(agentName, issueId)`); a token is
+  issued on claim/hand-out and rotated on every fresh attempt, so the
+  compare-and-set in §8.6 has a column to pin against.
+
+### 6.2 Clients without the capability
+
+A client that never calls `register`/`renew`/`disposition` (legacy, or an
+unknown harness) is supported but gets a **weaker** liveness ceiling:
+
+- It is treated as `CLAIMED_ACTIVE` while any lower-tier evidence (a live lease,
+  a recent `AgentWork` heartbeat, a fresh acknowledge) is present.
+- Once all lower-tier evidence is stale, it becomes `ABANDONED_CANDIDATE` and
+  must pass the **full confirmation ladder** (§8.2) before release. It is never
+  released on a single stale timestamp.
+- This preserves the legacy `DISPATCH_WORKER_TOKEN` migration-window path and
+  arbitrary harnesses without forcing them to adopt a new contract.
+
+## 7. Forge access
+
+Every reconciler read and write goes through the **configured forge
+capability** — `src/lib/github.ts` (labels, issues, PRs) and
+`src/lib/github-prs.ts` — never a forge-specific CLI. This keeps the reconciler
+forge-agnostic, honours the configured credentials/app auth, and preserves the
+#1037 rule that decisions are made against **live** labels. The reconciler must
+fail closed (no write, no local mutation) when the forge is unreachable, exactly
+as the claim route does (`src/app/api/issues/claim/route.ts:117-143`).
+
+## 8. Reconciliation
+
+### 8.1 Bounded, scheduled, single-replica
+
+- Runs as a scheduled job (the existing `stale-work` slot,
+  `src/lib/scheduler.ts:129-133`), confined to one replica, guarded by the
+  existing sync lock (`src/lib/sync-lock.ts`).
+- Bounded batch per tick; per-item try/catch so one failure cannot stall the
+  batch; structured report (`examined/released/skipped/errors`) as the current
+  sweep already emits.
+- Idempotent and resumable: a crash between "mark" and "release" is retried via
+  the existing `staleClaimReleasePending` marker.
+
+### 8.2 Confirmation ladder (no single-signal release)
+
+An `ABANDONED_CANDIDATE` must clear **all** of:
+
+1. Active window elapsed (durable registration expired, or all lower-tier
+   evidence older than the grace window).
+2. **Two independent observations** separated by a re-check interval (the
+   worker was already stale on the previous tick, i.e. sustained, not a blip).
+3. No `REVIEW_OWNED` (open linked PR / open PR-fix row), no `EXTERNAL_WAIT`
+   (retry-after in the future), and no `HELD`.
+4. Bounded attempt count not exceeded (a per-claim reclaim counter,
+   `DISPATCH_RECONCILE_MAX_RECLAIMS`, mirroring `PR_FIX_MAX_RECLAIMS`); on
+   exhaustion, **park as `HELD`/needs-human**, do not release.
+5. A fencing check immediately before the write: the current owner/attempt token
+   still matches the candidate snapshot.
+
+### 8.3 Grace periods
+
+| Window | Purpose | Suggested default |
+|---|---|---|
+| Active window | `renew` expected cadence; worker is healthy | 3× renew interval (e.g. 15 min) |
+| Long-run grace | Tolerate a single long model call / test run before even candidacy | ≥ 30 min, configurable |
+| Re-check interval | Separation between the two confirmation observations | one scheduler tick (5 min) |
+| Reclaim cooldown | Minimum spacing between successive release attempts on the same claim, so a flapping owner cannot churn release/reclaim | ≥ one re-check interval |
+| External-wait default | Minimum deferral for an `EXTERNAL_WAIT` marker | operator/lane configured |
+
+All windows are configuration, not code constants, so deployments can widen them
+without a release.
+
+### 8.4 Transition table
+
+Inputs are the derived state plus evidence. `→` is the resulting state; the
+action column is what the reconciler does (or explicitly does not do).
+
+| From | Condition | To | Action |
+|---|---|---|---|
+| `UNOWNED` | — | `UNOWNED` | None. |
+| any | multiple `agent/*` labels, or cache ≠ GitHub, or lease owner ≠ label owner | `CONFLICTED` | Surface; audit; **no write**. |
+| `CLAIMED_ACTIVE` | `renew` within active window | `CLAIMED_ACTIVE` | Extend ownership; no release. |
+| `CLAIMED_ACTIVE` | renewal older than active window, lower-tier evidence present | `CLAIMED_LONG_RUNNING` | Escalate observation; no release yet. |
+| `CLAIMED_LONG_RUNNING` | lower-tier evidence also stale, no hold/review/wait | `ABANDONED_CANDIDATE` | Start confirmation ladder. |
+| `ABANDONED_CANDIDATE` | first stale observation | `ABANDONED_CANDIDATE` | Record observation; wait re-check. |
+| `ABANDONED_CANDIDATE` | second stale observation, ladder 2–5 clear | `RELEASED` | Release **atomically** with fence; select next status. |
+| `ABANDONED_CANDIDATE` | reclaim limit reached | `HELD` | Park; audit; needs-human. |
+| `ABANDONED_CANDIDATE` | renew/disposition observed during ladder | `CLAIMED_ACTIVE` | Abort release; clear candidate. |
+| `CLAIMED_*` | terminal `disposition` (completed/released/handed_off) | `RELEASED` / successor owner | Honour disposition; do not double-release. |
+| `CLAIMED_*` | issue closed, or linked PR merged | `UNOWNED`/terminal | Do not release a live owner's claim just because the issue closed; let sync/close path handle it. |
+| `REVIEW_OWNED` | linked PR open or PR-fix row open | `REVIEW_OWNED` | Never release. |
+| `EXTERNAL_WAIT` | retry-after in the future | `EXTERNAL_WAIT` | Defer. |
+| `EXTERNAL_WAIT` | retry-after elapsed | re-evaluate from evidence | Re-derive. |
+| `HELD` | explicit hold / `blocked` + reason / needs-human | `HELD` | Never release. |
+| `HELD` | operator clears the hold | re-evaluate | Operator-driven only. |
+
+### 8.5 Release selection (never force `ready`)
+
+Releasing obsolete ownership must **not** always force `status/ready`. Reuse and
+extend `releaseIssueClaim`'s existing policy (`src/lib/issue-claim.ts:116-152`):
+
+- `status/in-progress` → `status/ready` (unexplained in-progress).
+- `status/blocked` **with** `blockedReason` → keep `blocked` (deliberate).
+- `status/blocked` **without** reason → `status/ready`.
+- `status/in-review` with an open linked PR → keep `in-review`.
+- Closed issue / merged PR → terminal; do not resurrect.
+- Otherwise → the lane's next eligible claimable state, resolved from lane
+  config, not hard-coded to `ready`.
+
+### 8.6 Fencing
+
+Every release write is conditioned on the ownership snapshot it was computed
+from (owner identity + attempt token + observed lease/heartbeat versions), the
+same compare-and-set discipline the stale sweep and PR-fix reclaim already use
+(`stale-work.ts:99-138`; `pr-fix-queue.ts` reclaim). A concurrent `renew`,
+re-claim, or operator reassign that lands first makes the release a no-op.
+Release + local cache update + audit row commit together; GitHub label removal
+is targeted (never a full label-set write) per `issue-claim.ts:154-164`.
+
+## 9. Operator escape hatch
+
+The reconciler must expose, and never bypass, explicit operator controls:
+
+| Control | Mechanism |
+|---|---|
+| Force-release a specific claim | existing `POST /api/issues/unclaim` (operator) and `POST /api/agent-work {action:"release"}` |
+| Reassign to another agent | existing `POST /api/agent-work {action:"reassign"}` |
+| Hold an issue (exempt from reconciliation) | new explicit hold marker (e.g. a label + audit row) that maps to `HELD`; distinct from a bare `status/blocked` |
+| Admit despite admission gate | existing `POST /api/issues/[issueId]/admission-override` (#1065) — a precedent for an operator override with a reason |
+| Inspect unresolved/conflicted ownership | a read surface that lists `CONFLICTED`/`ABANDONED_CANDIDATE` with their evidence |
+| Tune windows | configuration for active/grace/re-check/reclaim limits |
+
+All operator actions are maintainer-only and audit-logged, matching §3.6.
+
+## 10. Race and failure cases
+
+| Case | Required behaviour |
+|---|---|
+| **Active renewal concurrent with release** | Fenced CAS: whichever commits first wins; the loser no-ops. A renewal that lands after release re-registers as a *new* attempt (new token) and must re-claim, never revive the old record. |
+| **Disconnected worker** | Not abandoned on first miss. Escalates `ACTIVE → LONG_RUNNING → CANDIDATE` across sustained observations; a reconnect within the grace cancels the candidate. |
+| **Missing events / no telemetry** | Insufficient for release. Only raises a candidate; the confirmation ladder plus a bounded reclaim limit applies. |
+| **Closed issue** | Do not release a live claim merely because the issue closed; the close/sync path owns terminal cleanup. If the claim is already abandoned, release is ownership-only and must not move status. |
+| **Open linked PR** | `REVIEW_OWNED`; never release. PR-fix queue ownership (#1145) takes precedence. |
+| **Explicit hold** | `HELD`; never auto-release. Requires an operator to clear. |
+| **Deliberate block (`blockedReason`)** | `HELD`; release (if it ever applies) preserves `status/blocked`. |
+| **Generic legacy assignment** (`agent/courier`) | `CONFLICTED`/migration policy (§7); never blanket-aliased or stolen. |
+| **Multiple agent labels / cache divergence** | `CONFLICTED`; surface, do not guess. |
+| **Reconciler crash mid-release** | `staleClaimReleasePending` retry marker; idempotent GitHub delete. |
+| **Repeated release/reclaim churn** | Per-claim reclaim counter (`DISPATCH_RECONCILE_MAX_RECLAIMS`); on exhaustion park as `HELD`; reclaim cooldown between attempts (§8.3). |
+| **Forge unreachable** | Fail closed: no writes, no cache mutation, retry next tick. |
+| **Token rotation / identity change** | Ownership keys on the bound agent identity, so rotation is transparent; a genuinely different identity is a new owner and must re-claim. |
+
+## 11. Improvements over the existing mechanisms (not a parallel system)
+
+1. **Unify the clocks.** Make `renew` extend the same ownership record the queue
+   reasons about, and stop letting a 30-min lease and a 5-min heartbeat drift.
+   Either renew `Lease` from the checkpoint path or fold lease TTL into the
+   ownership record.
+2. **Add the missing state layer.** Introduce derived ownership states
+   (§4) as a read model over existing tables; no new lease table.
+3. **Confirm before releasing.** Replace the sweep's single-timestamp release
+   with the §8.2 ladder, reusing the `staleClaimReleasePending` two-phase
+   pattern.
+4. **Fence with attempt tokens.** Adopt the PR-fix `generation` discipline
+   (`PrFixQueueItem.generation`) for issue ownership so release/renew races are
+   CAS-safe.
+5. **Make `unknown` first-class.** Surface `CONFLICTED`/candidate rows instead
+   of silently excluding.
+6. **Reuse `releaseIssueClaim`.** Extend its status-selection policy (§8.5)
+   rather than writing a second release path.
+7. **Reuse the ack pattern.** Model `register`/`renew`/`disposition` on the
+   existing `agentHandouts`/`handoutAcks`/`handoutReclaims` machinery
+   (`pr-fix-queue.ts`) instead of inventing a new protocol.
+
+## 12. Compatibility and legacy migration policy
+
+- **No aliasing.** `agent/courier`, `agent/courier-frontier`, and any other
+  identity are distinct. The reconciler never treats one as another, and never
+  assumes one app owns a whole `agent/courier*` family.
+- **No stealing.** A release only targets the *observed* owner of the specific
+  claim, fenced by the attempt token; it never removes a newer/different owner.
+- **`CONFLICTED` is surfaced, not resolved.** Migration is an operator decision
+  recorded via the escape hatch (§9), with the reason audited.
+- **Legacy identity migration is explicit.** If two identities are genuinely the
+  same app (e.g. a rename), that mapping is an operator-declared, audited
+  alias/migration — never inferred from a name prefix.
+- **Capability adoption is gradual.** Clients may keep using the legacy path;
+  they get the weaker liveness ceiling and the full confirmation ladder. New
+  clients that implement `register`/`renew`/`disposition` get faster, safer
+  recovery. `DISPATCH_WORKER_TOKENS` binding (#1129) is the identity anchor for
+  both.
+
+## 13. Rollout and open questions
+
+- Implement behind a mode flag (`off`/`audit`/`enforce`), mirroring
+  `DISPATCH_QUEUE_ADMISSION_MODE` (#1065), so the reconciler can annotate
+  without acting first.
+- **Open:** exact window defaults and whether `renew` should be a new endpoint
+  or an extension of `POST /api/agent-work/checkpoint`.
+- **Open:** whether explicit holds use a new `status/`-adjacent label or a
+  Postgres marker; either way it must be auditable and operator-cleared.
+- **Open:** whether the read model is computed on demand or materialised by the
+  reconcile job.
+- **Open:** how `CONFLICTED` ownership appears on the Board and in
+  `GET /api/issues` for operators.
+
+## References
+
+- `docs/assignment-conflict-policy.md` — one-agent-label rule and conflict
+  analysis.
+- `docs/worker-execution-contract.md` — worker contract, PR-fix hand-out ack
+  (#1211), token tiers (#1129).
+- `docs/pr-review-fix-queue.md` — PR-fix ownership, generation fencing, reclaim.
+- `docs/hosted-groomer.md` — admission mode/override (#1065), the
+  audit/enforce rollout precedent.
+- `src/lib/lease.ts`, `src/lib/agent-work.ts`, `src/lib/stale-work.ts`,
+  `src/lib/issue-claim.ts`, `src/lib/pr-fix-queue.ts` — current mechanisms.
