@@ -139,19 +139,30 @@ caches are bounded and lossy:
   priority eviction (`:311`). Every fresh attempt **clears** it (`:1238`).
 - **Current:** `PrFixHistory` is the immutable audit record.
 
-The design therefore makes the **disposition timestamp** the authoritative
-freshness boundary, not cache membership:
+The design therefore makes a **durable disposition record** the authoritative
+freshness boundary, not cache membership or a re-read timestamp:
 
 - **Proposed:** each item stores `disposedAt` (set when a disposition is
-  written) and `recoveryAppliedAt` (set when a reactivation is applied).
-- An observation is fresh only if `observedAt > disposedAt` (and
-  `> recoveryAppliedAt` for a repeat), **and** its `(identity, version)` differs
-  from the disposition-triggering evidence. A key evicted from a bounded cache
-  but observed before `disposedAt` is **not** fresh.
-- Cache membership remains a fast-path dedupe; the timestamp comparison is the
+  written), `recoveryAppliedAt` (set when a reactivation is applied), and
+  `disposedEvidence` (the `(identity, version)` that triggered the current
+  disposition).
+- `observedAt` is the **forge-side event timestamp** where one exists
+  (`review.submitted_at`, `comment.updated_at`, `check_run.completed_at`), not
+  the time ingestion happened to re-read the observation. A periodic re-read of
+  an unchanged observation must not mint a fresh `observedAt`.
+- `merge_state`/`merge_conflict` have no forge event timestamp (their identity
+  *is* the condition string), so for those kinds freshness is decided **only**
+  by the durable `(identity, version)` comparison against `disposedEvidence`,
+  never by a re-read timestamp.
+- An observation is fresh only if its `(identity, version)` differs from
+  `disposedEvidence` **and**, where a forge timestamp exists, `observedAt >
+  disposedAt` (and `> recoveryAppliedAt` for a repeat). A key evicted from a
+  bounded cache but equal to `disposedEvidence` is **not** fresh, no matter when
+  it is re-read.
+- Cache membership remains a fast-path dedupe; the durable comparison is the
   correctness boundary that survives eviction.
 - The per-attempt reset of `postDispatchEvidenceKeys` is preserved as an
-  optimization; the immutable history and `disposedAt` preserve the prior
+  optimization; the immutable history and `disposedEvidence` preserve the prior
   attempt's reason (issue: "Preserve immutable prior attempts and reasons").
 
 ## Disposition model: status, disposition, hold class
@@ -165,7 +176,7 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 | `QUEUED` | — | active | n/a |
 | `FIXED` | — (resolved tombstone) | resolved | **Yes**, bounded by `PR_FIX_MAX_ATTEMPTS` |
 | `PARKED` | `no_progress`, budget available | operational | **Yes**, after cooldown, bounded |
-| `PARKED` | `no_progress`, budget exhausted | operational-terminal | **No**; sets stale-disposition flag; operator requeue resets budget |
+| `PARKED` | `no_progress`, budget exhausted | operational (budget-exhausted) | **No**; sets stale-disposition flag; operator requeue resets budget |
 | `PARKED` | `infra_failure` | operational (fail-closed) | **No**; needs a recovery trigger or operator |
 | `PARKED` | `security_failure` | operational (fail-closed) | **No**; operator only |
 | `WAITING_EXTERNAL` | `external_wait` (structured) | operational | **Yes** (trigger / fresh feedback / cooldown) |
@@ -179,8 +190,10 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 `handoutReclaims >= PR_FIX_MAX_RECLAIMS`. This matters because
 `PARKED`/`no_progress` is *created by* those caps: six of the seven `PARKED`
 write sites are cap-exhaustion (`src/lib/pr-fix-queue.ts:955`, `:1157`, `:1684`,
-`:1847`, `:2130`, `:2805`). The seventh — a bare `blocked` report
-(`resolvePrFixFromAgentReport`, `:2732`) — parks without incrementing
+`:1847`, `:2130`, `:2805`). The seventh is the generic `markPrFixItem` `PARKED`
+path (`:1608`, `:1784`), reachable from the worker-tier
+`POST /api/pr-fix-queue/mark` and from the bare-`blocked` report in
+`resolvePrFixFromAgentReport` (`:2732`); it parks without incrementing
 `fixAttempts`, so it is **budget-available** and reactivatable.
 
 **Proposed:** the item records why it parked (cap-exhausted vs. budget-available
@@ -218,9 +231,13 @@ hold:
    **and** version, not identity alone);
 3. `o.contentSignature` is not already recorded in `W` at the same or newer head
    (anti-repetition);
-4. `o.observedAt > d` (it postdates the disposition), which also handles a key
-   evicted from the bounded cache: an old key has `observedAt <= d` and is not
-   fresh.
+4. `(o.identity, o.version)` differs from `disposedEvidence` (the evidence that
+   triggered the current disposition), **and** `o.observedAt > d` where a
+   forge-side event timestamp exists. This is what handles a key evicted from
+   the bounded cache: an old key either equals `disposedEvidence` or has a
+   forge timestamp `<= d`, so it is not fresh even when re-read now. For
+   condition kinds with no forge event timestamp, only the durable
+   `(identity, version)` comparison applies.
 
 **Unknown evidence** is handled separately (see
 [Unknown-evidence behavior](#unknown-evidence-behavior)); it never silently
@@ -239,8 +256,8 @@ cooldown is named.
 | 2 | `QUEUED` (dispatched) | new actionable evidence | stays `QUEUED`; recorded in `postDispatchEvidenceKeys` | — | — | — | In-flight worker cannot see it; settlement must reopen (`#1119`). |
 | 3 | `QUEUED` | duplicate / replayed event | no-op | — | — | — | Identity+version already in `W`. |
 | 4 | `QUEUED` | non-actionable/cleared condition | no-op; recorded for audit | — | — | — | Transient `behind`, resolved comment, dismissed review. |
-| 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` | Enqueue reopen (`:1140`). |
-| 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` | `#940`; FIXED tombstone is untrusted (`:1136`). |
+| 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | Enqueue reopen (`:1140`). |
+| 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | `#940`; FIXED tombstone is untrusted (`:1136`). |
 | 7 | `FIXED` | duplicate/repeated text | no-op | — | — | — | Anti-churn (`#25`). |
 | 8 | **P** `PARKED`/`no_progress`, **budget available** | fresh actionable evidence, cooldown elapsed | `QUEUED` fresh attempt; clear `retryAt`/stale flag | +1 | +1 | cap → `PARKED` | **Gap today:** `PARKED` is sticky to enqueue (`:1116`). |
 | 9 | **P** `PARKED`/`no_progress`, **budget exhausted** | fresh actionable evidence | stays `PARKED`; set stale-disposition flag; record evidence | — | — | — | Operator requeue resets budget. Prevents livelock. |
@@ -426,9 +443,12 @@ These are the invariants implementation tests must pin:
    repeated cycles terminate at the cap in `PARKED`/`no_progress`.
 7. **Cap-exhausted `PARKED`** + fresh evidence → no reopen, no attempt
    increment, no generation bump; stale flag set; operator requeue required.
-8. **Evicted watermark key** re-read → not fresh (`observedAt <= disposedAt`).
+8. **Evicted watermark key** re-read → not fresh: its `(identity, version)`
+   equals `disposedEvidence`, or its forge-side `observedAt <= disposedAt`.
 9. **Watermark reset** at a fresh attempt → the prior attempt's reason survives
    in history; no re-open of already-settled evidence.
+9b. **`FIXED` reopened at the attempt cap** → lands `PARKED`/`no_progress` **with**
+   the stale-disposition flag (row 9), never a silent park.
 10. **Old worker settle** at a superseded generation → `skipped`, no mutation.
 11. **Reclaim vs ack race** — an ack landing in the read→write gap no-ops the
     reclaim; a healthy owner's lease is never cleared.
@@ -521,9 +541,10 @@ observation is recorded for audit only.
 
 ## Implementation outline (for the follow-up, not this issue)
 
-1. Extend the evidence record with `(version, contentSignature, observedAt)`;
-   add `disposedAt`/`recoveryAppliedAt` to `PrFixQueueItem`; keep `evidenceKeys`
-   for backward compatibility.
+1. Extend the evidence record with `(version, contentSignature, observedAt)`,
+   where `observedAt` is the forge-side event timestamp; add
+   `disposedAt`/`recoveryAppliedAt`/`disposedEvidence` to `PrFixQueueItem`; keep
+   `evidenceKeys` for backward compatibility.
 2. Add a disposition/hold classifier (including cap-exhausted vs budget-available)
    and a single `evaluateRecovery(watermark, observation)` used by both the
    event-driven enqueue path and the periodic reconciliation pass.
