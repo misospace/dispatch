@@ -1,0 +1,519 @@
+# Standalone Portable Observability for Dispatch
+
+Design only. This document defines Dispatch observability independently of
+Courier and of any operator's monitoring environment. It specifies the signals
+and states Dispatch already owns, a backend-neutral dashboard and alert
+specification, and integration approaches — without choosing an exporter,
+dashboard product, or rule engine. No implementation, requeues, claim release,
+worker credential changes, dashboard/rule assets, deployments, or home-ops
+configuration are part of this design.
+
+- Tracking issue: misospace/dispatch#1237
+- Informational counterpart (not a prerequisite): misospace/courier#289
+
+---
+
+## 1. Purpose and scope
+
+Dispatch owns **work-supply and task-lifecycle truth**: which issues are
+eligible, who owns them, whether an execution is live, how work is handed out,
+acknowledged, settled, reclaimed, and withheld. Observability must answer, from
+Dispatch's own state alone:
+
+1. Is there eligible work, and is any of it failing to reach a worker?
+2. Is claimed/assigned work actually being executed, or is ownership stale?
+3. How did work end — settled, blocked on a human, parked from exhaustion, or
+   stale because upstream is gone?
+4. Is the supply pipeline (sync, groomer, admission, scheduler) healthy, or is
+   the queue empty because the pipeline stopped?
+
+An observer must be able to consume this **without Courier**: any worker client,
+or none, is a valid deployment. Optional correlation with a connector/operator
+is composition (join on an exported identifier at the consumer), never a
+required shared identifier, dashboard, phase, or release cadence.
+
+### In scope
+
+- A **signal/state catalogue** with units, timestamp/reset semantics, bounded
+  dimensions, privacy constraints, and missing/unknown states.
+- A **dashboard view specification** as backend-neutral state predicates.
+- An **alert catalogue** covering stale ownership, failure to hand out eligible
+  work, unavailable upstream evidence, and normal inactivity.
+- An **integration matrix** for optional Prometheus/VictoriaMetrics and
+  OTel-based approaches.
+- Healthy/idle/degraded examples for a non-Courier consumer.
+- The current instrumentation and the unknowns.
+
+### Non-goals
+
+No implementation, requeues, claim release, worker credential changes,
+dashboard/rule assets, deployments, or home-ops configuration. Exporter and
+dependency choices require a later decision (see [§10](#10-open-questions-and-deferred-decisions)).
+
+---
+
+## 2. Boundaries and design principles
+
+- **Dispatch is standalone.** Every signal in this document is derived from
+  Dispatch's own database or its own HTTP surface. Nothing depends on Courier
+  telemetry, phases, dashboards, release cadence, or identifiers.
+- **Backend-neutral.** Signals are specified as state predicates and
+  dimensions. The document does not assume Prometheus, VictoriaMetrics, OTel,
+  Grafana, Alertmanager, or any vendor. Each integration is a mapping, not a
+  requirement.
+- **Bounded, low-cardinality dimensions.** Allowed label values are enumerable
+  (status, lane, reason code, run type). **Do not** use arbitrary repository
+  names, issue/PR numbers, task IDs, credentials, commit SHAs, or raw error
+  strings as metric labels — those belong in logs/events and drill-down views.
+- **Explicit unknown.** "No data" and "zero" are different. Freshness and
+  upstream reads have a first-class `unknown` state and must be surfaced as
+  such, never silently coerced to healthy.
+- **GitHub is the source of truth; Postgres is a cache.** Label-driven state
+  (issue status, `agent/*`, dependencies) is authoritative on GitHub and can
+  lag in Dispatch between syncs. Signals describe the cache and must not be
+  presented as the authoritative forge state.
+- **No secrets, no PII.** Tokens, credentials, and personal data never appear
+  in a label, metric name, or exported event.
+
+---
+
+## 3. Current instrumentation inventory
+
+Dispatch today has **no metrics endpoint, no `/metrics`, no OpenTelemetry, and
+no structured counters/timers**. Observability is limited to a health endpoint,
+in-process scheduler liveness, and append-only database tables. (Confirmed by
+searching the repository: no Prometheus/OTel/metrics integration exists.)
+
+| Source | Location | What it exposes | Limitation |
+|---|---|---|---|
+| Health endpoint | `src/app/api/health/route.ts` | `{ok, database, version, authMode, scheduler, schedulerOverdue}`; HTTP 503 when the DB is unreachable | Liveness only; no queue/lease/queue-depth detail |
+| Scheduler liveness | `src/lib/scheduler.ts:203-219` (`schedulerState()`) | Per job: `lastRunAt` (ISO or null), `intervalMs`, `overdue` (no run in > 2× interval) | In-process, `globalThis`; lost on restart; only reports armed jobs |
+| Scheduler jobs | `src/lib/scheduler.ts:88-140` | `sync` 15m, `groomer` 10m, `pr-followup` 15m, `ci-failures` 30m, `prune-closed` 24h, `reconcile` 30m, `stale-work` 5m, `pr-fix-sweep` disabled | Default-disabled unless `DISPATCH_SCHEDULER_ENABLED=true`; jobs are loopback HTTP POSTs |
+| Audit log | `prisma/schema.prisma:324-342`; `GET /api/audit` | actor, action, repo, issue number, success, errorMessage, before/after labels, notes, createdAt | Free-string `action`; read-only listing; no aggregation |
+| Agent runs | `prisma/schema.prisma:254-287` | agentName, runType, status, startedAt/finishedAt, summary, errorMessage, touchedIssueUrls, escalated outcome | `status` and `runType` are free strings |
+| Issue sync runs | `prisma/schema.prisma:699-712` | status, reposFetched, syncedCount, syncType (scheduled/manual/automation), startedAt/completedAt | No failure-reason taxonomy |
+| Automation sync runs | `prisma/schema.prisma:530-545` | status, reposFetched, workflowsFetched, runsFetched, startedAt/completedAt | Automation view only |
+| Sync lock | `prisma/schema.prisma:719-725` | Single row serializing scheduled sync | Not a signal by itself |
+| In-memory rate limiting | `src/lib/rate-limit.ts` | Per-instance counters | Not exported; per-replica |
+
+**Gap:** there is no way today to see queue depth/age, active leases, stale
+ownership, PR-fix hand-out/reclaim state, admission withholding, grooming
+freshness, or settlement outcomes as signals. This document specifies them.
+
+---
+
+## 4. Signal and state catalogue
+
+### 4.1 Naming, kinds, and semantics
+
+- **Naming:** `dispatch_<domain>_<measure>_<unit>` (e.g.
+  `dispatch_pr_fix_oldest_queued_seconds`).
+- **Kinds:** `gauge` (current value), `counter` (monotonic total), `histogram`
+  (bounded buckets). Because Dispatch has no in-process event counters, most
+  "counters" are derived from append-only tables and are **not process-
+  monotonic**. Model them either as gauges or as windowed deltas computed by the
+  exporter; document which. Counters derived from the DB do **not** reset on
+  process restart, unlike a conventional process counter.
+- **Timestamp semantics:** gauges are "as of scrape". Event-derived totals use
+  the row's own timestamp (`createdAt`, `at`, `startedAt`/`completedAt`) and are
+  windowed by the exporter (e.g. `[5m]`, `[1h]`).
+- **Reset semantics:** DB-derived totals never reset; the window is the reset.
+  If an in-process exporter is later added, its counters reset on restart and
+  must be paired with a start-time gauge.
+- **Unknown:** any dimension value not in the allowlist maps to `unknown`; an
+  absent baseline (e.g. never groomed) is `unknown`, distinct from `fresh`.
+
+### 4.2 Work supply
+
+| Signal | Kind | Unit | Source | Dimensions (allowlisted) | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_issues` | gauge | count | `Issue.state`, `Issue.labels`, `Issue.currentLane` | `status` (`backlog`,`ready`,`in-progress`,`in-review`,`blocked`,`done`,`unknown`), `lane`, `state` (`open`,`closed`) | Current cached issue count by status/lane |
+| `dispatch_issues_open_claimable` | gauge | count | derived (open, not `done`/`blocked`, claimable status) | `lane` | Eligible-to-work supply |
+| `dispatch_issue_age_seconds` | histogram | seconds | `Issue.createdAt` | `status`, `lane` | Waiting time since creation, for the tail that is starving |
+| `dispatch_issue_stale_sync_seconds` | gauge | seconds | `now - Issue.lastSyncedAt` | — | Cache staleness |
+| `dispatch_dependency_blocked` | gauge | count | open issues with open `blocked_by` / body deps | `lane` | Eligible-but-withheld by dependencies |
+
+Status values are the six canonical labels (`src/types/index.ts:138-153`).
+`claimable` is not the same as `ready`: `status/in-progress` and
+`status/in-review` are active but not new supply (`src/lib/agent-queue.ts:206-213`).
+
+### 4.3 Assignment vs active execution
+
+Assignment is label-only (`agent/*`, `owner/*`) and has no lease. Execution is a
+`Lease` and/or `AgentWork` row. These are distinct and must not be conflated.
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_issue_assigned` | gauge | count | `Issue.labels` `agent/*` | `lane` | Label-assigned (may be idle) |
+| `dispatch_leases_active` | gauge | count | `Lease.expiredAt > now` | — | Live ownership |
+| `dispatch_lease_age_seconds` | histogram | seconds | `now - Lease.renewedAt` / `createdAt` | — | How long ownership has been held |
+| `dispatch_leases_expired` | gauge | count | `Lease.expiredAt <= now` | — | Ownership past TTL (recoverable) |
+| `dispatch_assigned_without_execution` | gauge | count | assigned (`agent/*`) and no active lease/`AgentWork` | `lane` | Assignment that never became execution |
+
+`DEFAULT_LEASE_TTL_MS = 30 min` (`src/lib/lease.ts:18`). Lease active means
+`expiredAt > now`; there is no lease status column — the issue's status label is
+the state (`src/lib/lease.ts:99-112`). Orphan leases are released and audited:
+a corrupted checkpoint at `src/lib/lease.ts:168-180`, and a lease whose
+referenced issue is missing at `src/lib/lease.ts:191-204`.
+
+### 4.4 AgentWork lifecycle
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_agent_work` | gauge | count | `AgentWork.state` | `state` (`CLAIMED`,`IN_PROGRESS`,`BLOCKED`,`DONE`,`RELEASED`,`STALE`,`unknown`) | Active + terminal work rows |
+| `dispatch_agent_work_checkpoint` | gauge | count | `AgentWork.checkpoint` | `checkpoint` (8-value enum) | Progress distribution |
+| `dispatch_agent_work_heartbeat_age_seconds` | histogram | seconds | `now - AgentWork.lastHeartbeatAt` | `state` | Liveness of active work |
+| `dispatch_agent_work_stale_total` | gauge | count | `AgentWork.state = STALE` | — | Recovered/stale work |
+| `dispatch_agent_work_release_pending` | gauge | count | `staleClaimReleasePending = true` | — | Stale recovery in flight (retryable) |
+
+Enums are fixed: states `CLAIMED, IN_PROGRESS, BLOCKED, DONE, RELEASED, STALE`;
+checkpoints `CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE,
+TESTS_RUNNING, PR_OPENED, DONE, BLOCKED` (`prisma/schema.prisma:731-749`).
+Active states are `CLAIMED/IN_PROGRESS/BLOCKED`; internal AgentWork lease is
+5 min (`src/lib/agent-work.ts:168,209`). The stale sweep marks STALE with a
+`staleClaimReleasePending` retry marker, releases the GitHub claim, then
+finalizes (`src/lib/stale-work.ts`). Sweep defaults: max age 5 min, batch 50.
+
+### 4.5 PR-fix hand-out, acknowledgement, reclaim
+
+The PR-fix queue is a second supply path with its own lifecycle. **An empty
+PR-fix listing does not prove there is no assigned issue work** — the two paths
+are independent.
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_pr_fix_items` | gauge | count | `PrFixQueueItem.status` | `status` (7-value enum), `lane` (3-value enum) | Queue composition |
+| `dispatch_pr_fix_oldest_queued_seconds` | gauge | seconds | `now - queuedAt` for `QUEUED` | `lane` | Head-of-line wait |
+| `dispatch_pr_fix_fix_attempts` | histogram | count | `PrFixQueueItem.fixAttempts` | `lane` | Attempts per item |
+| `dispatch_pr_fix_handout_age_seconds` | histogram | seconds | `now - dispatchedAt` for stamped `QUEUED` | `lane` | Unacknowledged hand-out age |
+| `dispatch_pr_fix_unacked_handouts` | gauge | count | `QUEUED`, `dispatchedGeneration = generation`, no matching ack | `lane` | Hand-outs that may be stranded |
+| `dispatch_pr_fix_reclaims_total` | gauge | count | `PrFixHistory.action = reclaim` | — | Reopens of stamped-unacked hand-outs |
+| `dispatch_pr_fix_handout_reclaims` | histogram | count | `PrFixQueueItem.handoutReclaims` | — | Per-item reclaim count vs cap |
+
+Statuses: `QUEUED, FIXED, BLOCKED, PARKED, STALE, IGNORED, WAITING_EXTERNAL`;
+lanes `NORMAL, ESCALATED, NEEDS_HUMAN` (`prisma/schema.prisma:124-138`).
+`generation` is the work identity (bumped on a fresh attempt); `fixAttempts` is
+bounded by `PR_FIX_MAX_ATTEMPTS` default 5 (`src/lib/pr-fix-queue.ts:549-552`).
+Hand-out timeout `PR_FIX_HANDOUT_TIMEOUT_MS` default 30 min; reclaim cap
+`PR_FIX_MAX_RECLAIMS` default 3 (`pr-fix-queue.ts:579-597`). Past the cap the
+item is **PARKED + `no_progress`** — bounded exhaustion, never a human decision
+(`pr-fix-queue.ts:937-1010`). The `pr-fix-sweep` scheduler job is
+default-disabled, so reclaim may be absent in a default deployment.
+
+### 4.6 PR-fix settlement
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_pr_fix_settled_total` | gauge (windowed) | count | `PrFixHistory.action = mark` with a terminal `status` (`FIXED`,`BLOCKED`,`PARKED`,`STALE`,`IGNORED`) | `status`, `outcome`, `type` | How work ended. Exclude `mark` transitions to `QUEUED` (external-wait retry, re-enqueue) so this counts settlements, not every mark |
+| `dispatch_pr_fix_human_decisions` | gauge | count | `status = BLOCKED` (outcome `human_decision`) | `lane` | **Genuine** human decisions awaiting a call |
+| `dispatch_pr_fix_parked` | gauge | count | `status = PARKED` | `outcome` (`no_progress`,`infra_failure`,`security_failure`) | Operational exhaustion, **not** a human decision |
+| `dispatch_pr_fix_stale` | gauge | count | `status = STALE` | — | Upstream PR merged/closed |
+| `dispatch_pr_fix_waiting_external` | gauge | count | `status = WAITING_EXTERNAL`, `retryAt` | — | External-dependency wait, with cooldown |
+| `dispatch_pr_fix_oldest_human_decision_seconds` | gauge | seconds | `now - updatedAt` for `BLOCKED` | — | Age of the oldest unresolved human decision |
+
+Outcomes: `human_decision, no_progress, infra_failure, security_failure`
+(`src/types/index.ts:266`). Types: `MERGE_CONFLICT, CI_FAILURE,
+REVIEW_FEEDBACK, OTHER`. The distinction is load-bearing: **BLOCKED** is a
+genuine human decision (carries `needs-human`); **PARKED** is bounded exhaustion
+or an operational failure and must not be presented as a decision
+(`src/lib/pr-fix-surfacing.ts:175-230`). `WAITING_EXTERNAL` cooldown defaults to
+6h (`PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS`, bounded 60s–7d).
+
+### 4.7 Admission and dependency withholding
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_queue_withheld` | gauge | count | admission decision (`enforce`) | `reason` (12 reason codes) | Eligible `status/ready` issues withheld |
+| `dispatch_queue_admission_mode` | gauge | 0/1 | `DISPATCH_QUEUE_ADMISSION_MODE` | `mode` (`off`,`audit`,`enforce`) | Which mode is active |
+| `dispatch_queue_withheld_oldest_seconds` | gauge | seconds | oldest withheld issue age | `reason` | How long work has been withheld |
+
+Reason codes (`src/lib/queue-admission.ts:50-63`): `dependency_blocked,
+grooming_unknown, grooming_stale, grooming_issue_changed, grooming_unverified,
+grooming_run_missing, grooming_not_applied, grooming_partial,
+grooming_readiness_missing, grooming_not_ready, grooming_evidence_mismatch,
+escalation_lane_mismatch`. In `audit` nothing is filtered; in `enforce` withheld
+items are removed from worker pickup (still listable with `?includeWithheld=true`
+as `claimable:false`). PR-fix items are never gated.
+
+### 4.8 Grooming freshness
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_grooming_runs_total` | gauge (windowed) | count | `GroomingRun.status`, `stage` | `status`, `stage`, `dry_run` | Grooming activity |
+| `dispatch_grooming_freshness` | gauge | count | `Issue.groomedIssueFingerprint` / `groomingStaleAt` | `freshness` (`fresh`,`stale`,`unknown`) | Freshness of applied decisions |
+| `dispatch_grooming_backoff` | gauge | count | `Issue.groomingRetryAfter > now` | — | Issues backing off after an unreadable read |
+| `dispatch_grooming_stale_reasons` | gauge | count | `Issue.groomingStaleReasons` | `reason` (allowlisted) | Why decisions went stale |
+
+`GroomingFreshnessStatus = unknown | fresh | stale`
+(`src/lib/groomer/freshness.ts`). `groomedIssueFingerprint NULL` means freshness
+is **unknown** — never groomed since freshness tracking, or the baseline could
+not be recorded — and is distinct from `fresh`. `status`, `stage`, and
+`applyOutcome` are free strings today (observed `status`: `running, completed,
+partial, failed, dry_run_completed, unverifiable, stale`; `stage`: `selected,
+context_built, explored, planned, validated, skipped, applied`), so label sets
+must be allowlisted with an `unknown` bucket.
+
+### 4.9 Sync and scheduler freshness
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_scheduler_up` | gauge | 0/1 | scheduler enabled + token present | — | Scheduler armed at all |
+| `dispatch_scheduler_job_last_success_timestamp_seconds` | gauge | unix seconds | `schedulerState().jobs[].lastRunAt` | `job` (8 names) | Last completed tick |
+| `dispatch_scheduler_job_overdue` | gauge | 0/1 | `schedulerState().jobs[].overdue` | `job` | No run in > 2× interval |
+| `dispatch_sync_last_success_timestamp_seconds` | gauge | unix seconds | newest `IssueSyncRun.completedAt` with status success | `type` | Supply-pipeline freshness |
+| `dispatch_sync_failures_total` | gauge (windowed) | count | `IssueSyncRun.status != success` | `type` | Failed syncs |
+| `dispatch_repo_stale_sync_seconds` | gauge | seconds | `now - AutomationRepo.lastSyncedAt` | — | Per-repo cache staleness (aggregate max) |
+| `dispatch_health_up` | gauge | 0/1 | `GET /api/health` ok | — | Process + DB liveness |
+| `dispatch_scheduler_healthy` | gauge | 0/1 | derived: `dispatch_scheduler_up == 1` **and** no `dispatch_scheduler_job_overdue == 1` | — | Scheduler armed and every job ticking on time |
+
+Job names (`src/lib/scheduler.ts:88-140`): `sync, groomer, pr-followup,
+ci-failures, prune-closed, reconcile, stale-work, pr-fix-sweep`. `overdue`
+means no run in more than two intervals; `lastRunAt` is in-process and resets on
+restart, so a freshly started process reports `null` until the first tick.
+
+### 4.10 Failure and outcome signals
+
+| Signal | Kind | Unit | Source | Dimensions | Semantics |
+|---|---|---|---|---|---|
+| `dispatch_audit_failures_total` | gauge (windowed) | count | `AuditLog.success = false` | `action` (allowlisted) | Failed mutations |
+| `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Run throughput/outcomes |
+| `dispatch_agent_run_failures_total` | gauge (windowed) | count | `AgentRun.status = failed` | `run_type` | Hard run failures |
+| `dispatch_scheduler_job_errors_total` | gauge (windowed) | count | job HTTP non-2xx/409 (logs today) | `job` | Requires a future counter; **unknown** today |
+
+`AuditLog.action`, `AgentRun.status`, and `AgentRun.runType` are free strings.
+Allowlist the observed values and bucket the rest as `unknown`; never label by
+`errorMessage`.
+
+---
+
+## 5. Dashboard view specification
+
+Backend-neutral. Each view is described by the state predicate it evaluates; the
+mapping to panels, queries, or widgets is left to the consumer. Recommended
+layout is rows of related signals.
+
+| Row | Views (predicate) | Question answered |
+|---|---|---|
+| **1. Work supply** | `dispatch_issues` by `status`/`lane`; `dispatch_issues_open_claimable`; `dispatch_issue_age_seconds` p50/p95/max | Is there eligible work, and how old is it? |
+| **2. Execution** | `dispatch_issue_assigned`; `dispatch_leases_active`; `dispatch_agent_work` by `state`; `dispatch_agent_work_heartbeat_age_seconds` | Is assigned work actually executing? |
+| **3. Ownership health** | `dispatch_leases_expired`; `dispatch_agent_work` `STALE`; `dispatch_assigned_without_execution` | Is any ownership stale or orphaned? |
+| **4. PR-fix supply** | `dispatch_pr_fix_items` by `status`/`lane`; `dispatch_pr_fix_oldest_queued_seconds` | What PR-fix work is queued, and for how long? |
+| **5. PR-fix hand-out health** | `dispatch_pr_fix_unacked_handouts`; `dispatch_pr_fix_handout_age_seconds`; `dispatch_pr_fix_reclaims_total` | Are hand-outs reaching and being acknowledged by workers? |
+| **6. Settlement** | `dispatch_pr_fix_settled_total` by `status`/`outcome`/`type` | How is work ending? |
+| **7. Human decisions** | `dispatch_pr_fix_human_decisions`; `dispatch_pr_fix_oldest_human_decision_seconds`; `dispatch_queue_withheld` by `reason` | What genuinely needs a human, and how long has it waited? |
+| **8. Pipeline freshness** | `dispatch_scheduler_job_overdue`; `dispatch_scheduler_job_last_success_timestamp_seconds`; `dispatch_sync_last_success_timestamp_seconds`; `dispatch_repo_stale_sync_seconds`; `dispatch_health_up` | Did the supply pipeline stop? |
+| **9. Grooming** | `dispatch_grooming_freshness`; `dispatch_grooming_stale_reasons`; `dispatch_grooming_backoff` | Is the admission gate starved by stale/unknown grooming? |
+| **10. Failures** | `dispatch_audit_failures_total`; `dispatch_agent_run_failures_total` | Are mutations/runs failing? |
+
+**Separation requirement.** The dashboard must keep these distinct, because
+collapsing them produces wrong operator conclusions:
+
+- **Settled/closed** (`FIXED`, `STALE`, `IGNORED`; issues `status/done`) —
+  terminal, not work.
+- **Awaiting review** (issues `status/in-review`; `WAITING_EXTERNAL`) — active,
+  not stuck.
+- **Stale claims** (`dispatch_leases_expired`, `AgentWork STALE`) — recoverable
+  ownership loss.
+- **Blocked dependencies** (`dispatch_dependency_blocked`,
+  `withheld: dependency_blocked`) — correct withholding, not a bug.
+- **Genuine human decisions** (`BLOCKED` / `human_decision`) — the only class
+  that is a request for a person. `PARKED` must not appear here.
+- **Operational exhaustion** (`PARKED`) — bounded failure; requeueable by an
+  operator, not a design question.
+
+An empty PR-fix listing is a valid state and must not be read as "no work": the
+issue queue and the PR-fix queue are independent supply paths. Show both.
+
+---
+
+## 6. Alert catalogue
+
+Conditions are backend-neutral state predicates. `for` is the minimum duration
+the predicate must hold before firing (avoid flapping). Severity is a
+recommendation; the consumer maps it.
+
+| # | Alert | Condition (predicate) | Severity | `for` | Why actionable | Recovery / operator action |
+|---|---|---|---|---|---|---|
+| A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
+| A2 | No successful sync | `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` | critical | 5m | Supply is stale; issues will not enter the queue | Check `IssueSyncRun` errors and GitHub reachability |
+| A3 | Health/DB down | `dispatch_health_up == 0` | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
+| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `increase(dispatch_agent_runs_total{run_type="implement"}[30m]) == 0` **and** `dispatch_scheduler_healthy == 1` | warning | 30m | Work exists and the pipeline is healthy, but no implement runs start — supply is not reaching workers. Suppressed while A1/A2 fire, so a stopped pipeline is not misreported as a worker problem | Check worker availability/credentials; confirm `next-task` returns `implement` |
+| A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
+| A6 | Assigned without execution | `dispatch_assigned_without_execution > 0` | warning | 30m | Assigned but never picked up; invisible in a queue-depth-only view | Verify the worker polls its lane; check admission withholding |
+| A7 | Unacknowledged hand-outs | `dispatch_pr_fix_unacked_handouts > 0` for > hand-out timeout | warning | 35m | A worker may have died before materializing its run; item is stranded | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
+| A8 | PR-fix head-of-line | `dispatch_pr_fix_oldest_queued_seconds > threshold` | warning | 30m | Work is queued but not draining | Check worker concurrency, lane routing, and `fixAttempts` saturation |
+| A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | info/warning | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
+| A10 | Admission withholding | `dispatch_queue_withheld{reason="grooming_unknown"}` or `{reason="grooming_stale"}` sustained | warning | 1h | The admission gate is starving the queue on missing/stale grooming | Fix grooming pipeline; or operator admission override for a specific issue |
+| A11 | Grooming backoff | `dispatch_grooming_backoff > 0` sustained | warning | 30m | Upstream GitHub reads are failing; issues cannot be groomed | Check GitHub reachability/rate limits |
+| A12 | Audit failures | `increase(dispatch_audit_failures_total[15m]) > 0` | warning | 5m | Mutations are failing (labels/claims) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
+| A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` **or** `dispatch_grooming_backoff > 0` | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
+
+### Normal inactivity must NOT alert
+
+- Empty issue queue with `dispatch_issues_open_claimable == 0`: **no alert**.
+  An idle fleet is healthy.
+- Empty PR-fix listing: **no alert**. It is independent of the issue queue.
+- `dispatch_agent_runs_total == 0` when there is no eligible work: **no alert**.
+- No `BLOCKED` items: **no alert**. Absence of a human decision is good.
+- No `status/ready` issue with `unknown` freshness (no issue withheld as
+  `grooming_unknown`): **no alert**. Never-groomed backlog is not a fault.
+- `lastRunAt == null` immediately after process start: **no alert** until at
+  least one interval has elapsed.
+
+Alerts must be gated on **eligible work existing** (A4, A6) or on a **pipeline
+that should have run** (A1–A3, A13). "Nothing happened" is not a failure.
+
+---
+
+## 7. Integration matrix
+
+Optional approaches. **None is required, and none is chosen here.** Neither
+Grafana nor Alertmanager is assumed; the dashboard and evaluator are explicit
+choices at composition time.
+
+| Approach | Transport | State source | Dashboard choice | Evaluator choice | Cardinality control | Notes / gaps |
+|---|---|---|---|---|---|---|
+| **A. Pull exporter (Prometheus / VictoriaMetrics)** | HTTP `/metrics` scrape | Read-only DB queries (state gauges) + windowed totals from append-only tables | Any (Grafana, VM UI, custom) | Prometheus rules / vmalert / custom | Enforce label allowlists at the exporter | Needs a new read-only exporter; no in-process counters exist, so totals are windowed DB deltas |
+| **B. OTel push metrics** | OTLP push | Same as A, emitted as OTel instruments | Any OTel-compatible backend | OTel-native or downstream | Use OTel attribute allowlists; avoid high-cardinality attributes | Adds an OTel SDK/dependency; exporter/collector choice deferred |
+| **C. OTel logs/events** | OTLP logs | `AuditLog`, `PrFixHistory`, `AgentRun`, `IssueSyncRun` as events | Any log backend | Backend rules | Event attributes may carry IDs; **keep them out of metric labels** | Good for drill-down; not a substitute for gauges |
+| **D. Snapshot API** | HTTP JSON | A read-only `GET` that returns the catalogue as JSON | Any | Any | Consumer controls | Optional convenience; would be a small, separately-scoped implementation |
+| **E. Direct SQL / warehouse** | Batch | Postgres read replica | BI tool | BI/scheduled queries | Query-side | Couples to schema; acceptable for operators who already run a warehouse |
+
+**Recommended composition:** A or B for state gauges and windowed totals; C for
+drill-down. Exporter, collector, dashboard, and evaluator choices are
+**deferred** ([§10](#10-open-questions-and-deferred-decisions)). Correlation with
+an external connector is done at the consumer by joining on an exported
+identifier (e.g. repository + issue number), never by requiring a shared ID in
+Dispatch.
+
+---
+
+## 8. Worked examples for a non-Courier consumer
+
+These illustrate interpretation for a consumer that knows nothing about Courier.
+Values are illustrative.
+
+### 8.1 Healthy
+
+```
+dispatch_health_up                                  1
+dispatch_scheduler_up                               1
+dispatch_scheduler_job_overdue{job="sync"}          0
+dispatch_sync_last_success_timestamp_seconds        (2m ago)
+dispatch_issues{status="ready",state="open"}        12
+dispatch_issues_open_claimable                      9
+dispatch_leases_active                              4
+dispatch_agent_work{state="IN_PROGRESS"}            4
+dispatch_agent_work{state="STALE"}                  0
+dispatch_pr_fix_items{status="QUEUED"}              3
+dispatch_pr_fix_unacked_handouts                    0
+dispatch_pr_fix_human_decisions                     1
+```
+**Read:** supply is flowing, execution is live, ownership is fresh, hand-outs
+are acknowledged. A1–A8 and A10–A13 silent; A9 fires only if the one human
+decision has aged past the threshold. This is the expected steady state.
+
+### 8.2 Idle
+
+```
+dispatch_health_up                                  1
+dispatch_scheduler_up                               1
+dispatch_scheduler_job_overdue{job="sync"}          0
+dispatch_issues_open_claimable                      0
+dispatch_agent_work{state="IN_PROGRESS"}            0
+dispatch_pr_fix_items{status="QUEUED"}              0
+dispatch_agent_runs_total{run_type="implement"}     0
+```
+**Read:** nothing to do. No alert should fire. In particular, A4 must be gated
+on `open_claimable > 0`, and empty PR-fix must not alert. This is the example
+that most often produces false alarms if inactivity is treated as failure.
+
+### 8.3 Degraded — scheduler stopped, work piling up
+
+```
+dispatch_health_up                                  1
+dispatch_scheduler_up                               1
+dispatch_scheduler_job_overdue{job="sync"}          1     # last tick 45m ago, interval 15m
+dispatch_sync_last_success_timestamp_seconds        (45m ago)
+dispatch_issues_open_claimable                      20
+dispatch_agent_runs_total{run_type="implement"}     0     # nothing starting
+dispatch_leases_expired                             2
+dispatch_agent_work{state="STALE"}                  2
+dispatch_queue_withheld{reason="grooming_unknown"}  6
+```
+**Read:** A1 (scheduler overdue) and A2 (no sync) fire first. A4 does **not**
+fire here: its `dispatch_scheduler_healthy == 1` guard is false while A1 is
+active, so a stopped pipeline is not misreported as a worker problem. A5 fires
+on the expired leases/stale work. A10 fires on sustained `grooming_unknown`
+withholding. The operator checks the scheduler logs, then the grooming pipeline.
+Recovery is `sync` re-arming; the stale sweep recovers ownership. Once the
+scheduler is healthy again, A4 becomes the relevant signal if runs still do not
+start.
+
+### 8.4 Degraded — worker hand-outs stranded (PR-fix)
+
+```
+dispatch_pr_fix_items{status="QUEUED"}              8
+dispatch_pr_fix_unacked_handouts                    5
+dispatch_pr_fix_handout_age_seconds{quantile="0.5"} 2400   # 40m > 30m timeout
+dispatch_pr_fix_reclaims_total                      2
+dispatch_agent_runs_total{run_type="followup-pr"}   1
+```
+**Read:** A7 fires — hand-outs older than the 30m timeout without an ack. Either
+workers are not acknowledging (they should after durably materializing a run),
+or the reclaim sweep is disabled (default). Recovery: enable the reclaim sweep
+or have an operator requeue. This is distinct from A8 (head-of-line age) and
+from A9 (a human decision).
+
+---
+
+## 9. Privacy, cardinality, and security
+
+- **Label allowlists only.** Metric labels are drawn from fixed enums: status,
+  lane, reason code, job name, run type, state/checkpoint. Anything else is
+  `unknown`.
+- **Never label by** repository name (unless the tracked-repo set is small and
+  operator-approved), issue/PR number, task ID, commit SHA, credential, agent
+  name (potentially sensitive), or error string. These belong in logs/events and
+  drill-down views.
+- **No secrets or PII** in metric names, labels, or exported events. Token tiers
+  and identities are never exported.
+- **Auth:** the health endpoint is public; everything else is authenticated
+  (bearer maintainer/worker, Basic, OIDC, or signed webhook). Any future
+  exporter must be read-only and scoped accordingly; it must not accept
+  mutations.
+- **Source-of-truth caveat:** signals reflect Dispatch's cache. Label-driven
+  state is authoritative on GitHub and can lag; do not present cache state as
+  forge state in an alert that requires a human to act on the forge.
+
+---
+
+## 10. Open questions and deferred decisions
+
+Exporter and dependency choices are **explicitly deferred**; this document is a
+design, not a decision.
+
+- **Exporter shape:** pull exporter (A) vs OTel push (B) vs snapshot API (D).
+  Trade-offs: pull is simple and scrape-native; push fits an existing collector;
+  a snapshot API is vendor-neutral but adds an endpoint.
+- **Counter modeling:** since Dispatch has no in-process counters, decide
+  whether DB-derived totals are gauges or windowed deltas, and how the consumer
+  computes rates.
+- **Repo dimension:** whether `repo` is a bounded, acceptable label (small,
+  configured tracked set) or must be aggregated.
+- **Scheduler state is in-process** (`globalThis`) and resets on restart; decide
+  whether to persist last-run timestamps for cross-restart freshness.
+- **GitHub-native state** (native `blocked_by` links, PR review/merge state) is
+  read through the forge; decide how to represent `unknown` when a read fails
+  without writing back to Postgres.
+- **Free-string dimensions** (`AgentRun.status`, `GroomingRun.status/stage/
+  applyOutcome`, `PrFixHistory.action`, `AuditLog.action`) need a published
+  allowlist with an `unknown` bucket, or conversion to enums in a later change.
+- **Reclaim observability:** the `pr-fix-sweep` job is default-disabled, so
+  reclaim signals may be absent; decide how to surface that state explicitly.
+- **Acknowledgement gap:** issue claims have no ack (only PR-fix hand-outs do);
+  decide whether stale-claim detection is sufficient without one.
+- **Retention and windowing:** how long event tables feed windowed totals, and
+  whether the exporter queries the primary or a replica.
+- **OTel semantic conventions:** whether to map to standard metric/log
+  conventions or keep Dispatch-prefixed names.
