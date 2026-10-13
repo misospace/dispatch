@@ -157,13 +157,23 @@ Assignment is label-only (`agent/*`, `owner/*`) and has no lease. Execution is a
 | `dispatch_lease_age_seconds` | histogram | seconds | `now - Lease.renewedAt` / `createdAt` | — | How long ownership has been held |
 | `dispatch_leases_expired` | gauge | count | `Lease.expiredAt <= now` | — | Ownership past TTL (recoverable) |
 | `dispatch_assigned_without_execution` | gauge | count | assigned (`agent/*`) and no active lease/`AgentWork` | `lane` | Assignment that never became execution |
-| `dispatch_execution_active` | gauge | 0/1 | derived: `dispatch_leases_active >= 1` **or** any `AgentWork` in `CLAIMED`/`IN_PROGRESS` | — | Something is executing right now. Used as the A4 in-flight guard: a task picked up before the pickup window still suppresses A4 for its whole duration |
+| `dispatch_execution_active` | gauge | 0/1 | derived: an unexpired `Lease` **or** an `AgentWork` in `CLAIMED`/`IN_PROGRESS` exists, **counted for worker identities only** (see the system-emitter exclusion below) | — | Something is executing right now. Used as the A4 in-flight guard: a task picked up before the pickup window still suppresses A4 for its whole duration. `BLOCKED` AgentWork rows are deliberately excluded — blocked work is active (§4.4) but not flowing, and must not mask an otherwise idle fleet |
 
 `DEFAULT_LEASE_TTL_MS = 30 min` (`src/lib/lease.ts:18`). Lease active means
 `expiredAt > now`; there is no lease status column — the issue's status label is
 the state (`src/lib/lease.ts:99-112`). Orphan leases are released and audited:
 a corrupted checkpoint at `src/lib/lease.ts:168-180`, and a lease whose
 referenced issue is missing at `src/lib/lease.ts:191-204`.
+
+**System-emitter exclusion.** The hosted groomer takes its own lease without any
+worker involvement (`upsertLease({ agentName: "hosted-groomer", … })`,
+`src/lib/groomer/run.ts:250-254`) on its normal schedule, and it writes
+`AgentRun` rows with `runType: "groom"` as internal bookkeeping
+(`src/lib/groomer/run.ts:1196-1200`). Groomer leases and `groom` runs must be
+excluded from `dispatch_execution_active`, `dispatch_work_pickups_in_window`, and
+`dispatch_agent_runs_reported_in_window` — otherwise a running groomer makes the
+fleet look permanently busy. The exclusion is an exporter-side filter on
+`agentName`/`runType`, never a metric label (§9).
 
 ### 4.4 AgentWork lifecycle
 
@@ -288,7 +298,11 @@ restart, so a freshly started process reports `null` until the first tick.
 `src/app/api/sync/route.ts:67`, `src/app/api/sync/scheduled/route.ts:151`), and
 `failed` (error path, `src/app/api/sync/scheduled/route.ts:227`). There is **no**
 `success` value: predicates must match `"completed"`/`"failed"`, allowlist these,
-and bucket anything else as `unknown`.
+and bucket anything else as `unknown`. Note the coverage gap: the manual-sync
+error path returns a 500 **without** persisting `failed`
+(`src/app/api/sync/route.ts:80-82`), leaving the row `running` forever — so
+`dispatch_sync_failures_total` undercounts manual failures and A2 freshness is
+the backstop for them.
 
 ### 4.10 Failure and outcome signals
 
@@ -296,15 +310,17 @@ and bucket anything else as `unknown`.
 |---|---|---|---|---|---|
 | `dispatch_audit_failures_total` | gauge (windowed) | count | `AuditLog.success = false` | `action` (allowlisted) | Failed mutations |
 | `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Outcome distribution across `AgentRun` rows. **Windowed delta only**: the rows are append-only and the window is the reset, so the exporter computes rates over the chosen window (e.g. `[5m]`, `[1h]`). It is **not** process-monotonic and **must not** be evaluated with `increase()`-style rate functions |
-| `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Number of runs whose **reported start time** falls in the previous N seconds, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Survives process restarts because it is derived from the row timestamp. **Blind spot:** `AgentRun` rows are inserted by `tasks/report` when work *finishes* (`src/app/api/agents/[agentName]/tasks/report/route.ts:571`), and `startedAt` is a retrospective optional field defaulting to report time. A worker still mid-task (running longer than the window) is invisible to this gauge until it reports. It measures *reported starts*, not real-time pickups — do not use it alone to detect "nothing being handed out"; use `dispatch_work_pickups_in_window` for that |
-| `dispatch_work_pickups_in_window` | gauge (as-of-scrape) | count | new `AgentWork` rows (`AgentWork.createdAt >= now() - window`) **or** newly created `Lease` rows (`Lease.createdAt >= now() - window`) | `window` (allowlisted: `1800s`, `3600s`) | Work **picked up** in the previous N seconds, recorded at pickup time: `AgentWork` rows are created by `POST /api/agent-work/start` (`src/lib/agent-work.ts:186`) and `Lease` rows by claim via `upsertLease` (`src/lib/lease.ts:69`, `createdAt = DB now()`). Lease *renewals* do not count (they reuse the original `createdAt`). Because the timestamp is written when the worker takes the work — not when it reports — a just-started long task counts immediately even if its report lands an hour later (or never) |
+| `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Number of runs whose **reported start time** falls in the previous N seconds, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Survives process restarts because it is derived from the row timestamp. **Blind spot:** `AgentRun` rows are inserted by `tasks/report` when work *finishes* (`src/app/api/agents/[agentName]/tasks/report/route.ts:571`), and `startedAt` is a retrospective optional field defaulting to report time. A worker still mid-task (running longer than the window) is invisible to this gauge until it reports. It measures *reported starts*, not real-time pickups — do not use it alone to detect "nothing being handed out"; use `dispatch_work_pickups_in_window` / `dispatch_agent_runs_reported_in_window` for that |
+| `dispatch_work_pickups_in_window` | gauge (as-of-scrape) | count | new `AgentWork` rows (`AgentWork.createdAt >= now() - window`) **or** newly created `Lease` rows (`Lease.createdAt >= now() - window`), worker identities only (system-emitter exclusion, §4.3) | `window` (allowlisted: `1800s`, `3600s`) | Work **picked up** in the previous N seconds, recorded at pickup time: `AgentWork` rows are created by `POST /api/agent-work/start` (`src/lib/agent-work.ts:186`) and `Lease` rows by claim via `upsertLease` (`src/lib/lease.ts:69`, `createdAt = DB now()`). Lease *renewals* do not count (they reuse the original `createdAt`) |
+| `dispatch_agent_runs_reported_in_window` | gauge (as-of-scrape) | count | `AgentRun.createdAt >= now() - window` (row insertion by `tasks/report`), worker run types only — `groom` runs from the hosted groomer are excluded (§4.3) | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Completed tasks **reported** in the previous N seconds. Throughput evidence for the canonical loop (next-task → execute → report), which — unlike claim/agent-work — writes no pickup row, so pickups alone under-count a fleet that delivers without materializing a lease. A row lands only at finish, so this gauge cannot see a single task still in flight; that is what `dispatch_execution_active` covers |
 | `dispatch_agent_run_failures_total` | gauge (windowed) | count | `AgentRun.status = failed` | `run_type` | Hard run failures |
 | `dispatch_scheduler_job_errors_total` | gauge (windowed) | count | job HTTP non-2xx/409 (logs today) | `job` | Requires a future counter; **unknown** today |
 
 `AuditLog.action`, `AgentRun.status`, and `AgentRun.runType` are free strings.
 Allowlist the observed values and bucket the rest as `unknown`; never label by
-`errorMessage`. The default `window` allowlist for `dispatch_agent_runs_started_in_window`
-and `dispatch_work_pickups_in_window` covers the alerting needs in
+`errorMessage`. The default `window` allowlist shared by
+`dispatch_agent_runs_started_in_window`, `dispatch_work_pickups_in_window`, and
+`dispatch_agent_runs_reported_in_window` covers the alerting needs in
 [§6](#6-alert-catalogue); consumers may add other windows but must keep
 cardinality bounded.
 
@@ -319,7 +335,7 @@ layout is rows of related signals.
 | Row | Views (predicate) | Question answered |
 |---|---|---|
 | **1. Work supply** | `dispatch_issues` by `status`/`lane`; `dispatch_issues_open_claimable`; `dispatch_issue_age_seconds` p50/p95/max | Is there eligible work, and how old is it? |
-| **2. Execution** | `dispatch_issue_assigned`; `dispatch_leases_active`; `dispatch_execution_active`; `dispatch_work_pickups_in_window`; `dispatch_agent_work` by `state`; `dispatch_agent_work_heartbeat_age_seconds` | Is assigned work actually executing, and is new work being picked up? |
+| **2. Execution** | `dispatch_issue_assigned`; `dispatch_leases_active`; `dispatch_execution_active`; `dispatch_work_pickups_in_window`; `dispatch_agent_runs_reported_in_window`; `dispatch_agent_work` by `state`; `dispatch_agent_work_heartbeat_age_seconds` | Is assigned work actually executing, and is new work being picked up and reported? |
 | **3. Ownership health** | `dispatch_leases_expired`; `dispatch_agent_work` `STALE`; `dispatch_assigned_without_execution` | Is any ownership stale or orphaned? |
 | **4. PR-fix supply** | `dispatch_pr_fix_items` by `status`/`lane`; `dispatch_pr_fix_oldest_queued_seconds` | What PR-fix work is queued, and for how long? |
 | **5. PR-fix hand-out health** | `dispatch_pr_fix_unacked_handouts`; `dispatch_pr_fix_handout_age_seconds`; `dispatch_pr_fix_reclaims_total` | Are hand-outs reaching and being acknowledged by workers? |
@@ -361,7 +377,7 @@ recommendation; the consumer maps it.
 | A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
 | A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
 | A3 | Health/DB down | `dispatch_health_up == 0` | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
-| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. The pickup signal is written when a worker claims/starts work (`AgentWork.createdAt` / `Lease.createdAt`), not when it reports, so a task in flight keeps `dispatch_execution_active` at 1 and suppresses A4 for its full duration — a long-running worker (or a slow one that never reports) is never misread as "nothing handed out" (see §8.6); a *hung* task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement` |
+| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800s"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the hosted groomer's system rows (§4.3), so a busy groomer cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
 | A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
 | A6 | Assigned without execution | `dispatch_assigned_without_execution > 0` | warning | 30m | Assigned but never picked up; invisible in a queue-depth-only view | Verify the worker polls its lane; check admission withholding |
 | A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
@@ -526,23 +542,28 @@ dispatch_scheduler_up                               1
 dispatch_scheduler_job_overdue{job="sync"}          0
 dispatch_sync_last_success_timestamp_seconds        (6m ago)
 dispatch_issues_open_claimable                      7     # backlog exists
-dispatch_execution_active                           1     # lease live, AgentWork IN_PROGRESS
-dispatch_leases_active                              1
+dispatch_execution_active                           1     # AgentWork IN_PROGRESS (worker identity)
+dispatch_leases_active                              1     # kept live by the worker's re-claim renewal (src/lib/lease.ts:55-57)
 dispatch_agent_work{state="IN_PROGRESS"}            1
-dispatch_agent_work_heartbeat_age_seconds           40    # seconds — worker alive
+dispatch_agent_work_heartbeat_age_seconds           40    # seconds — checkpoint heartbeat extends lastHeartbeatAt (src/lib/agent-work.ts:220-227)
 dispatch_work_pickups_in_window{window="1800s"}     0     # the pickup was 45m ago
-dispatch_agent_runs_started_in_window{run_type="implement", window="1800s"}  0  # nothing reported yet
+dispatch_agent_runs_reported_in_window{window="1800s"}  0 # nothing finished/reported yet
+dispatch_agent_runs_started_in_window{run_type="implement", window="1800s"}  0  # no report row exists at all
 ```
 **Read:** one worker picked up an implement task 45 minutes ago and is still
 executing; the backlog is real but the fleet is not idle. A4 must **not** fire:
-`dispatch_execution_active == 1` fails its in-flight guard even though both
-30-minute window gauges are zero. This is the state a *reported-starts*-only
-predicate misfires on, because `AgentRun` rows — and their optional
-retrospective `startedAt` — only exist once `tasks/report` lands. If this
-worker instead died mid-task without reporting, its lease expires and A5 fires
-(expired lease / stale work), and a live-but-silent worker is caught by the
+`dispatch_execution_active == 1` fails its in-flight guard even though all
+three 30-minute window gauges are zero. This is the state a
+*reported-starts*-only predicate misfires on, because `AgentRun` rows — and
+their optional retrospective `startedAt` — only exist once `tasks/report`
+lands. If this worker died mid-task, its checkpoint heartbeats stop, the
+agent-work sweep marks the row `STALE` (§4.4) and the lease expires — A5 fires
+on stale work/expired ownership; a live-but-silent worker is caught by the
 `dispatch_agent_work_heartbeat_age_seconds` trend — not A4. Only when nothing
-is executing **and** nothing new is picked up does A4 become the relevant alert.
+is executing, nothing new is picked up, **and** nothing is reported does A4
+become the relevant alert. (A fleet that delivers through the canonical loop
+without ever materializing a claim or agent-work row is unobservable mid-task;
+see the blind spot stated in A4.)
 
 ---
 
@@ -591,7 +612,10 @@ design, not a decision.
 - **Reclaim observability:** the `pr-fix-sweep` job is default-disabled, so
   reclaim signals may be absent; decide how to surface that state explicitly.
 - **Acknowledgement gap:** issue claims have no ack (only PR-fix hand-outs do);
-  decide whether stale-claim detection is sufficient without one.
+  decide whether stale-claim detection is sufficient without one. Related: the
+  canonical loop (next-task → execute → report) writes no pickup row, so A4's
+  mid-task visibility depends on workers materializing a claim or agent-work
+  start ([§6 A4](#6-alert-catalogue) documents the residual blind spot).
 - **Retention and windowing:** how long event tables feed windowed totals, and
   whether the exporter queries the primary or a replica.
 - **OTel semantic conventions:** whether to map to standard metric/log
