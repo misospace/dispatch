@@ -12,8 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The composite action already runs `npm ci --include=dev`; a second
+      # bare `npm ci` reinstalled the same tree (#1174).
       - uses: ./.github/actions/setup-node
-      - run: npm ci
       # Blocking gate: production + optional dependencies only (#1166). The
       # .npmrc include=dev would otherwise cancel --omit=dev, so the script
       # passes an explicit --include=prod; see the "//".audit note in package.json.
