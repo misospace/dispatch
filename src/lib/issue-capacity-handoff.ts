@@ -201,7 +201,7 @@ async function recoverIssueCapacityHandoffUnlocked(
   const refusal = classifyLiveLabels(liveLabels, agentLabel);
   // A previous attempt may have removed the label before a later write
   // failed. The durable guard still excludes a new claim epoch.
-  if (refusal && !resuming) return refusal;
+  if (refusal && (!resuming || refusal.code === "human_hold" || refusal.code === "issue_done")) return refusal;
 
   // ── 4. Recheck live labels before any remote mutation ────────────────────
   let releaseLabels = liveLabels;
@@ -209,7 +209,8 @@ async function recoverIssueCapacityHandoffUnlocked(
   try {
     const recheck = await getLiveIssueLabels(repoFullName, issueNumber);
     const changed = classifyLiveLabels(recheck, agentLabel, true);
-    if (changed) ownershipChangedPostCas = true;
+    if (changed?.code === "human_hold" || changed?.code === "issue_done") return changed;
+    if (changed || !recheck.includes(agentLabel)) ownershipChangedPostCas = true;
     releaseLabels = recheck;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

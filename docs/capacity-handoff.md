@@ -74,11 +74,9 @@ verification. If ownership moved, the release narrows to
 **ownership-only** — our own `agent/*` label is removed idempotently and the
 cache mirrors the freshest known set minus that label — and no status label
 is ever touched, so a newer owner's transition survives. A re-read failure
-must not take the full-release path: ownership is unknown, and a status
-transition on a stale snapshot could clobber it. Ownership-only cleanup is
-safe under total ignorance (one targeted write, our own label, narrowing
-only), and the lease is already consumed, so halting would strand the claim
-with no owner.
+returns 503 without remote writes, retaining the lease and guard for retry.
+A blocked/done hold found on either read is refused without label or lease
+mutation; ownership-only cleanup is reserved for genuine changed owners.
 
 ## What success does
 
@@ -188,7 +186,11 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
   execution fence: callback work runs outside database transactions, and only
   the matching owner can reopen a completed-but-incomplete attempt. A crash
   leaves `executing: true`; an operator must confirm process termination
-  before resetting it to false.
+  before resetting it to false. Routine local-only lease failures remove
+  their own guard safely. A failed claim can resume under the same agent's
+  nonexecuting guard: it re-verifies live ownership and human holds, repairs
+  the cache plus lifecycle event transaction and lease, and does not steal a
+  changed claim. Other agents cannot enter until reconciliation finishes.
 * Capacity release retains its lease until GitHub label cleanup succeeds; the
   exact lease CAS delete follows remote cleanup. A cleanup failure retains both
   lease and guard for an exact-token retry. Failed GitHub reads/removals must

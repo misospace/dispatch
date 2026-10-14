@@ -50,6 +50,15 @@ describe("issue mutation guard", () => {
     expect(prisma.issueMutationGuard.updateMany).not.toHaveBeenCalled();
   });
 
+  it("allows only the exact same agent to resume a nonexecuting claim", async () => {
+    vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ agentName: "worker" }) as never);
+    vi.mocked(prisma.issueMutationGuard.updateMany as any).mockResolvedValue({ count: 1 });
+    const callback = vi.fn(async (_, context) => ({ complete: true, value: context.resuming }));
+    await expect(withIssueMutationGuard({ ...request, agentName: "worker" }, callback)).resolves.toMatchObject({ status: "completed", value: true });
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
   it("keeps an executing exact retry busy", async () => {
     vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ operation: "capacity-release", agentName: "worker", claimToken: "token", executing: true }) as never);
@@ -86,6 +95,27 @@ describe("issue mutation guard", () => {
     resume();
     await release;
     expect(await withIssueMutationGuard({ ...request, agentName: "worker" }, newClaim)).toMatchObject({ status: "completed", value: "new-token" });
+  });
+
+  it("removes a new lease guard after transient failure so a retry can acquire it", async () => {
+    let stored: any = null;
+    vi.mocked(prisma.issueMutationGuard.create as any).mockImplementation(async ({ data }: any) => {
+      if (stored) throw { code: "P2002" };
+      stored = { ...data };
+      return stored;
+    });
+    vi.mocked(prisma.issueMutationGuard.findUnique as any).mockImplementation(async () => stored);
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockImplementation(async ({ where }: any) => {
+      if (stored?.ownerToken !== where.ownerToken) return { count: 0 };
+      stored = null;
+      return { count: 1 };
+    });
+    const leaseRequest = { issueId: "issue-1", operation: "lease", agentName: "worker" };
+    await expect(withIssueMutationGuard(leaseRequest, async () => { throw new Error("transient"); })).rejects.toThrow("transient");
+    expect(stored).toBeNull();
+    const retry = await withIssueMutationGuard(leaseRequest, async () => ({ complete: true, value: "lease created" }));
+    expect(retry).toMatchObject({ status: "completed", value: "lease created" });
+    expect(prisma.issueMutationGuard.create).toHaveBeenCalledTimes(2);
   });
 
   it("reopens a thrown callback but keeps the owner barrier", async () => {

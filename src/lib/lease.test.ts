@@ -170,6 +170,19 @@ describe("upsertLease", () => {
       await expect(upsertLease({ agentName: "saffron", issueId: "i-1" })).rejects.toThrow("connection lost");
       expect(mocks.leaseFindUnique).toHaveBeenCalledTimes(1);
     });
+
+    it("succeeds when a transient create failure is retried", async () => {
+      mocks.leaseFindUnique.mockResolvedValue(null);
+      mocks.leaseCreate
+        .mockRejectedValueOnce(new Error("connection lost"))
+        .mockImplementation(async ({ data }: any) => ({ id: "l-1", ...data }));
+
+      await expect(upsertLease({ agentName: "saffron", issueId: "i-1" })).rejects.toThrow("connection lost");
+      const retry = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+      expect(retry.created).toBe(true);
+      expect(retry.lease.claimToken).toMatch(/^claim_/);
+      expect(mocks.leaseCreate).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe("renew path", () => {

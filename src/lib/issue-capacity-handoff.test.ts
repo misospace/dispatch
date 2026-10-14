@@ -61,13 +61,14 @@ describe("recoverIssueCapacityHandoff", () => {
     expect(client.lease.deleteMany).toHaveBeenCalledTimes(1);
   });
 
-  it("late blocked state uses targeted ownership cleanup", async () => {
-    claimGateMocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/alpha", "status/in-progress"]).mockResolvedValueOnce(["agent/alpha", "status/blocked"]);
+  it.each(["status/blocked", "status/done"])("refuses late %s without ownership or lease mutation", async (status) => {
+    claimGateMocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/alpha", "status/in-progress"]).mockResolvedValueOnce(["agent/alpha", status]);
     const client = makeClient();
-    const result = await call(client);
-    expect(result.ok).toBe(true);
+    expect(await call(client)).toMatchObject({ ok: false, code: status === "status/blocked" ? "human_hold" : "issue_done" });
     expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
-    expect(githubMocks.removeIssueLabel).toHaveBeenCalledWith(REPO, NUMBER, "agent/alpha");
+    expect(githubMocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.mirrors).toHaveLength(0);
   });
 
   it("second read failure returns 503 without writes and retains lease", async () => {
@@ -94,10 +95,10 @@ describe("recoverIssueCapacityHandoff", () => {
 
   it("resumes exact-token cleanup after prior label removal without changing resting status", async () => {
     guardState.resuming = true;
-    claimGateMocks.getLiveIssueLabels.mockResolvedValue(["status/blocked"]);
+    claimGateMocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress"]);
     const client = makeClient();
     const result = await call(client);
-    expect(result).toMatchObject({ ok: true, status: "status/blocked" });
+    expect(result).toMatchObject({ ok: true, status: "status/in-progress" });
     expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
     expect(client.lease.deleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", agentName: AGENT, issueId: ISSUE_ID, claimToken: TOKEN } });
   });

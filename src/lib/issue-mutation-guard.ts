@@ -37,7 +37,9 @@ export async function withIssueMutationGuard<T>(
     const exactRelease = request.operation === "capacity-release" && guard.operation === request.operation
       && request.agentName !== undefined && request.claimToken !== undefined
       && guard.agentName === request.agentName && guard.claimToken === request.claimToken;
-    if (!exactRelease || guard.executing) return { status: "busy", ownerToken: guard.ownerToken, operation: guard.operation };
+    const exactClaim = request.operation === "claim" && guard.operation === "claim"
+      && request.agentName !== undefined && guard.agentName === request.agentName;
+    if ((!exactRelease && !exactClaim) || guard.executing) return { status: "busy", ownerToken: guard.ownerToken, operation: guard.operation };
     const acquired = await prisma.issueMutationGuard.updateMany({
       where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: false }, data: { executing: true },
     });
@@ -55,7 +57,11 @@ export async function withIssueMutationGuard<T>(
     await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });
     return { status: "retained", ownerToken: guard.ownerToken, value: result.value };
   } catch (error) {
-    await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });
+    if (request.operation === "lease" && !resuming) {
+      await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
+    } else {
+      await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });
+    }
     throw error;
   }
 }
