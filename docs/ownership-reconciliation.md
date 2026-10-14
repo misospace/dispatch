@@ -597,7 +597,7 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 | **Open linked PR** | `REVIEW_OWNED`; never release. PR-fix queue ownership (#1145) takes precedence. |
 | **Explicit hold** | `HELD`; never auto-release. Requires an operator to clear. |
 | **Deliberate block (`blockedReason`)** | `HELD`; release (if it ever applies) preserves `status/blocked`. |
-| **Generic legacy assignment** (`agent/courier`) | `CONFLICTED`/migration policy (§7); never blanket-aliased or stolen. |
+| **Generic legacy assignment** (`agent/courier`) | `CONFLICTED`/migration policy (§12); never blanket-aliased or stolen. |
 | **Multiple agent labels / cache divergence** | `CONFLICTED`; surface, do not guess. |
 | **Reconciler crash mid-release** | The §8.7 crash/replay matrix: replay acts only on the pending intent (reusing the `staleClaimReleasePending` two-phase pattern) with an idempotent GitHub delete; a settled release's stale retry issues no forge call, so a later attempt's label is never deleted. |
 | **Repeated release/reclaim churn** | Per-claim reclaim counter (`DISPATCH_RECONCILE_MAX_RECLAIMS`); on exhaustion park as `HELD`; reclaim cooldown between attempts (§8.3). |
@@ -671,7 +671,7 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 Every requirement of #1245 mapped to where this design settles it. Per the
 issue's non-goals this PR is **design-only**: the "enforcement" for each row is
 the specification plus its pinned negative controls, and production predicates
-and regression tests land in the accepted implementation children
+and regression tests land in the designated implementation children
 ([#1251](https://github.com/misospace/dispatch/issues/1251) — renewal/capability
 and state layer; [#1254](https://github.com/misospace/dispatch/issues/1254) —
 bounded reconciliation and fenced release), whose acceptance criteria already
