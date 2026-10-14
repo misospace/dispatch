@@ -193,6 +193,7 @@ src/
     github.ts               # GitHub label/comment API helpers
     auth.ts                 # authorizeRequest, getAuthorizedActor (bearer/basic/oidc)
     lease.ts                # Lease TTL, upsert, release, resolveActiveWork
+    issue-lifecycle.ts      # IssueLifecycleEvent taxonomy + idempotent recorder
     agent-work.ts           # AgentWork start/checkpoint/finish, stale recovery
     assignment-conflicts.ts # label conflict analysis (agent/owner add/remove)
     kanban.ts               # getIssuesByStatus, getIssueStatus
@@ -213,6 +214,7 @@ Cross-cutting concerns and where they live. Read these first when working in tha
 | AgentWork lifecycle | `app/api/agent-work/route.ts`, `app/api/agent-work/{start,checkpoint,finish}/route.ts`, `lib/agent-work.ts` |
 | Fenced capacity handoff (#1256) | `app/api/issues/capacity-handoff/route.ts`, `lib/issue-capacity-handoff.ts`, `lib/capacity-handoff.ts`, `lib/pr-fix-queue.ts` (report resolver), `lib/lease.ts` (claim token), [docs/capacity-handoff.md](./docs/capacity-handoff.md) |
 | Auth & audit actor identity | `lib/auth.ts` (`authorizeRequest`, `getAuthorizedActor`) |
+| Lifecycle event stream (claim/status evidence, #1202) | `lib/issue-lifecycle.ts`, `docs/issue-lifecycle-events.md` |
 | Board UI component tree | `app/board/page.tsx` → `kanban-board-client.tsx` → `components/kanban-board.tsx` → `components/issue-card.tsx` |
 | App shell / header / nav | `app/layout.tsx` |
 | Label & status constants | `types/index.ts` (`BOARD_COLUMNS`, `StatusLabel`, `AGENT_PREFIX`, `OWNER_PREFIX`) |

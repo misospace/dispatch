@@ -45,6 +45,7 @@ model Issue {
   groomingApplications  GroomingApplication[]
   groomingChildClaims   GroomingChildClaim[]
   groomerPendingReplies GroomerPendingReply[]
+  lifecycleEvents       IssueLifecycleEvent[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -346,6 +347,69 @@ model AgentReportDedupe {
 
   @@unique([agentName, idempotencyKey])
   @@index([agentName])
+}
+
+// ---------------------------------------------------------------------------
+// IssueLifecycleEvent — the durable, worker-neutral event stream for a work
+// item's lifecycle (#1202). IssueLane already records lane history; this
+// records claim / release / status / completion history so a later
+// claim-to-merge read never has to infer a first claim from issue creation or
+// overwrite an earlier attempt.
+//
+// Every row belongs to the Issue it describes (there is no Courier-specific
+// table or side channel), and every writer — API route, hosted groomer,
+// reconciler, sync, webhook, worker report — goes through
+// src/lib/issue-lifecycle.ts, so the taxonomy and the idempotency rules live in
+// one place.
+//
+// `occurredAt` is when the transition happened; `observedAt` is when Dispatch
+// saw it. A late or out-of-order observation keeps its real occurredAt and is
+// never backdated into observedAt, and events are never replayed back onto
+// Issue state, so the present status can only be changed by the writer that
+// owns it. `dedupeKey` carries a source-provided identity (a GitHub delivery
+// id, a merged-PR identity, a sync's issue-updated_at) so redelivery upserts
+// instead of duplicating; Dispatch-authored writes leave it NULL and rely on
+// the no-op-transition guard instead.
+//
+// See docs/issue-lifecycle-events.md for the taxonomy and migration notes.
+// ---------------------------------------------------------------------------
+
+model IssueLifecycleEvent {
+  id           String @id @default(cuid())
+  issueId      String
+  issue        Issue  @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  repoFullName String
+  issueNumber  Int
+  // Taxonomy: claim | claim_released | attempt_failed | status_changed |
+  // completed | issue_closed | issue_reopened | pr_merged.
+  kind         String
+  // The writer that produced this event (see LIFECYCLE_SOURCES).
+  source       String
+  // The identity responsible: an agent name, an operator actor, or the
+  // automation's own name.
+  actor        String
+  agentName    String?
+  fromStatus   String?
+  toStatus     String?
+  // Identity of the event in its source system, when the source has one
+  // (GitHub delivery id, PR number + merged_at, webhook action). NULL for
+  // writes Dispatch authors itself.
+  sourceEventId String?
+  // Idempotency identity for externally observed events; unique, so a
+  // redelivered webhook or a repeated sync upserts instead of duplicating.
+  // NULL means "no source identity" — those writes are guarded by the
+  // transition check instead.
+  dedupeKey     String?  @unique
+  occurredAt    DateTime
+  observedAt    DateTime @default(now())
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  @@index([issueId, occurredAt])
+  @@index([issueId, kind])
+  @@index([issueId, kind, occurredAt])
+  @@index([repoFullName, issueNumber])
+  @@index([kind])
 }
 
 model AuditLog {

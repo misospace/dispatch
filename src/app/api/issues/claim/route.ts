@@ -10,6 +10,7 @@ import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/lib/lease";
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { recordClaimEvent } from "@/lib/issue-lifecycle";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 
@@ -216,10 +217,37 @@ export async function POST(request: Request) {
       // Base is the live GitHub label set (authoritative — #1037).
       await transitionIssueStatus(repoFullName, issueNumber, liveLabels, IN_PROGRESS_STATUS);
 
-      // Update local cache
-      await prisma.issue.update({
-        where: { id: issueId as string },
-        data: { labels: updatedLabels, lastSyncedAt: new Date() },
+      // Update local cache and record the lifecycle event in one transaction:
+      // a claim whose event failed to commit would leave the stream missing an
+      // attempt, and an event without the claim would describe work that never
+      // landed (#1202). A redelivered claim of an already-claimed issue is a
+      // no-op for both — the transition guard inside recordClaimEvent sees an
+      // unchanged status and an unchanged agent label.
+      await prisma.$transaction(async (tx) => {
+        await tx.issue.update({
+          where: { id: issueId as string },
+          data: { labels: updatedLabels, lastSyncedAt: new Date() },
+        });
+
+        await recordClaimEvent(tx, {
+          issueId: issueId as string,
+          repoFullName,
+          issueNumber,
+          kind: "claim",
+          source: "api:claim",
+          actor: agentName as string,
+          agentName: agentName as string,
+          before: liveLabels,
+          after: updatedLabels,
+          // The GitHub writes above are already outside this transaction, so a
+          // failure here rolls the mirror back while GitHub keeps the claim —
+          // and the retry reads those live labels as "already claimed". The
+          // cache row is written inside the transaction, so on the retry it
+          // still holds the pre-claim set and can supply the before-state this
+          // attempt is missing. Decision logic stays on liveLabels above.
+          mirroredBefore: issue.labels,
+          metadata: force === true ? { force: true } : null,
+        });
       });
 
       // Create or renew a lease for this agent (issue #166).

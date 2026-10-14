@@ -15,6 +15,7 @@ import {
 import { asRepoFilePath } from "@/lib/groomer/close-grounding";
 import { PLAN_LIMITS } from "@/lib/groomer/plan";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
+import { recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 
 const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
@@ -720,6 +721,39 @@ export async function POST(
           });
         }
       }
+    }
+
+    // A failed or blocked attempt is a lifecycle event of its own (#1202): it
+    // is the evidence that distinguishes "released because the work finished"
+    // from "released because the worker gave up", which a status label alone
+    // can never show. `blocked` is recorded here too — an attempt that stopped
+    // for input never reached done — and `metadata.outcome` keeps the two
+    // apart. Recorded once per report: a duplicate replays the original run
+    // and adds nothing. Quiet, because a worker retry must not fail over an
+    // evidence row.
+    if (issueId && !duplicate && (report.outcome === "failed" || report.outcome === "blocked")) {
+      await recordLifecycleEventQuietly(
+        prisma,
+        {
+          issueId,
+          repoFullName: report.repoFullName!,
+          issueNumber: report.issueNumber!,
+          kind: "attempt_failed",
+          source: "agent-report",
+          actor: agentName,
+          agentName,
+          fromStatus: null,
+          toStatus: null,
+          sourceEventId: `agent-run:${run.id}`,
+          occurredAt: now,
+          metadata: {
+            outcome: report.outcome,
+            ...(typeof report.error === "string" ? { error: report.error } : {}),
+            ...(typeof report.blockReason === "string" ? { blockReason: report.blockReason } : {}),
+          },
+        },
+        "agent task report",
+      );
     }
 
     return NextResponse.json({

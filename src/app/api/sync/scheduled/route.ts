@@ -7,7 +7,7 @@ import {
   syncIssuesForRepos,
   reconcileClosedIssues,
   makePrismaIssueStore,
-  findActiveCachedIssuesForReconcile,
+  makePrismaReconcileIssueStore,
   fetchAllStateIssues,
   SyncResponse,
   ClosedIssueReconcileResponse,
@@ -69,19 +69,7 @@ export async function POST(request: Request) {
 
       // Reconcile closed issues with stale active statuses
       try {
-        closedIssueReconcile = await reconcileClosedIssues(repos, fetchIssue, {
-          findActiveCachedIssues: findActiveCachedIssuesForReconcile,
-          async updateIssue(id, data) {
-            await prisma.issue.update({
-              where: { id },
-              data: {
-                labels: data.labels,
-                state: data.state,
-                closedAt: data.closedAt,
-              },
-            });
-          },
-        });
+        closedIssueReconcile = await reconcileClosedIssues(repos, fetchIssue, makePrismaReconcileIssueStore());
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         console.error("Closed issue reconciliation failed:", error);

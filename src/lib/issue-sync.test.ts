@@ -5,6 +5,11 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     fetchIssues: vi.fn(),
     issueAggregate: vi.fn(),
+    issueFindUnique: vi.fn(),
+    issueUpdate: vi.fn(),
+    issueCreate: vi.fn(),
+    createLifecycleEvent: vi.fn(),
+    upsertLifecycleEvent: vi.fn(),
   },
 }));
 
@@ -16,17 +21,27 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
       aggregate: mocks.issueAggregate,
+      findUnique: mocks.issueFindUnique,
+      update: mocks.issueUpdate,
+      create: mocks.issueCreate,
+    },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
     },
   },
 }));
 
 import {
   IssueStore,
+  type SyncedIssueData,
   syncIssuesForRepos,
   mergeLabels,
   reconcileClosedIssues,
   closedIssueStatusFix,
   fetchAllStateIssues,
+  makePrismaIssueStore,
+  makePrismaReconcileIssueStore,
   defaultCurrentLane,
   currentLaneForLabels,
   SYNC_OVERLAP_BUFFER_MS,
@@ -204,7 +219,13 @@ describe("syncIssuesForRepos", () => {
     );
 
     expect(findMock).toHaveBeenCalledTimes(2);
-    expect(updateMock).toHaveBeenCalledWith("existing-1", expect.objectContaining({ number: 1 }));
+    expect(updateMock).toHaveBeenCalledWith(
+      "existing-1",
+      expect.objectContaining({ number: 1 }),
+      // The cached state is handed to the store alongside the write so it can
+      // record what the sync changed (#1202).
+      expect.objectContaining({ labels: [] }),
+    );
     expect(createMock).toHaveBeenCalledWith("repo-1", expect.objectContaining({ number: 2 }));
   });
 
@@ -225,6 +246,9 @@ describe("syncIssuesForRepos", () => {
     expect(store.updateIssue).toHaveBeenCalledWith(
       "existing-1",
       expect.objectContaining({ labels: ["type/bug", "agent/saffron"] }),
+      expect.objectContaining({
+        labels: ["agent/saffron", "status/in-progress"],
+      }),
     );
   });
 
@@ -598,5 +622,207 @@ describe("currentLaneForLabels (dispatch#988)", () => {
     // No lane carries role=escalation, so an escalation-labeled issue must not
     // vanish — it falls back to the default claimable lane.
     expect(currentLaneForLabels(["needs-escalation"])).toBe("work");
+  });
+});
+
+describe("makePrismaIssueStore — lifecycle evidence (#1202)", () => {
+  const updatedAt = new Date("2026-10-02T08:00:00.000Z");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.issueUpdate.mockResolvedValue({ id: "issue-1" });
+    mocks.issueCreate.mockResolvedValue({ id: "issue-1" });
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      labels: ["status/ready"],
+      state: "open",
+      repository: { fullName: "org/repo" },
+    });
+    mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+  });
+
+  function syncData(overrides: Partial<SyncedIssueData> = {}): SyncedIssueData {
+    return {
+      number: 42,
+      title: "Issue 42",
+      body: null,
+      url: "https://github.com/org/repo/issues/42",
+      labels: ["status/in-review"],
+      assignees: [],
+      commentsCount: 0,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt,
+      closedAt: null,
+      lastSyncedAt: updatedAt,
+      state: "open",
+      ...overrides,
+    };
+  }
+
+  it("records the status move the sync mirrored, with GitHub's timestamp as the occurrence time", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "sync|org/repo|42|status_changed|status/ready|status/in-review|2026-10-02T08:00:00.000Z" },
+      create: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "status_changed",
+        source: "sync",
+        fromStatus: "status/ready",
+        toStatus: "status/in-review",
+        occurredAt: updatedAt,
+      }),
+      update: {},
+    });
+  });
+
+  it("records a close GitHub reported, separately from the status label moving to done", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue(
+      "issue-1",
+      syncData({ labels: ["status/done"], state: "closed", closedAt: updatedAt }),
+      { labels: ["status/in-progress"], state: "open" },
+    );
+
+    const kinds = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].create.kind);
+    expect(kinds).toEqual(["status_changed", "issue_closed"]);
+  });
+
+  it("records nothing when the synced issue did not change", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData({ labels: ["status/ready"] }), { labels: ["status/ready"], state: "open" });
+
+    expect(mocks.issueUpdate).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("collapses a repeated sync over the same GitHub state onto one row", async () => {
+    const store = makePrismaIssueStore();
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+    await store.findIssue("repo-1", 42);
+    await store.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+
+    const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it("defers the mirror when the event write fails, then records exactly one event on the next sync", async () => {
+    // The evidence is written before the mirror, so a failed event write must
+    // leave the cache row untouched: an already-mirrored change would leave the
+    // next sync with no transition to derive, and the missing row could never
+    // be reconstructed.
+    const failedRun = makePrismaIssueStore();
+    await failedRun.findIssue("repo-1", 42);
+    mocks.upsertLifecycleEvent.mockRejectedValueOnce(new Error("db down"));
+
+    await expect(
+      failedRun.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" }),
+    ).rejects.toThrow("db down");
+    expect(mocks.issueUpdate).not.toHaveBeenCalled();
+
+    // The next sync sees the same before-state, re-derives the same transition
+    // and upserts onto the same source-derived key.
+    const retriedRun = makePrismaIssueStore();
+    await retriedRun.findIssue("repo-1", 42);
+    await retriedRun.updateIssue("issue-1", syncData(), { labels: ["status/ready"], state: "open" });
+
+    expect(mocks.issueUpdate).toHaveBeenCalledTimes(1);
+    // Both attempts carried the same identity, so the retry upserts the row the
+    // failed run could not write instead of appending a second one.
+    const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(1);
+  });
+});
+
+describe("makePrismaReconcileIssueStore — lifecycle evidence (#1202)", () => {
+  const closedAt = new Date("2026-10-02T09:00:00.000Z");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.issueUpdate.mockResolvedValue({ id: "issue-1" });
+    mocks.issueFindUnique.mockResolvedValue({
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+  });
+
+  const closedData = { labels: ["status/done"], state: "closed", closedAt };
+
+  it("records the closure before mirroring it", async () => {
+    const store = makePrismaReconcileIssueStore();
+    await store.updateIssue("issue-1", closedData, { labels: ["status/ready"], state: "open" });
+
+    // Reconciling a close moves the status label and closes the issue, so both
+    // facts are recorded: a label that reads status/done on an open issue is
+    // not the same evidence as GitHub having closed it.
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "sync|org/repo|42|issue_closed|2026-10-02T09:00:00.000Z" },
+      create: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "issue_closed",
+        source: "sync",
+      }),
+      update: {},
+    });
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "sync|org/repo|42|status_changed|status/ready|status/done|" },
+      create: expect.objectContaining({
+        issueId: "issue-1",
+        kind: "status_changed",
+        fromStatus: "status/ready",
+        toStatus: "status/done",
+      }),
+      update: {},
+    });
+    expect(mocks.issueUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers the mirror when the event write fails, then records one closure on the next pass", async () => {
+    // Same ordering guarantee as the sync store: this store resolves the repo
+    // name itself, so it is the only place where an event failure could leave
+    // an already-closed cache row that no later reconcile could observe.
+    const failedRun = makePrismaReconcileIssueStore();
+    mocks.upsertLifecycleEvent.mockRejectedValueOnce(new Error("db down"));
+
+    await expect(
+      failedRun.updateIssue("issue-1", closedData, { labels: ["status/ready"], state: "open" }),
+    ).rejects.toThrow("db down");
+    expect(mocks.issueUpdate).not.toHaveBeenCalled();
+
+    const retriedRun = makePrismaReconcileIssueStore();
+    await retriedRun.updateIssue("issue-1", closedData, { labels: ["status/ready"], state: "open" });
+
+    expect(mocks.issueUpdate).toHaveBeenCalledTimes(1);
+    // The failed pass got as far as the first of the two identities before the
+    // write was rejected, and the retry derives both of them again from the
+    // unchanged cache row: three attempts, two identities, so the row the
+    // failed pass could not write is upserted rather than duplicated.
+    const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
+    expect(keys).toHaveLength(3);
+    expect(new Set(keys).size).toBe(2);
+    expect(keys[0]).toBe(keys[1]);
+  });
+
+  it("mirrors without an event when there is no before-state to measure against", async () => {
+    const store = makePrismaReconcileIssueStore();
+    await store.updateIssue("issue-1", closedData);
+
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.issueUpdate).toHaveBeenCalledTimes(1);
   });
 });

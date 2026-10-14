@@ -6,6 +6,7 @@ import { STATUS_LABELS, isStatusLabel } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import { recordStatusTransition } from "@/lib/issue-lifecycle";
 
 // Generous per-actor rate limit — normal kanban drag-and-drop and agent
 // status transitions stay far below this.
@@ -71,9 +72,26 @@ export async function POST(request: Request) {
       }
 
       if (issue) {
-        await prisma.issue.update({
-          where: { id: issueId as string },
-          data: { labels: newLabels as string[], lastSyncedAt: new Date() },
+        // The cached label write and the lifecycle event commit together, so a
+        // board move is never visible without its evidence row (#1202). A drag
+        // that lands on the column the card already sits in moves no status
+        // label and records nothing.
+        await prisma.$transaction(async (tx) => {
+          await tx.issue.update({
+            where: { id: issueId as string },
+            data: { labels: newLabels as string[], lastSyncedAt: new Date() },
+          });
+
+          await recordStatusTransition(tx, {
+            issueId: issueId as string,
+            repoFullName: repoFullName as string,
+            issueNumber: issueNumber as number,
+            kind: "status_changed",
+            source: "api:move",
+            actor: moveActor,
+            before: effectiveCurrentLabels,
+            after: newLabels as string[],
+          });
         });
       }
 

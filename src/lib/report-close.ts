@@ -31,6 +31,11 @@ import {
   fetchRepositoryMetadata,
 } from "@/lib/github-code-search";
 import { transitionIssueStatus } from "@/lib/issue-status";
+import {
+  lifecycleStatusLabel,
+  recordLifecycleEvent,
+  type LifecycleEventClient,
+} from "@/lib/issue-lifecycle";
 import { buildEvidenceCatalog, repositoryEvidenceId } from "@/lib/groomer/plan-evidence";
 import {
   collectPinnedReadContent,
@@ -508,6 +513,8 @@ export interface ReportCloseClient {
   auditLog: {
     create(args: { data: Record<string, unknown> }): Promise<unknown>;
   };
+  /** Optional: when present, the close also records its lifecycle evidence (#1202). */
+  issueLifecycleEvent?: LifecycleEventClient["issueLifecycleEvent"];
 }
 
 export interface ApplyReportCloseInput {
@@ -599,6 +606,33 @@ export async function applyReportClose(input: ApplyReportCloseInput): Promise<Ap
     });
   } catch (err) {
     addWarning(`the audit log write failed: ${errorMessage(err)}`);
+  }
+
+  // The completion itself, as a lifecycle event (#1202). Deliberately its own
+  // kind and separate from the status/done move above: "a worker reported this
+  // done and Dispatch closed it" is a different fact from "the card says done",
+  // and neither is evidence that a PR merged — only a merge observation is.
+  if (input.issueId && input.client.issueLifecycleEvent) {
+    try {
+      await recordLifecycleEvent(
+        { issueLifecycleEvent: input.client.issueLifecycleEvent },
+        {
+          issueId: input.issueId,
+          repoFullName: evaluation.repoFullName,
+          issueNumber: evaluation.issueNumber,
+          kind: "completed",
+          source: "agent-report",
+          actor: input.actor,
+          fromStatus: lifecycleStatusLabel(evaluation.liveLabels),
+          toStatus: lifecycleStatusLabel(labelsAfter),
+          occurredAt: now(),
+          observedAt: now(),
+          metadata: { evidenceDigest: evaluation.evidenceDigest, headSha: evaluation.headSha },
+        },
+      );
+    } catch (err) {
+      addWarning(`the lifecycle event write failed: ${errorMessage(err)}`);
+    }
   }
 
   return { closed: true, labelsAfter, ...(warning ? { warning } : {}) };

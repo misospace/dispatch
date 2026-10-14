@@ -2,6 +2,14 @@ import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { removeIssueLabel } from "@/lib/github";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { fetchPullRequestState } from "@/lib/github-prs";
+import {
+  lifecycleDedupeKey,
+  lifecycleStatusLabel,
+  recordLifecycleEvent,
+  type LifecycleEventClient,
+  type LifecycleEventWrite,
+  type LifecycleSource,
+} from "@/lib/issue-lifecycle";
 
 /** The issue fields needed by the shared claim-release policy. */
 export interface IssueClaimRecord {
@@ -17,6 +25,18 @@ export interface ReleaseIssueClaimOptions {
   allowMissingAgent?: boolean;
   /** Release ownership only; preserve the current status label. */
   preserveStatus?: boolean;
+  /** Lifecycle source for the release. Defaults to the operator/agent unclaim route. */
+  source?: LifecycleSource;
+  /** Lifecycle actor for the release. Defaults to the releasing agent. */
+  actor?: string;
+  /**
+   * A stable identity for THIS release attempt — one claim epoch — supplied by
+   * the caller so the ownership-only release and the already-released repair a
+   * retry of that same attempt takes collapse onto one `claim_released` row
+   * instead of recording the release twice. Absent, behavior is unchanged: the
+   * repair keeps its own key and the real release stays unkeyed.
+   */
+  releaseKey?: string;
 }
 
 export interface ReleaseIssueClaimResult {
@@ -32,6 +52,15 @@ export interface IssueClaimClient {
     update: (args: any) => Promise<unknown>;
     findUnique?: (args: any) => Promise<any>;
   };
+  /** Present on the real client; absent in fakes that do not record events. */
+  issueLifecycleEvent?: LifecycleEventClient["issueLifecycleEvent"];
+  /**
+   * When present, the cache write and the lifecycle event commit together, so
+   * a release is never visible without its evidence row (#1202). The
+   * transaction client's type is left open because the stale-work sweep passes
+   * its own narrower transaction shape.
+   */
+  $transaction?: <T>(fn: (tx: any) => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -40,6 +69,11 @@ export interface IssueClaimClient {
  * The operator unclaim route and stale-work recovery use this same mutation
  * core. Stale recovery uses ownership-only mode so it never rewrites a status
  * label while recovering an abandoned claim.
+ *
+ * Both callers also get the `claim_released` lifecycle event from here, so a
+ * release is recorded wherever it is decided — with the status the release
+ * left behind, which for a deliberate `preserveStatus` recovery is the status
+ * the issue already had, and never a guess that the work finished.
  */
 export async function releaseIssueClaim(params: {
   prisma: IssueClaimClient;
@@ -53,6 +87,57 @@ export async function releaseIssueClaim(params: {
   const options = params.options ?? {};
   const agentLabel = `${AGENT_PREFIX}${agentName}`;
   const currentAgent = getAgentFromLabels(issue.labels);
+  const source = options.source ?? "api:unclaim";
+  const actor = options.actor ?? agentName;
+
+  /**
+   * Commit the local label mirror and its release event together when the
+   * client supports a transaction; otherwise write them in order. Both are
+   * skipped into a no-op when the client cannot record events (test fakes and
+   * callers that pass a narrow client).
+   */
+  const commitRelease = async (labels: string[], event: LifecycleEventWrite) => {
+    const write = async (tx: IssueClaimClient) => {
+      await tx.issue.update({
+        where: { id: issue.id },
+        data: { labels, lastSyncedAt: new Date() },
+      });
+      if (tx.issueLifecycleEvent) {
+        await recordLifecycleEvent({ issueLifecycleEvent: tx.issueLifecycleEvent }, event);
+      }
+    };
+
+    if (typeof prisma.$transaction === "function") {
+      await prisma.$transaction((tx) => write(tx));
+      return;
+    }
+    await write(prisma);
+  };
+
+  const releaseEvent = (
+    from: string[],
+    to: string[],
+    dedupeKey?: string,
+  ): LifecycleEventWrite => ({
+    issueId: issue.id,
+    repoFullName,
+    issueNumber,
+    kind: "claim_released",
+    source,
+    actor,
+    agentName,
+    fromStatus: lifecycleStatusLabel(from),
+    toStatus: lifecycleStatusLabel(to),
+    dedupeKey: dedupeKey ?? null,
+  });
+
+  // One identity for this release attempt, shared by the ownership-only
+  // release and the repair a retry of the same attempt takes. Without it the
+  // two writes carry different identities — and a sweep that dies between them
+  // records one release twice, once for each path it took.
+  const releaseDedupeKey = options.releaseKey
+    ? lifecycleDedupeKey("claim-released", issue.id, agentLabel, options.releaseKey)
+    : null;
 
   // Never remove a newer agent's claim while an old AgentWork row is being
   // recovered. The stale-work caller can still retire the old local row.
@@ -78,10 +163,18 @@ export async function releaseIssueClaim(params: {
       ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
       : null;
     const cacheLabels = latestIssue?.labels ?? issue.labels;
-    await prisma.issue.update({
-      where: { id: issue.id },
-      data: { labels: cacheLabels, lastSyncedAt: new Date() },
-    });
+    // A sweep that dies between the GitHub release and the final AgentWork
+    // update repeats this repair, so the release event carries an identity:
+    // the same already-released repair cannot be recorded twice.
+    await commitRelease(
+      cacheLabels,
+      releaseEvent(
+        issue.labels,
+        cacheLabels,
+        releaseDedupeKey ??
+          lifecycleDedupeKey("claim-released", issue.id, agentLabel, "already-released"),
+      ),
+    );
     return {
       released: true,
       labels: cacheLabels,
@@ -101,10 +194,7 @@ export async function releaseIssueClaim(params: {
       ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
       : null;
     const cacheLabels = latestIssue?.labels?.filter((label: string) => label !== agentLabel) ?? updatedLabels;
-    await prisma.issue.update({
-      where: { id: issue.id },
-      data: { labels: cacheLabels, lastSyncedAt: new Date() },
-    });
+    await commitRelease(cacheLabels, releaseEvent(issue.labels, cacheLabels, releaseDedupeKey ?? undefined));
     return {
       released: true,
       labels: cacheLabels,
@@ -158,10 +248,7 @@ export async function releaseIssueClaim(params: {
   // silently revert every label change made on GitHub since the last sync.
   await removeIssueLabel(repoFullName, issueNumber, agentLabel);
 
-  await prisma.issue.update({
-    where: { id: issue.id },
-    data: { labels: updatedLabels, lastSyncedAt: new Date() },
-  });
+  await commitRelease(updatedLabels, releaseEvent(issue.labels, updatedLabels));
 
   return {
     released: true,
