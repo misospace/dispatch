@@ -316,3 +316,26 @@ Behavioral notes:
   `status: "FIXED"` + `alreadyAddressed: true` + optional `evidence` (bearer
   marks still require a generation; the QUEUED/IGNORED maintainer-only gate is
   unchanged).
+
+## Fenced capacity-exhaustion handoff (#1256)
+
+A worker whose execution capacity cannot run a handed attempt returns it with
+an explicit, token-fenced handoff instead of failing or silently stalling:
+
+- PR-fix attempt: `tasks/report` `outcome: "capacity-exhausted"` + issued
+  `prFixItem` token (including its per-hand-out `handoutToken` receipt) +
+  `capacity`. The release is fenced to the exact issued hand-out: only that
+  hand-out is removed, other agents' live hand-outs at the generation survive,
+  and the item stays QUEUED at the same generation and fixAttempts; the
+  cooldown is scoped to the exhausted capacity only (trusted caller-declared
+  scoping — never identity, never agent-filtered).
+- Claimed issue: `POST /api/issues/capacity-handoff` with the `claimToken`
+  issued by the claim. Release is fenced to the exact claim and refuses human
+  holds and changed ownership.
+
+Full contract, lease/label effects, and the GitHub-vs-database consistency
+boundary: [capacity-handoff.md](./capacity-handoff.md).
+
+## History
+- **2026-10-14** — Review follow-up (#1256): per-hand-out `handoutToken` receipts bind capacity-exhausted settlement to the exact issued source attempt (unrelated agents and rotated same-agent tokens are refused); the release preserves other agents' live receipts/acks and the dispatch stamps while any hand-out is live; a failed post-CAS live-label re-read now takes the ownership-only path (never a status transition).
+- **2026-10-14** — Added fenced capacity-exhaustion handoff (#1256): capacity-scoped cooldowns for PR-fix attempts and claim-token-fenced issue recovery.

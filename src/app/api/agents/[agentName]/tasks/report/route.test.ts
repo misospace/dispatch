@@ -1597,6 +1597,34 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
   });
 });
 
+describe("POST /api/agents/[agentName]/tasks/report — capacity exhaustion handoff", () => {
+  const validReport = { taskType: "followup-pr", outcome: "pr_updated", repoFullName: "org/repo", pullRequestNumber: 10 };
+
+  it("requires a recognized capacity identifier and issued PR-fix attempt token", async () => {
+    const missingCapacity = await postRequest({ ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted", prFixItem: { id: "item-1", generation: 1, handoutToken: "hnd_deadbeef00" } });
+    expect(missingCapacity.status).toBe(400);
+    const missingAttempt = await postRequest({ ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted", capacity: "provider/model" });
+    expect(missingAttempt.status).toBe(400);
+    // #1256 review: the per-hand-out receipt token is a hard gate for this
+    // outcome — (id, generation) alone cannot identify the exact hand-out.
+    const missingReceipt = await postRequest({ ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted", capacity: "provider/model", prFixItem: { id: "item-1", generation: 1 } });
+    expect(missingReceipt.status).toBe(400);
+    expect((await missingReceipt.json()).error).toMatch(/handoutToken/);
+  });
+
+  it("passes the normalized capacity and issued attempt token to the resolver", async () => {
+    const response = await postRequest({
+      ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted",
+      capacity: "  provider/model  ", prFixItem: { id: "item-1", generation: 2, handoutToken: "  hnd_deadbeef00  " },
+    });
+    expect(response.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: "capacity-exhausted", capacity: "provider/model",
+      attempt: { itemId: "item-1", generation: 2, handoutToken: "hnd_deadbeef00" },
+    }));
+  });
+});
+
 describe("POST /api/agents/[agentName]/tasks/report — prFixItem attempt token (#1074)", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;

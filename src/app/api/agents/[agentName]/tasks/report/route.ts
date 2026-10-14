@@ -33,6 +33,7 @@ const VALID_OUTCOMES = [
   "already_done",
   "handed-off",
   "waiting-external",
+  "capacity-exhausted",
 ] as const;
 type ValidOutcome = (typeof VALID_OUTCOMES)[number];
 
@@ -68,7 +69,8 @@ export interface TaskReportBody {
   // The (id, generation) attempt token next-task issued on this followup-pr
   // task, echoed back by the worker (#1074). Required for PR-fix queue
   // settlement; part of the report's payload identity (idempotency hash).
-  prFixItem?: { id: string; generation: number } | null;
+  prFixItem?: { id: string; generation: number; handoutToken?: string } | null;
+  capacity?: string;
 }
 
 function deriveStatus(outcome: ValidOutcome): string {
@@ -76,6 +78,9 @@ function deriveStatus(outcome: ValidOutcome): string {
   if (outcome === "failed") return "failed";
   if (outcome === "blocked") return "blocked";
   if (outcome === "waiting-external") return "waiting-external";
+  // #1256: neutral terminal status — the worker's capacity gave the attempt
+  // back; nothing succeeded or failed.
+  if (outcome === "capacity-exhausted") return "capacity-exhausted";
   return "completed";
 }
 
@@ -277,6 +282,28 @@ export async function POST(
     return errorResponse(`Invalid outcome. Must be one of: ${VALID_OUTCOMES.join(", ")}`, 400);
   }
 
+  if (outcome === "capacity-exhausted") {
+    if (typeof raw.capacity !== "string" || raw.capacity.trim().length === 0 || raw.capacity.trim().length > 200) {
+      return errorResponse("capacity must be a non-empty recognized capacity identifier of at most 200 characters", 400);
+    }
+    if (!raw.prFixItem || typeof raw.prFixItem !== "object" || Array.isArray(raw.prFixItem)) {
+      return errorResponse("capacity-exhausted requires the issued prFixItem { id, generation } token", 400);
+    }
+    // #1256 review: the release is fenced to the EXACT issued hand-out, so
+    // the per-hand-out receipt token is a hard gate for this outcome (other
+    // outcomes never required it and are unchanged).
+    const rawCapacityAttempt = raw.prFixItem as { handoutToken?: unknown };
+    if (typeof rawCapacityAttempt.handoutToken !== "string" || rawCapacityAttempt.handoutToken.trim().length === 0) {
+      return errorResponse("capacity-exhausted requires the issued prFixItem.handoutToken receipt token", 400);
+    }
+    // The outcome's entire effect is the queue settlement; a report without
+    // the PR coordinates would record an AgentRun and silently settle nothing.
+    // Claimed-issue exhaustion uses POST /api/issues/capacity-handoff instead.
+    if (typeof raw.repoFullName !== "string" || raw.repoFullName.trim() === "" || typeof raw.pullRequestNumber !== "number") {
+      return errorResponse("capacity-exhausted requires repoFullName and pullRequestNumber (issue work uses POST /api/issues/capacity-handoff)", 400);
+    }
+  }
+
   if (raw.issueNumber !== undefined && (typeof raw.issueNumber !== "number" || !Number.isInteger(raw.issueNumber))) {
     return errorResponse("issueNumber must be an integer", 400);
   }
@@ -285,7 +312,7 @@ export async function POST(
     return errorResponse("pullRequestNumber must be an integer", 400);
   }
 
-  const stringFields: readonly string[] = ["repoFullName", "pullRequestUrl", "summary", "error", "evidence"];
+  const stringFields: readonly string[] = ["repoFullName", "pullRequestUrl", "summary", "error", "evidence", "capacity"];
   for (const field of stringFields) {
     if (raw[field] !== undefined && typeof raw[field] !== "string") {
       return errorResponse(`${field} must be a string`, 400);
@@ -424,6 +451,14 @@ export async function POST(
     if (typeof prFixItem.generation !== "number" || !Number.isInteger(prFixItem.generation) || prFixItem.generation < 1) {
       return errorResponse("prFixItem.generation must be an integer >= 1", 400);
     }
+    // #1256: optional per-hand-out receipt token. Optional here so legacy
+    // (pre-receipt) reports keep settling every other outcome; the resolver
+    // enforces its presence for `capacity-exhausted`.
+    if (prFixItem.handoutToken !== undefined && prFixItem.handoutToken !== null) {
+      if (typeof prFixItem.handoutToken !== "string" || prFixItem.handoutToken.trim().length === 0 || prFixItem.handoutToken.trim().length > 100) {
+        return errorResponse("prFixItem.handoutToken must be a non-empty string of at most 100 characters", 400);
+      }
+    }
   }
 
   // Optional worker-chosen opaque key. Present → the report becomes
@@ -469,6 +504,10 @@ export async function POST(
       ? {
           id: (raw.prFixItem as { id: string }).id.trim(),
           generation: (raw.prFixItem as { generation: number }).generation,
+          handoutToken:
+            typeof (raw.prFixItem as { handoutToken?: unknown }).handoutToken === "string"
+              ? (raw.prFixItem as { handoutToken: string }).handoutToken.trim()
+              : undefined,
         }
       : undefined;
 
@@ -494,6 +533,7 @@ export async function POST(
     // #1120: normalized worker start time; undefined → report time (now).
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
     prFixItem,
+    capacity: typeof raw.capacity === "string" ? raw.capacity.trim() : undefined,
   };
 
   try {
@@ -599,9 +639,13 @@ export async function POST(
         // the resolver ignores both for any other outcome.
         blockReason: report.blockReason,
         decision: report.decision,
+        capacity: report.capacity,
+        agentName,
         // #1074: settlement is authorized by the attempt token the worker was
         // issued; a report without one never mutates the queue.
-        attempt: prFixItem ? { itemId: prFixItem.id, generation: prFixItem.generation } : null,
+        attempt: prFixItem
+          ? { itemId: prFixItem.id, generation: prFixItem.generation, handoutToken: prFixItem.handoutToken }
+          : null,
       });
       if (typeof idempotencyKey === "string") {
         // Persist the resolution before responding so a retry replays the real
