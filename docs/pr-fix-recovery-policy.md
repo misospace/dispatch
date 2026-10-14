@@ -70,7 +70,7 @@ queue API, the `(id, generation)` attempt token, and `tasks/report`.
 | **Evidence version** | The state-bearing fields of an identity (head SHA, review state/`commit_id`, comment resolution/`updated_at`, check `status`/`conclusion`). A new *version* of a known identity is only fresh if its transition is actionable. |
 | **Evidence ledger** | The durable, per-item record of every distinct observation: one row per `(item, identity)` holding the current `version`, the ledger sequence at which the transition was first recorded, and the forge-side event timestamp where one exists. **Proposed.** Re-recording an already-stored `(identity, version)` never creates a transition and never restamps anything. See [Evidence watermark lifetime](#evidence-watermark-lifetime). |
 | **Evidence watermark** | The evidence ledger's recorded `(identity, version)` transitions for the item, relative to which freshness is measured. Today only approximated by `evidenceKeys` (40, FIFO) and `postDispatchEvidenceKeys` (20, priority-eviction), both bounded and lossy; see [Evidence watermark lifetime](#evidence-watermark-lifetime). |
-| **Attempt watermark** | The ledger high-water mark (`attemptEvidenceWatermark`) stamped on a hand-out: the ledger sequence at dispatch. Evidence whose transition was recorded after an attempt's watermark could not have been in that worker's input and can be fresh; evidence recorded at or before it was. **Proposed.** |
+| **Attempt watermark** | The ledger high-water mark (`attemptEvidenceWatermark`) stamped on a hand-out: the ledger sequence at dispatch. Evidence whose transition was recorded after an attempt's watermark **was not in the issued hand-out snapshot** and can be fresh; evidence recorded at or before it was. A worker may still fetch newer forge state on its own and address it in the same attempt; settlement head-revalidation then bounds the resulting redundant reopen to one bounded attempt (#1119 behavior, unchanged). **Proposed.** |
 | **Attempt** | One dispatchable unit of PR-fix work, identified by `(id, generation)`. |
 | **Disposition** | The reason an item is not actively dispatchable: `human_decision`, `no_progress`, `infra_failure`, `security_failure`, or `external_wait`. Distinct from `status` (see below). |
 | **Hold class** | The recovery semantics of a disposition: `active`, `resolved`, `operational`, `human`, or `terminal`. Recovery keys off hold class, not status alone. |
@@ -224,7 +224,9 @@ a comparison against the moment a disposition was written:
   Pruning is allowed only for terminal items; for a live item, pruning any
   transition older than the newest reactivation requires that a re-read of a
   pruned identity falls to the unknown-evidence path (defer + audit), never to
-  "assume fresh".
+  "assume fresh", and the current per-condition baseline rows are never
+  pruned on a live item — evicting control 19's baseline would degrade it to
+  the defer path.
 
 ## Disposition model: status, disposition, hold class
 
@@ -237,10 +239,10 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 | `QUEUED` | — | active | n/a |
 | `FIXED` | — (resolved tombstone) | resolved | **Yes**, bounded by `PR_FIX_MAX_ATTEMPTS` |
 | `PARKED` | `no_progress`, budget available | operational | **Yes**, after cooldown, bounded |
-| `PARKED` | `no_progress`, budget exhausted | operational (budget-exhausted) | **No**; sets stale-disposition flag; operator requeue resets budget |
+| `PARKED` | `no_progress`, budget exhausted | operational (budget-exhausted) | **No**; sets stale-disposition flag (**Proposed**); operator requeue resets budget |
 | `PARKED` | `infra_failure` | operational (fail-closed) | **No**; needs a recovery trigger or operator |
 | `PARKED` | `security_failure` | operational (fail-closed) | **No**; operator only |
-| `WAITING_EXTERNAL` | `external_wait` (structured) | operational | **Yes** (trigger / fresh feedback / cooldown) |
+| `WAITING_EXTERNAL` | `external_wait` (structured) | operational | **Yes** (cooldown today; trigger / fresh feedback **Proposed**, rows 12–13) |
 | `WAITING_EXTERNAL` | `external_wait` (no dependency) | operational (fail-closed) | **No**; downgraded, see [contract](#waiting_external-contract) |
 | `BLOCKED` | `human_decision` | human | **No**; operator/maintainer only |
 | any | maintainer hold (**Proposed**) | human | **No** |
@@ -297,7 +299,7 @@ observedAt)` is **fresh actionable evidence** iff all hold:
 3. `o.contentSignature` is not already recorded in `L` at the same or newer
    head (anti-repetition);
 4. `o`'s ledger transition was recorded **after `W`** — the settling attempt
-   could not have been given this version. This replaces any `observedAt >
+   was not in the issued hand-out snapshot. This replaces any `observedAt >
    disposedAt` comparison: a webhook delayed past settlement still records a
    transition after `W` even though its forge timestamp predates the
    disposition, so late-arriving feedback recovers, while a re-read of
@@ -333,11 +335,11 @@ cooldown is named.
 |---|---------|---------|--------|-----|-----|-------------------|-------|
 | 1 | `QUEUED` (not dispatched) | new actionable evidence | stays `QUEUED`; version recorded | — | — | — | Same attempt; inline comments of one review never count (`#1103`). |
 | 2 | `QUEUED` (dispatched) | new actionable evidence | stays `QUEUED`; recorded in `postDispatchEvidenceKeys` | — | — | — | In-flight worker cannot see it; settlement must reopen (`#1119`). |
-| 3 | `QUEUED` | duplicate / replayed event | no-op | — | — | — | Identity+version already in `W`. |
+| 3 | `QUEUED` | duplicate / replayed event | no-op | — | — | — | Identity+version already in `L` at or before `W`. |
 | 4 | `QUEUED` | non-actionable/cleared condition | no-op; recorded for audit | — | — | — | Transient `behind`, resolved comment, dismissed review. |
 | 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | Enqueue reopen (`:1152`). |
 | 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | `#940`; FIXED tombstone is untrusted (`:1149`). |
-| 7 | `FIXED` | duplicate/repeated text | no-op | — | — | — | Anti-churn (`#25`). |
+| 7 | **P** `FIXED` | duplicate/repeated text | no-op | — | — | — | Content signature (proposed); today only the same-identity `#25` path no-ops, and never at `FIXED`/unchanged head (row 6 `#940` runs first). |
 | 8 | **P** `PARKED`/`no_progress`, **budget available** | fresh actionable evidence, cooldown elapsed | `QUEUED` fresh attempt; clear `retryAt`/stale flag | +1 | +1 | cap → `PARKED` | **Gap today:** `PARKED` is sticky to enqueue (`:1128`). |
 | 9 | **P** `PARKED`/`no_progress`, **budget exhausted** | fresh actionable evidence | stays `PARKED`; set stale-disposition flag; record evidence | — | — | — | Operator requeue resets budget. Prevents livelock. |
 | 10 | `PARKED`/`infra_failure` | PR feedback | stays `PARKED`; recorded; stale flag | — | — | — | Infra recovery is not PR evidence; needs health signal/operator. |
@@ -410,8 +412,10 @@ must be:
 - **Bounded** per run (page/cap, like `reclaimStalePrFixHandouts`,
   `:822`), so a backlog never becomes a thundering herd;
 - **Idempotent** — it re-computes `(identity, version)` and no-ops on anything
-  already in the ledger, while remaining able to discover transitions that
-  webhooks never delivered (the control-17 case);
+  already in the ledger, **except** the `#940` re-observation at `FIXED` with an
+  unchanged head (row 6 — ledger dedupe must not swallow that net on the
+  periodic path), while remaining able to discover transitions that webhooks
+  never delivered (the control-17 case);
 - **Cooldown-guarded** — a reactivation sets `recoveryAppliedAt` so
   reconciliation cannot reopen the same item in a tight loop;
 - **Audited** — every reactivation writes `PrFixHistory` with the actor
