@@ -249,16 +249,7 @@ async function executeGroomerRun(
     staleReasons: candidate.staleReasons,
   });
 
-  const activeLeases = await deps.findActiveLeases(candidate.id);
-  const hasOtherLease = activeLeases.some((lease: { agentName?: string }) => lease.agentName !== "hosted-groomer");
-  if (hasOtherLease && !options.force) return null;
-
-  const { lease } = await deps.upsertLease({
-    agentName: "hosted-groomer",
-    issueId: candidate.id,
-    checkpoint: "issue_claimed",
-    ttlMs: GROOMER_LEASE_TTL_MS,
-  });
+  let lease: { id: string } | undefined;
   const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
   // Freshness (#1064): a human comment after this instant is new evidence.
@@ -272,6 +263,17 @@ async function executeGroomerRun(
   let unreadableBackoffWritten = false;
 
   try {
+    stage = "lease_acquisition";
+    const activeLeases = await deps.findActiveLeases(candidate.id);
+    const hasOtherLease = activeLeases.some((active: { agentName?: string }) => active.agentName !== "hosted-groomer");
+    if (hasOtherLease && !options.force) throw new Error("Candidate has another active lease");
+    ({ lease } = await deps.upsertLease({
+      agentName: "hosted-groomer",
+      issueId: candidate.id,
+      checkpoint: "issue_claimed",
+      ttlMs: GROOMER_LEASE_TTL_MS,
+    }));
+    stage = "selected";
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
     try {
       comments = await deps.fetchComments(candidate.repoFullName, candidate.number);
@@ -1345,9 +1347,12 @@ async function executeGroomerRun(
         errorMessage: message,
       },
     });
+    // Acquisition failures are candidate-local; their backoff lets the next
+    // scheduled run select other work rather than repeatedly aborting here.
+    if (stage === "lease_acquisition") return null;
     throw error;
   } finally {
-    await deps.releaseLease(lease.id);
+    if (lease) await deps.releaseLease(lease.id);
   }
 }
 

@@ -1464,6 +1464,25 @@ describe("runHostedGroomer", () => {
     );
   });
 
+  it.each(["active capacity-release", "retained non-executing guard"])("backs off a candidate with %s and can service the next issue", async () => {
+    mocks.upsertLease.mockRejectedValueOnce(new Error("Issue mutation pending; lease cannot be renewed or reissued"));
+    expect(await runHostedGroomer()).toBeNull();
+    expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "gr-1" },
+      data: expect.objectContaining({ status: "failed", stage: "lease_acquisition", retryable: true }),
+    }));
+    expect(mocks.prisma.issue.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: mockCandidate.id },
+      data: { groomingRetryAfter: expect.any(Date) },
+    }));
+    mocks.selectGroomingCandidate.mockResolvedValueOnce({ ...mockCandidate, id: "next-issue", number: 43 });
+    await runHostedGroomer();
+    expect(mocks.callGroomerLLM).toHaveBeenCalledOnce();
+    expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+  });
+
   it("failure after groomingRun creation completes run as failed", async () => {
     mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
 
