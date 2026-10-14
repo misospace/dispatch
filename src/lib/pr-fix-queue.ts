@@ -2855,29 +2855,6 @@ export async function resolvePrFixFromAgentReport(
     if (!handoutToken || !reportingAgent) {
       return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "capacity-exhausted requires the issued prFixItem handoutToken receipt (exact source-attempt fencing)" };
     }
-    // Idempotent replay: an active cooldown recorded for THIS capacity at
-    // THIS generation means the report was already processed. The check is
-    // keyed on both so a different capacity exhausting the same live
-    // generation (possible: hand-outs are cleared, another worker can be
-    // dispatched at the same generation) still records its own scoped
-    // cooldown, and an older generation's window never absorbs a fresh one.
-    const activeHandoffs = client.capacityHandoff?.findMany
-      ? await client.capacityHandoff.findMany({
-          where: { kind: "pr_fix", repoFullName: repo, prNumber: pr, cooldownUntil: { gt: new Date() } },
-        })
-      : [];
-    if (
-      activeHandoffs.some(
-        (h: any) =>
-          h.prNumber === pr &&
-          String(h.repoFullName).toLowerCase() === repo &&
-          h.generation === expectedGeneration &&
-          typeof h.capacity === "string" &&
-          capacityEquals(h.capacity, capacity),
-      )
-    ) {
-      return { matched: true, action: "deferred", itemId: existing.id ?? null, reason: `capacity handoff already recorded for capacity ${capacity} at generation ${expectedGeneration}`, attemptGeneration: expectedGeneration };
-    }
     const cooldownUntil = new Date(Date.now() + capacityCooldownMs());
     const queueClient = client as PrFixQueueClient;
     const result = await queueClient.$transaction(async (tx) => {
@@ -2886,13 +2863,16 @@ export async function resolvePrFixFromAgentReport(
       // next-task stamped): exactly one concurrent report can consume the
       // stamps, so two racing duplicates cannot both mint a cooldown.
       const live = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      if (!live) return "stale" as const;
       if (
-        !live ||
         live.status !== "QUEUED" ||
         live.generation !== expectedGeneration ||
         live.dispatchedGeneration !== expectedGeneration
       ) {
-        return "stale" as const;
+        const prior = await tx.capacityHandoff?.findMany?.({
+          where: { kind: "pr_fix", repoFullName: repo, prNumber: pr, generation: expectedGeneration, agentName: reportingAgent, note: { contains: `receipt=${handoutReceipt(handoutToken, reportingAgent, expectedGeneration)};` } },
+        }) ?? [];
+        return prior.length ? "replayed" as const : "stale" as const;
       }
       const receipts: string[] = Array.isArray(live.handoutReceipts) ? live.handoutReceipts : [];
       const handouts: string[] = Array.isArray(live.agentHandouts) ? live.agentHandouts : [];
@@ -2906,7 +2886,12 @@ export async function resolvePrFixFromAgentReport(
         generation: expectedGeneration,
         token: handoutToken,
       });
-      if (!owned) return "unauthorized" as const;
+      if (!owned) {
+        const prior = await tx.capacityHandoff?.findMany?.({
+          where: { kind: "pr_fix", repoFullName: repo, prNumber: pr, generation: expectedGeneration, agentName: reportingAgent, note: { contains: `receipt=${handoutReceipt(handoutToken, reportingAgent, expectedGeneration)};` } },
+        }) ?? [];
+        return prior.length ? "replayed" as const : "unauthorized" as const;
+      }
       const remainingReceipts = receipts.filter((r) => r !== owned);
       const ownEntry = agentHandoutToken(reportingAgent, expectedGeneration);
       const remainingHandouts = handouts.filter((h) => h !== ownEntry);
@@ -2917,7 +2902,9 @@ export async function resolvePrFixFromAgentReport(
       // report that consumes the last live hand-out resets the stamps and the
       // post-dispatch evidence list, making the generation freshly
       // dispatchable.
-      const lastHandout = remainingReceipts.length === 0;
+      // Legacy hand-outs may predate receipt tokens; handouts remain the
+      // authoritative liveness set until all agents at this generation settle.
+      const lastHandout = remainingHandouts.length === 0;
       const { count } = await tx.prFixQueueItem.updateMany({
         where: {
           id: live.id,
@@ -2942,13 +2929,13 @@ export async function resolvePrFixFromAgentReport(
       if (count !== 1) return "stale" as const;
       await tx.prFixHistory.create({ data: { itemId: existing.id, action: "capacity_handoff", status: "QUEUED", lane: existing.lane, reason: capacity, note: `Capacity exhausted: ${capacity}; attempt generation ${expectedGeneration} released by ${reportingAgent} without consuming retry budget; item stays QUEUED and discoverable to compatible capacities.${remainingReceipts.length > 0 ? ` ${remainingReceipts.length} other live hand-out(s) at this generation preserved (dispatch stamps retained).` : ""}` } });
       if (tx.capacityHandoff) {
-        await tx.capacityHandoff.create({ data: { kind: "pr_fix", capacity, repoFullName: repo, prNumber: pr, issueNumber: existing.issue ?? null, agentName: reportingAgent, generation: expectedGeneration, cooldownUntil, note: `PR-fix attempt generation ${expectedGeneration} handed off by capacity report` } });
+        await tx.capacityHandoff.create({ data: { kind: "pr_fix", capacity, repoFullName: repo, prNumber: pr, issueNumber: existing.issue ?? null, agentName: reportingAgent, generation: expectedGeneration, cooldownUntil, note: `PR-fix attempt generation ${expectedGeneration} handed off by capacity report; receipt=${handoutReceipt(handoutToken, reportingAgent, expectedGeneration)};` } });
       }
       return true;
     });
     return {
       matched: true,
-      action: result === true ? "deferred" : "skipped",
+      action: result === true || result === "replayed" ? "deferred" : "skipped",
       itemId: existing.id ?? null,
       reason:
         result === true

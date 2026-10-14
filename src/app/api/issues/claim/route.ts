@@ -11,6 +11,7 @@ import { upsertLease, findActiveLeasesForIssue, releaseExpiredLeases } from "@/l
 import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -75,6 +76,9 @@ export async function POST(request: Request) {
       return errorResponse("Force claim requires a maintainer token", 403);
     }
 
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim" }, async () => {
+    let remoteStarted = false;
+    const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
     const issue = await prisma.issue.findUnique({
       where: { id: issueId as string },
@@ -181,6 +185,7 @@ export async function POST(request: Request) {
         // buildNewLabels below drops every conflicting agent label from the
         // cache, so GitHub must lose all of them too — leaving extras behind
         // is the same GitHub/cache divergence class #1037 fights.
+        remoteStarted = true;
         for (const staleAgentLabel of analysis.existingAgents) {
           try {
             await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
@@ -201,6 +206,7 @@ export async function POST(request: Request) {
     const updatedLabels = [...labelsWithAgent.filter((l) => !l.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
+      remoteStarted = true;
       // Add agent label on GitHub
       await addIssueLabel(repoFullName, issueNumber, agentLabel);
 
@@ -223,6 +229,7 @@ export async function POST(request: Request) {
         agentName: agentName as string,
         issueId: issueId as string,
         checkpoint: "issue_claimed",
+        mutationGuardHeld: true,
       });
 
       // Write audit log with conflict analysis details
@@ -281,6 +288,11 @@ export async function POST(request: Request) {
 
       return errorResponse(errorMessage, 500);
     }
+    })();
+    return { complete: !remoteStarted || value.status < 500, value };
+    });
+    if (guarded.status === "busy") return errorResponse("Issue mutation is in progress", 409);
+    return guarded.value;
   } catch (error) {
     console.error("Claim issue failed:", error);
     return errorResponse("Failed to claim issue", 500);

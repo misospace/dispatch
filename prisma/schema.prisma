@@ -40,6 +40,7 @@ model Issue {
   laneHistory   IssueLane[]
   agentWork     AgentWork[]
   leases        Lease[]
+  mutationGuard IssueMutationGuard?
   groomingRuns  GroomingRun[]
   groomingApplications  GroomingApplication[]
   groomingChildClaims   GroomingChildClaim[]
@@ -119,6 +120,19 @@ model Issue {
   @@index([linkedPrNeedsFollowup])
   @@index([groomingStaleAt])
   @@index([groomingRetryAfter])
+}
+
+model IssueMutationGuard {
+  issueId    String   @id
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  operation  String
+  ownerToken String   @unique
+  agentName  String?
+  claimToken String?
+  executing  Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@index([agentName, claimToken])
 }
 
 enum PrFixLane {

@@ -1,3 +1,9 @@
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  withIssueMutationGuard: async (_request: unknown, callback: any) => {
+    const result = await callback(undefined, { resuming: false });
+    return { status: result.complete ? "completed" : "retained", value: result.value };
+  },
+}));
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 

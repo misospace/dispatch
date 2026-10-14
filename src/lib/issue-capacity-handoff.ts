@@ -7,42 +7,17 @@
 // a human reassignment) moves the label, and lease expiry alone never clears
 // the `agent/*` label or guarantees rediscovery.
 //
-// This module implements the fenced counterpart:
-//
-//   * The caller presents the claim token Dispatch issued on the claim (the
-//     authoritative attempt receipt — see `Lease.claimToken`). The release is
-//     fenced to the EXACT claim: exact agent, exact lease row, still active,
-//     token equal. A re-claimed issue has a new lease row with a new token, so
-//     a stale worker's token is inert.
-//   * Ownership is verified against the LIVE GitHub label set before any write
-//     (#1037 rule: the claim decision lives on GitHub, not the cache). A
-//     different `agent/*` label, a missing own label, or a live `status/done`
-//     means the claim is no longer this worker's — refuse, mutate nothing.
-//   * Human holds are refused: closed/done issues and a deliberate block
-//     (`status/blocked` carrying a `blockedReason`) are human decisions this
-//     operation must never overwrite.
-//   * The ownership gate itself is a compare-and-delete on the lease row
-//     (`id + agentName + issueId + expiredAt > now`): exactly one racing
-//     handoff can take count=1; losers get 409 and write nothing.
-//   * On success the claim is released with the shared resting-status policy
-//     (`releaseIssueClaim`: in-progress → ready, so the issue is immediately
-//     discoverable to another compatible worker), a capacity-SCOPED cooldown
-//     is recorded, active AgentWork rows are retired with history, and an
-//     audit row closes the loop.
-//
-// Consistency boundary (documented in docs/capacity-handoff.md): the lease
-// delete is the atomic ownership transition; GitHub label writes and the
-// cache mirror happen after it. If a label write fails post-delete, the lease
-// is already released (the worker has definitively lost ownership) and the
-// residue — a stale `agent/*` label — is repaired by the existing stale-claim
-// recovery/sync paths. The failure is audited; it can never resurrect the
-// claim or block the item from rediscovery.
+// A durable, nonexpiring issue mutation guard excludes cooperating claim
+// and lease writers throughout remote cleanup. Failed cleanup retains the
+// lease and guard for exact-token retry; a crashed executor requires operator
+// recovery. GitHub itself provides no label CAS against external mutations.
 
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { removeIssueLabel } from "./github";
 import { getLiveIssueLabels } from "./claim-gate";
 import { releaseIssueClaim } from "./issue-claim";
 import { recordCapacityHandoff, type CapacityHandoffClient } from "./capacity-handoff";
+import { withIssueMutationGuard } from "./issue-mutation-guard";
 
 export interface IssueCapacityHandoffClient extends CapacityHandoffClient {
   issue: {
@@ -118,6 +93,26 @@ export type IssueCapacityHandoffResult =
 export async function recoverIssueCapacityHandoff(
   input: IssueCapacityHandoffInput,
 ): Promise<IssueCapacityHandoffResult> {
+  const guarded = await withIssueMutationGuard({
+    issueId: input.issueId,
+    operation: "capacity-release",
+    agentName: input.agentName,
+    claimToken: input.claimToken,
+  }, async (_tx, { resuming }) => {
+    const value = await recoverIssueCapacityHandoffUnlocked(input, resuming);
+    return { complete: !(value.ok === false && (value.code === "release_failed" || value.code === "github_unavailable")), value };
+  });
+  if (guarded.status === "busy") return {
+    ok: false, httpStatus: 409, code: "handoff_race_lost",
+    message: "Issue mutation is in progress; retry after recovery completes",
+  };
+  return guarded.value;
+}
+
+async function recoverIssueCapacityHandoffUnlocked(
+  input: IssueCapacityHandoffInput,
+  resuming: boolean,
+): Promise<IssueCapacityHandoffResult> {
   const { client, issueId, repoFullName, issueNumber, agentName, claimToken, capacity } = input;
   const now = input.now ?? new Date();
   const agentLabel = `${AGENT_PREFIX}${agentName}`;
@@ -181,7 +176,7 @@ export async function recoverIssueCapacityHandoff(
       message: "claimToken does not match the current claim; a re-issued claim invalidates prior tokens",
     };
   }
-  if (new Date(lease.expiredAt).getTime() <= now.getTime()) {
+  if (!resuming && new Date(lease.expiredAt).getTime() <= now.getTime()) {
     return {
       ok: false,
       httpStatus: 409,
@@ -204,74 +199,46 @@ export async function recoverIssueCapacityHandoff(
     };
   }
   const refusal = classifyLiveLabels(liveLabels, agentLabel);
-  if (refusal) return refusal;
+  // A previous attempt may have removed the label before a later write
+  // failed. The durable guard still excludes a new claim epoch.
+  if (refusal && !resuming) return refusal;
 
-  // ── 4. Atomic ownership gate: CAS delete of the exact lease row ──────────
-  // Exactly one racing release can take count=1. A lease that expired (or was
-  // otherwise replaced) between the read and here yields count=0 and a 409
-  // with zero writes — the new owner is never disturbed.
-  const { count } = await client.lease.deleteMany({
-    where: { id: lease.id, agentName, issueId, expiredAt: { gt: now } },
-  });
-  if (count !== 1) {
-    return {
-      ok: false,
-      httpStatus: 409,
-      code: "handoff_race_lost",
-      message: "Claim changed concurrently (expired or released); no state was modified",
-    };
+  // ── 4. Recheck live labels before any remote mutation ────────────────────
+  let releaseLabels = liveLabels;
+  let ownershipChangedPostCas = false;
+  try {
+    const recheck = await getLiveIssueLabels(repoFullName, issueNumber);
+    const changed = classifyLiveLabels(recheck, agentLabel, true);
+    if (changed) ownershipChangedPostCas = true;
+    releaseLabels = recheck;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await writeFailureAudit(client, input, liveLabels, `Could not verify live GitHub labels before release: ${message}`);
+    return { ok: false, httpStatus: 503, code: "github_unavailable", message: `Could not verify live GitHub labels before release: ${message}` };
   }
 
   // ── 5. Release the claim with the shared resting-status policy ───────────
-  // Re-verify live ownership AFTER the commit point. A force-claim (which
-  // does not delete the previous agent's lease row) or a human label change
-  // can land between the pre-CAS read and here; acting on the stale snapshot
-  // would strip a newer owner's status transition. On a changed/missing
-  // owner — OR WHEN THE RE-READ ITSELF FAILS — we narrow to an
-  // ownership-ONLY release: remove our own agent label (idempotent — a
-  // force-claim usually removed it already) and mirror the freshest known
-  // label set minus our label; touch no status label. A re-read failure must
-  // never take the full-release path: ownership is unknown, so a status
-  // transition (e.g. in-progress → ready) could clobber a newer owner's or a
-  // human's status. Ownership-only cleanup is safe under total ignorance —
-  // it writes exactly one label, our own, which only ever narrows state.
+  // The fresh label set is authoritative. A changed owner or newly applied
+  // human hold permits only targeted own-label cleanup, never status changes.
   let labels: string[];
   let status: string | null;
   let statusNote: string | null;
-  let ownershipChangedPostCas = false;
-  let recheckFailedPostCas = false;
-  let releaseLabels = liveLabels;
-  try {
-    const recheck = await getLiveIssueLabels(repoFullName, issueNumber);
-    if (getAgentFromLabels(recheck) !== agentLabel) {
-      ownershipChangedPostCas = true;
-      releaseLabels = recheck;
-    }
-  } catch (error) {
-    // Ownership unverifiable: assume it may have changed. The lease is
-    // already consumed, so halting would strand the claim with no owner;
-    // proceed with ownership-ONLY cleanup on the pre-CAS snapshot and never
-    // a status transition.
-    recheckFailedPostCas = true;
-    console.error(`capacity handoff: post-CAS live-label re-read failed for ${repoFullName}#${issueNumber}; releasing ownership-only:`, error);
-  }
-
-  if (ownershipChangedPostCas || recheckFailedPostCas) {
+  if (ownershipChangedPostCas) {
     const newOwner = getAgentFromLabels(releaseLabels);
     try {
       // Targeted, idempotent: only our own label. Never a status write —
       // the new owner's transition stands.
       await removeIssueLabel(repoFullName, issueNumber, agentLabel);
     } catch (error) {
-      console.error(`capacity handoff: post-CAS label cleanup failed for ${repoFullName}#${issueNumber}:`, error);
+      const message = error instanceof Error ? error.message : "Unknown error";
+      await writeFailureAudit(client, input, liveLabels, `Could not remove claim label: ${message}`);
+      return { ok: false, httpStatus: 500, code: "release_failed", message: `Could not remove claim label; lease and release guard retained: ${message}` };
     }
     labels = releaseLabels.filter((l: string) => l !== agentLabel);
     status = labels.find((l: string) => l.startsWith("status/")) ?? null;
-    statusNote = recheckFailedPostCas
-      ? "live label re-read failed after the lease CAS; ownership unverifiable, so only our own agent label was removed — no status change"
-      : newOwner
-        ? `claim moved to ${newOwner} after the lease CAS; only our own agent label was removed — no status change`
-        : "no agent claim present after the lease CAS; mirrored GitHub minus our label — no status change";
+    statusNote = newOwner
+        ? `claim moved to ${newOwner} before cleanup; only our own agent label was removed — no status change`
+        : "no agent claim present before cleanup; mirrored GitHub minus our label — no status change";
     try {
       await client.issue.update({
         where: { id: issueId },
@@ -293,33 +260,20 @@ export async function recoverIssueCapacityHandoff(
     statusNote = released.statusNote;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    // The lease is already deleted: the worker has definitively lost
-    // ownership, and any residue (a stale agent/* label on GitHub) is owned by
-    // stale-claim recovery. Audit the partial state explicitly.
-    try {
-      await client.auditLog.create({
-        data: {
-          actor: input.actor,
-          action: "issue_capacity_handoff",
-          repoFullName,
-          issueNumber,
-          issueId,
-          beforeLabels: liveLabels,
-          afterLabels: [],
-          success: false,
-          errorMessage: `Lease released but claim release failed: ${message}; stale-claim recovery owns the residual agent label`,
-        },
-      });
-    } catch {
-      // Audit failure must not mask the refusal.
-    }
+    await writeFailureAudit(client, input, liveLabels, `Claim label release failed; lease retained: ${message}`);
     return {
       ok: false,
       httpStatus: 500,
       code: "release_failed",
-      message: `Claim lease released but label release failed: ${message}`,
+      message: `Claim label release failed; lease and release guard retained: ${message}`,
     };
   }
+
+  // Consume the exact lease only after GitHub cleanup succeeded.
+  const { count } = await client.lease.deleteMany({
+    where: { id: lease.id, agentName, issueId, claimToken },
+  });
+  if (count !== 1) return { ok: false, httpStatus: 409, code: "handoff_race_lost", message: "Claim changed concurrently; no lease was released" };
 
   // ── 6. Retire active AgentWork rows with history (audit trail) ───────────
   try {
@@ -386,11 +340,9 @@ export async function recoverIssueCapacityHandoff(
         notes:
           `capacity=${capacity}; cooldownUntil=${cooldownUntil ? cooldownUntil.toISOString() : "none (cooldown write failed)"}; ` +
           `lease ${lease.id} released by claim-token fence${
-            recheckFailedPostCas
-              ? "; post-CAS live-label re-read failed: ownership-only release of our label"
-              : ownershipChangedPostCas
-                ? "; ownership changed post-CAS: ownership-only release of our label"
-                : ""
+            ownershipChangedPostCas
+              ? "; ownership changed before cleanup: ownership-only release of our label"
+              : ""
           }${input.note ? `; ${input.note}` : ""}`,
       },
     });
@@ -413,6 +365,7 @@ type HandoffRefusal = Extract<IssueCapacityHandoffResult, { ok: false }>;
 function classifyLiveLabels(
   liveLabels: string[],
   agentLabel: string,
+  allowMissingOwner = false,
 ): HandoffRefusal | null {
   if (liveLabels.includes("status/done")) {
     return { ok: false, httpStatus: 409, code: "issue_done", message: "Issue is done on GitHub; nothing to hand off" };
@@ -434,7 +387,7 @@ function classifyLiveLabels(
       message: `Issue claim on GitHub belongs to ${liveAgent}; refusing to release another owner's claim`,
     };
   }
-  if (!liveAgent) {
+  if (!liveAgent && !allowMissingOwner) {
     return {
       ok: false,
       httpStatus: 409,
@@ -443,4 +396,29 @@ function classifyLiveLabels(
     };
   }
   return null;
+}
+
+async function writeFailureAudit(
+  client: IssueCapacityHandoffClient,
+  input: IssueCapacityHandoffInput,
+  beforeLabels: string[],
+  errorMessage: string,
+): Promise<void> {
+  try {
+    await client.auditLog.create({
+      data: {
+        actor: input.actor,
+        action: "issue_capacity_handoff",
+        repoFullName: input.repoFullName,
+        issueNumber: input.issueNumber,
+        issueId: input.issueId,
+        beforeLabels,
+        afterLabels: [],
+        success: false,
+        errorMessage,
+      },
+    });
+  } catch {
+    // Audit failure must not mask the refusal.
+  }
 }

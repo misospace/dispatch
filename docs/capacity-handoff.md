@@ -47,9 +47,12 @@ bounded (≤200 chars) `capacity` and a valid issued token are hard 400 gates.
   unique, minted at lease creation). Renewals deliberately keep the token (a
   heartbeating worker keeps its receipt), but a released or expired lease that
   is re-claimed is a **new row with a new token** — an old worker's token is
-  permanently inert against a newer claim. The release itself is a CAS
-  `deleteMany` on `(lease id, agentName, issueId, expiredAt > now)`: exactly
-  one racing release wins; losers get 409 with zero writes.
+  permanently inert against a newer claim. A durable `IssueMutationGuard`
+  serializes cooperating claim, lease-upsert, and capacity-release mutations
+  per issue. The release retains the lease while it performs remote cleanup;
+  only after GitHub cleanup succeeds does it CAS-delete
+  `(lease id, agentName, issueId, expiredAt > now)`. A failed CAS is an
+  invariant/bypass race, not the normal inter-writer coordination mechanism.
 
 ## Human-hold and ownership safeguards (issue surface)
 
@@ -65,10 +68,9 @@ Checked **before** any write; every refusal is 409/400 with zero mutation:
   (already released or human-cleared).
 * GitHub unreachable → 503 fail-closed: no lease delete, no label write.
 
-**Post-CAS re-verification**: a force-claim (which does not delete the
-previous agent's lease row) or a human change can land between the pre-CAS
-read and the lease delete. After the CAS the live labels are re-read; if
-ownership moved **or the re-read itself fails**, the release narrows to
+**Post-read ownership re-verification**: a force-claim (which does not delete
+the previous agent's lease row) or a human change can land during label
+verification. If ownership moved, the release narrows to
 **ownership-only** — our own `agent/*` label is removed idempotently and the
 cache mirrors the freshest known set minus that label — and no status label
 is ever touched, so a newer owner's transition survives. A re-read failure
@@ -82,15 +84,19 @@ with no owner.
 
 **Issue handoff** (`issue_capacity_handoff` audit action):
 
-1. Lease row CAS-deleted — this is the atomic ownership transition.
-2. Claim released through the shared `releaseIssueClaim` policy, based on the
-   live labels: `agent/<name>` removed; `status/in-progress` → `status/ready`
+1. The operation creates a committed per-issue durable mutation guard with
+   `executing: true`. Cooperating claim and `upsertLease` writers cannot enter
+   during release. Only an exact agent+token retry can atomically resume a
+   retained `capacity-release` guard with `executing: false`; unrelated
+   operations and retries while executing are refused as busy.
+2. Claim cleanup uses the shared `releaseIssueClaim` policy, based on live
+   labels: `agent/<name>` removed; `status/in-progress` → `status/ready`
    (immediately discoverable to another compatible worker); `status/in-review`
-   is retained with a status note.
-3. Active `AgentWork` rows (CLAIMED/IN_PROGRESS/BLOCKED) for that agent+issue
-   are marked `RELEASED` with a `capacity_handoff` history entry.
-4. A `CapacityHandoff` cooldown row is written (`kind: "issue"`).
-5. Audit row with before/after labels, capacity, cooldown deadline.
+   is retained with a status note. If ownership changed during verification,
+   cleanup removes only our own agent label and never changes status.
+3. Only after remote label cleanup succeeds is the exact lease CAS-deleted.
+   Active `AgentWork` rows are then retired with history, followed by the
+   `CapacityHandoff` cooldown (`kind: "issue"`) and audit record.
 
 **PR-fix handoff** (`capacity_handoff` PrFixHistory action):
 
@@ -175,11 +181,21 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
 * Label writes are targeted (`removeIssueLabel` for the agent label,
   `transitionIssueStatus` for the status swap), never a full label-set
   replacement, so concurrent human label changes on GitHub are not reverted.
-* The **lease CAS delete is the commit point** for issue ownership. If a
-  label write fails *after* it, the worker has definitively lost ownership and
-  the residue (a stale `agent/*` label) is owned by the existing stale-claim
-  recovery / sync paths — the failure is audited (`success: false`, pointer in
-  `errorMessage`) and never resurrects the claim or blocks rediscovery.
+* A durable `IssueMutationGuard` serializes cooperating claim,
+  `upsertLease`, and capacity-release writers for an issue. It is a persistent
+  singleton row per issue, not a lease: there is no automatic timeout or
+  stale-guard clearing. The `executing` flag is a durable, nonexpiring
+  execution fence: callback work runs outside database transactions, and only
+  the matching owner can reopen a completed-but-incomplete attempt. A crash
+  leaves `executing: true`; an operator must confirm process termination
+  before resetting it to false.
+* Capacity release retains its lease until GitHub label cleanup succeeds; the
+  exact lease CAS delete follows remote cleanup. A cleanup failure retains both
+  lease and guard for an exact-token retry. Failed GitHub reads/removals must
+  not be represented as a successful cache mirror or lease release. After a
+  crash, an operator must confirm the prior process stopped and reconcile live
+  GitHub state before removing the guard. There is no timeout-based automatic
+  recovery that could overlap an in-flight remote mutation.
 * `CapacityHandoff` rows are Dispatch-local dispatch shaping. They are not
   mirrored to GitHub, carry no label, and self-expire; deleting them is always
   safe.
@@ -202,6 +218,9 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
 | Expired lease | 409 `claim_expired` (stale recovery owns release) |
 | Different/missing live `agent/*` label | 409 `ownership_changed` |
 | Deliberate block / done / closed | 409/400 human hold |
-| Lease CAS lost (concurrent release) | 409 `handoff_race_lost`, zero writes |
+| Another cooperating issue mutation is active / guard is not the exact resumable release | 409 busy response; no remote mutation |
+| Cleanup fails after guard acquisition | Lease and durable guard retained; exact-token retry can resume |
+| Lease CAS unexpectedly misses after remote cleanup (bypassing writer) | 409 `handoff_race_lost`; no cooldown is recorded; reconcile GitHub and lease state |
+| Guard remains after process crash | Operator confirms prior process stopped and reconciles GitHub before removal; no automatic timeout |
 | PR-fix generation moved / status settled | report `skipped`, queue untouched |
 | Repeat PR-fix report | `deferred`, one cooldown window only |

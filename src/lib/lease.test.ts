@@ -34,6 +34,13 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  withIssueMutationGuard: async (_request: unknown, callback: any) => {
+    const result = await callback(undefined, { resuming: false });
+    return { status: "completed", value: result.value };
+  },
+}));
+
 vi.mock("@/lib/next-action", () => ({
   buildResumeContext: vi.fn((input) => ({ ...input, nextAction: "inspect_issue" })),
   isValidCheckpoint: vi.fn((cp) => ["issue_claimed", "branch_created", "changes_made"].includes(cp)),

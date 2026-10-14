@@ -6,6 +6,7 @@
 // cron workers and harnesses resume interrupted work without overlapping
 // another agent's claimed work.
 
+import { withIssueMutationGuard } from "./issue-mutation-guard";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { newClaimToken } from "@/lib/capacity-handoff";
@@ -41,7 +42,16 @@ export async function upsertLease(params: {
   branch?: string;
   prUrl?: string;
   ttlMs?: number;
+  /** Internal: the claim route already holds the issue mutation guard. */
+  mutationGuardHeld?: boolean;
 }): Promise<{ created: boolean; lease: any }> {
+  if (!params.mutationGuardHeld) {
+    const result = await withIssueMutationGuard({ issueId: params.issueId, operation: "lease", agentName: params.agentName }, async () => ({
+      complete: true, value: await upsertLease({ ...params, mutationGuardHeld: true }),
+    }));
+    if (result.status === "busy") throw new Error("Issue mutation pending; lease cannot be renewed or reissued");
+    return result.value;
+  }
   const now = new Date();
   const checkpoint = params.checkpoint ?? "issue_claimed";
   const expiredAt = calculateLeaseExpiry(params.ttlMs);

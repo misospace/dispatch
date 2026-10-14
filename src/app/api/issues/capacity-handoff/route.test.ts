@@ -1,3 +1,9 @@
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  withIssueMutationGuard: async (_request: unknown, callback: any) => {
+    const result = await callback(undefined, { resuming: false });
+    return { status: result.complete ? "completed" : "retained", value: result.value };
+  },
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   authedRequest,
@@ -57,8 +63,7 @@ vi.mock("@/lib/prisma", () => ({
           db.lease.id === where.id &&
           db.lease.agentName === where.agentName &&
           db.lease.issueId === where.issueId &&
-          where.expiredAt?.gt != null &&
-          new Date(db.lease.expiredAt).getTime() > new Date(where.expiredAt.gt).getTime()
+          db.lease.claimToken === where.claimToken
         ) {
           db.lease = null;
           db.leaseDeletes += 1;
@@ -332,8 +337,10 @@ describe("POST /api/issues/capacity-handoff (#1256)", () => {
     expect(db.lease).not.toBeNull();
   });
 
-  it("refuses a lost lease race (CAS miss) with zero writes", async () => {
-    // Another handoff released the lease between the read and the CAS.
+  it("relies on the issue guard for cooperating writers and retains the lease if a bypassed CAS fails", async () => {
+    // A cooperating writer cannot enter while this operation owns the durable
+    // guard. Simulate an out-of-band/bypassing writer winning the lease CAS:
+    // remote cleanup may already have happened, but no cooldown is recorded.
     const { prisma } = await import("@/lib/prisma");
     const leaseModel = (prisma as any).lease;
     const original = leaseModel.deleteMany;
@@ -342,9 +349,9 @@ describe("POST /api/issues/capacity-handoff (#1256)", () => {
       const response = await postRequest();
       expect(response.status).toBe(409);
       expect((await response.json()).error).toMatch(/changed concurrently/i);
-      expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+      expect(mocks.removeIssueLabel).toHaveBeenCalled();
       expect(db.handoffs).toHaveLength(0);
-      expect(db.audit).toHaveLength(0);
+      expect(db.lease).not.toBeNull();
     } finally {
       leaseModel.deleteMany = original;
     }
@@ -390,7 +397,7 @@ describe("POST /api/issues/capacity-handoff (#1256)", () => {
     expect(mocks.addIssueLabel).not.toHaveBeenCalledWith("org/repo", 42, "status/ready");
     expect(json.labels).toContain("status/in-progress");
     expect(json.labels).not.toContain("agent/alpha");
-    expect(db.audit[0].notes).toMatch(/ownership changed post-CAS/i);
+    expect(db.audit[0].notes).toMatch(/ownership changed before cleanup/i);
   });
 
   it("still succeeds when the cooldown write fails after the release committed", async () => {
@@ -438,16 +445,17 @@ describe("POST /api/issues/capacity-handoff (#1256)", () => {
     expect(db.leaseDeletes).toBe(0);
   });
 
-  it("audits a partial failure where the lease released but the label release failed", async () => {
+  it("retains the lease and guard after remote label cleanup fails", async () => {
     mocks.removeIssueLabel.mockRejectedValueOnce(new Error("GitHub write failed"));
     const response = await postRequest();
     expect(response.status).toBe(500);
-    // Lease consumed (ownership definitively released); failure audited.
-    expect(db.lease).toBeNull();
+    // Remote cleanup is incomplete: retain ownership state and permit only an
+    // exact-token retry to resume the durable guard.
+    expect(db.lease).not.toBeNull();
+    expect(db.leaseDeletes).toBe(0);
     expect(db.audit).toHaveLength(1);
     expect(db.audit[0]).toMatchObject({ action: "issue_capacity_handoff", success: false });
-    expect(db.audit[0].errorMessage).toMatch(/stale-claim recovery/i);
-    // No cooldown row is minted for a failed handoff.
+    expect(db.audit[0].errorMessage).toMatch(/lease retained/i);
     expect(db.handoffs).toHaveLength(0);
   });
 });

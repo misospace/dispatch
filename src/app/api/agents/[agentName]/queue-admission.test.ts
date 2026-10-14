@@ -378,7 +378,9 @@ describe("admission enforce", () => {
     mocks.prFixFindMany.mockResolvedValue([PR_FIX]);
     const body = await getNextTask();
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 1 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 1 });
+    expect(body.prFixItem.handoutToken).toEqual(expect.any(String));
+    expect(body.prFixItem.handoutToken).not.toBe("");
 
     const listed = await getQueue();
     expect(listed[0]).toMatchObject({ pr: 77, repo: "org/repo" });

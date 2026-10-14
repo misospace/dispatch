@@ -95,6 +95,9 @@ function makeClient(): PrFixQueueClient & {
             (where?.kind === undefined || h.kind === where.kind) &&
             (where?.repoFullName === undefined || String(h.repoFullName).toLowerCase() === String(where.repoFullName).toLowerCase()) &&
             (where?.prNumber === undefined || h.prNumber === where.prNumber) &&
+            (where?.generation === undefined || h.generation === where.generation) &&
+            (where?.agentName === undefined || h.agentName === where.agentName) &&
+            (where?.note?.contains === undefined || h.note?.includes(where.note.contains)) &&
             (where?.cooldownUntil === undefined ||
               (where.cooldownUntil.gt != null && new Date(h.cooldownUntil).getTime() > new Date(where.cooldownUntil.gt).getTime())),
         ),
@@ -4264,6 +4267,50 @@ describe("PR-fix outcome separation (#1218)", () => {
     expect(repeat.action).toBe("deferred");
     expect(client.handoffs).toHaveLength(1);
     expect(client.history.filter((h: any) => h.action === "capacity_handoff")).toHaveLength(1);
+  });
+
+  it("settles two agents at the same capacity and generation independently; replaying A cannot consume a new receipt (#1256 review)", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 315, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k315" });
+    const row = client.items[0];
+    seedHandout(row, "worker-a", 1, "hnd_aaaaaaaaaaaaaaaa");
+    row.agentHandouts.push("worker-b@1");
+    row.handoutReceipts.push("hnd_bbbbbbbbbbbbbbbb@worker-b@1");
+    const report = (token: string, agentName = "worker-a") => resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient, repoFullName: "org/repo", pullRequestNumber: 315,
+      outcome: "capacity-exhausted", capacity: "same-capacity", agentName,
+      attempt: { itemId: row.id, generation: 1, handoutToken: token },
+    });
+    expect((await report("hnd_aaaaaaaaaaaaaaaa")).action).toBe("deferred");
+    expect(client.items[0].handoutReceipts).toEqual(["hnd_bbbbbbbbbbbbbbbb@worker-b@1"]);
+    expect((await report("hnd_bbbbbbbbbbbbbbbb", "worker-b")).action).toBe("deferred");
+    expect(client.items[0].handoutReceipts).toEqual([]);
+    expect(client.items[0].agentHandouts).toEqual([]);
+    expect(client.history.filter((h: any) => h.action === "capacity_handoff")).toHaveLength(2);
+    expect((await report("hnd_aaaaaaaaaaaaaaaa")).action).toBe("deferred");
+    expect(client.handoffs).toHaveLength(2);
+
+    // A new receipt at the same generation is not consumed by A's replay.
+    seedHandout(client.items[0], "worker-a", 1, "hnd_cccccccccccccccc");
+    expect((await report("hnd_aaaaaaaaaaaaaaaa")).action).toBe("deferred");
+    expect(client.items[0].handoutReceipts).toEqual(["hnd_cccccccccccccccc@worker-a@1"]);
+    expect(client.items[0].dispatchedGeneration).toBe(1);
+  });
+
+  it("legacy receiptless hand-outs keep their dispatch stamps when a receipt owner settles", async () => {
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 316, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k316" });
+    const row = client.items[0];
+    seedHandout(row, "worker-a", 1, "hnd_aaaaaaaaaaaaaaaa");
+    row.agentHandouts.push("worker-legacy@1");
+    const result = await resolvePrFixFromAgentReport({
+      client: client as PrFixQueueClient, repoFullName: "org/repo", pullRequestNumber: 316,
+      outcome: "capacity-exhausted", capacity: "model-a", agentName: "worker-a",
+      attempt: { itemId: row.id, generation: 1, handoutToken: "hnd_aaaaaaaaaaaaaaaa" },
+    });
+    expect(result.action).toBe("deferred");
+    expect(client.items[0].agentHandouts).toEqual(["worker-legacy@1"]);
+    expect(client.items[0].handoutReceipts).toEqual([]);
+    expect(client.items[0].dispatchedGeneration).toBe(1);
+    expect(client.items[0].dispatchedAt).toBeInstanceOf(Date);
   });
 
   it("a different capacity exhausting the same live generation records its own scoped cooldown (#1256)", async () => {
