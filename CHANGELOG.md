@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.5.70](https://github.com/misospace/dispatch/compare/v0.5.69...v0.5.70) (2026-10-14)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.55.0 → 1.56.0) ([#1241](https://github.com/misospace/dispatch/issues/1241)) ([e50a0ee](https://github.com/misospace/dispatch/commit/e50a0ee9c6df1b1962d1c8992273121b42d728bc))
+* **deps:** update dependency lucide-react (1.56.0 → 1.57.0) ([#1258](https://github.com/misospace/dispatch/issues/1258)) ([384ca59](https://github.com/misospace/dispatch/commit/384ca5967b6813824bcc93acd05dee1c7905640d))
+* **lifecycle:** persist idempotent claim and status transition evidence ([#1202](https://github.com/misospace/dispatch/issues/1202)) ([#1247](https://github.com/misospace/dispatch/issues/1247)) ([bcae9a0](https://github.com/misospace/dispatch/commit/bcae9a0b0dbf70e73b5e1f894ccc710f9ceb2db0))
+* **recovery:** add fenced capacity-exhaustion handoffs ([#1259](https://github.com/misospace/dispatch/issues/1259)) ([d2786d2](https://github.com/misospace/dispatch/commit/d2786d2555392daff2ac9f5b8775f2e68e78c317))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @testing-library/user-event (14.6.7 → 14.6.8) ([#1242](https://github.com/misospace/dispatch/issues/1242)) ([caf1467](https://github.com/misospace/dispatch/commit/caf1467b60aba77c122b263c3732d48888958e17))
+* **deps:** update nextjs monorepo (16.4.0 → 16.4.1) ([#1261](https://github.com/misospace/dispatch/issues/1261)) ([b8141b4](https://github.com/misospace/dispatch/commit/b8141b4e0c916ca714a04e9f963ea56064323af9))
+* **deps:** update react monorepo (19.3.0 → 19.3.1) ([#1260](https://github.com/misospace/dispatch/issues/1260)) ([250d651](https://github.com/misospace/dispatch/commit/250d651ed1640c53768bf0d38089a9dd947211a7))
+* **dockerfile:** parse FROM --platform flag in splitIntoStages ([#1178](https://github.com/misospace/dispatch/issues/1178)) ([#1240](https://github.com/misospace/dispatch/issues/1240)) ([a8fd35e](https://github.com/misospace/dispatch/commit/a8fd35e27ca678ffce34eed4ca0fba8cd51c3cec))
+
+
+### Documentation
+
+* **observability:** standalone portable observability design ([#1237](https://github.com/misospace/dispatch/issues/1237)) ([#1239](https://github.com/misospace/dispatch/issues/1239)) ([941f426](https://github.com/misospace/dispatch/commit/941f426d497e925bfa1eafdb61bcc893fd9eafac))
+* **recovery:** ownership reconciliation design ([#1245](https://github.com/misospace/dispatch/issues/1245)) ([#1246](https://github.com/misospace/dispatch/issues/1246)) ([3894ab1](https://github.com/misospace/dispatch/commit/3894ab11ecc249c987b92da043b3298afca58be3))
+
 ## [0.5.69](https://github.com/misospace/dispatch/compare/v0.5.68...v0.5.69) (2026-10-12)
 
 
