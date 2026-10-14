@@ -19,6 +19,14 @@ import { buildResumeContext, isValidCheckpoint } from "./next-action";
 
 export const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+/** Expected issue-mutation contention, not a lease-store failure. */
+export class IssueMutationBusyError extends Error {
+  constructor() {
+    super("Issue mutation pending; lease cannot be renewed or reissued");
+    this.name = "IssueMutationBusyError";
+  }
+}
+
 /**
  * Calculate the expiry timestamp for a lease with the given TTL.
  */
@@ -49,7 +57,7 @@ export async function upsertLease(params: {
     const result = await withIssueMutationGuard({ issueId: params.issueId, operation: "lease", agentName: params.agentName }, async () => ({
       complete: true, value: await upsertLease({ ...params, mutationGuardHeld: true }),
     }));
-    if (result.status === "busy") throw new Error("Issue mutation pending; lease cannot be renewed or reissued");
+    if (result.status === "busy") throw new IssueMutationBusyError();
     return result.value;
   }
   const now = new Date();

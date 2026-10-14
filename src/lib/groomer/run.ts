@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { fetchCollaboratorPermission } from "@/lib/github-issues";
-import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
+import { findActiveLeasesForIssue, IssueMutationBusyError, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
@@ -266,7 +266,12 @@ async function executeGroomerRun(
     stage = "lease_acquisition";
     const activeLeases = await deps.findActiveLeases(candidate.id);
     const hasOtherLease = activeLeases.some((active: { agentName?: string }) => active.agentName !== "hosted-groomer");
-    if (hasOtherLease && !options.force) throw new Error("Candidate has another active lease");
+    if (hasOtherLease && !options.force) {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "deferred", stage, errorMessage: null, retryable: true,
+      });
+      return null;
+    }
     ({ lease } = await deps.upsertLease({
       agentName: "hosted-groomer",
       issueId: candidate.id,
@@ -1306,6 +1311,13 @@ async function executeGroomerRun(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown groomer error";
 
+    if (stage === "lease_acquisition" && error instanceof IssueMutationBusyError) {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "deferred", stage, errorMessage: null, retryable: true,
+      });
+      return null;
+    }
+
     // Complete GroomingRun as failed
     try {
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
@@ -1347,9 +1359,6 @@ async function executeGroomerRun(
         errorMessage: message,
       },
     });
-    // Acquisition failures are candidate-local; their backoff lets the next
-    // scheduled run select other work rather than repeatedly aborting here.
-    if (stage === "lease_acquisition") return null;
     throw error;
   } finally {
     if (lease) await deps.releaseLease(lease.id);
