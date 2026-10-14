@@ -412,19 +412,24 @@ automation writer of the same label. The invariant:
 
 > **Every reconciler-initiated `agent/*` label delete, and every claim-path
 > `agent/*` label add, is backed by a Postgres intent committed under one
-> per-issue serialization anchor before the remote call is made. No automation
-> path issues a remote `agent/*` label write outside a live intent.**
+> per-issue serialization anchor before the remote call is made. No protocol
+> path (reconciler or claim) issues a remote `agent/*` label write outside a
+> live intent.**
 >
-> **Deliberate exemptions:** the owning agent's `POST /api/issues/unclaim`
-> (removes only its *own* observed label through `releaseIssueClaim`, which
-> already skips a newer owner's label — `issue-claim.ts:144-153`) and the
-> maintainer `force=true` stale-label cleanup
-> (`src/app/api/issues/claim/route.ts:185-192`) stay direct, intent-free
-> writes: they are explicit owner/operator decisions that cannot steal work,
-> and both are audited. Exempt paths still run under the same anchor rule
-> *when they coincide with a pending intent* — a pending reconciler intent
-> makes even an exempt delete name-check the intent (settle-or-supersede)
-> rather than silently racing it.
+> **Deliberate exemptions:** three direct, intent-free writers stay outside the
+> protocol — the owning agent's `POST /api/issues/unclaim` (removes only its
+> *own* observed label through `releaseIssueClaim`, which already skips a newer
+> owner's label — `issue-claim.ts:144-153`); the maintainer `force=true`
+> stale-label cleanup (`src/app/api/issues/claim/route.ts:185-192`); and direct
+> assignment via `POST /api/issues/actions` `assign_agent`
+> (`docs/assignment-conflict-policy.md:18`), used by operators and external
+> pipelines. These are explicit owner/operator/pipeline decisions naming a
+> specific agent, and they are audited. They still run under the anchor rule
+> *when they coincide with a pending intent*: under the lock, a pending
+> reconciler intent is **superseded** (audited) rather than silently raced, and
+> because label add/delete are idempotent, the post-settle label state
+> converges on the explicit human/pipeline choice, not the abandoned
+> reconciler's.
 
 **The anchor.** One Postgres serialization point per `(repo, issue)` — the
 issue's ownership row locked with `SELECT … FOR UPDATE`, or a per-issue
@@ -434,11 +439,15 @@ intent check) is a transaction on that anchor. Ordering between two concurrent
 writers is decided **by the lock, not by timing**: one commits first, the
 other loses or is held.
 
-State per `(repo, issue)`: a release-intent record
-(`issue-claim-release` style, reusing the `staleClaimReleasePending` two-phase
-pattern from `stale-work.ts:100-140,173-179`) carrying
-`(issueId, agentLabel, attemptToken, phase, createdAt)`; the `Lease.attemptToken`
-column from §6.1 is the fencing token the phases pin against.
+State per `(repo, issue)`: two intent records under the same anchor — a
+release-intent (`issue-claim-release` style, reusing the
+`staleClaimReleasePending` two-phase pattern from
+`stale-work.ts:100-140,173-179`) and a claim-intent written by step 2 of the
+Claim side — each carrying
+`(issueId, agentLabel, attemptToken, phase, createdAt)` and owned/replayed by
+its own path (reconciler replays release intents; the claim route replays its
+own unsettled claim intent on retry). The `Lease.attemptToken` column from
+§6.1 is the fencing token the phases pin against.
 
 **Phase A — fenced intent commit (Postgres only, atomic).** One transaction on
 the anchor: CAS the ownership row on `(owner, attemptToken = g)`; if it
@@ -509,6 +518,7 @@ it is already subject to.
 | After A, before B | Intent pending; replay issues Phase B, then C. | Claim path is held by the barrier, so no newer claim exists to hit. |
 | After B, before C | Intent pending; replay re-issues `removeIssueLabel` (idempotent; 404 = already gone, per `issue-claim.ts:159-161`), then settles. | Same barrier argument: no label re-add could have happened while pending. |
 | After C, on a stale retry | No matching intent (cleared at C) → the retry is a local no-op and issues **no** forge call. | A live `g+1` claim's label is never a target: retries act only on intents, and a cleared intent names nothing. |
+| Claim side: intent committed, crash before remote ADD | The claim route's retry replays its own pending claim-intent: re-issues the idempotent `addIssueLabel`, then settles it. | The claim intent is pinned to `g+1`; the reconciler never targets a label its own superseded/absent intent does not name. |
 
 **Fail-closed / operator path.** If the forge is unreachable during B, the
 intent stays pending and the reconciler retries each tick (issue remains held,
