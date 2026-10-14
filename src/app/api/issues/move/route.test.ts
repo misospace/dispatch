@@ -7,6 +7,8 @@ const { mocks } = vi.hoisted(() => ({
     findIssue: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
+    createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
+    upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     auth: vi.fn(),
@@ -22,9 +24,26 @@ vi.mock("@/lib/prisma", () => ({
       findUnique: mocks.findIssue,
       update: mocks.updateIssue,
     },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
+    },
     auditLog: {
       create: mocks.createAuditLog,
     },
+    // The move commits the cache write and its lifecycle event together (#1202).
+    $transaction: (arg: any) =>
+      Promise.resolve(
+        typeof arg === "function"
+          ? arg({
+              issue: { update: mocks.updateIssue },
+              issueLifecycleEvent: {
+                create: mocks.createLifecycleEvent,
+                upsert: mocks.upsertLifecycleEvent,
+              },
+            })
+          : Promise.all(arg),
+      ),
   },
 }));
 
@@ -394,5 +413,52 @@ describe("POST /api/issues/move — validation", () => {
     expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
     const body = await res.json();
     expect(body.error).toBe("Rate limit exceeded");
+  });
+});
+
+describe("POST /api/issues/move — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.auth.mockReset();
+    mocks.findIssue.mockResolvedValue(null);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("records the column move with the actor that made it", async () => {
+    mocks.findIssue.mockResolvedValue({ id: "issue-1", labels: ["status/backlog"] });
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "status_changed",
+        source: "api:move",
+        fromStatus: "status/backlog",
+        toStatus: "status/in-progress",
+      }),
+    });
+  });
+
+  it("records nothing when the drop does not move the card to another column", async () => {
+    mocks.findIssue.mockResolvedValue({ id: "issue-1", labels: ["status/backlog"] });
+
+    const res = await postRequest(
+      makePayload({ oldLabels: ["status/backlog"], newLabels: ["status/backlog", "priority/p0"] }),
+    );
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
   });
 });

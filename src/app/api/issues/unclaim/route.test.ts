@@ -8,6 +8,8 @@ const { mocks } = vi.hoisted(() => ({
     findUnique: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
+    createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
+    upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     removeIssueLabel: vi.fn().mockResolvedValue(undefined),
     addIssueLabel: vi.fn().mockResolvedValue(undefined),
     updateIssueLabels: vi.fn().mockResolvedValue(undefined),
@@ -33,6 +35,23 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: {
       create: mocks.createAuditLog,
     },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
+    },
+    // The release cache write and its lifecycle event commit together (#1202).
+    $transaction: (arg: any) =>
+      Promise.resolve(
+        typeof arg === "function"
+          ? arg({
+              issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
+              issueLifecycleEvent: {
+                create: mocks.createLifecycleEvent,
+                upsert: mocks.upsertLifecycleEvent,
+              },
+            })
+          : Promise.all(arg),
+      ),
   },
 }));
 
@@ -665,5 +684,68 @@ describe("POST /api/issues/unclaim — cross-issue identity invariant (#1129 rev
         success: true,
       }),
     });
+  });
+});
+
+describe("POST /api/issues/unclaim — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      number: 42,
+      repository: { fullName: "org/repo" },
+      labels: ["agent/test-agent", "status/in-progress"],
+    } as never);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
+    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(1);
+  });
+
+  it("records the release, attributed to the releasing agent", async () => {
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "claim_released",
+        source: "api:unclaim",
+        actor: "test-agent",
+        agentName: "test-agent",
+        fromStatus: "status/in-progress",
+        toStatus: "status/ready",
+      }),
+    });
+  });
+
+  it("attributes an operator release to the operator, not to the released agent", async () => {
+    process.env.DISPATCH_AUTH_MODE = "basic";
+    process.env.DISPATCH_AUTH_USERNAME = "alice";
+    process.env.DISPATCH_AUTH_PASSWORD = "hunter2";
+    const credentials = Buffer.from("alice:hunter2").toString("base64");
+
+    const res = await POST(
+      authedRequest("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        body: makePayload(),
+        includeAuth: false,
+        headers: { Authorization: `Basic ${credentials}` },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({ kind: "claim_released", actor: "alice", agentName: "test-agent" }),
+    });
+
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
   });
 });

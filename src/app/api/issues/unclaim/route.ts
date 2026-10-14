@@ -98,13 +98,16 @@ export async function POST(request: Request) {
 
     try {
       // The shared core keeps operator and scheduled claim release behaviour
-      // consistent while allowing stale retries to be idempotent.
+      // consistent while allowing stale retries to be idempotent. It also
+      // records the release's lifecycle event, attributed to the audited actor
+      // rather than to the agent being released (#1202).
       const released = await releaseIssueClaim({
         prisma,
         issue,
         repoFullName,
         issueNumber,
         agentName: agentName as string,
+        options: { actor },
       });
 
       const updatedLabels = released.labels;

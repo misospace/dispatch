@@ -407,3 +407,210 @@ describe("releaseIssueClaim — guards", () => {
     expect(update).not.toHaveBeenCalled();
   });
 });
+
+describe("releaseIssueClaim — lifecycle evidence (#1202)", () => {
+  /** A client that records lifecycle events, with a real transaction shape. */
+  function makeLifecyclePrisma(overrides: Partial<{ labels: string[] }> = {}) {
+    const base = makePrisma(overrides);
+    const createEvent = vi.fn().mockResolvedValue({ id: "evt-1" });
+    const upsertEvent = vi.fn().mockResolvedValue({ id: "evt-1" });
+    const client: IssueClaimClient = {
+      issue: base.client.issue,
+      issueLifecycleEvent: { create: createEvent, upsert: upsertEvent },
+      $transaction: (fn: any) => Promise.resolve(fn({
+        issue: base.client.issue,
+        issueLifecycleEvent: { create: createEvent, upsert: upsertEvent },
+      })),
+    };
+    return { client, createEvent, upsertEvent, update: base.update };
+  }
+
+  it("records the release with the status it left behind", async () => {
+    const { client, createEvent } = makeLifecyclePrisma();
+
+    await callRelease(client, ["agent/alpha", "status/in-progress"], {});
+
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: REPO,
+        issueNumber: ISSUE_NUMBER,
+        kind: "claim_released",
+        source: "api:unclaim",
+        actor: "alpha",
+        agentName: "alpha",
+        fromStatus: "status/in-progress",
+        toStatus: "status/ready",
+      }),
+    });
+  });
+
+  it("records the release even when the status is deliberately retained", async () => {
+    const { client, createEvent } = makeLifecyclePrisma();
+
+    await callRelease(
+      client,
+      ["agent/alpha", "status/in-review"],
+      { releaseOptions: { preserveStatus: true } },
+    );
+
+    // A release that keeps in-review still happened, and the unchanged status
+    // is what makes it distinguishable from a finished attempt.
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        kind: "claim_released",
+        fromStatus: "status/in-review",
+        toStatus: "status/in-review",
+      }),
+    });
+  });
+
+  it("attributes a stale sweep's release to the sweep, not to the abandoned agent", async () => {
+    const { client, createEvent } = makeLifecyclePrisma();
+
+    await callRelease(
+      client,
+      ["agent/alpha", "status/in-progress"],
+      {
+        releaseOptions: {
+          allowMissingAgent: true,
+          preserveStatus: true,
+          source: "stale-recovery",
+          actor: "system",
+        },
+      },
+    );
+
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        kind: "claim_released",
+        source: "stale-recovery",
+        actor: "system",
+        agentName: "alpha",
+      }),
+    });
+  });
+
+  it("de-duplicates the already-released repair a repeated sweep performs", async () => {
+    const { client, createEvent, upsertEvent } = makeLifecyclePrisma({ labels: ["status/in-progress"] });
+
+    const options = { allowMissingAgent: true, source: "stale-recovery", actor: "system" } as const;
+    await callRelease(client, ["status/in-progress"], { releaseOptions: options });
+    await callRelease(client, ["status/in-progress"], { releaseOptions: options });
+
+    // A sweep that dies mid-release retries the same repair; it must not
+    // inflate the release count.
+    expect(upsertEvent).toHaveBeenCalledTimes(2);
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(upsertEvent.mock.calls[0][0].create.dedupeKey).toBe(
+      upsertEvent.mock.calls[1][0].create.dedupeKey,
+    );
+  });
+
+  it("records nothing when the claim belongs to another agent", async () => {
+    const { client, createEvent, update } = makeLifecyclePrisma();
+
+    await callRelease(client, ["agent/beta", "status/in-progress"], { agentName: "alpha" });
+
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("records nothing for a narrow client that cannot record events", async () => {
+    // Callers that pass only an issue surface (test fakes, partial clients)
+    // keep working: the release still lands, it just has no evidence row.
+    const { client, update } = makePrisma();
+
+    const result = await callRelease(client, ["agent/alpha", "status/in-progress"], {});
+
+    expect(result.released).toBe(true);
+    expect(update).toHaveBeenCalled();
+  });
+});
+
+describe("releaseIssueClaim — one identity per release attempt (#1202 review)", () => {
+  /** A client whose event rows are keyed by dedupeKey, like the unique index. */
+  function makeRowKeepingPrisma(labels: string[]) {
+    const base = makePrisma({ labels });
+    const rows: Array<Record<string, any>> = [];
+    const issueLifecycleEvent = {
+      create: vi.fn(async ({ data }: { data: Record<string, any> }) => {
+        rows.push({ ...data });
+        return data;
+      }),
+      upsert: vi.fn(async ({ where, create }: { where: { dedupeKey: string }; create: Record<string, any> }) => {
+        const existing = rows.find((row) => row.dedupeKey === where.dedupeKey);
+        if (existing) return existing;
+        rows.push({ ...create });
+        return create;
+      }),
+    };
+    const client: IssueClaimClient = {
+      issue: base.client.issue,
+      issueLifecycleEvent,
+      $transaction: (fn: any) => Promise.resolve(fn({ issue: base.client.issue, issueLifecycleEvent })),
+    };
+    return { client, rows, upsertEvent: issueLifecycleEvent.upsert, createEvent: issueLifecycleEvent.create };
+  }
+
+  const staleOptions = (releaseKey?: string) => ({
+    allowMissingAgent: true,
+    preserveStatus: true,
+    source: "stale-recovery",
+    actor: "system",
+    ...(releaseKey ? { releaseKey } : {}),
+  }) as const;
+
+  it("collapses a retried release and its repair onto one row", async () => {
+    // The sweep releases the claim, dies before finalizing the AgentWork row,
+    // and the retry finds the agent label already gone. Both attempts are the
+    // same release of the same claim epoch, so the stream holds one row.
+    const { client, rows } = makeRowKeepingPrisma(["status/in-progress"]);
+
+    await callRelease(client, ["agent/alpha", "status/in-progress"], {
+      releaseOptions: staleOptions("agent-work|work-1"),
+    });
+    await callRelease(client, ["status/in-progress"], {
+      releaseOptions: staleOptions("agent-work|work-1"),
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: "claim_released", source: "stale-recovery" });
+  });
+
+  it("records a reclaim as its own release, because it is a new claim epoch", async () => {
+    // Same issue, same agent, but the work was claimed again in between, so
+    // the caller holds a new AgentWork row and supplies a new key.
+    const { client, rows } = makeRowKeepingPrisma(["status/in-progress"]);
+
+    await callRelease(client, ["agent/alpha", "status/in-progress"], {
+      releaseOptions: staleOptions("agent-work|work-1"),
+    });
+    await callRelease(client, ["agent/alpha", "status/in-progress"], {
+      releaseOptions: staleOptions("agent-work|work-2"),
+    });
+
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.dedupeKey)).size).toBe(2);
+  });
+
+  it("leaves the unclaim route's path unchanged when no release key is supplied", async () => {
+    // The operator/agent unclaim route knows no claim epoch: its release stays
+    // a plain insert, and the already-released repair keeps its own key.
+    const unclaimed = makeRowKeepingPrisma(["status/in-progress"]);
+    await callRelease(unclaimed.client, ["agent/alpha", "status/in-progress"], {});
+
+    expect(unclaimed.createEvent).toHaveBeenCalledTimes(1);
+    expect(unclaimed.createEvent.mock.calls[0][0].data.dedupeKey).toBeUndefined();
+
+    const repaired = makeRowKeepingPrisma(["status/in-progress"]);
+    await callRelease(repaired.client, ["status/in-progress"], {
+      releaseOptions: { allowMissingAgent: true, source: "stale-recovery", actor: "system" },
+    });
+
+    expect(repaired.createEvent).not.toHaveBeenCalled();
+    expect(repaired.upsertEvent.mock.calls[0][0].create.dedupeKey).toBe(
+      "claim-released|issue-1|agent/alpha|already-released",
+    );
+  });
+});
