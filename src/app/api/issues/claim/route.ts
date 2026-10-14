@@ -233,6 +233,13 @@ export async function POST(request: Request) {
           agentName: agentName as string,
           before: liveLabels,
           after: updatedLabels,
+          // The GitHub writes above are already outside this transaction, so a
+          // failure here rolls the mirror back while GitHub keeps the claim —
+          // and the retry reads those live labels as "already claimed". The
+          // cache row is written inside the transaction, so on the retry it
+          // still holds the pre-claim set and can supply the before-state this
+          // attempt is missing. Decision logic stays on liveLabels above.
+          mirroredBefore: issue.labels,
           metadata: force === true ? { force: true } : null,
         });
       });

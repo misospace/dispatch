@@ -454,4 +454,61 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
     expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
   });
+
+  // `.filter()` returns a new array even when nothing was removed, so an
+  // absent-label removal used to read as a phantom move on every redelivery —
+  // unbounded, because such a hand-rolled delivery has no id to key on.
+  it.each([
+    ["with", { "x-github-delivery": "delivery-absent-label" }],
+    ["without", {}],
+  ])("records nothing when unlabeling a status label the cache does not carry (%s delivery id)", async (_label, headers) => {
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      number: 42,
+      repositoryId: "repo-1",
+      labels: ["status/ready", "type/bug"],
+    });
+
+    const res = await POST(
+      signedRequest(
+        makeIssuesEvent({ action: "unlabeled", label: { name: "status/in-review" } }),
+        undefined,
+        headers,
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    // The cached label set is left exactly as it was.
+    expect((await res.json()).labels).toEqual(["status/ready", "type/bug"]);
+    expect(mocks.issueUpdate).toHaveBeenCalledWith({
+      where: { repositoryId_number: { repositoryId: "repo-1", number: 42 } },
+      data: expect.objectContaining({ labels: ["status/ready", "type/bug"] }),
+    });
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("records exactly one event for a real status removal", async () => {
+    const res = await POST(
+      signedRequest(
+        makeIssuesEvent({ action: "unlabeled", label: { name: "status/backlog" } }),
+        undefined,
+        { "x-github-delivery": "delivery-removal" },
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "webhook|org/repo|42|delivery-removal|status/backlog" },
+      create: expect.objectContaining({
+        kind: "status_changed",
+        source: "webhook",
+        fromStatus: "status/backlog",
+        toStatus: null,
+      }),
+      update: {},
+    });
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+  });
 });

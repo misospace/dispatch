@@ -28,7 +28,12 @@ import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRe
 import { explorationCallsForFreshness } from "./freshness";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
 import { compareCommits, searchRepositoryCode } from "@/lib/github-code-search";
-import { lifecycleStatusLabel, recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
+import {
+  lifecycleDedupeKey,
+  lifecycleStatusLabel,
+  recordLifecycleEventQuietly,
+  recordStatusTransitionQuietly,
+} from "@/lib/issue-lifecycle";
 import { fetchCommitDate } from "@/lib/github-ci";
 import { validateApplyPreconditions, type LiveComment, type PreconditionReader } from "./mutation-validator";
 import {
@@ -1225,11 +1230,15 @@ async function executeGroomerRun(
     // Record the status move the grooming plan actually made (#1202). The
     // labels only reach the issue cache on the next sync, so without this the
     // groomer's own transition would first be observable as a `sync` event and
-    // a claim-to-merge read could not tell who moved the card. Quiet by
-    // design: a grooming run that already landed its mutations must not fail
-    // over an evidence row, and a replayed application records nothing because
-    // this branch is only reached the first time the application key lands.
-    await recordLifecycleEventQuietly(
+    // a claim-to-merge read could not tell who moved the card. The shared
+    // guard decides what counts: a plan whose application changed no
+    // `status/*` label (a `noop`, or a `partial` that landed something else
+    // first) records nothing rather than a row with identical from/to. Quiet
+    // by design: a grooming run that already landed its mutations must not
+    // fail over an evidence row, and a replayed application records nothing
+    // because this branch is only reached the first time the application key
+    // lands.
+    await recordStatusTransitionQuietly(
       deps.prisma,
       {
         issueId: candidate.id,
@@ -1238,13 +1247,43 @@ async function executeGroomerRun(
         kind: "status_changed",
         source: "hosted-groomer",
         actor: "hosted-groomer",
-        fromStatus: lifecycleStatusLabel(analyzed.labels),
-        toStatus: lifecycleStatusLabel(applied.labels),
-        occurredAt: new Date(),
+        before: analyzed.labels,
+        after: applied.labels,
         metadata: { groomingRunId: groomingRun.id, applicationKey },
       },
       "hosted-groomer",
     );
+
+    // A close is a separate fact from the status label that goes with it, and
+    // the next sync can never observe this one: the close above is mirrored
+    // into the cache in the same run, so by the time sync looks the issue is
+    // already closed there. Recorded under the application key so a retry of
+    // the same plan collapses onto one row. Independent of the transition
+    // above — a plan that closes without moving the status label still
+    // records the close, and records no `status_changed`.
+    if (applied.closed) {
+      await recordLifecycleEventQuietly(
+        deps.prisma,
+        {
+          issueId: candidate.id,
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          kind: "issue_closed",
+          source: "hosted-groomer",
+          actor: "hosted-groomer",
+          toStatus: lifecycleStatusLabel(applied.labels),
+          dedupeKey: lifecycleDedupeKey(
+            "hosted-groomer",
+            candidate.repoFullName,
+            candidate.number,
+            "issue_closed",
+            applicationKey,
+          ),
+          metadata: { groomingRunId: groomingRun.id, applicationKey },
+        },
+        "hosted-groomer",
+      );
+    }
 
     // Complete GroomingRun. A partial application is explicit in history
     // and retryable: every landed step is recorded, so a retry of the same

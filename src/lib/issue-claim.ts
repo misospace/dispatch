@@ -29,6 +29,14 @@ export interface ReleaseIssueClaimOptions {
   source?: LifecycleSource;
   /** Lifecycle actor for the release. Defaults to the releasing agent. */
   actor?: string;
+  /**
+   * A stable identity for THIS release attempt — one claim epoch — supplied by
+   * the caller so the ownership-only release and the already-released repair a
+   * retry of that same attempt takes collapse onto one `claim_released` row
+   * instead of recording the release twice. Absent, behavior is unchanged: the
+   * repair keeps its own key and the real release stays unkeyed.
+   */
+  releaseKey?: string;
 }
 
 export interface ReleaseIssueClaimResult {
@@ -123,6 +131,14 @@ export async function releaseIssueClaim(params: {
     dedupeKey: dedupeKey ?? null,
   });
 
+  // One identity for this release attempt, shared by the ownership-only
+  // release and the repair a retry of the same attempt takes. Without it the
+  // two writes carry different identities — and a sweep that dies between them
+  // records one release twice, once for each path it took.
+  const releaseDedupeKey = options.releaseKey
+    ? lifecycleDedupeKey("claim-released", issue.id, agentLabel, options.releaseKey)
+    : null;
+
   // Never remove a newer agent's claim while an old AgentWork row is being
   // recovered. The stale-work caller can still retire the old local row.
   if (currentAgent && currentAgent !== agentLabel) {
@@ -155,7 +171,8 @@ export async function releaseIssueClaim(params: {
       releaseEvent(
         issue.labels,
         cacheLabels,
-        lifecycleDedupeKey("claim-released", issue.id, agentLabel, "already-released"),
+        releaseDedupeKey ??
+          lifecycleDedupeKey("claim-released", issue.id, agentLabel, "already-released"),
       ),
     );
     return {
@@ -177,7 +194,7 @@ export async function releaseIssueClaim(params: {
       ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
       : null;
     const cacheLabels = latestIssue?.labels?.filter((label: string) => label !== agentLabel) ?? updatedLabels;
-    await commitRelease(cacheLabels, releaseEvent(issue.labels, cacheLabels));
+    await commitRelease(cacheLabels, releaseEvent(issue.labels, cacheLabels, releaseDedupeKey ?? undefined));
     return {
       released: true,
       labels: cacheLabels,

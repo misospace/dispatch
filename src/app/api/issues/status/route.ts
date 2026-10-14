@@ -148,6 +148,13 @@ export async function POST(request: Request) {
           agentName: typeof agentName === "string" ? agentName : null,
           before: liveLabels,
           after: labelsToSet,
+          // The GitHub status swap above is already outside this transaction,
+          // so a failure here rolls the mirror back while GitHub keeps the new
+          // label — and the retry reads those live labels as "already at the
+          // requested status". The cache row is written inside the transaction,
+          // so on the retry it still holds the pre-write set and can supply the
+          // before-state this attempt is missing. Decisions stay on liveLabels.
+          mirroredBefore: issue.labels,
           metadata: targetLabel === "status/blocked" ? { blocked: true } : null,
         });
       });

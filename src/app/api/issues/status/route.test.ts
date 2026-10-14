@@ -495,4 +495,33 @@ describe("POST /api/issues/status — lifecycle evidence (#1202)", () => {
     expect(res.status).toBe(503);
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
   });
+
+  it("recovers the transition on a retry whose GitHub write already landed", async () => {
+    // First attempt: GitHub takes status/in-progress, the event insert fails,
+    // and the transaction rolls the mirror back. The retry reads an issue that
+    // already carries the requested status — only the cache row still shows
+    // the pre-write state, and it is what makes the evidence recoverable.
+    mocks.getLiveIssueLabels
+      .mockResolvedValueOnce(["status/ready"])
+      .mockResolvedValue(["status/in-progress"]);
+    mocks.createLifecycleEvent.mockRejectedValueOnce(new Error("lifecycle write failed"));
+
+    const first = await POST(makeRequest());
+    expect(first.status).toBe(500);
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(1);
+
+    const retry = await POST(makeRequest());
+    expect(retry.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(2);
+    expect(mocks.createLifecycleEvent).toHaveBeenLastCalledWith({
+      data: expect.objectContaining({
+        kind: "status_changed",
+        source: "api:status",
+        fromStatus: "status/ready",
+        toStatus: "status/in-progress",
+        metadata: { recoveredFromMirroredState: true },
+      }),
+    });
+  });
 });

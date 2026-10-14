@@ -173,14 +173,18 @@ export async function POST(request: Request) {
     }
 
     // Idempotent: adding a label that is already present (or removing one
-    // that is absent) leaves the label set unchanged.
+    // that is absent) leaves the label set unchanged — returned as the same
+    // array reference, which is what makes the identity check below exact
+    // rather than a "new array means a change" test.
     const currentLabels = cachedIssue.labels;
     const nextLabels =
       action === "labeled"
         ? currentLabels.includes(labelName)
           ? currentLabels
           : [...currentLabels, labelName]
-        : currentLabels.filter((label) => label !== labelName);
+        : currentLabels.includes(labelName)
+          ? currentLabels.filter((label) => label !== labelName)
+          : currentLabels;
 
     await prisma.issue.update({
       where: { repositoryId_number: { repositoryId: repo.id, number: issueNumber } },

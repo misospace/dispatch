@@ -478,26 +478,35 @@ export function makePrismaIssueStore(): IssueStore {
       });
     },
     async updateIssue(id: string, data: SyncedIssueData, previous?: IssueSyncSnapshot | null) {
-      await prisma.issue.update({ where: { id }, data });
-
       const repoFullName = repoByIssueId.get(id);
       repoByIssueId.delete(id);
-      // The write landed even if the lookup above never ran, so a missing repo
-      // name costs the event, not the sync.
-      if (!repoFullName || !previous) return;
 
-      await recordSyncedIssueEvents(prisma, {
-        issueId: id,
-        repoFullName,
-        issueNumber: data.number,
-        before: { labels: previous.labels, state: previous.state ?? null },
-        after: {
-          labels: data.labels,
-          state: data.state,
-          updatedAt: data.updatedAt,
-          closedAt: data.closedAt,
-        },
-      });
+      // Evidence before the mirror (#1202). Committing the cache write first
+      // and the event second would make a failed event write unrecoverable: the
+      // next sync would read an already-updated cache, derive no transition and
+      // never reconstruct the missing row. Recording first lets the failure
+      // abort this issue's mirror instead — the sync core catches a throwing
+      // updateIssue at repo level and reports that repo as errored, exactly as
+      // it already does for a failed mirror write — and because the cache row
+      // never moved, the next run re-derives the same transition from the same
+      // before-state and upserts onto the same source-derived dedupe key: one
+      // row, not a duplicate.
+      if (repoFullName && previous) {
+        await recordSyncedIssueEvents(prisma, {
+          issueId: id,
+          repoFullName,
+          issueNumber: data.number,
+          before: { labels: previous.labels, state: previous.state ?? null },
+          after: {
+            labels: data.labels,
+            state: data.state,
+            updatedAt: data.updatedAt,
+            closedAt: data.closedAt,
+          },
+        });
+      }
+
+      await prisma.issue.update({ where: { id }, data });
     },
     async createIssue(repositoryId: string, data: SyncedIssueData) {
       // Stamp the configured default claimable lane so a freshly-ingested,
@@ -564,22 +573,27 @@ export function makePrismaReconcileIssueStore(): {
   return {
     findActiveCachedIssues: findActiveCachedIssuesForReconcile,
     async updateIssue(id, data, previous) {
+      // Evidence before the mirror, for the same reason as the sync store
+      // above: a failed event write must leave the cache untouched so the next
+      // run can re-derive the transition. The repo lookup is this store's only
+      // extra read; it moves ahead of the update rather than being added for it.
+      if (previous) {
+        const repo = await prisma.issue.findUnique({
+          where: { id },
+          select: { number: true, repository: { select: { fullName: true } } },
+        });
+        if (repo) {
+          await recordSyncedIssueEvents(prisma, {
+            issueId: id,
+            repoFullName: repo.repository.fullName,
+            issueNumber: repo.number,
+            before: { labels: previous.labels, state: previous.state ?? null },
+            after: { labels: data.labels, state: data.state, closedAt: data.closedAt },
+          });
+        }
+      }
+
       await prisma.issue.update({ where: { id }, data });
-      if (!previous) return;
-
-      const repo = await prisma.issue.findUnique({
-        where: { id },
-        select: { number: true, repository: { select: { fullName: true } } },
-      });
-      if (!repo) return;
-
-      await recordSyncedIssueEvents(prisma, {
-        issueId: id,
-        repoFullName: repo.repository.fullName,
-        issueNumber: repo.number,
-        before: { labels: previous.labels, state: previous.state ?? null },
-        after: { labels: data.labels, state: data.state, closedAt: data.closedAt },
-      });
     },
   };
 }

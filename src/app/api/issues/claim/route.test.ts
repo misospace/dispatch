@@ -674,13 +674,50 @@ describe("POST /api/issues/claim — lifecycle evidence (#1202)", () => {
 
   it("records nothing for a redelivered claim of an already-claimed issue", async () => {
     // Live GitHub already shows this agent holding the issue as in-progress,
-    // which is exactly what a replayed claim request looks like.
+    // which is exactly what a replayed claim request looks like — and so does
+    // the cache, because the first attempt's mirror committed.
     mocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress", "agent/test-agent"]);
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" },
+      labels: ["status/in-progress", "agent/test-agent"],
+    });
 
     const res = await POST(makeRequest());
     expect(res.status).toBe(200);
     expect(mocks.updateIssue).toHaveBeenCalled();
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("recovers the claim on a retry whose GitHub writes already landed", async () => {
+    // First attempt: GitHub takes the labels, the event insert fails, and the
+    // transaction rolls the mirror back. The retry then reads an
+    // already-claimed issue — only the cache row still shows the pre-claim
+    // state, and it is what makes the first attempt's evidence recoverable.
+    mocks.getLiveIssueLabels
+      .mockResolvedValueOnce(["status/ready", "type/feature"])
+      .mockResolvedValue(["type/feature", "agent/test-agent", "status/in-progress"]);
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" },
+      labels: ["status/ready", "type/feature"],
+    });
+    mocks.createLifecycleEvent.mockRejectedValueOnce(new Error("lifecycle write failed"));
+
+    const first = await POST(makeRequest());
+    expect(first.status).toBe(500);
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(1);
+
+    const retry = await POST(makeRequest());
+    expect(retry.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(2);
+    expect(mocks.createLifecycleEvent).toHaveBeenLastCalledWith({
+      data: expect.objectContaining({
+        kind: "claim",
+        fromStatus: "status/ready",
+        toStatus: "status/in-progress",
+        metadata: { recoveredFromMirroredState: true },
+      }),
+    });
   });
 
   it("records a force-claim that only changes ownership", async () => {

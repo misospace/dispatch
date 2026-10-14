@@ -8,6 +8,7 @@ import {
   recordLifecycleEvent,
   recordLifecycleEventQuietly,
   recordStatusTransition,
+  recordStatusTransitionQuietly,
   recordSyncedIssueEvents,
   type LifecycleEventClient,
 } from "./issue-lifecycle";
@@ -191,6 +192,48 @@ describe("recordStatusTransition", () => {
       toStatus: "status/in-review",
     });
   });
+
+  it("recovers the before-state from the mirrored cache when the observed labels already show the write", async () => {
+    const { client, rows } = makeClient();
+
+    // The GitHub write landed and the local transaction that mirrors it rolled
+    // back, so the retry observes labels that already carry the new status and
+    // the cache still holds the state from before the write. Without the
+    // fallback the first attempt's transition would be lost for good.
+    const recorded = await recordStatusTransition(client, {
+      ...base,
+      kind: "status_changed",
+      source: "api:status",
+      actor: "operator",
+      before: ["status/in-review"],
+      after: ["status/in-review"],
+      mirroredBefore: ["status/ready"],
+    });
+
+    expect(recorded).toBe(true);
+    expect(rows[0]).toMatchObject({
+      fromStatus: "status/ready",
+      toStatus: "status/in-review",
+      metadata: { recoveredFromMirroredState: true },
+    });
+  });
+
+  it("records nothing when neither the observed nor the mirrored labels show a change", async () => {
+    const { client, rows } = makeClient();
+
+    const recorded = await recordStatusTransition(client, {
+      ...base,
+      kind: "status_changed",
+      source: "api:status",
+      actor: "operator",
+      before: ["status/in-review"],
+      after: ["status/in-review"],
+      mirroredBefore: ["status/in-review"],
+    });
+
+    expect(recorded).toBe(false);
+    expect(rows).toHaveLength(0);
+  });
 });
 
 describe("recordClaimEvent", () => {
@@ -243,6 +286,78 @@ describe("recordClaimEvent", () => {
     });
 
     expect(rows).toHaveLength(1);
+  });
+
+  it("recovers a retried claim from the mirrored cache, and only marks it when it had to", async () => {
+    const { client, rows } = makeClient();
+    const after = ["status/in-progress", "agent/alpha"];
+
+    // The claim's GitHub writes landed and its transaction rolled back: the
+    // retry sees an already-claimed issue, and only the cache row — written
+    // inside that transaction — still holds the pre-claim labels.
+    const recovered = await recordClaimEvent(client, {
+      ...base, kind: "claim", source: "api:claim", actor: "alpha", agentName: "alpha",
+      before: after, after, mirroredBefore: ["status/ready"],
+    });
+
+    expect(recovered).toBe(true);
+    expect(rows[0]).toMatchObject({
+      kind: "claim",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      metadata: { recoveredFromMirroredState: true },
+    });
+
+    // A claim the observed labels already show as a genuine transition is not
+    // labelled as recovered.
+    await recordClaimEvent(client, {
+      ...base, kind: "claim", source: "api:claim", actor: "bravo", agentName: "bravo",
+      before: ["status/ready"], after: ["status/in-progress", "agent/bravo"],
+      mirroredBefore: ["status/backlog"],
+    });
+    expect(rows[1].metadata).not.toHaveProperty("recoveredFromMirroredState");
+  });
+
+  it("records nothing for a redelivered claim whose mirror already carries the claim", async () => {
+    const { client, rows } = makeClient();
+    const labels = ["status/in-progress", "agent/alpha"];
+
+    const recorded = await recordClaimEvent(client, {
+      ...base, kind: "claim", source: "api:claim", actor: "alpha", agentName: "alpha",
+      before: labels, after: labels, mirroredBefore: labels,
+    });
+
+    expect(recorded).toBe(false);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("marks a recovery that a stale cache cannot distinguish from a real prior state", async () => {
+    const { client, rows } = makeClient();
+
+    // Known limitation (dispatch#1202 review, second pass): the mirrored row
+    // is only a witness of the pre-write state when the cache was in step with
+    // GitHub. When sync lag has left it behind, a retry that finds the observed
+    // labels already at the target still recovers from it — so the recovered
+    // `fromStatus` can describe the last mirrored state rather than the state
+    // this claim actually displaced. There is no way to tell the two apart at
+    // retry time without a durable intent recorded before the GitHub write, so
+    // the row is marked instead: a reader that filters on
+    // `recoveredFromMirroredState` never mistakes it for an observed move.
+    // Sync independently records the real GitHub-side move, so a status change
+    // is never lost — only its attribution to this writer is approximate.
+    const recorded = await recordStatusTransition(client, {
+      ...base, kind: "status_changed", source: "api:status", actor: "alpha",
+      before: ["status/in-progress", "agent/alpha"],
+      after: ["status/in-progress", "agent/beta"],
+      mirroredBefore: ["status/backlog"],
+    });
+
+    expect(recorded).toBe(true);
+    expect(rows[0]).toMatchObject({
+      fromStatus: "status/backlog",
+      toStatus: "status/in-progress",
+      metadata: { recoveredFromMirroredState: true },
+    });
   });
 });
 
@@ -315,18 +430,48 @@ describe("recordSyncedIssueEvents", () => {
     expect(Object.keys(client)).toEqual(["issueLifecycleEvent"]);
   });
 
-  it("keeps a failed sync write from failing the sync", async () => {
+  it("propagates a failed event write so the caller can defer its mirror", async () => {
     const { client } = makeClient();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.mocked(client.issueLifecycleEvent.create).mockRejectedValue(new Error("db down"));
+    vi.mocked(client.issueLifecycleEvent.upsert).mockRejectedValue(new Error("db down"));
 
+    // The stores record before mirroring, so swallowing this would leave a
+    // cache that shows a move the stream has no record of — and the next sync
+    // derives no transition from it, so the row can never be reconstructed.
     await expect(
       recordSyncedIssueEvents(client, {
         ...base,
         before: { labels: ["status/ready"], state: "open" },
         after: { labels: ["status/done"], state: "open", updatedAt: syncedAt },
       }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow("db down");
+  });
+});
+
+describe("recordStatusTransitionQuietly", () => {
+  it("reports whether the transition was recorded and never throws", async () => {
+    const { client, rows } = makeClient();
+
+    await expect(
+      recordStatusTransitionQuietly(
+        client,
+        { ...base, kind: "status_changed", source: "hosted-groomer", actor: "hosted-groomer",
+          before: ["status/backlog"], after: ["status/ready"] },
+        "hosted-groomer",
+      ),
+    ).resolves.toBe(true);
+    expect(rows).toHaveLength(1);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(client.issueLifecycleEvent.create).mockRejectedValue(new Error("db down"));
+    await expect(
+      recordStatusTransitionQuietly(
+        client,
+        { ...base, kind: "status_changed", source: "hosted-groomer", actor: "hosted-groomer",
+          before: ["status/backlog"], after: ["status/ready"] },
+        "hosted-groomer",
+      ),
+    ).resolves.toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("hosted-groomer"));
   });
 });
 

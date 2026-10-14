@@ -208,11 +208,55 @@ export interface LifecycleStatusTransitionInput {
   before: readonly string[];
   /** Label set after the write — the same set the writer mirrored locally. */
   after: readonly string[];
+  /**
+   * The label set Dispatch last mirrored into the cache. A fallback only: it
+   * becomes the before-state when `before` no longer shows the change, which
+   * is what happens when the GitHub write of a Dispatch-authored change landed
+   * but the local transaction that mirrors it and records the evidence rolled
+   * back — the live labels already carry the change while the cache still
+   * holds the state from before it. Absent, `before` is used exactly as it is
+   * today.
+   */
+  mirroredBefore?: readonly string[] | null;
   sourceEventId?: string | null;
   dedupeKey?: string | null;
   occurredAt?: Date;
   observedAt?: Date;
   metadata?: Record<string, unknown> | null;
+}
+
+/**
+ * Decide which label set to read a Dispatch-authored change's "before" state
+ * from, and describe the change it shows.
+ *
+ * `observed` is what the writer passed as `before`; `resolve` returns the
+ * change it describes, or null when there is none. A mirrored fallback (the
+ * cache row the writer last wrote) is consulted only when `observed` no longer
+ * shows the change — the shape of a retry after a rolled-back local write,
+ * where the GitHub mutation already landed and the live labels therefore read
+ * as "already in the after state". Recovering the evidence of the first attempt
+ * matters more than the extra write: without it the attempt is lost forever,
+ * because nothing downstream can reconstruct a transition the cache no longer
+ * shows. A row written this way is marked `recoveredFromMirroredState`.
+ */
+function resolveBeforeState<T>(
+  input: LifecycleStatusTransitionInput,
+  resolve: (before: readonly string[], after: readonly string[]) => T | null,
+): { before: readonly string[]; recoveredFromMirroredState: boolean; change: T } | null {
+  const observed = resolve(input.before, input.after);
+  if (observed) {
+    return { before: input.before, recoveredFromMirroredState: false, change: observed };
+  }
+
+  const mirrored = input.mirroredBefore;
+  if (mirrored) {
+    const fromMirror = resolve(mirrored, input.after);
+    if (fromMirror) {
+      return { before: mirrored, recoveredFromMirroredState: true, change: fromMirror };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -225,8 +269,8 @@ export async function recordStatusTransition(
   client: LifecycleEventClient,
   input: LifecycleStatusTransitionInput,
 ): Promise<boolean> {
-  const transition = lifecycleStatusTransition(input.before, input.after);
-  if (!transition) return false;
+  const resolved = resolveBeforeState(input, lifecycleStatusTransition);
+  if (!resolved) return false;
 
   await recordLifecycleEvent(client, {
     issueId: input.issueId,
@@ -236,13 +280,15 @@ export async function recordStatusTransition(
     source: input.source,
     actor: input.actor,
     agentName: input.agentName ?? null,
-    fromStatus: transition.from,
-    toStatus: transition.to,
+    fromStatus: resolved.change.from,
+    toStatus: resolved.change.to,
     sourceEventId: input.sourceEventId ?? null,
     dedupeKey: input.dedupeKey ?? null,
     occurredAt: input.occurredAt,
     observedAt: input.observedAt,
-    metadata: input.metadata ?? null,
+    metadata: resolved.recoveredFromMirroredState
+      ? { ...input.metadata, recoveredFromMirroredState: true }
+      : input.metadata ?? null,
   });
   return true;
 }
@@ -261,10 +307,15 @@ export async function recordClaimEvent(
   client: LifecycleEventClient,
   input: LifecycleStatusTransitionInput,
 ): Promise<boolean> {
-  const transition = lifecycleStatusTransition(input.before, input.after);
-  const claimedFrom = getAgentFromLabels([...input.before]);
-  const claimedTo = getAgentFromLabels([...input.after]);
-  if (!transition && claimedFrom === claimedTo) return false;
+  const resolved = resolveBeforeState(input, (before, after) => {
+    const transition = lifecycleStatusTransition(before, after);
+    const claimedFrom = getAgentFromLabels([...before]);
+    const claimedTo = getAgentFromLabels([...after]);
+    if (!transition && claimedFrom === claimedTo) return null;
+    return { transition, claimedFrom, claimedTo };
+  });
+  if (!resolved) return false;
+  const { transition, claimedFrom, claimedTo } = resolved.change;
 
   await recordLifecycleEvent(client, {
     issueId: input.issueId,
@@ -274,7 +325,7 @@ export async function recordClaimEvent(
     source: input.source,
     actor: input.actor,
     agentName: input.agentName ?? null,
-    fromStatus: lifecycleStatusLabel(input.before),
+    fromStatus: lifecycleStatusLabel(resolved.before),
     toStatus: lifecycleStatusLabel(input.after),
     sourceEventId: input.sourceEventId ?? null,
     dedupeKey: input.dedupeKey ?? null,
@@ -285,6 +336,7 @@ export async function recordClaimEvent(
       ...(transition
         ? null
         : { claimedFrom, claimedTo, note: "ownership changed without a status transition" }),
+      ...(resolved.recoveredFromMirroredState ? { recoveredFromMirroredState: true } : null),
     },
   });
   return true;
@@ -308,6 +360,12 @@ export async function recordClaimEvent(
  *   move has a different `updated_at` and therefore a different key.
  * - Nothing here writes back to `Issue`. The events are evidence, so a late or
  *   out-of-order sync can be recorded without ever moving the present status.
+ *
+ * A failed event write propagates. Callers record before mirroring the change
+ * into the cache, so a throw defers that issue's mirror to the next run —
+ * where the same transition is re-derived from the same before-state and lands
+ * on the same dedupe key — instead of leaving a cache that shows a change the
+ * stream has no record of.
  */
 export async function recordSyncedIssueEvents(
   client: LifecycleEventClient,
@@ -395,18 +453,18 @@ export async function recordSyncedIssueEvents(
   }
 
   for (const write of writes) {
-    await recordLifecycleEventQuietly(client, write, "issue sync");
+    await recordLifecycleEvent(client, write);
   }
 }
 
 /**
  * Record an event without letting a lifecycle failure abort the writer.
  *
- * For the observed sources — sync, webhook, reconcile — the job is the local
- * mirror, not the event: those paths are periodic and retried, so a failed
- * event must cost a log line rather than the whole run. Dispatch-authored
- * writes share a transaction with the state they describe and deliberately
- * fail together instead (see the route callers).
+ * For the sources whose job is the local mirror rather than the event
+ * (webhook, reconciler, worker report, hosted groomer) those paths are periodic
+ * and retried, so a failed event must cost a log line rather than the whole
+ * run. Dispatch-authored writes share a transaction with the state they
+ * describe and deliberately fail together instead (see the route callers).
  */
 export async function recordLifecycleEventQuietly(
   client: LifecycleEventClient,
@@ -420,5 +478,27 @@ export async function recordLifecycleEventQuietly(
     console.warn(
       `lifecycle event ${write.kind} for ${write.repoFullName}#${write.issueNumber} was not recorded (${context}): ${message}`,
     );
+  }
+}
+
+/**
+ * `recordStatusTransition` with the same guarantee as above, for a writer that
+ * goes through the transition guard but still must not fail over its evidence
+ * row (the hosted groomer, whose mutations have already landed by then).
+ * Returns whether the transition was recorded.
+ */
+export async function recordStatusTransitionQuietly(
+  client: LifecycleEventClient,
+  input: LifecycleStatusTransitionInput,
+  context: string,
+): Promise<boolean> {
+  try {
+    return await recordStatusTransition(client, input);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `lifecycle event ${input.kind} for ${input.repoFullName}#${input.issueNumber} was not recorded (${context}): ${message}`,
+    );
+    return false;
   }
 }
