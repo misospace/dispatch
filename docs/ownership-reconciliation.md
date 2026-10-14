@@ -59,19 +59,19 @@ per-hand-out acknowledgement. The design builds on these.
 | `agent/<name>` label | GitHub, cached on `Issue.labels` | The only queue-level claim filter; "one agent label at a time" (`docs/assignment-conflict-policy.md`) | Shared, mutable, no expiry; label present ≠ process alive; label absent ≠ not working |
 | `owner/<name>` label | GitHub, cached | Human/board ownership, independent of agent (`src/lib/assignment-conflicts.ts`) | Never blocks a claim; not a liveness signal |
 | `status/*` label | GitHub, cached | Lifecycle column (`ready`/`in-progress`/`in-review`/`blocked`/`done`); `blocked` parks the issue (`src/lib/agent-queue.ts:186-198`) | `blocked` without `blockedReason` is ambiguous |
-| `Issue.blockedReason` | Postgres (`prisma/schema.prisma:65`) | Distinguishes a deliberate block from an unexplained one; consumed by the release policy (`src/lib/issue-claim.ts:126-137`) | Only set by grooming/ops paths |
-| `Issue.linkedPr*` snapshot | Postgres (`prisma/schema.prisma:105-112`) | Linked PR identity + health, split across `linkedPrNumber/Url/NeedsFollowup/FollowupReasons/ReviewDecision/MergeState/HealthCheckedAt` | Refreshed on reconcile cadence; can lag |
+| `Issue.blockedReason` | Postgres (`prisma/schema.prisma:66`) | Distinguishes a deliberate block from an unexplained one;   consumed by the release policy (`src/lib/issue-claim.ts:216-229`) | Only set by grooming/ops paths |
+| `Issue.linkedPr*` snapshot | Postgres (`prisma/schema.prisma:107-113`) | Linked PR identity + health, split across `linkedPrNumber/Url/NeedsFollowup/FollowupReasons/ReviewDecision/MergeState/HealthCheckedAt` | Refreshed on reconcile cadence; can lag |
 | `PrFixQueueItem` | Postgres | Owns PR-fix/PR-followup work per `(repo, pr)`, incl. hand-out + ack state | Separate ownership domain; not issue assignment |
 
 ### 3.2 `Lease` (durable ownership checkpoint)
 
-`prisma/schema.prisma:798-814`; helpers in `src/lib/lease.ts`.
+`prisma/schema.prisma:862-878`; helpers in `src/lib/lease.ts`.
 
 - Unique `(agentName, issueId)`; absolute `expiredAt`; `renewedAt`; `checkpoint`,
   `branch`, `prUrl`.
 - Default TTL **30 min** (`DEFAULT_LEASE_TTL_MS`, `src/lib/lease.ts:18`).
-- Created/renewed **only** on claim (`src/app/api/issues/claim/route.ts:220`) and
-  by the hosted groomer (`src/lib/groomer/run.ts:250`, 10-min TTL). The 5-minute
+- Created/renewed **only**   on claim (`src/app/api/issues/claim/route.ts:248`) and
+  by the hosted groomer (`src/lib/groomer/run.ts:256`, 10-min TTL). The 5-minute
   `AgentWork` checkpoint loop does **not** renew it.
 - Active (non-expired) leases from other agents exclude the issue from the queue
   (`findLeasedIssueIds`, `src/lib/lease.ts:226`; filtered at
@@ -87,16 +87,16 @@ disagree.
 
 ### 3.3 `AgentWork` (execution state machine)
 
-`prisma/schema.prisma:751-773`; helpers in `src/lib/agent-work.ts`.
+`prisma/schema.prisma:815-837`; helpers in `src/lib/agent-work.ts`.
 
 - States `CLAIMED | IN_PROGRESS | BLOCKED | DONE | RELEASED | STALE`
-  (`schema.prisma:731-738`) plus a finer `checkpoint` enum
-  (`schema.prisma:740-749`).
+  (`schema.prisma:795-802`) plus a finer `checkpoint` enum
+  (`schema.prisma:804-813`).
 - `leaseExpiresAt` set to **now + 5 min** on start and every checkpoint
-  (`src/lib/agent-work.ts:166-169,207-221`); `lastHeartbeatAt` updated on
+  (`src/lib/agent-work.ts:168-169,221-226`); `lastHeartbeatAt` updated on
   checkpoint; `blockerReason` set on `BLOCKED`.
 - One active `AgentWork` per agent (a new `start` releases the prior one,
-  `src/lib/agent-work.ts:171-184`).
+  `src/lib/agent-work.ts:173-184`).
 - `AgentWorkHistory` records each transition.
 
 **Gap:** `AgentWork` is per-agent, not per-issue-claim, and a worker that never
@@ -112,8 +112,8 @@ row with a stale `lastHeartbeatAt`. Its presence is weak liveness evidence.
   `status/in-progress`.
 - `POST /api/issues/unclaim` (`src/app/api/issues/unclaim/route.ts`) removes the
   label via the shared `releaseIssueClaim` core, releases the lease, and (for
-  operators) releases `AgentWork`. `releaseIssueClaim`
-  (`src/lib/issue-claim.ts:44`) **already refuses to remove a newer agent's
+  operators) releases `AgentWork`.   `releaseIssueClaim`
+  (`src/lib/issue-claim.ts:78`) **already refuses to remove a newer agent's
   label** (`currentAgent !== agentLabel` → skip) and keeps an in-review issue
   in-review while its linked PR is open.
 
@@ -125,7 +125,7 @@ every 5 min when the in-process scheduler is enabled
 
 - Candidates: `AgentWork` in `CLAIMED/IN_PROGRESS/BLOCKED` whose
   `lastHeartbeatAt` or `leaseExpiresAt` is older than **5 min**
-  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:4`).
+  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:5`).
 - Two-phase, crash-safe: mark `STALE` + `staleClaimReleasePending` in one
   transaction (also deleting the `Lease`), then release the GitHub claim via
   `releaseIssueClaim` with `allowMissingAgent` + `preserveStatus`, then clear
@@ -277,7 +277,7 @@ Design notes:
   `finishAgentWork` + lease release. The `attemptToken` itself is a **new column
   on `Lease`** (the row that already owns `(agentName, issueId)`); a token is
   issued on claim/hand-out and rotated on every fresh attempt, so the
-  compare-and-set in §8.6 has a column to pin against.
+  compare-and-set in §8.6/§8.7 has a column to pin against.
 
 ### 6.2 Clients without the capability
 
@@ -300,7 +300,7 @@ capability** — `src/lib/github.ts` (labels, issues, PRs) and
 forge-agnostic, honours the configured credentials/app auth, and preserves the
 #1037 rule that decisions are made against **live** labels. The reconciler must
 fail closed (no write, no local mutation) when the forge is unreachable, exactly
-as the claim route does (`src/app/api/issues/claim/route.ts:117-143`).
+as the claim route does (`src/app/api/issues/claim/route.ts:114-143`).
 
 ## 8. Reconciliation
 
@@ -328,8 +328,10 @@ An `ABANDONED_CANDIDATE` must clear **all** of:
 4. Bounded attempt count not exceeded (a per-claim reclaim counter,
    `DISPATCH_RECONCILE_MAX_RECLAIMS`, mirroring `PR_FIX_MAX_RECLAIMS`); on
    exhaustion, **park as `HELD`/needs-human**, do not release.
-5. A fencing check immediately before the write: the current owner/attempt token
-   still matches the candidate snapshot.
+5. A fenced intent commit (§8.7 Phase A): the release CAS on the current
+   owner/attempt token succeeds atomically with writing the pending
+   delete-intent, which also opens the claim-admission barrier. The fence is
+   the commit itself, not a check timed before the remote write.
 
 ### 8.3 Grace periods
 
@@ -357,7 +359,7 @@ action column is what the reconciler does (or explicitly does not do).
 | `CLAIMED_ACTIVE` | renewal older than active window, lower-tier evidence present | `CLAIMED_LONG_RUNNING` | Escalate observation; no release yet. |
 | `CLAIMED_LONG_RUNNING` | lower-tier evidence also stale, no hold/review/wait | `ABANDONED_CANDIDATE` | Start confirmation ladder. |
 | `ABANDONED_CANDIDATE` | first stale observation | `ABANDONED_CANDIDATE` | Record observation; wait re-check. |
-| `ABANDONED_CANDIDATE` | second stale observation, ladder 2–5 clear | `RELEASED` | Release **atomically** with fence; select next status. |
+| `ABANDONED_CANDIDATE` | second stale observation, ladder 2–5 clear | `RELEASED` | Release via the §8.7 intent protocol (fenced Phase A commit → targeted forge delete → settle); select next status. |
 | `ABANDONED_CANDIDATE` | reclaim limit reached | `HELD` | Park; audit; needs-human. |
 | `ABANDONED_CANDIDATE` | renew/disposition observed during ladder | `CLAIMED_ACTIVE` | Abort release; clear candidate. |
 | `CLAIMED_*` | terminal `disposition` (completed/released/handed_off) | `RELEASED` / successor owner | Honour disposition; do not double-release. |
@@ -371,7 +373,7 @@ action column is what the reconciler does (or explicitly does not do).
 ### 8.5 Release selection (never force `ready`)
 
 Releasing obsolete ownership must **not** always force `status/ready`. Reuse and
-extend `releaseIssueClaim`'s existing policy (`src/lib/issue-claim.ts:116-152`):
+extend `releaseIssueClaim`'s existing policy (`src/lib/issue-claim.ts:207-241`):
 
 - `status/in-progress` → `status/ready` (unexplained in-progress).
 - `status/blocked` **with** `blockedReason` → keep `blocked` (deliberate).
@@ -381,15 +383,116 @@ extend `releaseIssueClaim`'s existing policy (`src/lib/issue-claim.ts:116-152`):
 - Otherwise → the lane's next eligible claimable state, resolved from lane
   config, not hard-coded to `ready`.
 
-### 8.6 Fencing
+### 8.6 Fencing — and its hard limit
 
-Every release write is conditioned on the ownership snapshot it was computed
-from (owner identity + attempt token + observed lease/heartbeat versions), the
-same compare-and-set discipline the stale sweep and PR-fix reclaim already use
-(`stale-work.ts:99-138`; `pr-fix-queue.ts` reclaim). A concurrent `renew`,
-re-claim, or operator reassign that lands first makes the release a no-op.
-Release + local cache update + audit row commit together; GitHub label removal
-is targeted (never a full label-set write) per `issue-claim.ts:154-164`.
+Every release **decision** is conditioned on the ownership snapshot it was
+computed from (owner identity + attempt token + observed lease/heartbeat
+versions), the same compare-and-set discipline the stale sweep and PR-fix
+reclaim already use (`stale-work.ts:99-125`; `pr-fix-queue.ts` reclaim). A
+concurrent `renew`, re-claim, or operator reassign that lands first makes the
+release a no-op. Label removal is targeted (never a full label-set write) per
+`issue-claim.ts:244-249`.
+
+**What the CAS cannot do.** The fence lives in Postgres; the `agent/*` label
+lives on GitHub. GitHub's label API supports no conditional mutation — no
+ETag/precondition on the label set, no compare-and-delete. A Prisma
+transaction therefore **cannot atomically commit a local CAS and a remote
+label deletion**, and a fencing check placed "immediately before" the remote
+write is still a check-then-act race: between the read and the DELETE, the
+same agent can reclaim with a fresh attempt token, and the stale reconciler's
+targeted delete would strip the *new* live claim's label. Claiming atomicity
+from the local database alone would be false. This section deliberately makes
+no such claim; §8.7 defines the actual cross-system boundary.
+
+### 8.7 The two-sided release boundary (cross-system serialization)
+
+Because the remote write cannot be fenced, the design fences **admission** in
+Postgres and lets that barrier serialize the remote write against every other
+writer of the same label. The invariant:
+
+> **Every automated `agent/*` label mutation (add or delete) is backed by a
+> Postgres intent row naming the exact label; no remote label write is ever
+> issued outside a live or pending intent, and the claim path is blocked while
+> a pending delete-intent names its label.**
+
+State per `(repo, issue)`: a release-intent record
+(`issue-claim-release` style, reusing the `staleClaimReleasePending` two-phase
+pattern from `stale-work.ts:60-125`) carrying
+`(issueId, agentLabel, attemptToken, phase, createdAt)`; the `Lease.attemptToken`
+column from §6.1 is the fencing token the phases pin against.
+
+**Phase A — fenced intent commit (Postgres only, atomic).** One transaction:
+CAS the ownership row on `(owner, attemptToken = g)`; if it matches, retire
+token `g` (monotonic — `g` can never renew or checkpoint again), write the
+pending intent `(agentLabel = "agent/<name>", token = g)`, increment the reclaim
+counter, and write the audit row. This commit **is** the fence: from this
+instant, (a) `renew`/`checkpoint` carrying token `g` is rejected, and (b)
+`POST /api/issues/claim` for this issue sees the pending delete-intent and is
+held (retryable `409`, bounded by the reconciler's retry cadence). No new
+attempt can issue or re-add `agent/<name>` while the intent is unsettled.
+
+**Phase B — forge write (the only remote mutation).** Issue the targeted
+`removeIssueLabel(issue, agentLabel)` through the forge adapter (§7). It runs
+**only while a matching intent exists** — never speculatively, never for a
+label an intent does not name. Because the claim path holds at the barrier,
+no concurrent ADD of the same label can race this DELETE by construction, not
+by timing.
+
+**Phase C — settle (Postgres only).** One transaction: re-check the intent
+still matches `(issueId, agentLabel, token g)`, clear it, finalize the release
+(`AgentWork` terminal, lease row retired), and apply the §8.5 next-status
+selection. Status labels are disjoint from the `agent/*` label, so the
+`status/*` writes in this phase cannot collide with the Phase-B target.
+
+**When a new attempt may hold the label again.** Only after Phase C settles
+(or an operator explicitly clears the barrier via §9). A same-agent reclaim
+after settle is a **fresh** claim: new attempt token `g+1`, intent gone, the
+claim path is again the sole writer of the label. A reconnect *during* A–C is
+a rejected renewal, and its re-claim simply waits behind the barrier it is
+already subject to.
+
+**Crash/replay matrix (GitHub-success / DB-failure safe).**
+
+| Crash point | Replay behaviour | Why it cannot delete a later attempt |
+|---|---|---|
+| Before A | Nothing exists; candidate re-derives from evidence. | No intent → no remote write is ever issued. |
+| After A, before B | Intent pending; replay issues Phase B, then C. | Claim path is held by the barrier, so no newer claim exists to hit. |
+| After B, before C | Intent pending; replay re-issues `removeIssueLabel` (idempotent; 404 = already gone, per `issue-claim.ts:159-161`), then settles. | Same barrier argument: no label re-add could have happened while pending. |
+| After C, on a stale retry | No matching intent (cleared at C) → the retry is a local no-op and issues **no** forge call. | A live `g+1` claim's label is never a target: retries act only on intents, and a cleared intent names nothing. |
+
+**Fail-closed / operator path.** If the forge is unreachable during B, the
+intent stays pending and the reconciler retries each tick (issue remains held,
+not stranded in a worse state than the manual release today). After bounded
+forge retries, park the issue as `HELD`/needs-human with the pending intent
+surfaced on the §9 inspect surface; **an operator force-release is the only way
+to clear a stuck barrier** — ambiguous automation defers to the operator rather
+than pretending the DB commit fenced GitHub.
+
+**Owner-change (reassign).** An operator reassign runs through the same state
+machine: its intent names both labels (remove `agent/a`, add `agent/b`), so a
+stale reconciler's delete for `agent/a` can never touch `agent/b`, and the
+reconciler's Phase-A CAS on `(owner, token)` fails first when the operator
+already moved the owner.
+
+**Pinned negative controls** (acceptance tests the implementation tickets
+#1251/#1254 must ship; each asserts no work is ever stolen):
+
+1. **Renewed same-agent claim during stale release.** Hold the release in
+   Phase B; deliver `renew(token=g)` → rejected (token retired at A). Settle C,
+   then the agent re-claims → `g+1` re-adds the label. Final state: exactly one
+   `agent/<name>` label, owned by the *new* attempt.
+2. **Changed-owner reassign.** Operator reassigns `agent/a → agent/b` mid-ladder;
+   the reconciler's Phase-A CAS fails (owner moved); its Phase-B delete (if any
+   in-flight intent predates the reassign) names only `agent/a`. Assert no
+   automation path ever issues a delete for `agent/b`.
+3. **GitHub delete succeeds, DB settlement fails.** Crash between B and C;
+   replay finds the intent, re-issues the idempotent delete (404 accepted), and
+   settles once. Assert no double-release, no second audit terminal row, no
+   extra label writes.
+4. **Retry of an old deletion with a fresh live token.** After settle and a
+   fresh live `agent/<name>` claim at `g+1`, a late retry of the old release
+   finds no matching intent and issues zero forge calls. Assert the new
+   claim's label is untouched.
 
 ## 9. Operator escape hatch
 
@@ -410,7 +513,7 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 
 | Case | Required behaviour |
 |---|---|
-| **Active renewal concurrent with release** | Fenced CAS: whichever commits first wins; the loser no-ops. A renewal that lands after release re-registers as a *new* attempt (new token) and must re-claim, never revive the old record. |
+| **Active renewal concurrent with release** | Decided by the §8.7 Phase-A CAS: if the renewal commits first, token `g` is still live and the release intent CAS fails (no-op). If the intent commits first, `g` is retired, the renewal is rejected, and the reconnecting worker re-claims as a *new* attempt (`g+1`) held behind the barrier until settle — never reviving the old record, and never losing its label to the in-flight delete. |
 | **Disconnected worker** | Not abandoned on first miss. Escalates `ACTIVE → LONG_RUNNING → CANDIDATE` across sustained observations; a reconnect within the grace cancels the candidate. |
 | **Missing events / no telemetry** | Insufficient for release. Only raises a candidate; the confirmation ladder plus a bounded reclaim limit applies. |
 | **Closed issue** | Do not release a live claim merely because the issue closed; the close/sync path owns terminal cleanup. If the claim is already abandoned, release is ownership-only and must not move status. |
@@ -419,7 +522,7 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 | **Deliberate block (`blockedReason`)** | `HELD`; release (if it ever applies) preserves `status/blocked`. |
 | **Generic legacy assignment** (`agent/courier`) | `CONFLICTED`/migration policy (§7); never blanket-aliased or stolen. |
 | **Multiple agent labels / cache divergence** | `CONFLICTED`; surface, do not guess. |
-| **Reconciler crash mid-release** | `staleClaimReleasePending` retry marker; idempotent GitHub delete. |
+| **Reconciler crash mid-release** | The §8.7 crash/replay matrix: replay acts only on the pending intent (reusing the `staleClaimReleasePending` two-phase pattern) with an idempotent GitHub delete; a settled release's stale retry issues no forge call, so a later attempt's label is never deleted. |
 | **Repeated release/reclaim churn** | Per-claim reclaim counter (`DISPATCH_RECONCILE_MAX_RECLAIMS`); on exhaustion park as `HELD`; reclaim cooldown between attempts (§8.3). |
 | **Forge unreachable** | Fail closed: no writes, no cache mutation, retry next tick. |
 | **Token rotation / identity change** | Ownership keys on the bound agent identity, so rotation is transparent; a genuinely different identity is a new owner and must re-claim. |
@@ -437,7 +540,9 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
    pattern.
 4. **Fence with attempt tokens.** Adopt the PR-fix `generation` discipline
    (`PrFixQueueItem.generation`) for issue ownership so release/renew races are
-   CAS-safe.
+   CAS-safe inside Postgres, and serialize across the Postgres/GitHub boundary
+   through the §8.7 intent protocol rather than assuming the CAS reaches
+   GitHub.
 5. **Make `unknown` first-class.** Surface `CONFLICTED`/candidate rows instead
    of silently excluding.
 6. **Reuse `releaseIssueClaim`.** Extend its status-selection policy (§8.5)
@@ -453,6 +558,9 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
   assumes one app owns a whole `agent/courier*` family.
 - **No stealing.** A release only targets the *observed* owner of the specific
   claim, fenced by the attempt token; it never removes a newer/different owner.
+  Cross-system, this is enforced by the §8.7 barrier (a new claim cannot re-add
+  the label while a delete-intent for it is unsettled), not by the local CAS
+  alone.
 - **`CONFLICTED` is surfaced, not resolved.** Migration is an operator decision
   recorded via the escape hatch (§9), with the reason audited.
 - **Legacy identity migration is explicit.** If two identities are genuinely the
