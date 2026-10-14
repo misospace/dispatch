@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { releaseIssueClaim, type IssueClaimClient } from "@/lib/issue-claim";
+import { lifecycleDedupeKey } from "@/lib/issue-lifecycle";
 
 export const DEFAULT_STALE_WORK_MAX_AGE_MS = 5 * 60 * 1000;
 export const DEFAULT_STALE_WORK_BATCH_SIZE = 50;
@@ -143,13 +144,29 @@ export async function sweepStaleWork(
       }
 
       if (work.issue) {
+        // The release is attributed to the sweep, not to the abandoned agent:
+        // nobody chose to let this claim go, and a claim-to-merge read must be
+        // able to tell a recovered stall apart from a worker's own unclaim
+        // (#1202).
         await releaseIssueClaim({
           prisma: client,
           issue: work.issue,
           repoFullName: work.issue.repository.fullName,
           issueNumber: work.issue.number,
           agentName: work.agentName,
-          options: { allowMissingAgent: true, preserveStatus: true },
+          options: {
+            allowMissingAgent: true,
+            preserveStatus: true,
+            source: "stale-recovery",
+            actor: "system",
+            // This AgentWork row is this claim epoch, and it is stable across a
+            // retry of the same sweep (the retry re-marks the same STALE row).
+            // Keying the release on it means the release and the
+            // already-released repair a retry has to take are one
+            // `claim_released`, not two. A reclaimed issue gets a new row and
+            // therefore a new key, so a genuine second release still counts.
+            releaseKey: lifecycleDedupeKey("agent-work", work.id),
+          },
         });
       }
 

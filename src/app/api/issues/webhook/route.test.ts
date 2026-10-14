@@ -11,6 +11,8 @@ const { mocks } = vi.hoisted(() => ({
     repoFindUnique: vi.fn(),
     issueFindUnique: vi.fn(),
     issueUpdate: vi.fn(),
+    createLifecycleEvent: vi.fn(),
+    upsertLifecycleEvent: vi.fn(),
     invalidateGroomingForComment: vi.fn(),
   },
 }));
@@ -23,6 +25,10 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     repository: { findUnique: mocks.repoFindUnique },
     issue: { findUnique: mocks.issueFindUnique, update: mocks.issueUpdate },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
+    },
   },
 }));
 
@@ -58,7 +64,7 @@ function postRequest(body: unknown, headers: Record<string, string> = {}) {
  * Builds a Request whose body bytes are exactly what the HMAC was computed
  * over, plus a valid x-hub-signature-256 header.
  */
-function signedRequest(body: unknown, rawBody?: string) {
+function signedRequest(body: unknown, rawBody?: string, extraHeaders: Record<string, string> = {}) {
   const bodyStr = rawBody ?? JSON.stringify(body);
   const sig =
     "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(bodyStr).digest("hex");
@@ -69,6 +75,7 @@ function signedRequest(body: unknown, rawBody?: string) {
       "Content-Type": "application/json",
       "x-github-event": "issues",
       "x-hub-signature-256": sig,
+      ...extraHeaders,
     },
     body: bodyStr,
   });
@@ -92,6 +99,8 @@ describe("POST /api/issues/webhook", () => {
       labels: ["status/backlog"],
     });
     mocks.issueUpdate.mockResolvedValue({ id: "issue-1", labels: ["status/backlog"] });
+    mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
   });
 
   describe("signature verification (fail-closed default)", () => {
@@ -361,5 +370,145 @@ describe("POST /api/issues/webhook", () => {
       const res = await postRequest(commentEvent({ comment: { created_at: "2026-09-25T03:00:00Z" } }), headers);
       expect(res.status).toBe(400);
     });
+  });
+});
+
+describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.WEBHOOK_GATEWAY_MODE;
+    process.env.WEBHOOK_SECRET = WEBHOOK_SECRET;
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1", fullName: "org/repo" });
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      number: 42,
+      repositoryId: "repo-1",
+      labels: ["status/backlog"],
+    });
+    mocks.issueUpdate.mockResolvedValue({ id: "issue-1" });
+    mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+  });
+
+  const statusDelivery = makeIssuesEvent({
+    action: "labeled",
+    label: { name: "status/ready" },
+    issue: { number: 42, updated_at: "2026-10-02T08:00:00Z" },
+    sender: { login: "octocat" },
+  });
+
+  it("records a status label move with the delivery as its idempotency identity", async () => {
+    const res = await POST(signedRequest(statusDelivery, undefined, { "x-github-delivery": "delivery-1" }));
+    expect(res.status).toBe(200);
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "webhook|org/repo|42|delivery-1|status/ready" },
+      create: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "status_changed",
+        source: "webhook",
+        actor: "octocat",
+        fromStatus: "status/backlog",
+        toStatus: "status/ready",
+        sourceEventId: "delivery-1",
+        // GitHub sends no per-label timestamp, so the issue's own updated_at
+        // is the occurrence time — and the observation stays on the clock.
+        occurredAt: new Date("2026-10-02T08:00:00Z"),
+      }),
+      update: {},
+    });
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("upserts the same identity when GitHub redelivers", async () => {
+    await POST(signedRequest(statusDelivery, undefined, { "x-github-delivery": "delivery-1" }));
+    await POST(signedRequest(statusDelivery, undefined, { "x-github-delivery": "delivery-1" }));
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledTimes(2);
+    const keys = mocks.upsertLifecycleEvent.mock.calls.map((call: any[]) => call[0].where.dedupeKey);
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it("still records a move for a delivery that carries no delivery id", async () => {
+    const res = await POST(signedRequest(statusDelivery));
+    expect(res.status).toBe(200);
+
+    // No source identity to key on, so the write is a plain insert and the
+    // label-set check is what makes a repeat a no-op.
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({ kind: "status_changed", source: "webhook", sourceEventId: null }),
+    });
+  });
+
+  it("records nothing for a non-status label", async () => {
+    const res = await POST(signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } })));
+    expect(res.status).toBe(200);
+
+    expect(mocks.issueUpdate).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  // `.filter()` returns a new array even when nothing was removed, so an
+  // absent-label removal used to read as a phantom move on every redelivery —
+  // unbounded, because such a hand-rolled delivery has no id to key on.
+  it.each([
+    ["with", { "x-github-delivery": "delivery-absent-label" }],
+    ["without", {}],
+  ])("records nothing when unlabeling a status label the cache does not carry (%s delivery id)", async (_label, headers) => {
+    mocks.issueFindUnique.mockResolvedValue({
+      id: "issue-1",
+      number: 42,
+      repositoryId: "repo-1",
+      labels: ["status/ready", "type/bug"],
+    });
+
+    const res = await POST(
+      signedRequest(
+        makeIssuesEvent({ action: "unlabeled", label: { name: "status/in-review" } }),
+        undefined,
+        headers,
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    // The cached label set is left exactly as it was.
+    expect((await res.json()).labels).toEqual(["status/ready", "type/bug"]);
+    expect(mocks.issueUpdate).toHaveBeenCalledWith({
+      where: { repositoryId_number: { repositoryId: "repo-1", number: 42 } },
+      data: expect.objectContaining({ labels: ["status/ready", "type/bug"] }),
+    });
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("records exactly one event for a real status removal", async () => {
+    const res = await POST(
+      signedRequest(
+        makeIssuesEvent({ action: "unlabeled", label: { name: "status/backlog" } }),
+        undefined,
+        { "x-github-delivery": "delivery-removal" },
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.upsertLifecycleEvent).toHaveBeenCalledWith({
+      where: { dedupeKey: "webhook|org/repo|42|delivery-removal|status/backlog" },
+      create: expect.objectContaining({
+        kind: "status_changed",
+        source: "webhook",
+        fromStatus: "status/backlog",
+        toStatus: null,
+      }),
+      update: {},
+    });
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
   });
 });

@@ -131,3 +131,140 @@ describe("GET /api/issues/reconcile", () => {
     expect(mocks.auditLogFindMany).not.toHaveBeenCalled();
   });
 });
+
+describe("recordReconciledAction — lifecycle evidence (#1202)", () => {
+  function makeClient() {
+    const rows: Array<Record<string, any>> = [];
+    const client = {
+      issueLifecycleEvent: {
+        create: vi.fn(async ({ data }: any) => {
+          rows.push({ ...data });
+          return data;
+        }),
+        upsert: vi.fn(async ({ where, create }: any) => {
+          const existing = rows.find((row) => row.dedupeKey === where.dedupeKey);
+          if (existing) return existing;
+          rows.push({ ...create });
+          return create;
+        }),
+      },
+    };
+    return { client, rows };
+  }
+
+  const repo = { id: "repo-1", fullName: "org/repo" };
+
+  it("records the merge and the close as separate facts", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      executed: {
+        action: { type: "close_issue", issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: true,
+        beforeLabels: ["status/in-review"],
+        afterLabels: [],
+      },
+      client,
+    });
+
+    expect(rows.map((row) => row.kind)).toEqual(["pr_merged", "issue_closed"]);
+    // The merge is dated by the PR's own merged_at, not by the reconcile pass.
+    expect(rows[0]).toMatchObject({
+      source: "reconciler",
+      sourceEventId: "pr-7",
+      occurredAt: new Date("2026-10-02T08:00:00Z"),
+      metadata: { pullRequestNumber: 7 },
+    });
+  });
+
+  it("does not record a second merge when a later pass re-derives the same one", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+    const input = {
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      executed: {
+        action: { type: "close_issue" as const, issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: true,
+        beforeLabels: ["status/in-review"],
+        afterLabels: [],
+      },
+      client,
+    };
+
+    await recordReconciledAction(input);
+    await recordReconciledAction(input);
+
+    expect(rows).toHaveLength(2);
+  });
+
+  it("records a PR-driven status move with the PR as its identity", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 9, merged_at: null },
+      executed: {
+        action: { type: "set_status", issueNumber: 42, repoFullName: "org/repo", label: "status/in-review", reason: "PR healthy" },
+        success: true,
+        beforeLabels: ["status/backlog"],
+        afterLabels: ["status/in-review"],
+      },
+      client,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: "status_changed",
+      source: "reconciler",
+      fromStatus: "status/backlog",
+      toStatus: "status/in-review",
+      dedupeKey: "reconciler|org/repo|42|status_changed|9|unknown",
+    });
+  });
+
+  it("records nothing for a failed action or an uncached issue", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: null,
+      executed: {
+        action: { type: "set_status", issueNumber: 42, repoFullName: "org/repo", label: "status/ready", reason: "x" },
+        success: false,
+        error: "github 500",
+        beforeLabels: ["status/backlog"],
+        afterLabels: ["status/backlog"],
+      },
+      client,
+    });
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: undefined,
+      mergedPr: null,
+      executed: {
+        action: { type: "set_status", issueNumber: 42, repoFullName: "org/repo", label: "status/ready", reason: "x" },
+        success: true,
+        beforeLabels: ["status/backlog"],
+        afterLabels: ["status/ready"],
+      },
+      client,
+    });
+
+    expect(rows).toHaveLength(0);
+  });
+});
