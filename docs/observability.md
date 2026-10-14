@@ -111,17 +111,26 @@ freshness, or settlement outcomes as signals. This document specifies them.
 - **Kinds:** `gauge` (current value), `counter` (monotonic total), `histogram`
   (bounded buckets). Because Dispatch has no in-process event counters, most
   "counters" are derived from append-only tables and are **not process-
-  monotonic**. Model them either as gauges or as windowed deltas computed by the
-  exporter; document which. Counters derived from the DB do **not** reset on
-  process restart, unlike a conventional process counter.
-- **`increase()` and `rate()` are counter-only.** They assume a monotonically
-  increasing series with well-defined resets. DB-derived totals in this document
-  are **windowed deltas**, not counters, so evaluators must query them via
-  `delta()`-style window deltas or, where the question is "did anything happen
-  in the last N", via an as-of-scrape gauge such as
-  `dispatch_<...>_in_window{..., window="<seconds>"}` (see §4.10). Using
-  `increase()` on a gauge-derived series produces false negatives and positives
-  as the window rolls.
+   monotonic**. Model them either as gauges or as windowed counts recomputed by
+   the exporter at each scrape; document which. Counters derived from the DB do
+   **not** reset on process restart, unlike a conventional process counter.
+- **`increase()`, `rate()`, and `delta()` are counter/cumulative-only — and the
+  distinction is load-bearing here.** They all assume a monotonically increasing
+  series. DB counts in this document are exported as **as-of-scrape windowed
+  gauges** — `dispatch_<...>_in_window{..., window="<seconds>"}` (see §4.10) —
+  where each scrape recomputes the count over its window. Such a series is not
+  monotonic, so **no** rate-style function applies to it. In particular,
+  `delta()` is sound only over a *cumulative* (non-decreasing) exported total;
+  applied to an already-windowed count it silently loses events: a rolling 15m
+  failure count can read `1` at both ends of the evaluation window while an
+  older failure expired and a new one arrived, giving `delta == 0` and missing
+  the failure entirely. Therefore: "did anything happen in the last N" evaluates
+  the as-of-scrape gauge **directly** (e.g.
+  `dispatch_<...>_in_window{window="900s"} > 0`), never via `increase()`,
+  `rate()`, or `delta()`. The `_total` suffix that remains on some rows of this
+  catalogue is historical; those rows are windowed counts under this same rule,
+  not monotonic counters, and must not fire alerts through rate-style
+  evaluators.
 - **Timestamp semantics:** gauges are "as of scrape". Event-derived totals use
   the row's own timestamp (`createdAt`, `at`, `startedAt`/`completedAt`) and are
   windowed by the exporter (e.g. `[5m]`, `[1h]`).
@@ -156,7 +165,7 @@ Assignment is label-only (`agent/*`, `owner/*`) and has no lease. Execution is a
 | `dispatch_leases_active` | gauge | count | `Lease.expiredAt > now` | — | Live ownership |
 | `dispatch_lease_age_seconds` | histogram | seconds | `now - Lease.renewedAt` / `createdAt` | — | How long ownership has been held |
 | `dispatch_leases_expired` | gauge | count | `Lease.expiredAt <= now` | — | Ownership past TTL (recoverable) |
-| `dispatch_assigned_without_execution` | gauge | count | assigned (`agent/*`) and no active lease/`AgentWork` | `lane` | Assignment that never became execution |
+| `dispatch_assigned_without_execution` | gauge | count | assigned (`agent/*`) and no active lease/`AgentWork` | `lane` | Assignment that never became execution. **Dashboard aggregate — must not fire alerts.** Steady assignment churn keeps it above zero continuously even when every assignment is picked up within seconds, and per-item waiting age is not derivable from persisted columns (`Issue` has no `assignedAt`; `updatedAt` is refreshed by any GitHub change at `src/lib/issue-sync.ts:115`, `lastSyncedAt` by claims/webhooks). See A6's future-gap pinning and §8.7 |
 | `dispatch_execution_active` | gauge | 0/1 | derived: an unexpired `Lease` **or** an `AgentWork` in `CLAIMED`/`IN_PROGRESS` exists, **counted for worker identities only** (see the system-emitter exclusion below) | — | Something is executing right now. Used as the A4 in-flight guard: a task picked up before the pickup window still suppresses A4 for its whole duration. `BLOCKED` AgentWork rows are deliberately excluded — blocked work is active (§4.4) but not flowing, and must not mask an otherwise idle fleet |
 
 `DEFAULT_LEASE_TTL_MS = 30 min` (`src/lib/lease.ts:18`). Lease active means
@@ -316,8 +325,8 @@ the backstop for them.
 
 | Signal | Kind | Unit | Source | Dimensions | Semantics |
 |---|---|---|---|---|---|
-| `dispatch_audit_failures_total` | gauge (windowed) | count | `AuditLog.success = false` | `action` (allowlisted) | Failed mutations |
-| `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Outcome distribution across `AgentRun` rows. **Windowed delta only**: the rows are append-only and the window is the reset, so the exporter computes rates over the chosen window (e.g. `[5m]`, `[1h]`). It is **not** process-monotonic and **must not** be evaluated with `increase()`-style rate functions |
+| `dispatch_audit_failures_in_window` | gauge (as-of-scrape) | count | `AuditLog.success = false` **and** `createdAt >= now() - window` | `action` (allowlisted), `window` (allowlisted: `900s`, `3600s`) | Failed mutations in the previous N seconds, recomputed at scrape time. Evaluated **directly** (e.g. `{window="900s"} > 0` for A12) — never via `increase()`, `rate()`, or `delta()` (§4.1). Replaces the earlier `dispatch_audit_failures_total` windowed gauge, which A12 misused through `delta()` |
+| `dispatch_agent_runs_total` | gauge (windowed) | count | `AgentRun.runType`, `status` | `run_type`, `status` | Outcome distribution across `AgentRun` rows. **Windowed count only**: the rows are append-only and the window is the reset, so the exporter recomputes the count over the chosen window at each scrape. It is **not** process-monotonic and **must not** be evaluated with `increase()`-style rate functions (§4.1) |
 | `dispatch_agent_runs_started_in_window` | gauge (as-of-scrape) | count | `AgentRun.startedAt >= now() - window` | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Number of runs whose **reported start time** falls in the previous N seconds, computed at scrape time. Used directly (e.g. `== 0`) — never via `increase()`. Survives process restarts because it is derived from the row timestamp. **Blind spot:** `AgentRun` rows are inserted by `tasks/report` when work *finishes* (`src/app/api/agents/[agentName]/tasks/report/route.ts:571`), and `startedAt` is a retrospective optional field defaulting to report time. A worker still mid-task (running longer than the window) is invisible to this gauge until it reports. It measures *reported starts*, not real-time pickups — do not use it alone to detect "nothing being handed out"; use `dispatch_work_pickups_in_window` / `dispatch_agent_runs_reported_in_window` for that |
 | `dispatch_work_pickups_in_window` | gauge (as-of-scrape) | count | new `AgentWork` rows (`AgentWork.createdAt >= now() - window`) **or** newly created `Lease` rows (`Lease.createdAt >= now() - window`), worker identities only (system-emitter exclusion, §4.3) | `window` (allowlisted: `1800s`, `3600s`) | Work **picked up** in the previous N seconds, recorded at pickup time: `AgentWork` rows are created by `POST /api/agent-work/start` (`src/lib/agent-work.ts:186`) and `Lease` rows by claim via `upsertLease` (`src/lib/lease.ts:69`, `createdAt = DB now()`). Lease *renewals* do not count (they reuse the original `createdAt`) |
 | `dispatch_agent_runs_reported_in_window` | gauge (as-of-scrape) | count | task `AgentRun` rows (`AgentRun.createdAt >= now() - window`, `runType` allowlisted to the task types `implement`/`followup-pr` — heartbeat/groom/legacy rows excluded, §4.3) | `run_type` (allowlisted), `window` (allowlisted: `1800s`, `3600s`) | Completed tasks **reported** in the previous N seconds. Throughput evidence for the canonical loop (next-task → execute → report), which — unlike claim/agent-work — writes no pickup row, so pickups alone under-count a fleet that delivers without materializing a lease. A row lands only at finish, so this gauge cannot see a single task still in flight; that is what `dispatch_execution_active` covers |
@@ -326,10 +335,11 @@ the backstop for them.
 
 `AuditLog.action`, `AgentRun.status`, and `AgentRun.runType` are free strings.
 Allowlist the observed values and bucket the rest as `unknown`; never label by
-`errorMessage`. The default `window` allowlist shared by
-`dispatch_agent_runs_started_in_window`, `dispatch_work_pickups_in_window`, and
-`dispatch_agent_runs_reported_in_window` covers the alerting needs in
-[§6](#6-alert-catalogue); consumers may add other windows but must keep
+`errorMessage`. The default `window` allowlists shared by
+`dispatch_agent_runs_started_in_window`, `dispatch_work_pickups_in_window`,
+`dispatch_agent_runs_reported_in_window` (`1800s`, `3600s`) and
+`dispatch_audit_failures_in_window` (`900s`, `3600s`) cover the alerting needs
+in [§6](#6-alert-catalogue); consumers may add other windows but must keep
 cardinality bounded.
 
 ---
@@ -351,7 +361,7 @@ layout is rows of related signals.
 | **7. Human decisions** | `dispatch_pr_fix_human_decisions`; `dispatch_pr_fix_oldest_human_decision_seconds`; `dispatch_queue_withheld` by `reason` | What genuinely needs a human, and how long has it waited? |
 | **8. Pipeline freshness** | `dispatch_scheduler_job_overdue`; `dispatch_scheduler_job_last_success_timestamp_seconds`; `dispatch_sync_last_success_timestamp_seconds`; `dispatch_repo_stale_sync_seconds`; `dispatch_health_up` | Did the supply pipeline stop? |
 | **9. Grooming** | `dispatch_grooming_freshness`; `dispatch_grooming_stale_reasons`; `dispatch_grooming_backoff` | Is the admission gate starved by stale/unknown grooming? |
-| **10. Failures** | `dispatch_audit_failures_total`; `dispatch_agent_run_failures_total` | Are mutations/runs failing? |
+| **10. Failures** | `dispatch_audit_failures_in_window{window="900s"}`; `dispatch_agent_run_failures_total` | Are mutations/runs failing? |
 
 **Separation requirement.** The dashboard must keep these distinct, because
 collapsing them produces wrong operator conclusions:
@@ -387,13 +397,13 @@ recommendation; the consumer maps it.
 | A3 | Health/DB down | `dispatch_health_up == 0` | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
 | A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800s"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
 | A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
-| A6 | Assigned without execution | `dispatch_assigned_without_execution > 0` | warning | 30m | Assigned but never picked up; invisible in a queue-depth-only view | Verify the worker polls its lane; check admission withholding |
+| A6 | Assigned without execution | **Future gap — must NOT fire on the aggregate.** Intended predicate: an individual **open, eligible** issue (not `done`/`blocked`) has carried `agent/*` with no active lease/`AgentWork` for longer than a threshold T. Per-item waiting age is not derivable from persisted columns today — label assignment carries no timestamp (`Issue` has no `assignedAt`; `updatedAt`/`lastSyncedAt` refresh on unrelated changes), and only actions-route assignments produce `assign_agent` audit rows (`src/app/api/issues/actions/route.ts:14`; claims audit as `claim_issue` but materialize a lease, so they fall outside this predicate), so a GitHub-side assignment has no age source at all. Firing `dispatch_assigned_without_execution > 0` sustained would misreport healthy churn as failure (§8.7), so this row stays pinned — an exporter that ships an age source promotes it to a real alert (§10) | info (pinned; not firing) | 30m (T, once age exists) | Assigned but never picked up; invisible in a queue-depth-only view. Until the age gap closes, execution-loss detection is owned by A5 (expired leases / STALE work) and pickup starvation by A4/A10 | Verify the worker polls its lane; check admission withholding |
 | A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
 | A8 | PR-fix head-of-line | `dispatch_pr_fix_oldest_queued_seconds > threshold` | warning | 30m | Work is queued but not draining | Check worker concurrency, lane routing, and `fixAttempts` saturation |
 | A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | info/warning | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
 | A10 | Admission withholding | `dispatch_queue_withheld{reason="grooming_unknown"}` or `{reason="grooming_stale"}` sustained | warning | 1h | The admission gate is starving the queue on missing/stale grooming | Fix grooming pipeline; or operator admission override for a specific issue |
 | A11 | Grooming backoff | `dispatch_grooming_backoff > 0` sustained | warning | 30m | Upstream GitHub reads are failing; issues cannot be groomed | Check GitHub reachability/rate limits |
-| A12 | Audit failures | `delta(dispatch_audit_failures_total[15m]) > 0` | warning | 5m | Mutations are failing (labels/claims). The predicate uses a window-delta evaluator (per §4.1) because `dispatch_audit_failures_total` is a gauge-derived total, not a monotonic counter | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
+| A12 | Audit failures | `dispatch_audit_failures_in_window{window="900s"} > 0` | warning | 5m | Mutations are failing (labels/claims). The predicate evaluates the as-of-scrape 15-minute gauge **directly**, so a new failure fires even when an older one expires from the window at the same moment — a `delta()` over a rolling windowed count could read zero there (§4.1) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
 | A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` **or** `dispatch_grooming_backoff > 0` | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
 
 ### Normal inactivity must NOT alert
@@ -406,6 +416,10 @@ recommendation; the consumer maps it.
   **no alert** for A7 even though `dispatch_pr_fix_unacked_handouts > 0` — the
   age-tied `dispatch_pr_fix_overdue_unacked` is zero. Aggregate unacked is
   surfaced on the dashboard only.
+- Assignment steady-churn where every `agent/*` assignment gains a
+  lease/`AgentWork` within seconds: **no alert** for A6 even though
+  `dispatch_assigned_without_execution > 0` — see §8.7. A6 is pinned as a
+  future gap and never fires on the aggregate.
 - No `BLOCKED` items: **no alert**. Absence of a human decision is good.
 - No `status/ready` issue with `unknown` freshness (no issue withheld as
   `grooming_unknown`): **no alert**. Never-groomed backlog is not a fault.
@@ -418,7 +432,8 @@ recommendation; the consumer maps it.
   mid-single-task is the documented blind spot in A4, not this case. A hung
   materialized task is caught by A5 and the heartbeat-age signal, not A4.
 
-Alerts must be gated on **eligible work existing** (A4, A6) or on a **pipeline
+Alerts must be gated on **eligible work existing** (A4; A6 is pinned as a
+future gap and fires nothing until it gains per-item age) or on a **pipeline
 that should have run** (A1–A3, A13) or on an **overdue age** (A7, A8, A9, A11).
 "Nothing happened" is not a failure, and "something exists right now" is not
 a failure when nothing is past its timeout.
@@ -433,7 +448,7 @@ choices at composition time.
 
 | Approach | Transport | State source | Dashboard choice | Evaluator choice | Cardinality control | Notes / gaps |
 |---|---|---|---|---|---|---|
-| **A. Pull exporter (Prometheus / VictoriaMetrics)** | HTTP `/metrics` scrape | Read-only DB queries (state gauges, as-of-scrape windowed gauges, windowed deltas over append-only tables) | Any (Grafana, VM UI, custom) | Prometheus rules / vmalert / custom | Enforce label allowlists at the exporter | Needs a new read-only exporter; no in-process counters exist, so totals are windowed DB deltas. Use `delta()` (or direct comparison of `_in_window` as-of-scrape gauges) for "did anything happen in the last N" predicates — never `increase()` per §4.1 |
+| **A. Pull exporter (Prometheus / VictoriaMetrics)** | HTTP `/metrics` scrape | Read-only DB queries (state gauges, as-of-scrape windowed gauges, windowed counts over append-only tables) | Any (Grafana, VM UI, custom) | Prometheus rules / vmalert / custom | Enforce label allowlists at the exporter | Needs a new read-only exporter; no in-process counters exist. Evaluate "did anything happen in the last N" predicates **directly** against the as-of-scrape `_in_window` gauges — never `increase()` (any series here is non-monotonic) and never `delta()` over an already-windowed count (window roll can cancel a fresh event to zero); `delta()` is sound only if the exporter instead emits cumulative totals (§4.1) |
 | **B. OTel push metrics** | OTLP push | Same as A, emitted as OTel instruments | Any OTel-compatible backend | OTel-native or downstream | Use OTel attribute allowlists; avoid high-cardinality attributes | Adds an OTel SDK/dependency; exporter/collector choice deferred |
 | **C. OTel logs/events** | OTLP logs | `AuditLog`, `PrFixHistory`, `AgentRun`, `IssueSyncRun` as events | Any log backend | Backend rules | Event attributes may carry IDs; **keep them out of metric labels** | Good for drill-down; not a substitute for gauges |
 | **D. Snapshot API** | HTTP JSON | A read-only `GET` that returns the catalogue as JSON | Any | Any | Consumer controls | Optional convenience; would be a small, separately-scoped implementation |
@@ -575,6 +590,32 @@ become the relevant alert. (A fleet that delivers through the canonical loop
 without ever materializing a claim or agent-work row is unobservable mid-task;
 see the blind spot stated in A4.)
 
+### 8.7 Healthy — assignment steady churn (A6 must NOT fire)
+
+```
+dispatch_health_up                                  1
+dispatch_scheduler_up                               1
+dispatch_sync_last_success_timestamp_seconds        (3m ago)
+dispatch_issues{status="ready",state="open"}        5
+dispatch_issue_assigned                             3     # label-assigned supply
+dispatch_assigned_without_execution                 1     # just assigned; gains a lease <60s later
+dispatch_leases_active                              2
+dispatch_execution_active                           1
+dispatch_work_pickups_in_window{window="1800s"}     4
+dispatch_agent_runs_reported_in_window{window="1800s"} 3
+```
+**Read:** workers label-assign, then pick up within seconds, so the
+`dispatch_assigned_without_execution` aggregate is nonzero at most scrapes —
+each individual assignment waits under a minute, but the waits overlap. A
+`for: 30m` timer over the aggregate does not help: overlapping short waits keep
+it *continuously* nonzero and an aggregate-fired A6 would alert on a perfectly
+healthy fleet. This is the same false-positive class the A7 review fix removed by
+making the predicate age-tied, but A6 has no age-tied equivalent today: label
+assignment carries no persisted timestamp, so per-item waiting age cannot be
+computed (see A6's future-gap pinning and §10). This state must **not** alert;
+real ownership loss here is caught by A5 (expired lease / `STALE` work) and
+pickup starvation by A4/A10.
+
 ---
 
 ## 9. Privacy, cardinality, and security
@@ -607,8 +648,9 @@ design, not a decision.
   Trade-offs: pull is simple and scrape-native; push fits an existing collector;
   a snapshot API is vendor-neutral but adds an endpoint.
 - **Counter modeling:** since Dispatch has no in-process counters, decide
-  whether DB-derived totals are gauges or windowed deltas, and how the consumer
-  computes rates.
+  whether DB-derived totals are as-of-scrape windowed counts or exported
+  cumulative totals (the only shape `delta()` is sound on — §4.1), and how the
+  consumer evaluates them.
 - **Repo dimension:** whether `repo` is a bounded, acceptable label (small,
   configured tracked set) or must be aggregated.
 - **Scheduler state is in-process** (`globalThis`) and resets on restart; decide
@@ -626,6 +668,16 @@ design, not a decision.
   canonical loop (next-task → execute → report) writes no pickup row, so A4's
   mid-task visibility depends on workers materializing a claim or agent-work
   start ([§6 A4](#6-alert-catalogue) documents the residual blind spot).
+- **Assignment age source (A6 graduation):** A6 is pinned as a future gap
+  because "assigned without execution" has no per-item age. Candidate sources:
+  persist an `assignedAt`-style timestamp when an `agent/*` label first appears
+  in the sync diff (covers GitHub-side and Dispatch-side assignments alike),
+  or derive age from `assign_agent` AuditLog rows (covers only actions-route
+  assignments — GitHub-side label adds never hit the audit path, and claims
+  audit as `claim_issue` but materialize a lease, so they are outside A6's
+  predicate). No AuditLog
+  pruning exists today, but retention must be settled before a join-based age
+  is relied on. Decide before unpinning A6 ([§6 A6](#6-alert-catalogue), §8.7).
 - **Retention and windowing:** how long event tables feed windowed totals, and
   whether the exporter queries the primary or a replica.
 - **OTel semantic conventions:** whether to map to standard metric/log
