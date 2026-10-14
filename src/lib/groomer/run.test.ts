@@ -96,7 +96,8 @@ vi.mock("@/lib/prisma", () => ({
   prisma: mocks.prisma,
 }));
 
-vi.mock("@/lib/lease", () => ({
+vi.mock("@/lib/lease", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/lease")>()),
   findActiveLeasesForIssue: mocks.findActiveLeasesForIssue,
   upsertLease: mocks.upsertLease,
   releaseLease: mocks.releaseLease,
@@ -134,6 +135,7 @@ import {
   runHostedGroomer,
   UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
 } from "./run";
+import { IssueMutationBusyError } from "@/lib/lease";
 import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
@@ -1464,6 +1466,35 @@ describe("runHostedGroomer", () => {
     );
   });
 
+  it.each(["active capacity-release", "retained non-executing guard"])("defers %s without failure backoff and can service the next issue", async () => {
+    mocks.upsertLease.mockRejectedValueOnce(new IssueMutationBusyError());
+    expect(await runHostedGroomer()).toBeNull();
+    expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "gr-1" },
+      data: expect.objectContaining({ status: "deferred", stage: "lease_acquisition", completedAt: expect.any(Date) }),
+    }));
+    mocks.selectGroomingCandidate.mockResolvedValueOnce({ ...mockCandidate, id: "next-issue", number: 43 });
+    await runHostedGroomer();
+    expect(mocks.callGroomerLLM).toHaveBeenCalledOnce();
+  });
+
+  it("records and propagates unexpected lease-store errors", async () => {
+    mocks.upsertLease.mockRejectedValueOnce(new Error("database unavailable"));
+    await expect(runHostedGroomer()).rejects.toThrow("database unavailable");
+    expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "failed", stage: "lease_acquisition", errorMessage: "database unavailable" }),
+    }));
+    expect(mocks.prisma.agentRun.create).toHaveBeenCalled();
+    expect(mocks.prisma.auditLog.create).toHaveBeenCalled();
+  });
+
   it("failure after groomingRun creation completes run as failed", async () => {
     mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
 
@@ -1629,6 +1660,17 @@ describe("runHostedGroomer", () => {
     expect(result).toBeNull();
     expect(mocks.upsertLease).not.toHaveBeenCalled();
     expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "deferred", completedAt: expect.any(Date) }),
+    }));
+    // No retry timestamp was written: the same candidate can run immediately
+    // once the other agent releases its lease.
+    mocks.findActiveLeasesForIssue.mockResolvedValue([]);
+    await runHostedGroomer();
+    expect(mocks.callGroomerLLM).toHaveBeenCalledOnce();
   });
 
   it("force option overrides another active lease", async () => {

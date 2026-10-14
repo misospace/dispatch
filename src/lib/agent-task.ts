@@ -29,6 +29,14 @@ export interface PullRequestRef {
 export interface PrFixItemIdentity {
   id: string;
   generation: number;
+  /**
+   * #1256: per-hand-out receipt token minted for THIS hand-out (rotates on
+   * every issuance). Workers echo it back on reports; a `capacity-exhausted`
+   * settlement is only authorized with it, releasing exactly the hand-out it
+   * was issued with. Other outcomes ignore it, so pre-token workers are
+   * unaffected.
+   */
+  handoutToken?: string;
 }
 
 export interface IdleTask {

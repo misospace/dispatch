@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { fetchCollaboratorPermission } from "@/lib/github-issues";
-import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
+import { findActiveLeasesForIssue, IssueMutationBusyError, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
@@ -249,16 +249,7 @@ async function executeGroomerRun(
     staleReasons: candidate.staleReasons,
   });
 
-  const activeLeases = await deps.findActiveLeases(candidate.id);
-  const hasOtherLease = activeLeases.some((lease: { agentName?: string }) => lease.agentName !== "hosted-groomer");
-  if (hasOtherLease && !options.force) return null;
-
-  const { lease } = await deps.upsertLease({
-    agentName: "hosted-groomer",
-    issueId: candidate.id,
-    checkpoint: "issue_claimed",
-    ttlMs: GROOMER_LEASE_TTL_MS,
-  });
+  let lease: { id: string } | undefined;
   const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
   // Freshness (#1064): a human comment after this instant is new evidence.
@@ -272,6 +263,22 @@ async function executeGroomerRun(
   let unreadableBackoffWritten = false;
 
   try {
+    stage = "lease_acquisition";
+    const activeLeases = await deps.findActiveLeases(candidate.id);
+    const hasOtherLease = activeLeases.some((active: { agentName?: string }) => active.agentName !== "hosted-groomer");
+    if (hasOtherLease && !options.force) {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "deferred", stage, errorMessage: null, retryable: true,
+      });
+      return null;
+    }
+    ({ lease } = await deps.upsertLease({
+      agentName: "hosted-groomer",
+      issueId: candidate.id,
+      checkpoint: "issue_claimed",
+      ttlMs: GROOMER_LEASE_TTL_MS,
+    }));
+    stage = "selected";
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
     try {
       comments = await deps.fetchComments(candidate.repoFullName, candidate.number);
@@ -1304,6 +1311,13 @@ async function executeGroomerRun(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown groomer error";
 
+    if (stage === "lease_acquisition" && error instanceof IssueMutationBusyError) {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "deferred", stage, errorMessage: null, retryable: true,
+      });
+      return null;
+    }
+
     // Complete GroomingRun as failed
     try {
       await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
@@ -1347,7 +1361,7 @@ async function executeGroomerRun(
     });
     throw error;
   } finally {
-    await deps.releaseLease(lease.id);
+    if (lease) await deps.releaseLease(lease.id);
   }
 }
 

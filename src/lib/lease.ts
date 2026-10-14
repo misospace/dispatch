@@ -6,8 +6,10 @@
 // cron workers and harnesses resume interrupted work without overlapping
 // another agent's claimed work.
 
+import { withIssueMutationGuard } from "./issue-mutation-guard";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { newClaimToken } from "@/lib/capacity-handoff";
 import type { CheckpointValue, ResumeContext, ResumeContextWithLease } from "./next-action";
 import { buildResumeContext, isValidCheckpoint } from "./next-action";
 
@@ -16,6 +18,14 @@ import { buildResumeContext, isValidCheckpoint } from "./next-action";
 // 30 minutes covers typical cron intervals (15 min) with headroom.
 
 export const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Expected issue-mutation contention, not a lease-store failure. */
+export class IssueMutationBusyError extends Error {
+  constructor() {
+    super("Issue mutation pending; lease cannot be renewed or reissued");
+    this.name = "IssueMutationBusyError";
+  }
+}
 
 /**
  * Calculate the expiry timestamp for a lease with the given TTL.
@@ -40,7 +50,16 @@ export async function upsertLease(params: {
   branch?: string;
   prUrl?: string;
   ttlMs?: number;
+  /** Internal: the claim route already holds the issue mutation guard. */
+  mutationGuardHeld?: boolean;
 }): Promise<{ created: boolean; lease: any }> {
+  if (!params.mutationGuardHeld) {
+    const result = await withIssueMutationGuard({ issueId: params.issueId, operation: "lease", agentName: params.agentName }, async () => ({
+      complete: true, value: await upsertLease({ ...params, mutationGuardHeld: true }),
+    }));
+    if (result.status === "busy") throw new IssueMutationBusyError();
+    return result.value;
+  }
   const now = new Date();
   const checkpoint = params.checkpoint ?? "issue_claimed";
   const expiredAt = calculateLeaseExpiry(params.ttlMs);
@@ -65,6 +84,12 @@ export async function upsertLease(params: {
   // @@unique([agentName, issueId]) constraint. The loser hits a P2002
   // unique violation — re-read and return the lease the winner created
   // instead of surfacing a 500 to the caller.
+  //
+  // #1256: creation mints the opaque claim token that fences later
+  // capacity-handoff releases to THIS exact claim. Renewals deliberately keep
+  // the token (a heartbeating worker must not lose its receipt); a released or
+  // expired lease that is re-claimed is a NEW row with a NEW token, so old
+  // tokens are inert against new claims.
   try {
     const lease = await prisma.lease.create({
       data: {
@@ -74,6 +99,7 @@ export async function upsertLease(params: {
         checkpoint,
         branch: params.branch,
         prUrl: params.prUrl,
+        claimToken: newClaimToken(),
       },
     });
     return { created: true, lease };
@@ -214,6 +240,9 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
       prUrl: lease.prUrl ?? undefined,
     }),
     leaseId: lease.id,
+    // #1256: the issued claim token, so a resuming worker keeps the receipt
+    // that fences its capacity-handoff release to this exact claim.
+    claimToken: lease.claimToken ?? undefined,
     lane: lease.issue.currentLane ?? "default",
     status: lease.issue.state,
     labels: lease.issue.labels,

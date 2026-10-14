@@ -12,6 +12,7 @@ import { findAndReleaseStaleAgentWorkForIssue } from "@/lib/agent-work";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import { recordClaimEvent } from "@/lib/issue-lifecycle";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -76,6 +77,9 @@ export async function POST(request: Request) {
       return errorResponse("Force claim requires a maintainer token", 403);
     }
 
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string }, async (_tx, { resuming }) => {
+    let remoteStarted = false;
+    const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
     const issue = await prisma.issue.findUnique({
       where: { id: issueId as string },
@@ -143,10 +147,19 @@ export async function POST(request: Request) {
       return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
     }
 
-    // Refuse done issues (live labels are the authoritative base — #1037).
-    // Any live status/done makes the issue done, even alongside other status labels.
+    // Refuse human holds (live labels are authoritative), including on a retry
+    // after GitHub succeeded but the local mirror failed.
+    if (liveLabels.includes("status/blocked")) {
+      return errorResponse("Cannot claim a blocked issue", 400);
+    }
     if (liveLabels.includes("status/done")) {
       return errorResponse("Cannot claim a done issue", 400);
+    }
+
+    const alreadyOwned = liveLabels.includes(`${AGENT_PREFIX}${agentName}`);
+    const hasOtherOwner = liveLabels.some((label) => label.startsWith(AGENT_PREFIX) && label !== `${AGENT_PREFIX}${agentName}`);
+    if (resuming && (!alreadyOwned || hasOtherOwner)) {
+      return errorResponse("Cannot resume claim because live issue ownership changed", 409);
     }
 
     // Check for active leases from OTHER agents — refuse unless force=true
@@ -182,6 +195,7 @@ export async function POST(request: Request) {
         // buildNewLabels below drops every conflicting agent label from the
         // cache, so GitHub must lose all of them too — leaving extras behind
         // is the same GitHub/cache divergence class #1037 fights.
+        remoteStarted = true;
         for (const staleAgentLabel of analysis.existingAgents) {
           try {
             await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
@@ -202,14 +216,18 @@ export async function POST(request: Request) {
     const updatedLabels = [...labelsWithAgent.filter((l) => !l.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
-      // Add agent label on GitHub
-      await addIssueLabel(repoFullName, issueNumber, agentLabel);
+      remoteStarted = true;
+      // A resumed claim already landed remotely. Repair only the local mirror,
+      // lifecycle event and lease; do not repeat GitHub label mutations.
+      if (!resuming) await addIssueLabel(repoFullName, issueNumber, agentLabel);
 
       // Remove ALL existing status labels (not just the first) before adding
       // status/in-progress — keeps GitHub and the Prisma cache from
       // diverging when an issue carries more than one status label.
       // Base is the live GitHub label set (authoritative — #1037).
-      await transitionIssueStatus(repoFullName, issueNumber, liveLabels, IN_PROGRESS_STATUS);
+      if (!resuming || !liveLabels.includes(IN_PROGRESS_STATUS)) {
+        await transitionIssueStatus(repoFullName, issueNumber, liveLabels, IN_PROGRESS_STATUS);
+      }
 
       // Update local cache and record the lifecycle event in one transaction:
       // a claim whose event failed to commit would leave the stream missing an
@@ -244,11 +262,14 @@ export async function POST(request: Request) {
         });
       });
 
-      // Create or renew a lease for this agent (issue #166)
-      await upsertLease({
+      // Create or renew a lease for this agent (issue #166).
+      // #1256: the lease carries the opaque claim token that fences a later
+      // capacity-handoff release to THIS exact claim; echo it to the worker.
+      const lease = await upsertLease({
         agentName: agentName as string,
         issueId: issueId as string,
         checkpoint: "issue_claimed",
+        mutationGuardHeld: true,
       });
 
       // Write audit log with conflict analysis details
@@ -282,7 +303,11 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ success: true, labels: updatedLabels });
+      return NextResponse.json({
+        success: true,
+        labels: updatedLabels,
+        claimToken: lease.lease.claimToken ?? null,
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
@@ -303,6 +328,11 @@ export async function POST(request: Request) {
 
       return errorResponse(errorMessage, 500);
     }
+    })();
+    return { complete: !remoteStarted || value.status < 500, value };
+    });
+    if (guarded.status === "busy") return errorResponse("Issue mutation is in progress", 409);
+    return guarded.value;
   } catch (error) {
     console.error("Claim issue failed:", error);
     return errorResponse("Failed to claim issue", 500);

@@ -40,6 +40,7 @@ model Issue {
   laneHistory   IssueLane[]
   agentWork     AgentWork[]
   leases        Lease[]
+  mutationGuard IssueMutationGuard?
   groomingRuns  GroomingRun[]
   groomingApplications  GroomingApplication[]
   groomingChildClaims   GroomingChildClaim[]
@@ -122,6 +123,19 @@ model Issue {
   @@index([groomingRetryAfter])
 }
 
+model IssueMutationGuard {
+  issueId    String   @id
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  operation  String
+  ownerToken String   @unique
+  agentName  String?
+  claimToken String?
+  executing  Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@index([agentName, claimToken])
+}
+
 enum PrFixLane {
   NORMAL
   ESCALATED
@@ -187,6 +201,19 @@ model PrFixQueueItem {
   // wall-clock of that hand-out.
   dispatchedGeneration Int?
   dispatchedAt       DateTime?
+  // #1256: authoritative per-hand-out receipts. One entry per live hand-out
+  // issued by next-task, format "<token>@<agentName>@<generation>" (token is
+  // an opaque random value containing no "@"; the agent name may contain "@",
+  // so the token boundary is the FIRST "@" and the generation the LAST).
+  // Settlement of a capacity-exhausted report requires the reporting agent to
+  // present the exact token it was issued, and the write releases only that
+  // agent's receipt — other agents' live hand-outs and acknowledgements at
+  // the same generation survive. Invariant: an entry exists exactly while the
+  // matching `agentHandouts` entry exists (issuance pushes both atomically;
+  // every clear site clears both), so a hand-out that was released, reclaimed,
+  // or superseded by a generation bump can never be settled with its old
+  // token, and each new hand-out rotates in a fresh token.
+  handoutReceipts    String[]       @default([])
   // New (previously-unrecorded) evidence arrived AFTER the current generation
   // was handed out (#1119): the in-flight worker cannot see it, so settlement
   // must reopen a fresh attempt instead of absorbing it. Records the evidence
@@ -869,10 +896,53 @@ model Lease {
   prUrl      String?  // associated PR URL if one exists
   expiredAt  DateTime // absolute expiry; default TTL is set at creation time
   renewedAt  DateTime?
+  // #1256: opaque attempt/claim token issued to the worker on claim. It fences
+  // a capacity-handoff release to the EXACT claim: renewals keep the token,
+  // but a released/expired lease that is re-claimed gets a fresh row and a
+  // fresh token, so a stale worker's token can never release a newer claim.
+  claimToken String?  @unique
   createdAt  DateTime @default(now())
 
   @@unique([agentName, issueId])
   @@index([agentName, expiredAt])
   @@index([expiredAt])
   @@index([issueId])
+}
+
+// ---------------------------------------------------------------------------
+// Capacity handoffs (#1256) — bounded, capacity-SCOPED cooldowns.
+//
+// When a worker explicitly recognizes that its execution capacity (an opaque
+// provider/model/runner identifier chosen by the worker) cannot run a handed
+// attempt, it settles the attempt with a fenced handoff. Dispatch keeps the
+// work item itself discoverable to other compatible workers; this table only
+// records "capacity C should not be re-handed <this item> until T". Workers
+// that declare no capacity conservatively skip cooled items (fail-closed).
+// Expired rows are pruned lazily on read; they carry no retry budget.
+// ---------------------------------------------------------------------------
+
+model CapacityHandoff {
+  id            String   @id @default(cuid())
+  capacity      String   // opaque worker-declared capacity identifier
+  // Which subsystem owns the handed-off work: "issue" (claim/lease release)
+  // or "pr_fix" (PR-fix queue attempt).
+  kind          String
+  repoFullName  String
+  issueNumber   Int?
+  prNumber      Int?
+  // The worker that handed the work off, for audit/history.
+  agentName     String
+  issueId       String?  // issue-form handoffs: the local Issue row
+  // The attempt generation the handoff settles (pr_fix rows). The replay
+  // check is keyed on it so a fresh attempt is never absorbed by an older
+  // generation's cooldown window.
+  generation    Int?
+  cooldownUntil DateTime // handoff suppresses re-hand to `capacity` before this time
+  note          String?  @db.Text
+  createdAt     DateTime @default(now())
+
+  @@index([capacity, cooldownUntil])
+  @@index([kind, repoFullName, issueNumber, cooldownUntil])
+  @@index([kind, repoFullName, prNumber, cooldownUntil])
+  @@index([cooldownUntil])
 }
