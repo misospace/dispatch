@@ -33,8 +33,11 @@ precise transition defect.
 
 The root shape of the defect is a **missing freshness relation**: the queue
 records *that* evidence was seen (dedupe keys) but not *what state it was
-relative to which attempt*, so it cannot answer "is this observation newer than
-the disposition that parked or resolved the item?"
+relative to which attempt*, so it cannot answer "was this observation part of
+the input the settling attempt was handed, or did it arrive after that attempt
+was dispatched?" The boundary is the attempt's evidence snapshot, not the wall
+time the disposition happened to be written — a delayed or lost webhook lands
+after settlement while being strictly newer than anything the worker saw.
 
 ## Scope
 
@@ -65,7 +68,9 @@ queue API, the `(id, generation)` attempt token, and `tasks/report`.
 |------|---------|
 | **Evidence identity** | The stable key of an observation, e.g. `review:<repo>#<pr>:<reviewId>`. Replayed webhooks of the same observation share it. Current format: `computeEvidenceKey` in `src/lib/pr-followup-ingestion.ts:255`. |
 | **Evidence version** | The state-bearing fields of an identity (head SHA, review state/`commit_id`, comment resolution/`updated_at`, check `status`/`conclusion`). A new *version* of a known identity is only fresh if its transition is actionable. |
-| **Evidence watermark** | The record of `(identity, version, observedAt)` seen for the item, plus the head SHA, relative to which freshness is measured. Backed today by `evidenceKeys` (40, FIFO) and `postDispatchEvidenceKeys` (20, priority-eviction); see [Evidence watermark lifetime](#evidence-watermark-lifetime). |
+| **Evidence ledger** | The durable, per-item record of every distinct observation: one row per `(item, identity)` holding the current `version`, the ledger sequence at which the transition was first recorded, and the forge-side event timestamp where one exists. **Proposed.** Re-recording an already-stored `(identity, version)` never creates a transition and never restamps anything. See [Evidence watermark lifetime](#evidence-watermark-lifetime). |
+| **Evidence watermark** | The evidence ledger's recorded `(identity, version)` transitions for the item, relative to which freshness is measured. Today only approximated by `evidenceKeys` (40, FIFO) and `postDispatchEvidenceKeys` (20, priority-eviction), both bounded and lossy; see [Evidence watermark lifetime](#evidence-watermark-lifetime). |
+| **Attempt watermark** | The ledger high-water mark (`attemptEvidenceWatermark`) stamped on a hand-out: the ledger sequence at dispatch. Evidence whose transition was recorded after an attempt's watermark could not have been in that worker's input and can be fresh; evidence recorded at or before it was. **Proposed.** |
 | **Attempt** | One dispatchable unit of PR-fix work, identified by `(id, generation)`. |
 | **Disposition** | The reason an item is not actively dispatchable: `human_decision`, `no_progress`, `infra_failure`, `security_failure`, or `external_wait`. Distinct from `status` (see below). |
 | **Hold class** | The recovery semantics of a disposition: `active`, `resolved`, `operational`, `human`, or `terminal`. Recovery keys off hold class, not status alone. |
@@ -85,8 +90,8 @@ the presence of the following fields through the configured capability.
 | `review_comment` | comment id | `commit_id`, `updated_at`, resolution/outdated state (**Proposed** read) | unresolved comment on the current or a newer head |
 | `comment` | comment id | `updated_at`, author association | non-bot comment on the PR |
 | `check_run` | check run id | `head_sha`, `status`, `conclusion`, `completed_at` | `failure`/`timed_out`/`action_required`/`cancelled` on the current or a newer head |
-| `merge_state` | derived from the state string | the state string + head | a **persistent** problematic state (`behind`, `dirty`, `unstable`, `has_hooks`) |
-| `merge_conflict` | derived (`conflicting`) | `mergeable` | `CONFLICTING` persists |
+| `merge_state` | **Proposed:** stable `merge_state:<repo>#<pr>` (current derives it from the state string, which prevents a durable baseline; see [Conditions vs one-shot events](#conditions-vs-one-shot-events)) | `(state string, head)` | a **persistent** problematic state (`behind`, `dirty`, `unstable`, `has_hooks`) |
+| `merge_conflict` | **Proposed:** stable `merge_conflict:<repo>#<pr>` | `(mergeable, head)` | `CONFLICTING` persists |
 
 **Gap:** the current forge reads expose head SHA, merge state, and PR state
 (`src/lib/github-prs.ts`) but **not** review-comment resolution/outdated state.
@@ -99,7 +104,7 @@ Two rules make this "fresh" rather than merely "seen":
 1. **Identity is stable across replays.** A duplicated webhook, a re-read by the
    periodic sync, or an at-least-once redelivery has the same identity and must
    be a no-op. The current `evidenceKeys` dedupe (`uniqueAppend`,
-   `src/lib/pr-fix-queue.ts:297`) gives this for identity; this design extends
+   `src/lib/pr-fix-queue.ts:306`) gives this for identity; this design extends
    it with version.
 2. **Version transitions, not repetitions, are fresh.** A `check_run` that was
    `pending` at the snapshot and is now `failure` is fresh. A `review` submitted
@@ -114,9 +119,9 @@ Two rules make this "fresh" rather than merely "seen":
 To distinguish genuinely new feedback from repeated review text, freshness for
 `review` and `comment`/`review_comment` kinds also compares a **content
 signature** = hash of `(normalized body, author identity, state, commit_id)`.
-If a new identity carries a signature already present in the watermark at the
-same or newer head, it is recorded for audit but is **not** actionable on its
-own. Body text alone never establishes freshness; the authoritative identity and
+If a new identity carries a signature already present in the ledger at the same
+or newer head, it is recorded for audit but is **not** actionable on its own.
+Body text alone never establishes freshness; the authoritative identity and
 version do.
 
 ### Conditions vs one-shot events
@@ -127,43 +132,99 @@ holds and only when it is persistent across at least one re-read (so transient
 `behind` churn during normal rebases does not open work). A condition that
 clears is not evidence of anything and must not reactivate.
 
+**Current gap in the identity itself:** the identity is *derived from the state
+string*, so each state string reads as a distinct observation and a stable
+per-condition baseline cannot exist. **Proposed:** each condition kind gets one
+stable ledger identity per PR — `merge_state:<repo>#<pr>`,
+`merge_conflict:<repo>#<pr>` — with version `(state string, head SHA)`. The
+ledger row is then a **durable per-condition baseline**: exactly one row per
+condition kind, updated on *every* observation (webhook or reconciliation),
+independent of any disposition, and not subject to FIFO eviction.
+
+Consequences the implementation must honor:
+
+- A re-read of an unchanged condition (`(identity, version)` equals the ledger
+  row) is not a transition and can never reopen — even after older keys are
+  evicted from the bounded fast-path caches, and even when the current
+  disposition was triggered by *different* evidence (say review `R`). A
+  disposition's `disposedEvidence` can never serve as the condition baseline:
+  it records only the disposition's one cause, so an unrelated cause silently
+  discards the condition's prior known state and the unchanged condition then
+  reads as new.
+- A **transition** is: entry into an actionable state (`clean → dirty`,
+  `mergeable → CONFLICTING`), or the same problematic state observed at a
+  **new head** (the old resolution no longer applies to the new base). Only a
+  transition recorded after the boundary attempt's watermark, confirmed
+  persistent by one re-read, is fresh.
+
 ## Evidence watermark lifetime
 
 Freshness cannot rely on "not present in a cache" alone, because the current
 caches are bounded and lossy:
 
 - **Current:** `evidenceKeys` is a 40-entry FIFO (`uniqueAppend` is
-  `slice(-maxItems)`, `src/lib/pr-fix-queue.ts:297`), and one review contributes
+  `slice(-maxItems)`, `src/lib/pr-fix-queue.ts:306`), and one review contributes
   one key per inline comment, so eviction is routine.
 - **Current:** `postDispatchEvidenceKeys` is a *separate* 20-entry list with
-  priority eviction (`:311`). Every fresh attempt **clears** it (`:1238`).
+  priority eviction (`:320`). Every fresh attempt **clears** it (`:1255`).
 - **Current:** `PrFixHistory` is the immutable audit record.
 
-The design therefore makes a **durable disposition record** the authoritative
-freshness boundary, not cache membership or a re-read timestamp:
+The design therefore makes a **durable evidence ledger plus a per-attempt
+watermark** the authoritative freshness boundary — not cache membership, and not
+a comparison against the moment a disposition was written:
 
-- **Proposed:** each item stores `disposedAt` (set when a disposition is
-  written), `recoveryAppliedAt` (set when a reactivation is applied), and
+- **Proposed:** each item has a durable evidence ledger: one row per
+  `(item, identity)` storing the current `version`, the position in a per-item
+  monotonic transition sequence, and the forge-side event timestamp
+  (`review.submitted_at`, `comment.updated_at`, `check_run.completed_at`) where
+  one exists. Recording an already-stored `(identity, version)` is a no-op: it
+  creates no transition and restamps nothing, so duplicated webhooks,
+  at-least-once redeliveries, and periodic re-reads are inert against the
+  ledger.
+- **Proposed:** each hand-out stamps `attemptEvidenceWatermark` — the ledger
+  sequence at dispatch — as the durable record of *what the worker was actually
+  given*. The hand-out snapshot is built from the same authoritative reads the
+  admission decision used; if those reads fail, admission defers (see
+  [Unknown-evidence behavior](#unknown-evidence-behavior)) rather than minting
+  an attempt with an unknown boundary. For a disposition written without any
+  dispatched attempt (e.g. an enqueue-path cap park), the boundary is the
+  ledger sequence at the moment the disposition was recorded — no worker was
+  given a snapshot, so nothing recorded before the park can read as unseen.
+- `observedAt` remains the **forge-side event timestamp** and is audit data,
+  never the freshness boundary. Two adversarial cases decide this:
+  - **Late first discovery.** A review submitted during a dispatched attempt
+    whose webhook is delayed or lost is first discovered — by reconciliation,
+    after the worker has already settled — and its ledger transition is
+    recorded *after* the settled attempt's watermark. It stays fresh even
+    though its forge `observedAt` precedes the disposition timestamp. A rule
+    comparing `observedAt > disposedAt` would strand exactly this evidence,
+    which is the case this design exists to recover.
+  - **Replay of known evidence.** An old already-recorded review re-read after
+    a disposition (and after cache eviction) never creates a ledger
+    transition, and its transition predates the watermark, so it is not fresh
+    no matter when it is re-read. Note this is why ingestion/re-read *time*
+    is never the freshness source either: freshness comes from *transition
+    existence*, and only a genuine `(identity, version)` change appends.
+- Cache membership remains a fast-path dedupe; the ledger is the correctness
+  boundary that survives eviction.
+- **Proposed:** each item also stores `disposedAt`, `recoveryAppliedAt`, and
   `disposedEvidence` (the `(identity, version)` that triggered the current
-  disposition).
-- `observedAt` is the **forge-side event timestamp** where one exists
-  (`review.submitted_at`, `comment.updated_at`, `check_run.completed_at`), not
-  the time ingestion happened to re-read the observation. A periodic re-read of
-  an unchanged observation must not mint a fresh `observedAt`.
-- `merge_state`/`merge_conflict` have no forge event timestamp (their identity
-  *is* the condition string), so for those kinds freshness is decided **only**
-  by the durable `(identity, version)` comparison against `disposedEvidence`,
-  never by a re-read timestamp.
-- An observation is fresh only if its `(identity, version)` differs from
-  `disposedEvidence` **and**, where a forge timestamp exists, `observedAt >
-  disposedAt` (and `> recoveryAppliedAt` for a repeat). A key evicted from a
-  bounded cache but equal to `disposedEvidence` is **not** fresh, no matter when
-  it is re-read.
-- Cache membership remains a fast-path dedupe; the durable comparison is the
-  correctness boundary that survives eviction.
+  disposition) as the **audit** record of why and when the disposition
+  happened — operator-readable, referenced by history — but they are not
+  freshness predicates. In particular `disposedEvidence` is a single key and
+  can never be the baseline for timestamp-less condition kinds; those use the
+  durable per-condition ledger row ([Conditions vs one-shot
+  events](#conditions-vs-one-shot-events)).
 - The per-attempt reset of `postDispatchEvidenceKeys` is preserved as an
-  optimization; the immutable history and `disposedEvidence` preserve the prior
-  attempt's reason (issue: "Preserve immutable prior attempts and reasons").
+  optimization; the ledger generalizes it durably — post-dispatch evidence is
+  exactly evidence whose transition postdates the current attempt's watermark.
+  The immutable history preserves the prior attempt's reason (issue: "Preserve
+  immutable prior attempts and reasons").
+- **Ledger bounds.** The ledger grows with distinct identities, not with reads.
+  Pruning is allowed only for terminal items; for a live item, pruning any
+  transition older than the newest reactivation requires that a re-read of a
+  pruned identity falls to the unknown-evidence path (defer + audit), never to
+  "assume fresh".
 
 ## Disposition model: status, disposition, hold class
 
@@ -189,11 +250,11 @@ by fresh evidence depends on **hold class** and **remaining budget**, not on
 **Budget-exhausted** means `fixAttempts >= PR_FIX_MAX_ATTEMPTS` **or**
 `handoutReclaims >= PR_FIX_MAX_RECLAIMS`. This matters because
 `PARKED`/`no_progress` is *created by* those caps: six of the seven `PARKED`
-write sites are cap-exhaustion (`src/lib/pr-fix-queue.ts:955`, `:1157`, `:1684`,
-`:1847`, `:2130`, `:2805`). The seventh is the generic `markPrFixItem` `PARKED`
-path (`:1608`, `:1784`), reachable from the worker-tier
+write sites are cap-exhaustion (`src/lib/pr-fix-queue.ts:965`, `:1169`, `:1697`,
+`:1863`, `:2148`, `:3039`). The seventh is the generic `markPrFixItem` `PARKED`
+path (`:1620`, `:1799`), reachable from the worker-tier
 `POST /api/pr-fix-queue/mark` and from the bare-`blocked` report in
-`resolvePrFixFromAgentReport` (`:2732`); it parks without incrementing
+`resolvePrFixFromAgentReport` (`:2976`); it parks without incrementing
 `fixAttempts`, so it is **budget-available** and reactivatable.
 
 **Proposed:** the item records why it parked (cap-exhausted vs. budget-available
@@ -209,7 +270,7 @@ Two hard separations the design enforces:
   it must never auto-override a human decision or maintainer hold.
 - **Terminal ≠ recoverable.** A merged, closed, or archived PR is `STALE` and
   is never reactivated by evidence (`reconcileStalePrFixItems`,
-  `reconcileArchivedRepoPrFixItems`, `src/lib/pr-fix-queue.ts:2206`, `:2274`).
+  `reconcileArchivedRepoPrFixItems`, `src/lib/pr-fix-queue.ts:2226`, `:2294`).
 
 **On "dependency block" (issue bullet 4).** That bullet's non-overridable
 "dependency block" is read as the human/maintainer hold class and unresolved
@@ -220,25 +281,42 @@ dependency is re-checked when the new attempt runs).
 
 ## Fresh actionable evidence
 
-Let `d` be the item's `disposedAt` and `W` its watermark. An observation
-`o = (identity, version, observedAt)` is **fresh actionable evidence** iff all
-hold:
+Let `A` be the attempt that wrote the item's current disposition, `W =
+attemptEvidenceWatermark(A)` its durable hand-out snapshot boundary, and `L`
+the item's durable evidence ledger. An observation `o = (identity, version,
+observedAt)` is **fresh actionable evidence** iff all hold:
 
 1. `o.identity` is actionable by kind (table above) and is not in a
    terminal/resolved state (review no longer `CHANGES_REQUESTED`, comment
    resolved/outdated, condition cleared);
-2. `(o.identity, o.version)` is not already recorded in `W` (dedupe by identity
-   **and** version, not identity alone);
-3. `o.contentSignature` is not already recorded in `W` at the same or newer head
-   (anti-repetition);
-4. `(o.identity, o.version)` differs from `disposedEvidence` (the evidence that
-   triggered the current disposition), **and** `o.observedAt > d` where a
-   forge-side event timestamp exists (and `> recoveryAppliedAt` for a repeat
-   after a reactivation). This is what handles a key evicted from the bounded
-   cache: an old key either equals `disposedEvidence` or has a forge timestamp
-   `<= d`, so it is not fresh even when re-read now. For condition kinds with no
-   forge event timestamp, only the durable `(identity, version)` comparison
-   applies.
+2. `o` is a **new ledger transition**: `(o.identity, o.version)` records this
+   identity for the first time, or transitions the version of a known identity.
+   Dedupe is by identity **and** version on the durable ledger, not the bounded
+   cache; a re-read or replay of a stored version is not a transition and is
+   inert here and in every predicate below;
+3. `o.contentSignature` is not already recorded in `L` at the same or newer
+   head (anti-repetition);
+4. `o`'s ledger transition was recorded **after `W`** — the settling attempt
+   could not have been given this version. This replaces any `observedAt >
+   disposedAt` comparison: a webhook delayed past settlement still records a
+   transition after `W` even though its forge timestamp predates the
+   disposition, so late-arriving feedback recovers, while a re-read of
+   already-known evidence (even after cache eviction) has a transition at or
+   before `W` and never mints a new one, so replays stay inert. Forge
+   `observedAt` and ingestion time are both excluded as freshness sources; only
+   transition existence against `W` decides.
+   For a repeat following a reactivation, no separate `recoveryAppliedAt`
+   comparison is needed: reactivation bumps the generation and the next
+   hand-out stamps a fresh watermark, so anything already seen is
+   pre-watermark by construction; `recoveryAppliedAt` remains only as the
+   cooldown timestamp.
+   Condition kinds without a forge event timestamp (`merge_state`,
+   `merge_conflict`) follow the same ledger rule with the stable per-condition
+   identity and version `(state, head)`; their baseline is the durable
+   per-condition ledger row, **never** the single `disposedEvidence` key — the
+   disposition's cause may be unrelated evidence, which says nothing about
+   whether the condition is new to the settling attempt. See [Conditions vs
+   one-shot events](#conditions-vs-one-shot-events).
 
 **Unknown evidence** is handled separately (see
 [Unknown-evidence behavior](#unknown-evidence-behavior)); it never silently
@@ -257,30 +335,50 @@ cooldown is named.
 | 2 | `QUEUED` (dispatched) | new actionable evidence | stays `QUEUED`; recorded in `postDispatchEvidenceKeys` | — | — | — | In-flight worker cannot see it; settlement must reopen (`#1119`). |
 | 3 | `QUEUED` | duplicate / replayed event | no-op | — | — | — | Identity+version already in `W`. |
 | 4 | `QUEUED` | non-actionable/cleared condition | no-op; recorded for audit | — | — | — | Transient `behind`, resolved comment, dismissed review. |
-| 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | Enqueue reopen (`:1140`). |
-| 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | `#940`; FIXED tombstone is untrusted (`:1136`). |
+| 5 | `FIXED` | fresh actionable evidence | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | Enqueue reopen (`:1152`). |
+| 6 | `FIXED` | known evidence, head unchanged | `QUEUED` fresh attempt | +1 | +1 | cap → `PARKED` + stale flag (row 9) | `#940`; FIXED tombstone is untrusted (`:1149`). |
 | 7 | `FIXED` | duplicate/repeated text | no-op | — | — | — | Anti-churn (`#25`). |
-| 8 | **P** `PARKED`/`no_progress`, **budget available** | fresh actionable evidence, cooldown elapsed | `QUEUED` fresh attempt; clear `retryAt`/stale flag | +1 | +1 | cap → `PARKED` | **Gap today:** `PARKED` is sticky to enqueue (`:1116`). |
+| 8 | **P** `PARKED`/`no_progress`, **budget available** | fresh actionable evidence, cooldown elapsed | `QUEUED` fresh attempt; clear `retryAt`/stale flag | +1 | +1 | cap → `PARKED` | **Gap today:** `PARKED` is sticky to enqueue (`:1128`). |
 | 9 | **P** `PARKED`/`no_progress`, **budget exhausted** | fresh actionable evidence | stays `PARKED`; set stale-disposition flag; record evidence | — | — | — | Operator requeue resets budget. Prevents livelock. |
 | 10 | `PARKED`/`infra_failure` | PR feedback | stays `PARKED`; recorded; stale flag | — | — | — | Infra recovery is not PR evidence; needs health signal/operator. |
 | 11 | `PARKED`/`security_failure` | PR feedback | stays `PARKED`; recorded | — | — | — | Operator only (fail-closed). |
 | 12 | **P** `WAITING_EXTERNAL` | recorded recovery trigger fires | `QUEUED` recheck; clear `retryAt` | +1 | — | — | Recheck of the dependency; uncharged (matches current cooldown). |
 | 13 | **P** `WAITING_EXTERNAL` | fresh actionable feedback | `QUEUED` fresh attempt; dependency re-checked on run; clear `retryAt` | +1 | +1 | cap | New work independent of the dependency. |
-| 14 | `WAITING_EXTERNAL` | cooldown elapsed, no trigger | `QUEUED` recheck; clear `retryAt` | +1 | — | `PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS` | Current `reactivateDueExternalWaits` (`:559`); **uncharged**. |
-| 15 | `WAITING_EXTERNAL` | duplicate mark / late mark | no-op | — | — | — | Idempotent; cannot change generation (`:1610`). |
+| 14 | `WAITING_EXTERNAL` | cooldown elapsed, no trigger | `QUEUED` recheck; clear `retryAt` | +1 | — | `PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS` | Current `reactivateDueExternalWaits` (`:568`); **uncharged**. |
+| 15 | `WAITING_EXTERNAL` | duplicate mark / late mark | no-op | — | — | — | Idempotent; cannot change generation (`:1622`). |
 | 16 | `BLOCKED`/`human_decision` | any automatic evidence | stays `BLOCKED`; recorded; stale flag | — | — | — | Human hold; operator requeue/maintainer only. |
 | 17 | **P** any active | maintainer hold set | stays; hold recorded | — | — | — | Explicit hold; evidence cannot override. |
-| 18 | any active | PR merged/closed/archived | `STALE` | — | — | — | Terminal (`:2206`, `:2274`). |
-| 19 | `STALE`/`IGNORED` | evidence | stays | — | — | — | Maintainer mark to `QUEUED` only (`requeue` rejects `STALE`, `:2434`). |
-| 20 | any | operator requeue | `QUEUED` fresh attempt; budgets reset | +1 | reset | — | `requeuePrFixItem` (`:2419`). |
-| 21 | any | maintainer mark `QUEUED` | `QUEUED` fresh attempt | +1 | +1 | — | `markPrFixItem` QUEUED path (`:1788`). |
+| 18 | any active | PR merged/closed/archived | `STALE` | — | — | — | Terminal (`:2226`, `:2294`). |
+| 19 | `STALE`/`IGNORED` | evidence | stays | — | — | — | Maintainer mark to `QUEUED` only (`requeue` rejects `STALE`, `:2526`). |
+| 20 | any | operator requeue | `QUEUED` fresh attempt; budgets reset | +1 | reset | — | `requeuePrFixItem` (`:2511`). |
+| 21 | any | maintainer mark `QUEUED` | `QUEUED` fresh attempt | +1 | +1 | — | `markPrFixItem` QUEUED path (`:1803`). |
 | 22 | dispatched, unacked, stale | reclaim | `QUEUED` fresh generation | +1 | — | `PR_FIX_MAX_RECLAIMS` → `PARKED` | Hand-out never reached a worker (`#1211`). |
-| 23 | dispatched, **acked**, stale | reclaim attempt | never reclaimed | — | — | — | Live owner's lease is protected (`:882`). |
-| 24 | any | old-worker settle at stale generation | no-op (`skipped`) | — | — | — | Settlement token fencing (`:2657`, `:2666`). |
+| 23 | dispatched, **acked**, stale | reclaim attempt | never reclaimed | — | — | — | Live owner's lease is protected (`:893`). |
+| 24 | any | old-worker settle at stale generation | no-op (`skipped`) | — | — | — | Settlement token fencing (`:2765`, `:2774`). |
 
 Row 12 vs row 14: a wait that ends because its dependency resolved is an
 uncharged recheck (as today); a wait interrupted by *new feedback* opens a
 charged attempt (row 13), consistent with `FIXED` reopening on new evidence.
+
+**The `#940` exception and its precedence over rows 3/7.** Row 6 is the `#940`
+stale-`FIXED` safety net (`src/lib/pr-fix-queue.ts:1149`, `:1344`): on a `FIXED`
+item whose PR head has not moved, re-detecting **even already-known**
+triggering evidence reopens. That is deliberate — `FIXED` asserts the feedback
+was addressed, and the same evidence persisting at an unchanged head
+disproves the tombstone — so the duplicate/replay no-ops of rows 3/7 do **not**
+apply to it. Precedence is explicit:
+
+1. On `FIXED` with an unchanged head, evaluate the `#940` rule **first**. A
+   re-observation of actionable evidence for that item reopens (row 6),
+   regardless of whether its `(identity, version)` is already in the ledger.
+2. Duplicate/replay suppression (rows 3/7) applies at every other status, and
+   at `FIXED` it applies only to *anti-repetition* matches — repeated review
+   text under a new review id (row 7, content signature) is not evidence that
+   the tombstone is false and stays a no-op.
+3. Implementation must not let the ledger dedupe of predicate 2 or the
+   content-signature rule of predicate 3 silently delete the `#940` net; a
+   dedupe suppression on `FIXED` at an unchanged head is a bug, and negative
+   control 18 pins both directions.
 
 ## Recovery policy
 
@@ -288,14 +386,15 @@ charged attempt (row 13), consistent with `FIXED` reopening on new evidence.
 
 1. The configured forge capability delivers an observation (webhook or pull
    sync). Ingestion derives `(identity, version, contentSignature)` and
-   populates `observedAt` from the forge payload (see
+   populates `observedAt` from the forge payload, appends a ledger transition
+   only when the version actually changes (see
    [watermark lifetime](#evidence-watermark-lifetime)), and calls the enqueue
    path.
 2. Enqueue is a **commit-time decision** pinned on the row's current
    `generation` and evidence watermark. It appends the observation, then
    re-derives the transition from the same snapshot the write is pinned on, so
    a concurrent append cannot be silently absorbed or clobbered (the `#1134`
-   pinned loop, `src/lib/pr-fix-queue.ts:1276`).
+   pinned loop, `src/lib/pr-fix-queue.ts:1294`).
 3. The transition follows the state-transition table by hold class and remaining
    budget. Only `FIXED`, budget-available `PARKED`/`no_progress`, and structured
    `WAITING_EXTERNAL` are reactivatable by evidence; `BLOCKED`, fail-closed
@@ -309,9 +408,10 @@ the configured forge capability and applies the **same** transition rules. It
 must be:
 
 - **Bounded** per run (page/cap, like `reclaimStalePrFixHandouts`,
-  `:813`), so a backlog never becomes a thundering herd;
+  `:822`), so a backlog never becomes a thundering herd;
 - **Idempotent** — it re-computes `(identity, version)` and no-ops on anything
-  already recorded;
+  already in the ledger, while remaining able to discover transitions that
+  webhooks never delivered (the control-17 case);
 - **Cooldown-guarded** — a reactivation sets `recoveryAppliedAt` so
   reconciliation cannot reopen the same item in a tight loop;
 - **Audited** — every reactivation writes `PrFixHistory` with the actor
@@ -324,11 +424,15 @@ reaping closed PRs.
 
 ### Idempotency, cooldowns, budgets
 
-- **Identity+version dedupe** makes replays and repeated reads no-ops.
-- **Content signature** makes repeated review text no-ops.
-- **`disposedEvidence` durable comparison** (plus `disposedAt` for
-  timestamped kinds) makes cache eviction harmless (see
-  [watermark lifetime](#evidence-watermark-lifetime)).
+- **Ledger transitions** make replays and repeated reads no-ops: only a new
+  `(identity, version)` appends, and reads never restate the baseline.
+- **Content signature** makes repeated review text no-ops (excepting the `#940`
+  precedence on `FIXED` at an unchanged head — see the table note).
+- **The durable ledger plus the per-attempt watermark** make cache eviction
+  harmless and late discovery recoverable (see
+  [watermark lifetime](#evidence-watermark-lifetime)); condition kinds carry
+  their baseline in the per-condition ledger row, so no disposition key is
+  ever consulted for freshness.
 - **Cooldown** (`PR_FIX_RECOVERY_COOLDOWN_MS`, **Proposed**; default 6 h,
   matching the external-wait cooldown) paces evidence-driven reactivation of
   operational holds.
@@ -342,7 +446,7 @@ reaping closed PRs.
 ### Audit trail
 
 Every transition appends an immutable `PrFixHistory` row. **Proposed** fields
-extend the current row (`prisma/schema.prisma:237`) with: from/to `status`,
+extend the current row (`prisma/schema.prisma:265`) with: from/to `status`,
 `generation`, actor class (worker / operator / maintainer / reconciler), and the
 triggering `(identity, version)`. Prior attempts and their reasons are
 preserved; reactivation never erases the record of why the item was parked or
@@ -356,7 +460,7 @@ next reactivation or operator requeue).
 |---------|--------|
 | `POST /api/pr-fix-queue/requeue` | Release `BLOCKED`, `PARKED`, or `FIXED`; fresh generation; reset attempt and reclaim budgets. |
 | Mark to `QUEUED` (maintainer tier) | Release a sticky settlement including `STALE`/`IGNORED`; fresh generation; +1 attempt. |
-| `POST /api/pr-fix-queue/requeue` for `WAITING_EXTERNAL` (**Proposed**) | Explicitly end an external wait early; today `requeue` rejects it (`:2434`). |
+| `POST /api/pr-fix-queue/requeue` for `WAITING_EXTERNAL` (**Proposed**) | Explicitly end an external wait early; today `requeue` rejects it (`:2526`). |
 | Maintainer hold (**Proposed**) | Explicit hold that evidence cannot override; cleared only by an operator. |
 | `GET /api/audit` / `PrFixHistory` | Inspect why an item is held and what evidence has arrived since. |
 
@@ -364,7 +468,7 @@ next reactivation or operator requeue).
 
 `WAITING_EXTERNAL` must name a **concrete dependency**, not merely "we have not
 pushed a patch." Today the status carries only a free-text note and a timer
-(`markPrFixItem`, `src/lib/pr-fix-queue.ts:1609`); the note is not machine
+(`markPrFixItem`, `src/lib/pr-fix-queue.ts:1626`); the note is not machine
 checkable, so the queue cannot tell whether the dependency resolved.
 
 A conforming wait records:
@@ -399,20 +503,20 @@ Rules:
 - **Settlement authority is the attempt token.** A report settles exactly the
   `(id, generation)` it was issued; a stale generation, mismatched repo/PR, or
   already-settled status yields `action: "skipped"` with no mutation
-  (`resolvePrFixFromAgentReport`, `:2604`; fences at `:2657`, `:2666`). An old
+  (`resolvePrFixFromAgentReport`, `:2712`; fences at `:2765`, `:2774`). An old
   worker can never settle newer feedback.
 - **Commit-time pins.** Settlement, reclaim, and enqueue writes are
   generation-conditional and, where they touch the watermark, pinned on the
   exact snapshot they decided from, so a concurrent re-issue between read and
   write no-ops the loser. **Current exception:** the terminal reap in
-  `reconcileStalePrFixItems` (`:2229`) and `reconcileArchivedRepoPrFixItems`
-  (`:2292`) writes `STALE` by `id` only, with no generation/status predicate, so
+  `reconcileStalePrFixItems` (`:2251`) and `reconcileArchivedRepoPrFixItems`
+  (`:2312`) writes `STALE` by `id` only, with no generation/status predicate, so
   a concurrent requeue can be clobbered. **Proposed:** make the reaps
   generation-pinned, or scope this invariant to settlement/reclaim/enqueue
   writes and document the reap exception.
 - **Hand-out ownership.** An acked attempt is never reclaimed, even when stale
   by wall-clock; reclamation targets only unacked stamped hand-outs and counts
-  toward `PR_FIX_MAX_RECLAIMS` (`:813`–`:1065`). Reactivation must not clear a
+  toward `PR_FIX_MAX_RECLAIMS` (`:822`–`:1076`). Reactivation must not clear a
   healthy owner's ack or duplicate an active hand-out.
 - **Generation bump on every reactivation** is what makes old-worker settling
   safe: the consumed identity is no longer current.
@@ -423,7 +527,7 @@ Rules:
 |-----------|----------|
 | Unparseable / unknown event kind | Do **not** advance the watermark; record an `unknown_evidence` audit entry; do **not** reopen (fail-closed against churn); bounded reconciliation re-reads authoritative state. |
 | Missing head SHA on a check | Treat as actionable (conservative) but bounded by cooldown and attempt cap; re-fetch on the next pass. |
-| Missing/unknown PR state | Defer; never reopen or reap into a fresh attempt (`report.unknownState`, `:892`). |
+| Missing/unknown PR state | Defer; never reopen or reap into a fresh attempt (`report.unknownState`, `:901`). |
 | Head fetch failure | Defer with an audit note; never silently absorb and never loop unbounded. |
 
 The asymmetry is deliberate: absorbing real evidence is the bug this design
@@ -447,8 +551,10 @@ These are the invariants implementation tests must pin:
    repeated cycles terminate at the cap in `PARKED`/`no_progress`.
 7. **Cap-exhausted `PARKED`** + fresh evidence → no reopen, no attempt
    increment, no generation bump; stale flag set; operator requeue required.
-8. **Evicted watermark key** re-read → not fresh: its `(identity, version)`
-   equals `disposedEvidence`, or its forge-side `observedAt <= disposedAt`.
+8. **Evicted watermark key** re-read → not fresh: the durable ledger holds its
+   `(identity, version)` with a transition at or before the boundary attempt's
+   watermark, and the re-read mints no new transition — regardless of when it
+   is re-read or what `disposedEvidence` references.
 9. **Watermark reset** at a fresh attempt → the prior attempt's reason survives
    in history; no re-open of already-settled evidence.
    - **`FIXED` reopened at the attempt cap** → lands `PARKED`/`no_progress`
@@ -465,6 +571,31 @@ These are the invariants implementation tests must pin:
     concurrent requeue (or the reap exception is explicitly accepted).
 16. **Wait downgrade** — a new dependency-less wait parks fail-closed and is not
     evidence-reactivatable; a legacy wait is flagged, not bulk-downgraded.
+17. **Delayed webhook during the attempt** — hand-out at 10:00 (watermark
+    stamped); review submitted 10:05, webhook lost; worker settles
+    `FIXED`/no-change (or `WAITING_EXTERNAL`) at 10:10; reconciliation first
+    discovers the review at 10:15. Its ledger transition postdates the attempt
+    watermark → fresh, reopen, **even though** `submitted_at (10:05) <
+    disposedAt (10:10)`. A design that compares forge timestamps against the
+    disposition time fails this control.
+18. **Old-known replay vs `#940`** — an evidence identity already recorded at
+    or before the hand-out watermark is replayed or re-read after the
+    disposition, following cache eviction → no ledger transition, no reopen at
+    any status **except** `FIXED` at an unchanged head, where the `#940` rule
+    (row 6) reopens; and the reverse direction: repeated review text under a
+    new review id at `FIXED`/unchanged head stays a no-op via content
+    signature. Both directions must hold together — dedupe must not swallow
+    the `#940` net, and `#940` must not resurrect anti-repetition reopening.
+19. **Persistent condition across eviction and an unrelated disposition** —
+    `dirty` merge state observed and recorded before the attempt; the item is
+    parked by unrelated review `R`; later observations evict the `dirty` key
+    from the bounded fast-path caches; reconciliation re-reads the unchanged
+    `dirty` at the same head → the per-condition ledger row already holds that
+    `(state, head)` version → no transition, **no reopen**, even though
+    `disposedEvidence` references `R` and not `dirty`. Paired positive: a
+    clean→dirty transition, or the same `dirty` observed at a new head, is a
+    ledger transition and may reopen (subject to persistence, cooldown, and
+    budget).
 
 ## Worked examples
 
@@ -474,15 +605,25 @@ Item is `QUEUED` and dispatched (generation `g`). A new `CHANGES_REQUESTED`
 review lands before the worker reports. It is recorded in
 `postDispatchEvidenceKeys` bound to `g`. When the worker reports `FIXED`/`no_changes_needed`,
 settlement sees actionable post-dispatch evidence and reopens a fresh attempt
-at `g+1` (`:1762`) instead of marking `FIXED`. Current behavior already matches
+at `g+1` (`:1786`) instead of marking `FIXED`. Current behavior already matches
 this case.
+
+**The webhook is lost instead.** Hand-out at 10:00 stamps the attempt
+watermark; the review is submitted 10:05 but its webhook never arrives; the
+worker settles `FIXED`/no-change (or `WAITING_EXTERNAL`) at 10:10; the bounded
+reconciliation pass first discovers the 10:05 review at 10:15. It was never in
+the hand-out snapshot, so its ledger transition is recorded after the attempt
+watermark and it is fresh despite `submitted_at (10:05) < disposedAt (10:10)`:
+the item reopens at `g+1`. Rejecting it on a timestamp comparison against the
+disposition would strand exactly the missed-event case #1244 exists to
+recover — pinned by negative control 17.
 
 ### 2. Feedback arrives after no-change
 
 Worker reports `no_changes_needed`; item becomes `FIXED` at head `H`. Later a
 review requests changes on head `H` (same head) or on a newer head. With new
-actionable evidence, enqueue reopens a fresh attempt (`:1140`). With the same
-evidence and an unchanged head, the `#940` path reopens (`:1136`) because the
+actionable evidence, enqueue reopens a fresh attempt (`:1152`). With the same
+evidence and an unchanged head, the `#940` path reopens (`:1149`) because the
 FIXED tombstone is untrusted. **Gap:** if the new feedback is repeated text
 under a new review id, today it reopens; the design suppresses it via content
 signature.
@@ -491,7 +632,7 @@ signature.
 
 Item is `WAITING_EXTERNAL` on `org/repo#123` with `retryAt = +6h`. A
 `CHANGES_REQUESTED` review lands at +1h. **Current:** the item stays
-`WAITING_EXTERNAL` until the cooldown (sticky at `:1116`), so the new feedback
+`WAITING_EXTERNAL` until the cooldown (sticky at `:1128`), so the new feedback
 is stranded. **Proposed:** fresh actionable feedback opens a fresh generation
 immediately (row 13); the worker re-checks the dependency and, if it is still
 unsatisfied, re-parks with a refreshed `recheckAt`. Alternatively, if the
@@ -524,7 +665,7 @@ boundary, dependency block, or unresolved scope decision.
 
 ### 6. Feedback arrives after merge/close
 
-The PR merged. Reconcile marks the item `STALE` (`:2206`). A late webhook then
+The PR merged. Reconcile marks the item `STALE` (`:2226`). A late webhook then
 arrives. **Current and design:** no reopen; terminal states are inert. The late
 observation is recorded for audit only.
 
@@ -532,23 +673,28 @@ observation is recorded for audit only.
 
 | Requirement | Current behavior | Gap |
 |-------------|------------------|-----|
-| Fresh evidence by authoritative identity | `evidenceKeys` dedupe by identity only (`:297`); `postDispatchEvidenceKeys` for the FIXED-settle path (`:1190`) | No version/content-signature model; new id ⇒ fresh even for repeated text. |
+| Fresh evidence by authoritative identity | `evidenceKeys` dedupe by identity only (`:306`); `postDispatchEvidenceKeys` for the FIXED-settle path (`:1780`) | No version/content-signature model; new id ⇒ fresh even for repeated text. |
 | Already-resolved comments excluded | No resolution/outdated state is read (`src/lib/github-prs.ts`) | **Gap:** needs a new forge read capability. |
-| Watermark sound under bounds | 40-entry FIFO + 20-entry priority caches; per-attempt reset (`:1238`) | No disposition timestamp; evicted keys can read as fresh. |
-| Reactivate operational parking | `PARKED` and `WAITING_EXTERNAL` are sticky to enqueue (`:1116`) | Fresh evidence does not reactivate budget-available `no_progress`; cap-exhausted parks need an explicit operator path + stale flag. |
-| WAITING_EXTERNAL concrete dependency | Free-text note + timer only (`:1609`, `:559`) | No machine-checkable dependency/evidence/recovery trigger; "no patch" can masquerade as an external wait. |
+| Watermark sound under bounds | 40-entry FIFO + 20-entry priority caches; per-attempt reset (`:1255`) | No durable ledger and no per-attempt evidence watermark: evicted keys can read as fresh, and late-discovered events fail any timestamp-vs-disposition comparison. |
+| Durable baseline for condition kinds | `merge_state`/`merge_conflict` identity derived from the state string; only bounded caches hold observations | No stable per-condition row: an unchanged persistent condition re-read after eviction reads as new, and no single disposition key can preserve it. |
+| Reactivate operational parking | `PARKED` and `WAITING_EXTERNAL` are sticky to enqueue (`:1128`) | Fresh evidence does not reactivate budget-available `no_progress`; cap-exhausted parks need an explicit operator path + stale flag. |
+| WAITING_EXTERNAL concrete dependency | Free-text note + timer only (`:1626`, `:568`) | No machine-checkable dependency/evidence/recovery trigger; "no patch" can masquerade as an external wait. |
 | Event-driven invalidation of a wait | Cooldown only | No recovery-trigger or fresh-feedback invalidation. |
-| Preserve human decisions | `BLOCKED` sticky; worker settlements pinned (`:1624`) | No explicit maintainer hold distinct from `BLOCKED`; no stale-disposition flag when evidence arrives. |
-| Settlement fencing | Attempt token + generation pins + ack/reclaim (`:2604`, `:813`) | Reap writes are not generation-conditional (`:2229`, `:2292`). |
+| Preserve human decisions | `BLOCKED` sticky; worker settlements pinned (`:1657`) | No explicit maintainer hold distinct from `BLOCKED`; no stale-disposition flag when evidence arrives. |
+| Settlement fencing | Attempt token + generation pins + ack/reclaim (`:2712`, `:822`) | Reap writes are not generation-conditional (`:2251`, `:2312`). |
 | Bounded periodic reconciliation | `pr-followup` sync + `reconcile` reap closed/archived | Reconciliation reaps terminal PRs but does not apply the freshness transition table to active items. |
-| Unknown evidence | Split: unknown event kinds non-actionable; unknown head actionable (`:388`) | No single documented policy; no audit entry. |
+| Unknown evidence | Split: unknown event kinds non-actionable; unknown head actionable (`:415`) | No single documented policy; no audit entry. |
 
 ## Implementation outline (for the follow-up, not this issue)
 
-1. Extend the evidence record with `(version, contentSignature, observedAt)`,
-   where `observedAt` is the forge-side event timestamp; add
-   `disposedAt`/`recoveryAppliedAt`/`disposedEvidence` to `PrFixQueueItem`; keep
-   `evidenceKeys` for backward compatibility.
+1. Add a durable per-item evidence ledger (one row per `(item, identity)`:
+   `version`, monotonic transition position, forge-side event timestamp,
+   content signature) and stamp `attemptEvidenceWatermark` on every hand-out;
+   extend the in-band evidence record with `(version, contentSignature,
+   observedAt)` as its fast-path projection; add `disposedAt`/
+   `recoveryAppliedAt`/`disposedEvidence` to `PrFixQueueItem` as audit fields
+   (not freshness predicates); give `merge_state`/`merge_conflict` stable
+   per-PR identities; keep `evidenceKeys` for backward compatibility.
 2. Add a disposition/hold classifier (including cap-exhausted vs budget-available)
    and a single `evaluateRecovery(watermark, observation)` used by both the
    event-driven enqueue path and the periodic reconciliation pass.
@@ -557,7 +703,7 @@ observation is recorded for audit only.
 4. Add `PR_FIX_RECOVERY_COOLDOWN_MS` (default 6 h) and a stale-disposition flag.
 5. Extend `PrFixHistory` with from/to `status`, `generation`, actor class, and
    `(identity, version)`; extend `PrFixOutcome`/`VALID_PR_FIX_OUTCOMES`
-   (`src/types/index.ts:264`) if `external_wait` is promoted to a stored
+   (`src/types/index.ts:266`) if `external_wait` is promoted to a stored
    outcome, or keep it status-implied.
 6. Make the terminal reap writes generation-pinned (or document the exception).
 7. Add the negative-control tests above.
