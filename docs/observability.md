@@ -232,9 +232,9 @@ lanes `NORMAL, ESCALATED, NEEDS_HUMAN` (`prisma/schema.prisma:124-138`).
 `generation` is the work identity (bumped on a fresh attempt); `fixAttempts` is
 bounded by `PR_FIX_MAX_ATTEMPTS` default 5 (`src/lib/pr-fix-queue.ts:549-552`).
 Hand-out timeout `PR_FIX_HANDOUT_TIMEOUT_MS` default 30 min; reclaim cap
-`PR_FIX_MAX_RECLAIMS` default 3 (`pr-fix-queue.ts:579-597`). Past the cap the
+`PR_FIX_MAX_RECLAIMS` default 3 (`src/lib/pr-fix-queue.ts:579-597`). Past the cap the
 item is **PARKED + `no_progress`** — bounded exhaustion, never a human decision
-(`pr-fix-queue.ts:937-1010`). The `pr-fix-sweep` scheduler job is
+(`src/lib/pr-fix-queue.ts:937-1010`). The `pr-fix-sweep` scheduler job is
 default-disabled, so reclaim may be absent in a default deployment, and the
 overdue signal can rise without an automated sweeper to drain it — see A7.
 
@@ -390,21 +390,29 @@ Conditions are backend-neutral state predicates. `for` is the minimum duration
 the predicate must hold before firing (avoid flapping). Severity is a
 recommendation; the consumer maps it.
 
-| # | Alert | Condition (predicate) | Severity | `for` | Why actionable | Recovery / operator action |
-|---|---|---|---|---|---|---|
-| A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
-| A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
-| A3 | Health/DB down | `dispatch_health_up == 0` | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
-| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800s"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
-| A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
-| A6 | Assigned without execution | **Future gap — must NOT fire on the aggregate.** Intended predicate: an individual **open, eligible** issue (not `done`/`blocked`) has carried `agent/*` with no active lease/`AgentWork` for longer than a threshold T. Per-item waiting age is not derivable from persisted columns today — label assignment carries no timestamp (`Issue` has no `assignedAt`; `updatedAt`/`lastSyncedAt` refresh on unrelated changes), and only actions-route assignments produce `assign_agent` audit rows (`src/app/api/issues/actions/route.ts:14`; claims audit as `claim_issue` but materialize a lease, so they fall outside this predicate), so a GitHub-side assignment has no age source at all. Firing `dispatch_assigned_without_execution > 0` sustained would misreport healthy churn as failure (§8.7), so this row stays pinned — an exporter that ships an age source promotes it to a real alert (§10) | info (pinned; not firing) | 30m (T, once age exists) | Assigned but never picked up; invisible in a queue-depth-only view. Until the age gap closes, execution-loss detection is owned by A5 (expired leases / STALE work) and pickup starvation by A4/A10 | Verify the worker polls its lane; check admission withholding |
-| A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
-| A8 | PR-fix head-of-line | `dispatch_pr_fix_oldest_queued_seconds > threshold` | warning | 30m | Work is queued but not draining | Check worker concurrency, lane routing, and `fixAttempts` saturation |
-| A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | info/warning | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
-| A10 | Admission withholding | `dispatch_queue_withheld{reason="grooming_unknown"}` or `{reason="grooming_stale"}` sustained | warning | 1h | The admission gate is starving the queue on missing/stale grooming | Fix grooming pipeline; or operator admission override for a specific issue |
-| A11 | Grooming backoff | `dispatch_grooming_backoff > 0` sustained | warning | 30m | Upstream GitHub reads are failing; issues cannot be groomed | Check GitHub reachability/rate limits |
-| A12 | Audit failures | `dispatch_audit_failures_in_window{window="900s"} > 0` | warning | 5m | Mutations are failing (labels/claims). The predicate evaluates the as-of-scrape 15-minute gauge **directly**, so a new failure fires even when an older one expires from the window at the same moment — a `delta()` over a rolling windowed count could read zero there (§4.1) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
-| A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` **or** `dispatch_grooming_backoff > 0` | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
+| # | Alert | Condition (predicate) | Enabled | Severity | `for` | Why actionable | Recovery / operator action |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 | Scheduler job overdue | `dispatch_scheduler_job_overdue{job=...} == 1` | yes | critical | 10m | Every queue is fed by these jobs; a stopped timer starves the loop silently | Inspect logs; restart/verify `DISPATCH_SCHEDULER_ENABLED`; supervisor re-arms, but a persistent stop is a real fault |
+| A2 | No successful sync | `dispatch_sync_last_success_timestamp_seconds` series **absent** (no `IssueSyncRun` has ever completed — the never-successful first sync must not be silent) **or** `time() - dispatch_sync_last_success_timestamp_seconds > 2× sync interval` | yes | critical | 5m | Supply is stale, or has never flowed; issues will not enter the queue. Consumers must evaluate the absent-series case as firing (e.g. `absent(...) == 1` in Prometheus), because `time() - <no data> > x` yields no data, not true | Check `IssueSyncRun` errors and GitHub reachability |
+| A3 | Health/DB down | `dispatch_health_up == 0` | yes | critical | 2m | The service cannot serve work | Check DB connectivity; `/api/health` returns 503 |
+| A4 | Eligible work not handed out | `dispatch_issues_open_claimable > 0` **and** `dispatch_execution_active == 0` **and** `dispatch_work_pickups_in_window{window="1800s"} == 0` **and** `dispatch_agent_runs_reported_in_window{window="1800s"} == 0` **and** `dispatch_scheduler_healthy == 1` **and** `(time() - dispatch_sync_last_success_timestamp_seconds) <= 2 × sync interval` | yes | warning | 30m | Work exists **and** nothing is executing **and** nothing has been picked up or reported in 30 minutes **and** every scheduled job is ticking **and** the last sync is fresh enough that A2 would be silent — an idle fleet while work waits, i.e. supply is not reaching workers. Three suppressors cover both delivery modes: a task in flight keeps `dispatch_execution_active` at 1 for its full duration (claim/agent-work workers — see §8.6); a fresh claim/start raises the pickup gauge; and any finished task's report lands in the reported gauge even for the canonical loop (next-task → execute → report), which writes no pickup row. Both gauges exclude the non-task system rows (groomer, heartbeat, legacy ingestion) per the §4.3 filter, so a busy groomer or a merely polling fleet cannot mask an idle fleet — nor disarm A4 the other way. Residual blind spot (documented, not solvable from the DB): a worker that materializes no claim/agent-work and runs a *single* task longer than the window without reporting is invisible while mid-task, and A4 fires; that firing is a truthful "Dispatch cannot observe this fleet" warning, and materializing a claim or agent-work start removes the ambiguity. A *hung* claimed task is caught by A5 and the AgentWork heartbeat-age signal instead. The fresh-sync guard is the explicit spelling of A2-suppresses-A4: a scheduler that ticks on time while sync is failing (or has never completed, so the sync series is absent and the guard cannot pass) no longer satisfies A4, and is routed to A2/A13 instead | Check worker availability/credentials; confirm `next-task` returns `implement`; confirm workers materialize a claim or agent-work start |
+| A5 | Stale ownership | `dispatch_leases_expired > 0` or `dispatch_agent_work{state="STALE"} > 0` | yes | warning | 15m | Ownership is lost; the issue may be stuck in-progress | Stale sweep releases it; if it persists, inspect the sweep job (A1) |
+| A6 | Assigned without execution | **Future gap — must NOT fire on the aggregate.** Intended predicate: an individual **open, eligible** issue (not `done`/`blocked`) has carried `agent/*` with no active lease/`AgentWork` for longer than a threshold T. Per-item waiting age is not derivable from persisted columns today — label assignment carries no timestamp (`Issue` has no `assignedAt`; `updatedAt`/`lastSyncedAt` refresh on unrelated changes), and only actions-route assignments produce `assign_agent` audit rows (`src/app/api/issues/actions/route.ts:14`; claims audit as `claim_issue` but materialize a lease, so they fall outside this predicate), so a GitHub-side assignment has no age source at all. Firing `dispatch_assigned_without_execution > 0` sustained would misreport healthy churn as failure (§8.7), so this row stays pinned — an exporter that ships an age source promotes it to a real alert (§10) | no — pinned future gap | info (pinned; not firing) | — (T applies only when promoted) | Assigned but never picked up; invisible in a queue-depth-only view. Until the age gap closes, execution-loss detection is owned by A5 (expired leases / STALE work) and pickup starvation by A4/A10 | Verify the worker polls its lane; check admission withholding |
+| A7 | Unacknowledged hand-outs (overdue) | `dispatch_pr_fix_overdue_unacked > 0` sustained | yes | warning | 35m | A worker may have died before materializing its run; item is stranded past the configured hand-out timeout. The predicate is age-tied to `dispatchedAt` (per-row `now − dispatchedAt > PR_FIX_HANDOUT_TIMEOUT_MS`), not the aggregate unacked count, so steady churn does not fire | Reclaim sweep (`pr-fix-sweep`, default-disabled) or operator requeue |
+| A8 | PR-fix head-of-line | `dispatch_pr_fix_oldest_queued_seconds > threshold` | yes | warning | 30m | Work is queued but not draining | Check worker concurrency, lane routing, and `fixAttempts` saturation |
+| A9 | Human decisions piling up | `dispatch_pr_fix_human_decisions > 0` **and** oldest age > threshold | yes | info/warning | 1h | A person must decide; PARKED is excluded so this is real | Review the BLOCKED item's decision context and act |
+| A10 | Admission withholding | `dispatch_queue_withheld{reason="grooming_unknown"}` or `{reason="grooming_stale"}` sustained | yes | warning | 1h | The admission gate is starving the queue on missing/stale grooming | Fix grooming pipeline; or operator admission override for a specific issue |
+| A11 | Grooming backoff | `dispatch_grooming_backoff > 0` sustained | yes | warning | 30m | Upstream GitHub reads are failing; issues cannot be groomed | Check GitHub reachability/rate limits |
+| A12 | Audit failures | `dispatch_audit_failures_in_window{window="900s"} > 0` | yes | warning | 5m | Mutations are failing (labels/claims). The predicate evaluates the as-of-scrape 15-minute gauge **directly**, so a new failure fires even when an older one expires from the window at the same moment — a `delta()` over a rolling windowed count could read zero there (§4.1) | Inspect `AuditLog.errorMessage` for the action; **do not** label by error string |
+| A13 | Upstream evidence unavailable | `dispatch_repo_stale_sync_seconds > 2× sync interval` **or** `dispatch_grooming_backoff > 0` | yes | warning | 15m | Admission/settlement decisions lack current evidence; the forge could not be read | Check GitHub reachability/rate limits; treat `unknown` as unknown, never healthy |
+
+The `Enabled` column is the wiring contract: `yes` means a consumer **may**
+evaluate the predicate and map it to a rule; `no` means the row documents a known
+gap and **must not** be wired into an evaluator. A6 is the only disabled row —
+its intended predicate (per-issue assignment age T) and the missing age source
+are spelled out in the row itself, and it graduates to `yes` via
+[§10](#10-open-questions-and-deferred-decisions) once a per-item assignment age
+exists.
 
 ### Normal inactivity must NOT alert
 
@@ -682,3 +690,28 @@ design, not a decision.
   whether the exporter queries the primary or a replica.
 - **OTel semantic conventions:** whether to map to standard metric/log
   conventions or keep Dispatch-prefixed names.
+
+---
+
+## 11. Design self-verification
+
+Because this document is design-only, its invariants are enforced by an
+executable check at `docs/observability.test.ts`, run as part of `npm run test`
+— not by production code, which has no exporter yet.
+
+- **Alert structure:** alert IDs `A1`–`A13` appear exactly once, every row has
+  the required columns, and the required cells are non-empty.
+- **Enablement contract:** disabled rows carry no `for` duration and a severity
+  of `info`, so a `no` row can never look like a live rule.
+- **Rate functions:** no alert condition evaluates a signal with `increase()`,
+  `rate()`, or `delta()` (§4.1).
+- **Signal closure:** every `dispatch_*` signal named in an alert condition is
+  defined in the [§4](#4-signal-and-state-catalogue) catalogue.
+- **Citation drift:** every `file:line` citation in this document resolves to an
+  existing file and an existing line, so a refactor that moves code fails here.
+- **Source drift:** the `IssueSyncRun.status` values the predicates match are
+  exactly the values the source writes.
+
+This verifies **structure and source drift only**. It does not exercise alert
+runtime behavior — no exporter exists yet, so there is nothing to evaluate
+against ([§10](#10-open-questions-and-deferred-decisions)).
