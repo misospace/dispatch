@@ -62,6 +62,9 @@ Issues are classified into execution lanes that control agent queue behavior and
 ### Agent Labels
 - `agent/*` - Issue is assigned to or being worked on by an agent (e.g., `agent/alpha`, `agent/beta`). The Board Agent filter is derived only from synced `agent/*` labels, not `AgentRun` names, configured agents, or GitHub assignees.
 
+### Claim Ownership and Reconciliation
+- A claim is not proof of active execution and missing telemetry is not proof of abandonment. The proposed ownership state model, evidence hierarchy, compatibility/migration policy, and bounded reconciliation transitions are specified in [Ownership Reconciliation Design](docs/ownership-reconciliation.md).
+
 ### Project Labels
 - Optional: `project/*` labels may exist on issues, but Dispatch Projects groups issues by repository by default.
 
