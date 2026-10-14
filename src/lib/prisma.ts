@@ -136,6 +136,7 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
     issue: client.issue,
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
+    capacityHandoff: client.capacityHandoff,
     $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
       client.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
   };

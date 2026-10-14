@@ -107,6 +107,8 @@ export interface ResumeContext {
 
 export interface ResumeContextWithLease extends ResumeContext {
   leaseId: string;
+  /** #1256: opaque claim token fencing capacity-handoff release to this claim. */
+  claimToken?: string;
   lane: string;
   status: string;
   labels: string[];

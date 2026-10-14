@@ -40,10 +40,12 @@ model Issue {
   laneHistory   IssueLane[]
   agentWork     AgentWork[]
   leases        Lease[]
+  mutationGuard IssueMutationGuard?
   groomingRuns  GroomingRun[]
   groomingApplications  GroomingApplication[]
   groomingChildClaims   GroomingChildClaim[]
   groomerPendingReplies GroomerPendingReply[]
+  lifecycleEvents       IssueLifecycleEvent[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -121,6 +123,19 @@ model Issue {
   @@index([groomingRetryAfter])
 }
 
+model IssueMutationGuard {
+  issueId    String   @id
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  operation  String
+  ownerToken String   @unique
+  agentName  String?
+  claimToken String?
+  executing  Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@index([agentName, claimToken])
+}
+
 enum PrFixLane {
   NORMAL
   ESCALATED
@@ -186,6 +201,19 @@ model PrFixQueueItem {
   // wall-clock of that hand-out.
   dispatchedGeneration Int?
   dispatchedAt       DateTime?
+  // #1256: authoritative per-hand-out receipts. One entry per live hand-out
+  // issued by next-task, format "<token>@<agentName>@<generation>" (token is
+  // an opaque random value containing no "@"; the agent name may contain "@",
+  // so the token boundary is the FIRST "@" and the generation the LAST).
+  // Settlement of a capacity-exhausted report requires the reporting agent to
+  // present the exact token it was issued, and the write releases only that
+  // agent's receipt — other agents' live hand-outs and acknowledgements at
+  // the same generation survive. Invariant: an entry exists exactly while the
+  // matching `agentHandouts` entry exists (issuance pushes both atomically;
+  // every clear site clears both), so a hand-out that was released, reclaimed,
+  // or superseded by a generation bump can never be settled with its old
+  // token, and each new hand-out rotates in a fresh token.
+  handoutReceipts    String[]       @default([])
   // New (previously-unrecorded) evidence arrived AFTER the current generation
   // was handed out (#1119): the in-flight worker cannot see it, so settlement
   // must reopen a fresh attempt instead of absorbing it. Records the evidence
@@ -319,6 +347,69 @@ model AgentReportDedupe {
 
   @@unique([agentName, idempotencyKey])
   @@index([agentName])
+}
+
+// ---------------------------------------------------------------------------
+// IssueLifecycleEvent — the durable, worker-neutral event stream for a work
+// item's lifecycle (#1202). IssueLane already records lane history; this
+// records claim / release / status / completion history so a later
+// claim-to-merge read never has to infer a first claim from issue creation or
+// overwrite an earlier attempt.
+//
+// Every row belongs to the Issue it describes (there is no Courier-specific
+// table or side channel), and every writer — API route, hosted groomer,
+// reconciler, sync, webhook, worker report — goes through
+// src/lib/issue-lifecycle.ts, so the taxonomy and the idempotency rules live in
+// one place.
+//
+// `occurredAt` is when the transition happened; `observedAt` is when Dispatch
+// saw it. A late or out-of-order observation keeps its real occurredAt and is
+// never backdated into observedAt, and events are never replayed back onto
+// Issue state, so the present status can only be changed by the writer that
+// owns it. `dedupeKey` carries a source-provided identity (a GitHub delivery
+// id, a merged-PR identity, a sync's issue-updated_at) so redelivery upserts
+// instead of duplicating; Dispatch-authored writes leave it NULL and rely on
+// the no-op-transition guard instead.
+//
+// See docs/issue-lifecycle-events.md for the taxonomy and migration notes.
+// ---------------------------------------------------------------------------
+
+model IssueLifecycleEvent {
+  id           String @id @default(cuid())
+  issueId      String
+  issue        Issue  @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  repoFullName String
+  issueNumber  Int
+  // Taxonomy: claim | claim_released | attempt_failed | status_changed |
+  // completed | issue_closed | issue_reopened | pr_merged.
+  kind         String
+  // The writer that produced this event (see LIFECYCLE_SOURCES).
+  source       String
+  // The identity responsible: an agent name, an operator actor, or the
+  // automation's own name.
+  actor        String
+  agentName    String?
+  fromStatus   String?
+  toStatus     String?
+  // Identity of the event in its source system, when the source has one
+  // (GitHub delivery id, PR number + merged_at, webhook action). NULL for
+  // writes Dispatch authors itself.
+  sourceEventId String?
+  // Idempotency identity for externally observed events; unique, so a
+  // redelivered webhook or a repeated sync upserts instead of duplicating.
+  // NULL means "no source identity" — those writes are guarded by the
+  // transition check instead.
+  dedupeKey     String?  @unique
+  occurredAt    DateTime
+  observedAt    DateTime @default(now())
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  @@index([issueId, occurredAt])
+  @@index([issueId, kind])
+  @@index([issueId, kind, occurredAt])
+  @@index([repoFullName, issueNumber])
+  @@index([kind])
 }
 
 model AuditLog {
@@ -805,10 +896,53 @@ model Lease {
   prUrl      String?  // associated PR URL if one exists
   expiredAt  DateTime // absolute expiry; default TTL is set at creation time
   renewedAt  DateTime?
+  // #1256: opaque attempt/claim token issued to the worker on claim. It fences
+  // a capacity-handoff release to the EXACT claim: renewals keep the token,
+  // but a released/expired lease that is re-claimed gets a fresh row and a
+  // fresh token, so a stale worker's token can never release a newer claim.
+  claimToken String?  @unique
   createdAt  DateTime @default(now())
 
   @@unique([agentName, issueId])
   @@index([agentName, expiredAt])
   @@index([expiredAt])
   @@index([issueId])
+}
+
+// ---------------------------------------------------------------------------
+// Capacity handoffs (#1256) — bounded, capacity-SCOPED cooldowns.
+//
+// When a worker explicitly recognizes that its execution capacity (an opaque
+// provider/model/runner identifier chosen by the worker) cannot run a handed
+// attempt, it settles the attempt with a fenced handoff. Dispatch keeps the
+// work item itself discoverable to other compatible workers; this table only
+// records "capacity C should not be re-handed <this item> until T". Workers
+// that declare no capacity conservatively skip cooled items (fail-closed).
+// Expired rows are pruned lazily on read; they carry no retry budget.
+// ---------------------------------------------------------------------------
+
+model CapacityHandoff {
+  id            String   @id @default(cuid())
+  capacity      String   // opaque worker-declared capacity identifier
+  // Which subsystem owns the handed-off work: "issue" (claim/lease release)
+  // or "pr_fix" (PR-fix queue attempt).
+  kind          String
+  repoFullName  String
+  issueNumber   Int?
+  prNumber      Int?
+  // The worker that handed the work off, for audit/history.
+  agentName     String
+  issueId       String?  // issue-form handoffs: the local Issue row
+  // The attempt generation the handoff settles (pr_fix rows). The replay
+  // check is keyed on it so a fresh attempt is never absorbed by an older
+  // generation's cooldown window.
+  generation    Int?
+  cooldownUntil DateTime // handoff suppresses re-hand to `capacity` before this time
+  note          String?  @db.Text
+  createdAt     DateTime @default(now())
+
+  @@index([capacity, cooldownUntil])
+  @@index([kind, repoFullName, issueNumber, cooldownUntil])
+  @@index([kind, repoFullName, prNumber, cooldownUntil])
+  @@index([cooldownUntil])
 }

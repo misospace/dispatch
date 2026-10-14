@@ -1,3 +1,10 @@
+const { guardState } = vi.hoisted(() => ({ guardState: { resuming: false } }));
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  withIssueMutationGuard: async (_request: unknown, callback: any) => {
+    const result = await callback(undefined, { resuming: guardState.resuming });
+    return { status: result.complete ? "completed" : "retained", value: result.value };
+  },
+}));
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
@@ -6,6 +13,8 @@ const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn(), updateIssue: vi.fn(), createAuditLog: vi.fn(),
+    createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
+    upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
     addIssueLabel: vi.fn(), removeIssueLabel: vi.fn(),
     leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
@@ -15,7 +24,17 @@ const { mocks } = vi.hoisted(() => ({
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
     transaction: vi.fn((arg: any) => {
       if (typeof arg === "function") {
-        return Promise.resolve(arg({ agentWork: { update: mocks.agentWorkUpdate }, agentWorkHistory: { create: vi.fn().mockResolvedValue({}) } }));
+        return Promise.resolve(
+          arg({
+            issue: { update: mocks.updateIssue },
+            issueLifecycleEvent: {
+              create: mocks.createLifecycleEvent,
+              upsert: mocks.upsertLifecycleEvent,
+            },
+            agentWork: { update: mocks.agentWorkUpdate },
+            agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+          }),
+        );
       }
       return Promise.all(arg.map((op: any) => op));
     }),
@@ -32,6 +51,10 @@ vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
     auditLog: { create: mocks.createAuditLog },
+    issueLifecycleEvent: {
+      create: mocks.createLifecycleEvent,
+      upsert: mocks.upsertLifecycleEvent,
+    },
     lease: { 
       findMany: mocks.leaseFindMany, 
       deleteMany: mocks.leaseDeleteMany, 
@@ -51,6 +74,7 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 vi.mock("@/lib/github", () => ({ addIssueLabel: mocks.addIssueLabel, removeIssueLabel: mocks.removeIssueLabel }));
+vi.mock("@/lib/issue-status", () => ({ transitionIssueStatus: vi.fn(async (_repo: string, _number: number, labels: string[], status: string) => { for (const label of labels.filter((value) => value.startsWith("status/") && value !== status)) await mocks.removeIssueLabel(_repo, _number, label); await mocks.addIssueLabel(_repo, _number, status); }) }));
 
 vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
 
@@ -61,6 +85,7 @@ import { POST } from "./route";
 // shared TEST_AGENT_TOKEN buckets cannot bleed across describes (same pattern
 // as move/webhook suites).
 beforeEach(() => {
+  guardState.resuming = false;
   resetRateLimits();
 });
 
@@ -134,8 +159,15 @@ describe("POST /api/issues/claim — business logic", () => {
     mocks.leaseFindMany.mockResolvedValue([]);
     mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
     mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.leaseFindMany.mockResolvedValue([]);
-    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
   });
 
   it("adds agent label and moves a fresh claim to in-progress", async () => {
@@ -149,6 +181,19 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: true, actor: "test-agent" }) });
   });
 
+  it("echoes the issued claim token that fences a later capacity handoff (#1256)", async () => {
+    // Mirror the real client: create persists what the code minted.
+    mocks.leaseCreate.mockImplementation(async ({ data }: any) => ({ id: "l-1", ...data }));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.claimToken).toBe("string");
+    expect(body.claimToken).toMatch(/^claim_/);
+    // The minted token is persisted on the lease row, not just returned.
+    const created = (mocks.leaseCreate.mock.calls[0] as any)[0].data;
+    expect(created.claimToken).toBe(body.claimToken);
+  });
+
   it("refuses closed issues", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "closed", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     const res = await POST(makeRequest());
@@ -156,12 +201,52 @@ describe("POST /api/issues/claim — business logic", () => {
     expect((await res.json()).error).toBe("Cannot claim a closed issue");
   });
 
-  it("refuses done issues", async () => {
-    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/done"] });
-    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/done"]);
+  it.each(["status/blocked", "status/done"])("refuses %s while resuming without remote or lease writes", async (status) => {
+    guardState.resuming = true;
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [status] });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce([status]);
     const res = await POST(makeRequest());
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toBe("Cannot claim a done issue");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+  });
+
+  it("repairs a failed claim transaction on exact-agent retry without repeating remote labels", async () => {
+    guardState.resuming = false;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready"]).mockResolvedValue(["agent/test-agent", "status/in-progress"]);
+    mocks.transaction.mockRejectedValueOnce(new Error("db transaction failed"));
+    const first = await POST(makeRequest());
+    expect(first.status).toBe(500);
+    guardState.resuming = true;
+    const retry = await POST(makeRequest());
+    expect(retry.status).toBe(200);
+    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(2);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledTimes(1);
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a resumed claim after live ownership changes without writes", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready"]);
+    mocks.transaction.mockRejectedValueOnce(new Error("db transaction failed"));
+    const first = await POST(makeRequest());
+    expect(first.status).toBe(500);
+    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(2);
+    const remoteAddCount = mocks.addIssueLabel.mock.calls.length;
+    const remoteRemoveCount = mocks.removeIssueLabel.mock.calls.length;
+    const issueUpdateCount = mocks.updateIssue.mock.calls.length;
+    const leaseCreateCount = mocks.leaseCreate.mock.calls.length;
+
+    guardState.resuming = true;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/other-agent", "status/in-progress"]);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(remoteAddCount);
+    expect(mocks.removeIssueLabel).toHaveBeenCalledTimes(remoteRemoveCount);
+    expect(mocks.updateIssue).toHaveBeenCalledTimes(issueUpdateCount);
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(leaseCreateCount);
   });
 
   // The 20-day stall: an issue left at status/ready while still carrying its own
@@ -470,6 +555,8 @@ describe("POST /api/issues/claim — #1037 live label gate", () => {
 describe("POST /api/issues/claim — worker tier (#1111)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    guardState.resuming = false;
+    mocks.getLiveIssueLabels.mockResolvedValue([]);
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
@@ -618,6 +705,127 @@ describe("POST /api/issues/claim — cross-issue identity invariant (#1129 revie
         issueNumber: 42,
         success: true,
       }),
+    });
+  });
+});
+
+describe("POST /api/issues/claim — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    guardState.resuming = false;
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    resetRateLimits();
+  });
+
+  it("records the claim with its source, actor and transition", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready", "type/feature"]);
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "claim",
+        source: "api:claim",
+        actor: "test-agent",
+        agentName: "test-agent",
+        fromStatus: "status/ready",
+        toStatus: "status/in-progress",
+      }),
+    });
+  });
+
+  it("records nothing for a redelivered claim of an already-claimed issue", async () => {
+    // Live GitHub already shows this agent holding the issue as in-progress,
+    // which is exactly what a replayed claim request looks like — and so does
+    // the cache, because the first attempt's mirror committed.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress", "agent/test-agent"]);
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" },
+      labels: ["status/in-progress", "agent/test-agent"],
+    });
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssue).toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+  });
+
+  it("recovers the claim on a retry whose GitHub writes already landed", async () => {
+    // First attempt: GitHub takes the labels, the event insert fails, and the
+    // transaction rolls the mirror back. The retry then reads an
+    // already-claimed issue — only the cache row still shows the pre-claim
+    // state, and it is what makes the first attempt's evidence recoverable.
+    mocks.getLiveIssueLabels
+      .mockResolvedValueOnce(["status/ready", "type/feature"])
+      .mockResolvedValue(["type/feature", "agent/test-agent", "status/in-progress"]);
+    mocks.findUnique.mockResolvedValue({
+      id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" },
+      labels: ["status/ready", "type/feature"],
+    });
+    mocks.createLifecycleEvent.mockRejectedValueOnce(new Error("lifecycle write failed"));
+
+    const first = await POST(makeRequest());
+    expect(first.status).toBe(500);
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(1);
+
+    guardState.resuming = true;
+    const retry = await POST(makeRequest());
+    expect(retry.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(2);
+    expect(mocks.createLifecycleEvent).toHaveBeenLastCalledWith({
+      data: expect.objectContaining({
+        kind: "claim",
+        fromStatus: "status/ready",
+        toStatus: "status/in-progress",
+        metadata: { recoveredFromMirroredState: true },
+      }),
+    });
+  });
+
+  it("records a force-claim that only changes ownership", async () => {
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress", "agent/other-agent"]);
+
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        kind: "claim",
+        actor: "test-agent",
+        fromStatus: "status/in-progress",
+        toStatus: "status/in-progress",
+        metadata: {
+          force: true,
+          claimedFrom: "agent/other-agent",
+          claimedTo: "agent/test-agent",
+          note: "ownership changed without a status transition",
+        },
+      }),
+    });
+  });
+
+  it("fails the claim when the evidence write fails, instead of recording nothing", async () => {
+    // The cache write and the event share a transaction: a claim that landed
+    // without its evidence row would silently drop an attempt.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready"]);
+    mocks.createLifecycleEvent.mockRejectedValueOnce(new Error("lifecycle write failed"));
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(500);
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "claim_issue", success: false }),
     });
   });
 });

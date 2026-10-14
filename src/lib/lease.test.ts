@@ -34,6 +34,13 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  withIssueMutationGuard: async (_request: unknown, callback: any) => {
+    const result = await callback(undefined, { resuming: false });
+    return { status: "completed", value: result.value };
+  },
+}));
+
 vi.mock("@/lib/next-action", () => ({
   buildResumeContext: vi.fn((input) => ({ ...input, nextAction: "inspect_issue" })),
   isValidCheckpoint: vi.fn((cp) => ["issue_claimed", "branch_created", "changes_made"].includes(cp)),
@@ -162,6 +169,19 @@ describe("upsertLease", () => {
 
       await expect(upsertLease({ agentName: "saffron", issueId: "i-1" })).rejects.toThrow("connection lost");
       expect(mocks.leaseFindUnique).toHaveBeenCalledTimes(1);
+    });
+
+    it("succeeds when a transient create failure is retried", async () => {
+      mocks.leaseFindUnique.mockResolvedValue(null);
+      mocks.leaseCreate
+        .mockRejectedValueOnce(new Error("connection lost"))
+        .mockImplementation(async ({ data }: any) => ({ id: "l-1", ...data }));
+
+      await expect(upsertLease({ agentName: "saffron", issueId: "i-1" })).rejects.toThrow("connection lost");
+      const retry = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+      expect(retry.created).toBe(true);
+      expect(retry.lease.claimToken).toMatch(/^claim_/);
+      expect(mocks.leaseCreate).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -406,5 +426,86 @@ describe("findLeasedIssueIds", () => {
     const result = await findLeasedIssueIds("saffron");
 
     expect(result).toEqual([]);
+  });
+});
+
+describe("claim token fencing (#1256)", () => {
+  it("mints an opaque claim token on lease creation", async () => {
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseCreate.mockImplementation((args: any) => Promise.resolve({ id: "l-1", ...args.data }));
+
+    const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+    const token = result.lease.claimToken;
+    expect(typeof token).toBe("string");
+    expect(token.length).toBeGreaterThan(10);
+    expect(token).toMatch(/^claim_/);
+  });
+
+  it("issues a distinct token for every new claim (re-claims are fenced)", async () => {
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseCreate.mockImplementation((args: any) => Promise.resolve({ id: "l-1", ...args.data }));
+
+    await upsertLease({ agentName: "saffron", issueId: "i-1" });
+    await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+    const [first, second] = mocks.leaseCreate.mock.calls.map((c: any) => c[0].data.claimToken);
+    expect(first).not.toBe(second);
+  });
+
+  it("keeps the claim token stable across renewals (heartbeats do not invalidate it)", async () => {
+    mocks.leaseFindUnique.mockResolvedValue(makeLease({ id: "l-1", claimToken: "claim_stable" }));
+    mocks.leaseUpdate.mockImplementation((args: any) =>
+      Promise.resolve({ ...makeLease(args.where), claimToken: "claim_stable", ...args.data }),
+    );
+
+    await upsertLease({ agentName: "saffron", issueId: "i-1", checkpoint: "branch_created" });
+
+    const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+    // Renewal must NOT mint or rewrite a token — the issued receipt stays valid.
+    expect(updateData.claimToken).toBeUndefined();
+  });
+
+  it("exposes the claim token on the resume context so a resuming worker keeps its receipt", async () => {
+    mocks.leaseFindFirst.mockResolvedValue({
+      id: "l-1",
+      agentName: "saffron",
+      issueId: "i-1",
+      checkpoint: "issue_claimed",
+      branch: null,
+      prUrl: null,
+      claimToken: "claim_resume-me",
+      expiredAt: new Date(Date.now() + 60_000),
+      renewedAt: makeNow(),
+      createdAt: makeNow(),
+      issue: { number: 42, repository: { fullName: "misospace/dispatch" } },
+    });
+    mocks.issueFindUnique.mockResolvedValue({ id: "i-1" });
+
+    const result = await resolveActiveWork("saffron");
+
+    expect(result).not.toBeNull();
+    expect(result!.claimToken).toBe("claim_resume-me");
+  });
+
+  it("leaves claimToken undefined for legacy token-less leases", async () => {
+    mocks.leaseFindFirst.mockResolvedValue({
+      id: "l-1",
+      agentName: "saffron",
+      issueId: "i-1",
+      checkpoint: "issue_claimed",
+      branch: null,
+      prUrl: null,
+      claimToken: null,
+      expiredAt: new Date(Date.now() + 60_000),
+      renewedAt: makeNow(),
+      createdAt: makeNow(),
+      issue: { number: 42, repository: { fullName: "misospace/dispatch" } },
+    });
+    mocks.issueFindUnique.mockResolvedValue({ id: "i-1" });
+
+    const result = await resolveActiveWork("saffron");
+
+    expect(result!.claimToken).toBeUndefined();
   });
 });

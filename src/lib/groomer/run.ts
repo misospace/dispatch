@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { fetchCollaboratorPermission } from "@/lib/github-issues";
-import { findActiveLeasesForIssue, releaseLease, upsertLease } from "@/lib/lease";
+import { findActiveLeasesForIssue, IssueMutationBusyError, releaseLease, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
@@ -28,6 +28,12 @@ import { createGroomingRunRecord, completeGroomingRunRecord, updateGroomingRunRe
 import { explorationCallsForFreshness } from "./freshness";
 import { freshnessBaselineIssueData } from "./freshness-invalidation";
 import { compareCommits, searchRepositoryCode } from "@/lib/github-code-search";
+import {
+  lifecycleDedupeKey,
+  lifecycleStatusLabel,
+  recordLifecycleEventQuietly,
+  recordStatusTransitionQuietly,
+} from "@/lib/issue-lifecycle";
 import { fetchCommitDate } from "@/lib/github-ci";
 import { validateApplyPreconditions, type LiveComment, type PreconditionReader } from "./mutation-validator";
 import {
@@ -243,16 +249,7 @@ async function executeGroomerRun(
     staleReasons: candidate.staleReasons,
   });
 
-  const activeLeases = await deps.findActiveLeases(candidate.id);
-  const hasOtherLease = activeLeases.some((lease: { agentName?: string }) => lease.agentName !== "hosted-groomer");
-  if (hasOtherLease && !options.force) return null;
-
-  const { lease } = await deps.upsertLease({
-    agentName: "hosted-groomer",
-    issueId: candidate.id,
-    checkpoint: "issue_claimed",
-    ttlMs: GROOMER_LEASE_TTL_MS,
-  });
+  let lease: { id: string } | undefined;
   const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
   // Freshness (#1064): a human comment after this instant is new evidence.
@@ -266,6 +263,22 @@ async function executeGroomerRun(
   let unreadableBackoffWritten = false;
 
   try {
+    stage = "lease_acquisition";
+    const activeLeases = await deps.findActiveLeases(candidate.id);
+    const hasOtherLease = activeLeases.some((active: { agentName?: string }) => active.agentName !== "hosted-groomer");
+    if (hasOtherLease && !options.force) {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "deferred", stage, errorMessage: null, retryable: true,
+      });
+      return null;
+    }
+    ({ lease } = await deps.upsertLease({
+      agentName: "hosted-groomer",
+      issueId: candidate.id,
+      checkpoint: "issue_claimed",
+      ttlMs: GROOMER_LEASE_TTL_MS,
+    }));
+    stage = "selected";
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
     try {
       comments = await deps.fetchComments(candidate.repoFullName, candidate.number);
@@ -1221,6 +1234,64 @@ async function executeGroomerRun(
       },
     });
 
+    // Record the status move the grooming plan actually made (#1202). The
+    // labels only reach the issue cache on the next sync, so without this the
+    // groomer's own transition would first be observable as a `sync` event and
+    // a claim-to-merge read could not tell who moved the card. The shared
+    // guard decides what counts: a plan whose application changed no
+    // `status/*` label (a `noop`, or a `partial` that landed something else
+    // first) records nothing rather than a row with identical from/to. Quiet
+    // by design: a grooming run that already landed its mutations must not
+    // fail over an evidence row, and a replayed application records nothing
+    // because this branch is only reached the first time the application key
+    // lands.
+    await recordStatusTransitionQuietly(
+      deps.prisma,
+      {
+        issueId: candidate.id,
+        repoFullName: candidate.repoFullName,
+        issueNumber: candidate.number,
+        kind: "status_changed",
+        source: "hosted-groomer",
+        actor: "hosted-groomer",
+        before: analyzed.labels,
+        after: applied.labels,
+        metadata: { groomingRunId: groomingRun.id, applicationKey },
+      },
+      "hosted-groomer",
+    );
+
+    // A close is a separate fact from the status label that goes with it, and
+    // the next sync can never observe this one: the close above is mirrored
+    // into the cache in the same run, so by the time sync looks the issue is
+    // already closed there. Recorded under the application key so a retry of
+    // the same plan collapses onto one row. Independent of the transition
+    // above — a plan that closes without moving the status label still
+    // records the close, and records no `status_changed`.
+    if (applied.closed) {
+      await recordLifecycleEventQuietly(
+        deps.prisma,
+        {
+          issueId: candidate.id,
+          repoFullName: candidate.repoFullName,
+          issueNumber: candidate.number,
+          kind: "issue_closed",
+          source: "hosted-groomer",
+          actor: "hosted-groomer",
+          toStatus: lifecycleStatusLabel(applied.labels),
+          dedupeKey: lifecycleDedupeKey(
+            "hosted-groomer",
+            candidate.repoFullName,
+            candidate.number,
+            "issue_closed",
+            applicationKey,
+          ),
+          metadata: { groomingRunId: groomingRun.id, applicationKey },
+        },
+        "hosted-groomer",
+      );
+    }
+
     // Complete GroomingRun. A partial application is explicit in history
     // and retryable: every landed step is recorded, so a retry of the same
     // application replays them instead of repeating them.
@@ -1239,6 +1310,13 @@ async function executeGroomerRun(
     return result({ plannedLabels: newLabels, appliedMutations });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown groomer error";
+
+    if (stage === "lease_acquisition" && error instanceof IssueMutationBusyError) {
+      await completeGroomingRunRecord(deps.prisma, groomingRun.id, {
+        status: "deferred", stage, errorMessage: null, retryable: true,
+      });
+      return null;
+    }
 
     // Complete GroomingRun as failed
     try {
@@ -1283,7 +1361,7 @@ async function executeGroomerRun(
     });
     throw error;
   } finally {
-    await deps.releaseLease(lease.id);
+    if (lease) await deps.releaseLease(lease.id);
   }
 }
 

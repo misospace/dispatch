@@ -52,6 +52,7 @@ const { mocks } = vi.hoisted(() => ({
       groomingChildClaim: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
       groomerPendingReply: { updateMany: vi.fn(), upsert: vi.fn() },
       issue: { update: vi.fn(), findMany: vi.fn() },
+      issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
       issueLane: { create: vi.fn() },
       agentRun: { create: vi.fn() },
       auditLog: { create: vi.fn() },
@@ -95,7 +96,8 @@ vi.mock("@/lib/prisma", () => ({
   prisma: mocks.prisma,
 }));
 
-vi.mock("@/lib/lease", () => ({
+vi.mock("@/lib/lease", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/lease")>()),
   findActiveLeasesForIssue: mocks.findActiveLeasesForIssue,
   upsertLease: mocks.upsertLease,
   releaseLease: mocks.releaseLease,
@@ -133,6 +135,7 @@ import {
   runHostedGroomer,
   UNVERIFIABLE_RETRY_BACKOFF_MINUTES,
 } from "./run";
+import { IssueMutationBusyError } from "@/lib/lease";
 import { computeGroomingIssueFingerprint } from "./freshness";
 
 const mockCandidate: GroomingCandidate = {
@@ -936,6 +939,133 @@ describe("runHostedGroomer", () => {
     );
   });
 
+  it("write mode records the status move the grooming plan made (#1202)", async () => {
+    await runHostedGroomer();
+
+    // The groomer writes labels to GitHub; the issue cache only catches up on
+    // the next sync. Recording the move here is what keeps the transition
+    // attributable to the groomer instead of to whatever sync ran next.
+    const events = mocks.prisma.issueLifecycleEvent.create.mock.calls.map((call: any[]) => call[0].data);
+    expect(events.filter((data: any) => data.kind === "status_changed")).toEqual([
+      expect.objectContaining({
+        issueId: "issue-42",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "status_changed",
+        source: "hosted-groomer",
+        actor: "hosted-groomer",
+        fromStatus: null,
+        toStatus: "status/ready",
+      }),
+    ]);
+  });
+
+  it("records no status_changed for a plan that changed no status label", async () => {
+    // Already at the status the plan derives, so the application lands nothing
+    // at all: the shared guard must keep a `noop` out of the stream instead of
+    // persisting a row whose from/to are identical.
+    mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/ready", "priority/p0"] });
+
+    const result = await runHostedGroomer();
+
+    expect(result!.appliedMutations).toMatchObject({ outcome: "noop" });
+    expect(mocks.prisma.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issueLifecycleEvent.upsert).not.toHaveBeenCalled();
+  });
+
+  it("records no status_changed for a partial plan that landed no status label", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.closeIssue.mockRejectedValue(new Error("GitHub API error: 502"));
+    mocks.callGroomerLLM.mockResolvedValue(
+      notReadyDraft("already_done", {
+        mutations: {
+          githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
+          close: {
+            reason: "already_done",
+            rationale: "login.ts no longer has the step",
+            evidenceRefs: ["repo:src/auth/login.ts"],
+            criteria: GROUNDED_CRITERIA,
+          },
+        },
+      }),
+    );
+
+    const result = await runHostedGroomer();
+
+    // The explaining comment landed, the close did not, and no `status/*`
+    // label moved either way — so there is no transition to record.
+    expect(result!.appliedMutations).toMatchObject({ outcome: "partial" });
+    expect(mocks.prisma.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issueLifecycleEvent.upsert).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("records the close it authored, which the next sync can no longer observe", async () => {
+    mocks.selectGroomingCandidate.mockResolvedValue({ ...mockCandidate, labels: ["status/done", "priority/p0"] });
+    mocks.callGroomerLLM.mockResolvedValue(
+      notReadyDraft("already_done", {
+        mutations: {
+          githubComment: "Verified on the default branch: the step is gone, so closing as already resolved.",
+          close: {
+            reason: "already_done",
+            rationale: "login.ts no longer has the step",
+            evidenceRefs: ["repo:src/auth/login.ts"],
+            criteria: GROUNDED_CRITERIA,
+          },
+        },
+      }),
+    );
+
+    const result = await runHostedGroomer();
+    const key = result!.mutationPlan!.applicationKey as string;
+
+    // The close landed with no status-label move alongside it: one close, and
+    // no transition to stand in for it.
+    expect(mocks.closeIssue).toHaveBeenCalledWith("org/repo", 42);
+    expect(mocks.prisma.issueLifecycleEvent.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issueLifecycleEvent.upsert).toHaveBeenCalledTimes(1);
+    expect(mocks.prisma.issueLifecycleEvent.upsert).toHaveBeenCalledWith({
+      where: { dedupeKey: `hosted-groomer|org/repo|42|issue_closed|${key}` },
+      create: expect.objectContaining({
+        issueId: "issue-42",
+        kind: "issue_closed",
+        source: "hosted-groomer",
+        actor: "hosted-groomer",
+        toStatus: "status/done",
+      }),
+      update: {},
+    });
+
+    // The close is mirrored into the cache in the same run, so the next sync
+    // observes an issue that was already closed and adds nothing to it.
+    const { recordSyncedIssueEvents } = await import("@/lib/issue-lifecycle");
+    const syncClient = { issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() } };
+    await recordSyncedIssueEvents(syncClient, {
+      issueId: "issue-42",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      before: { labels: ["status/done", "priority/p0"], state: "closed" },
+      after: {
+        labels: ["status/done", "priority/p0"],
+        state: "closed",
+        updatedAt: new Date("2026-10-02T08:00:00.000Z"),
+        closedAt: new Date("2026-10-02T08:00:00.000Z"),
+      },
+    });
+    expect(syncClient.issueLifecycleEvent.upsert).not.toHaveBeenCalled();
+  });
+
+  it("keeps the run successful when the lifecycle write fails", async () => {
+    mocks.prisma.issueLifecycleEvent.create.mockRejectedValue(new Error("db down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await runHostedGroomer();
+
+    expect(result).toBeTruthy();
+    expect(mocks.prisma.auditLog.create).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+  });
+
   it("passes untrusted commenter trust decisions into the prompt", async () => {
     const { buildIssueContext } = await vi.importActual<typeof import("./context")>("./context");
     let capturedInput: Parameters<typeof buildIssueContext>[0] | undefined;
@@ -1336,6 +1466,35 @@ describe("runHostedGroomer", () => {
     );
   });
 
+  it.each(["active capacity-release", "retained non-executing guard"])("defers %s without failure backoff and can service the next issue", async () => {
+    mocks.upsertLease.mockRejectedValueOnce(new IssueMutationBusyError());
+    expect(await runHostedGroomer()).toBeNull();
+    expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "gr-1" },
+      data: expect.objectContaining({ status: "deferred", stage: "lease_acquisition", completedAt: expect.any(Date) }),
+    }));
+    mocks.selectGroomingCandidate.mockResolvedValueOnce({ ...mockCandidate, id: "next-issue", number: 43 });
+    await runHostedGroomer();
+    expect(mocks.callGroomerLLM).toHaveBeenCalledOnce();
+  });
+
+  it("records and propagates unexpected lease-store errors", async () => {
+    mocks.upsertLease.mockRejectedValueOnce(new Error("database unavailable"));
+    await expect(runHostedGroomer()).rejects.toThrow("database unavailable");
+    expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "failed", stage: "lease_acquisition", errorMessage: "database unavailable" }),
+    }));
+    expect(mocks.prisma.agentRun.create).toHaveBeenCalled();
+    expect(mocks.prisma.auditLog.create).toHaveBeenCalled();
+  });
+
   it("failure after groomingRun creation completes run as failed", async () => {
     mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
 
@@ -1501,6 +1660,17 @@ describe("runHostedGroomer", () => {
     expect(result).toBeNull();
     expect(mocks.upsertLease).not.toHaveBeenCalled();
     expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
+    expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
+    expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
+    expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "deferred", completedAt: expect.any(Date) }),
+    }));
+    // No retry timestamp was written: the same candidate can run immediately
+    // once the other agent releases its lease.
+    mocks.findActiveLeasesForIssue.mockResolvedValue([]);
+    await runHostedGroomer();
+    expect(mocks.callGroomerLLM).toHaveBeenCalledOnce();
   });
 
   it("force option overrides another active lease", async () => {

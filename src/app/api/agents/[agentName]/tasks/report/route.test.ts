@@ -39,6 +39,10 @@ const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, pri
     issue: {
       findUnique: vi.fn().mockResolvedValue(null),
     },
+    issueLifecycleEvent: {
+      create: vi.fn().mockResolvedValue({ id: "evt-1" }),
+      upsert: vi.fn().mockResolvedValue({ id: "evt-1" }),
+    },
     // `tasks/report` resolves a queued pr-fix item when the agent reports
     // back on PR coordinates. Tests that send `repoFullName` +
     // `pullRequestNumber` should keep the pr-fix queue empty by default;
@@ -1593,6 +1597,34 @@ describe("POST /api/agents/[agentName]/tasks/report — idempotencyKey", () => {
   });
 });
 
+describe("POST /api/agents/[agentName]/tasks/report — capacity exhaustion handoff", () => {
+  const validReport = { taskType: "followup-pr", outcome: "pr_updated", repoFullName: "org/repo", pullRequestNumber: 10 };
+
+  it("requires a recognized capacity identifier and issued PR-fix attempt token", async () => {
+    const missingCapacity = await postRequest({ ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted", prFixItem: { id: "item-1", generation: 1, handoutToken: "hnd_deadbeef00" } });
+    expect(missingCapacity.status).toBe(400);
+    const missingAttempt = await postRequest({ ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted", capacity: "provider/model" });
+    expect(missingAttempt.status).toBe(400);
+    // #1256 review: the per-hand-out receipt token is a hard gate for this
+    // outcome — (id, generation) alone cannot identify the exact hand-out.
+    const missingReceipt = await postRequest({ ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted", capacity: "provider/model", prFixItem: { id: "item-1", generation: 1 } });
+    expect(missingReceipt.status).toBe(400);
+    expect((await missingReceipt.json()).error).toMatch(/handoutToken/);
+  });
+
+  it("passes the normalized capacity and issued attempt token to the resolver", async () => {
+    const response = await postRequest({
+      ...validReport, taskType: "followup-pr", outcome: "capacity-exhausted",
+      capacity: "  provider/model  ", prFixItem: { id: "item-1", generation: 2, handoutToken: "  hnd_deadbeef00  " },
+    });
+    expect(response.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: "capacity-exhausted", capacity: "provider/model",
+      attempt: { itemId: "item-1", generation: 2, handoutToken: "hnd_deadbeef00" },
+    }));
+  });
+});
+
 describe("POST /api/agents/[agentName]/tasks/report — prFixItem attempt token (#1074)", () => {
   beforeEach(() => {
     delete process.env.DISPATCH_AUTH_MODE;
@@ -2347,5 +2379,92 @@ describe("POST /api/agents/[agentName]/tasks/report — bound worker scope on al
     // The duplicate branch must NOT re-fire the gate or run the resolver.
     expect(getLiveIssueLabelsMock).toHaveBeenCalledTimes(1);
     expect(closeResolveMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — lifecycle evidence (#1202)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mockAgentRun.create.mockResolvedValue({
+      id: "run-1",
+      agentName: "test-agent",
+      runType: "implement",
+      status: "failed",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+      summary: null,
+      errorMessage: null,
+      touchedIssueUrls: [],
+    });
+    // A cached issue, so the report resolves to an issueId to attach evidence to.
+    mocks.issueFindUnique.mockResolvedValue({ id: "issue-1" });
+  });
+
+  it("records a failed attempt as its own lifecycle fact", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "failed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      error: "tests failed",
+    });
+
+    expect(res.status).toBe(200);
+    expect(prismaMock.issueLifecycleEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        kind: "attempt_failed",
+        source: "agent-report",
+        actor: "test-agent",
+        agentName: "test-agent",
+        sourceEventId: "agent-run:run-1",
+        metadata: { outcome: "failed", error: "tests failed" },
+      }),
+    });
+  });
+
+  it("records nothing for an ordinary successful report", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+    });
+
+    expect(res.status).toBe(200);
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("records nothing when the report could not resolve a cached issue", async () => {
+    mocks.issueFindUnique.mockResolvedValue(null);
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "blocked",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+    });
+
+    expect(res.status).toBe(200);
+    expect(prismaMock.issueLifecycleEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps the report successful when the evidence write fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    prismaMock.issueLifecycleEvent.create.mockRejectedValueOnce(new Error("db down"));
+
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "failed",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+    });
+
+    expect(res.status).toBe(200);
+    expect(warn).toHaveBeenCalled();
   });
 });

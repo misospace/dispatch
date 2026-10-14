@@ -901,3 +901,79 @@ describe("already_done never touches the PR-fix queue (#1143)", () => {
     });
   });
 });
+
+describe("applyReportClose — lifecycle evidence (#1202)", () => {
+  function lifecycleClient() {
+    const createEvent = vi.fn(async () => ({}));
+    const upsertEvent = vi.fn(async () => ({}));
+    return {
+      createEvent,
+      upsertEvent,
+      client: { ...client(), issueLifecycleEvent: { create: createEvent, upsert: upsertEvent } },
+    };
+  }
+
+  /** Swaps every status label like the real transitionIssueStatus does. */
+  function swapToDone() {
+    return deps({
+      transitionStatus: vi.fn(async (_repo: string, _number: number, labels: string[]) => [
+        ...labels.filter((label) => !label.startsWith("status/")),
+        "status/done",
+      ]),
+    });
+  }
+
+  it("records the completion with the status the close left behind", async () => {
+    const d = swapToDone();
+    const { client: c, createEvent } = lifecycleClient();
+    const evaluation = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      d,
+    );
+
+    await applyReportClose({ evaluation, actor: "alpha", issueId: "issue-42", client: c, deps: d });
+
+    expect(createEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        issueId: "issue-42",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        // A completion is its own fact, not the status label moving to done.
+        kind: "completed",
+        source: "agent-report",
+        actor: "alpha",
+        fromStatus: "status/backlog",
+        toStatus: "status/done",
+        metadata: { evidenceDigest: evaluation.evidenceDigest, headSha: HEAD },
+      }),
+    });
+  });
+
+  it("records nothing when the close could not resolve to a cached issue", async () => {
+    const d = deps();
+    const { client: c, createEvent } = lifecycleClient();
+    const evaluation = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      d,
+    );
+
+    await applyReportClose({ evaluation, actor: "alpha", issueId: null, client: c, deps: d });
+
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed evidence write as a warning without undoing the close", async () => {
+    const d = deps();
+    const { client: c, createEvent } = lifecycleClient();
+    createEvent.mockRejectedValueOnce(new Error("db down"));
+    const evaluation = await evaluateReportClose(
+      { repoFullName: "org/repo", issueNumber: 42, criteria: [criterion()] },
+      d,
+    );
+
+    const applied = await applyReportClose({ evaluation, actor: "alpha", issueId: "issue-42", client: c, deps: d });
+
+    expect(applied.closed).toBe(true);
+    expect(applied.warning).toContain("lifecycle event write failed");
+  });
+});
