@@ -216,8 +216,10 @@ export async function POST(request: Request) {
         data: { labels: updatedLabels, lastSyncedAt: new Date() },
       });
 
-      // Create or renew a lease for this agent (issue #166)
-      await upsertLease({
+      // Create or renew a lease for this agent (issue #166).
+      // #1256: the lease carries the opaque claim token that fences a later
+      // capacity-handoff release to THIS exact claim; echo it to the worker.
+      const lease = await upsertLease({
         agentName: agentName as string,
         issueId: issueId as string,
         checkpoint: "issue_claimed",
@@ -254,7 +256,11 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ success: true, labels: updatedLabels });
+      return NextResponse.json({
+        success: true,
+        labels: updatedLabels,
+        claimToken: lease.lease.claimToken ?? null,
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
 

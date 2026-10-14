@@ -149,6 +149,19 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: true, actor: "test-agent" }) });
   });
 
+  it("echoes the issued claim token that fences a later capacity handoff (#1256)", async () => {
+    // Mirror the real client: create persists what the code minted.
+    mocks.leaseCreate.mockImplementation(async ({ data }: any) => ({ id: "l-1", ...data }));
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.claimToken).toBe("string");
+    expect(body.claimToken).toMatch(/^claim_/);
+    // The minted token is persisted on the lease row, not just returned.
+    const created = (mocks.leaseCreate.mock.calls[0] as any)[0].data;
+    expect(created.claimToken).toBe(body.claimToken);
+  });
+
   it("refuses closed issues", async () => {
     mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "closed", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
     const res = await POST(makeRequest());

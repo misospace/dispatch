@@ -1,0 +1,207 @@
+# Fenced Capacity-Exhaustion Handoff (#1256)
+
+Dispatch-native recovery for the case "the worker holding a handed attempt
+cannot actually run it because its execution capacity is exhausted". The work
+must return to circulation **for other compatible workers** without letting a
+stale worker stomp a newer claim, a human hold, or anyone's retry budget.
+
+This is a generic Dispatch capability. The `capacity` identifier is an opaque,
+worker-chosen string (for example `provider/model-a` or `runner-pool-gpu`);
+Dispatch never interprets it and carries no coupling to any particular
+executor, provider, or source product.
+
+## The two surfaces
+
+| Work form | Operation | Fencing token (issued by) |
+|---|---|---|
+| PR-fix queue attempt | `POST /api/agents/{agent}/tasks/report` with `outcome: "capacity-exhausted"`, `capacity`, and the issued `prFixItem: { id, generation, handoutToken }` | `next-task` hand-out (#1074 token + #1256 per-hand-out receipt token) |
+| Claimed issue | `POST /api/issues/capacity-handoff` with `issueId`, `repoFullName`, `issueNumber`, `agentName`, `claimToken`, `capacity` | `POST /api/issues/claim` response `claimToken` (also in the `active-work` resume context) |
+
+Both require bearer auth; a bound worker credential (`DISPATCH_WORKER_TOKENS`)
+may only hand off its **own** agent's work, and the unbound legacy worker token
+is refused (#1129). A handoff must be an *explicit* recognition: a non-empty,
+bounded (≤200 chars) `capacity` and a valid issued token are hard 400 gates.
+
+## Attempt tokens and fencing
+
+* **PR-fix**: settlement is a compare-and-set on `(item id, status QUEUED,
+  generation)` — a stale generation (a fresh attempt was re-issued meanwhile),
+  an already-settled status, or a human hold (BLOCKED / PARKED / NEEDS_HUMAN)
+  settles as a no-op; the report never overwrites newer state. For
+  `capacity-exhausted` the CAS is bound further, to the **exact source
+  attempt**: next-task mints a fresh opaque `handoutToken` per hand-out and
+  persists it as a receipt (`PrFixQueueItem.handoutReceipts`, one entry per
+  live hand-out, format `token@agent@generation`). The report must present
+  that token, and the write — pinned on the full receipt/hand-out/ack lists —
+  removes **only the reporting agent's** receipt, hand-out record, and own
+  ack. An unrelated agent that merely knows `(id, generation)` has no
+  authority, and neither does the *same* agent presenting a token from a
+  **previous** hand-out of the same generation (release keeps the generation,
+  so generation alone cannot distinguish hand-outs). A receipt exists exactly
+  while its `agentHandouts` entry exists — issuance pushes both in one
+  conditional write and every clear site clears both — so a released,
+  reclaimed, or generation-superseded hand-out can never be settled with its
+  old token. Pre-receipt (legacy) hand-outs cannot settle this outcome; every
+  other outcome ignores the token and settles unchanged.
+* **Issue**: the claim token lives on the `Lease` row (`Lease.claimToken`,
+  unique, minted at lease creation). Renewals deliberately keep the token (a
+  heartbeating worker keeps its receipt), but a released or expired lease that
+  is re-claimed is a **new row with a new token** — an old worker's token is
+  permanently inert against a newer claim. The release itself is a CAS
+  `deleteMany` on `(lease id, agentName, issueId, expiredAt > now)`: exactly
+  one racing release wins; losers get 409 with zero writes.
+
+## Human-hold and ownership safeguards (issue surface)
+
+Checked **before** any write; every refusal is 409/400 with zero mutation:
+
+* closed issue, cached or **live** `status/done`;
+* deliberate block: cached `status/blocked` carrying a `blockedReason`, or
+  **any live `status/blocked`** — fail-closed: a block applied on GitHub that
+  has not reached the cache is still a hold, and releasing it is an explicit
+  operator action, never a side effect of a capacity handoff;
+* ownership changed: the **live GitHub** label set (not the cache — #1037
+  rule) carries a *different* `agent/*` label, or *no* agent label at all
+  (already released or human-cleared).
+* GitHub unreachable → 503 fail-closed: no lease delete, no label write.
+
+**Post-CAS re-verification**: a force-claim (which does not delete the
+previous agent's lease row) or a human change can land between the pre-CAS
+read and the lease delete. After the CAS the live labels are re-read; if
+ownership moved **or the re-read itself fails**, the release narrows to
+**ownership-only** — our own `agent/*` label is removed idempotently and the
+cache mirrors the freshest known set minus that label — and no status label
+is ever touched, so a newer owner's transition survives. A re-read failure
+must not take the full-release path: ownership is unknown, and a status
+transition on a stale snapshot could clobber it. Ownership-only cleanup is
+safe under total ignorance (one targeted write, our own label, narrowing
+only), and the lease is already consumed, so halting would strand the claim
+with no owner.
+
+## What success does
+
+**Issue handoff** (`issue_capacity_handoff` audit action):
+
+1. Lease row CAS-deleted — this is the atomic ownership transition.
+2. Claim released through the shared `releaseIssueClaim` policy, based on the
+   live labels: `agent/<name>` removed; `status/in-progress` → `status/ready`
+   (immediately discoverable to another compatible worker); `status/in-review`
+   is retained with a status note.
+3. Active `AgentWork` rows (CLAIMED/IN_PROGRESS/BLOCKED) for that agent+issue
+   are marked `RELEASED` with a `capacity_handoff` history entry.
+4. A `CapacityHandoff` cooldown row is written (`kind: "issue"`).
+5. Audit row with before/after labels, capacity, cooldown deadline.
+
+**PR-fix handoff** (`capacity_handoff` PrFixHistory action):
+
+1. Exact-owner CAS (see “Attempt tokens and fencing”): removes the reporting
+   agent's receipt, hand-out record, and own ack — and nothing else. Other
+   agents' live receipts, hand-out records, and acknowledgements at the same
+   generation are preserved, and the dispatch stamps
+   (`dispatchedGeneration/At`) plus `postDispatchEvidenceKeys` survive while
+   any *other* hand-out at that generation is still live (clearing them would
+   reclassify the surviving workers' mid-run evidence as pre-dispatch, #1119);
+   only the report that consumes the last live hand-out resets them, making
+   the generation freshly dispatchable. The item **stays `QUEUED`** at the
+   same `generation` and `fixAttempts`, with `branch`, `url`, and PR state
+   untouched — the attempt is returned, not burned, and no repair budget is
+   spent. It is explicitly *not* a `WAITING_EXTERNAL` park: nothing hides the
+   item from workers whose capacity is unrelated.
+2. A `CapacityHandoff` row is written (`kind: "pr_fix"`, recording the
+   settled `generation`).
+3. Idempotency is layered: a repeat report of the **same capacity at the
+   same generation** while the cooldown is active replays as `deferred`
+   without minting a second window; concurrent duplicates are fenced by the
+   consumed receipt (only one write can remove the exact token) and by the
+   CAS pinning the issued hand-out stamp (`dispatchedGeneration =
+   generation`) and the full receipt/hand-out/ack lists, so exactly one
+   duplicate can win and losers settle as no-ops with zero mutation. A
+   *different* capacity exhausting the same live generation records its own
+   scoped cooldown (it was legitimately dispatched alongside or after the
+   first hand-off, with its own receipt); an older generation's window never
+   absorbs a fresh attempt.
+
+## Capacity-scoped cooldown
+
+**Trust boundary.** The `capacity` identifier is **caller-declared and
+trusted for scoping only** — it is a shaping hint, not an identity claim.
+Settlement authority comes exclusively from the issued receipt/claim token,
+never from the capacity string, and the cooldown deliberately does **not**
+filter by agent: the same worker legitimately declares different capacities
+(a different model or runner pool behind one agent name), and an unrelated
+capacity must keep receiving the work. A worker that lies about its capacity
+can only re-acquire work for a capacity it claims to have exhausted — it
+consumes no extra repair budget, and its own hand-out is fenced from anyone
+else. Given the active
+(`cooldownUntil > now`) handoff rows:
+
+* requester's capacity **equals** the exhausted capacity (matched
+  case-insensitively — the identifier is opaque and `Model-A` re-declared is
+  the same capacity) → the cooled item is skipped until the deadline;
+* requester declares an **unrelated** capacity → the item dispatches normally
+  (this is the entire point of scoping the cooldown);
+* requester declares **no capacity** → conservatively skips *any* cooled item
+  (Dispatch cannot prove it is not the exhausted capacity). Legacy workers are
+  thus protected until expiry without globalizing the wait for declared,
+  unrelated capacities.
+
+Cooldown bound: `DISPATCH_CAPACITY_COOLDOWN_MS` (default 15 minutes, clamped
+to [1 minute, 6 hours]). Expired rows are pruned lazily on read, throttled to
+once per minute per process so the prune never becomes a per-poll write on the
+dispatch hot path. When every remaining candidate is cooled, `next-task` says
+so in the idle reason instead of a bare "No work available". A cooldown read
+failure **fails open** (dispatch proceeds unfiltered): handing cooled work to
+the exhausted capacity is a bounded nuisance the worker reports again;
+blocking the whole lane is not. Symmetrically, a cooldown **write** failure
+after the release already committed does not fail the handoff — the response
+returns `cooldownUntil: null` (audited), because the ownership release is the
+operation the worker asked for and a false 500 would invite a retry that can
+only 409.
+
+The exhausted capacity's own re-report is also fenced: the PR-fix attempt
+token is consumed and the issue lease is gone, so the same worker cannot
+double-settle; at worst it re-receives the item after the cooldown, which is
+the intended bounded retry for that capacity.
+
+## Label / lease effects and consistency boundaries
+
+**GitHub is the source of truth for the issue's labels and status. The
+database (Issue cache, Lease, AgentWork, CapacityHandoff, PrFixQueueItem) is
+Dispatch's coordination layer — never write it as if GitHub were behind.**
+
+* Ownership is *verified* against live GitHub labels before any mutation; the
+  Prisma cache is used only for non-label facts (`blockedReason`,
+  `linkedPrNumber`, closed state) and the post-write mirror.
+* Label writes are targeted (`removeIssueLabel` for the agent label,
+  `transitionIssueStatus` for the status swap), never a full label-set
+  replacement, so concurrent human label changes on GitHub are not reverted.
+* The **lease CAS delete is the commit point** for issue ownership. If a
+  label write fails *after* it, the worker has definitively lost ownership and
+  the residue (a stale `agent/*` label) is owned by the existing stale-claim
+  recovery / sync paths — the failure is audited (`success: false`, pointer in
+  `errorMessage`) and never resurrects the claim or blocks rediscovery.
+* `CapacityHandoff` rows are Dispatch-local dispatch shaping. They are not
+  mirrored to GitHub, carry no label, and self-expire; deleting them is always
+  safe.
+* The PR-fix cooldown deliberately does not touch PR state on GitHub at all:
+  no label, no comment, no push. Queue-row changes are cache-side work
+  bookkeeping; the PR/branch identity is retained exactly.
+* Lease expiry alone never clears labels — expiry is a *staleness* signal
+  owned by stale-claim recovery; capacity handoff is an *intentional* release
+  owned by the worker holding the token.
+
+## Failure-mode summary
+
+| Situation | Result |
+|---|---|
+| Missing/blank capacity, attempt token, or receipt token (PR-fix) | 400 |
+| PR-fix receipt token not owned by the reporting agent (unknown, rotated, or another agent's) | report `skipped`, queue untouched |
+| Wrong agent's token (bound worker) | 403 |
+| GitHub labels unreadable | 503, zero writes |
+| Stale claim token (re-claimed lease) | 409 `stale_claim_token` |
+| Expired lease | 409 `claim_expired` (stale recovery owns release) |
+| Different/missing live `agent/*` label | 409 `ownership_changed` |
+| Deliberate block / done / closed | 409/400 human hold |
+| Lease CAS lost (concurrent release) | 409 `handoff_race_lost`, zero writes |
+| PR-fix generation moved / status settled | report `skipped`, queue untouched |
+| Repeat PR-fix report | `deferred`, one cooldown window only |

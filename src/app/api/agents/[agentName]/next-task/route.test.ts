@@ -18,6 +18,8 @@ const { mocks } = vi.hoisted(() => ({
     linkedRows: [] as any[],
     fetchPullRequestLabels: vi.fn().mockResolvedValue([]),
     fetchPullRequestHeadSha: vi.fn().mockResolvedValue(null),
+    capacityHandoffFindMany: vi.fn().mockResolvedValue([]),
+    capacityHandoffDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
   },
 }));
 
@@ -38,6 +40,10 @@ vi.mock("@/lib/prisma", () => ({
       updateMany: mocks.prFixUpdateMany,
     },
     prFixHistory: { create: mocks.prFixHistoryCreate },
+    capacityHandoff: {
+      findMany: mocks.capacityHandoffFindMany,
+      deleteMany: mocks.capacityHandoffDeleteMany,
+    },
     $transaction: async (fn: any) => fn({
       prFixQueueItem: {
         create: mocks.prFixCreate,
@@ -426,7 +432,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 3 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 3 });
     expect(body.prFixExclusions).toEqual({ version: 1, skipped: [] });
   });
 
@@ -597,7 +603,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.repoFullName).toBe("org/repo");
     expect(body.pullRequest.number).toBe(12);
     expect(body.pullRequest.url).toBe("https://github.com/org/repo/pull/12");
-    expect(body.prFixItem).toEqual({
+    expect(body.prFixItem).toMatchObject({
       id: "prfix-1",
       generation: 1,
     });
@@ -632,7 +638,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
     const firstBody = await first.json();
-    expect(firstBody.prFixItem).toEqual({ id: "prfix-1", generation: 1 });
+    expect(firstBody.prFixItem).toMatchObject({ id: "prfix-1", generation: 1 });
 
     // Same queue row after an explicit requeue — same id, bumped generation.
     item.generation = 2;
@@ -642,7 +648,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     );
     const secondBody = await second.json();
     expect(secondBody.type).toBe("followup-pr");
-    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(secondBody.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
     expect(secondBody.prFixItem.id).toBe(firstBody.prFixItem.id);
   });
 
@@ -701,7 +707,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const due = await poll();
     const body = await due.json();
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: waiting.id, generation: issuedGeneration + 1 });
+    expect(body.prFixItem).toMatchObject({ id: waiting.id, generation: issuedGeneration + 1 });
     expect(waiting.status).toBe("QUEUED");
     expect(waiting.generation).toBeGreaterThan(issuedGeneration);
     expect(waiting.fixAttempts).toBeUndefined();
@@ -748,7 +754,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     );
     const secondBody = await second.json();
     expect(secondBody.type).toBe("followup-pr");
-    expect(secondBody.prFixItem).toEqual({ id: itemId, generation: 2 });
+    expect(secondBody.prFixItem).toMatchObject({ id: itemId, generation: 2 });
   });
 
   it("stamps the hand-out with a generation-conditional update (#1119)", async () => {
@@ -848,6 +854,10 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(row.dispatchedAt).toBeInstanceOf(Date);
     expect(row.postDispatchEvidenceKeys).toEqual([]);
     expect(row.agentHandouts).toEqual(["example-agent@2"]);
+    // #1256 review: the hand-out pushed a per-hand-out receipt alongside the
+    // record, and the task carries its token back to the worker.
+    const firstIssued = /^(hnd_[0-9a-f]+)@example-agent@2$/.exec(row.handoutReceipts[0] ?? "");
+    expect(firstIssued).not.toBeNull();
     const stampedAt = row.dispatchedAt;
 
     // (b) New evidence enqueues mid-run, after the dispatch.
@@ -862,7 +872,12 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     );
     const secondBody = await second.json();
     expect(secondBody.type).toBe("followup-pr");
-    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(secondBody.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
+    expect(typeof secondBody.prFixItem.handoutToken).toBe("string");
+    // The token rotates per hand-out: B's receipt is a distinct entry from A's.
+    expect(row.handoutReceipts).toHaveLength(2);
+    expect(row.handoutReceipts[1]).toBe(`${secondBody.prFixItem.handoutToken}@other-agent@2`);
+    expect(row.handoutReceipts[0]).not.toBe(row.handoutReceipts[1]);
     expect(row.postDispatchEvidenceKeys).toEqual(["review:o/r#7:r2@H1"]);
     expect(row.dispatchedGeneration).toBe(2);
     expect(row.dispatchedAt).toBe(stampedAt);
@@ -962,7 +977,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     // The already-handed item is skipped; the NEXT pr-fix item ships.
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: "prfix-2", generation: 1 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-2", generation: 1 });
     expect(handed.agentHandouts).toEqual(["example-agent@2"]);
     expect(fresh.agentHandouts).toEqual(["example-agent@1"]);
   });
@@ -1118,7 +1133,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       request("/api/agents/example-agent/next-task?lane=local"),
       { params: Promise.resolve({ agentName: "example-agent" }) },
     );
-    expect((await first.json()).prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect((await first.json()).prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
     expect(row.agentHandouts).toEqual(["example-agent@2"]);
 
     // The item is re-issued as a fresh attempt (requeue/reopen): generation
@@ -1133,7 +1148,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     );
     const secondBody = await second.json();
     expect(secondBody.type).toBe("followup-pr");
-    expect(secondBody.prFixItem).toEqual({ id: "prfix-1", generation: 3 });
+    expect(secondBody.prFixItem).toMatchObject({ id: "prfix-1", generation: 3 });
     expect(row.agentHandouts).toEqual(["example-agent@3"]);
   });
 
@@ -1182,7 +1197,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
     expect(row.agentHandouts).toEqual(["some-other-agent@2", "example-agent@2"]);
   });
 
@@ -1301,7 +1316,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(stamps[1].generation).toBe(3);
     // The handed-out token is the NEW generation, so the worker's settle
     // report matches the live row instead of being rejected as a mismatch.
-    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 3 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 3 });
     // The payload reasons come from the latest read, not the queue snapshot.
     expect(body.reasons).toContain("CI failure on main (re-issued)");
     expect(body.reasons).toContain("fix lint");
@@ -1490,7 +1505,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.type).toBe("followup-pr");
     // Best-effort: the task is served with the pre-stamp snapshot's
     // generation and reasons.
-    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
     expect(body.reasons).toContain("CI failure on main");
     expect(body.reasons).toContain("update tests");
   });
@@ -1530,7 +1545,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: "prfix-1", generation: 2 });
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
     expect(body.reasons).toContain("CI failure on main");
     expect(body.reasons).toContain("update tests");
     // Only present in the re-read row — proves the payload reasons come from
@@ -1785,7 +1800,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.shouldRun).toBe(true);
-    expect(body.prFixItem).toEqual({ id: "linked-prfix", generation: 1 });
+    expect(body.prFixItem).toMatchObject({ id: "linked-prfix", generation: 1 });
     expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
     expect(mocks.prFixHistoryCreate).toHaveBeenCalledTimes(1);
   });
@@ -1820,7 +1835,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
-    expect(body.prFixItem).toEqual({ id: "existing-prfix", generation: 3 });
+    expect(body.prFixItem).toMatchObject({ id: "existing-prfix", generation: 3 });
     expect(mocks.prFixCreate).not.toHaveBeenCalled();
     expect(mocks.fetchPullRequestLabels).not.toHaveBeenCalled();
   });
@@ -1834,7 +1849,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     );
     const firstBody = await first.json();
     expect(firstBody.type).toBe("followup-pr");
-    expect(firstBody.prFixItem).toEqual({ id: "linked-prfix", generation: 1 });
+    expect(firstBody.prFixItem).toMatchObject({ id: "linked-prfix", generation: 1 });
     expect(mocks.prFixHistoryCreate).toHaveBeenCalledTimes(1);
 
     const second = await GET(
@@ -1851,7 +1866,12 @@ describe("GET /api/agents/[agentName]/next-task", () => {
         id: "linked-prfix", generation: 1, status: "QUEUED",
         NOT: { agentHandouts: { has: "example-agent@1" } },
       }),
-      data: { agentHandouts: { push: ["example-agent@1"] } },
+      // #1256 review: the hand-out record and its per-hand-out receipt are
+      // pushed in the same conditional write (token rotates per issuance).
+      data: expect.objectContaining({
+        agentHandouts: { push: ["example-agent@1"] },
+        handoutReceipts: { push: [expect.stringMatching(/^hnd_[0-9a-f]+@example-agent@1$/)] },
+      }),
     }));
   });
 
@@ -1990,7 +2010,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.pullRequest.number).toBe(16);
-    expect(body.prFixItem).toEqual({ id: "linked-prfix-2", generation: 1 });
+    expect(body.prFixItem).toMatchObject({ id: "linked-prfix-2", generation: 1 });
   });
 
   it("materializes linked-only work for a lane without a PR-fix equivalent, without handing it to that lane", async () => {
@@ -2661,5 +2681,144 @@ describe("GET /api/agents/[agentName]/next-task — bound worker scope (#1129)",
       { params: Promise.resolve({ agentName: "alpha" }) },
     );
     expect(res.status).toBe(403);
+  });
+});
+
+describe("GET /api/agents/[agentName]/next-task — capacity-scoped handoff cooldowns (#1256)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    mocks.prFixFindMany.mockResolvedValue([]);
+    mocks.issueFindMany.mockResolvedValue([]);
+    mocks.findLeasedIssueIds.mockResolvedValue([]);
+    mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.prFixFindUnique.mockResolvedValue(null);
+    mocks.prFixFindUniqueByRepo.mockResolvedValue(null);
+    mocks.capacityHandoffFindMany.mockResolvedValue([]);
+    mocks.capacityHandoffDeleteMany.mockResolvedValue({ count: 0 });
+  });
+
+  function cooledPrRow(): any {
+    return {
+      id: "prfix-cooled",
+      repo: "org/repo",
+      pr: 70,
+      issue: null,
+      branch: "work/70",
+      url: "https://github.com/org/repo/pull/70",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "review changes requested",
+      feedback: [],
+      generation: 1,
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+      agentHandouts: [],
+    };
+  }
+
+  it("rejects a malformed capacity query", async () => {
+    const res = await GET(
+      request(`/api/agents/example-agent/next-task?capacity=${"x".repeat(250)}`),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("does not re-hand a cooled PR-fix attempt to the exhausted capacity, but hands it to an unrelated capacity", async () => {
+    const row = cooledPrRow();
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      if (row.id !== where.id) return { count: 0 };
+      if (where.generation !== undefined && row.generation !== where.generation) return { count: 0 };
+      applyUpdate(row, data);
+      return { count: 1 };
+    });
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      reason: row.reason, feedback: row.feedback, generation: row.generation,
+      status: row.status, lane: row.lane, agentHandouts: row.agentHandouts,
+    }));
+    mocks.capacityHandoffFindMany.mockResolvedValue([
+      { kind: "pr_fix", capacity: "model-a", repoFullName: "org/repo", issueNumber: null, prNumber: 70 },
+    ]);
+
+    // The exhausted capacity is suppressed; with no other work it goes idle.
+    const cooled = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&capacity=model-a"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect((await cooled.json()).type).toBe("idle");
+
+    // An unrelated capacity still gets the work — the cooldown is scoped.
+    const unrelated = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&capacity=model-b"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const body = await unrelated.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(70);
+    expect(body.prFixItem).toMatchObject({ id: row.id, generation: 1 });
+  });
+
+  it("suppresses a cooled issue only for the exhausted capacity; undeclared workers skip conservatively", async () => {
+    mocks.issueFindMany.mockResolvedValue([independentIssue(101)]);
+    mocks.capacityHandoffFindMany.mockResolvedValue([
+      { kind: "issue", capacity: "model-a", repoFullName: "org/repo", issueNumber: 101, prNumber: null },
+    ]);
+
+    const exhausted = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&capacity=model-a"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect((await exhausted.json()).type).toBe("idle");
+
+    // Fail-closed for workers that declare no capacity: Dispatch cannot prove
+    // they are not the exhausted capacity.
+    const undeclared = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect((await undeclared.json()).type).toBe("idle");
+
+    const unrelated = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&capacity=model-b"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const body = await unrelated.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(101);
+  });
+
+  it("resumes normal dispatch once no active cooldown exists (expiry is lazy)", async () => {
+    mocks.issueFindMany.mockResolvedValue([independentIssue(101)]);
+    // The route filters by `cooldownUntil > now`; expiry simply means the row
+    // no longer comes back from the active read.
+    mocks.capacityHandoffFindMany.mockResolvedValue([]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&capacity=model-a"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(101);
+  });
+
+  it("dispatches without capacity suppression when the cooldown read fails (availability over strictness)", async () => {
+    mocks.issueFindMany.mockResolvedValue([independentIssue(101)]);
+    mocks.capacityHandoffFindMany.mockRejectedValue(new Error("db down"));
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local&capacity=model-a"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("implement");
+    expect(body.issue.number).toBe(101);
   });
 });

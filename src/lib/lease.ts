@@ -8,6 +8,7 @@
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { newClaimToken } from "@/lib/capacity-handoff";
 import type { CheckpointValue, ResumeContext, ResumeContextWithLease } from "./next-action";
 import { buildResumeContext, isValidCheckpoint } from "./next-action";
 
@@ -65,6 +66,12 @@ export async function upsertLease(params: {
   // @@unique([agentName, issueId]) constraint. The loser hits a P2002
   // unique violation — re-read and return the lease the winner created
   // instead of surfacing a 500 to the caller.
+  //
+  // #1256: creation mints the opaque claim token that fences later
+  // capacity-handoff releases to THIS exact claim. Renewals deliberately keep
+  // the token (a heartbeating worker must not lose its receipt); a released or
+  // expired lease that is re-claimed is a NEW row with a NEW token, so old
+  // tokens are inert against new claims.
   try {
     const lease = await prisma.lease.create({
       data: {
@@ -74,6 +81,7 @@ export async function upsertLease(params: {
         checkpoint,
         branch: params.branch,
         prUrl: params.prUrl,
+        claimToken: newClaimToken(),
       },
     });
     return { created: true, lease };
@@ -214,6 +222,9 @@ export async function resolveActiveWork(agentName: string): Promise<ResumeContex
       prUrl: lease.prUrl ?? undefined,
     }),
     leaseId: lease.id,
+    // #1256: the issued claim token, so a resuming worker keeps the receipt
+    // that fences its capacity-handoff release to this exact claim.
+    claimToken: lease.claimToken ?? undefined,
     lane: lease.issue.currentLane ?? "default",
     status: lease.issue.state,
     labels: lease.issue.labels,

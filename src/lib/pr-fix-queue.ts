@@ -1,7 +1,9 @@
+import { randomBytes } from "node:crypto";
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, normalizePrFixOutcome, PrFixLane, PrFixOutcome, PrFixStatus, PrFixType, PrFixDecisionContext, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { surfacePrFixBlocked, surfacePrFixParked, surfacePrFixRequeued, surfacePrFixUnblocked, extractUrlsFromText, type PrFixUnblockOutcome } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
 import { fetchPullRequestMergeState, fetchPullRequestHeadSha, fetchPullRequestState } from "./github-prs";
+import { capacityCooldownMs, capacityEquals } from "./capacity-handoff";
 import { fetchRepositoryMetadata } from "./github-code-search";
 import { sanitizeForStorage } from "./groomer/sanitize";
 
@@ -17,6 +19,13 @@ export type PrFixQueueClient = {
     updateMany: (args: any) => Promise<{ count: number }>;
   };
   prFixHistory: {
+    create: (args: any) => Promise<any>;
+    findMany?: (args: any) => Promise<any[]>;
+  };
+  // #1256: capacity-scoped cooldown rows. Optional so legacy/test clients
+  // without the table still settle other outcomes; capacity-exhausted
+  // settlement records the cooldown whenever the surface exists.
+  capacityHandoff?: {
     create: (args: any) => Promise<any>;
     findMany?: (args: any) => Promise<any[]>;
   };
@@ -562,7 +571,7 @@ async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): 
     await client.$transaction(async (tx) => {
       const { count } = await tx.prFixQueueItem.updateMany({
         where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
-        data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [] },
+        data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [] },
       });
       if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
     });
@@ -912,6 +921,7 @@ export async function reclaimStalePrFixHandouts(
                 status: "STALE",
                 agentHandouts: [],
                 handoutAcks: [],
+                handoutReceipts: [],
                 dispatchedGeneration: null,
                 dispatchedAt: null,
               },
@@ -958,6 +968,7 @@ export async function reclaimStalePrFixHandouts(
                 decisionDetail: null,
                 agentHandouts: [],
                 handoutAcks: [],
+                handoutReceipts: [],
                 dispatchedGeneration: null,
                 dispatchedAt: null,
               },
@@ -1026,6 +1037,7 @@ export async function reclaimStalePrFixHandouts(
               handoutReclaims: { increment: 1 },
               agentHandouts: [],
               handoutAcks: [],
+              handoutReceipts: [],
               postDispatchEvidenceKeys: [],
               dispatchedGeneration: null,
               dispatchedAt: null,
@@ -1240,7 +1252,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // way, and the skip check must match only the current identity
           // (#1119, #1133, #1211).
           ...(isFreshAttempt
-            ? { postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [] }
+            ? { postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [], handoutReceipts: [] }
             : {}),
           // Structured outcome (#1218): recorded on the same write as the
           // status. Only BLOCKED/PARKED carry one; decisionDetail is persisted
@@ -1618,6 +1630,7 @@ export async function markPrFixItem(
     data.dispatchedGeneration = null;
     data.dispatchedAt = null;
     data.agentHandouts = [];
+    data.handoutReceipts = [];
     data.handoutAcks = [];
   }
 
@@ -1688,6 +1701,7 @@ export async function markPrFixItem(
           postDispatchEvidenceKeys: [],
           agentHandouts: [],
           handoutAcks: [],
+          handoutReceipts: [],
         }
       : {
           status: "QUEUED",
@@ -1703,6 +1717,7 @@ export async function markPrFixItem(
           // prior generation's acknowledgements are dead (#1211).
           agentHandouts: [],
           handoutAcks: [],
+          handoutReceipts: [],
         };
     const { count } = await tx.prFixQueueItem.updateMany({
       where: {
@@ -1806,6 +1821,7 @@ export async function markPrFixItem(
       // match must not survive the identity change (#1133).
       data.postDispatchEvidenceKeys = [];
       data.agentHandouts = [];
+      data.handoutReceipts = [];
       data.handoutAcks = [];
     }
     // QUEUED → QUEUED: leave the key list untouched — the entries still refer
@@ -1851,6 +1867,7 @@ export async function markPrFixItem(
             postDispatchEvidenceKeys: [],
             agentHandouts: [],
             handoutAcks: [],
+            handoutReceipts: [],
           }
         : {
             status: "QUEUED",
@@ -1867,6 +1884,7 @@ export async function markPrFixItem(
             // acknowledgements (#1133, #1211).
             agentHandouts: [],
             handoutAcks: [],
+            handoutReceipts: [],
           };
       const refusal = await client.$transaction(async (tx) => {
         const { count } = await tx.prFixQueueItem.updateMany({
@@ -2134,6 +2152,7 @@ export async function markPrFixItem(
         postDispatchEvidenceKeys: [],
         agentHandouts: [],
         handoutAcks: [],
+        handoutReceipts: [],
       }
     : {
         status: "QUEUED",
@@ -2149,6 +2168,7 @@ export async function markPrFixItem(
         // prior generation's acknowledgements are dead (#1211).
         agentHandouts: [],
         handoutAcks: [],
+        handoutReceipts: [],
       };
   const forced = await client.$transaction(async (tx) => {
     const { count } = await tx.prFixQueueItem.updateMany({
@@ -2351,6 +2371,78 @@ export function parseAgentHandoutToken(entry: unknown): { agentName: string; gen
   return { agentName: entry.slice(0, idx), generation };
 }
 
+// ── Per-hand-out receipts (#1256 review) ───────────────────────────────────
+//
+// `agentHandouts` answers "was this generation already handed to agent X",
+// which is all ordinary dispatch needs. Capacity-exhausted settlement needs
+// more: it must authorize the EXACT hand-out attempt a worker was issued, so
+// that (a) an unrelated agent that merely knows the (id, generation) token can
+// never release the current hand-out, and (b) a stale token from a PREVIOUS
+// hand-out of the SAME agent at the SAME generation (release/reclaim keep the
+// generation) cannot release the live one. Generation alone cannot express
+// either — the receipt carries a fresh opaque token per hand-out.
+//
+// Receipt entry format: `<token>@<agentName>@<generation>`. The token is
+// Dispatch-minted hex (never contains "@"), so the token boundary is the
+// FIRST "@"; the agent name may contain "@", so its boundary with the
+// generation stays the LAST "@" (same rule as `agentHandoutToken`).
+//
+// Invariant (enforced at every write site below): a receipt exists exactly
+// while the matching `agentHandouts` entry exists — issuance pushes both in
+// one conditional write, every site that clears `agentHandouts` clears
+// `handoutReceipts` in the same data object. A released/reclaimed/
+// superseded hand-out therefore has no live receipt, and every NEW hand-out
+// rotates in a fresh token.
+
+/** Fresh opaque per-hand-out token. Opaque to everyone but the matcher. */
+export function newHandoutToken(): string {
+  return `hnd_${randomBytes(12).toString("hex")}`;
+}
+
+/** Encoding of a persisted hand-out owner receipt. */
+export function handoutReceipt(token: string, agentName: string, generation: number): string {
+  return `${token}@${agentName}@${generation}`;
+}
+
+export function parseHandoutReceipt(
+  entry: unknown,
+): { token: string; agentName: string; generation: number } | null {
+  if (typeof entry !== "string") return null;
+  const first = entry.indexOf("@");
+  const last = entry.lastIndexOf("@");
+  // Token and agent name must both be non-empty; token shape is Dispatch's.
+  if (first <= 0 || last <= first) return null;
+  const token = entry.slice(0, first);
+  if (!/^hnd_[0-9a-f]{8,}$/.test(token)) return null;
+  const generation = Number(entry.slice(last + 1));
+  if (!Number.isInteger(generation) || generation < 1) return null;
+  return { token, agentName: entry.slice(first + 1, last), generation };
+}
+
+/**
+ * The receipt in `entries` matching the exact (agent, generation, token)
+ * triple, or null. All three must match: the agent binds the source owner,
+ * the token binds the exact hand-out issuance, the generation is defense in
+ * depth against a cleared-then-reissued entry.
+ */
+export function findHandoutReceipt(
+  entries: readonly unknown[],
+  owner: { agentName: string; generation: number; token: string },
+): string | null {
+  for (const entry of entries) {
+    const parsed = parseHandoutReceipt(entry);
+    if (
+      parsed &&
+      parsed.agentName === owner.agentName &&
+      parsed.generation === owner.generation &&
+      parsed.token === owner.token
+    ) {
+      return entry as string;
+    }
+  }
+  return null;
+}
+
 /**
  * Whether this item was already handed to `agentName` at its CURRENT
  * generation (#1133). Entries for older generations and malformed entries
@@ -2461,6 +2553,7 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         postDispatchEvidenceKeys: [],
         agentHandouts: [],
         handoutAcks: [],
+        handoutReceipts: [],
         handoutReclaims: 0,
       },
     });
@@ -2517,7 +2610,8 @@ export type AgentReportOutcome =
   | "waiting-external"
   // #1143: an issue close, not a PR-fix settlement; never touches the queue.
   | "already_done"
-  | "handed-off";
+  | "handed-off"
+  | "capacity-exhausted";
 
 /**
  * The (id, generation) attempt token `next-task` issues on a followup-pr
@@ -2526,6 +2620,13 @@ export type AgentReportOutcome =
 export interface PrFixReportAttempt {
   itemId: string;
   generation: number;
+  /**
+   * #1256: the per-hand-out receipt token next-task issued with this
+   * hand-out. REQUIRED by `capacity-exhausted` settlement (exact source-
+   * attempt fencing); ignored by every other outcome, so legacy reports and
+   * token-less hand-outs settle exactly as before.
+   */
+  handoutToken?: string | null;
 }
 
 export interface ResolvePrFixFromAgentReportInput {
@@ -2542,6 +2643,13 @@ export interface ResolvePrFixFromAgentReportInput {
   // give-up) marks PARKED — a bare give-up is NOT a human decision.
   blockReason?: string | null;
   decision?: PrFixDecisionContext | null;
+  // #1256: opaque worker-declared capacity identifier, required (with an
+  // attempt token) by the `capacity-exhausted` outcome.
+  capacity?: string | null;
+  // #1256: reporting agent — recorded on the capacity-handoff history row and,
+  // for `capacity-exhausted`, part of the exact-owner CAS (the presented
+  // handoutToken must belong to THIS agent's live receipt).
+  agentName?: string | null;
   client?: PrFixQueueClient;
   // #1074: required for queue settlement. When present, the report settles
   // exactly the item + generation the token identifies; when absent (legacy
@@ -2713,6 +2821,145 @@ export async function resolvePrFixFromAgentReport(
 
   const expectedGeneration = attempt?.generation ?? undefined;
 
+  // #1256: explicit capacity exhaustion on a handed PR-fix attempt.
+  //
+  // Semantics (deliberately NOT a WAITING_EXTERNAL park): the item STAYS
+  // QUEUED at the same generation with the same fixAttempts count, branch, and
+  // PR identity — the attempt token is consumed (hand-out stamps cleared so
+  // any compatible worker can take it) but no repair budget is spent, and no
+  // global wait hides the item from workers whose capacity is unrelated. The
+  // suppression is scoped to the exhausted capacity via a CapacityHandoff
+  // cooldown row that next-task applies when the requester declares a
+  // capacity (workers declaring none skip conservatively until expiry).
+  //
+  // Fencing (#1256 review): the release is authorized by the EXACT source
+  // attempt — the reporting agent plus the per-hand-out receipt token
+  // next-task issued with the hand-out (`prFixItem.handoutToken`). An
+  // unrelated agent that merely knows (id, generation), and the same agent
+  // presenting a token from a PREVIOUS hand-out of the same generation
+  // (release keeps the generation), are both refused with zero mutation. The
+  // write pins the full hand-out state (receipts/hand-outs/acks) and removes
+  // ONLY the reporting agent's receipt, hand-out entry, and own ack; other
+  // agents' live hand-outs and acknowledgements at the same generation are
+  // preserved, and the dispatch stamps survive while any other hand-out is
+  // still live. A generation race (fresh attempt re-issued meanwhile) or a
+  // human hold (BLOCKED/PARKED/NEEDS_HUMAN — the non-QUEUED gate above)
+  // lands as count=0 → skipped with zero mutation.
+  if (input.outcome === "capacity-exhausted") {
+    const capacity = input.capacity?.trim();
+    const handoutToken = attempt?.handoutToken?.trim();
+    const reportingAgent = input.agentName?.trim();
+    if (expectedGeneration === undefined || !capacity) {
+      return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "capacity-exhausted requires a capacity identifier and prFixItem attempt token" };
+    }
+    if (!handoutToken || !reportingAgent) {
+      return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "capacity-exhausted requires the issued prFixItem handoutToken receipt (exact source-attempt fencing)" };
+    }
+    // Idempotent replay: an active cooldown recorded for THIS capacity at
+    // THIS generation means the report was already processed. The check is
+    // keyed on both so a different capacity exhausting the same live
+    // generation (possible: hand-outs are cleared, another worker can be
+    // dispatched at the same generation) still records its own scoped
+    // cooldown, and an older generation's window never absorbs a fresh one.
+    const activeHandoffs = client.capacityHandoff?.findMany
+      ? await client.capacityHandoff.findMany({
+          where: { kind: "pr_fix", repoFullName: repo, prNumber: pr, cooldownUntil: { gt: new Date() } },
+        })
+      : [];
+    if (
+      activeHandoffs.some(
+        (h: any) =>
+          h.prNumber === pr &&
+          String(h.repoFullName).toLowerCase() === repo &&
+          h.generation === expectedGeneration &&
+          typeof h.capacity === "string" &&
+          capacityEquals(h.capacity, capacity),
+      )
+    ) {
+      return { matched: true, action: "deferred", itemId: existing.id ?? null, reason: `capacity handoff already recorded for capacity ${capacity} at generation ${expectedGeneration}`, attemptGeneration: expectedGeneration };
+    }
+    const cooldownUntil = new Date(Date.now() + capacityCooldownMs());
+    const queueClient = client as PrFixQueueClient;
+    const result = await queueClient.$transaction(async (tx) => {
+      // Read the live hand-out set and pin it below. The CAS still pins the
+      // ISSUED hand-out stamp (dispatchedGeneration = the generation
+      // next-task stamped): exactly one concurrent report can consume the
+      // stamps, so two racing duplicates cannot both mint a cooldown.
+      const live = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      if (
+        !live ||
+        live.status !== "QUEUED" ||
+        live.generation !== expectedGeneration ||
+        live.dispatchedGeneration !== expectedGeneration
+      ) {
+        return "stale" as const;
+      }
+      const receipts: string[] = Array.isArray(live.handoutReceipts) ? live.handoutReceipts : [];
+      const handouts: string[] = Array.isArray(live.agentHandouts) ? live.agentHandouts : [];
+      const acks: string[] = Array.isArray(live.handoutAcks) ? live.handoutAcks : [];
+      // Exact source-owner authorization: agent + generation + issued token
+      // must all match a live receipt. An unknown or rotated token (the
+      // hand-out was already released, reclaimed, or re-issued to this same
+      // agent at this same generation) has no authority over the current one.
+      const owned = findHandoutReceipt(receipts, {
+        agentName: reportingAgent,
+        generation: expectedGeneration,
+        token: handoutToken,
+      });
+      if (!owned) return "unauthorized" as const;
+      const remainingReceipts = receipts.filter((r) => r !== owned);
+      const ownEntry = agentHandoutToken(reportingAgent, expectedGeneration);
+      const remainingHandouts = handouts.filter((h) => h !== ownEntry);
+      const remainingAcks = acks.filter((a) => a !== ownEntry);
+      // The dispatch stamps survive while ANY other agent's hand-out at this
+      // generation is still live (#1119: clearing them would reclassify
+      // mid-run evidence as pre-dispatch for the surviving workers). Only the
+      // report that consumes the last live hand-out resets the stamps and the
+      // post-dispatch evidence list, making the generation freshly
+      // dispatchable.
+      const lastHandout = remainingReceipts.length === 0;
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: {
+          id: live.id,
+          status: "QUEUED",
+          generation: expectedGeneration,
+          dispatchedGeneration: expectedGeneration,
+          // Receipt/hand-out/ack pins: a concurrent hand-out, ack, or reclaim
+          // landing in the read→write gap makes this a no-op.
+          handoutReceipts: { equals: receipts },
+          agentHandouts: { equals: handouts },
+          handoutAcks: { equals: acks },
+        },
+        data: {
+          handoutReceipts: remainingReceipts,
+          agentHandouts: remainingHandouts,
+          handoutAcks: remainingAcks,
+          ...(lastHandout
+            ? { postDispatchEvidenceKeys: [], dispatchedGeneration: null, dispatchedAt: null }
+            : {}),
+        },
+      });
+      if (count !== 1) return "stale" as const;
+      await tx.prFixHistory.create({ data: { itemId: existing.id, action: "capacity_handoff", status: "QUEUED", lane: existing.lane, reason: capacity, note: `Capacity exhausted: ${capacity}; attempt generation ${expectedGeneration} released by ${reportingAgent} without consuming retry budget; item stays QUEUED and discoverable to compatible capacities.${remainingReceipts.length > 0 ? ` ${remainingReceipts.length} other live hand-out(s) at this generation preserved (dispatch stamps retained).` : ""}` } });
+      if (tx.capacityHandoff) {
+        await tx.capacityHandoff.create({ data: { kind: "pr_fix", capacity, repoFullName: repo, prNumber: pr, issueNumber: existing.issue ?? null, agentName: reportingAgent, generation: expectedGeneration, cooldownUntil, note: `PR-fix attempt generation ${expectedGeneration} handed off by capacity report` } });
+      }
+      return true;
+    });
+    return {
+      matched: true,
+      action: result === true ? "deferred" : "skipped",
+      itemId: existing.id ?? null,
+      reason:
+        result === true
+          ? `capacity ${capacity} exhausted; attempt released with a capacity-scoped cooldown until ${cooldownUntil.toISOString()}`
+          : result === "unauthorized"
+            ? `capacity handoff refused: no live hand-out receipt for ${reportingAgent} at generation ${expectedGeneration} matches the presented handoutToken (already released, reclaimed, or rotated by a newer hand-out); the queue was not modified`
+            : "capacity handoff lost a status/generation race",
+      attemptGeneration: expectedGeneration,
+    };
+  }
+
   if (input.outcome === "waiting-external") {
     if (expectedGeneration === undefined) {
       return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "waiting-external requires a prFixItem attempt token" };
@@ -2809,6 +3056,7 @@ export async function resolvePrFixFromAgentReport(
             postDispatchEvidenceKeys: [],
             agentHandouts: [],
             handoutAcks: [],
+            handoutReceipts: [],
           }
         : {
             status: "QUEUED",
@@ -2824,6 +3072,7 @@ export async function resolvePrFixFromAgentReport(
             // acknowledgements are dead (#1211).
             agentHandouts: [],
             handoutAcks: [],
+            handoutReceipts: [],
           };
       // The head-snapshot pin guards the fresh-attempt branch's baseline on
       // EVERY pass; the capped BLOCKED branch carries no baseline, so it

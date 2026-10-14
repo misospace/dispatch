@@ -10,9 +10,10 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, normalizeQueueRepo } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, newHandoutToken, normalizeQueueRepo } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
+import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
 
 /** A queued PR-fix item as the route consumes it (see toAgentQueuePrFixItem). */
 type PrFixCandidate = {
@@ -148,6 +149,17 @@ export async function GET(
 
   const { searchParams } = new URL(request.url);
   const lane = searchParams.get("lane");
+  // #1256: optional worker-declared execution capacity. When set, active
+  // capacity handoffs only suppress re-hand of the matching capacity's work;
+  // when absent, a worker conservatively skips ANY cooled item (Dispatch
+  // cannot prove it is not the exhausted capacity).
+  const capacityParam = searchParams.get("capacity");
+  const requestedCapacity = capacityParam === null || capacityParam.trim() === ""
+    ? undefined
+    : normalizeCapacity(capacityParam) ?? undefined;
+  if (capacityParam !== null && capacityParam.trim() !== "" && requestedCapacity === undefined) {
+    return errorResponse("capacity must be a non-empty string of at most 200 characters", 400);
+  }
   const excludeDecomposed = searchParams.get("exclude_decomposed");
   const includeClaimed = searchParams.get("includeClaimed") === "true";
   const includeRenovate = searchParams.get("includeRenovate") === "true";
@@ -205,6 +217,20 @@ export async function GET(
   if (scopeError) return scopeError;
 
   try {
+    // Active capacity-scoped cooldowns (#1256). Best-effort: a read failure
+    // must not 500 the poll (dispatching cooled work to the exhausted capacity
+    // is a bounded nuisance; blocking the whole lane is not), so fail open
+    // with no skips and log.
+    let skipIssueForCapacity = (_repo: string | null | undefined, _issueNumber: number) => false;
+    let skipPrForCapacity = (_repo: string, _prNumber: number) => false;
+    try {
+      const handoffs = await loadActiveCapacityHandoffs(prisma as any);
+      const skip = buildCapacitySkip(handoffs, requestedCapacity);
+      skipIssueForCapacity = skip.skipIssue;
+      skipPrForCapacity = skip.skipPr;
+    } catch (error) {
+      console.error("next-task capacity-handoff read failed; dispatching without capacity suppression:", error);
+    }
     const { laneValid, resolvedLane, rankedQueue, fullQueue, withheldQueue, admissionMode, prFixItems, availableLanes } =
       await fetchAgentQueueData({
         agentName,
@@ -233,16 +259,31 @@ export async function GET(
       if (excluded(candidate.repo, candidate.pr, candidate.generation)) {
         return null;
       }
+      // #1256: the exhausted capacity must not be re-handed the attempt it
+      // gave up (and an undeclared capacity is conservatively treated the
+      // same); unrelated capacities dispatch it normally.
+      if (skipPrForCapacity(candidate.repo, candidate.pr)) return null;
       if (agentAlreadyHanded(candidate, agentName)) return null;
       const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded);
       if (!confirmed) return null;
 
       if (excluded(candidate.repo, candidate.pr, confirmed.generation)) return null;
+      // Mint the per-hand-out receipt token (#1256 review): every issuance
+      // rotates in a fresh opaque token, pushed atomically with the hand-out
+      // record (one conditional write — the hand-out/receipt bijection never
+      // drifts). The task ships it in `prFixItem.handoutToken`; only a
+      // capacity-exhausted report must present it back, and settlement then
+      // releases exactly THIS hand-out — not a newer one for the same agent
+      // at the same generation, and never another agent's.
+      const handoutToken = newHandoutToken();
       try {
         // Conditional append fences concurrent polls for the same agent/generation.
         const claimed = await prisma.prFixQueueItem.updateMany({
           where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED", NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } } },
-          data: { agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] } },
+          data: {
+            agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] },
+            handoutReceipts: { push: [handoutReceipt(handoutToken, agentName, confirmed.generation)] },
+          },
         });
         if (claimed.count !== 1) return null;
       } catch (error) {
@@ -262,7 +303,7 @@ export async function GET(
         issue: candidate.issue
           ? { repoFullName: candidate.repo, number: candidate.issue }
           : undefined,
-        prFixItem: { id: candidate.id, generation: confirmed.generation },
+        prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken },
         reasons,
       });
     };
@@ -409,7 +450,7 @@ export async function GET(
     // instead of re-serving the deferred one.
     const isDeferred = (item: { repoFullName?: string | null; number: number }) =>
       deferredIssues.has(issueKey(item.repoFullName, item.number));
-    const first = rankedQueue.find((item) => !isDeferred(item));
+    const first = rankedQueue.find((item) => !isDeferred(item) && !skipIssueForCapacity(item.repoFullName, item.number));
     if (first) {
       if (admissionMode === "audit" && first.admission && !first.admission.admitted) {
         console.warn(
@@ -440,15 +481,25 @@ export async function GET(
     const excludedNote = skipped.size > 0
       ? `${skipped.size} PR-fix generations skipped by client exclusion` : null;
 
+    // #1256: surface capacity suppression separately from queue ownership,
+    // so an operator can tell "everything left is cooled for this capacity"
+    // from an empty lane.
+    const capacityDeferredCount =
+      prFixItems.filter((candidate) => skipPrForCapacity(candidate.repo, candidate.pr)).length +
+      rankedQueue.filter((item) => !isDeferred(item) && skipIssueForCapacity(item.repoFullName, item.number)).length;
+    const capacityNote = capacityDeferredCount > 0
+      ? `${capacityDeferredCount} item${capacityDeferredCount === 1 ? "" : "s"} cooled for ${requestedCapacity ?? "any capacity (undeclared request)"} by a capacity handoff`
+      : null;
+
     if (withheldQueue.length > 0) {
       const withheldNote = `${withheldQueue.length} ready issue${withheldQueue.length === 1 ? "" : "s"} withheld by grooming admission`;
       return respond(
-        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote].filter(Boolean).join("; ")})`),
+        createIdleTask(`No work available (${[withheldNote, deferredNote, excludedNote, capacityNote].filter(Boolean).join("; ")})`),
       );
     }
 
-    if (deferredNote || excludedNote) {
-      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote].filter(Boolean).join("; ")})`));
+    if (deferredNote || excludedNote || capacityNote) {
+      return respond(createIdleTask(`No work available (${[deferredNote, excludedNote, capacityNote].filter(Boolean).join("; ")})`));
     }
 
     return respond(createIdleTask("No work available"));

@@ -32,6 +32,12 @@ export interface ResolveIssueResult {
 export interface ClaimIssueResult {
   success: boolean;
   labels: string[];
+  /**
+   * #1256: opaque claim token fencing a later capacity-handoff release
+   * (`POST /api/issues/capacity-handoff`) to this exact claim. Null for
+   * legacy token-less leases.
+   */
+  claimToken?: string | null;
 }
 
 export interface UnclaimIssueResult {
