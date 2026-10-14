@@ -257,6 +257,10 @@ Dispatch supports three authentication models:
 
 ### Operational Notes
 
+#### Observability
+
+For the standalone, backend-neutral signal/state catalogue, dashboard view specification, alert catalogue, and integration approaches (independent of any worker client or monitoring stack), see [Standalone Portable Observability](docs/observability.md).
+
 #### Basic-auth brute-force protection
 
 In `DISPATCH_AUTH_MODE=basic`, `src/middleware.ts` rate-limits failed Basic-auth attempts to **5 attempts per minute per source IP**; a successful password authentication resets the counter. A request that exceeds the limit receives `429 Too Many Requests` with `Retry-After` and security headers until the window resets.
