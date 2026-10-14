@@ -59,25 +59,25 @@ per-hand-out acknowledgement. The design builds on these.
 | `agent/<name>` label | GitHub, cached on `Issue.labels` | The only queue-level claim filter; "one agent label at a time" (`docs/assignment-conflict-policy.md`) | Shared, mutable, no expiry; label present ≠ process alive; label absent ≠ not working |
 | `owner/<name>` label | GitHub, cached | Human/board ownership, independent of agent (`src/lib/assignment-conflicts.ts`) | Never blocks a claim; not a liveness signal |
 | `status/*` label | GitHub, cached | Lifecycle column (`ready`/`in-progress`/`in-review`/`blocked`/`done`); `blocked` parks the issue (`src/lib/agent-queue.ts:186-198`) | `blocked` without `blockedReason` is ambiguous |
-| `Issue.blockedReason` | Postgres (`prisma/schema.prisma:66`) | Distinguishes a deliberate block from an unexplained one; consumed by the release policy (`src/lib/issue-claim.ts:216-229`) | Only set by grooming/ops paths |
-| `Issue.linkedPr*` snapshot | Postgres (`prisma/schema.prisma:107-113`) | Linked PR identity + health, split across `linkedPrNumber/Url/NeedsFollowup/FollowupReasons/ReviewDecision/MergeState/HealthCheckedAt` | Refreshed on reconcile cadence; can lag |
+| `Issue.blockedReason` | Postgres (`prisma/schema.prisma:67`) | Distinguishes a deliberate block from an unexplained one; consumed by the release policy (`src/lib/issue-claim.ts:216-229`) | Only set by grooming/ops paths |
+| `Issue.linkedPr*` snapshot | Postgres (`prisma/schema.prisma:108-114`) | Linked PR identity + health, split across `linkedPrNumber/Url/NeedsFollowup/FollowupReasons/ReviewDecision/MergeState/HealthCheckedAt` | Refreshed on reconcile cadence; can lag |
 | `PrFixQueueItem` | Postgres | Owns PR-fix/PR-followup work per `(repo, pr)`, incl. hand-out + ack state | Separate ownership domain; not issue assignment |
 
 ### 3.2 `Lease` (durable ownership checkpoint)
 
-`prisma/schema.prisma:862-878`; helpers in `src/lib/lease.ts`.
+`prisma/schema.prisma:889-910`; helpers in `src/lib/lease.ts`.
 
 - Unique `(agentName, issueId)`; absolute `expiredAt`; `renewedAt`; `checkpoint`,
   `branch`, `prUrl`.
-- Default TTL **30 min** (`DEFAULT_LEASE_TTL_MS`, `src/lib/lease.ts:18`).
-- Created/renewed **only** on claim (`src/app/api/issues/claim/route.ts:248`) and
-  by the hosted groomer (`src/lib/groomer/run.ts:256`, 10-min TTL). The 5-minute
+- Default TTL **30 min** (`DEFAULT_LEASE_TTL_MS`, `src/lib/lease.ts:20`).
+- Created/renewed **only** on claim (`src/app/api/issues/claim/route.ts:268-273`) and
+  by the hosted groomer (`src/lib/groomer/run.ts:275-280`, 10-min TTL). The 5-minute
   `AgentWork` checkpoint loop does **not** renew it.
 - Active (non-expired) leases from other agents exclude the issue from the queue
-  (`findLeasedIssueIds`, `src/lib/lease.ts:226`; filtered at
+  (`findLeasedIssueIds`, `src/lib/lease.ts:255-265`; filtered at
   `src/lib/agent-queue-fetch.ts:144,152`).
 - `resolveActiveWork` releases orphaned/corrupt leases lazily on read
-  (`src/lib/lease.ts:155`).
+  (`src/lib/lease.ts:181-250`).
 
 **Gap:** the 30-minute lease and the 5-minute AgentWork heartbeat are separate
 clocks. A legitimately long-running worker that checkpoints every few minutes
@@ -87,11 +87,11 @@ disagree.
 
 ### 3.3 `AgentWork` (execution state machine)
 
-`prisma/schema.prisma:815-837`; helpers in `src/lib/agent-work.ts`.
+`prisma/schema.prisma:842-864`; helpers in `src/lib/agent-work.ts`.
 
 - States `CLAIMED | IN_PROGRESS | BLOCKED | DONE | RELEASED | STALE`
-  (`schema.prisma:795-802`) plus a finer `checkpoint` enum
-  (`schema.prisma:804-813`).
+  (`schema.prisma:822-829`) plus a finer `checkpoint` enum
+  (`schema.prisma:831-840`).
 - `leaseExpiresAt` set to **now + 5 min** on start and every checkpoint
   (`src/lib/agent-work.ts:168-169,221-226`); `lastHeartbeatAt` updated on
   checkpoint; `blockerReason` set on `BLOCKED`.
@@ -300,7 +300,7 @@ capability** — `src/lib/github.ts` (labels, issues, PRs) and
 forge-agnostic, honours the configured credentials/app auth, and preserves the
 #1037 rule that decisions are made against **live** labels. The reconciler must
 fail closed (no write, no local mutation) when the forge is unreachable, exactly
-as the claim route does (`src/app/api/issues/claim/route.ts:114-143`).
+as the claim route does (`src/app/api/issues/claim/route.ts:118-148`).
 
 ## 8. Reconciliation
 
@@ -420,7 +420,7 @@ automation writer of the same label. The invariant:
 > protocol — the owning agent's `POST /api/issues/unclaim` (removes only its
 > *own* observed label through `releaseIssueClaim`, which already skips a newer
 > owner's label — `issue-claim.ts:144-153`); the maintainer `force=true`
-> stale-label cleanup (`src/app/api/issues/claim/route.ts:185-192`); and direct
+> stale-label cleanup (`src/app/api/issues/claim/route.ts:193-210`); and direct
 > assignment via `POST /api/issues/actions` `assign_agent`
 > (`docs/assignment-conflict-policy.md:18`), used by operators and external
 > pipelines. These are explicit owner/operator/pipeline decisions naming a
@@ -437,7 +437,14 @@ advisory lock; the implementation tickets pick exactly one and all writers use
 it. Every protocol below (release intent, claim intent, settle, exempt-path
 intent check) is a transaction on that anchor. Ordering between two concurrent
 writers is decided **by the lock, not by timing**: one commits first, the
-other loses or is held.
+other loses or is held. #1259 landed this anchor shape while this design was in
+review: `withIssueMutationGuard` (`src/lib/issue-mutation-guard.ts`) is a
+persistent per-issue guard row (unique on `issueId`) that already serializes
+claim, resume, and fenced capacity-release mutations, and `Lease.claimToken`
+(`prisma/schema.prisma:903`) is a per-claim unique receipt. The protocol below
+builds on that machinery — the reconciler takes the same guard, and the
+attempt-token discipline of §6.1 generalizes `claimToken` — rather than
+standing up a second lock.
 
 State per `(repo, issue)`: two intent records under the same anchor — a
 release-intent (`issue-claim-release` style, reusing the
@@ -477,8 +484,8 @@ The claim path is transactional and ordered the same way as the release:
    add is idempotent — without creating a second owner).
 
 This **supersedes the current claim-route ordering**, which calls
-`addIssueLabel` (`src/app/api/issues/claim/route.ts:206`) *before* writing the
-lease (`upsertLease` at `:248`): intent/lease commit first, remote add second.
+`addIssueLabel` (`src/app/api/issues/claim/route.ts:222`) *before* writing the
+lease (`upsertLease` at `:268`): intent/lease commit first, remote add second.
 With both sides serialized on the anchor, every interleaving resolves: a
 claim that wins the lock commits `g+1` first and Phase A's CAS on `g` then
 **fails** (release is a no-op); a Phase A that wins the lock first makes the
@@ -612,7 +619,8 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
    (`PrFixQueueItem.generation`) for issue ownership so release/renew races are
    CAS-safe inside Postgres, and serialize across the Postgres/GitHub boundary
    through the §8.7 intent protocol rather than assuming the CAS reaches
-   GitHub.
+   GitHub. #1259's `IssueMutationGuard` + `Lease.claimToken` already provide the
+   per-issue serialization row and a per-claim receipt to build this on.
 5. **Make `unknown` first-class.** Surface `CONFLICTED`/candidate rows instead
    of silently excluding.
 6. **Reuse `releaseIssueClaim`.** Extend its status-selection policy (§8.5)
@@ -658,6 +666,30 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 - **Open:** how `CONFLICTED` ownership appears on the Board and in
   `GET /api/issues` for operators.
 
+## 14. Requirements traceability (#1245)
+
+Every requirement of #1245 mapped to where this design settles it. Per the
+issue's non-goals this PR is **design-only**: the "enforcement" for each row is
+the specification plus its pinned negative controls, and production predicates
+and regression tests land in the accepted implementation children
+([#1251](https://github.com/misospace/dispatch/issues/1251) — renewal/capability
+and state layer; [#1254](https://github.com/misospace/dispatch/issues/1254) —
+bounded reconciliation and fenced release), whose acceptance criteria already
+quote this document.
+
+| #1245 requirement | Settled in | Negative controls / evidence anchors |
+|---|---|---|
+| Inventory claim/lease/ack/AgentWork semantics | §3.1–§3.9 (file:line cited) | Gap summary §3.9 |
+| Authoritative ownership/liveness evidence, separate from labels | §4 (derived states), §5 (evidence tiers) | Tier separation §5 |
+| Arbitrary workers; minimal optional capability; safe without it | §6.1 (`register`/`renew`/`disposition`), §6.2 | Unverified clients stay conservatively owned, never auto-abandoned |
+| Distinguish abandoned / long-running / review-owned / external wait / human assignment / maintainer hold | §4 state table (`CLAIMED_LONG_RUNNING`, `REVIEW_OWNED`, `EXTERNAL_WAIT`, `HELD`, …) | `HELD`/`REVIEW_OWNED` terminal for automation |
+| Bounded reconciliation, expiration/grace periods, restart recovery, explicit operator controls; missing telemetry ≠ abandonment | §8.1 (bounded, single-replica, quotas), §8.2 (confirmation ladder — never a single missing signal), §8.3 (grace windows), §8.7 crash/replay matrix (restart recovery of pending intents), §9 (operator controls) | §5 tiering explicitly rejects "missing telemetry" as abandonment evidence; §10 rows "disconnected workers", "missing events", "forge outage" |
+| Release only verified obsolete ownership atomically, fenced against renewed/replaced owner | §8.2 ladder, §8.6 (CAS hard limit), §8.7 Phase A–C protocol | Controls 1–5 of §8.7 (same-agent reclaim, reassign, remote-success/local-failure, stale retry vs fresh token, both lock orders) |
+| Preserve attempt history, audits, genuine blocker reasons, linked-PR ownership; select next eligible state, never force `ready` | §8.5 (reuses `releaseIssueClaim` status policy, `issue-claim.ts:207-241`), §8.7 Phase C | Blocked-reason preservation cited at §8.5; history rows §11 |
+| Legacy identity migration explicit; no `agent/courier*` aliasing; no stealing | §12 | Operator-declared, audited migration only |
+| GitHub/cache/lease consistency; unresolved ownership surfaced as unknown; bounded retries and release/reclaim churn | §8.7 (intents + fail-closed park), §4 (`CONFLICTED`), §10 (churn, forge outage rows) | Stuck barrier is operator-cleared only; bounded Phase-B retries then `HELD` |
+| Deliverables: state model, evidence hierarchy, migration policy, transition table, operator escape hatch, race/failure cases, inspect-first | §4, §5, §12, §8.4, §9, §10, §3/§11 | §11: improvements over existing machinery, not a parallel system |
+
 ## References
 
 - `docs/assignment-conflict-policy.md` — one-agent-label rule and conflict
@@ -667,5 +699,8 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 - `docs/pr-review-fix-queue.md` — PR-fix ownership, generation fencing, reclaim.
 - `docs/hosted-groomer.md` — admission mode/override (#1065), the
   audit/enforce rollout precedent.
+- `docs/capacity-handoff.md` — fenced capacity-exhaustion handoffs (#1259),
+  the landed `IssueMutationGuard`/`claimToken` serialization machinery this
+  design builds on.
 - `src/lib/lease.ts`, `src/lib/agent-work.ts`, `src/lib/stale-work.ts`,
   `src/lib/issue-claim.ts`, `src/lib/pr-fix-queue.ts` — current mechanisms.
