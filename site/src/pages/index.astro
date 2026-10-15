@@ -1,0 +1,61 @@
+---
+import Base from "../layouts/Base.astro";
+---
+<Base
+  title="Dispatch — Kanban for AI agent work"
+  description="Dispatch is a harness-agnostic Kanban and work dispatch layer for AI agents. GitHub stays the source of truth."
+  active="/dispatch"
+>
+  <section class="hero">
+    <span class="kicker">dispatch</span>
+    <h1>Kanban for<br/>AI agent work.</h1>
+    <p class="sub">
+      Dispatch turns GitHub Issues and PR follow-ups into claimable queues,
+      tracks agent runs, manages status transitions, and keeps an audit trail —
+      while GitHub remains the source of truth.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/misospace/dispatch">View on GitHub ↗</a>
+      <a class="btn" href="https://github.com/misospace/dispatch/tree/main/docs">Read the contracts</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>What it does</h2>
+    <div class="cards two">
+      <div class="card"><h3>Claimable lanes</h3><p>Issues are groomed into lanes and handed out one at a time, per agent, with generation tokens so nothing is handed to two workers at once.</p></div>
+      <div class="card"><h3>PR-fix queue</h3><p>Review feedback becomes first-class work: fix-attempt budgets, generation-fenced outcomes, and <code>WAITING_EXTERNAL</code> for work that's blocked on something outside the loop.</p></div>
+      <div class="card"><h3>Audit trail</h3><p>Every run, transition, and handout is recorded. The queue explains its own history.</p></div>
+      <div class="card"><h3>Source of truth rules</h3><p>GitHub is authoritative. Dispatch Postgres caches issue metadata and stores local project state, agent runs, and audit logs. It never auto-completes work.</p></div>
+      <div class="card"><h3>Bound worker identity</h3><p>Worker tokens are bound to agent names — identity comes from the credential, fail-closed. Worker and maintainer tiers keep force-operations gated.</p></div>
+      <div class="card"><h3>No harness coupling</h3><p>Dispatch doesn't mount agent harness configs or require access to any agent's local workspace. It queues work; the harness is somebody else's job.</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>The contract</h2>
+    <p class="lede">
+      Every worker — Courier, a cron script, your own harness — consumes the
+      same documented interface: one item per run, acknowledgement after
+      durable execution, explicit outcome marks with generations, and phases
+      the client owns.
+    </p>
+    <div class="terminal">
+      <div class="term-head"><span class="dotset"><i></i><i></i><i></i></span> a worker's day</div>
+      <pre><span class="c-prompt">$</span> GET  /api/agents/[agent]#123;agent[agent]#125;/next-task      <span class="c-dim">→ one item, generation token</span>
+<span class="c-prompt">$</span> <span class="c-hi">create the run durably</span>                  <span class="c-dim">← before anything else</span>
+<span class="c-prompt">$</span> POST /api/pr-fix-queue/ack             <span class="c-dim">→ the handout is mine now</span>
+<span class="c-prompt">$</span> <span class="c-dim">... do the work ...</span>
+<span class="c-prompt">$</span> POST /api/agents/[agent]#123;agent[agent]#125;/tasks/report  <span class="c-dim">→ FIXED · PARKED · WAITING_EXTERNAL</span></pre>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Stack</h2>
+    <p class="lede">
+      Next.js 16 (App Router) · React 19 · Prisma 7 · Node 24 · TypeScript 6 ·
+      Tailwind 4. Deploys as an ordinary container; needs Postgres and a
+      GitHub token, nothing exotic.
+    </p>
+  </section>
+</Base>
