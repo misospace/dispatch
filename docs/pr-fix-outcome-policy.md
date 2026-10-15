@@ -30,14 +30,14 @@ A *new* `WAITING_EXTERNAL` must name a concrete, independently verifiable depend
 | Field | Meaning |
 |-------|---------|
 | `kind` | `upstream_pr` \| `upstream_issue` \| `ci_check` \| `external_service` |
-| `ref` | Authoritative identity, e.g. `org/repo#123` or `check:build@<head>` (≤ 200 chars) |
+| `ref` | Authoritative identity, syntax-validated per kind: `org/repo#123` for forge refs, `check:build@<head>` for CI checks (≤ 200 chars) |
 | `evidence` | Observed fact showing the dependency is not satisfied (≤ 500 chars) |
-| `trigger` | Recovery predicate, e.g. "upstream PR merged" (≤ 500 chars) |
+| `trigger` | `{ kind, note? }` — a recovery predicate with defined evaluator semantics: `merged` (upstream_pr), `closed` (upstream_issue), `check_success` (ci_check), `cooldown_recheck` (any), `service_ready` (external_service). Free-text predicates the evaluator would ignore are rejected at admission. |
 
 The recheck deadline remains `retryAt` (`PR_FIX_EXTERNAL_WAIT_COOLDOWN_MS`).
 
 - A dependency-less or malformed wait **fails closed** to a generation-pinned `PARKED`/`invalid_wait` disposition with an audited history note and a surfaced parked comment — never a six-hour fake wait and never a human `BLOCKED` decision. An operator must requeue it.
-- Pre-existing free-text waits are **legacy/unknown**: queue listings surface `legacyWait: true` on `WAITING_EXTERNAL` rows without a contract, for operator action only. There is no automatic bulk downgrade, requeue, or expired-wait rewrite.
+- Pre-existing free-text waits are **legacy/unknown**: queue listings surface `legacyWait: true` on `WAITING_EXTERNAL` rows without a contract, for operator action only. There is no automatic bulk downgrade, requeue, or expired-wait rewrite — including the cooldown reactivator, which skips contract-less (or no-longer-valid) waits instead of silently reissuing them.
 - Duplicate marks for the same generation stay idempotent and never reset the deadline; a stale generation is rejected and cannot clobber a newer attempt — including the fail-closed downgrade, which carries the same generation pin.
 - A read-only trigger evaluation contract (`GET /api/pr-fix-queue/external-wait?repo=&pr=`, operator auth) evaluates the recorded dependency against live forge state and returns `satisfied` / `unsatisfied` / `unknown`. Unverifiable dependencies (external services, fetch failures, in-flight checks) stay `unknown` — held, never silently ready. A later recovery worker decides on this contract.
 

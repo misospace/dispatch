@@ -24,7 +24,7 @@ interface PrFixItem {
   fixAttempts?: number | null;
   // #1250: structured external-wait contract, surfaced read-only on
   // WAITING_EXTERNAL rows; `legacyWait` flags a pre-contract free-text wait.
-  externalWait?: { kind: string; ref: string; evidence: string; trigger: string } | null;
+  externalWait?: { kind: string; ref: string; evidence: string; trigger: { kind: string; note?: string } } | null;
   legacyWait?: boolean;
 }
 
@@ -315,7 +315,7 @@ export default function PrFixQueuePage() {
                 <TableCell className="text-sm">{item.legacyWait
                   ? <Badge className="bg-amber-100 text-amber-800">legacy wait — no structured dependency (#1250)</Badge>
                   : item.externalWait
-                    ? <span className="text-xs"><span className="font-medium">{item.externalWait.kind}</span> · {item.externalWait.ref}</span>
+                    ? <span className="text-xs"><span className="font-medium">{item.externalWait.kind}</span> · {item.externalWait.ref} <span className="text-muted-foreground">→ {item.externalWait.trigger.kind}</span></span>
                     : <span className="text-xs text-muted-foreground">unknown</span>}
                 </TableCell>
                 <TableCell className="text-sm">{item.latestNote || item.reason}</TableCell>

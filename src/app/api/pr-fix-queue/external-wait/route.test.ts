@@ -33,7 +33,7 @@ const item = (overrides: Record<string, unknown> = {}) => ({
   pr: 42,
   status: "WAITING_EXTERNAL",
   retryAt: new Date("2026-10-15T18:00:00Z"),
-  externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: "upstream PR merged" },
+  externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } },
   ...overrides,
 });
 

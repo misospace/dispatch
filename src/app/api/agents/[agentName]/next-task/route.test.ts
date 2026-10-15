@@ -690,7 +690,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     await markPrFixItem(client, {
       repo: "org/repo", pr: 123, status: "WAITING_EXTERNAL",
       expectedGeneration: item.generation, note: "waiting on prerequisite",
-      externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: "upstream PR merged" },
+      externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } },
     });
     const waiting = client.items[0];
     const issuedGeneration = waiting.generation;

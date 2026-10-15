@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { Prisma } from "@prisma/client";
 import { listQueuedPrFixItems, markPrFixItem, resolvePrFixFromAgentReport, type PrFixQueueClient } from "./pr-fix-queue";
 import {
   evaluateExternalWaitTrigger,
@@ -40,10 +41,11 @@ function clientFor(item: any, hooks: { beforeUpdate?: (where: any, data: any) =>
 
 const item = () => ({ id: "pf1", repo: "org/repo", pr: 7, status: "QUEUED", lane: "NORMAL", generation: 4, fixAttempts: 5, attemptHeadSha: null as string | null, retryAt: null as Date | null, dispatchedGeneration: 4, dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"], postDispatchEvidenceKeys: [], outcome: null as string | null, externalWait: null as unknown });
 
+// #1250: every new WAITING_EXTERNAL mark/report must name a concrete,
+// verifiable dependency — this is the shared conforming payload.
+const structuredWait = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open, not merged", trigger: { kind: "merged" } };
+
 describe("external prerequisite waits (#1231)", () => {
-  // #1250: every new WAITING_EXTERNAL mark/report must name a concrete,
-  // verifiable dependency — this is the shared conforming payload.
-  const structuredWait = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open, not merged", trigger: "upstream PR merged" };
 
   it("marks a generation once without charging attempts, and accepts repeats idempotently", async () => {
     const row = item();
@@ -61,7 +63,7 @@ describe("external prerequisite waits (#1231)", () => {
   });
 
   it("reissues a due wait as a clean new generation without changing attempt budget", async () => {
-    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1), dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"] };
+    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1), dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"], externalWait: structuredWait };
     const { client, history } = clientFor(row);
     const queued = await listQueuedPrFixItems(client);
     expect(queued.map((x: any) => x.status)).toEqual(["QUEUED"]);
@@ -174,7 +176,7 @@ describe("external prerequisite waits (#1231)", () => {
   });
 
   it("does not overwrite status or generation changed during due-wait reactivation", async () => {
-    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1000) };
+    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1000), externalWait: structuredWait };
     const { client, history } = clientFor(row, { beforeUpdate: () => { row.status = "BLOCKED"; row.generation = 8; } });
     await listQueuedPrFixItems(client);
     expect(row.status).toBe("BLOCKED");
@@ -183,7 +185,7 @@ describe("external prerequisite waits (#1231)", () => {
   });
 
   it("keeps attempt count through due reactivation and subsequent FIXED settlement", async () => {
-    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1000) };
+    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1000), externalWait: structuredWait };
     const { client } = clientFor(row);
     await listQueuedPrFixItems(client);
     const generation = row.generation;
@@ -214,22 +216,45 @@ describe("external prerequisite waits (#1231)", () => {
 });
 
 describe("structured external-wait contract (#1250)", () => {
+  const goodContract = { kind: "upstream_pr", ref: "org/repo#12", evidence: "PR open, unmerged", trigger: { kind: "merged" } };
+
   it("validates a bounded, typed contract", () => {
-    const good = parseExternalWaitInput({ kind: "upstream_pr", ref: "org/repo#12", evidence: "PR open, unmerged", trigger: "upstream PR merged" });
-    expect(good.ok).toBe(true);
+    expect(parseExternalWaitInput(goodContract).ok).toBe(true);
+    expect(parseExternalWaitInput({ ...goodContract, trigger: { kind: "merged", note: "merge commit expected" } }).ok).toBe(true);
+    expect(parseExternalWaitInput({ kind: "ci_check", ref: "check:build@abc1234", evidence: "pending", trigger: { kind: "check_success" } }).ok).toBe(true);
+    expect(parseExternalWaitInput({ kind: "upstream_issue", ref: "org/repo#9", evidence: "open", trigger: { kind: "closed" } }).ok).toBe(true);
+    expect(parseExternalWaitInput({ kind: "external_service", ref: "vendor:cdn", evidence: "propagating", trigger: { kind: "service_ready" } }).ok).toBe(true);
+    expect(parseExternalWaitInput({ kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: { kind: "cooldown_recheck" } }).ok).toBe(true);
     for (const bad of [
       null,
       "wait",
       [],
-      { kind: "mystery", ref: "org/repo#12", evidence: "e", trigger: "t" },
-      { kind: "upstream_pr", evidence: "e", trigger: "t" },
-      { kind: "upstream_pr", ref: "", evidence: "e", trigger: "t" },
-      { kind: "upstream_pr", ref: "org/repo#12", trigger: "t" },
+      { kind: "mystery", ref: "org/repo#12", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "upstream_pr", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "upstream_pr", ref: "", evidence: "e", trigger: { kind: "merged" } },
       { kind: "upstream_pr", ref: "org/repo#12", evidence: "e" },
-      { kind: "upstream_pr", ref: "x".repeat(201), evidence: "e", trigger: "t" },
-      { kind: "upstream_pr", ref: "org/repo#12", evidence: "x".repeat(501), trigger: "t" },
-      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: "x".repeat(501) },
-      { kind: "upstream_pr", ref: 7, evidence: "e", trigger: "t" },
+      { kind: "upstream_pr", ref: "x".repeat(201), evidence: "e", trigger: { kind: "merged" } },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "x".repeat(501), trigger: { kind: "merged" } },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: { kind: "merged", note: "x".repeat(501) } },
+      { kind: "upstream_pr", ref: 7, evidence: "e", trigger: { kind: "merged" } },
+      // Free-text / missing recovery predicates the evaluator would ignore:
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: "upstream PR merged" },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: { kind: "someday" } },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: {} },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: null },
+      // Trigger/dependency pairs without defined evaluator semantics:
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: { kind: "closed" } },
+      { kind: "upstream_issue", ref: "org/repo#9", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "ci_check", ref: "check:build@abc", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "external_service", ref: "vendor:cdn", evidence: "e", trigger: { kind: "check_success" } },
+      // Authoritative reference syntax per dependency kind:
+      { kind: "upstream_pr", ref: "not-a-ref", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "upstream_pr", ref: "org/repo", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "upstream_pr", ref: "org/repo#0", evidence: "e", trigger: { kind: "merged" } },
+      { kind: "upstream_issue", ref: "not-a-ref", evidence: "e", trigger: { kind: "closed" } },
+      { kind: "ci_check", ref: "build@abc1234", evidence: "e", trigger: { kind: "check_success" } },
+      { kind: "ci_check", ref: "check:build", evidence: "e", trigger: { kind: "check_success" } },
+      { kind: "ci_check", ref: "check:@abc1234", evidence: "e", trigger: { kind: "check_success" } },
     ]) {
       expect(parseExternalWaitInput(bad).ok).toBe(false);
     }
@@ -238,7 +263,8 @@ describe("structured external-wait contract (#1250)", () => {
   it("treats a malformed stored contract as a legacy wait", () => {
     expect(parseStoredExternalWait(null)).toBeNull();
     expect(parseStoredExternalWait({ kind: "nonsense" })).toBeNull();
-    expect(parseStoredExternalWait({ kind: "upstream_pr", ref: "org/repo#1", evidence: "e", trigger: "t" })).toEqual({ kind: "upstream_pr", ref: "org/repo#1", evidence: "e", trigger: "t" });
+    expect(parseStoredExternalWait({ kind: "upstream_pr", ref: "not-a-ref", evidence: "e", trigger: { kind: "merged" } })).toBeNull();
+    expect(parseStoredExternalWait(goodContract)).toEqual({ kind: "upstream_pr", ref: "org/repo#12", evidence: "PR open, unmerged", trigger: { kind: "merged" } });
   });
 
   it("downgrades a dependency-less wait mark to a fail-closed PARKED, generation-pinned", async () => {
@@ -250,7 +276,9 @@ describe("structured external-wait contract (#1250)", () => {
     expect(row.lane).toBe("NORMAL");
     expect(row.outcome).toBe("invalid_wait");
     expect(row.retryAt).toBeNull();
-    expect(row.externalWait).toBeNull();
+    // #1250 review: the downgrade writes SQL NULL (Prisma.DbNull), not a
+    // JSON null document.
+    expect(row.externalWait).toBe(Prisma.DbNull);
     expect(history).toHaveLength(1);
     expect(history[0].status).toBe("PARKED");
     expect(history[0].outcome).toBe("invalid_wait");
@@ -283,7 +311,11 @@ describe("structured external-wait contract (#1250)", () => {
     const row = item();
     const { client, history } = clientFor(row);
     const result = await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", summary: "still nothing to push", attempt: { itemId: row.id, generation: 4 }, client });
-    expect(result.action).toBe("deferred");
+    // #1250 review: truthful outcome — the report recorded a fail-closed
+    // park, not a wait.
+    expect(result.action).toBe("parked");
+    expect(result.reason).toContain("fail-closed park");
+    expect(result.reason).toContain("invalid_wait");
     expect(row.status).toBe("PARKED");
     expect(row.outcome).toBe("invalid_wait");
     expect(row.lane).toBe("NORMAL");
@@ -292,9 +324,18 @@ describe("structured external-wait contract (#1250)", () => {
     expect(history[0].note).toContain("still nothing to push");
   });
 
+  it("reports a conforming wait as deferred, not parked", async () => {
+    const row = item();
+    const { client } = clientFor(row);
+    const result = await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", summary: "blocked on upstream", attempt: { itemId: row.id, generation: 4 }, externalWait: structuredWait, client });
+    expect(result.action).toBe("deferred");
+    expect(result.reason).toBe("worker is waiting for an external prerequisite");
+    expect(row.status).toBe("WAITING_EXTERNAL");
+  });
+
   it("surfaces legacy free-text waits read-only in queue listings", async () => {
     const legacy = { ...item(), status: "WAITING_EXTERNAL" as const, externalWait: null };
-    const structured = { ...item(), id: "item-2", repo: "org/two", pr: 2, status: "WAITING_EXTERNAL" as const, externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "open", trigger: "merged" } };
+    const structured = { ...item(), id: "item-2", repo: "org/two", pr: 2, status: "WAITING_EXTERNAL" as const, externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "open", trigger: { kind: "merged" } } };
     const client: any = {
       prFixQueueItem: {
         findUnique: async () => null,
@@ -307,28 +348,63 @@ describe("structured external-wait contract (#1250)", () => {
     const structuredRow = included.find((entry: any) => entry.id === structured.id);
     expect(legacyRow).toMatchObject({ status: "WAITING_EXTERNAL", legacyWait: true, externalWait: null });
     expect(structuredRow).toMatchObject({ status: "WAITING_EXTERNAL", legacyWait: false });
-    expect(structuredRow.externalWait).toEqual({ kind: "upstream_pr", ref: "org/deps#7", evidence: "open", trigger: "merged" });
+    expect(structuredRow.externalWait).toEqual({ kind: "upstream_pr", ref: "org/deps#7", evidence: "open", trigger: { kind: "merged" } });
+  });
+
+  it("does not auto-reissue an expired legacy wait; it stays held for operator action", async () => {
+    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1), externalWait: null };
+    const { client, history } = clientFor(row);
+    const queued = await listQueuedPrFixItems(client);
+    // Not reissued, and not returned as claimable QUEUED work either: the
+    // item stays WAITING_EXTERNAL and is surfaced only via includeBlocked.
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.retryAt).not.toBeNull();
+    expect(row.generation).toBe(4);
+    expect(queued).toEqual([]);
+    expect(history).toHaveLength(0);
+    const withBlocked = await listQueuedPrFixItems(client, { includeBlocked: true });
+    expect(withBlocked.map((entry: any) => entry.legacyWait)).toEqual([true]);
+  });
+
+  it("does not auto-reissue an expired wait whose stored contract no longer validates", async () => {
+    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1), externalWait: { kind: "upstream_pr", ref: "garbage", evidence: "e", trigger: { kind: "merged" } } };
+    const { client, history } = clientFor(row);
+    await listQueuedPrFixItems(client);
+    expect(row.status).toBe("WAITING_EXTERNAL");
+    expect(row.generation).toBe(4);
+    expect(history).toHaveLength(0);
+  });
+
+  it("still reissues an expired valid structured wait at its cooldown deadline", async () => {
+    const row = { ...item(), status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 1), externalWait: structuredWait };
+    const { client, history } = clientFor(row);
+    const queued = await listQueuedPrFixItems(client);
+    expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
+    expect(row.status).toBe("QUEUED");
+    expect(row.generation).toBe(5);
+    expect(row.retryAt).toBeNull();
+    expect(history).toHaveLength(1);
   });
 
   describe("read-only trigger evaluation", () => {
-    const wait: ExternalWaitContract = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open", trigger: "upstream PR merged" };
+    const wait: ExternalWaitContract = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open", trigger: { kind: "merged" } };
 
-    it("evaluates upstream_pr: merged satisfies, open stays unsatisfied, fetch failure stays unknown", async () => {
+    it("evaluates upstream_pr/merged: merged satisfies, open stays unsatisfied, fetch failure stays unknown", async () => {
       expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: "merged", mergedAt: "2026-10-15T00:00:00Z" }) })).toBe("satisfied");
       expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: "closed", mergedAt: null }) })).toBe("unsatisfied");
       expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: "open", mergedAt: null }) })).toBe("unsatisfied");
       expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: null, mergedAt: null }) })).toBe("unknown");
     });
 
-    it("evaluates upstream_issue: closed satisfies, open unsatisfied, unknown on failure", async () => {
-      const issueWait: ExternalWaitContract = { ...wait, kind: "upstream_issue" };
+    it("evaluates upstream_issue/closed: closed satisfies, open unsatisfied, unknown on failure", async () => {
+      const issueWait: ExternalWaitContract = { ...wait, kind: "upstream_issue", trigger: { kind: "closed" } };
       expect(await evaluateExternalWaitTrigger(issueWait, "org/repo", { fetchIssueState: async () => ({ state: "closed" }) })).toBe("satisfied");
       expect(await evaluateExternalWaitTrigger(issueWait, "org/repo", { fetchIssueState: async () => ({ state: "open" }) })).toBe("unsatisfied");
       expect(await evaluateExternalWaitTrigger(issueWait, "org/repo", { fetchIssueState: async () => null })).toBe("unknown");
     });
 
-    it("evaluates ci_check: success satisfies, failure unsatisfied, in-flight or missing stays unknown", async () => {
-      const checkWait: ExternalWaitContract = { kind: "ci_check", ref: "check:build@abc1234", evidence: "check pending on attempt head", trigger: "check build concludes success on head abc1234" };
+    it("evaluates ci_check/check_success: success satisfies, failure unsatisfied, in-flight or missing stays unknown", async () => {
+      const checkWait: ExternalWaitContract = { kind: "ci_check", ref: "check:build@abc1234", evidence: "check pending on attempt head", trigger: { kind: "check_success" } };
       expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => "success" })).toBe("satisfied");
       expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => "failure" })).toBe("unsatisfied");
       expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => null })).toBe("unknown");
@@ -336,9 +412,14 @@ describe("structured external-wait contract (#1250)", () => {
     });
 
     it("never silently satisfies an unverifiable dependency", async () => {
-      const serviceWait: ExternalWaitContract = { kind: "external_service", ref: "vendor:cdn", evidence: "propagation pending", trigger: "vendor confirms propagation" };
+      const serviceWait: ExternalWaitContract = { kind: "external_service", ref: "vendor:cdn", evidence: "propagation pending", trigger: { kind: "service_ready" } };
       expect(await evaluateExternalWaitTrigger(serviceWait, "org/repo")).toBe("unknown");
       expect(await evaluateExternalWaitTrigger({ ...wait, ref: "not-a-ref" }, "org/repo")).toBe("unknown");
+    });
+
+    it("holds cooldown_recheck waits for their bounded deadline instead of evaluating a live predicate", async () => {
+      const recheckWait: ExternalWaitContract = { ...wait, trigger: { kind: "cooldown_recheck" } };
+      expect(await evaluateExternalWaitTrigger(recheckWait, "org/repo", { fetchPullRequestState: async () => ({ state: "merged", mergedAt: "2026-10-15T00:00:00Z" }) })).toBe("unknown");
     });
   });
 });
