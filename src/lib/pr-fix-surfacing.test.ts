@@ -286,31 +286,42 @@ describe("surfacePrFixBlocked — terminal PR guard", () => {
 
 describe("buildNeedsHumanComment — richer context", () => {
   it("renders workerExecutions and enqueueRows separately, never as 'attempts' (#1218)", () => {
-    const body = buildNeedsHumanComment({
-      ...baseInput,
-      context: {
-        workerExecutions: 3,
-        enqueueRows: 7,
-        attemptsByLane: { NORMAL: 2, ESCALATED: 1 },
-        finalFailureSignature: "tests failed after 3 attempts",
-        failingRunLinks: ["https://github.com/org/repo/actions/runs/42"],
-        lastAttemptSummary: "final attempt still failing",
-        // Retained for back-compat but must NOT be rendered as "attempts".
-        totalAttempts: 99,
-      },
-    });
+    // Freeze the footer timestamp so the rendered body is byte-stable across
+    // wall-clock millisecond values (#1257). The legacy `totalAttempts` value
+    // below (99) used to collide with the footer timestamp's millisecond field
+    // whenever it happened to contain two consecutive nines.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    try {
+      const body = buildNeedsHumanComment({
+        ...baseInput,
+        context: {
+          workerExecutions: 3,
+          enqueueRows: 7,
+          attemptsByLane: { NORMAL: 2, ESCALATED: 1 },
+          finalFailureSignature: "tests failed after 3 attempts",
+          failingRunLinks: ["https://github.com/org/repo/actions/runs/42"],
+          lastAttemptSummary: "final attempt still failing",
+          // Retained for back-compat but must NOT be rendered as "attempts".
+          totalAttempts: 99,
+        },
+      });
 
-    expect(body).toContain("**Worker executions:** 3");
-    expect(body).toContain("**Enqueue rows:** 7");
-    expect(body).toContain("**Enqueues by lane:**");
-    expect(body).toContain("**NORMAL:** 2");
-    expect(body).toContain("**ESCALATED:** 1");
-    expect(body).toContain("**Final failure:** tests failed after 3 attempts");
-    expect(body).toContain("https://github.com/org/repo/actions/runs/42");
-    expect(body).toContain("**Last attempt:** final attempt still failing");
-    // The legacy totalAttempts is never rendered as "attempts".
-    expect(body).not.toContain("Total attempts");
-    expect(body).not.toContain("99");
+      expect(body).toContain("**Worker executions:** 3");
+      expect(body).toContain("**Enqueue rows:** 7");
+      expect(body).toContain("**Enqueues by lane:**");
+      expect(body).toContain("**NORMAL:** 2");
+      expect(body).toContain("**ESCALATED:** 1");
+      expect(body).toContain("**Final failure:** tests failed after 3 attempts");
+      expect(body).toContain("https://github.com/org/repo/actions/runs/42");
+      expect(body).toContain("**Last attempt:** final attempt still failing");
+      // The legacy totalAttempts is never rendered as "attempts". The
+      // label-level guard above is sufficient — a bare-digit guard on the value
+      // collides with the timestamp footer (~79 ms triples, ~299/399/.../999).
+      expect(body).not.toContain("Total attempts");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("omits context sections that are absent (backwards compatible)", () => {
