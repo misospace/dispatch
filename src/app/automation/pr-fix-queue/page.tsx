@@ -22,6 +22,10 @@ interface PrFixItem {
   latestNote?: string | null;
   outcome?: string | null;
   fixAttempts?: number | null;
+  // #1250: structured external-wait contract, surfaced read-only on
+  // WAITING_EXTERNAL rows; `legacyWait` flags a pre-contract free-text wait.
+  externalWait?: { kind: string; ref: string; evidence: string; trigger: string } | null;
+  legacyWait?: boolean;
 }
 
 const PARKED_OUTCOME_LABELS: Record<string, string> = {
@@ -29,6 +33,7 @@ const PARKED_OUTCOME_LABELS: Record<string, string> = {
   infra_failure: "infra / auth failure",
   security_failure: "security failure",
   human_decision: "human decision",
+  invalid_wait: "invalid external wait",
 };
 
 function formatTime(isoString: string): string {
@@ -304,9 +309,15 @@ export default function PrFixQueuePage() {
         <CardContent>
           {waiting.length === 0 ? <p className="text-center py-8 text-muted-foreground">No external waits.</p> : (
             <Table>
-              <TableHeader><TableRow><TableHead>Repo / PR</TableHead><TableHead>Last-known explanation</TableHead><TableHead>Retry At</TableHead></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>Repo / PR</TableHead><TableHead>Dependency</TableHead><TableHead>Last-known explanation</TableHead><TableHead>Retry At</TableHead></TableRow></TableHeader>
               <TableBody>{waiting.map((item) => <TableRow key={item.id}>
                 <TableCell><a href={prLink(item)} target="_blank" rel="noopener noreferrer" className="font-medium hover:underline">{prTitle(item)}</a><div className="text-xs text-muted-foreground">{item.repo}</div></TableCell>
+                <TableCell className="text-sm">{item.legacyWait
+                  ? <Badge className="bg-amber-100 text-amber-800">legacy wait — no structured dependency (#1250)</Badge>
+                  : item.externalWait
+                    ? <span className="text-xs"><span className="font-medium">{item.externalWait.kind}</span> · {item.externalWait.ref}</span>
+                    : <span className="text-xs text-muted-foreground">unknown</span>}
+                </TableCell>
                 <TableCell className="text-sm">{item.latestNote || item.reason}</TableCell>
                 <TableCell className="text-sm text-muted-foreground">{item.retryAt ? formatTime(item.retryAt) : "Not scheduled"}</TableCell>
               </TableRow>)}</TableBody>

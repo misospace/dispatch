@@ -1657,6 +1657,20 @@ describe("POST /api/agents/[agentName]/tasks/report — prFixItem attempt token 
     expect(mockAgentRun.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "waiting-external" }) }));
   });
 
+  it("passes a structured externalWait contract through to the queue resolver (#1250)", async () => {
+    const externalWait = { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: "upstream PR merged" };
+    const body = { ...validReport, taskType: "followup-pr" as const, outcome: "waiting-external", error: "missing prerequisite: X", externalWait, prFixItem: { id: "cktz-abc", generation: 2 } };
+    const res = await postRequest(body);
+    expect(res.status).toBe(200);
+    expect(prFixResolveMock).toHaveBeenCalledWith(expect.objectContaining({ externalWait }));
+  });
+
+  it("400s when externalWait is not an object (#1250)", async () => {
+    const res = await postRequest({ ...validReport, outcome: "waiting-external", externalWait: "upstream", prFixItem: { id: "cktz-abc", generation: 2 } });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/externalWait must be an object/);
+  });
+
   it("returns 400 when prFixItem is not an object", async () => {
     const res = await postRequest({ ...validReport, prFixItem: "cktz-abc" });
     expect(res.status).toBe(400);

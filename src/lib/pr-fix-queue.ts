@@ -6,6 +6,7 @@ import { fetchPullRequestMergeState, fetchPullRequestHeadSha, fetchPullRequestSt
 import { capacityCooldownMs, capacityEquals } from "./capacity-handoff";
 import { fetchRepositoryMetadata } from "./github-code-search";
 import { sanitizeForStorage } from "./groomer/sanitize";
+import { parseExternalWaitInput, parseStoredExternalWait, type ExternalWaitContract } from "./pr-fix-external-wait";
 
 export type PrFixQueueClient = {
   issue: {
@@ -98,6 +99,10 @@ export interface MarkPrFixInput {
   pr: number;
   status: string;
   note?: string | null;
+  // #1250: structured external-wait contract, REQUIRED for a new
+  // WAITING_EXTERNAL mark. Absent or malformed → fail-closed PARKED
+  // (outcome `invalid_wait`), generation-pinned.
+  externalWait?: unknown;
   // Commit-time revalidation (#1074): when provided, every status write goes
   // through `updateMany({ where: { id, generation } })` and the mark is
   // skipped (no mutation) if the row's generation no longer matches — i.e.
@@ -300,6 +305,9 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
     ...(evidence ? { evidence } : {}),
     ...(outcome ? { outcome } : {}),
     ...(decisionResult.decision ? { decision: decisionResult.decision } : {}),
+    // #1250: validated again at mark time; parse here only to reject a
+    // structurally impossible body early with a clear error.
+    ...(input.externalWait !== undefined ? { externalWait: input.externalWait } : {}),
   };
 }
 
@@ -1509,6 +1517,16 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
     for (const item of items) if (item.status === "WAITING_EXTERNAL") item.latestNote = latestNotes.get(item.id) ?? null;
   }
 
+  // #1250: surface the structured-wait contract (and its absence) on every
+  // listed WAITING_EXTERNAL item. `externalWait` carries the parsed bounded
+  // contract; `legacyWait` flags pre-contract free-text waits for operator
+  // action — surfaced read-only, never auto-downgraded.
+  for (const item of items) {
+    if (item.status !== "WAITING_EXTERNAL") continue;
+    item.externalWait = parseStoredExternalWait(item.externalWait);
+    item.legacyWait = item.externalWait === null;
+  }
+
   return items;
 }
 
@@ -1619,11 +1637,60 @@ export async function markPrFixItem(
   // needs-human label. The bridge's ACTIONABLE_LANES filter skips BLOCKED.
   const data: Record<string, unknown> = { status: nextStatus };
   if (nextStatus === "WAITING_EXTERNAL") {
+    // Idempotent duplicate for the same generation: never extend the
+    // cooldown, never overwrite the recorded contract or note (#1231).
     if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
       return { mutated: true, item: existing };
     }
     if (existing.status !== "QUEUED") return { mutated: false, reason: "generation-mismatch" };
+
+    // #1250: a NEW wait must name a concrete, independently verifiable
+    // dependency. "We have not pushed a patch" is not one. A dependency-less
+    // or malformed wait fails closed to a PARKED/`invalid_wait` disposition —
+    // an operational hold an operator must requeue, never a human BLOCKED
+    // decision and never a six-hour fake wait. The downgrade is
+    // generation-pinned below so it cannot clobber a newer attempt.
+    const parsedWait = parseExternalWaitInput(input.externalWait);
+    if (!parsedWait.ok) {
+      const downgradeNote = `Fail-closed park: external wait without a verifiable dependency (${parsedWait.reason}); operator requeue required (#1250).${input.note ? ` ${input.note}` : ""}`;
+      const downgraded = await client.$transaction(async (tx) => {
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: { id: existing.id, status: "QUEUED", generation: expectedGeneration },
+          data: {
+            status: "PARKED",
+            lane: "NORMAL",
+            outcome: "invalid_wait",
+            decisionDetail: null,
+            retryAt: null,
+            externalWait: null,
+          },
+        });
+        if (count !== 1) return null;
+        await tx.prFixHistory.create({
+          data: { itemId: existing.id, action: "mark", status: "PARKED", lane: existing.lane, outcome: "invalid_wait", note: downgradeNote },
+        });
+        return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      });
+      if (downgraded) {
+        // Mirror the shared PARKED tail: surface the fail-closed park on the
+        // PR so operators see why the item stopped (#1250).
+        const context = await buildPrFixBlockedContext(client, downgraded);
+        await surfacePrFixParked({
+          repo: input.repo,
+          pr: input.pr,
+          reason: downgraded.reason,
+          outcome: "invalid_wait",
+          latestNote: input.note ?? null,
+          context,
+        });
+        return { mutated: true, item: downgraded };
+      }
+      const latest = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) return { mutated: true, item: latest };
+      return { mutated: false, reason: "generation-mismatch" };
+    }
     data.retryAt = new Date(Date.now() + externalWaitCooldownMs());
+    data.externalWait = parsedWait.wait;
     data.outcome = null;
     data.decisionDetail = null;
     data.postDispatchEvidenceKeys = [];
@@ -2643,6 +2710,10 @@ export interface ResolvePrFixFromAgentReportInput {
   // give-up) marks PARKED — a bare give-up is NOT a human decision.
   blockReason?: string | null;
   decision?: PrFixDecisionContext | null;
+  // #1250: structured external-wait contract carried by a `waiting-external`
+  // report. Without a valid contract the attempt fails closed to
+  // PARKED/`invalid_wait` instead of a cooldown wait.
+  externalWait?: unknown;
   // #1256: opaque worker-declared capacity identifier, required (with an
   // attempt token) by the `capacity-exhausted` outcome.
   capacity?: string | null;
@@ -2952,7 +3023,7 @@ export async function resolvePrFixFromAgentReport(
       return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "waiting-external requires a prFixItem attempt token" };
     }
     const marked = await markPrFixItem(client as PrFixQueueClient, {
-      repo, pr, status: "WAITING_EXTERNAL", note: sanitizeForStorage(input.summary?.trim() || input.error || "", 500) || null, expectedGeneration,
+      repo, pr, status: "WAITING_EXTERNAL", note: sanitizeForStorage(input.summary?.trim() || input.error || "", 500) || null, expectedGeneration, externalWait: input.externalWait,
     });
     return {
       matched: true,

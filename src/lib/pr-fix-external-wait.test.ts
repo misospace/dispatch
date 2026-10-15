@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { listQueuedPrFixItems, markPrFixItem, resolvePrFixFromAgentReport, type PrFixQueueClient } from "./pr-fix-queue";
+import {
+  evaluateExternalWaitTrigger,
+  parseExternalWaitInput,
+  parseStoredExternalWait,
+  type ExternalWaitContract,
+} from "./pr-fix-external-wait";
 
 function clientFor(item: any, hooks: { beforeUpdate?: (where: any, data: any) => void } = {}) {
   const history: any[] = [];
@@ -32,20 +38,25 @@ function clientFor(item: any, hooks: { beforeUpdate?: (where: any, data: any) =>
   return { client: client as PrFixQueueClient, history };
 }
 
-const item = () => ({ id: "pf1", repo: "org/repo", pr: 7, status: "QUEUED", lane: "NORMAL", generation: 4, fixAttempts: 5, attemptHeadSha: null as string | null, retryAt: null as Date | null, dispatchedGeneration: 4, dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"], postDispatchEvidenceKeys: [] });
+const item = () => ({ id: "pf1", repo: "org/repo", pr: 7, status: "QUEUED", lane: "NORMAL", generation: 4, fixAttempts: 5, attemptHeadSha: null as string | null, retryAt: null as Date | null, dispatchedGeneration: 4, dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"], postDispatchEvidenceKeys: [], outcome: null as string | null, externalWait: null as unknown });
 
 describe("external prerequisite waits (#1231)", () => {
+  // #1250: every new WAITING_EXTERNAL mark/report must name a concrete,
+  // verifiable dependency — this is the shared conforming payload.
+  const structuredWait = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open, not merged", trigger: "upstream PR merged" };
+
   it("marks a generation once without charging attempts, and accepts repeats idempotently", async () => {
     const row = item();
     const { client, history } = clientFor(row);
-    const first = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "CI dependency" });
+    const first = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "CI dependency", externalWait: structuredWait });
     const deadline = row.retryAt;
-    const repeated = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "duplicate" });
+    const repeated = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "duplicate", externalWait: structuredWait });
     expect(first.mutated).toBe(true);
     expect(repeated.mutated).toBe(true);
     expect(row.status).toBe("WAITING_EXTERNAL");
     expect(row.fixAttempts).toBe(5);
     expect(row.retryAt).toBe(deadline);
+    expect(row.externalWait).toEqual(structuredWait);
     expect(history).toHaveLength(1);
   });
 
@@ -69,11 +80,11 @@ describe("external prerequisite waits (#1231)", () => {
   it("does not let stale wait marks overwrite an updated generation or sticky decisions", async () => {
     const stale = item();
     stale.generation = 5;
-    const staleResult = await markPrFixItem(clientFor(stale).client, { repo: stale.repo, pr: stale.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
+    const staleResult = await markPrFixItem(clientFor(stale).client, { repo: stale.repo, pr: stale.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, externalWait: structuredWait });
     expect(staleResult).toEqual({ mutated: false, reason: "generation-mismatch" });
     for (const status of ["BLOCKED", "PARKED"]) {
       const sticky = { ...item(), status };
-      const result = await markPrFixItem(clientFor(sticky).client, { repo: sticky.repo, pr: sticky.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
+      const result = await markPrFixItem(clientFor(sticky).client, { repo: sticky.repo, pr: sticky.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, externalWait: structuredWait });
       expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
       expect(sticky.status).toBe(status);
     }
@@ -82,7 +93,7 @@ describe("external prerequisite waits (#1231)", () => {
   it("routes waiting-external reports through the same generation-fenced transition", async () => {
     const row = item();
     const { client } = clientFor(row);
-    const result = await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, client });
+    const result = await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, externalWait: structuredWait, client });
     expect(result.action).toBe("deferred");
     expect(row.status).toBe("WAITING_EXTERNAL");
     expect(row.fixAttempts).toBe(5);
@@ -93,7 +104,7 @@ describe("external prerequisite waits (#1231)", () => {
     const row = { ...item(), fixAttempts: 5 };
     const { client, history } = clientFor(row);
     for (let cycle = 0; cycle < 3; cycle++) {
-      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: row.generation });
+      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: row.generation, externalWait: structuredWait });
       expect(row.fixAttempts).toBe(5);
       row.status = "QUEUED";
       row.generation += 1;
@@ -117,13 +128,13 @@ describe("external prerequisite waits (#1231)", () => {
     const row = item();
     const { client, history } = clientFor(row);
     if (order === "report-first") {
-      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: "missing prerequisite: X", attempt: { itemId: row.id, generation: 4 }, client });
+      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: "missing prerequisite: X", attempt: { itemId: row.id, generation: 4 }, externalWait: structuredWait, client });
       expect(history).toHaveLength(1);
       expect(history[0].note).toBe("missing prerequisite: X");
-      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "actual mark note" });
+      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "actual mark note", externalWait: structuredWait });
     } else {
-      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "actual mark note" });
-      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: "missing prerequisite: X", attempt: { itemId: row.id, generation: 4 }, client });
+      await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "actual mark note", externalWait: structuredWait });
+      await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: "missing prerequisite: X", attempt: { itemId: row.id, generation: 4 }, externalWait: structuredWait, client });
     }
     const deadline = row.retryAt;
     await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, client });
@@ -136,7 +147,7 @@ describe("external prerequisite waits (#1231)", () => {
     const row = item();
     const { client, history } = clientFor(row);
     const secretError = `token=${"s".repeat(700)}`;
-    await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: secretError, attempt: { itemId: row.id, generation: 4 }, client });
+    await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", error: secretError, attempt: { itemId: row.id, generation: 4 }, externalWait: structuredWait, client });
     expect(history[0].note).toContain("token=");
     expect(history[0].note.length).toBeLessThanOrEqual(500);
     expect(history[0].note).not.toContain("s".repeat(700));
@@ -146,7 +157,7 @@ describe("external prerequisite waits (#1231)", () => {
     const row = item();
     let raced = false;
     const { client, history } = clientFor(row, { beforeUpdate: () => { if (!raced) { raced = true; row.status = "BLOCKED"; } } });
-    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
+    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, externalWait: structuredWait });
     expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
     expect(row.status).toBe("BLOCKED");
     expect(history).toHaveLength(0);
@@ -156,7 +167,7 @@ describe("external prerequisite waits (#1231)", () => {
     const row = item();
     let raced = false;
     const { client, history } = clientFor(row, { beforeUpdate: () => { if (!raced) { raced = true; row.status = "WAITING_EXTERNAL"; row.retryAt = new Date(Date.now() + 60_000); } } });
-    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
+    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, externalWait: structuredWait });
     expect(result.mutated).toBe(true);
     expect(row.status).toBe("WAITING_EXTERNAL");
     expect(history).toHaveLength(0);
@@ -199,5 +210,135 @@ describe("external prerequisite waits (#1231)", () => {
     const result = await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", attempt: { itemId: row.id, generation: 4 }, client: clientFor(row).client });
     expect(result.action).toBe("skipped");
     expect(result.reason).toContain("stale attempt generation");
+  });
+});
+
+describe("structured external-wait contract (#1250)", () => {
+  it("validates a bounded, typed contract", () => {
+    const good = parseExternalWaitInput({ kind: "upstream_pr", ref: "org/repo#12", evidence: "PR open, unmerged", trigger: "upstream PR merged" });
+    expect(good.ok).toBe(true);
+    for (const bad of [
+      null,
+      "wait",
+      [],
+      { kind: "mystery", ref: "org/repo#12", evidence: "e", trigger: "t" },
+      { kind: "upstream_pr", evidence: "e", trigger: "t" },
+      { kind: "upstream_pr", ref: "", evidence: "e", trigger: "t" },
+      { kind: "upstream_pr", ref: "org/repo#12", trigger: "t" },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e" },
+      { kind: "upstream_pr", ref: "x".repeat(201), evidence: "e", trigger: "t" },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "x".repeat(501), trigger: "t" },
+      { kind: "upstream_pr", ref: "org/repo#12", evidence: "e", trigger: "x".repeat(501) },
+      { kind: "upstream_pr", ref: 7, evidence: "e", trigger: "t" },
+    ]) {
+      expect(parseExternalWaitInput(bad).ok).toBe(false);
+    }
+  });
+
+  it("treats a malformed stored contract as a legacy wait", () => {
+    expect(parseStoredExternalWait(null)).toBeNull();
+    expect(parseStoredExternalWait({ kind: "nonsense" })).toBeNull();
+    expect(parseStoredExternalWait({ kind: "upstream_pr", ref: "org/repo#1", evidence: "e", trigger: "t" })).toEqual({ kind: "upstream_pr", ref: "org/repo#1", evidence: "e", trigger: "t" });
+  });
+
+  it("downgrades a dependency-less wait mark to a fail-closed PARKED, generation-pinned", async () => {
+    const row = item();
+    const { client, history } = clientFor(row);
+    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "no patch yet" });
+    expect(result.mutated).toBe(true);
+    expect(row.status).toBe("PARKED");
+    expect(row.lane).toBe("NORMAL");
+    expect(row.outcome).toBe("invalid_wait");
+    expect(row.retryAt).toBeNull();
+    expect(row.externalWait).toBeNull();
+    expect(history).toHaveLength(1);
+    expect(history[0].status).toBe("PARKED");
+    expect(history[0].outcome).toBe("invalid_wait");
+    expect(history[0].note).toContain("without a verifiable dependency");
+    expect(history[0].note).toContain("no patch yet");
+  });
+
+  it("downgrades a malformed wait contract the same way", async () => {
+    const row = item();
+    const { client, history } = clientFor(row);
+    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, externalWait: { kind: "hope" } });
+    expect(result.mutated).toBe(true);
+    expect(row.status).toBe("PARKED");
+    expect(row.outcome).toBe("invalid_wait");
+    expect(history[0].note).toContain("externalWait.kind must be one of");
+  });
+
+  it("never lets a fail-closed downgrade clobber a newer attempt", async () => {
+    const row = item();
+    let raced = false;
+    const { client, history } = clientFor(row, { beforeUpdate: () => { if (!raced) { raced = true; row.generation = 5; row.status = "QUEUED"; } } });
+    const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4 });
+    expect(result).toEqual({ mutated: false, reason: "generation-mismatch" });
+    expect(row.status).toBe("QUEUED");
+    expect(row.generation).toBe(5);
+    expect(history).toHaveLength(0);
+  });
+
+  it("downgrades a dependency-less waiting-external worker report fail-closed", async () => {
+    const row = item();
+    const { client, history } = clientFor(row);
+    const result = await resolvePrFixFromAgentReport({ repoFullName: row.repo, pullRequestNumber: row.pr, outcome: "waiting-external", summary: "still nothing to push", attempt: { itemId: row.id, generation: 4 }, client });
+    expect(result.action).toBe("deferred");
+    expect(row.status).toBe("PARKED");
+    expect(row.outcome).toBe("invalid_wait");
+    expect(row.lane).toBe("NORMAL");
+    expect(row.retryAt).toBeNull();
+    expect(history[0].note).toContain("Fail-closed park");
+    expect(history[0].note).toContain("still nothing to push");
+  });
+
+  it("surfaces legacy free-text waits read-only in queue listings", async () => {
+    const legacy = { ...item(), status: "WAITING_EXTERNAL" as const, externalWait: null };
+    const structured = { ...item(), id: "item-2", repo: "org/two", pr: 2, status: "WAITING_EXTERNAL" as const, externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "open", trigger: "merged" } };
+    const client: any = {
+      prFixQueueItem: {
+        findUnique: async () => null,
+        findMany: async () => [legacy, structured],
+      },
+      prFixHistory: { findMany: async () => [] },
+    };
+    const included = await listQueuedPrFixItems(client, { includeBlocked: true });
+    const legacyRow = included.find((entry: any) => entry.id === legacy.id);
+    const structuredRow = included.find((entry: any) => entry.id === structured.id);
+    expect(legacyRow).toMatchObject({ status: "WAITING_EXTERNAL", legacyWait: true, externalWait: null });
+    expect(structuredRow).toMatchObject({ status: "WAITING_EXTERNAL", legacyWait: false });
+    expect(structuredRow.externalWait).toEqual({ kind: "upstream_pr", ref: "org/deps#7", evidence: "open", trigger: "merged" });
+  });
+
+  describe("read-only trigger evaluation", () => {
+    const wait: ExternalWaitContract = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open", trigger: "upstream PR merged" };
+
+    it("evaluates upstream_pr: merged satisfies, open stays unsatisfied, fetch failure stays unknown", async () => {
+      expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: "merged", mergedAt: "2026-10-15T00:00:00Z" }) })).toBe("satisfied");
+      expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: "closed", mergedAt: null }) })).toBe("unsatisfied");
+      expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: "open", mergedAt: null }) })).toBe("unsatisfied");
+      expect(await evaluateExternalWaitTrigger(wait, "org/repo", { fetchPullRequestState: async () => ({ state: null, mergedAt: null }) })).toBe("unknown");
+    });
+
+    it("evaluates upstream_issue: closed satisfies, open unsatisfied, unknown on failure", async () => {
+      const issueWait: ExternalWaitContract = { ...wait, kind: "upstream_issue" };
+      expect(await evaluateExternalWaitTrigger(issueWait, "org/repo", { fetchIssueState: async () => ({ state: "closed" }) })).toBe("satisfied");
+      expect(await evaluateExternalWaitTrigger(issueWait, "org/repo", { fetchIssueState: async () => ({ state: "open" }) })).toBe("unsatisfied");
+      expect(await evaluateExternalWaitTrigger(issueWait, "org/repo", { fetchIssueState: async () => null })).toBe("unknown");
+    });
+
+    it("evaluates ci_check: success satisfies, failure unsatisfied, in-flight or missing stays unknown", async () => {
+      const checkWait: ExternalWaitContract = { kind: "ci_check", ref: "check:build@abc1234", evidence: "check pending on attempt head", trigger: "check build concludes success on head abc1234" };
+      expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => "success" })).toBe("satisfied");
+      expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => "failure" })).toBe("unsatisfied");
+      expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => null })).toBe("unknown");
+      expect(await evaluateExternalWaitTrigger(checkWait, "org/repo", { fetchCheckRunConclusion: async () => "in_progress" })).toBe("unknown");
+    });
+
+    it("never silently satisfies an unverifiable dependency", async () => {
+      const serviceWait: ExternalWaitContract = { kind: "external_service", ref: "vendor:cdn", evidence: "propagation pending", trigger: "vendor confirms propagation" };
+      expect(await evaluateExternalWaitTrigger(serviceWait, "org/repo")).toBe("unknown");
+      expect(await evaluateExternalWaitTrigger({ ...wait, ref: "not-a-ref" }, "org/repo")).toBe("unknown");
+    });
   });
 });

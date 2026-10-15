@@ -250,6 +250,11 @@ model PrFixQueueItem {
   handoutReclaims Int @default(0)
   // Cooldown deadline for external dependency waits; due items are reissued lazily.
   retryAt DateTime?
+  // Structured external-wait contract (#1250): bounded { kind, ref, evidence,
+  // trigger } validated at every WAITING_EXTERNAL writer. Null on a
+  // WAITING_EXTERNAL row means a legacy free-text wait (pre-#1250) — surfaced
+  // for operator action, never auto-downgraded.
+  externalWait Json?
   author       String?
   history      PrFixHistory[]
 
