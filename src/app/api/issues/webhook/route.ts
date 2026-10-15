@@ -24,6 +24,27 @@ function deliveryActor(body: Record<string, any>): string {
   return typeof sender === "string" && sender ? sender : "github";
 }
 
+/** Bounded compare-and-swap retries for one label delivery (#1220). */
+const LABEL_UPDATE_MAX_ATTEMPTS = 5;
+
+/**
+ * Apply a labeled/unlabeled action to a label snapshot. Returning the same
+ * array reference when nothing changes is what makes the identity checks
+ * below exact rather than a "new array means a change" test: adding a label
+ * that is already present, or removing one that is absent, is a no-op.
+ */
+function applyLabelAction(
+  action: "labeled" | "unlabeled",
+  labelName: string,
+  currentLabels: string[],
+): string[] {
+  const present = currentLabels.includes(labelName);
+  if (action === "labeled") {
+    return present ? currentLabels : [...currentLabels, labelName];
+  }
+  return present ? currentLabels.filter((label) => label !== labelName) : currentLabels;
+}
+
 /**
  * GitHub Webhook Handler for Issue Label Events
  *
@@ -42,6 +63,8 @@ function deliveryActor(body: Record<string, any>): string {
  *
  * Only the Prisma cache is updated. GitHub is the source of truth and the
  * event already came from GitHub, so no outbound GitHub calls are made.
+ * Label writes are compare-and-swap guarded so concurrent deliveries for the
+ * same issue preserve each other's changes (#1220).
  */
 
 export async function POST(request: Request) {
@@ -172,24 +195,50 @@ export async function POST(request: Request) {
       return errorResponse("Missing label.name in payload", 400);
     }
 
-    // Idempotent: adding a label that is already present (or removing one
-    // that is absent) leaves the label set unchanged — returned as the same
-    // array reference, which is what makes the identity check below exact
-    // rather than a "new array means a change" test.
-    const currentLabels = cachedIssue.labels;
-    const nextLabels =
-      action === "labeled"
-        ? currentLabels.includes(labelName)
-          ? currentLabels
-          : [...currentLabels, labelName]
-        : currentLabels.includes(labelName)
-          ? currentLabels.filter((label) => label !== labelName)
-          : currentLabels;
+    // Concurrency-safe cache update (#1220): compute the next label set from
+    // the snapshot we just read, then commit it with a compare-and-swap — the
+    // guarded update only lands while the stored array still equals that
+    // snapshot. If a concurrent delivery for the same issue wrote in between,
+    // count is 0 and we re-read and recompute (bounded), so each delivery
+    // applies its own add/remove on top of the other's change instead of
+    // blindly replacing the array and losing it. The guard is database-level
+    // (single UPDATE with a predicate), so it holds across replicas, unlike
+    // an in-process mutex.
+    let snapshot = cachedIssue;
+    let nextLabels = applyLabelAction(action, labelName, snapshot.labels);
+    let committed = false;
 
-    await prisma.issue.update({
-      where: { repositoryId_number: { repositoryId: repo.id, number: issueNumber } },
-      data: { labels: nextLabels, lastSyncedAt: new Date() },
-    });
+    for (let attempt = 1; attempt <= LABEL_UPDATE_MAX_ATTEMPTS; attempt++) {
+      const result = await prisma.issue.updateMany({
+        where: {
+          repositoryId_number: { repositoryId: repo.id, number: issueNumber },
+          labels: { equals: snapshot.labels },
+        },
+        data: { labels: nextLabels, lastSyncedAt: new Date() },
+      });
+      if (result.count === 1) {
+        committed = true;
+        break;
+      }
+      if (attempt === LABEL_UPDATE_MAX_ATTEMPTS) break;
+      // Lost the race (or the row moved on): re-read and recompute. The row
+      // was cached at the start of this delivery, so a missing row here means
+      // it was pruned concurrently; treat that like the uncached case.
+      const fresh = await prisma.issue.findUnique({
+        where: { repositoryId_number: { repositoryId: repo.id, number: issueNumber } },
+      });
+      if (!fresh) {
+        return NextResponse.json({ message: "Issue not cached, ignored" });
+      }
+      snapshot = fresh;
+      nextLabels = applyLabelAction(action, labelName, snapshot.labels);
+    }
+
+    if (!committed) {
+      // Contention this sustained across bounded retries is pathological;
+      // 5xx so GitHub redelivers rather than silently dropping the change.
+      return errorResponse("Issue label update contended, retry delivery", 503);
+    }
 
     // A status label moving on GitHub is a transition in the lifecycle stream
     // with GitHub, not Dispatch, as its source (#1202).
@@ -199,27 +248,27 @@ export async function POST(request: Request) {
     // status swap reaches the cache as "labeled new" while the old label is
     // still on it, and a set diff would read that as no transition at all.
     // The route's own no-op handling (adding a label that is already present,
-    // removing one that is absent leaves `nextLabels` equal to `currentLabels`)
-    // is what makes a repeat delivery a no-op here. The delivery id is GitHub's
-    // identity for the event, so a redelivery upserts the row it already wrote
-    // instead of counting as a second move.
+    // removing one that is absent leaves `nextLabels` equal to the committed
+    // snapshot's labels) is what makes a repeat delivery a no-op here. The
+    // delivery id is GitHub's identity for the event, so a redelivery upserts
+    // the row it already wrote instead of counting as a second move.
     //
     // GitHub sends no per-label timestamp, so the issue's own updated_at
     // stands in as the occurrence time and is labelled as such in metadata —
     // the observation time is never backdated to it.
-    if (labelName.startsWith("status/") && nextLabels !== currentLabels) {
+    if (labelName.startsWith("status/") && nextLabels !== snapshot.labels) {
       const statusUpdatedAt = parseGithubTimestamp(body.issue?.updated_at);
       const added = action === "labeled";
       await recordLifecycleEventQuietly(
         prisma,
         {
-          issueId: cachedIssue.id,
+          issueId: snapshot.id,
           repoFullName,
           issueNumber,
           kind: "status_changed",
           source: "webhook",
           actor: deliveryActor(body),
-          fromStatus: added ? lifecycleStatusLabel(currentLabels) : labelName,
+          fromStatus: added ? lifecycleStatusLabel(snapshot.labels) : labelName,
           toStatus: added ? labelName : lifecycleStatusLabel(nextLabels),
           sourceEventId: deliveryId,
           dedupeKey: deliveryId
