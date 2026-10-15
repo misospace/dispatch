@@ -220,6 +220,7 @@ export async function POST(request: Request) {
         committed = true;
         break;
       }
+      if (attempt === LABEL_UPDATE_MAX_ATTEMPTS) break;
       // Lost the race (or the row moved on): re-read and recompute. The row
       // was cached at the start of this delivery, so a missing row here means
       // it was pruned concurrently; treat that like the uncached case.

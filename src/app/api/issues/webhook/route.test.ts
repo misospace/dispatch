@@ -639,4 +639,47 @@ describe("POST /api/issues/webhook — concurrent deliveries (#1220)", () => {
     expect(resB.status).toBe(200);
     expect([...env.store.labels].sort()).toEqual(["status/backlog"]);
   });
+
+  it("returns 503 after exhausting bounded retries so GitHub redelivers", async () => {
+    // A store that shifts under every read: each CAS misses, so the delivery
+    // re-reads and recomputes until the attempt bound is spent.
+    let reads = 0;
+    mocks.issueFindUnique.mockImplementation(async () => {
+      reads++;
+      return {
+        id: "issue-1",
+        number: 42,
+        repositoryId: "repo-1",
+        labels: [`status/backlog`, `churn/${reads}`],
+      };
+    });
+    mocks.issueUpdateMany.mockResolvedValue({ count: 0 });
+
+    const res = await POST(
+      signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } })),
+    );
+
+    expect(res.status).toBe(503);
+    expect(mocks.issueUpdateMany).toHaveBeenCalledTimes(5);
+    // The initial read plus one re-read per failed attempt except the last.
+    expect(mocks.issueFindUnique).toHaveBeenCalledTimes(5);
+  });
+
+  it("settles as uncached when the issue row is pruned during a retry", async () => {
+    let reads = 0;
+    mocks.issueFindUnique.mockImplementation(async () => {
+      reads++;
+      if (reads > 1) return null;
+      return { id: "issue-1", number: 42, repositoryId: "repo-1", labels: ["status/backlog"] };
+    });
+    mocks.issueUpdateMany.mockResolvedValue({ count: 0 });
+
+    const res = await POST(
+      signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } })),
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).message).toBe("Issue not cached, ignored");
+    expect(mocks.issueUpdateMany).toHaveBeenCalledTimes(1);
+  });
 });
