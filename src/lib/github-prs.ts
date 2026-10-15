@@ -1,6 +1,141 @@
 import type { CheckFailure, PrHealthInput } from "./linked-pr-health";
 import { GITHUB_API, getHeadersAsync, fetchPaginated, fetchWithRetry } from "./github-auth";
 
+/**
+ * GraphQL read of a PR's review threads: for each thread, whether it is
+ * resolved and/or outdated, plus the `databaseId` of every inline comment it
+ * holds. The REST API does not expose thread resolution, so this is the only
+ * way to learn whether an inline review comment lives in an already-resolved
+ * thread (dispatch#1249: a resolved/outdated comment is recorded, never
+ * treated as new work).
+ */
+const REVIEW_THREAD_STATES_QUERY = `
+query ReviewThreadStates($owner: String!, $repo: String!, $number: Int!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: $first, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          isResolved
+          isOutdated
+          comments(first: 100) {
+            nodes {
+              databaseId
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+/** Bounded page limit for the review-thread connection (50 threads/page). */
+const REVIEW_THREAD_PAGE_SIZE = 50;
+const REVIEW_THREAD_MAX_PAGES = 10;
+
+interface RawReviewThreadConnection {
+  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null } | null;
+  nodes?: Array<{
+    isResolved?: boolean | null;
+    isOutdated?: boolean | null;
+    comments?: { nodes?: Array<{ databaseId?: number | null } | null> } | null;
+  } | null>;
+}
+
+interface RawGraphQLResponse {
+  data?: {
+    repository?: {
+      pullRequest?: { reviewThreads?: RawReviewThreadConnection | null } | null;
+    } | null;
+  } | null;
+  errors?: Array<{ message?: string }>;
+}
+
+/**
+ * Map a PR's inline review comments (by stringified `databaseId`) to their
+ * review thread's resolved/outdated state.
+ *
+ * One read per PR, bounded to 10 pages. Fail-closed: any missing credential,
+ * non-2xx response, GraphQL error, or unknown shape returns `null` so the
+ * caller treats the thread state as *unknown* rather than silently resolved —
+ * missing/unknown forge evidence is never deemed resolved (dispatch#1249).
+ */
+export async function fetchPullRequestReviewThreadStates(
+  repoFullName: string,
+  prNumber: number,
+): Promise<Map<string, { resolved: boolean; outdated: boolean }> | null> {
+  const [owner, repo] = repoFullName.split("/");
+  if (!owner || !repo) return null;
+
+  try {
+    const headers = await getHeadersAsync();
+    const map = new Map<string, { resolved: boolean; outdated: boolean }>();
+    let after: string | null = null;
+
+    for (let page = 0; page < REVIEW_THREAD_MAX_PAGES; page++) {
+      const response = await fetchWithRetry(
+        `${GITHUB_API}/graphql`,
+        {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: REVIEW_THREAD_STATES_QUERY,
+            variables: { owner, repo, number: prNumber, first: REVIEW_THREAD_PAGE_SIZE, after },
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        console.warn(
+          `[github-prs] review-thread states unavailable for ${repoFullName}#${prNumber}: HTTP ${response.status}`,
+        );
+        return null;
+      }
+
+      const data = (await response.json()) as RawGraphQLResponse;
+      if (data.errors && data.errors.length > 0) {
+        const why = data.errors.map((e) => e.message).filter(Boolean).join("; ") || "GraphQL error";
+        console.warn(`[github-prs] review-thread states for ${repoFullName}#${prNumber}: ${why}`);
+        return null;
+      }
+
+      const connection = data.data?.repository?.pullRequest?.reviewThreads;
+      if (!connection) {
+        console.warn(
+          `[github-prs] review-thread states unavailable for ${repoFullName}#${prNumber}: no reviewThreads data`,
+        );
+        return null;
+      }
+
+      for (const node of connection.nodes ?? []) {
+        if (!node) continue;
+        const state = { resolved: node.isResolved === true, outdated: node.isOutdated === true };
+        for (const comment of node.comments?.nodes ?? []) {
+          const id = comment?.databaseId;
+          if (id == null) continue;
+          map.set(String(id), state);
+        }
+      }
+
+      if (!connection.pageInfo?.hasNextPage || !connection.pageInfo?.endCursor) break;
+      after = connection.pageInfo.endCursor;
+    }
+
+    return map;
+  } catch (error) {
+    console.warn(
+      `[github-prs] review-thread states unavailable for ${repoFullName}#${prNumber}: ${
+        error instanceof Error ? error.message : error
+      }`,
+    );
+    return null;
+  }
+}
+
 export interface GithubPR {
   number: number;
   url: string;

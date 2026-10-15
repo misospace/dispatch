@@ -14,9 +14,32 @@ import {
   ingestReviewCommentEvent,
   ingestCheckRunEvent,
   ingestMergeStateEvent,
+  ingestMergeConflict,
   processPrFollowupEvents,
   PrFollowupConfig,
 } from "./pr-followup-ingestion";
+
+// ─── Durable evidence-field capture (#1249) ──────────────────────────────────
+//
+// The follow-up ingestion path projects each event onto the ledger's
+// evidence* block and hands it to enqueuePrFixItem. The new describe block
+// below captures that hand-off payload. We mock ONLY the enqueuePrFixItem
+// binding from pr-fix-queue, delegating to the real implementation so every
+// pre-existing test in this file keeps its exact behavior; the mock just
+// records the EnqueuePrFixInput each enqueue receives.
+const evidenceEnqueueInputs = vi.hoisted(() => [] as any[]);
+
+vi.mock("./pr-fix-queue", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./pr-fix-queue")>();
+  return {
+    ...original,
+    enqueuePrFixItem: async (client: any, input: any) => {
+      evidenceEnqueueInputs.push(input);
+      return (original.enqueuePrFixItem as any)(client, input);
+    },
+  };
+});
+
 
 // ─── Mock client ────────────────────────────────────────────────────────────
 
@@ -1443,5 +1466,241 @@ describe("extractLinkedIssue commit fallback", () => {
     expect(
       extractLinkedIssue({ title: "t", body: "b", commitMessages: [null, undefined, ""] }),
     ).toBeNull();
+  });
+});
+
+// ─── Durable Evidence Fields (#1249) ─────────────────────────────────────────
+//
+// Captures the EnqueuePrFixInput the ingestion path hands to enqueuePrFixItem
+// (recorded by the module mock above) and asserts on the durable evidence*
+// block: kind, stable key, state-bearing version, actionability, content
+// signature, observed timestamp, head SHA, and source.
+
+describe("durable evidence fields (#1249)", () => {
+  beforeEach(() => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    evidenceEnqueueInputs.length = 0;
+  });
+
+  afterEach(() => {
+    delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+  });
+
+  it("ingestReviewEvent → review evidence block on the enqueue payload", async () => {
+    const client = makeClient();
+    await ingestReviewEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      reviewBody: "Test failed: expected 200 but got 404",
+      reviewId: "r1",
+      reviewState: "CHANGES_REQUESTED",
+      actorLogin: "octocat",
+      commitId: "abc123",
+      submittedAt: "2026-10-01T10:00:00Z",
+      headSha: "head-review",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("review");
+    expect(input.evidenceKey).toBe("review:org/repo#42:r1");
+    expect(input.evidenceVersion).toBe("state=changes_requested|commit=abc123");
+    expect(input.evidenceContentSignature).toMatch(/^[0-9a-f]{32}$/);
+    expect(input.evidenceObservedAt).toBe("2026-10-01T10:00:00Z");
+    expect(input.evidenceActionable).toBe(true);
+    expect(input.evidenceHeadSha).toBe("head-review");
+    expect(input.evidenceSource).toBe("webhook");
+  });
+
+  it("ingestCommentEvent → comment evidence block (actor lowercased in version)", async () => {
+    const client = makeClient();
+    await ingestCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Test failed: expected 200 but got 404",
+      commentId: "c1",
+      actorLogin: "OctoCat",
+      updatedAt: "2026-10-02T12:00:00Z",
+      headSha: "head-comment",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("comment");
+    expect(input.evidenceKey).toBe("comment:org/repo#42:c1");
+    expect(input.evidenceVersion).toBe("updated=2026-10-02t12:00:00z|actor=octocat");
+    expect(input.evidenceActionable).toBe(true);
+    expect(input.evidenceContentSignature).toMatch(/^[0-9a-f]{32}$/);
+    expect(input.evidenceObservedAt).toBe("2026-10-02T12:00:00Z");
+  });
+
+  it("ingestReviewCommentEvent with a resolved thread → recorded, never actionable", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Unused import on line 12",
+      commentId: "rc1",
+      path: "src/foo.ts",
+      line: 12,
+      actorLogin: "octocat",
+      commitId: "abc123",
+      updatedAt: "2026-10-03T00:00:00Z",
+      threadResolved: true,
+      threadOutdated: false,
+      headSha: "head-rc",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("review_comment");
+    expect(input.evidenceKey).toBe("review_comment:org/repo#42:rc1");
+    expect(input.evidenceVersion).toContain("resolved=y");
+    expect(input.evidenceActionable).toBe(false);
+  });
+
+  it("ingestReviewCommentEvent with undefined thread flags → actionable", async () => {
+    const client = makeClient();
+    await ingestReviewCommentEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      commentBody: "Unused import on line 12",
+      commentId: "rc2",
+      path: "src/foo.ts",
+      line: 12,
+      actorLogin: "octocat",
+      commitId: "abc123",
+      updatedAt: "2026-10-03T00:00:00Z",
+      threadResolved: undefined,
+      threadOutdated: undefined,
+      headSha: "head-rc",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("review_comment");
+    expect(input.evidenceVersion).toContain("resolved=n");
+    expect(input.evidenceActionable).toBe(true);
+  });
+
+  it("ingestCheckRunEvent with a failing conclusion → actionable check_run block", async () => {
+    const client = makeClient();
+    await ingestCheckRunEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      checkName: "lint",
+      conclusion: "failure",
+      checkRunId: "cr1",
+      checkDetails: "eslint error: unused import",
+      checkStatus: "completed",
+      completedAt: "2026-10-04T00:00:00Z",
+      headSha: "head-check",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("check_run");
+    expect(input.evidenceKey).toBe("check_run:org/repo#42:cr1");
+    expect(input.evidenceVersion).toBe("head=head-check|status=completed|conclusion=failure");
+    expect(input.evidenceActionable).toBe(true);
+    expect(input.evidenceObservedAt).toBe("2026-10-04T00:00:00Z");
+    expect(input.evidenceHeadSha).toBe("head-check");
+    expect(input.evidenceSource).toBe("webhook");
+  });
+
+  it("ingestMergeStateEvent dirty → stable per-PR identity (no state-derived key)", async () => {
+    const client = makeClient();
+    await ingestMergeStateEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      mergeStateStatus: "dirty",
+      headSha: "head-ms",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("merge_state");
+    expect(input.evidenceKey).toBe("merge_state:org/repo#42");
+    expect(input.evidenceVersion).toBe("state=dirty|head=head-ms");
+    expect(input.evidenceActionable).toBe(true);
+  });
+
+  it("ingestMergeConflict CONFLICTING → stable per-PR identity (no trailing state)", async () => {
+    const client = makeClient();
+    await ingestMergeConflict(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      mergeable: "CONFLICTING",
+      headSha: "head-mc",
+      source: "webhook",
+    });
+
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    const input = evidenceEnqueueInputs[0];
+    expect(input.evidenceKind).toBe("merge_conflict");
+    expect(input.evidenceKey).toBe("merge_conflict:org/repo#42");
+    expect(input.evidenceVersion).toBe("mergeable=conflicting|head=head-mc");
+    expect(input.evidenceActionable).toBe(true);
+    expect(input.evidenceContentSignature).toBeNull();
+  });
+
+  it("ingestReviewEvent with a non-date submittedAt → observedAt passes through raw (queue validates)", async () => {
+    const client = makeClient();
+    const result = await ingestReviewEvent(client, {
+      repoFullName: "org/repo",
+      prNumber: 42,
+      branch: "fix/test",
+      url: "https://github.com/org/repo/pull/42",
+      title: "Fix test",
+      author: "itsmiso-ai",
+      reviewBody: "Test failed: expected 200 but got 404",
+      reviewId: "r7",
+      reviewState: "CHANGES_REQUESTED",
+      actorLogin: "octocat",
+      commitId: "abc123",
+      submittedAt: "not-a-date",
+      headSha: "head-review",
+      source: "webhook",
+    });
+
+    // No throw, and the event was enqueued.
+    expect(result).toBe("review:org/repo#42:r7");
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    // The forge timestamp is recorded verbatim — the queue is what validates it.
+    expect(evidenceEnqueueInputs[0].evidenceObservedAt).toBe("not-a-date");
   });
 });

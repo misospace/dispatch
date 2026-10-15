@@ -133,7 +133,43 @@ async function confirmPrFixHandOut(
     console.warn(`next-task pr-fix hand-out for ${candidate.repo}#${candidate.pr}: no confirmed generation; deferring the item to the next poll`);
     return null;
   }
+  await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration);
   return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane };
+}
+
+/**
+ * Stamp the durable evidence-snapshot boundary of this hand-out (#1249): the
+ * ledger sequence at dispatch is the durable record of what the worker was
+ * actually given — settlement reopens only on transitions recorded AFTER it.
+ * Pinned on the exact `evidenceSequence` read a moment earlier: a transition
+ * landing in the read→write gap misses the pin, and the row keeps a NULL (or
+ * prior) watermark instead of a too-low stamp — settlement then falls back to
+ * the bounded #1119 cache, the pre-#1249 behavior. Best-effort like the
+ * dispatch stamp around it: a failure here loses durable freshness tracking,
+ * never the task.
+ */
+async function stampAttemptEvidenceWatermark(itemId: string, generation: number): Promise<void> {
+  try {
+    const head = await prisma.prFixQueueItem.findUnique({
+      where: { id: itemId },
+      select: { evidenceSequence: true },
+    });
+    if (!head || typeof head.evidenceSequence !== "number") return;
+    const { count } = await prisma.prFixQueueItem.updateMany({
+      where: { id: itemId, generation, evidenceSequence: head.evidenceSequence },
+      data: { attemptEvidenceWatermark: head.evidenceSequence },
+    });
+    if (count !== 1) {
+      console.warn(
+        `next-task pr-fix evidence watermark stamp missed for item ${itemId} (generation ${generation}); settlement falls back to the bounded cache`,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `next-task pr-fix evidence watermark stamp failed for item ${itemId}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
 }
 
 export async function GET(

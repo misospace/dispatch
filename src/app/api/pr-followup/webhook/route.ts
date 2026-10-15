@@ -49,6 +49,10 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         prState: pr.state,
         prMergedAt: pr.merged_at,
         headSha: pr.head?.sha ?? null,
+        actorLogin: prReview.review?.user?.login ?? null,
+        commitId: prReview.review?.commit_id,
+        submittedAt: prReview.review?.submitted_at,
+        source: "webhook",
       });
       break;
     }
@@ -70,6 +74,9 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         id: String(comment.comment?.id),
         linkedIssue: extractLinkedIssue(pr),
         headSha: pr.head?.sha ?? null,
+        actorLogin: comment.comment?.user?.login ?? null,
+        updatedAt: comment.comment?.updated_at,
+        source: "webhook",
       });
       break;
     }
@@ -93,6 +100,9 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         id: String(issueComment.comment?.id),
         linkedIssue: extractLinkedIssue(issue),
         headSha: null,
+        actorLogin: issueComment.comment?.user?.login ?? null,
+        updatedAt: issueComment.comment?.updated_at,
+        source: "webhook",
       });
       break;
     }
@@ -133,6 +143,9 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         checkName: check.name,
         linkedIssue: null,
         headSha: firstPr?.head?.sha ?? check.head_sha ?? null,
+        checkStatus: check.status,
+        completedAt: check.completed_at,
+        source: "webhook",
       });
       break;
     }
@@ -155,6 +168,7 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         prState: pr.state,
         prMergedAt: pr.merged_at,
         headSha: pr.head?.sha ?? null,
+        source: "webhook",
       });
       break;
     }

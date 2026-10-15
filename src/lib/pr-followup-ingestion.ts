@@ -13,6 +13,14 @@ import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-healt
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
 import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
+import {
+  conditionEvidenceKey,
+  computeEvidenceContentSignature,
+  computeEvidenceVersion,
+  isActionableEvidenceVersion,
+  type EvidenceVersionFields,
+  type PrFixEvidenceKind,
+} from "@/lib/pr-fix-evidence";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -489,6 +497,63 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
 };
 
 /**
+ * Durable per-event evidence block (#1249). The pure helpers in `pr-fix-evidence`
+ * own the canonical version / actionability / content-signature logic; this is a
+ * thin projection from a follow-up event onto the ledger's `evidence*` fields.
+ * `merge_state` uses a stable per-PR identity (`conditionEvidenceKey`) so a PR's
+ * repeated merge-state observations are not treated as distinct work.
+ */
+function evidenceFieldsFor(event: PrFollowupEvent) {
+  const kind: PrFixEvidenceKind = event.eventType;
+  const fields: EvidenceVersionFields = {
+    state: event.state ?? null,
+    commitId: event.commitId ?? null,
+    updatedAt: event.updatedAt ?? null,
+    resolved: event.threadResolved ?? null,
+    outdated: event.threadOutdated ?? null,
+    actorLogin: event.actorLogin ?? event.author ?? null,
+    headSha: event.headSha ?? null,
+    checkStatus: event.checkStatus ?? null,
+    conclusion: event.conclusion ?? null,
+    mergeStateStatus: event.mergeStateStatus ?? null,
+  };
+  const evidenceVersion = computeEvidenceVersion(kind, fields);
+  const evidenceActionable = isActionableEvidenceVersion(kind, fields);
+  const hasBody = kind === "review" || kind === "comment" || kind === "review_comment";
+  const evidenceContentSignature = hasBody
+    ? computeEvidenceContentSignature({
+        body: event.body ?? null,
+        actorLogin: fields.actorLogin,
+        state: event.state ?? null,
+        commitId: event.commitId ?? null,
+      })
+    : null;
+  const evidenceObservedAt =
+    kind === "review"
+      ? event.submittedAt ?? null
+      : kind === "comment" || kind === "review_comment"
+        ? event.updatedAt ?? null
+        : kind === "check_run"
+          ? event.completedAt ?? null
+          : null;
+  const evidenceKey =
+    kind === "merge_state"
+      ? conditionEvidenceKey("merge_state", event.repoFullName, event.prNumber)
+      : computeEvidenceKey(event.eventType, INGEST_DESCRIPTORS[event.eventType].sourceId(event), event.repoFullName, event.prNumber);
+
+  return {
+    evidenceKind: kind,
+    evidenceVersion,
+    evidenceContentSignature,
+    evidenceObservedAt,
+    evidenceActionable,
+    evidenceHeadSha: event.headSha ?? null,
+    evidenceSource: event.source ?? null,
+    evidenceKey,
+  };
+}
+
+/**
  * Shared ingestion path for all PR follow-up event types.
  * Returns the evidence key if the event was eligible and enqueued,
  * or null if it was filtered out (gated, terminal PR, not bot-authored,
@@ -542,7 +607,7 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
       });
     }
   }
-  const evidenceKey = computeEvidenceKey(event.eventType, descriptor.sourceId(event), event.repoFullName, event.prNumber);
+  const { evidenceKey, ...evidence } = evidenceFieldsFor(event);
 
   await enqueuePrFixItem(client, {
     repo: event.repoFullName,
@@ -558,6 +623,7 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
     title: event.title,
     headSha: event.headSha ?? null,
     author: event.author,
+    ...evidence,
   });
 
   return evidenceKey;
@@ -580,6 +646,11 @@ export async function ingestCommentEvent(
     commentBody: string;
     commentId: string;
     linkedIssue?: number | null;
+    /** The comment author's login (drives the durable `actor=` slot). */
+    actorLogin?: string | null;
+    updatedAt?: string | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -593,6 +664,10 @@ export async function ingestCommentEvent(
     body: opts.commentBody,
     id: opts.commentId,
     linkedIssue: opts.linkedIssue,
+    actorLogin: opts.actorLogin,
+    updatedAt: opts.updatedAt,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -614,6 +689,12 @@ export async function ingestReviewEvent(
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
+    /** The review author's login (drives the durable `actor=` slot). */
+    actorLogin?: string | null;
+    commitId?: string | null;
+    submittedAt?: string | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -630,6 +711,11 @@ export async function ingestReviewEvent(
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
+    actorLogin: opts.actorLogin,
+    commitId: opts.commitId,
+    submittedAt: opts.submittedAt,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -658,6 +744,14 @@ export async function ingestReviewCommentEvent(
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
+    /** The review-comment author's login (drives the durable `actor=` slot). */
+    actorLogin?: string | null;
+    commitId?: string | null;
+    updatedAt?: string | null;
+    threadResolved?: boolean | null;
+    threadOutdated?: boolean | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -675,6 +769,13 @@ export async function ingestReviewCommentEvent(
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
+    actorLogin: opts.actorLogin,
+    commitId: opts.commitId,
+    updatedAt: opts.updatedAt,
+    threadResolved: opts.threadResolved,
+    threadOutdated: opts.threadOutdated,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -699,6 +800,10 @@ export async function ingestCheckRunEvent(
     checkRunUrl?: string | null;
     checkDetails?: string;
     linkedIssue?: number | null;
+    checkStatus?: string | null;
+    completedAt?: string | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -715,6 +820,10 @@ export async function ingestCheckRunEvent(
     conclusion: opts.conclusion,
     checkName: opts.checkName,
     linkedIssue: opts.linkedIssue,
+    checkStatus: opts.checkStatus,
+    completedAt: opts.completedAt,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -734,6 +843,8 @@ export async function ingestMergeStateEvent(
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -744,12 +855,14 @@ export async function ingestMergeStateEvent(
     url: opts.url,
     title: opts.title,
     author: opts.author,
-    // The evidence key for merge_state events derives from the status itself.
+    // The evidence key for merge_state events is now a stable per-PR identity.
     id: opts.mergeStateStatus,
     mergeStateStatus: opts.mergeStateStatus,
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -775,6 +888,7 @@ export async function ingestMergeConflict(
     mergeable: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
     linkedIssue?: number | null;
     headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   // Only CONFLICTING PRs trigger merge conflict items
@@ -786,7 +900,15 @@ export async function ingestMergeConflict(
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(opts.repoFullName)) return null;
 
-  const evidenceKey = computeEvidenceKey("merge_conflict", "conflicting", opts.repoFullName, opts.prNumber);
+  // #1249: a stable per-PR identity (not state-derived) so repeated
+  // conflicting observations on the same PR are not distinct work.
+  const evidenceKey = conditionEvidenceKey("merge_conflict", opts.repoFullName, opts.prNumber);
+  const conditionFields: EvidenceVersionFields = {
+    mergeable: opts.mergeable,
+    headSha: opts.headSha ?? null,
+  };
+  const evidenceVersion = computeEvidenceVersion("merge_conflict", conditionFields);
+  const evidenceActionable = isActionableEvidenceVersion("merge_conflict", conditionFields);
 
   await enqueuePrFixItem(client, {
     repo: opts.repoFullName,
@@ -802,6 +924,13 @@ export async function ingestMergeConflict(
     title: opts.title,
     headSha: opts.headSha ?? null,
     author: opts.author,
+    evidenceKind: "merge_conflict",
+    evidenceVersion,
+    evidenceContentSignature: null,
+    evidenceObservedAt: null,
+    evidenceActionable,
+    evidenceHeadSha: opts.headSha ?? null,
+    evidenceSource: opts.source ?? null,
   });
 
   return evidenceKey;
@@ -887,6 +1016,28 @@ export interface PrFollowupEvent {
    * and the queue records `FIXED` (#940).
    */
   headSha?: string | null;
+  /**
+   * The feedback author's login (comment/review body author). Distinct from
+   * `author` (the PR's author, used for the bot-author gate). Drives the
+   * durable `actor=` slot in the evidence version / content signature.
+   */
+  actorLogin?: string | null;
+  /** The commit the review/comment was written against (REST `commit_id`). */
+  commitId?: string | null;
+  /** review: REST `submitted_at`. */
+  submittedAt?: string | null;
+  /** comment / review_comment: REST `updated_at`. */
+  updatedAt?: string | null;
+  /** review_comment: whether its review thread is resolved (GraphQL). */
+  threadResolved?: boolean | null;
+  /** review_comment: whether its review thread is outdated (GraphQL). */
+  threadOutdated?: boolean | null;
+  /** check_run: REST lifecycle `status`. */
+  checkStatus?: string | null;
+  /** check_run: REST `completed_at`. */
+  completedAt?: string | null;
+  /** Ingestion source label recorded in the ledger (`sync` / `webhook`). */
+  source?: "sync" | "webhook";
 }
 
 /**

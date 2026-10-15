@@ -6,6 +6,11 @@ import { fetchPullRequestMergeState, fetchPullRequestHeadSha, fetchPullRequestSt
 import { capacityCooldownMs, capacityEquals } from "./capacity-handoff";
 import { fetchRepositoryMetadata } from "./github-code-search";
 import { sanitizeForStorage } from "./groomer/sanitize";
+import {
+  isPrFixEvidenceKind,
+  ledgerRowsToPostDispatchEntries,
+  type PrFixEvidenceKind,
+} from "./pr-fix-evidence";
 
 export type PrFixQueueClient = {
   issue: {
@@ -28,6 +33,15 @@ export type PrFixQueueClient = {
   capacityHandoff?: {
     create: (args: any) => Promise<any>;
     findMany?: (args: any) => Promise<any[]>;
+  };
+  // #1249: durable per-item evidence ledger. Optional so legacy/test clients
+  // without the table keep settling: with no surface the enqueue falls back to
+  // the bounded `evidenceKeys` cache (identity-only, pre-#1249 semantics) and
+  // settlement consults only the cached post-dispatch list.
+  prFixEvidence?: {
+    findFirst: (args: any) => Promise<any>;
+    findMany: (args: any) => Promise<any[]>;
+    upsert: (args: any) => Promise<any>;
   };
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
 };
@@ -72,6 +86,37 @@ export interface EnqueuePrFixInput {
   outcome?: string | null;
   /** Human-decision payload persisted on a BLOCKED result (#1218). */
   decision?: PrFixDecisionContext | null;
+  /**
+   * Durable evidence-snapshot fields (#1249). When `evidenceKey` carries these,
+   * the enqueue records a versioned transition in the item's durable evidence
+   * ledger (one row per identity), and the ledger — not the bounded 40-entry
+   * `evidenceKeys` cache — decides whether the observation is known evidence.
+   * All optional: legacy callers keep the pre-#1249 identity-only behavior.
+   * Build these with the pure helpers in `pr-fix-evidence.ts`.
+   */
+  /** One of `PrFixEvidenceKind` ("review", "check_run", ...). Unknown kinds
+   * are recorded for audit and never treated as fresh work. */
+  evidenceKind?: string | null;
+  /** Canonical version of the identity's state-bearing fields
+   * (`computeEvidenceVersion`). A change is a ledger transition. */
+  evidenceVersion?: string | null;
+  /** Bounded anti-repetition signature (`computeEvidenceContentSignature`).
+   * A new identity whose signature already exists in the ledger at the same
+   * commit is recorded but not treated as new evidence. */
+  evidenceContentSignature?: string | null;
+  /** Forge-side event timestamp (review submitted_at, comment updated_at,
+   * check completed_at). Audit provenance ONLY — never a freshness boundary. */
+  evidenceObservedAt?: Date | string | null;
+  /** Whether the observation's CURRENT version is actionable by kind
+   * (`isActionableEvidenceVersion`). Unknown provenance defers, never
+   * silently resolves. */
+  evidenceActionable?: boolean | null;
+  /** Head the observation was taken against (ledger row's head; entries
+   * re-encoded for settlement use it). */
+  evidenceHeadSha?: string | null;
+  /** Ingestion source label recorded on the ledger row for audit
+   * ("webhook" | "sync" | ...). */
+  evidenceSource?: string | null;
 }
 
 export interface CreateLinkedPrFixInput {
@@ -306,6 +351,124 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
 function uniqueAppend(values: string[], value: string, maxItems: number): string[] {
   const next = values.includes(value) ? values : [...values, value];
   return next.slice(-maxItems);
+}
+
+// ─── Durable evidence ledger helpers (#1249) ────────────────────────────────
+
+/**
+ * Normalize a forge-side event timestamp for audit storage. Malformed values
+ * store NULL rather than throwing: provenance is audit data and must never
+ * block an enqueue.
+ */
+function parseEvidenceObservedAt(value: Date | string | null | undefined): Date | null {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+  return null;
+}
+
+/** The item's ledger state relevant to ONE incoming observation. */
+interface EvidenceLedgerView {
+  /** Whether this enqueue carries durable evidence fields AND the client
+   * exposes the ledger table. False keeps pre-#1249 cache semantics. */
+  records: boolean;
+  /** The CURRENTLY stored row for this identity, if any. */
+  prior: { version: string; sequence: number } | null;
+  /** Another identity already holds this observation's content signature. */
+  repeatedSignature: boolean;
+}
+
+async function readEvidenceLedgerView(
+  tx: PrFixQueueClient,
+  itemId: string,
+  input: EnqueuePrFixInput,
+): Promise<EvidenceLedgerView> {
+  if (!tx.prFixEvidence || !input.evidenceKey || !isPrFixEvidenceKind(input.evidenceKind)) {
+    return { records: false, prior: null, repeatedSignature: false };
+  }
+  const prior = (await tx.prFixEvidence.findFirst({
+    where: { itemId, identity: input.evidenceKey },
+  })) as { version: string; sequence: number } | null;
+  let repeatedSignature = false;
+  const signature =
+    typeof input.evidenceContentSignature === "string" && input.evidenceContentSignature.trim()
+      ? input.evidenceContentSignature.trim()
+      : null;
+  if (signature) {
+    const matches = await tx.prFixEvidence.findMany({
+      where: { itemId, contentSignature: signature },
+    });
+    repeatedSignature = (matches ?? []).some((row: any) => row.identity !== input.evidenceKey);
+  }
+  return { records: true, prior: prior ?? null, repeatedSignature };
+}
+
+/**
+ * Upsert the ledger row for a NEW transition, claiming `sequence` (the value
+ * the incrementing item write assigned from the same snapshot). Only called
+ * when the (identity, version) pair actually changed — re-recording a stored
+ * version never reaches here, so replays never restamp or resequence.
+ *
+ * Two concurrent transitions for DIFFERENT identities can both assign the
+ * same sequence under contention (the #1134 pin covers the post-dispatch list,
+ * not the counter; the increment is atomic either way). Duplicate sequence
+ * numbers are benign for watermark comparisons: both rows straddle any
+ * watermark together, so a collision can at most reproduce the bounded
+ * redundant-attempt cost #1119 already accepts — it can never hide a
+ * post-watermark transition or fake one.
+ */
+async function recordEvidenceTransition(
+  tx: PrFixQueueClient,
+  itemId: string,
+  input: EnqueuePrFixInput,
+  sequence: number,
+): Promise<void> {
+  if (!tx.prFixEvidence || !input.evidenceKey || !isPrFixEvidenceKind(input.evidenceKind)) return;
+  const row = {
+    kind: input.evidenceKind,
+    version: input.evidenceVersion ?? "",
+    contentSignature:
+      typeof input.evidenceContentSignature === "string" && input.evidenceContentSignature.trim()
+        ? input.evidenceContentSignature.trim()
+        : null,
+    observedAt: parseEvidenceObservedAt(input.evidenceObservedAt),
+    headSha: input.evidenceHeadSha ?? null,
+    source: input.evidenceSource ?? null,
+    // Missing provenance (legacy caller without the field) records as
+    // actionable = true only for kinds the caller gated already; `unknown`
+    // kinds stay non-actionable, never silently fresh (design: unknown
+    // evidence defers, it does not resolve).
+    actionable: input.evidenceActionable !== false,
+  };
+  await tx.prFixEvidence.upsert({
+    where: { itemId_identity: { itemId, identity: input.evidenceKey } },
+    create: { itemId, identity: input.evidenceKey, ...row, sequence },
+    update: row,
+  });
+}
+
+/**
+ * Durable post-dispatch entries for a settling attempt (#1249): actionable
+ * ledger transitions recorded AFTER the attempt's evidence-snapshot watermark,
+ * projected into the #1119 `<evidenceKey>@<head>` format so settlement
+ * revalidates them (head-gated for checks) through `hasActionablePostDispatch-
+ * Evidence` exactly like the bounded cache. No watermark → empty list: the
+ * cache fast path stands (legacy rows and lost best-effort stamps behave as
+ * before #1249; they never gain a false reopen from ledger rows they cannot
+ * bound).
+ */
+async function listDurablePostDispatchEntries(
+  client: PrFixQueueClient,
+  row: any,
+): Promise<string[]> {
+  if (!client.prFixEvidence || typeof row.attemptEvidenceWatermark !== "number") return [];
+  const rows = await client.prFixEvidence.findMany({
+    where: { itemId: row.id, sequence: { gt: row.attemptEvidenceWatermark }, actionable: true },
+    orderBy: { sequence: "asc" },
+  });
+  return ledgerRowsToPostDispatchEntries(rows ?? []);
 }
 
 /**
@@ -1096,7 +1259,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       // write and the history row depend on is derived from ONE row snapshot,
       // so the #1134 pinned-write loop below can re-derive it from a fresh
       // read instead of replaying a stale decision.
-      const buildUpdate = (snapshot: any) => {
+      const buildUpdate = (snapshot: any, ledgerView: EvidenceLedgerView) => {
         // Evidence this item has already recorded must not move it back to
         // QUEUED. The sync re-reads every open PR each sweep, so an event that
         // never goes away — an undismissed CHANGES_REQUESTED review, a comment
@@ -1112,14 +1275,47 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         // a workload reported success without pushing a fix. This is the safety
         // net for the case where markPrFixItem's head-SHA guard ran with
         // missing data or before this re-detection loop kicked in.
-        const isKnownEvidence =
-          !!input.evidenceKey && (snapshot.evidenceKeys ?? []).includes(input.evidenceKey);
+        //
+        // #1249: when the enqueue carries durable evidence fields, KNOWN means
+        // the ledger holds this identity at an UNCHANGED version — not mere
+        // membership in the bounded 40-entry cache. A replay of recorded
+        // evidence stays inert after eviction (the design's control 8), a new
+        // VERSION of a known identity is new evidence (review state change),
+        // a new identity repeating an already-recorded signature is recorded
+        // but not actionable on its own (control 3/7), and a non-actionable
+        // version (dismissed review, cleared condition) is recorded and kept
+        // sticky (control 4). Without ledger fields the pre-#1249
+        // identity-only cache semantics stand.
+        const evidenceKind: PrFixEvidenceKind | null = isPrFixEvidenceKind(input.evidenceKind)
+          ? input.evidenceKind
+          : null;
+        // Condition kinds are persistent states, not one-shot observations:
+        // their baseline is the durable per-condition ledger row, and a
+        // re-read of the SAME (state, head) must never reopen — even at FIXED
+        // with an unchanged head, where the #940 net reopens one-shot evidence
+        // (design control 19: a persistent old `dirty` re-discovered after
+        // eviction, dispositioned by unrelated review R, stays closed).
+        const isConditionKind = evidenceKind === "merge_state" || evidenceKind === "merge_conflict";
+        const cacheKnown = !!input.evidenceKey && (snapshot.evidenceKeys ?? []).includes(input.evidenceKey);
+        const identityKnown = !!input.evidenceKey && (!!ledgerView?.prior || cacheKnown);
+        const versionUnchanged =
+          !!input.evidenceKey &&
+          (ledgerView?.prior
+            ? ledgerView.prior.version === (input.evidenceVersion ?? "")
+            : cacheKnown);
+        // Repeated text: a NEW identity whose content signature was already
+        // recorded under another identity at the same commit. An already-known
+        // identity repeating itself is the duplicate-version case below, not
+        // this one.
+        const isRepeatedText = !!ledgerView?.repeatedSignature && !ledgerView?.prior;
+        const isNonActionableVersion = input.evidenceActionable === false;
+        const isKnownEvidence = versionUnchanged || isRepeatedText || isNonActionableVersion;
         const headShaUnchanged =
           snapshot.status === "FIXED" &&
           !!snapshot.headSha &&
           typeof input.headSha === "string" &&
           snapshot.headSha === input.headSha;
-        const reopenFixStale = isKnownEvidence && headShaUnchanged;
+        const reopenFixStale = identityKnown && headShaUnchanged && !isConditionKind;
 
         // Human-decision BLOCKED and operational PARKED states are sticky too
         // (#1218): a fresh enqueue must not auto-reopen either. Only an
@@ -1205,6 +1401,17 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           snapshot.status === "QUEUED" &&
           dispatchedThisGeneration;
 
+        // #1249: a NEW identity, or a version change of a known identity, is a
+        // durable ledger transition and claims the next per-item sequence from
+        // the SAME snapshot this write is computed on (the pinned loop
+        // re-derives it on a contention retry). Re-recording a stored
+        // (identity, version) — replayed webhook, at-least-once redelivery,
+        // periodic re-read — is inert here: no increment, no restamp.
+        const isNewLedgerTransition =
+          ledgerView.records &&
+          (!ledgerView.prior || ledgerView.prior.version !== (input.evidenceVersion ?? ""));
+        const assignedEvidenceSequence = (snapshot.evidenceSequence ?? 0) + 1;
+
         const data = {
           lane: resolvedLane,
           type,
@@ -1259,6 +1466,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // only for a human-decision BLOCKED.
           ...(resolvedOutcome ? { outcome: resolvedOutcome } : {}),
           ...(resolvedStatus === "BLOCKED" && resolvedDecision ? { decisionDetail: resolvedDecision } : {}),
+          // #1249: the ledger row itself is upserted AFTER the (pinned) item
+          // write succeeds, with `assignedEvidenceSequence`; the item only
+          // carries the atomic counter bump here.
+          ...(isNewLedgerTransition ? { evidenceSequence: { increment: 1 } } : {}),
           ...metadataPatch(input),
         };
 
@@ -1267,6 +1478,8 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           statusNote,
           reopenFixStale,
           outcome: resolvedOutcome,
+          isNewLedgerTransition,
+          assignedEvidenceSequence,
           // #1134: the append above is computed from THIS snapshot's key list,
           // so the write must be pinned on exactly that list. The
           // isFreshAttempt reset-to-[] is mutually exclusive with the append
@@ -1287,7 +1500,8 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       // transaction-timeout hazard does not apply.
       const maxPinnedEnqueueWrites = 3;
       let snapshot = existing;
-      let decided = buildUpdate(snapshot);
+      let ledgerView = await readEvidenceLedgerView(tx, existing.id, input);
+      let decided = buildUpdate(snapshot, ledgerView);
       let updated: any;
       if (decided.pinnedKeys !== null) {
         let pinnedKeys: string[] = decided.pinnedKeys;
@@ -1309,7 +1523,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // like the pre-#1134 path did for a deleted row.
           if (!fresh) break;
           snapshot = fresh;
-          decided = buildUpdate(fresh);
+          // Re-read the ledger alongside the fresh row so a concurrent
+          // transition that landed in the gap re-decides known/version
+          // instead of replaying the stale ledger snapshot's decision.
+          ledgerView = await readEvidenceLedgerView(tx, existing.id, input);
+          decided = buildUpdate(fresh, ledgerView);
           // Pin the retry against the FRESH key list the new write was computed
           // from, so a further gap append no-ops it the same way.
           pinnedKeys = fresh.postDispatchEvidenceKeys ?? [];
@@ -1332,6 +1550,14 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         updated = await tx.prFixQueueItem.update({ where: { id: existing.id }, data: decided.data });
       }
 
+      // #1249: the durable ledger transition rides the SAME transaction as the
+      // item write it was decided from — a rolled-back write rolls back the
+      // ledger row, and a committed decision can never miss its ledger row
+      // ("concurrent settlement vs enqueue cannot discard an observation").
+      if (decided.isNewLedgerTransition) {
+        await recordEvidenceTransition(tx, existing.id, input, decided.assignedEvidenceSequence);
+      }
+
       const historyData: Record<string, unknown> = {
         itemId: updated.id,
         action: "enqueue",
@@ -1349,6 +1575,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       return updated;
     }
 
+    // A brand-new item's first durable observation opens the ledger at
+    // sequence 1 (#1249); legacy enqueues without evidence fields stay 0.
+    const createsEvidenceLedger =
+      !!tx.prFixEvidence && !!input.evidenceKey && isPrFixEvidenceKind(input.evidenceKind);
     const created = await tx.prFixQueueItem.create({
       data: {
         repo: input.repo,
@@ -1359,6 +1589,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         reason: input.reason,
         feedback: [input.feedback],
         evidenceKeys: [input.evidenceKey],
+        ...(createsEvidenceLedger ? { evidenceSequence: 1 } : {}),
         // #1098: the item URL is identity (the PR URL) — set it at first
         // enqueue, explicitly, so it is never left to the update patch.
         ...(itemUrlFromInput(input) ? { url: itemUrlFromInput(input) } : {}),
@@ -1372,6 +1603,9 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         ...metadataPatch(input),
       },
     });
+    if (createsEvidenceLedger) {
+      await recordEvidenceTransition(tx, created.id, input, 1);
+    }
     await tx.prFixHistory.create({
       data: {
         itemId: created.id,
@@ -1627,6 +1861,9 @@ export async function markPrFixItem(
     data.outcome = null;
     data.decisionDetail = null;
     data.postDispatchEvidenceKeys = [];
+    // A wait is not a hand-out: drop the previous attempt's evidence snapshot
+    // so durable freshness never keys off a superseded boundary (#1249).
+    data.attemptEvidenceWatermark = null;
     data.dispatchedGeneration = null;
     data.dispatchedAt = null;
     data.agentHandouts = [];
@@ -1775,9 +2012,24 @@ export async function markPrFixItem(
   // timeout must never have to span a GitHub round-trip (#1124 review).
   const settlesAttempt = nextStatus === "FIXED" || nextStatus === "BLOCKED" || nextStatus === "PARKED";
   const reopenEligible = nextStatus === "FIXED";
+  // #1249: the durable ledger backstops the bounded 20-entry cache. Actionable
+  // transitions recorded AFTER this attempt's snapshot watermark reopen even
+  // if the cache evicted them (or the hand-out raced the enqueue): a review
+  // first discovered after the worker wrote FIXED is fresh even when its
+  // forge-side submitted_at predates the settlement, while a replay never
+  // minted a transition and stays inert forever. Without a watermark (legacy
+  // rows, lost best-effort stamps) the pre-#1249 cache-only decision stands —
+  // the durable set can never introduce a false reopen for an unbounded
+  // attempt, only remove false silences.
+  const durablePostDispatchEntries = reopenEligible
+    ? await listDurablePostDispatchEntries(client, existing)
+    : [];
+  const settleEvidenceEntries = Array.from(
+    new Set([...(existing.postDispatchEvidenceKeys ?? []), ...durablePostDispatchEntries]),
+  );
   const reopenOnPostDispatch =
     reopenEligible &&
-    (await hasActionablePostDispatchEvidence(existing.postDispatchEvidenceKeys ?? [], input.repo, input.pr));
+    (await hasActionablePostDispatchEvidence(settleEvidenceEntries, input.repo, input.pr));
   // The initial reopen attempt can miss its keys/generation pin when evidence
   // is recorded between the check above and the write. That is not a
   // generation-mismatch: fall into the bounded re-decision loop below rather
@@ -2346,8 +2598,16 @@ export async function reconcileArchivedRepoPrFixItems(
  * known evidence, or updates that stay within the same active attempt —
  * repeated reads of one pending unit of work must return the same identity.
  */
-export function freshAttemptGeneration(): { generation: { increment: number } } {
-  return { generation: { increment: 1 } };
+export function freshAttemptGeneration(): {
+  generation: { increment: number };
+  attemptEvidenceWatermark: null;
+} {
+  // A fresh attempt has no hand-out yet, so it has no evidence snapshot: the
+  // watermark resets alongside the post-dispatch list and dies only with the
+  // generation it bounded (#1249). The durable ledger COUNTER is not reset —
+  // ledger positions are per-item history, and a stale-low watermark must
+  // never survive into a new attempt to make known evidence read as new.
+  return { generation: { increment: 1 }, attemptEvidenceWatermark: null };
 }
 
 /**

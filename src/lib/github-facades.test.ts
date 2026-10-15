@@ -61,6 +61,7 @@ describe("github domain modules expose expected exports", () => {
       "fetchPullRequestHealthSignals",
       "fetchPullRequestLabels",
       "fetchPullRequestMergeState",
+      "fetchPullRequestReviewThreadStates",
       "fetchPullRequestState",
       "fetchPullRequests",
     ]);
