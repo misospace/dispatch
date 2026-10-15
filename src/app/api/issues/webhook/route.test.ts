@@ -10,7 +10,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     repoFindUnique: vi.fn(),
     issueFindUnique: vi.fn(),
-    issueUpdate: vi.fn(),
+    issueUpdateMany: vi.fn(),
     createLifecycleEvent: vi.fn(),
     upsertLifecycleEvent: vi.fn(),
     invalidateGroomingForComment: vi.fn(),
@@ -24,7 +24,10 @@ vi.mock("@/lib/groomer/freshness-invalidation", () => ({
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     repository: { findUnique: mocks.repoFindUnique },
-    issue: { findUnique: mocks.issueFindUnique, update: mocks.issueUpdate },
+    issue: {
+      findUnique: mocks.issueFindUnique,
+      updateMany: mocks.issueUpdateMany,
+    },
     issueLifecycleEvent: {
       create: mocks.createLifecycleEvent,
       upsert: mocks.upsertLifecycleEvent,
@@ -98,7 +101,7 @@ describe("POST /api/issues/webhook", () => {
       repositoryId: "repo-1",
       labels: ["status/backlog"],
     });
-    mocks.issueUpdate.mockResolvedValue({ id: "issue-1", labels: ["status/backlog"] });
+    mocks.issueUpdateMany.mockResolvedValue({ count: 1 });
     mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
     mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
   });
@@ -127,7 +130,7 @@ describe("POST /api/issues/webhook", () => {
       });
 
       expect(res.status).toBe(200);
-      expect(mocks.issueUpdate).toHaveBeenCalledTimes(1);
+      expect(mocks.issueUpdateMany).toHaveBeenCalledTimes(1);
     });
 
     it("returns 401 when no auth header is present in gateway mode", async () => {
@@ -183,8 +186,11 @@ describe("POST /api/issues/webhook", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.labels).toEqual(["status/backlog", "type/bug"]);
-      expect(mocks.issueUpdate).toHaveBeenCalledWith({
-        where: { repositoryId_number: { repositoryId: "repo-1", number: 42 } },
+      expect(mocks.issueUpdateMany).toHaveBeenCalledWith({
+        where: {
+          repositoryId_number: { repositoryId: "repo-1", number: 42 },
+          labels: { equals: ["status/backlog"] },
+        },
         data: expect.objectContaining({
           labels: ["status/backlog", "type/bug"],
           lastSyncedAt: expect.any(Date),
@@ -202,8 +208,11 @@ describe("POST /api/issues/webhook", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.labels).toEqual([]);
-      expect(mocks.issueUpdate).toHaveBeenCalledWith({
-        where: { repositoryId_number: { repositoryId: "repo-1", number: 42 } },
+      expect(mocks.issueUpdateMany).toHaveBeenCalledWith({
+        where: {
+          repositoryId_number: { repositoryId: "repo-1", number: 42 },
+          labels: { equals: ["status/backlog"] },
+        },
         data: expect.objectContaining({ labels: [] }),
       });
     });
@@ -217,7 +226,7 @@ describe("POST /api/issues/webhook", () => {
       const body = await res.json();
       expect(body.labels).toEqual(["status/backlog"]);
       // Idempotent: the stored label set is written back unchanged.
-      expect(mocks.issueUpdate).toHaveBeenCalledWith(
+      expect(mocks.issueUpdateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({ labels: ["status/backlog"] }),
         }),
@@ -233,7 +242,7 @@ describe("POST /api/issues/webhook", () => {
       const body = await res.json();
       expect(body.message).toBe("Repo not tracked, ignored");
       expect(mocks.issueFindUnique).not.toHaveBeenCalled();
-      expect(mocks.issueUpdate).not.toHaveBeenCalled();
+      expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
     });
 
     it("ignores PR deliveries (issue.pull_request present) without touching the issue cache", async () => {
@@ -250,7 +259,7 @@ describe("POST /api/issues/webhook", () => {
       const body = await res.json();
       expect(body.message).toBe("Pull request event, ignored");
       expect(mocks.issueFindUnique).not.toHaveBeenCalled();
-      expect(mocks.issueUpdate).not.toHaveBeenCalled();
+      expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
     });
 
     it("ignores deliveries for unknown issue numbers without updating the cache", async () => {
@@ -261,7 +270,7 @@ describe("POST /api/issues/webhook", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.message).toBe("Issue not cached, ignored");
-      expect(mocks.issueUpdate).not.toHaveBeenCalled();
+      expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
     });
   });
 
@@ -314,7 +323,7 @@ describe("POST /api/issues/webhook", () => {
     const body = await res.json();
     expect(body.message).toContain("Only labeled/unlabeled");
     expect(mocks.repoFindUnique).not.toHaveBeenCalled();
-    expect(mocks.issueUpdate).not.toHaveBeenCalled();
+    expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
   });
 
   it("returns 500 on processing error without leaking internals", async () => {
@@ -354,7 +363,7 @@ describe("POST /api/issues/webhook", () => {
         author: "joryirving",
         createdAt: "2026-09-25T03:00:00Z",
       });
-      expect(mocks.issueUpdate).not.toHaveBeenCalled();
+      expect(mocks.issueUpdateMany).not.toHaveBeenCalled();
     });
 
     it("ignores edits, PR comments and untracked issues", async () => {
@@ -388,7 +397,7 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
       repositoryId: "repo-1",
       labels: ["status/backlog"],
     });
-    mocks.issueUpdate.mockResolvedValue({ id: "issue-1" });
+    mocks.issueUpdateMany.mockResolvedValue({ count: 1 });
     mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
     mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
   });
@@ -450,7 +459,7 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
     const res = await POST(signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } })));
     expect(res.status).toBe(200);
 
-    expect(mocks.issueUpdate).toHaveBeenCalled();
+    expect(mocks.issueUpdateMany).toHaveBeenCalled();
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
     expect(mocks.upsertLifecycleEvent).not.toHaveBeenCalled();
   });
@@ -480,8 +489,11 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
 
     // The cached label set is left exactly as it was.
     expect((await res.json()).labels).toEqual(["status/ready", "type/bug"]);
-    expect(mocks.issueUpdate).toHaveBeenCalledWith({
-      where: { repositoryId_number: { repositoryId: "repo-1", number: 42 } },
+    expect(mocks.issueUpdateMany).toHaveBeenCalledWith({
+      where: {
+        repositoryId_number: { repositoryId: "repo-1", number: 42 },
+        labels: { equals: ["status/ready", "type/bug"] },
+      },
       data: expect.objectContaining({ labels: ["status/ready", "type/bug"] }),
     });
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
@@ -510,5 +522,121 @@ describe("POST /api/issues/webhook — lifecycle evidence (#1202)", () => {
       update: {},
     });
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/webhook — concurrent deliveries (#1220)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.WEBHOOK_GATEWAY_MODE;
+    process.env.WEBHOOK_SECRET = WEBHOOK_SECRET;
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.repoFindUnique.mockResolvedValue({ id: "repo-1", fullName: "org/repo" });
+    mocks.createLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+    mocks.upsertLifecycleEvent.mockResolvedValue({ id: "evt-1" });
+  });
+
+  /**
+   * In-memory label store with a real compare-and-swap, gating every write
+   * until two reads have completed: both competing deliveries are forced to
+   * compute their next label set from the original snapshot before either
+   * writes — the exact stale-read interleaving a blind whole-array write
+   * loses. The guarded update returns count 0 when the stored array no
+   * longer equals the caller's snapshot, exercising the re-read/retry path.
+   */
+  function withContendedStore(initialLabels: string[]) {
+    const store = { labels: [...initialLabels] };
+    let reads = 0;
+    let releaseWrites: () => void = () => {};
+    const bothRead = new Promise<void>((resolve) => {
+      releaseWrites = resolve;
+    });
+
+    mocks.issueFindUnique.mockImplementation(async () => {
+      reads++;
+      if (reads >= 2) releaseWrites();
+      return {
+        id: "issue-1",
+        number: 42,
+        repositoryId: "repo-1",
+        labels: [...store.labels],
+      };
+    });
+
+    mocks.issueUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      await bothRead;
+      const expected = where?.labels?.equals as string[] | undefined;
+      if (!expected || expected.join("\u0000") !== store.labels.join("\u0000")) {
+        return { count: 0 };
+      }
+      store.labels = [...data.labels];
+      return { count: 1 };
+    });
+
+    return { store, readsAfter: () => reads };
+  }
+
+  it("keeps both labels when two labeled deliveries read before either writes", async () => {
+    const env = withContendedStore(["status/backlog"]);
+
+    const [resA, resB] = await Promise.all([
+      POST(signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } }))),
+      POST(
+        signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "priority/p2" } })),
+      ),
+    ]);
+
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+    // The losing delivery must have re-read and reapplied on the winner's state.
+    expect(env.readsAfter()).toBeGreaterThanOrEqual(3);
+    expect([...env.store.labels].sort()).toEqual(["priority/p2", "status/backlog", "type/bug"]);
+  });
+
+  it("keeps both changes when one delivery adds and the other removes a distinct label", async () => {
+    const env = withContendedStore(["status/backlog", "priority/p2"]);
+
+    const [resA, resB] = await Promise.all([
+      POST(signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } }))),
+      POST(
+        signedRequest(makeIssuesEvent({ action: "unlabeled", label: { name: "priority/p2" } })),
+      ),
+    ]);
+
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+    expect([...env.store.labels].sort()).toEqual(["status/backlog", "type/bug"]);
+  });
+
+  it("applies concurrent duplicate adds idempotently", async () => {
+    const env = withContendedStore(["status/backlog"]);
+
+    const [resA, resB] = await Promise.all([
+      POST(signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } }))),
+      POST(signedRequest(makeIssuesEvent({ action: "labeled", label: { name: "type/bug" } }))),
+    ]);
+
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+    expect(env.store.labels.filter((label) => label === "type/bug")).toHaveLength(1);
+  });
+
+  it("applies concurrent removal of an already-absent label idempotently", async () => {
+    const env = withContendedStore(["status/backlog"]);
+
+    const [resA, resB] = await Promise.all([
+      POST(
+        signedRequest(makeIssuesEvent({ action: "unlabeled", label: { name: "type/bug" } })),
+      ),
+      POST(
+        signedRequest(makeIssuesEvent({ action: "unlabeled", label: { name: "priority/p2" } })),
+      ),
+    ]);
+
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+    expect([...env.store.labels].sort()).toEqual(["status/backlog"]);
   });
 });
