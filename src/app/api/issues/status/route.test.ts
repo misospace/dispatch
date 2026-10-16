@@ -236,6 +236,20 @@ describe("POST /api/issues/status — business logic", () => {
     expect((await res.json()).error).toBe("Issue not found in local cache");
   });
 
+  it("refuses status changes on a closed issue with no writes (#1206)", async () => {
+    mocks.findUnique.mockResolvedValueOnce({ id: "issue-1", state: "closed", labels: ["status/done"], number: 42, repository: { fullName: "org/repo" } });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot set status on a closed issue");
+    // Rejected from the cached state alone: no live-label fetch, no GitHub
+    // label writes, no cache update, and no audit row (refusal, not failure).
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
   it("writes failure audit log when GitHub API fails", async () => {
     mocks.addIssueLabel.mockRejectedValueOnce(new Error("github 500"));
     const res = await POST(makeRequest());
@@ -414,6 +428,24 @@ describe("POST /api/issues/status — bound worker scope (#1129)", () => {
     const res = await workerRequest();
     expect(res.status).toBe(403);
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+  });
+
+  it("refuses a closed issue before the live-label assignment gate (#1206)", async () => {
+    // The closed guard reads the cached state and short-circuits ahead of the
+    // #1129 assigned-issue check: even another agent's closed issue is a 400
+    // closed refusal, not a 403.
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "closed",
+      labels: ["agent/bravo", "status/done"],
+      number: 42,
+      repository: { fullName: "org/repo" },
+    });
+    const res = await workerRequest();
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot set status on a closed issue");
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).not.toHaveBeenCalled();
   });
 
