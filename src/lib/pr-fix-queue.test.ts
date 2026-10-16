@@ -412,7 +412,7 @@ describe("PR review-fix queue", () => {
 
   it("includes future external waits only when requested, with the latest note and deadline", async () => {
     const item = await enqueuePrFixItem(client, { repo: "org/repo", pr: 45, lane: "NORMAL", reason: "CI blocked", feedback: "wait", evidenceKey: "wait:1" });
-    await markPrFixItem(client, { repo: item.repo, pr: item.pr, status: "WAITING_EXTERNAL", expectedGeneration: item.generation, note: "older note" });
+    await markPrFixItem(client, { repo: item.repo, pr: item.pr, status: "WAITING_EXTERNAL", expectedGeneration: item.generation, note: "older note", externalWait: { kind: "upstream_pr", ref: "org/deps#7", evidence: "upstream PR open", trigger: { kind: "merged" } } });
     const deadline = new Date(Date.now() + 60 * 60_000);
     item.retryAt = deadline;
     client.history.push({ itemId: item.id, action: "mark", status: "WAITING_EXTERNAL", note: "latest note", at: new Date(Date.now() + 1) });

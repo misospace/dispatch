@@ -261,9 +261,17 @@ export const VALID_PR_FIX_STATUSES: PrFixStatus[] = ["QUEUED", "FIXED", "BLOCKED
 // bounded retry/no-progress exhaustion and every infrastructure/auth/security
 // failure is `PARKED` instead. Keeping these separate stops operational failure
 // from masquerading as a design decision in the queue.
-export type PrFixOutcome = "human_decision" | "no_progress" | "infra_failure" | "security_failure";
+export type PrFixOutcome =
+  | "human_decision"
+  | "no_progress"
+  | "infra_failure"
+  | "security_failure"
+  // #1250: fail-closed park for a WAITING_EXTERNAL attempt that named no
+  // verifiable external dependency. Operator requeue required; never
+  // reactivated by evidence.
+  | "invalid_wait";
 
-export const VALID_PR_FIX_OUTCOMES: PrFixOutcome[] = ["human_decision", "no_progress", "infra_failure", "security_failure"];
+export const VALID_PR_FIX_OUTCOMES: PrFixOutcome[] = ["human_decision", "no_progress", "infra_failure", "security_failure", "invalid_wait"];
 
 export function isValidPrFixOutcome(value: string): value is PrFixOutcome {
   return VALID_PR_FIX_OUTCOMES.includes(value as PrFixOutcome);
