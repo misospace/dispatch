@@ -61,6 +61,8 @@ function matches(row: any, where: any): boolean {
           if (sameValue(value, operand)) return false;
         } else if (op === "gt") {
           if (!(typeof value === "number" && value > (operand as number))) return false;
+        } else if (op === "gte") {
+          if (!(typeof value === "number" && value >= (operand as number))) return false;
         } else if (op === "lte") {
           const v = value instanceof Date ? value.getTime() : (value as number);
           const o = operand instanceof Date ? operand.getTime() : (operand as number);
@@ -298,6 +300,68 @@ describe("attempt-snapshot freshness at settlement (#1249)", () => {
     expect(result.fixAttempts).toBe(2);
     // Fresh attempt resets the snapshot boundary.
     expect(result.attemptEvidenceWatermark).toBeNull();
+  });
+
+  it("a transition that raced the watermark stamp still reopens with the cache emptied (#1249)", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // r1, seq 1 — the payload this hand-out delivered
+    const row = client.items[0];
+    // Dispatched, but the watermark stamp has not run yet.
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date();
+    // The transition commits in the re-read→stamp gap: seq 2, actionable.
+    await seedReviewItem(client, { ...reviewEvidence("r2"), feedback: "more changes" });
+    expect(row.evidenceSequence).toBe(2);
+    // The stamp runs against the ADVANCED counter at the delivered position:
+    // the lower bound admits the raced row where the pre-fix reverse pin missed.
+    const stamp = await client.prFixQueueItem.updateMany({
+      where: {
+        id: row.id,
+        generation: row.generation,
+        evidenceSequence: { gte: 1 },
+        attemptEvidenceWatermark: null,
+      },
+      data: { attemptEvidenceWatermark: 1 },
+    });
+    expect(stamp.count).toBe(1);
+    expect(row.attemptEvidenceWatermark).toBe(1);
+    // The bounded cache loses the append (#1119 eviction); only the durable
+    // ledger row past the watermark can still drive the reopen.
+    row.postDispatchEvidenceKeys = [];
+    expect(client.ledger[1]).toMatchObject({ sequence: 2, actionable: true });
+
+    const result = await settleFixed(client);
+
+    expect(result.status).toBe("QUEUED");
+    expect(result.generation).toBe(2);
+    expect(result.fixAttempts).toBe(2);
+  });
+
+  it("the same raced transition settles silently when the stamp missed (paired control)", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // r1, seq 1
+    const row = client.items[0];
+    row.dispatchedGeneration = row.generation;
+    row.dispatchedAt = new Date();
+    await seedReviewItem(client, { ...reviewEvidence("r2"), feedback: "more changes" });
+    // The stamp predicate misses against the raced counter, so no watermark is
+    // ever recorded: the loss the `gte` pin exists to prevent.
+    const stamp = await client.prFixQueueItem.updateMany({
+      where: {
+        id: row.id,
+        generation: row.generation,
+        evidenceSequence: { lte: 1 },
+        attemptEvidenceWatermark: null,
+      },
+      data: { attemptEvidenceWatermark: 1 },
+    });
+    expect(stamp.count).toBe(0);
+    row.postDispatchEvidenceKeys = [];
+
+    const result = await settleFixed(client);
+
+    expect(result.status).toBe("FIXED");
+    expect(row.attemptEvidenceWatermark).toBeNull();
   });
 
   it("a pre-watermark transition never reopens settlement, even with the cache emptied (control 18)", async () => {

@@ -181,12 +181,25 @@ async function confirmPrFixHandOut(
  * payload this hand-out ships, so the boundary covers exactly the delivered
  * evidence and can never sit above evidence the worker never received.
  *
- * Pinned as an UPPER BOUND (`lte`), not an equality: a transition that lands
- * after the payload snapshot moves the counter past it, and such evidence is
- * exactly what this worker never received — so the stamp still applies, at the
- * delivered position, and settlement reopens on the transition. An equality
- * pin would instead lose the stamp entirely and silently degrade the attempt
- * to the bounded #1119 cache.
+ * Pinned as a LOWER BOUND (`gte`) on the counter, not an equality: a
+ * transition that lands after the payload snapshot moves the counter past it,
+ * and such evidence is exactly what this worker never received — so the stamp
+ * still applies, at the delivered position, and settlement reopens on that
+ * transition. An equality pin (or the reverse `lte` this replaced) instead
+ * rejects the stamp once the counter advanced and silently degrades the
+ * attempt to the bounded #1119 cache — losing durable post-dispatch freshness
+ * after cache eviction, the exact loss class #1249 exists to close. `gte`
+ * keeps the stamp at the DELIVERED position (the row's counter is monotonic and
+ * never reset, so it can only have moved on, never below), which is what
+ * prevents the watermark from ever sitting above evidence this worker never
+ * received.
+ *
+ * `attemptEvidenceWatermark: null` makes the stamp idempotent and
+ * first-hand-out-only: the watermark is cleared with every fresh attempt
+ * (`freshAttemptGeneration`, the sole generation bump), so a NULL watermark is
+ * exactly the pre-dispatch state of this generation. A retry — or anything
+ * that already stamped — can never overwrite a boundary another reader
+ * established, and the count stays an honest signal that this hand-out set it.
  *
  * Best-effort like the dispatch stamp around it: a failure here loses durable
  * freshness tracking, never the task.
@@ -199,12 +212,17 @@ async function stampAttemptEvidenceWatermark(
   if (evidenceSequence === null) return;
   try {
     const { count } = await prisma.prFixQueueItem.updateMany({
-      where: { id: itemId, generation, evidenceSequence: { lte: evidenceSequence } },
+      where: {
+        id: itemId,
+        generation,
+        evidenceSequence: { gte: evidenceSequence },
+        attemptEvidenceWatermark: null,
+      },
       data: { attemptEvidenceWatermark: evidenceSequence },
     });
     if (count !== 1) {
       console.warn(
-        `next-task pr-fix evidence watermark stamp missed for item ${itemId} (generation ${generation}); settlement falls back to the bounded cache`,
+        `next-task pr-fix evidence watermark stamp did not apply for item ${itemId} (generation ${generation}); durable post-dispatch freshness is unavailable for this attempt and settlement falls back to the bounded cache`,
       );
     }
   } catch (error) {

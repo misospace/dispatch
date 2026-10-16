@@ -188,6 +188,25 @@ function applyUpdate(row: any, data: any): void {
   Object.assign(row, patch);
 }
 
+/**
+ * Mirrors the route's evidence-watermark stamp `where` against a stateful fake
+ * row, so the stamp is genuinely applied or rejected: id + generation, an
+ * unstamped row (`attemptEvidenceWatermark: null`), and a counter pin on the
+ * delivered sequence. Both inequality forms are evaluated, so a predicate
+ * rejected by an advanced counter (the pre-fix `lte`) misses while the `gte`
+ * lower bound applies. The hand-out flow's other writes (the dispatch stamp,
+ * the per-agent hand-out record) defer to `matchesFirstHandOut`.
+ */
+function matchesLiveRow(row: any, where: any): boolean {
+  if (!("evidenceSequence" in where)) return matchesFirstHandOut(row, where);
+  if (row.id !== where.id || row.generation !== where.generation) return false;
+  if (where.attemptEvidenceWatermark === null && row.attemptEvidenceWatermark != null) return false;
+  const bound = where.evidenceSequence ?? {};
+  if (typeof bound.gte === "number" && !(row.evidenceSequence >= bound.gte)) return false;
+  if (typeof bound.lte === "number" && !(row.evidenceSequence <= bound.lte)) return false;
+  return true;
+}
+
 function request(url: string, agentName = "example-agent", includeAuth = true) {
   return authedRequest(`http://localhost${url}`, { includeAuth });
 }
@@ -1615,8 +1634,147 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     // The boundary is the delivered payload's own position (7), not the
     // counter's later value (99), and the pin admits the counter having moved
     // on — transitions recorded after the payload are what must stay fresh.
-    expect(stamps[0].where.evidenceSequence).toEqual({ lte: 7 });
+    expect(stamps[0].where.evidenceSequence).toEqual({ gte: 7 });
+    expect(stamps[0].where.attemptEvidenceWatermark).toBeNull();
     expect(stamps[0].data.attemptEvidenceWatermark).toBe(7);
+  });
+
+  it("stamps the watermark when a transition moves the counter past the delivered sequence (#1276)", async () => {
+    // A concurrent sync commits a transition in the re-read→stamp gap: the row
+    // counter is N+1 while the payload shipped N. That evidence is exactly what
+    // this worker never received, so the stamp must still apply at the delivered
+    // position — the pre-fix `lte` pin rejected it (count 0) and left the attempt
+    // with no durable boundary once the bounded cache was evicted.
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 12,
+      issue: null,
+      branch: "fix/something",
+      url: "https://github.com/org/repo/pull/12",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["check:1"],
+      author: "itsmiso-ai",
+      generation: 2,
+      evidenceSequence: 6,
+      attemptEvidenceWatermark: null,
+      agentHandouts: [],
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    let raced = false;
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) => {
+      const snapshot = {
+        reason: row.reason,
+        feedback: row.feedback,
+        generation: row.generation,
+        status: row.status,
+        lane: row.lane,
+        agentHandouts: row.agentHandouts,
+        evidenceSequence: row.evidenceSequence,
+      };
+      if (where?.id === row.id && !raced) {
+        raced = true;
+        row.evidenceSequence += 1;
+      }
+      return snapshot;
+    });
+    const updateManyCalls: any[] = [];
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      updateManyCalls.push({ where, data });
+      if (!matchesLiveRow(row, where)) return { count: 0 };
+      applyUpdate(row, data);
+      return { count: 1 };
+    });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
+    const stamps = updateManyCalls.filter((call) => call.data && "attemptEvidenceWatermark" in call.data);
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0].where.evidenceSequence).toEqual({ gte: 6 });
+    expect(stamps[0].where.attemptEvidenceWatermark).toBeNull();
+    // The delivered position, never the counter this worker raced ahead of.
+    expect(stamps[0].data.attemptEvidenceWatermark).toBe(6);
+    expect(row.attemptEvidenceWatermark).toBe(6);
+    expect(row.evidenceSequence).toBe(7);
+  });
+
+  it("never overwrites a watermark another reader stamped, and still hands out the task (#1276)", async () => {
+    // The `attemptEvidenceWatermark: null` fence is the idempotence guard: an
+    // existing boundary for this generation must survive the stamp attempt, and
+    // a miss is best-effort — it must never cost the worker its hand-out.
+    const row: any = {
+      id: "prfix-1",
+      repo: "org/repo",
+      pr: 12,
+      issue: null,
+      branch: "fix/something",
+      url: "https://github.com/org/repo/pull/12",
+      title: "Fix something",
+      lane: "NORMAL",
+      status: "QUEUED",
+      reason: "CI failure on main",
+      feedback: ["update tests"],
+      evidenceKeys: ["check:1"],
+      author: "itsmiso-ai",
+      generation: 2,
+      evidenceSequence: 6,
+      attemptEvidenceWatermark: 4,
+      agentHandouts: [],
+      queuedAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      dispatchedAt: null,
+      dispatchedGeneration: null,
+      postDispatchEvidenceKeys: [],
+    };
+    mocks.prFixFindMany.mockResolvedValue([row]);
+    mocks.prFixFindUnique.mockImplementation(async () => ({
+      reason: row.reason,
+      feedback: row.feedback,
+      generation: row.generation,
+      status: row.status,
+      lane: row.lane,
+      agentHandouts: row.agentHandouts,
+      evidenceSequence: row.evidenceSequence,
+    }));
+    const stampCounts: number[] = [];
+    mocks.prFixUpdateMany.mockImplementation(async ({ where, data }: any) => {
+      const matched = matchesLiveRow(row, where);
+      if (matched) applyUpdate(row, data);
+      else if (data && "attemptEvidenceWatermark" in data) stampCounts.push(0);
+      return { count: matched ? 1 : 0 };
+    });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem).toMatchObject({ id: "prfix-1", generation: 2 });
+    expect(stampCounts).toEqual([0]);
+    expect(row.attemptEvidenceWatermark).toBe(4);
+    // The dispatch stamp itself did apply — the fence is specific to the
+    // watermark, not a blanket refusal on this hand-out.
+    expect(row.dispatchedGeneration).toBe(2);
+    expect(row.agentHandouts).toEqual(["example-agent@2"]);
   });
 
   it("includes linked issue context when PR-fix has an issue number", async () => {
