@@ -15,6 +15,7 @@ import {
   ingestCheckRunEvent,
   ingestMergeStateEvent,
   ingestMergeConflict,
+  clearResolvedConflictItems,
   processPrFollowupEvents,
   PrFollowupConfig,
 } from "./pr-followup-ingestion";
@@ -1966,5 +1967,323 @@ describe("record-only review state transitions (#1276)", () => {
     expect(client.ledger[0]).toEqual(ledgerBefore);
     expect(client.items[0].evidenceSequence).toBe(1);
     expect(evidenceEnqueueInputs).toHaveLength(1);
+  });
+});
+
+// ─── Record-only merge_state observations (#1276 review) ─────────────────────
+//
+// `merge_state` gates work on the same actionability predicate the ledger
+// stamps (`isActionableEvidenceVersion`), so a state that is NOT problematic is
+// a record-only observation of the PR's stable condition identity. Without the
+// record-only branch the ledger row froze at its last `dirty`/`behind` version
+// with `actionable: true` and a later settlement could read that stale
+// condition as fresh post-watermark evidence — reopening a merge state that had
+// actually cleared.
+
+describe("record-only merge_state observations (#1276 review)", () => {
+  beforeEach(() => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    evidenceEnqueueInputs.length = 0;
+  });
+
+  afterEach(() => {
+    delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+  });
+
+  const DIRTY_STATE = {
+    repoFullName: "org/repo",
+    prNumber: 42,
+    branch: "fix/test",
+    url: "https://github.com/org/repo/pull/42",
+    title: "Fix test",
+    author: "itsmiso-ai",
+    mergeStateStatus: "dirty",
+    headSha: "head-1",
+    source: "sync",
+  } as const;
+
+  it("a cleared merge state moves the ledger row to a non-actionable version and enqueues nothing", async () => {
+    const client = makeLedgerClient();
+    await ingestMergeStateEvent(client, DIRTY_STATE);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "merge_state:org/repo#42",
+      kind: "merge_state",
+      version: "state=dirty|head=head-1",
+      actionable: true,
+    });
+    const before = {
+      status: client.items[0].status,
+      lane: client.items[0].lane,
+      type: client.items[0].type,
+      feedback: [...client.items[0].feedback],
+      generation: client.items[0].generation,
+      fixAttempts: client.items[0].fixAttempts,
+      history: client.history.length,
+    };
+
+    const result = await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean" });
+
+    // Recorded (same stable identity, one row) and reported as NOT enqueued.
+    expect(result).toBeNull();
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "merge_state:org/repo#42",
+      kind: "merge_state",
+      version: "state=clean|head=head-1",
+      actionable: false,
+    });
+    // The transition is real (the version moved), so it got its own position.
+    expect(client.items[0].evidenceSequence).toBe(2);
+    // Work untouched: no enqueue, no reopen, no attempt movement.
+    expect(client.items[0].status).toBe(before.status);
+    expect(client.items[0].lane).toBe(before.lane);
+    expect(client.items[0].type).toBe(before.type);
+    expect(client.items[0].feedback).toEqual(before.feedback);
+    expect(client.items[0].generation).toBe(before.generation);
+    expect(client.items[0].fixAttempts).toBe(before.fixAttempts);
+    expect(client.history).toHaveLength(before.history);
+  });
+
+  it("a replayed cleared merge state is inert (no counter bump, no restamp)", async () => {
+    const client = makeLedgerClient();
+    await ingestMergeStateEvent(client, DIRTY_STATE);
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean" });
+    const settled = { ...client.ledger[0] };
+
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean" });
+
+    expect(client.ledger[0]).toEqual(settled);
+    expect(client.items[0].evidenceSequence).toBe(2);
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+  });
+
+  it("processPrFollowupEvents counts a cleared merge state as skipped, never enqueued", async () => {
+    const client = makeLedgerClient();
+    await ingestMergeStateEvent(client, DIRTY_STATE);
+
+    const counts = await processPrFollowupEvents(client, [
+      {
+        eventType: "merge_state",
+        repoFullName: DIRTY_STATE.repoFullName,
+        prNumber: DIRTY_STATE.prNumber,
+        branch: DIRTY_STATE.branch,
+        url: DIRTY_STATE.url,
+        title: DIRTY_STATE.title,
+        author: DIRTY_STATE.author,
+        id: "clean",
+        mergeStateStatus: "clean",
+        headSha: "head-1",
+        source: "sync",
+      },
+    ]);
+
+    expect(counts).toEqual({ enqueued: 0, skipped: 1 });
+    expect(client.ledger[0]).toMatchObject({ version: "state=clean|head=head-1", actionable: false });
+    expect(client.items[0].status).toBe("QUEUED");
+  });
+
+  it("the eligibility filters still apply to cleared merge states", async () => {
+    const client = makeLedgerClient();
+    await ingestMergeStateEvent(client, DIRTY_STATE);
+    const ledgerBefore = { ...client.ledger[0] };
+
+    // A merged/closed PR, a non-bot author, and a disallowed branch owner each
+    // drop the observation exactly like they drop work.
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean", prMergedAt: "2026-06-01T00:00:00Z" });
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean", prState: "closed" });
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean", author: "human" });
+    process.env.PR_FOLLOWUP_BRANCH_OWNERS = "other-org";
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "clean" });
+    delete process.env.PR_FOLLOWUP_BRANCH_OWNERS;
+
+    expect(client.ledger[0]).toEqual(ledgerBefore);
+    expect(client.items[0].evidenceSequence).toBe(1);
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+  });
+
+  it("defers `unknown` instead of clearing a real condition (#1276 review)", async () => {
+    const client = makeLedgerClient();
+    await ingestMergeStateEvent(client, DIRTY_STATE);
+    const actionableRow = { ...client.ledger[0] };
+
+    // GitHub still computing mergeability is the ABSENCE of an observation, not
+    // a cleared one. Recording it would overwrite an actionable `dirty`
+    // baseline with a non-actionable version at a HIGHER sequence — a false
+    // silence on a condition that is still live, and one no later re-read would
+    // repair until the PR's state actually changed again.
+    const result = await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "unknown" });
+
+    expect(result).toBeNull();
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toEqual(actionableRow);
+    expect(client.items[0].evidenceSequence).toBe(1);
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+
+    // A DEFINITE non-problematic state is the opposite case and does record, so
+    // the deferral is scoped to "unknown" and not to "not problematic".
+    await ingestMergeStateEvent(client, { ...DIRTY_STATE, mergeStateStatus: "blocked" });
+    expect(client.ledger[0]).toMatchObject({ version: "state=blocked|head=head-1", actionable: false });
+    expect(client.items[0].evidenceSequence).toBe(2);
+  });
+});
+
+// ─── Cleared merge_conflict ledger baseline (#1276 review) ───────────────────
+//
+// Settling a resolved conflict FIXED without recording the cleared condition
+// left the `merge_conflict:<repo>#<pr>` row authoritative and actionable — a
+// durable baseline contradicting a PR that had already resolved. The transition
+// is recorded BEFORE the settle so a crash between the two leaves a stale
+// QUEUED item (re-run idempotently) rather than a settled item whose baseline
+// still demands work.
+
+describe("clearResolvedConflictItems ledger baseline (#1276 review)", () => {
+  beforeEach(() => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    evidenceEnqueueInputs.length = 0;
+  });
+
+  afterEach(() => {
+    delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+  });
+
+  const CONFLICT = {
+    repoFullName: "org/repo",
+    prNumber: 42,
+    branch: "fix/test",
+    url: "https://github.com/org/repo/pull/42",
+    title: "Fix test",
+    author: "itsmiso-ai",
+    mergeable: "CONFLICTING",
+    headSha: "head-1",
+    source: "sync",
+  } as const;
+
+  async function conflicting(client: any) {
+    await ingestMergeConflict(client, CONFLICT);
+    return client.items[0];
+  }
+
+  it("records the cleared condition on the ledger BEFORE settling FIXED", async () => {
+    const client = makeLedgerClient();
+    const item = await conflicting(client);
+    item.attemptEvidenceWatermark = 2;
+    const historyBefore = client.history.length;
+
+    // Observe the ledger exactly as the settle sees it, so the ordering is
+    // asserted rather than assumed.
+    const ledgerAtSettle: any[] = [];
+    const originalUpdate = client.prFixQueueItem.update;
+    client.prFixQueueItem.update = async (args: any) => {
+      ledgerAtSettle.push(client.ledger.map((row: any) => ({ version: row.version, actionable: row.actionable })));
+      return originalUpdate(args);
+    };
+
+    const cleared = await clearResolvedConflictItems(client, {
+      repoFullName: CONFLICT.repoFullName,
+      prNumber: CONFLICT.prNumber,
+      mergeable: "MERGEABLE",
+      headSha: "head-1",
+    });
+
+    expect(cleared).toBe(true);
+    expect(ledgerAtSettle).toEqual([[{ version: "mergeable=mergeable|head=head-1", actionable: false }]]);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "merge_conflict:org/repo#42",
+      kind: "merge_conflict",
+      version: "mergeable=mergeable|head=head-1",
+      actionable: false,
+      contentSignature: null,
+      observedAt: null,
+      headSha: "head-1",
+      source: "sync",
+    });
+    expect(item.evidenceSequence).toBe(2);
+    // Existing settle behaviour untouched.
+    expect(item.status).toBe("FIXED");
+    expect(item.attemptEvidenceWatermark).toBeNull();
+    expect(client.history).toHaveLength(historyBefore + 1);
+    expect(client.history.at(-1).status).toBe("FIXED");
+    // No work was created: only the original conflict enqueue exists.
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+  });
+
+  it("records a head-less cleared version when the caller has no head SHA", async () => {
+    const client = makeLedgerClient();
+    await conflicting(client);
+
+    const cleared = await clearResolvedConflictItems(client, {
+      repoFullName: CONFLICT.repoFullName,
+      prNumber: CONFLICT.prNumber,
+      mergeable: "MERGEABLE",
+    });
+
+    expect(cleared).toBe(true);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "merge_conflict:org/repo#42",
+      version: "mergeable=mergeable|head=",
+      actionable: false,
+      headSha: null,
+    });
+    expect(client.items[0].status).toBe("FIXED");
+  });
+
+  it("settles FIXED even when the ledger record fails, and warns", async () => {
+    const client = makeLedgerClient();
+    const item = await conflicting(client);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    client.prFixEvidence.findFirst = async () => {
+      throw new Error("ledger unavailable");
+    };
+
+    try {
+      const cleared = await clearResolvedConflictItems(client, {
+        repoFullName: CONFLICT.repoFullName,
+        prNumber: CONFLICT.prNumber,
+        mergeable: "MERGEABLE",
+        headSha: "head-1",
+      });
+
+      // The conflict really did clear, so a ledger error must not strand the
+      // item in QUEUED.
+      expect(cleared).toBe(true);
+      expect(item.status).toBe("FIXED");
+      expect(item.attemptEvidenceWatermark).toBeNull();
+      expect(warn.mock.calls.some((call) => JSON.stringify(call[0]).includes("cleared merge-conflict ledger record failed"))).toBe(true);
+      // Worst case left visible for an operator: the row is still the old
+      // actionable condition, which is the failure mode the ordering bounds.
+      expect(client.ledger[0]).toMatchObject({ version: "mergeable=conflicting|head=head-1", actionable: true });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps the QUEUED/MERGE_CONFLICT guard and still requires a non-conflicting state", async () => {
+    const client = makeLedgerClient();
+    const item = await conflicting(client);
+    item.status = "BLOCKED";
+    const historyBefore = client.history.length;
+
+    expect(
+      await clearResolvedConflictItems(client, {
+        repoFullName: CONFLICT.repoFullName,
+        prNumber: CONFLICT.prNumber,
+        mergeable: "MERGEABLE",
+        headSha: "head-1",
+      }),
+    ).toBe(false);
+    expect(await clearResolvedConflictItems(client, {
+      repoFullName: CONFLICT.repoFullName,
+      prNumber: CONFLICT.prNumber,
+      mergeable: "CONFLICTING",
+      headSha: "head-1",
+    })).toBe(false);
+    // Still conflicting, or not a merge conflict item: nothing recorded, nothing settled.
+    expect(client.ledger[0]).toMatchObject({ version: "mergeable=conflicting|head=head-1", actionable: true });
+    expect(item.status).toBe("BLOCKED");
+    expect(client.items).toHaveLength(1);
+    expect(client.history).toHaveLength(historyBefore);
   });
 });

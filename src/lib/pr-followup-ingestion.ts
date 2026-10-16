@@ -372,8 +372,6 @@ function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
 }
 
 
-const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
-
 const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor> = {
   comment: {
     isIngestible: (event) => Boolean(event.body && event.id),
@@ -498,8 +496,32 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
   },
   merge_state: {
     isIngestible: (event) => Boolean(event.mergeStateStatus),
-    // Only problematic states trigger PR-fix work
-    gate: (event) => PROBLEMATIC_MERGE_STATES.includes((event.mergeStateStatus ?? "").toLowerCase()),
+    // Only problematic states trigger PR-fix work. Like the `review` gate
+    // above, this reads the ledger's own actionability decision rather than a
+    // string list, so the work gate, the record-only branch, and the
+    // `actionable` stamp the row is written with can never disagree about the
+    // same state (#1276 review).
+    gate: (event) => isActionableEvidenceVersion("merge_state", { mergeStateStatus: event.mergeStateStatus }),
+    // A DEFINITE non-problematic state is a record-only observation of the
+    // same stable identity (#1276 review). The sync used to drop `clean` and
+    // every other non-problematic re-read on the way in, so the ledger row for
+    // `merge_state:<repo>#<pr>` stayed frozen at its last `dirty`/`behind`
+    // version with `actionable: true` — a baseline that no longer describes the
+    // PR, and that any consumer of the durable per-condition baseline (#1253's
+    // `evaluateEvidenceFreshness`) would read as a live condition. Recording
+    // the cleared version is what makes the clearing visible; enqueueing from
+    // it is exactly what must not happen.
+    //
+    // `unknown` DEFERS: GitHub is still computing mergeability, so it is the
+    // absence of an observation, not a cleared one — recording it would
+    // overwrite an actionable `dirty` baseline with a non-actionable version at
+    // a higher sequence, silencing a real condition. This is the same defer
+    // rule `evidenceFieldsFor` applies to an unread `review_comment` thread
+    // state below.
+    recordOnly: (event) =>
+      Boolean(event.mergeStateStatus) &&
+      (event.mergeStateStatus ?? "").toLowerCase() !== "unknown" &&
+      !isActionableEvidenceVersion("merge_state", { mergeStateStatus: event.mergeStateStatus }),
     filterTerminalPr: true,
     sourceId: (event) => event.mergeStateStatus ?? "",
     workItem: (event) => ({
@@ -1011,6 +1033,12 @@ export async function clearResolvedConflictItems(
     repoFullName: string;
     prNumber: number;
     mergeable: string; // "MERGEABLE", "CONFLICTING", "UNKNOWN"
+    /**
+     * PR head SHA at observation time. Drives the cleared condition's version
+     * (`mergeable=<state>|head=<sha>`), so a re-conflict at the same head is
+     * still a transition rather than a replay of the cleared version.
+     */
+    headSha?: string | null;
   },
 ): Promise<boolean> {
   // Only clear when PR is no longer conflicting
@@ -1024,6 +1052,47 @@ export async function clearResolvedConflictItems(
 
   // Only clear if it's a merge conflict item and still queued
   if (existing.type !== "MERGE_CONFLICT" || existing.status !== "QUEUED") return false;
+
+  // #1276 review: settle nothing before the ledger says the condition cleared.
+  // The `merge_conflict:<repo>#<pr>` row is otherwise left at its last
+  // `mergeable=conflicting` version with `actionable: true` — a baseline that
+  // contradicts the PR, which is why the clearing is recorded here rather than
+  // only in the bounded cache. ORDER MATTERS: recording first means a crash
+  // between the two leaves a stale QUEUED item (safe — the next sync re-runs
+  // idempotently) rather than a settled item whose baseline still says
+  // "conflicting" (unsafe — the contradiction outlives the settle).
+  // `evidenceActionable: false` is literal because the guard above already
+  // proved the PR is not CONFLICTING; the cleared write never re-derives
+  // actionability from a second read.
+  try {
+    await recordPrFixEvidenceBaseline(client, {
+      repo: opts.repoFullName,
+      pr: opts.prNumber,
+      evidenceKey: conditionEvidenceKey("merge_conflict", opts.repoFullName, opts.prNumber),
+      evidenceKind: "merge_conflict",
+      evidenceVersion: computeEvidenceVersion("merge_conflict", {
+        mergeable: opts.mergeable,
+        headSha: opts.headSha ?? null,
+      }),
+      evidenceContentSignature: null,
+      evidenceObservedAt: null,
+      evidenceActionable: false,
+      evidenceHeadSha: opts.headSha ?? null,
+      evidenceSource: "sync",
+    });
+  } catch (error) {
+    // Best-effort with respect to the settle: the conflict really did clear,
+    // so leaving the item QUEUED on a ledger write error would strand work
+    // that no longer exists. The worst case is a stale actionable row on an
+    // already-settled item, which contradicts the PR but enqueues nothing:
+    // condition kinds are not actionable post-dispatch evidence today
+    // (`hasActionablePostDispatchEvidence` reads only review/comment/check_run).
+    console.warn("[pr-followup-ingestion] cleared merge-conflict ledger record failed", {
+      repo: opts.repoFullName,
+      pr: opts.prNumber,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+  }
 
   await client.prFixQueueItem.update({
     where: { id: existing.id },

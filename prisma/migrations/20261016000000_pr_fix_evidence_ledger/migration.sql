@@ -23,3 +23,12 @@ CREATE TABLE "PrFixEvidence" (
 );
 CREATE INDEX "PrFixEvidence_itemId_sequence_idx" ON "PrFixEvidence"("itemId", "sequence");
 CREATE INDEX "PrFixEvidence_itemId_contentSignature_idx" ON "PrFixEvidence"("itemId", "contentSignature");
+-- Bound the content signature in the schema, not only at the write boundary.
+-- `recordEvidenceTransition` normalizes every signature through
+-- `normalizeEvidenceContentSignature` (`^[0-9a-f]{32}$`), but
+-- "contentSignature" is an indexed TEXT column (PrFixEvidence_itemId_contentSignature_idx)
+-- and settlement compares it for equality, so a direct SQL writer could park
+-- unbounded text there — bloating the index and making the anti-repetition
+-- comparison meaningless. The table is new in this unreleased migration, so the
+-- constraint is additive (#1276 review).
+ALTER TABLE "PrFixEvidence" ADD CONSTRAINT "PrFixEvidence_contentSignature_check" CHECK ("contentSignature" IS NULL OR "contentSignature" ~ '^[0-9a-f]{32}$');

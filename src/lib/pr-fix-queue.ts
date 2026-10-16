@@ -2103,6 +2103,13 @@ export async function markPrFixItem(
   // is bounded exhaustion or an operational failure: lane NORMAL, no
   // needs-human label. The bridge's ACTIONABLE_LANES filter skips BLOCKED.
   const data: Record<string, unknown> = { status: nextStatus };
+  // The ONE place an item's status becomes WAITING_EXTERNAL (the write is the
+  // pinned updateMany further down, fed by `data`): the external-wait contract
+  // is validated here and nowhere else, so every route that waits (mark,
+  // worker report) shares one fail-closed downgrade. Pinned by
+  // "WAITING_EXTERNAL has a single status writer (#1276 review)" in
+  // src/lib/pr-fix-evidence-requirements.test.ts, which fails if any other
+  // production module assigns this status directly.
   if (nextStatus === "WAITING_EXTERNAL") {
     // Idempotent duplicate for the same generation: never extend the
     // cooldown, never overwrite the recorded contract or note (#1231).

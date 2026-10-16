@@ -341,8 +341,17 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        // Track merge state
-        if (pr.mergeable_state && pr.mergeable_state !== "clean") {
+        // Track merge state — every reported state, `clean` included (#1276
+        // review). The descriptor decides what each state means: a problematic
+        // one enqueues work, a definite non-problematic one records the cleared
+        // baseline on the durable `merge_state:<repo>#<pr>` ledger row, and
+        // `unknown` (GitHub still computing) is dropped by both — the same
+        // defer rule the conflict block above documents. The `clean` exclusion
+        // this replaces made the record-only branch unreachable from the only
+        // timer-driven producer, so a cleared condition could never retire its
+        // actionable baseline and the row stayed actionable until something else
+        // overwrote it.
+        if (pr.mergeable_state) {
             allEvents.push({
               eventType: "merge_state" as const,
               repoFullName,
@@ -385,6 +394,10 @@ export async function POST(request: NextRequest) {
               repoFullName,
               prNumber: pr.number,
               mergeable: pr.mergeable,
+              // #1276 review: the cleared `merge_conflict` ledger version names
+              // the head the clearing was observed at, so a re-conflict at this
+              // head still reads as a transition rather than a replay.
+              headSha: prHeadSha,
             });
           }
         }

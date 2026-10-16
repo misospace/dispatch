@@ -331,6 +331,45 @@ describe("structured external-wait contract (#1250)", () => {
     expect(history[0].note).toContain("still nothing to push");
   });
 
+  it("downgrades a malformed wait contract arriving through the report path fail-closed", async () => {
+    const row = item();
+    // The dispatched attempt's snapshot must not survive the park either way
+    // (#1249/#1250 boundary), so the assertions pin both halves of the
+    // requirement: an invalid contract is not parked as a wait, and every
+    // terminal disposition clears the attempt snapshot.
+    row.attemptEvidenceWatermark = 3;
+    row.postDispatchEvidenceKeys = ["review:org/repo#7:r1"];
+    const { client, history } = clientFor(row);
+
+    const result = await resolvePrFixFromAgentReport({
+      repoFullName: row.repo,
+      pullRequestNumber: row.pr,
+      outcome: "waiting-external",
+      summary: "waiting on the upstream release",
+      attempt: { itemId: row.id, generation: 4 },
+      externalWait: { kind: "hope", ref: "nope", evidence: "trust me", trigger: "later" },
+      client,
+    });
+
+    // Not "deferred": the report named no verifiable dependency, so the single
+    // markPrFixItem writer parked it instead of parking it as a valid wait.
+    expect(result.action).toBe("parked");
+    expect(result.reason).toContain("invalid_wait");
+    expect(row.status).toBe("PARKED");
+    expect(row.outcome).toBe("invalid_wait");
+    expect(row.lane).toBe("NORMAL");
+    expect(row.retryAt).toBeNull();
+    // Terminal disposition ⇒ the attempt's evidence snapshot is retired, so a
+    // later settlement cannot key off this attempt's watermark.
+    expect(row.attemptEvidenceWatermark).toBeNull();
+    expect(row.postDispatchEvidenceKeys).toEqual([]);
+    // The invalid contract is never persisted as a wait contract.
+    expect(row.externalWait).toBe(Prisma.DbNull);
+    expect(history).toHaveLength(1);
+    expect(history[0].status).toBe("PARKED");
+    expect(history[0].outcome).toBe("invalid_wait");
+  });
+
   it("reports a conforming wait as deferred, not parked", async () => {
     const row = item();
     const { client } = clientFor(row);
