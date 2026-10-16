@@ -71,6 +71,11 @@ export interface TaskReportBody {
   // settlement; part of the report's payload identity (idempotency hash).
   prFixItem?: { id: string; generation: number; handoutToken?: string } | null;
   capacity?: string;
+  // #1250: structured external-wait contract for a `waiting-external`
+  // report. Validated (bounded) at the mark writer; a missing or malformed
+  // contract fails closed to PARKED/`invalid_wait` rather than a cooldown
+  // wait. Part of the report's payload identity (idempotency hash).
+  externalWait?: Record<string, unknown>;
 }
 
 function deriveStatus(outcome: ValidOutcome): string {
@@ -363,6 +368,18 @@ export async function POST(
     decision = parsedDecision;
   }
 
+  // #1250: a `waiting-external` report may carry the structured
+  // external-wait contract. Shape-check here only (400 on non-object);
+  // bounded field validation and the fail-closed downgrade live in the
+  // mark writer so every WAITING_EXTERNAL path shares one contract.
+  let externalWait: Record<string, unknown> | undefined;
+  if (raw.externalWait !== undefined) {
+    if (typeof raw.externalWait !== "object" || raw.externalWait === null || Array.isArray(raw.externalWait)) {
+      return errorResponse("externalWait must be an object", 400);
+    }
+    externalWait = raw.externalWait as Record<string, unknown>;
+  }
+
   // #1121/#1143: evidence is meaningful for an already_addressed settlement and
   // for an already_done close — it is trimmed, bounded, and recorded in the
   // settlement/close history. On any other outcome it is ignored (never hashed,
@@ -529,6 +546,9 @@ export async function POST(
     // payload hash like the other report fields.
     blockReason,
     decision,
+    // #1250: structured external-wait contract; participates in the
+    // idempotency payload hash like the other report fields.
+    externalWait,
     close: closeCriteria ? { criteria: closeCriteria } : undefined,
     // #1120: normalized worker start time; undefined → report time (now).
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
@@ -639,6 +659,7 @@ export async function POST(
         // the resolver ignores both for any other outcome.
         blockReason: report.blockReason,
         decision: report.decision,
+        externalWait: report.externalWait,
         capacity: report.capacity,
         agentName,
         // #1074: settlement is authorized by the attempt token the worker was

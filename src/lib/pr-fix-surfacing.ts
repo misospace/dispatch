@@ -181,6 +181,8 @@ const PARKED_HEADLINES: Record<PrFixOutcome, string> = {
     "> ⏸️ This PR fix item is **PARKED** after a security failure. An operator must investigate before requeuing.",
   human_decision:
     "> ⏸️ This PR fix item is **PARKED**. An operator can requeue it to retry.",
+  invalid_wait:
+    "> ⏸️ This PR fix item reported an external wait without a verifiable dependency, so it was parked fail-closed (#1250). An operator can requeue it once a concrete dependency is identified.",
 };
 
 /**

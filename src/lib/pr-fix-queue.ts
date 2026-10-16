@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { Prisma } from "@prisma/client";
 import { normalizePrFixLane, normalizePrFixStatus, normalizePrFixType, normalizePrFixOutcome, PrFixLane, PrFixOutcome, PrFixStatus, PrFixType, PrFixDecisionContext, PR_FIX_TYPE_PRIORITY } from "@/types";
 import { surfacePrFixBlocked, surfacePrFixParked, surfacePrFixRequeued, surfacePrFixUnblocked, extractUrlsFromText, type PrFixUnblockOutcome } from "./pr-fix-surfacing";
 import { prisma } from "@/lib/prisma";
@@ -11,6 +12,7 @@ import {
   ledgerRowsToPostDispatchEntries,
   type PrFixEvidenceKind,
 } from "./pr-fix-evidence";
+import { parseExternalWaitInput, parseStoredExternalWait, type ExternalWaitContract } from "./pr-fix-external-wait";
 
 export type PrFixQueueClient = {
   issue: {
@@ -143,6 +145,10 @@ export interface MarkPrFixInput {
   pr: number;
   status: string;
   note?: string | null;
+  // #1250: structured external-wait contract, REQUIRED for a new
+  // WAITING_EXTERNAL mark. Absent or malformed → fail-closed PARKED
+  // (outcome `invalid_wait`), generation-pinned.
+  externalWait?: unknown;
   // Commit-time revalidation (#1074): when provided, every status write goes
   // through `updateMany({ where: { id, generation } })` and the mark is
   // skipped (no mutation) if the row's generation no longer matches — i.e.
@@ -345,6 +351,9 @@ export function parseMarkPrFixInput(body: unknown): MarkPrFixInput | { error: st
     ...(evidence ? { evidence } : {}),
     ...(outcome ? { outcome } : {}),
     ...(decisionResult.decision ? { decision: decisionResult.decision } : {}),
+    // #1250: validated again at mark time; parse here only to reject a
+    // structurally impossible body early with a clear error.
+    ...(input.externalWait !== undefined ? { externalWait: input.externalWait } : {}),
   };
 }
 
@@ -752,16 +761,50 @@ export function externalWaitCooldownMs(): number {
   return Number.isInteger(n) && n >= 60_000 && n <= 7 * 24 * 60 * 60 * 1000 ? n : 6 * 60 * 60 * 1000;
 }
 
+// Batch size for the bounded external-wait reactivation scan (#1231).
+const EXTERNAL_WAIT_REACTIVATION_BATCH = 100;
+// Per-sweep scan bound (#1250 review): the query already excludes legacy
+// (SQL NULL) contracts at the database level, so in-memory skips only defend
+// against rows whose stored JSON no longer validates — a shape writers can
+// no longer produce. Pagination past skipped rows is deterministic (id
+// cursor) and stops after this many scanned rows so pathological garbage
+// rows can stall discovery but never turn the sweep unbounded.
+const EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT = 500;
+
 async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): Promise<void> {
-  const due = await client.prFixQueueItem.findMany({ where: { status: "WAITING_EXTERNAL", retryAt: { lte: now } }, take: 100 });
-  for (const row of due.filter((candidate) => candidate.status === "WAITING_EXTERNAL" && candidate.retryAt && new Date(candidate.retryAt).getTime() <= now.getTime())) {
-    await client.$transaction(async (tx) => {
-      const { count } = await tx.prFixQueueItem.updateMany({
-        where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
-        data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [] },
-      });
-      if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
+  let cursor: string | undefined;
+  let scanned = 0;
+  while (scanned < EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT) {
+    // #1250 review: exclude legacy free-text waits (SQL NULL contract) in the
+    // query itself — 100+ legacy rows must never occupy the batch and starve
+    // valid structured waits out of discovery. Valid-but-unparseable rows
+    // (if any exist) are skipped in memory and walked past deterministically
+    // via the id cursor below.
+    const due: any[] = await client.prFixQueueItem.findMany({
+      where: { status: "WAITING_EXTERNAL", retryAt: { lte: now }, externalWait: { not: Prisma.DbNull } },
+      orderBy: { id: "asc" },
+      ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+      take: EXTERNAL_WAIT_REACTIVATION_BATCH,
     });
+    if (due.length === 0) break;
+    scanned += due.length;
+    for (const row of due) {
+      cursor = row.id;
+      if (row.status !== "WAITING_EXTERNAL" || !row.retryAt || new Date(row.retryAt).getTime() > now.getTime()) continue;
+      // A stored contract that no longer validates is NOT a bounded external
+      // wait: stay held for operator action (surfaced as `legacyWait` in
+      // queue listings), never silently auto-requeued. Cooldown-based
+      // recheck continues for valid structured contracts.
+      if (!parseStoredExternalWait(row.externalWait)) continue;
+      await client.$transaction(async (tx) => {
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
+          data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [], externalWait: Prisma.DbNull },
+        });
+        if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
+      });
+    }
+    if (due.length < EXTERNAL_WAIT_REACTIVATION_BATCH) break;
   }
 }
 
@@ -1786,6 +1829,16 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
     for (const item of items) if (item.status === "WAITING_EXTERNAL") item.latestNote = latestNotes.get(item.id) ?? null;
   }
 
+  // #1250: surface the structured-wait contract (and its absence) on every
+  // listed WAITING_EXTERNAL item. `externalWait` carries the parsed bounded
+  // contract; `legacyWait` flags pre-contract free-text waits for operator
+  // action — surfaced read-only, never auto-downgraded.
+  for (const item of items) {
+    if (item.status !== "WAITING_EXTERNAL") continue;
+    item.externalWait = parseStoredExternalWait(item.externalWait);
+    item.legacyWait = item.externalWait === null;
+  }
+
   return items;
 }
 
@@ -1896,11 +1949,63 @@ export async function markPrFixItem(
   // needs-human label. The bridge's ACTIONABLE_LANES filter skips BLOCKED.
   const data: Record<string, unknown> = { status: nextStatus };
   if (nextStatus === "WAITING_EXTERNAL") {
+    // Idempotent duplicate for the same generation: never extend the
+    // cooldown, never overwrite the recorded contract or note (#1231).
     if (existing.status === "WAITING_EXTERNAL" && existing.generation === expectedGeneration) {
       return { mutated: true, item: existing };
     }
     if (existing.status !== "QUEUED") return { mutated: false, reason: "generation-mismatch" };
+
+    // #1250: a NEW wait must name a concrete, independently verifiable
+    // dependency. "We have not pushed a patch" is not one. A dependency-less
+    // or malformed wait fails closed to a PARKED/`invalid_wait` disposition —
+    // an operational hold an operator must requeue, never a human BLOCKED
+    // decision and never a six-hour fake wait. The downgrade is
+    // generation-pinned below so it cannot clobber a newer attempt.
+    const parsedWait = parseExternalWaitInput(input.externalWait);
+    if (!parsedWait.ok) {
+      const downgradeNote = `Fail-closed park: external wait without a verifiable dependency (${parsedWait.reason}); operator requeue required (#1250).${input.note ? ` ${input.note}` : ""}`;
+      const downgraded = await client.$transaction(async (tx) => {
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: { id: existing.id, status: "QUEUED", generation: expectedGeneration },
+          data: {
+            status: "PARKED",
+            lane: "NORMAL",
+            outcome: "invalid_wait",
+            decisionDetail: null,
+            retryAt: null,
+            // #1250 review: a nullable JSON column must receive SQL NULL
+            // (Prisma.DbNull), not a JSON null document — plain `null` on a
+            // Json field is rejected by the Prisma runtime for updateMany.
+            externalWait: Prisma.DbNull,
+          },
+        });
+        if (count !== 1) return null;
+        await tx.prFixHistory.create({
+          data: { itemId: existing.id, action: "mark", status: "PARKED", lane: existing.lane, outcome: "invalid_wait", note: downgradeNote },
+        });
+        return tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      });
+      if (downgraded) {
+        // Mirror the shared PARKED tail: surface the fail-closed park on the
+        // PR so operators see why the item stopped (#1250).
+        const context = await buildPrFixBlockedContext(client, downgraded);
+        await surfacePrFixParked({
+          repo: input.repo,
+          pr: input.pr,
+          reason: downgraded.reason,
+          outcome: "invalid_wait",
+          latestNote: input.note ?? null,
+          context,
+        });
+        return { mutated: true, item: downgraded };
+      }
+      const latest = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
+      if (latest?.status === "WAITING_EXTERNAL" && latest.generation === expectedGeneration) return { mutated: true, item: latest };
+      return { mutated: false, reason: "generation-mismatch" };
+    }
     data.retryAt = new Date(Date.now() + externalWaitCooldownMs());
+    data.externalWait = parsedWait.wait;
     data.outcome = null;
     data.decisionDetail = null;
     data.postDispatchEvidenceKeys = [];
@@ -2098,9 +2203,11 @@ export async function markPrFixItem(
   } else if (nextStatus === "QUEUED") {
     data.lane = "NORMAL";
     // A mark back to QUEUED releases a BLOCKED/PARKED item: clear the outcome
-    // and human-decision payload (#1218).
+    // and human-decision payload (#1218). A WAITING_EXTERNAL item leaving its
+    // wait also sheds the consumed external-wait contract (#1250).
     data.outcome = null;
     data.decisionDetail = null;
+    data.externalWait = Prisma.DbNull;
     // Marking a non-QUEUED item back to QUEUED creates a fresh dispatchable
     // attempt (same semantics as requeuePrFixItem) — bump the generation
     // alongside the status flip so the work identity changes (#1044).
@@ -2952,6 +3059,10 @@ export interface ResolvePrFixFromAgentReportInput {
   // give-up) marks PARKED — a bare give-up is NOT a human decision.
   blockReason?: string | null;
   decision?: PrFixDecisionContext | null;
+  // #1250: structured external-wait contract carried by a `waiting-external`
+  // report. Without a valid contract the attempt fails closed to
+  // PARKED/`invalid_wait` instead of a cooldown wait.
+  externalWait?: unknown;
   // #1256: opaque worker-declared capacity identifier, required (with an
   // attempt token) by the `capacity-exhausted` outcome.
   capacity?: string | null;
@@ -3271,13 +3382,28 @@ export async function resolvePrFixFromAgentReport(
       return { matched: true, action: "skipped", itemId: existing.id ?? null, reason: "waiting-external requires a prFixItem attempt token" };
     }
     const marked = await markPrFixItem(client as PrFixQueueClient, {
-      repo, pr, status: "WAITING_EXTERNAL", note: sanitizeForStorage(input.summary?.trim() || input.error || "", 500) || null, expectedGeneration,
+      repo, pr, status: "WAITING_EXTERNAL", note: sanitizeForStorage(input.summary?.trim() || input.error || "", 500) || null, expectedGeneration, externalWait: input.externalWait,
     });
+    if (marked.mutated) {
+      // #1250 review: report the truthful outcome. A wait without a
+      // verifiable dependency was downgraded fail-closed to PARKED by
+      // markPrFixItem — the report did NOT record a wait.
+      const parked = (marked.item as { status?: string; outcome?: string } | null)?.status === "PARKED";
+      return {
+        matched: true,
+        action: parked ? "parked" : "deferred",
+        itemId: existing.id ?? null,
+        reason: parked
+          ? `fail-closed park: external wait without a verifiable dependency parked the item as PARKED/invalid_wait; operator requeue required (#1250)`
+          : "worker is waiting for an external prerequisite",
+        attemptGeneration: attempt?.generation ?? null,
+      };
+    }
     return {
       matched: true,
-      action: marked.mutated ? "deferred" : "skipped",
+      action: "skipped",
       itemId: existing.id ?? null,
-      reason: marked.mutated ? "worker is waiting for an external prerequisite" : `wait transition skipped: ${marked.reason}`,
+      reason: `wait transition skipped: ${marked.reason}`,
       attemptGeneration: attempt?.generation ?? null,
     };
   }

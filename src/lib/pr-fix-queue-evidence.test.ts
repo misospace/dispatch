@@ -518,8 +518,10 @@ describe("legacy fallback and snapshot lifecycle (#1249)", () => {
       status: "WAITING_EXTERNAL",
       expectedGeneration: client.items[0].generation,
       note: "waiting on upstream merge",
+      externalWait: { kind: "upstream_pr", ref: "acme/deps#3", evidence: "upstream PR still open", trigger: { kind: "merged" } },
     } as any);
     expect(result.mutated).toBe(true);
+    expect(settled(result).status).toBe("WAITING_EXTERNAL");
     expect(settled(result).attemptEvidenceWatermark).toBeNull();
   });
 
