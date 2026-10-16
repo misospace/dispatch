@@ -72,6 +72,7 @@ interface GithubReviewComment {
   line?: number | null;
   original_line?: number | null;
   updated_at?: string;
+  commit_id?: string;
 }
 
 interface GithubCheckRun {
@@ -263,6 +264,10 @@ export async function POST(request: NextRequest) {
             prMergedAt: pr.merged_at,
             headSha: prHeadSha,
             actorLogin: rc.user?.login ?? null,
+            // #1249: the comment's own commit anchors the version/signature so
+            // "same body at the same commit" stays the anti-repetition rule and
+            // a re-paste against a NEWER commit remains fresh.
+            commitId: rc.commit_id ?? null,
             updatedAt: rc.updated_at,
             threadResolved: reviewThreadStates?.get(String(rc.id))?.resolved,
             threadOutdated: reviewThreadStates?.get(String(rc.id))?.outdated,

@@ -1574,7 +1574,7 @@ describe("durable evidence fields (#1249)", () => {
     expect(input.evidenceActionable).toBe(false);
   });
 
-  it("ingestReviewCommentEvent with undefined thread flags → actionable", async () => {
+  it("ingestReviewCommentEvent with undefined thread flags → defers the ledger (legacy cache semantics)", async () => {
     const client = makeClient();
     await ingestReviewCommentEvent(client, {
       repoFullName: "org/repo",
@@ -1598,9 +1598,15 @@ describe("durable evidence fields (#1249)", () => {
 
     expect(evidenceEnqueueInputs).toHaveLength(1);
     const input = evidenceEnqueueInputs[0];
-    expect(input.evidenceKind).toBe("review_comment");
-    expect(input.evidenceVersion).toContain("resolved=n");
-    expect(input.evidenceActionable).toBe(true);
+    // Unknown thread state defers: the enqueue still carries the identity
+    // (bounded-cache dedupe keeps working) but NO ledger fields, so a
+    // transient GraphQL thread-read failure can never overwrite a known
+    // resolved/unresolved baseline or mint an unknown-version transition.
+    expect(input.evidenceKey).toBe("review_comment:org/repo#42:rc2");
+    expect(input.evidenceKind).toBeNull();
+    expect(input.evidenceVersion).toBeNull();
+    expect(input.evidenceActionable).toBeNull();
+    expect(input.evidenceContentSignature).toBeNull();
   });
 
   it("ingestCheckRunEvent with a failing conclusion → actionable check_run block", async () => {

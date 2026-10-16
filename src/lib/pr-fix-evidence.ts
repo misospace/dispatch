@@ -128,7 +128,11 @@ export function computeEvidenceVersion(kind: PrFixEvidenceKind, fields: Evidence
     case "review":
       return `state=${norm(fields.state)}|commit=${norm(fields.commitId)}`;
     case "review_comment":
-      return `commit=${norm(fields.commitId)}|updated=${norm(fields.updatedAt)}|resolved=${fields.resolved === true ? "y" : "n"}|outdated=${fields.outdated === true ? "y" : "n"}`;
+      // Tri-state thread flags: `u` (unknown — the GraphQL thread read failed
+      // or is unavailable) is DISTINCT from `n`, so a failed re-read after a
+      // known observation never silently flips the version into (or out of)
+      // an actionable shape. Unknown defers (see isActionableEvidenceVersion).
+      return `commit=${norm(fields.commitId)}|updated=${norm(fields.updatedAt)}|resolved=${fields.resolved === true ? "y" : fields.resolved === false ? "n" : "u"}|outdated=${fields.outdated === true ? "y" : fields.outdated === false ? "n" : "u"}`;
     case "comment":
       return `updated=${norm(fields.updatedAt)}|actor=${norm(fields.actorLogin)}`;
     case "check_run":

@@ -553,6 +553,8 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         path: "src/app.ts",
         line: 12,
         user: { login: "reviewer" },
+        commit_id: "def456",
+        updated_at: "2026-10-15T10:00:00Z",
       },
       pull_request: pullRequest,
       repository,
@@ -574,6 +576,8 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         linkedIssue: 7,
         headSha: "abc123",
         actorLogin: "reviewer",
+        commitId: "def456",
+        updatedAt: "2026-10-15T10:00:00Z",
         source: "webhook",
       },
     ]);

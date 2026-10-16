@@ -73,6 +73,17 @@ describe("computeEvidenceVersion", () => {
     expect(computeEvidenceVersion("review_comment", { commitId: "abc", updatedAt: "t1", resolved: false, outdated: true })).not.toBe(base);
   });
 
+  it("review_comment: unknown (unread) thread flags are a DISTINCT version token, never conflated with 'n'", () => {
+    const known = computeEvidenceVersion("review_comment", { commitId: "abc", updatedAt: "t1", resolved: false, outdated: false });
+    const unknown = computeEvidenceVersion("review_comment", { commitId: "abc", updatedAt: "t1", resolved: null, outdated: null });
+    expect(unknown).not.toBe(known);
+    expect(unknown).toContain("resolved=u");
+    expect(unknown).toContain("outdated=u");
+    // A failed re-read after a KNOWN observation never silently reuses the
+    // known version — and (paired with ingestion deferral) never overwrites it.
+    expect(computeEvidenceVersion("review_comment", { commitId: "abc", updatedAt: "t1" })).toBe(unknown);
+  });
+
   it("check_run: head, status, and conclusion all participate", () => {
     const base = computeEvidenceVersion("check_run", { headSha: "h", checkStatus: "completed", conclusion: "failure" });
     expect(computeEvidenceVersion("check_run", { headSha: "h2", checkStatus: "completed", conclusion: "failure" })).not.toBe(base);

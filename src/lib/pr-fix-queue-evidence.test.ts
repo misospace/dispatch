@@ -527,3 +527,55 @@ describe("legacy fallback and snapshot lifecycle (#1249)", () => {
     expect(freshAttemptGeneration()).toEqual({ generation: { increment: 1 }, attemptEvidenceWatermark: null });
   });
 });
+
+describe("review-round pins (#1249 review)", () => {
+  it("repeated text recorded mid-attempt cannot reopen at settlement (controls 3/7 durable-side)", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // r1, sig-r1, seq 1
+    dispatchStamp(client, 1);
+    // A NEW identity repeating r1's signature lands after hand-out: audited
+    // as a transition, but stamped non-actionable so neither the enqueue
+    // decision nor the settlement durable read can treat it as fresh work.
+    await seedReviewItem(client, {
+      ...reviewEvidence("r2", { evidenceContentSignature: "sig-r1" }),
+      feedback: "bot boilerplate again",
+    });
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual([]);
+    expect(client.ledger[1]).toMatchObject({
+      identity: "review:acme/widgets#7:r2",
+      sequence: 2,
+      actionable: false,
+    });
+    // Cache emptied: the durable set is the only remaining source, and the
+    // repeated row must not surface from it.
+    client.items[0].postDispatchEvidenceKeys = [];
+    headShaMock.current = "ccc9";
+    const result = await settleFixed(client);
+    expect(result.status).toBe("FIXED");
+  });
+
+  it("evidence fields without a version fail closed to the cache: no ledger row, no counter bump", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // seq 1
+    dispatchStamp(client, 1);
+    // A caller that supplies identity+kind but no version cannot be
+    // version-compared; recording it would mint a transition on every re-read.
+    await enqueuePrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      lane: "NORMAL",
+      type: "REVIEW_FEEDBACK",
+      reason: "PR review: CHANGES_REQUESTED",
+      feedback: "versionless payload",
+      headSha: "aaa1",
+      evidenceKey: "review:acme/widgets#7:r9",
+      evidenceKind: "review",
+      evidenceActionable: true,
+    } as any);
+    expect(client.items[0].evidenceSequence).toBe(1);
+    expect(client.ledger).toHaveLength(1);
+    // Legacy identity-only cache semantics stand: new identity → recorded.
+    expect(client.items[0].evidenceKeys).toContain("review:acme/widgets#7:r9");
+    expect(client.items[0].postDispatchEvidenceKeys).toEqual(["review:acme/widgets#7:r9@aaa1"]);
+  });
+});

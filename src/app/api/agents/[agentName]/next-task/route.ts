@@ -69,11 +69,15 @@ async function confirmPrFixHandOut(
   // observe concurrent re-issues; differing from candidate.generation
   // marks that a move was observed.
   let nextGeneration = candidate.generation;
+  // #1249: the generation whose dispatch stamp THIS pass flipped from
+  // undispatched (updateMany count === 1). Only that first hand-out of a
+  // generation stamps the evidence watermark.
+  let newlyDispatchedGeneration: number | null = null;
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       const stampGeneration = nextGeneration;
       if (excluded(candidate.repo, candidate.pr, stampGeneration)) return null;
-      await prisma.prFixQueueItem.updateMany({
+      const stamp = await prisma.prFixQueueItem.updateMany({
         where: {
           id: candidate.id,
           generation: stampGeneration,
@@ -89,6 +93,7 @@ async function confirmPrFixHandOut(
           postDispatchEvidenceKeys: [],
         },
       });
+      if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
       const fresh = await prisma.prFixQueueItem.findUnique({
         where: { id: candidate.id },
         select: { reason: true, feedback: true, generation: true, status: true, lane: true, agentHandouts: true },
@@ -133,7 +138,17 @@ async function confirmPrFixHandOut(
     console.warn(`next-task pr-fix hand-out for ${candidate.repo}#${candidate.pr}: no confirmed generation; deferring the item to the next poll`);
     return null;
   }
-  await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration);
+  // #1249: stamp the evidence-snapshot boundary ONLY when this pass actually
+  // transitioned the dispatch stamp (count === 1 — the first hand-out of this
+  // generation). A repeat hand-out of an already-dispatched generation to a
+  // second agent must NOT raise the watermark: transitions recorded since the
+  // first stamp stay durably fresh, so settlement against any agent's report
+  // reopens rather than absorbs evidence the first worker never received.
+  // (The per-agent feedback re-read above still gives every worker the full
+  // current picture; the watermark guards settlement, not delivery.)
+  if (confirmedGeneration !== null && newlyDispatchedGeneration === confirmedGeneration) {
+    await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration);
+  }
   return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane };
 }
 

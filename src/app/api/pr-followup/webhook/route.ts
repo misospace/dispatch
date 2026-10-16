@@ -75,6 +75,8 @@ function parseWebhookEvent(githubEvent: string, body: Record<string, unknown>): 
         linkedIssue: extractLinkedIssue(pr),
         headSha: pr.head?.sha ?? null,
         actorLogin: comment.comment?.user?.login ?? null,
+        // #1249: same-commit anchoring for the anti-repetition signature.
+        commitId: comment.comment?.commit_id ?? null,
         updatedAt: comment.comment?.updated_at,
         source: "webhook",
       });

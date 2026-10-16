@@ -505,6 +505,29 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
  */
 function evidenceFieldsFor(event: PrFollowupEvent) {
   const kind: PrFixEvidenceKind = event.eventType;
+  // #1249: a `review_comment` ledger row is only written when the thread
+  // state was actually READ. Unknown thread state DEFERS: the observation
+  // falls back to the pre-#1249 bounded-cache semantics instead of recording
+  // an unknown-version row — a transient GraphQL failure never overwrites a
+  // known resolved/unresolved baseline (which could either strand real
+  // feedback or flip a cleared thread back to fresh).
+  if (kind === "review_comment" && event.threadResolved == null && event.threadOutdated == null) {
+    return {
+      evidenceKind: null,
+      evidenceVersion: null,
+      evidenceContentSignature: null,
+      evidenceObservedAt: null,
+      evidenceActionable: null,
+      evidenceHeadSha: null,
+      evidenceSource: null,
+      evidenceKey: computeEvidenceKey(
+        event.eventType,
+        INGEST_DESCRIPTORS[event.eventType].sourceId(event),
+        event.repoFullName,
+        event.prNumber,
+      ),
+    };
+  }
   const fields: EvidenceVersionFields = {
     state: event.state ?? null,
     commitId: event.commitId ?? null,
