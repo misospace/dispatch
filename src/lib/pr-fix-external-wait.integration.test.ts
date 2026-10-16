@@ -36,6 +36,7 @@ const suite = enabled ? describe : describe.skip;
 
 const REPO = "integration/external-wait";
 const CONTRACT: ExternalWaitContract = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open, not merged", trigger: { kind: "merged" } };
+const ownQueueItems = (items: any[]) => items.filter((item) => item.repo === REPO);
 
 suite("external-wait contract against a real PostgreSQL", () => {
   beforeAll(() => {
@@ -90,14 +91,14 @@ suite("external-wait contract against a real PostgreSQL", () => {
     expect(updated.generation).toBe(enqueued.generation);
 
     const client = asPrFixQueueClient(prisma);
-    const queued = await listQueuedPrFixItems(client);
+    const queued = ownQueueItems(await listQueuedPrFixItems(client));
     expect(queued).toEqual([]);
     const row = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 3 } } });
     expect(row?.status).toBe("WAITING_EXTERNAL");
     expect(row?.retryAt).not.toBeNull();
     expect(row?.generation).toBe(enqueued.generation);
 
-    const surfaced = await listQueuedPrFixItems(client, { includeBlocked: true });
+    const surfaced = ownQueueItems(await listQueuedPrFixItems(client, { includeBlocked: true }));
     expect(surfaced).toHaveLength(1);
     expect(surfaced[0]).toMatchObject({ status: "WAITING_EXTERNAL", legacyWait: true });
   });
@@ -108,7 +109,7 @@ suite("external-wait contract against a real PostgreSQL", () => {
     await prisma.prFixQueueItem.update({ where: { repo_pr: { repo: REPO, pr: 4 } }, data: { retryAt: new Date(Date.now() - 1000) } });
 
     const client = asPrFixQueueClient(prisma);
-    const queued = await listQueuedPrFixItems(client);
+    const queued = ownQueueItems(await listQueuedPrFixItems(client));
     expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
     const row = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 4 } } });
     expect(row?.status).toBe("QUEUED");
@@ -135,7 +136,7 @@ suite("external-wait contract against a real PostgreSQL", () => {
     await prisma.prFixQueueItem.update({ where: { repo_pr: { repo: REPO, pr: 5 } }, data: { retryAt: stale } });
 
     const client = asPrFixQueueClient(prisma);
-    const queued = await listQueuedPrFixItems(client);
+    const queued = ownQueueItems(await listQueuedPrFixItems(client));
     expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
 
     const valid = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 5 } } });
@@ -155,6 +156,9 @@ suite("external-wait contract against a real PostgreSQL", () => {
     // deterministic id-cursor pagination instead.
     await prisma.prFixQueueItem.createMany({
       data: Array.from({ length: 120 }, (_, index) => ({
+        // Keep these ahead of the target row in the id cursor regardless of
+        // insert timing from other integration suites.
+        id: `a-external-wait-${String(index).padStart(3, "0")}`,
         repo: REPO,
         pr: 2000 + index,
         lane: "NORMAL",
@@ -164,13 +168,24 @@ suite("external-wait contract against a real PostgreSQL", () => {
         externalWait: { kind: "upstream_pr", ref: "garbage" } as unknown as Prisma.InputJsonValue,
       })),
     });
-    await enqueuePrFixItem(prisma, { repo: REPO, pr: 6, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "e:6" });
-    await markPrFixItem(prisma, { repo: REPO, pr: 6, status: "WAITING_EXTERNAL", expectedGeneration: 1, externalWait: CONTRACT });
-    await prisma.prFixQueueItem.update({ where: { repo_pr: { repo: REPO, pr: 6 } }, data: { retryAt: stale } });
+    await prisma.prFixQueueItem.create({
+      data: {
+        id: "z-external-wait-target",
+        repo: REPO,
+        pr: 6,
+        lane: "NORMAL",
+        reason: "r",
+        status: "WAITING_EXTERNAL",
+        retryAt: stale,
+        externalWait: CONTRACT as unknown as Prisma.InputJsonValue,
+      },
+    });
 
     const client = asPrFixQueueClient(prisma);
-    const queued = await listQueuedPrFixItems(client);
-    expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
+    const queued = ownQueueItems(await listQueuedPrFixItems(client));
+    expect(queued.filter((entry: any) => entry.pr === 6).map((entry: any) => ({ pr: entry.pr, status: entry.status }))).toEqual([
+      { pr: 6, status: "QUEUED" },
+    ]);
 
     const valid = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 6 } } });
     expect(valid?.status).toBe("QUEUED");

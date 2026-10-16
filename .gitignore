@@ -40,3 +40,9 @@ tsconfig.tsbuildinfo
 
 # helm dependency tarballs (rebuilt from Chart.lock)
 charts/dispatch/charts/
+node_modules/
+dist/
+.astro/
+node_modules/
+dist/
+.astro/
