@@ -14,6 +14,7 @@
  * integration CI job applies the migrations and opts in explicitly.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { enqueuePrFixItem, markPrFixItem, listQueuedPrFixItems } from "./pr-fix-queue";
 import { asPrFixQueueClient } from "@/lib/prisma";
@@ -114,5 +115,67 @@ suite("external-wait contract against a real PostgreSQL", () => {
     expect(row?.generation).toBe(2);
     expect(row?.retryAt).toBeNull();
     expect(parseStoredExternalWait(row?.externalWait)).toBeNull();
+  });
+
+  it("reactivates a valid expired wait past 120 expired legacy rows — no starvation (#1250 review)", async () => {
+    // 120 pre-#1250 free-text waits past their deadline: SQL NULL contract.
+    const stale = new Date(Date.now() - 60_000);
+    await prisma.prFixQueueItem.createMany({
+      data: Array.from({ length: 120 }, (_, index) => ({
+        repo: REPO,
+        pr: 1000 + index,
+        lane: "NORMAL",
+        reason: "legacy free-text wait",
+        status: "WAITING_EXTERNAL" as const,
+        retryAt: stale,
+      })),
+    });
+    await enqueuePrFixItem(prisma, { repo: REPO, pr: 5, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "e:5" });
+    await markPrFixItem(prisma, { repo: REPO, pr: 5, status: "WAITING_EXTERNAL", expectedGeneration: 1, externalWait: CONTRACT });
+    await prisma.prFixQueueItem.update({ where: { repo_pr: { repo: REPO, pr: 5 } }, data: { retryAt: stale } });
+
+    const client = asPrFixQueueClient(prisma);
+    const queued = await listQueuedPrFixItems(client);
+    expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
+
+    const valid = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 5 } } });
+    expect(valid?.status).toBe("QUEUED");
+    expect(valid?.generation).toBe(2);
+
+    // Every legacy row stayed held, exactly as it was.
+    const legacy = await prisma.prFixQueueItem.findMany({ where: { repo: REPO, pr: { gte: 1000 } } });
+    expect(legacy).toHaveLength(120);
+    expect(legacy.every((row) => row.status === "WAITING_EXTERNAL" && row.retryAt !== null && row.externalWait === null)).toBe(true);
+  });
+
+  it("paginates past 120 expired rows whose stored contracts no longer validate (#1250 review)", async () => {
+    const stale = new Date(Date.now() - 60_000);
+    // These rows carry well-formed JSON that fails contract validation, so
+    // they pass the SQL-NULL database filter and must be walked past by the
+    // deterministic id-cursor pagination instead.
+    await prisma.prFixQueueItem.createMany({
+      data: Array.from({ length: 120 }, (_, index) => ({
+        repo: REPO,
+        pr: 2000 + index,
+        lane: "NORMAL",
+        reason: "r",
+        status: "WAITING_EXTERNAL" as const,
+        retryAt: stale,
+        externalWait: { kind: "upstream_pr", ref: "garbage" } as unknown as Prisma.InputJsonValue,
+      })),
+    });
+    await enqueuePrFixItem(prisma, { repo: REPO, pr: 6, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "e:6" });
+    await markPrFixItem(prisma, { repo: REPO, pr: 6, status: "WAITING_EXTERNAL", expectedGeneration: 1, externalWait: CONTRACT });
+    await prisma.prFixQueueItem.update({ where: { repo_pr: { repo: REPO, pr: 6 } }, data: { retryAt: stale } });
+
+    const client = asPrFixQueueClient(prisma);
+    const queued = await listQueuedPrFixItems(client);
+    expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
+
+    const valid = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 6 } } });
+    expect(valid?.status).toBe("QUEUED");
+    const staleRows = await prisma.prFixQueueItem.findMany({ where: { repo: REPO, pr: { gte: 2000 } } });
+    expect(staleRows).toHaveLength(120);
+    expect(staleRows.every((row) => row.status === "WAITING_EXTERNAL")).toBe(true);
   });
 });

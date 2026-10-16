@@ -574,22 +574,50 @@ export function externalWaitCooldownMs(): number {
   return Number.isInteger(n) && n >= 60_000 && n <= 7 * 24 * 60 * 60 * 1000 ? n : 6 * 60 * 60 * 1000;
 }
 
+// Batch size for the bounded external-wait reactivation scan (#1231).
+const EXTERNAL_WAIT_REACTIVATION_BATCH = 100;
+// Per-sweep scan bound (#1250 review): the query already excludes legacy
+// (SQL NULL) contracts at the database level, so in-memory skips only defend
+// against rows whose stored JSON no longer validates — a shape writers can
+// no longer produce. Pagination past skipped rows is deterministic (id
+// cursor) and stops after this many scanned rows so pathological garbage
+// rows can stall discovery but never turn the sweep unbounded.
+const EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT = 500;
+
 async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): Promise<void> {
-  const due = await client.prFixQueueItem.findMany({ where: { status: "WAITING_EXTERNAL", retryAt: { lte: now } }, take: 100 });
-  for (const row of due.filter((candidate) => candidate.status === "WAITING_EXTERNAL" && candidate.retryAt && new Date(candidate.retryAt).getTime() <= now.getTime())) {
-    // #1250: a legacy free-text wait (no structured contract) — or any row
-    // whose stored contract no longer validates — is NOT a bounded external
-    // wait. It must stay held for operator action (surfaced as `legacyWait`
-    // in queue listings), never silently auto-requeued. Cooldown-based
-    // recheck continues for valid structured contracts.
-    if (!parseStoredExternalWait(row.externalWait)) continue;
-    await client.$transaction(async (tx) => {
-      const { count } = await tx.prFixQueueItem.updateMany({
-        where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
-        data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [], externalWait: Prisma.DbNull },
-      });
-      if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
+  let cursor: string | undefined;
+  let scanned = 0;
+  while (scanned < EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT) {
+    // #1250 review: exclude legacy free-text waits (SQL NULL contract) in the
+    // query itself — 100+ legacy rows must never occupy the batch and starve
+    // valid structured waits out of discovery. Valid-but-unparseable rows
+    // (if any exist) are skipped in memory and walked past deterministically
+    // via the id cursor below.
+    const due: any[] = await client.prFixQueueItem.findMany({
+      where: { status: "WAITING_EXTERNAL", retryAt: { lte: now }, externalWait: { not: Prisma.DbNull } },
+      orderBy: { id: "asc" },
+      ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+      take: EXTERNAL_WAIT_REACTIVATION_BATCH,
     });
+    if (due.length === 0) break;
+    scanned += due.length;
+    for (const row of due) {
+      cursor = row.id;
+      if (row.status !== "WAITING_EXTERNAL" || !row.retryAt || new Date(row.retryAt).getTime() > now.getTime()) continue;
+      // A stored contract that no longer validates is NOT a bounded external
+      // wait: stay held for operator action (surfaced as `legacyWait` in
+      // queue listings), never silently auto-requeued. Cooldown-based
+      // recheck continues for valid structured contracts.
+      if (!parseStoredExternalWait(row.externalWait)) continue;
+      await client.$transaction(async (tx) => {
+        const { count } = await tx.prFixQueueItem.updateMany({
+          where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation, retryAt: row.retryAt },
+          data: { status: "QUEUED", ...freshAttemptGeneration(), retryAt: null, dispatchedGeneration: null, dispatchedAt: null, postDispatchEvidenceKeys: [], attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null, outcome: null, decisionDetail: null, agentHandouts: [], handoutAcks: [], handoutReceipts: [], externalWait: Prisma.DbNull },
+        });
+        if (count === 1) await tx.prFixHistory.create({ data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait cooldown elapsed; retrying prerequisite check." } });
+      });
+    }
+    if (due.length < EXTERNAL_WAIT_REACTIVATION_BATCH) break;
   }
 }
 

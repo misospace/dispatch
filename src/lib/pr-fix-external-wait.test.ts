@@ -386,6 +386,99 @@ describe("structured external-wait contract (#1250)", () => {
     expect(history).toHaveLength(1);
   });
 
+  // #1250 review: a full batch of expired legacy rows must never starve a
+  // valid structured wait out of reactivation. The mock below emulates the
+  // DB semantics the reactivation query relies on (status/retryAt/externalWait
+  // filtering plus deterministic id-cursor pagination); the real-Postgres
+  // integration suite proves the same against the actual engine.
+  function dbFilteringClient(rows: any[]) {
+    const history: any[] = [];
+    const findManyCalls: any[] = [];
+    const client: any = {
+      prFixQueueItem: {
+        findUnique: async () => null,
+        findMany: async (args: any = {}) => {
+          findManyCalls.push(args);
+          const where = args.where ?? {};
+          const statuses = where.status?.in ?? [where.status];
+          let matched = rows.filter((row) => statuses.includes(row.status));
+          if (where.retryAt) matched = matched.filter((row) => row.retryAt && new Date(row.retryAt).getTime() <= new Date(where.retryAt.lte).getTime());
+          if (where.externalWait?.not === Prisma.DbNull) matched = matched.filter((row) => row.externalWait !== Prisma.DbNull);
+          matched.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+          if (args.cursor?.id) {
+            const index = matched.findIndex((row) => row.id === args.cursor.id);
+            if (index >= 0) matched = matched.slice(index + (args.skip ?? 0));
+          }
+          return matched.slice(0, args.take ?? 100);
+        },
+        updateMany: async ({ where, data }: any) => {
+          const row = rows.find((candidate) => candidate.id === where.id);
+          if (!row || (where.status && row.status !== where.status) || (where.generation !== undefined && row.generation !== where.generation) || (where.retryAt && row.retryAt !== where.retryAt)) return { count: 0 };
+          const patch = { ...data };
+          if (typeof patch.generation === "object" && patch.generation !== null && "increment" in patch.generation) {
+            patch.generation = (row.generation ?? 0) + patch.generation.increment;
+          }
+          Object.assign(row, patch);
+          return { count: 1 };
+        },
+      },
+      prFixHistory: {
+        create: async ({ data }: any) => { history.push(data); },
+        findMany: async () => [],
+      },
+      $transaction: async (fn: any) => fn(client),
+    };
+    return { client: client as PrFixQueueClient, history, findManyCalls };
+  }
+
+  function expiredLegacyRows(count: number, externalWait: unknown, idPrefix = "legacy"): any[] {
+    return Array.from({ length: count }, (_, index) => ({
+      ...item(),
+      id: `${idPrefix}-${String(index).padStart(3, "0")}`,
+      pr: 1000 + index,
+      status: "WAITING_EXTERNAL",
+      retryAt: new Date(Date.now() - 60_000),
+      externalWait,
+    }));
+  }
+
+  it("reactivates a valid wait past a full batch of legacy SQL-NULL rows (no starvation)", async () => {
+    const valid = { ...item(), id: "zz-valid", pr: 9999, status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 60_000), externalWait: structuredWait };
+    const rows = [...expiredLegacyRows(120, null), valid];
+    const { client, history, findManyCalls } = dbFilteringClient(rows);
+    const queued = await listQueuedPrFixItems(client);
+    expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
+    expect(valid.status).toBe("QUEUED");
+    expect(valid.generation).toBe(5);
+    expect(rows.filter((row) => row.id.startsWith("legacy-")).every((row) => row.status === "WAITING_EXTERNAL" && row.retryAt)).toBe(true);
+    expect(history).toHaveLength(1);
+    // The legacy rows were excluded by the database filter, never fetched.
+    expect(findManyCalls[0].where.externalWait).toEqual({ not: Prisma.DbNull });
+  });
+
+  it("paginates deterministically past >100 rows whose stored contracts no longer validate", async () => {
+    const valid = { ...item(), id: "zz-valid", pr: 9999, status: "WAITING_EXTERNAL", retryAt: new Date(Date.now() - 60_000), externalWait: structuredWait };
+    const rows = [...expiredLegacyRows(120, { kind: "upstream_pr", ref: "garbage" }, "stale"), valid];
+    const { client, history } = dbFilteringClient(rows);
+    const queued = await listQueuedPrFixItems(client);
+    expect(queued.map((entry: any) => entry.status)).toEqual(["QUEUED"]);
+    expect(valid.status).toBe("QUEUED");
+    expect(rows.filter((row) => row.id.startsWith("stale-")).every((row) => row.status === "WAITING_EXTERNAL")).toBe(true);
+    expect(history).toHaveLength(1);
+  });
+
+  it("bounds the reactivation scan so pathological skipped rows cannot make the sweep unbounded", async () => {
+    const rows = expiredLegacyRows(500, { garbage: true }, "stale");
+    const { client, history, findManyCalls } = dbFilteringClient(rows);
+    await listQueuedPrFixItems(client);
+    // 500-row scan limit / 100-row batch = at most 5 reactivation pages per
+    // sweep, even though every scanned row is skipped in memory. (The final
+    // findMany call is the queue listing itself, which carries no retryAt.)
+    expect(findManyCalls.filter((args: any) => args.where?.retryAt).length).toBeLessThanOrEqual(5);
+    expect(rows.every((row) => row.status === "WAITING_EXTERNAL")).toBe(true);
+    expect(history).toHaveLength(0);
+  });
+
   describe("read-only trigger evaluation", () => {
     const wait: ExternalWaitContract = { kind: "upstream_pr", ref: "org/deps#77", evidence: "upstream PR open", trigger: { kind: "merged" } };
 
