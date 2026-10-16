@@ -1974,6 +1974,12 @@ export async function markPrFixItem(
             outcome: "invalid_wait",
             decisionDetail: null,
             retryAt: null,
+            // A park is a terminal disposition: drop the attempt's evidence
+            // snapshot like every other sticky PARKED settle, so a later
+            // maintainer-tier mark never reopens on the parked attempt's
+            // cache or a stale watermark (#1249/#1250 boundary).
+            attemptEvidenceWatermark: null,
+            postDispatchEvidenceKeys: [],
             // #1250 review: a nullable JSON column must receive SQL NULL
             // (Prisma.DbNull), not a JSON null document — plain `null` on a
             // Json field is rejected by the Prisma runtime for updateMany.
