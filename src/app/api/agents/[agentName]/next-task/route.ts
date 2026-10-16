@@ -73,6 +73,11 @@ async function confirmPrFixHandOut(
   // undispatched (updateMany count === 1). Only that first hand-out of a
   // generation stamps the evidence watermark.
   let newlyDispatchedGeneration: number | null = null;
+  // The ledger counter read in the same snapshot as the payload this hand-out
+  // ships (#1249). Null when no confirming snapshot was taken (the catch
+  // fallback below), which leaves the watermark unstamped rather than
+  // guessing past undelivered evidence.
+  let dispatchEvidenceSequence: number | null = null;
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       const stampGeneration = nextGeneration;
@@ -96,7 +101,20 @@ async function confirmPrFixHandOut(
       if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
       const fresh = await prisma.prFixQueueItem.findUnique({
         where: { id: candidate.id },
-        select: { reason: true, feedback: true, generation: true, status: true, lane: true, agentHandouts: true },
+        select: {
+          reason: true,
+          feedback: true,
+          generation: true,
+          status: true,
+          lane: true,
+          agentHandouts: true,
+          // #1249: read the durable ledger counter in the SAME snapshot as the
+          // payload it bounds. Reading it separately would let a transition
+          // recorded in between raise the watermark past evidence this hand-out
+          // never delivered — settlement would then absorb exactly the loss
+          // class #1119 exists to prevent.
+          evidenceSequence: true,
+        },
       });
       if (
         !fresh ||
@@ -119,6 +137,8 @@ async function confirmPrFixHandOut(
       // The re-read confirms the row is still at the stamped
       // generation: the token may ship.
       confirmedGeneration = typeof fresh.generation === "number" ? fresh.generation : stampGeneration;
+      dispatchEvidenceSequence =
+        typeof fresh.evidenceSequence === "number" ? fresh.evidenceSequence : null;
       break;
     }
   } catch (error) {
@@ -147,7 +167,7 @@ async function confirmPrFixHandOut(
   // (The per-agent feedback re-read above still gives every worker the full
   // current picture; the watermark guards settlement, not delivery.)
   if (confirmedGeneration !== null && newlyDispatchedGeneration === confirmedGeneration) {
-    await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration);
+    await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration, dispatchEvidenceSequence);
   }
   return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane };
 }
@@ -156,23 +176,31 @@ async function confirmPrFixHandOut(
  * Stamp the durable evidence-snapshot boundary of this hand-out (#1249): the
  * ledger sequence at dispatch is the durable record of what the worker was
  * actually given — settlement reopens only on transitions recorded AFTER it.
- * Pinned on the exact `evidenceSequence` read a moment earlier: a transition
- * landing in the read→write gap misses the pin, and the row keeps a NULL (or
- * prior) watermark instead of a too-low stamp — settlement then falls back to
- * the bounded #1119 cache, the pre-#1249 behavior. Best-effort like the
- * dispatch stamp around it: a failure here loses durable freshness tracking,
- * never the task.
+ *
+ * `evidenceSequence` is the value from the same row snapshot that assembled the
+ * payload this hand-out ships, so the boundary covers exactly the delivered
+ * evidence and can never sit above evidence the worker never received.
+ *
+ * Pinned as an UPPER BOUND (`lte`), not an equality: a transition that lands
+ * after the payload snapshot moves the counter past it, and such evidence is
+ * exactly what this worker never received — so the stamp still applies, at the
+ * delivered position, and settlement reopens on the transition. An equality
+ * pin would instead lose the stamp entirely and silently degrade the attempt
+ * to the bounded #1119 cache.
+ *
+ * Best-effort like the dispatch stamp around it: a failure here loses durable
+ * freshness tracking, never the task.
  */
-async function stampAttemptEvidenceWatermark(itemId: string, generation: number): Promise<void> {
+async function stampAttemptEvidenceWatermark(
+  itemId: string,
+  generation: number,
+  evidenceSequence: number | null,
+): Promise<void> {
+  if (evidenceSequence === null) return;
   try {
-    const head = await prisma.prFixQueueItem.findUnique({
-      where: { id: itemId },
-      select: { evidenceSequence: true },
-    });
-    if (!head || typeof head.evidenceSequence !== "number") return;
     const { count } = await prisma.prFixQueueItem.updateMany({
-      where: { id: itemId, generation, evidenceSequence: head.evidenceSequence },
-      data: { attemptEvidenceWatermark: head.evidenceSequence },
+      where: { id: itemId, generation, evidenceSequence: { lte: evidenceSequence } },
+      data: { attemptEvidenceWatermark: evidenceSequence },
     });
     if (count !== 1) {
       console.warn(

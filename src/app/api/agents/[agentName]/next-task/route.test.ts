@@ -1554,6 +1554,71 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.reasons).toContain("fix lint (enqueued after the hand-out read)");
   });
 
+  it("stamps the evidence watermark from the same snapshot it ships (#1276)", async () => {
+    // The ledger counter moves BETWEEN the queue snapshot and the confirming
+    // re-read (a sync recorded a transition). The boundary must follow the
+    // re-read that assembled this hand-out's payload — never a later read,
+    // which would sit ABOVE the delivered evidence and make settlement absorb a
+    // transition this worker never received.
+    mocks.prFixFindMany.mockResolvedValue([
+      {
+        id: "prfix-1",
+        repo: "org/repo",
+        pr: 12,
+        issue: null,
+        branch: "fix/something",
+        url: "https://github.com/org/repo/pull/12",
+        title: "Fix something",
+        lane: "NORMAL",
+        status: "QUEUED",
+        reason: "CI failure on main",
+        feedback: ["update tests"],
+        evidenceKeys: ["check:1"],
+        author: "itsmiso-ai",
+        generation: 2,
+        evidenceSequence: 5,
+        agentHandouts: [],
+        queuedAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ]);
+    mocks.prFixFindUnique.mockImplementation(async (args: any) => {
+      // A counter-only read — the pre-fix shape — would answer 99 here, which
+      // is exactly the "watermark above delivered evidence" bug this pins.
+      if (args?.select && Object.keys(args.select).length === 1 && "evidenceSequence" in args.select) {
+        return { evidenceSequence: 99 };
+      }
+      return {
+        reason: "CI failure on main",
+        feedback: ["update tests", "and lint"],
+        generation: 2,
+        status: "QUEUED",
+        lane: "NORMAL",
+        agentHandouts: [],
+        evidenceSequence: 7,
+      };
+    });
+    const updateManyCalls: any[] = [];
+    mocks.prFixUpdateMany.mockImplementation(async (args: any) => {
+      updateManyCalls.push(args);
+      return { count: 1 };
+    });
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const stamps = updateManyCalls.filter((call) => call.data && "attemptEvidenceWatermark" in call.data);
+    expect(stamps).toHaveLength(1);
+    // The boundary is the delivered payload's own position (7), not the
+    // counter's later value (99), and the pin admits the counter having moved
+    // on — transitions recorded after the payload are what must stay fresh.
+    expect(stamps[0].where.evidenceSequence).toEqual({ lte: 7 });
+    expect(stamps[0].data.attemptEvidenceWatermark).toBe(7);
+  });
+
   it("includes linked issue context when PR-fix has an issue number", async () => {
     mocks.prFixFindMany.mockResolvedValue([
       {

@@ -183,6 +183,8 @@ export function isActionableEvidenceVersion(
  * the anti-repetition check, small enough to store/index beside the row). */
 export const CONTENT_SIGNATURE_LENGTH = 32;
 
+const CONTENT_SIGNATURE_PATTERN = new RegExp(`^[0-9a-f]{${CONTENT_SIGNATURE_LENGTH}}$`);
+
 /**
  * Bounded content signature for text-bearing kinds (review / review_comment /
  * comment): hash of (normalized body, author login, state, commit id).
@@ -211,6 +213,23 @@ export function computeEvidenceContentSignature(input: {
   const normalized = body.toLowerCase().replace(/\s+/g, " ");
   const material = [normalized, norm(input.actorLogin), norm(input.state), norm(input.commitId)].join("\u0000");
   return createHash("sha256").update(material).digest("hex").slice(0, CONTENT_SIGNATURE_LENGTH);
+}
+
+/**
+ * Validate a caller-supplied content signature against the bounded
+ * representation the ledger stores and indexes (`^[0-9a-f]{32}$`).
+ *
+ * The signature is an internal anti-repetition digest, not free text: anything
+ * that is not exactly the shape `computeEvidenceContentSignature` produces is
+ * not a digest we produced, so it is dropped (null) rather than persisted. An
+ * unbounded string would ride into a `TEXT` column that is part of a composite
+ * index and into exact-equality repeat comparisons, so bounding it at the write
+ * boundary is what keeps the ledger's storage and repeat semantics honest.
+ */
+export function normalizeEvidenceContentSignature(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return CONTENT_SIGNATURE_PATTERN.test(trimmed) ? trimmed : null;
 }
 
 export type EvidenceFreshnessReason =

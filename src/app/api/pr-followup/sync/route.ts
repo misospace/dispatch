@@ -275,32 +275,36 @@ export async function POST(request: NextRequest) {
           });
         }
 
-        // Collect review events
+        // Collect review events. EVERY state present in the API response is
+        // pushed (#1276): a review that left CHANGES_REQUESTED (APPROVED,
+        // DISMISSED, COMMENTED) is a real state transition, and ingestion
+        // records it on the durable evidence ledger for the existing item
+        // WITHOUT enqueueing work. Dropping them here was what kept the
+        // ledger's actionable baseline stale forever.
         for (const review of reviews) {
-          if (review.state === "CHANGES_REQUESTED") {
-              allEvents.push({
-                eventType: "review" as const,
-                repoFullName,
-                prNumber: pr.number,
-                branch: pr.head?.ref ?? null,
-                url: pr.url,
-                title: pr.title,
-                author: pr.user.login,
-                body: review.body,
-                id: String(review.id),
-                state: review.state,
-                linkedIssue,
-                prState: pr.state,
-                prMergedAt: pr.merged_at,
-                headSha: prHeadSha,
-                actorLogin: review.user.login,
-                commitId: review.commit_id,
-                submittedAt: review.submitted_at,
-                source: "sync",
-              });
-          } else {
-            totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
-          }
+          allEvents.push({
+            eventType: "review" as const,
+            repoFullName,
+            prNumber: pr.number,
+            branch: pr.head?.ref ?? null,
+            url: pr.url,
+            title: pr.title,
+            author: pr.user.login,
+            body: review.body,
+            id: String(review.id),
+            state: review.state,
+            linkedIssue,
+            prState: pr.state,
+            prMergedAt: pr.merged_at,
+            headSha: prHeadSha,
+            actorLogin: review.user.login,
+            commitId: review.commit_id,
+            submittedAt: review.submitted_at,
+            source: "sync",
+          });
+          // No `totalSkipped++` here: the event IS delivered, and ingestion
+          // reports it as not-enqueued (it enqueues no work — it only records
+          // the transition). Counting it on both sides would double it.
         }
 
         // Collect failing check run events

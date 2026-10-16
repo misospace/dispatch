@@ -8,7 +8,7 @@
  * (real-time GitHub event reception). Both paths converge on the same ingestion logic.
  */
 
-import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, recordPrFixEvidenceBaseline, PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
@@ -330,6 +330,13 @@ interface IngestDescriptor {
   sourceId: (event: PrFollowupEvent) => string;
   /** Lane/type/reason/feedback for the enqueued item. */
   workItem: (event: PrFollowupEvent) => IngestWorkItem;
+  /**
+   * Whether this event is a RECORD-ONLY observation (#1276): a state
+   * transition that must update the durable evidence ledger for an existing
+   * PR-fix item without enqueueing, reopening, or otherwise touching work.
+   * Optional — event types that never observe state transitions omit it.
+   */
+  recordOnly?: (event: PrFollowupEvent) => boolean;
 }
 
 function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
@@ -399,8 +406,19 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
   },
   review: {
     isIngestible: (event) => Boolean(event.state && event.id),
-    // Only CHANGES_REQUESTED triggers PR-fix work (not APPROVED or COMMENTED)
-    gate: (event) => event.state === "CHANGES_REQUESTED",
+    // Only a review that DEMANDS work triggers PR-fix work (not APPROVED or
+    // COMMENTED). Both predicates below read the ledger's own actionability
+    // decision rather than string literals, so the work gate, the record-only
+    // branch, and the `actionable` stamp the row is written with can never
+    // disagree about the same state (#1276 review).
+    gate: (event) => isActionableEvidenceVersion("review", { state: event.state }),
+    // Every OTHER review state is a record-only observation of the same
+    // identity (#1276). The sync used to drop APPROVED/COMMENTED/DISMISSED
+    // reviews on the way in, so a review leaving CHANGES_REQUESTED never
+    // reached the ledger and the item kept a stale actionable baseline forever.
+    // Recording the transition is what makes the dismissal visible; enqueueing
+    // from it is exactly what must not happen.
+    recordOnly: (event) => Boolean(event.state) && !isActionableEvidenceVersion("review", { state: event.state }),
     filterTerminalPr: true,
     sourceId: (event) => event.id,
     workItem: (event) => ({
@@ -580,10 +598,33 @@ function evidenceFieldsFor(event: PrFollowupEvent) {
  * Shared ingestion path for all PR follow-up event types.
  * Returns the evidence key if the event was eligible and enqueued,
  * or null if it was filtered out (gated, terminal PR, not bot-authored,
- * or owner not allowed).
+ * or owner not allowed), or if it was a record-only observation (#1276) —
+ * a ledger update that enqueues nothing and is therefore reported as
+ * not-enqueued so the caller's counters stay honest about real work.
  */
 async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Promise<string | null> {
   const descriptor = INGEST_DESCRIPTORS[event.eventType];
+
+  // #1276: a record-only observation short-circuits BEFORE the work gate. It
+  // enqueues nothing, so it must never be decided by `gate` (which exists to
+  // filter work), but it IS still subject to the same eligibility filters as a
+  // work event: a terminal PR, a non-bot-authored PR, or a disallowed branch
+  // owner is not an observation of this queue's work at all.
+  if (descriptor.recordOnly?.(event)) {
+    if (descriptor.filterTerminalPr && (event.prMergedAt || event.prState === "closed")) return null;
+    if (!isAllowedBotAuthor(event.author)) return null;
+    if (!isAllowedBranchOwner(event.repoFullName)) return null;
+    if (!descriptor.isIngestible(event)) return null;
+    const { evidenceKey, ...evidence } = evidenceFieldsFor(event);
+    await recordPrFixEvidenceBaseline(client, {
+      repo: event.repoFullName,
+      pr: event.prNumber,
+      evidenceKey,
+      ...evidence,
+    });
+    return null;
+  }
+
   if (!descriptor.gate(event)) return null;
 
   // Filter merged/closed PRs — do not enqueue work for terminal PRs
@@ -986,7 +1027,10 @@ export async function clearResolvedConflictItems(
 
   await client.prFixQueueItem.update({
     where: { id: existing.id },
-    data: { status: "FIXED" },
+    // #1249: settling FIXED here ends the attempt, so its evidence snapshot
+    // boundary is cleared like every other terminal disposition — the durable
+    // read of a settled item must find no post-watermark evidence.
+    data: { status: "FIXED", attemptEvidenceWatermark: null },
   });
 
   await client.prFixHistory.create({

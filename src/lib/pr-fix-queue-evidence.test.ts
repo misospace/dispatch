@@ -7,6 +7,14 @@
 // emptied, #940 keeps precedence over dedupe for one-shot kinds, and the
 // per-condition baseline survives eviction and unrelated dispositions.
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { createHash } from "node:crypto";
+
+/** A ledger-shaped content signature: the bounded 32 lowercase hex the queue
+ *  accepts (`normalizeEvidenceContentSignature`). Derived like production so a
+ *  fixture can never drift out of the stored representation. */
+function signatureFor(reviewId: string): string {
+  return createHash("sha256").update(`review-body:${reviewId}`).digest("hex").slice(0, 32);
+}
 
 const headShaMock = vi.hoisted(() => ({ current: "bbb2" }));
 vi.mock("./github-prs", () => ({
@@ -22,7 +30,7 @@ vi.mock("./pr-fix-surfacing", () => ({
   extractUrlsFromText: vi.fn(() => []),
 }));
 
-import { enqueuePrFixItem, markPrFixItem, freshAttemptGeneration, type PrFixQueueClient } from "./pr-fix-queue";
+import { enqueuePrFixItem, markPrFixItem, freshAttemptGeneration, recordPrFixEvidenceBaseline, type PrFixQueueClient } from "./pr-fix-queue";
 
 // ─── In-memory fake with the durable ledger surface ─────────────────────────
 
@@ -193,7 +201,7 @@ function reviewEvidence(reviewId: string, overrides: Record<string, unknown> = {
     evidenceKey: `review:acme/widgets#7:${reviewId}`,
     evidenceKind: "review",
     evidenceVersion: "state=changes_requested|commit=aaa1",
-    evidenceContentSignature: `sig-${reviewId}`,
+    evidenceContentSignature: signatureFor(reviewId),
     evidenceObservedAt: "2026-10-10T10:00:00Z",
     evidenceActionable: true,
     evidenceHeadSha: "aaa1",
@@ -366,7 +374,7 @@ describe("attempt-snapshot freshness at settlement (#1249)", () => {
 describe("anti-repetition and #940 precedence (#1249)", () => {
   it("repeated text under a new identity stays a no-op at FIXED, but is audited (controls 3/7)", async () => {
     const client = makeFake();
-    await seedReviewItem(client); // r1 with sig-r1, FIXED next
+    await seedReviewItem(client); // r1 (settles FIXED next)
     headShaMock.current = "ccc9";
     await markPrFixItem(client, {
       repo: "acme/widgets",
@@ -377,7 +385,7 @@ describe("anti-repetition and #940 precedence (#1249)", () => {
     expect(client.items[0].status).toBe("FIXED");
 
     await seedReviewItem(client, {
-      ...reviewEvidence("r2", { evidenceContentSignature: "sig-r1" }),
+      ...reviewEvidence("r2", { evidenceContentSignature: signatureFor("r1") }),
       headSha: "ddd4",
     });
     expect(client.items[0].status).toBe("FIXED"); // repeated text: no reopen
@@ -533,13 +541,13 @@ describe("legacy fallback and snapshot lifecycle (#1249)", () => {
 describe("review-round pins (#1249 review)", () => {
   it("repeated text recorded mid-attempt cannot reopen at settlement (controls 3/7 durable-side)", async () => {
     const client = makeFake();
-    await seedReviewItem(client); // r1, sig-r1, seq 1
+    await seedReviewItem(client); // r1, sequence 1
     dispatchStamp(client, 1);
     // A NEW identity repeating r1's signature lands after hand-out: audited
     // as a transition, but stamped non-actionable so neither the enqueue
     // decision nor the settlement durable read can treat it as fresh work.
     await seedReviewItem(client, {
-      ...reviewEvidence("r2", { evidenceContentSignature: "sig-r1" }),
+      ...reviewEvidence("r2", { evidenceContentSignature: signatureFor("r1") }),
       feedback: "bot boilerplate again",
     });
     expect(client.items[0].postDispatchEvidenceKeys).toEqual([]);
@@ -579,5 +587,330 @@ describe("review-round pins (#1249 review)", () => {
     // Legacy identity-only cache semantics stand: new identity → recorded.
     expect(client.items[0].evidenceKeys).toContain("review:acme/widgets#7:r9");
     expect(client.items[0].postDispatchEvidenceKeys).toEqual(["review:acme/widgets#7:r9@aaa1"]);
+  });
+});
+
+describe("terminal dispositions retire the attempt snapshot (#1276 review)", () => {
+  it("FIXED clears the watermark and the post-dispatch list", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    dispatchStamp(client, 1);
+    const result = await settleFixed(client);
+    expect(result.status).toBe("FIXED");
+    expect(result.attemptEvidenceWatermark).toBeNull();
+    expect(result.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("BLOCKED clears the watermark", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    dispatchStamp(client, 1);
+    const result = await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      status: "BLOCKED",
+      expectedGeneration: client.items[0].generation,
+      note: "needs a human decision",
+      decision: "waiting on upstream API",
+    } as any);
+    expect(settled(result).status).toBe("BLOCKED");
+    expect(settled(result).attemptEvidenceWatermark).toBeNull();
+  });
+
+  it("PARKED clears the watermark", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    dispatchStamp(client, 1);
+    const result = await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      status: "PARKED",
+      expectedGeneration: client.items[0].generation,
+      outcome: "no_progress",
+      note: "worker made no progress",
+    } as any);
+    expect(settled(result).status).toBe("PARKED");
+    expect(settled(result).attemptEvidenceWatermark).toBeNull();
+  });
+
+  it("a mark back to QUEUED keeps the snapshot for the SAME attempt and drops it for a fresh one", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    dispatchStamp(client, 1);
+    // QUEUED → QUEUED is the same attempt: its entries and boundary survive.
+    const sameAttempt = await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      status: "QUEUED",
+      expectedGeneration: client.items[0].generation,
+      note: "operator requeue",
+    } as any);
+    expect(settled(sameAttempt).attemptEvidenceWatermark).toBe(1);
+
+    // A settled item marked back to QUEUED mints a fresh attempt, which has no
+    // hand-out yet and therefore no snapshot to bound.
+    await settleFixed(client);
+    expect(client.items[0].attemptEvidenceWatermark).toBeNull();
+    dispatchStamp(client, 2);
+    const fresh = await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      status: "QUEUED",
+      expectedGeneration: client.items[0].generation,
+      note: "operator requeue",
+    } as any);
+    expect(settled(fresh).attemptEvidenceWatermark).toBeNull();
+  });
+});
+
+describe("bounded content signature (#1276 review)", () => {
+  it("records a bounded 32-hex signature and rejects anything outside that shape", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    expect(client.ledger[0].contentSignature).toBe(signatureFor("r1"));
+    // A caller-supplied signature outside the stored representation is dropped
+    // rather than persisted into the indexed column.
+    await seedReviewItem(client, {
+      ...reviewEvidence("r2", { evidenceContentSignature: "not-a-digest" }),
+    });
+    expect(client.ledger[1].contentSignature).toBeNull();
+    await seedReviewItem(client, {
+      ...reviewEvidence("r3", { evidenceContentSignature: "A".repeat(32) }),
+    });
+    expect(client.ledger[2].contentSignature).toBeNull();
+    await seedReviewItem(client, {
+      ...reviewEvidence("r4", { evidenceContentSignature: `${"a".repeat(31)}b` }),
+    });
+    expect(client.ledger[3].contentSignature).toBe(`${"a".repeat(31)}b`);
+    await seedReviewItem(client, {
+      ...reviewEvidence("r5", { evidenceContentSignature: "a".repeat(33) }),
+    });
+    expect(client.ledger[4].contentSignature).toBeNull();
+  });
+});
+
+// ─── Record-only state transitions (#1276) ──────────────────────────────────
+//
+// A review that LEAVES CHANGES_REQUESTED is a state transition the ledger must
+// learn about, and it is not work. These pins hold both halves at once: the
+// transition is recorded (non-actionable), and nothing about the item's work
+// state moves — no status, no lane, no feedback, no generation, no history row.
+
+describe("record-only evidence baseline (#1276)", () => {
+  /** The same (repo, pr) ownership key `seedReviewItem` uses. */
+  const recordBaseline = (evidence: Record<string, unknown>) => ({
+    repo: "acme/widgets",
+    pr: 7,
+    ...evidence,
+  });
+  const approvedBaseline = () =>
+    recordBaseline(
+      reviewEvidence("r1", {
+        evidenceVersion: "state=approved|commit=aaa1",
+        evidenceActionable: false,
+      }),
+    );
+
+  it("records a non-actionable transition with the next sequence, leaving work state untouched", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // CHANGES_REQUESTED, sequence 1
+    const before = { ...client.items[0], feedback: [...client.items[0].feedback] };
+
+    const recorded = await recordPrFixEvidenceBaseline(client, approvedBaseline() as any);
+
+    expect(recorded).toBe(true);
+    const row = client.items[0];
+    // The item's atomic counter is what advances (one bump per transition);
+    // the per-identity row is restamped in place, one row per identity.
+    expect(row.evidenceSequence).toBe(2);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "review:acme/widgets#7:r1",
+      kind: "review",
+      version: "state=approved|commit=aaa1",
+      actionable: false,
+    });
+    // Work state is untouched: no enqueue happened, so nothing about the
+    // attempt may move.
+    expect(row.status).toBe(before.status);
+    expect(row.lane).toBe(before.lane);
+    expect(row.generation).toBe(before.generation);
+    expect(row.fixAttempts).toBe(before.fixAttempts);
+    expect(row.feedback).toEqual(before.feedback);
+    expect(row.evidenceKeys).toEqual(before.evidenceKeys);
+    // The ledger row IS the audit record — no enqueue history row for work
+    // that was never enqueued.
+    expect(client.history).toHaveLength(1);
+    expect(client.history[0].action).toBe("enqueue");
+  });
+
+  it("replay of the recorded state is inert: no counter bump, no restamp, no write", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    await recordPrFixEvidenceBaseline(client, approvedBaseline() as any);
+    const stamped = { ...client.ledger[0] };
+    expect(client.items[0].evidenceSequence).toBe(2);
+
+    // Periodic re-read of the same dismissed/approved review: the stored
+    // (identity, version) pair is not a transition.
+    expect(await recordPrFixEvidenceBaseline(client, approvedBaseline() as any)).toBe(false);
+    expect(await recordPrFixEvidenceBaseline(client, approvedBaseline() as any)).toBe(false);
+
+    expect(client.items[0].evidenceSequence).toBe(2);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toEqual(stamped);
+    expect(client.history).toHaveLength(1);
+  });
+
+  it("with no item for (repo, pr) it records nothing and creates nothing", async () => {
+    const client = makeFake();
+    const recorded = await recordPrFixEvidenceBaseline(client, {
+      ...approvedBaseline(),
+      pr: 99,
+    } as any);
+    expect(recorded).toBe(false);
+    expect(client.items).toHaveLength(0);
+    expect(client.ledger).toHaveLength(0);
+    expect(client.history).toHaveLength(0);
+  });
+
+  it("a record-only observation on ANOTHER review's identity never enqueues work", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    const before = { status: client.items[0].status, feedback: [...client.items[0].feedback] };
+
+    // A different review on the same PR, dismissed: recorded under its own
+    // identity, and still no work item.
+    const recorded = await recordPrFixEvidenceBaseline(client, recordBaseline(
+      reviewEvidence("r2", {
+        evidenceVersion: "state=dismissed|commit=aaa1",
+        evidenceActionable: false,
+      }),
+    ) as any);
+
+    expect(recorded).toBe(true);
+    expect(client.ledger[1]).toMatchObject({
+      identity: "review:acme/widgets#7:r2",
+      version: "state=dismissed|commit=aaa1",
+      sequence: 2,
+      actionable: false,
+    });
+    expect(client.items[0].status).toBe(before.status);
+    expect(client.items[0].feedback).toEqual(before.feedback);
+    expect(client.items[0].fixAttempts).toBe(1);
+    expect(client.history).toHaveLength(1);
+  });
+
+  it("a pin that keeps missing gives up in a bounded loop without a partial write", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // sequence 1
+    // Sustained contention: every pinned counter claim misses (a concurrent
+    // transition moved the counter in the read→write gap, every time). A
+    // missed pin means the write never happened — nothing applied.
+    let attempts = 0;
+    client.prFixQueueItem.updateMany = async () => {
+      attempts += 1;
+      return { count: 0 };
+    };
+
+    const recorded = await recordPrFixEvidenceBaseline(client, approvedBaseline() as any);
+
+    // Bounded, and nothing half-written: no counter bump, no ledger row for a
+    // sequence the item write never claimed. The next sweep re-observes.
+    expect(recorded).toBe(false);
+    expect(attempts).toBe(3);
+    expect(client.items[0].evidenceSequence).toBe(1);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0].version).toBe("state=changes_requested|commit=aaa1");
+    expect(client.history).toHaveLength(1);
+  });
+
+  it("a re-versioned row moves to its new position, so settlement cannot absorb it", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // CHANGES_REQUESTED, sequence 1
+    dispatchStamp(client, 1); // hand-out snapshot = sequence 1
+    // The reviewer dismisses, then requests changes again on the SAME review
+    // identity. The second transition is newer than the hand-out, so a settle
+    // must see it — which requires the row to carry its CURRENT position
+    // rather than the one it was first recorded at.
+    await recordPrFixEvidenceBaseline(client, approvedBaseline() as any);
+    await recordPrFixEvidenceBaseline(
+      client,
+      recordBaseline(
+        reviewEvidence("r1", {
+          evidenceVersion: "state=changes_requested|commit=bbb2",
+          evidenceActionable: true,
+        }),
+      ) as any,
+    );
+
+    expect(client.items[0].evidenceSequence).toBe(3);
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "review:acme/widgets#7:r1",
+      sequence: 3,
+      actionable: true,
+    });
+
+    // Cache emptied: only the durable read can surface the re-request, and it
+    // does — the row is at sequence 3, past the watermark of 1.
+    client.items[0].postDispatchEvidenceKeys = [];
+    headShaMock.current = "ddd4";
+    const result = await settleFixed(client);
+    expect(result.status).toBe("QUEUED"); // reopened: fresh post-watermark evidence
+  });
+
+  it("a settled item records the transition without settling, reopening or enqueueing", async () => {
+    const client = makeFake();
+    await seedReviewItem(client);
+    await settleFixed(client); // terminal: watermark and keys cleared
+
+    const recorded = await recordPrFixEvidenceBaseline(client, approvedBaseline() as any);
+
+    // No status filter: a dismissal on a FIXED item is still the durable truth
+    // a later requeue (and the #1253 reconciliation) reads. It cannot reopen —
+    // the settled item carries no watermark, so the durable read is empty.
+    expect(recorded).toBe(true);
+    const row = client.items[0];
+    expect(row.status).toBe("FIXED");
+    expect(row.attemptEvidenceWatermark).toBeNull();
+    expect(row.generation).toBe(1);
+    expect(row.fixAttempts).toBe(1);
+    expect(client.ledger[0]).toMatchObject({ version: "state=approved|commit=aaa1", actionable: false });
+    // Nothing durable survives for a settle to read: no watermark, no cache
+    // entries, so the post-watermark set is empty by construction.
+    expect(row.postDispatchEvidenceKeys).toEqual([]);
+  });
+
+  it("the unpinned exhausted-loop fallback writes no ledger row, and the next read records it", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // r1, sequence 1
+    dispatchStamp(client, 1);
+    // Every pinned write misses (sustained contention), so the enqueue path
+    // takes its documented pre-#1134 fallback: a plain, unpinned update whose
+    // counter bump nobody can vouch for.
+    client.prFixQueueItem.updateMany = async () => ({ count: 0 });
+
+    await seedReviewItem(client, {
+      ...reviewEvidence("r2", { evidenceVersion: "state=changes_requested|commit=ccc3" }),
+      feedback: "second observation",
+    });
+
+    expect(client.items[0].evidenceSequence).toBeGreaterThan(1);
+    // No row was written at the unclaimed position: a re-versioned row here
+    // would MOVE its sequence, potentially below a live watermark.
+    const identities = client.ledger.map((row: any) => row.identity);
+    expect(new Set(identities)).toEqual(new Set(["review:acme/widgets#7:r1"]));
+
+    // Self-healing: the next observation of that identity records the
+    // transition, because the stored version still differs.
+    const client2 = makeFake();
+    await seedReviewItem(client2);
+    await seedReviewItem(client2, {
+      ...reviewEvidence("r2", { evidenceVersion: "state=changes_requested|commit=ccc3" }),
+      feedback: "second observation",
+    });
+    expect(client2.ledger).toHaveLength(2);
+    expect(client2.ledger[1]).toMatchObject({ identity: "review:acme/widgets#7:r2", sequence: 2 });
   });
 });

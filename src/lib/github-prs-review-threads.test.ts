@@ -182,4 +182,28 @@ describe("fetchPullRequestReviewThreadStates", () => {
 
     expect(map).toBeNull();
   });
+
+  it("fails closed when the connection is still paginating at the page bound", async () => {
+    // A connection that never ends would otherwise return a PARTIAL map, whose
+    // missing threads are indistinguishable from "thread state unknown" per
+    // comment — the exact shape the null return exists to prevent.
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string);
+      requests.push(body);
+      const after = (body.variables as { after?: string | null }).after ?? null;
+      return jsonResponse(200,
+        reviewThreadsPayload(
+          { hasNextPage: true, endCursor: after === null ? "c1" : `c${Number(after.slice(1)) + 1}` },
+          [{ isResolved: true, isOutdated: false, comments: { nodes: [{ databaseId: 9000 }] } }],
+        ),
+      );
+    });
+
+    const map = await fetchPullRequestReviewThreadStates("org/repo", 42);
+
+    expect(map).toBeNull();
+    // The bound is honored: 10 pages of 50 threads, then it gives up.
+    expect(requests).toHaveLength(10);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("thread state as unknown"));
+  });
 });

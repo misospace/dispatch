@@ -1710,3 +1710,261 @@ describe("durable evidence fields (#1249)", () => {
     expect(evidenceEnqueueInputs[0].evidenceObservedAt).toBe("not-a-date");
   });
 });
+
+// ─── Record-only review state transitions (#1276) ────────────────────────────
+//
+// A review that leaves CHANGES_REQUESTED is an observation of the ledger, not
+// work: ingestion must record the transition on the EXISTING item's durable
+// ledger and enqueue nothing, and must still report the event as not-enqueued.
+//
+// makeClient above is deliberately ledger-inert (its transaction handle has no
+// prFixEvidence), which is what keeps every pre-existing enqueue assertion
+// exactly as it was. These cases need the durable surface to be observable at
+// all, so this is the smallest ledger-capable fake: lookup by (repo, pr) plus
+// the pinned counter claim the record-only path makes.
+
+function makeLedgerClient() {
+  const items: any[] = [];
+  const ledger: any[] = [];
+  const history: any[] = [];
+  let seq = 0;
+  const applyData = (row: any, data: any) => {
+    for (const [key, value] of Object.entries(data ?? {})) {
+      if (value !== null && typeof value === "object" && "increment" in (value as any)) {
+        row[key] = (row[key] ?? 0) + (value as any).increment;
+      } else {
+        row[key] = value;
+      }
+    }
+  };
+  const client: any = {
+    items,
+    ledger,
+    history,
+    issue: { findFirst: async () => null },
+    prFixQueueItem: {
+      findUnique: async ({ where }: any) =>
+        where.repo_pr
+          ? items.find((r) => r.repo === where.repo_pr.repo && r.pr === where.repo_pr.pr) ?? null
+          : items.find((r) => r.id === where.id) ?? null,
+      create: async ({ data }: any) => {
+        const row = {
+          id: `item-${++seq}`,
+          generation: 1,
+          fixAttempts: 1,
+          evidenceSequence: 0,
+          status: "QUEUED",
+          feedback: [],
+          evidenceKeys: [],
+          postDispatchEvidenceKeys: [],
+          ...data,
+        };
+        items.push(row);
+        return row;
+      },
+      update: async ({ where, data }: any) => {
+        const row = items.find((r) => r.id === where.id);
+        if (!row) throw new Error("P2025");
+        applyData(row, data);
+        return row;
+      },
+      updateMany: async ({ where, data }: any) => {
+        const hit = items.filter(
+          (r) =>
+            r.id === where.id &&
+            (where.evidenceSequence === undefined || r.evidenceSequence === where.evidenceSequence),
+        );
+        for (const row of hit) applyData(row, data);
+        return { count: hit.length };
+      },
+    },
+    prFixHistory: {
+      create: async ({ data }: any) => {
+        history.push(data);
+        return data;
+      },
+    },
+    prFixEvidence: {
+      findFirst: async ({ where }: any) =>
+        ledger.find((row) => row.itemId === where.itemId && row.identity === where.identity) ?? null,
+      findMany: async ({ where }: any) =>
+        ledger.filter(
+          (row) =>
+            row.itemId === where.itemId &&
+            (where.contentSignature === undefined || row.contentSignature === where.contentSignature),
+        ),
+      upsert: async ({ where, create, update }: any) => {
+        const { itemId, identity } = where.itemId_identity;
+        const existing = ledger.find((row) => row.itemId === itemId && row.identity === identity);
+        if (existing) {
+          Object.assign(existing, update);
+          return existing;
+        }
+        const row = { ...create };
+        ledger.push(row);
+        return row;
+      },
+    },
+    $transaction: async (fn: any) => fn(client),
+  };
+  return client;
+}
+
+/** The CHANGES_REQUESTED review that opens the item the transition lands on. */
+const REQUESTED_REVIEW = {
+  repoFullName: "org/repo",
+  prNumber: 42,
+  branch: "fix/test",
+  url: "https://github.com/org/repo/pull/42",
+  title: "Fix test",
+  author: "itsmiso-ai",
+  reviewBody: "Test failed: expected 200 but got 404",
+  reviewId: "r1",
+  reviewState: "CHANGES_REQUESTED",
+  actorLogin: "octocat",
+  commitId: "abc123",
+  submittedAt: "2026-10-01T10:00:00Z",
+  headSha: "head-review",
+  source: "webhook",
+} as const;
+
+describe("record-only review state transitions (#1276)", () => {
+  beforeEach(() => {
+    process.env.PR_FOLLOWUP_BOT_IDENTITIES = "itsmiso-ai";
+    evidenceEnqueueInputs.length = 0;
+  });
+
+  afterEach(() => {
+    delete process.env.PR_FOLLOWUP_BOT_IDENTITIES;
+  });
+
+  it("an APPROVED re-read records the transition and enqueues no work", async () => {
+    const client = makeLedgerClient();
+    await ingestReviewEvent(client, REQUESTED_REVIEW);
+    expect(client.items).toHaveLength(1);
+    expect(client.ledger).toHaveLength(1);
+    const before = {
+      status: client.items[0].status,
+      lane: client.items[0].lane,
+      feedback: [...client.items[0].feedback],
+      generation: client.items[0].generation,
+      history: client.history.length,
+    };
+
+    const result = await ingestReviewEvent(client, { ...REQUESTED_REVIEW, reviewState: "APPROVED" });
+
+    // Recorded, and reported as NOT enqueued.
+    expect(result).toBeNull();
+    expect(evidenceEnqueueInputs).toHaveLength(1); // only the CHANGES_REQUESTED enqueue
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({
+      identity: "review:org/repo#42:r1",
+      kind: "review",
+      version: "state=approved|commit=abc123",
+      actionable: false,
+    });
+    expect(client.items[0].evidenceSequence).toBe(2);
+    // Work state untouched: no enqueue, so nothing about the attempt moved.
+    expect(client.items[0].status).toBe(before.status);
+    expect(client.items[0].lane).toBe(before.lane);
+    expect(client.items[0].feedback).toEqual(before.feedback);
+    expect(client.items[0].generation).toBe(before.generation);
+    expect(client.items[0].fixAttempts).toBe(1);
+    expect(client.history).toHaveLength(before.history);
+  });
+
+  it("a DISMISSED review with no queue item records nothing and creates nothing", async () => {
+    const client = makeLedgerClient();
+    const result = await ingestReviewEvent(client, {
+      ...REQUESTED_REVIEW,
+      reviewState: "DISMISSED",
+      prNumber: 99,
+    });
+
+    expect(result).toBeNull();
+    expect(evidenceEnqueueInputs).toHaveLength(0);
+    expect(client.items).toHaveLength(0);
+    expect(client.ledger).toHaveLength(0);
+    expect(client.history).toHaveLength(0);
+  });
+
+  it("processPrFollowupEvents counts a record-only review as skipped, never enqueued", async () => {
+    const client = makeLedgerClient();
+    await ingestReviewEvent(client, REQUESTED_REVIEW);
+
+    const counts = await processPrFollowupEvents(client, [
+      {
+        eventType: "review",
+        repoFullName: "org/repo",
+        prNumber: 42,
+        branch: "fix/test",
+        url: "https://github.com/org/repo/pull/42",
+        title: "Fix test",
+        author: "itsmiso-ai",
+        body: "Test failed: expected 200 but got 404",
+        id: "r1",
+        state: "APPROVED",
+        actorLogin: "octocat",
+        commitId: "abc123",
+        submittedAt: "2026-10-01T10:00:00Z",
+        headSha: "head-review",
+        source: "sync",
+      },
+    ]);
+
+    expect(counts).toEqual({ enqueued: 0, skipped: 1 });
+    expect(client.ledger[0]).toMatchObject({
+      version: "state=approved|commit=abc123",
+      actionable: false,
+    });
+    expect(client.items[0].status).toBe("QUEUED");
+  });
+
+  it("an existing CHANGES_REQUESTED review still enqueues work exactly as before", async () => {
+    const client = makeLedgerClient();
+    const counts = await processPrFollowupEvents(client, [
+      {
+        eventType: "review",
+        repoFullName: "org/repo",
+        prNumber: 42,
+        branch: "fix/test",
+        url: "https://github.com/org/repo/pull/42",
+        title: "Fix test",
+        author: "itsmiso-ai",
+        body: "Test failed: expected 200 but got 404",
+        id: "r1",
+        state: "CHANGES_REQUESTED",
+        actorLogin: "octocat",
+        commitId: "abc123",
+        submittedAt: "2026-10-01T10:00:00Z",
+        headSha: "head-review",
+        source: "sync",
+      },
+    ]);
+
+    expect(counts).toEqual({ enqueued: 1, skipped: 0 });
+    expect(client.items).toHaveLength(1);
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].type).toBe("REVIEW_FEEDBACK");
+    expect(client.ledger).toHaveLength(1);
+    expect(client.ledger[0]).toMatchObject({ version: "state=changes_requested|commit=abc123", actionable: true });
+  });
+
+  it("the eligibility filters still apply to record-only reviews", async () => {
+    const client = makeLedgerClient();
+    await ingestReviewEvent(client, REQUESTED_REVIEW);
+    const ledgerBefore = { ...client.ledger[0] };
+
+    // Non-bot PR author, terminal PR, and a disallowed branch owner each drop
+    // the observation exactly like they drop work.
+    await ingestReviewEvent(client, { ...REQUESTED_REVIEW, reviewState: "APPROVED", author: "human" });
+    await ingestReviewEvent(client, { ...REQUESTED_REVIEW, reviewState: "APPROVED", prState: "closed" });
+    process.env.PR_FOLLOWUP_BRANCH_OWNERS = "other-org";
+    await ingestReviewEvent(client, { ...REQUESTED_REVIEW, reviewState: "APPROVED" });
+    delete process.env.PR_FOLLOWUP_BRANCH_OWNERS;
+
+    expect(client.ledger[0]).toEqual(ledgerBefore);
+    expect(client.items[0].evidenceSequence).toBe(1);
+    expect(evidenceEnqueueInputs).toHaveLength(1);
+  });
+});

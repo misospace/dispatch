@@ -60,8 +60,9 @@ interface RawGraphQLResponse {
  * review thread's resolved/outdated state.
  *
  * One read per PR, bounded to 10 pages. Fail-closed: any missing credential,
- * non-2xx response, GraphQL error, or unknown shape returns `null` so the
- * caller treats the thread state as *unknown* rather than silently resolved —
+ * non-2xx response, GraphQL error, unknown shape, or a thread connection that
+ * is still paginating when the bound runs out returns `null` so the caller
+ * treats the thread state as *unknown* rather than silently resolved —
  * missing/unknown forge evidence is never deemed resolved (dispatch#1249).
  */
 export async function fetchPullRequestReviewThreadStates(
@@ -75,6 +76,10 @@ export async function fetchPullRequestReviewThreadStates(
     const headers = await getHeadersAsync();
     const map = new Map<string, { resolved: boolean; outdated: boolean }>();
     let after: string | null = null;
+    // A connection that still has pages when the bound runs out is NOT fully
+    // read: threads past the cap would be absent from the map and their
+    // comments would read as "unknown thread" instead of their real state.
+    let truncated = false;
 
     for (let page = 0; page < REVIEW_THREAD_MAX_PAGES; page++) {
       const response = await fetchWithRetry(
@@ -121,8 +126,27 @@ export async function fetchPullRequestReviewThreadStates(
         }
       }
 
-      if (!connection.pageInfo?.hasNextPage || !connection.pageInfo?.endCursor) break;
-      after = connection.pageInfo.endCursor;
+      const pageInfo = connection.pageInfo;
+      if (!pageInfo?.hasNextPage) break;
+      // Still paginating with no cursor to continue from is just as incomplete
+      // as running out of pages: threads past this point were never read.
+      if (!pageInfo.endCursor) {
+        truncated = true;
+        break;
+      }
+      after = pageInfo.endCursor;
+      if (page === REVIEW_THREAD_MAX_PAGES - 1) truncated = true;
+    }
+
+    // Fail-closed at the bound: a partial thread map would silently classify
+    // every unvisited comment's thread as unknown-but-not-resolved, which is
+    // exactly the "missing evidence read as resolved" shape the null return
+    // exists to prevent. Treat the whole read as unavailable instead (#1249).
+    if (truncated) {
+      console.warn(
+        `[github-prs] review-thread states for ${repoFullName}#${prNumber}: more than ${REVIEW_THREAD_MAX_PAGES * REVIEW_THREAD_PAGE_SIZE} threads; treating thread state as unknown`,
+      );
+      return null;
     }
 
     return map;

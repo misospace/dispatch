@@ -50,6 +50,19 @@ describe("archived repos (#1106)", () => {
     expect(client.history[0]).toMatchObject({ action: "mark", status: "STALE", note: "Upstream repo archived at reconcile time (#1106)" });
   });
 
+  it("reaping to STALE retires the attempt's evidence snapshot (#1249)", async () => {
+    const client = makeClient([
+      { ...item("a", "org/archived", 1, "QUEUED"), attemptEvidenceWatermark: 4 },
+    ]);
+
+    await reconcileArchivedRepoPrFixItems(client, vi.fn(async () => true));
+
+    // A terminal disposition must not leave a watermark behind: a settled item
+    // carries no attempt for a durable snapshot to bound, and a stale one would
+    // reopen the item on evidence this attempt already had.
+    expect(client.items[0].attemptEvidenceWatermark).toBeNull();
+  });
+
   it("refuses to requeue an item in an archived repo", async () => {
     const client = makeClient([item("a", "org/archived", 1, "BLOCKED")]);
 
