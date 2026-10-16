@@ -8,11 +8,19 @@
  * (real-time GitHub event reception). Both paths converge on the same ingestion logic.
  */
 
-import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, recordPrFixEvidenceBaseline, PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
 import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
+import {
+  conditionEvidenceKey,
+  computeEvidenceContentSignature,
+  computeEvidenceVersion,
+  isActionableEvidenceVersion,
+  type EvidenceVersionFields,
+  type PrFixEvidenceKind,
+} from "@/lib/pr-fix-evidence";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -322,6 +330,13 @@ interface IngestDescriptor {
   sourceId: (event: PrFollowupEvent) => string;
   /** Lane/type/reason/feedback for the enqueued item. */
   workItem: (event: PrFollowupEvent) => IngestWorkItem;
+  /**
+   * Whether this event is a RECORD-ONLY observation (#1276): a state
+   * transition that must update the durable evidence ledger for an existing
+   * PR-fix item without enqueueing, reopening, or otherwise touching work.
+   * Optional — event types that never observe state transitions omit it.
+   */
+  recordOnly?: (event: PrFollowupEvent) => boolean;
 }
 
 function laneFor(feedback: string): "NORMAL" | "NEEDS_HUMAN" {
@@ -357,8 +372,6 @@ function reviewLane(body: string): "NORMAL" | "NEEDS_HUMAN" {
 }
 
 
-const PROBLEMATIC_MERGE_STATES = ["behind", "dirty", "unstable", "has_hooks"];
-
 const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor> = {
   comment: {
     isIngestible: (event) => Boolean(event.body && event.id),
@@ -391,8 +404,19 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
   },
   review: {
     isIngestible: (event) => Boolean(event.state && event.id),
-    // Only CHANGES_REQUESTED triggers PR-fix work (not APPROVED or COMMENTED)
-    gate: (event) => event.state === "CHANGES_REQUESTED",
+    // Only a review that DEMANDS work triggers PR-fix work (not APPROVED or
+    // COMMENTED). Both predicates below read the ledger's own actionability
+    // decision rather than string literals, so the work gate, the record-only
+    // branch, and the `actionable` stamp the row is written with can never
+    // disagree about the same state (#1276 review).
+    gate: (event) => isActionableEvidenceVersion("review", { state: event.state }),
+    // Every OTHER review state is a record-only observation of the same
+    // identity (#1276). The sync used to drop APPROVED/COMMENTED/DISMISSED
+    // reviews on the way in, so a review leaving CHANGES_REQUESTED never
+    // reached the ledger and the item kept a stale actionable baseline forever.
+    // Recording the transition is what makes the dismissal visible; enqueueing
+    // from it is exactly what must not happen.
+    recordOnly: (event) => Boolean(event.state) && !isActionableEvidenceVersion("review", { state: event.state }),
     filterTerminalPr: true,
     sourceId: (event) => event.id,
     workItem: (event) => ({
@@ -472,8 +496,32 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
   },
   merge_state: {
     isIngestible: (event) => Boolean(event.mergeStateStatus),
-    // Only problematic states trigger PR-fix work
-    gate: (event) => PROBLEMATIC_MERGE_STATES.includes((event.mergeStateStatus ?? "").toLowerCase()),
+    // Only problematic states trigger PR-fix work. Like the `review` gate
+    // above, this reads the ledger's own actionability decision rather than a
+    // string list, so the work gate, the record-only branch, and the
+    // `actionable` stamp the row is written with can never disagree about the
+    // same state (#1276 review).
+    gate: (event) => isActionableEvidenceVersion("merge_state", { mergeStateStatus: event.mergeStateStatus }),
+    // A DEFINITE non-problematic state is a record-only observation of the
+    // same stable identity (#1276 review). The sync used to drop `clean` and
+    // every other non-problematic re-read on the way in, so the ledger row for
+    // `merge_state:<repo>#<pr>` stayed frozen at its last `dirty`/`behind`
+    // version with `actionable: true` — a baseline that no longer describes the
+    // PR, and that any consumer of the durable per-condition baseline (#1253's
+    // `evaluateEvidenceFreshness`) would read as a live condition. Recording
+    // the cleared version is what makes the clearing visible; enqueueing from
+    // it is exactly what must not happen.
+    //
+    // `unknown` DEFERS: GitHub is still computing mergeability, so it is the
+    // absence of an observation, not a cleared one — recording it would
+    // overwrite an actionable `dirty` baseline with a non-actionable version at
+    // a higher sequence, silencing a real condition. This is the same defer
+    // rule `evidenceFieldsFor` applies to an unread `review_comment` thread
+    // state below.
+    recordOnly: (event) =>
+      Boolean(event.mergeStateStatus) &&
+      (event.mergeStateStatus ?? "").toLowerCase() !== "unknown" &&
+      !isActionableEvidenceVersion("merge_state", { mergeStateStatus: event.mergeStateStatus }),
     filterTerminalPr: true,
     sourceId: (event) => event.mergeStateStatus ?? "",
     workItem: (event) => ({
@@ -489,13 +537,116 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
 };
 
 /**
+ * Durable per-event evidence block (#1249). The pure helpers in `pr-fix-evidence`
+ * own the canonical version / actionability / content-signature logic; this is a
+ * thin projection from a follow-up event onto the ledger's `evidence*` fields.
+ * `merge_state` uses a stable per-PR identity (`conditionEvidenceKey`) so a PR's
+ * repeated merge-state observations are not treated as distinct work.
+ */
+function evidenceFieldsFor(event: PrFollowupEvent) {
+  const kind: PrFixEvidenceKind = event.eventType;
+  // #1249: a `review_comment` ledger row is only written when the thread
+  // state was actually READ. Unknown thread state DEFERS: the observation
+  // falls back to the pre-#1249 bounded-cache semantics instead of recording
+  // an unknown-version row — a transient GraphQL failure never overwrites a
+  // known resolved/unresolved baseline (which could either strand real
+  // feedback or flip a cleared thread back to fresh).
+  if (kind === "review_comment" && event.threadResolved == null && event.threadOutdated == null) {
+    return {
+      evidenceKind: null,
+      evidenceVersion: null,
+      evidenceContentSignature: null,
+      evidenceObservedAt: null,
+      evidenceActionable: null,
+      evidenceHeadSha: null,
+      evidenceSource: null,
+      evidenceKey: computeEvidenceKey(
+        event.eventType,
+        INGEST_DESCRIPTORS[event.eventType].sourceId(event),
+        event.repoFullName,
+        event.prNumber,
+      ),
+    };
+  }
+  const fields: EvidenceVersionFields = {
+    state: event.state ?? null,
+    commitId: event.commitId ?? null,
+    updatedAt: event.updatedAt ?? null,
+    resolved: event.threadResolved ?? null,
+    outdated: event.threadOutdated ?? null,
+    actorLogin: event.actorLogin ?? event.author ?? null,
+    headSha: event.headSha ?? null,
+    checkStatus: event.checkStatus ?? null,
+    conclusion: event.conclusion ?? null,
+    mergeStateStatus: event.mergeStateStatus ?? null,
+  };
+  const evidenceVersion = computeEvidenceVersion(kind, fields);
+  const evidenceActionable = isActionableEvidenceVersion(kind, fields);
+  const hasBody = kind === "review" || kind === "comment" || kind === "review_comment";
+  const evidenceContentSignature = hasBody
+    ? computeEvidenceContentSignature({
+        body: event.body ?? null,
+        actorLogin: fields.actorLogin,
+        state: event.state ?? null,
+        commitId: event.commitId ?? null,
+      })
+    : null;
+  const evidenceObservedAt =
+    kind === "review"
+      ? event.submittedAt ?? null
+      : kind === "comment" || kind === "review_comment"
+        ? event.updatedAt ?? null
+        : kind === "check_run"
+          ? event.completedAt ?? null
+          : null;
+  const evidenceKey =
+    kind === "merge_state"
+      ? conditionEvidenceKey("merge_state", event.repoFullName, event.prNumber)
+      : computeEvidenceKey(event.eventType, INGEST_DESCRIPTORS[event.eventType].sourceId(event), event.repoFullName, event.prNumber);
+
+  return {
+    evidenceKind: kind,
+    evidenceVersion,
+    evidenceContentSignature,
+    evidenceObservedAt,
+    evidenceActionable,
+    evidenceHeadSha: event.headSha ?? null,
+    evidenceSource: event.source ?? null,
+    evidenceKey,
+  };
+}
+
+/**
  * Shared ingestion path for all PR follow-up event types.
  * Returns the evidence key if the event was eligible and enqueued,
  * or null if it was filtered out (gated, terminal PR, not bot-authored,
- * or owner not allowed).
+ * or owner not allowed), or if it was a record-only observation (#1276) —
+ * a ledger update that enqueues nothing and is therefore reported as
+ * not-enqueued so the caller's counters stay honest about real work.
  */
 async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Promise<string | null> {
   const descriptor = INGEST_DESCRIPTORS[event.eventType];
+
+  // #1276: a record-only observation short-circuits BEFORE the work gate. It
+  // enqueues nothing, so it must never be decided by `gate` (which exists to
+  // filter work), but it IS still subject to the same eligibility filters as a
+  // work event: a terminal PR, a non-bot-authored PR, or a disallowed branch
+  // owner is not an observation of this queue's work at all.
+  if (descriptor.recordOnly?.(event)) {
+    if (descriptor.filterTerminalPr && (event.prMergedAt || event.prState === "closed")) return null;
+    if (!isAllowedBotAuthor(event.author)) return null;
+    if (!isAllowedBranchOwner(event.repoFullName)) return null;
+    if (!descriptor.isIngestible(event)) return null;
+    const { evidenceKey, ...evidence } = evidenceFieldsFor(event);
+    await recordPrFixEvidenceBaseline(client, {
+      repo: event.repoFullName,
+      pr: event.prNumber,
+      evidenceKey,
+      ...evidence,
+    });
+    return null;
+  }
+
   if (!descriptor.gate(event)) return null;
 
   // Filter merged/closed PRs — do not enqueue work for terminal PRs
@@ -542,7 +693,7 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
       });
     }
   }
-  const evidenceKey = computeEvidenceKey(event.eventType, descriptor.sourceId(event), event.repoFullName, event.prNumber);
+  const { evidenceKey, ...evidence } = evidenceFieldsFor(event);
 
   await enqueuePrFixItem(client, {
     repo: event.repoFullName,
@@ -558,6 +709,7 @@ async function ingestEvent(client: PrFixQueueClient, event: PrFollowupEvent): Pr
     title: event.title,
     headSha: event.headSha ?? null,
     author: event.author,
+    ...evidence,
   });
 
   return evidenceKey;
@@ -580,6 +732,11 @@ export async function ingestCommentEvent(
     commentBody: string;
     commentId: string;
     linkedIssue?: number | null;
+    /** The comment author's login (drives the durable `actor=` slot). */
+    actorLogin?: string | null;
+    updatedAt?: string | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -593,6 +750,10 @@ export async function ingestCommentEvent(
     body: opts.commentBody,
     id: opts.commentId,
     linkedIssue: opts.linkedIssue,
+    actorLogin: opts.actorLogin,
+    updatedAt: opts.updatedAt,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -614,6 +775,12 @@ export async function ingestReviewEvent(
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
+    /** The review author's login (drives the durable `actor=` slot). */
+    actorLogin?: string | null;
+    commitId?: string | null;
+    submittedAt?: string | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -630,6 +797,11 @@ export async function ingestReviewEvent(
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
+    actorLogin: opts.actorLogin,
+    commitId: opts.commitId,
+    submittedAt: opts.submittedAt,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -658,6 +830,14 @@ export async function ingestReviewCommentEvent(
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
+    /** The review-comment author's login (drives the durable `actor=` slot). */
+    actorLogin?: string | null;
+    commitId?: string | null;
+    updatedAt?: string | null;
+    threadResolved?: boolean | null;
+    threadOutdated?: boolean | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -675,6 +855,13 @@ export async function ingestReviewCommentEvent(
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
+    actorLogin: opts.actorLogin,
+    commitId: opts.commitId,
+    updatedAt: opts.updatedAt,
+    threadResolved: opts.threadResolved,
+    threadOutdated: opts.threadOutdated,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -699,6 +886,10 @@ export async function ingestCheckRunEvent(
     checkRunUrl?: string | null;
     checkDetails?: string;
     linkedIssue?: number | null;
+    checkStatus?: string | null;
+    completedAt?: string | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -715,6 +906,10 @@ export async function ingestCheckRunEvent(
     conclusion: opts.conclusion,
     checkName: opts.checkName,
     linkedIssue: opts.linkedIssue,
+    checkStatus: opts.checkStatus,
+    completedAt: opts.completedAt,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -734,6 +929,8 @@ export async function ingestMergeStateEvent(
     prState?: string | null;
     prMergedAt?: string | null;
     linkedIssue?: number | null;
+    headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   return ingestEvent(client, {
@@ -744,12 +941,14 @@ export async function ingestMergeStateEvent(
     url: opts.url,
     title: opts.title,
     author: opts.author,
-    // The evidence key for merge_state events derives from the status itself.
+    // The evidence key for merge_state events is now a stable per-PR identity.
     id: opts.mergeStateStatus,
     mergeStateStatus: opts.mergeStateStatus,
     prState: opts.prState,
     prMergedAt: opts.prMergedAt,
     linkedIssue: opts.linkedIssue,
+    headSha: opts.headSha ?? null,
+    source: opts.source,
   });
 }
 
@@ -775,6 +974,7 @@ export async function ingestMergeConflict(
     mergeable: string; // "CONFLICTING", "MERGEABLE", "UNKNOWN"
     linkedIssue?: number | null;
     headSha?: string | null;
+    source?: "sync" | "webhook";
   },
 ): Promise<string | null> {
   // Only CONFLICTING PRs trigger merge conflict items
@@ -786,7 +986,15 @@ export async function ingestMergeConflict(
   // Check repo owner eligibility
   if (!isAllowedBranchOwner(opts.repoFullName)) return null;
 
-  const evidenceKey = computeEvidenceKey("merge_conflict", "conflicting", opts.repoFullName, opts.prNumber);
+  // #1249: a stable per-PR identity (not state-derived) so repeated
+  // conflicting observations on the same PR are not distinct work.
+  const evidenceKey = conditionEvidenceKey("merge_conflict", opts.repoFullName, opts.prNumber);
+  const conditionFields: EvidenceVersionFields = {
+    mergeable: opts.mergeable,
+    headSha: opts.headSha ?? null,
+  };
+  const evidenceVersion = computeEvidenceVersion("merge_conflict", conditionFields);
+  const evidenceActionable = isActionableEvidenceVersion("merge_conflict", conditionFields);
 
   await enqueuePrFixItem(client, {
     repo: opts.repoFullName,
@@ -802,6 +1010,13 @@ export async function ingestMergeConflict(
     title: opts.title,
     headSha: opts.headSha ?? null,
     author: opts.author,
+    evidenceKind: "merge_conflict",
+    evidenceVersion,
+    evidenceContentSignature: null,
+    evidenceObservedAt: null,
+    evidenceActionable,
+    evidenceHeadSha: opts.headSha ?? null,
+    evidenceSource: opts.source ?? null,
   });
 
   return evidenceKey;
@@ -818,6 +1033,12 @@ export async function clearResolvedConflictItems(
     repoFullName: string;
     prNumber: number;
     mergeable: string; // "MERGEABLE", "CONFLICTING", "UNKNOWN"
+    /**
+     * PR head SHA at observation time. Drives the cleared condition's version
+     * (`mergeable=<state>|head=<sha>`), so a re-conflict at the same head is
+     * still a transition rather than a replay of the cleared version.
+     */
+    headSha?: string | null;
   },
 ): Promise<boolean> {
   // Only clear when PR is no longer conflicting
@@ -832,9 +1053,53 @@ export async function clearResolvedConflictItems(
   // Only clear if it's a merge conflict item and still queued
   if (existing.type !== "MERGE_CONFLICT" || existing.status !== "QUEUED") return false;
 
+  // #1276 review: settle nothing before the ledger says the condition cleared.
+  // The `merge_conflict:<repo>#<pr>` row is otherwise left at its last
+  // `mergeable=conflicting` version with `actionable: true` — a baseline that
+  // contradicts the PR, which is why the clearing is recorded here rather than
+  // only in the bounded cache. ORDER MATTERS: recording first means a crash
+  // between the two leaves a stale QUEUED item (safe — the next sync re-runs
+  // idempotently) rather than a settled item whose baseline still says
+  // "conflicting" (unsafe — the contradiction outlives the settle).
+  // `evidenceActionable: false` is literal because the guard above already
+  // proved the PR is not CONFLICTING; the cleared write never re-derives
+  // actionability from a second read.
+  try {
+    await recordPrFixEvidenceBaseline(client, {
+      repo: opts.repoFullName,
+      pr: opts.prNumber,
+      evidenceKey: conditionEvidenceKey("merge_conflict", opts.repoFullName, opts.prNumber),
+      evidenceKind: "merge_conflict",
+      evidenceVersion: computeEvidenceVersion("merge_conflict", {
+        mergeable: opts.mergeable,
+        headSha: opts.headSha ?? null,
+      }),
+      evidenceContentSignature: null,
+      evidenceObservedAt: null,
+      evidenceActionable: false,
+      evidenceHeadSha: opts.headSha ?? null,
+      evidenceSource: "sync",
+    });
+  } catch (error) {
+    // Best-effort with respect to the settle: the conflict really did clear,
+    // so leaving the item QUEUED on a ledger write error would strand work
+    // that no longer exists. The worst case is a stale actionable row on an
+    // already-settled item, which contradicts the PR but enqueues nothing:
+    // condition kinds are not actionable post-dispatch evidence today
+    // (`hasActionablePostDispatchEvidence` reads only review/comment/check_run).
+    console.warn("[pr-followup-ingestion] cleared merge-conflict ledger record failed", {
+      repo: opts.repoFullName,
+      pr: opts.prNumber,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+  }
+
   await client.prFixQueueItem.update({
     where: { id: existing.id },
-    data: { status: "FIXED" },
+    // #1249: settling FIXED here ends the attempt, so its evidence snapshot
+    // boundary is cleared like every other terminal disposition — the durable
+    // read of a settled item must find no post-watermark evidence.
+    data: { status: "FIXED", attemptEvidenceWatermark: null },
   });
 
   await client.prFixHistory.create({
@@ -887,6 +1152,28 @@ export interface PrFollowupEvent {
    * and the queue records `FIXED` (#940).
    */
   headSha?: string | null;
+  /**
+   * The feedback author's login (comment/review body author). Distinct from
+   * `author` (the PR's author, used for the bot-author gate). Drives the
+   * durable `actor=` slot in the evidence version / content signature.
+   */
+  actorLogin?: string | null;
+  /** The commit the review/comment was written against (REST `commit_id`). */
+  commitId?: string | null;
+  /** review: REST `submitted_at`. */
+  submittedAt?: string | null;
+  /** comment / review_comment: REST `updated_at`. */
+  updatedAt?: string | null;
+  /** review_comment: whether its review thread is resolved (GraphQL). */
+  threadResolved?: boolean | null;
+  /** review_comment: whether its review thread is outdated (GraphQL). */
+  threadOutdated?: boolean | null;
+  /** check_run: REST lifecycle `status`. */
+  checkStatus?: string | null;
+  /** check_run: REST `completed_at`. */
+  completedAt?: string | null;
+  /** Ingestion source label recorded in the ledger (`sync` / `webhook`). */
+  source?: "sync" | "webhook";
 }
 
 /**

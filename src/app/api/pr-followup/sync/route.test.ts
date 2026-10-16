@@ -279,6 +279,52 @@ describe("POST /api/pr-followup/sync", () => {
     vi.unstubAllGlobals();
   });
 
+  // #1276 review: the sync is the only timer-driven producer of merge_state
+  // observations, and it used to drop `clean` before ingestion. The durable
+  // `merge_state:<repo>#<pr>` baseline could therefore never be retired by a
+  // clearing, because the clearing never arrived. The per-PR mergeability read
+  // is also what carries the head the cleared `merge_conflict` baseline names.
+  it("forwards a clean merge state and the head that a cleared conflict baseline records", async () => {
+    process.env.GITHUB_TOKEN = "gh_fake_token";
+    mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);
+    mocks.isAllowedBotAuthor.mockReturnValue(true);
+
+    const jsonRes = (data: unknown) => ({ ok: true, headers: new Headers(), json: async () => data, text: async () => "" });
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/pulls?state=open")) {
+        return jsonRes([{
+          id: 1, number: 265, url: "https://gh/pr/265", title: "fix", body: "Fixes #255",
+          state: "open", user: { login: "itsmiso-ai" },
+          head: { ref: "foreman/x/issue-255", sha: "head-265" },
+          base: { ref: "main" }, merged_at: null, draft: false, mergeable_state: "clean",
+        }]);
+      }
+      // Behind, not conflicting: the item is cleared, and the cleared ledger
+      // version names the head it was observed at.
+      if (/\/pulls\/\d+$/.test(u)) return jsonRes({ mergeable_state: "behind", mergeable: true });
+      return jsonRes([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await postRequest(true);
+    expect(res.status).toBe(200);
+
+    const events = mocks.processPrFollowupEvents.mock.calls.at(-1)?.[1] ?? [];
+    expect(
+      events.some((e: { eventType: string; mergeStateStatus?: string }) =>
+        e.eventType === "merge_state" && e.mergeStateStatus === "clean"),
+      "a clean merge state must reach ingestion so the record-only baseline path is reachable from the sync",
+    ).toBe(true);
+
+    expect(mocks.clearResolvedConflictItems).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ repoFullName: "misospace/windowstead", prNumber: 265, headSha: "head-265" }),
+    );
+
+    vi.unstubAllGlobals();
+  });
+
   it("calls reconcileStalePrFixItems during sync to reap stale queue items", async () => {
     process.env.GITHUB_TOKEN = "gh_fake_token";
     mocks.getTrackedRepos.mockResolvedValue(["misospace/windowstead"]);

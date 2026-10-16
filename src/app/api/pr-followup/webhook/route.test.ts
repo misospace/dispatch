@@ -537,6 +537,9 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         prState: "open",
         prMergedAt: null,
         headSha: "abc123",
+        actorLogin: "reviewer",
+        commitId: "abc123",
+        source: "webhook",
       },
     ]);
   });
@@ -550,6 +553,8 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         path: "src/app.ts",
         line: 12,
         user: { login: "reviewer" },
+        commit_id: "def456",
+        updated_at: "2026-10-15T10:00:00Z",
       },
       pull_request: pullRequest,
       repository,
@@ -570,6 +575,10 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         id: "777",
         linkedIssue: 7,
         headSha: "abc123",
+        actorLogin: "reviewer",
+        commitId: "def456",
+        updatedAt: "2026-10-15T10:00:00Z",
+        source: "webhook",
       },
     ]);
   });
@@ -618,6 +627,8 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         id: "888",
         linkedIssue: 7,
         headSha: null,
+        actorLogin: "reviewer",
+        source: "webhook",
       },
     ]);
   });
@@ -690,6 +701,8 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         checkName: "lint",
         linkedIssue: null,
         headSha: "abc123",
+        checkStatus: "completed",
+        source: "webhook",
       },
     ]);
   });
@@ -743,6 +756,8 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         checkName: "lint",
         linkedIssue: null,
         headSha: "abc123",
+        checkStatus: "completed",
+        source: "webhook",
       },
     ]);
   });
@@ -818,6 +833,7 @@ describe("POST /api/pr-followup/webhook — event dispatch", () => {
         prState: "open",
         prMergedAt: null,
         headSha: "abc123",
+        source: "webhook",
       },
     ]);
   });

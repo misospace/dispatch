@@ -250,6 +250,19 @@ model PrFixQueueItem {
   handoutReclaims Int @default(0)
   // Cooldown deadline for external dependency waits; due items are reissued lazily.
   retryAt DateTime?
+  // Durable evidence ledger position counter (#1249): every recorded ledger
+  // transition assigns the next sequence from this column (atomic increment on
+  // the same pinned write that records it). Monotonic for the item's life;
+  // never reset by fresh attempts — the ledger is per-item, not per-attempt.
+  evidenceSequence Int @default(0)
+  // Evidence-snapshot boundary of the CURRENT hand-out (#1249): the ledger
+  // sequence at dispatch — the durable record of what the worker was actually
+  // given. A transition recorded AFTER it was not in the issued snapshot and
+  // can be fresh; at-or-before it was. Cleared on every fresh attempt
+  // (freshAttemptGeneration) alongside postDispatchEvidenceKeys; NULL = never
+  // dispatched in the current life, so the durable ledger cannot decide
+  // freshness and callers use the bounded cache fast path.
+  attemptEvidenceWatermark Int?
   // Structured external-wait contract (#1250): bounded { kind, ref, evidence,
   // trigger } validated at every WAITING_EXTERNAL writer. Null on a
   // WAITING_EXTERNAL row means a legacy free-text wait (pre-#1250) — surfaced
@@ -257,6 +270,7 @@ model PrFixQueueItem {
   externalWait Json?
   author       String?
   history      PrFixHistory[]
+  evidence     PrFixEvidence[]
 
   @@unique([repo, pr])
   @@index([status])
@@ -282,6 +296,48 @@ model PrFixHistory {
 
   @@index([itemId])
   @@index([at])
+}
+
+// Durable per-item evidence ledger (#1249): one row per (item, identity)
+// holding the CURRENT forge-authoritative version of that identity, the
+// per-item transition sequence at which the current version was first
+// recorded, and the bounded content signature. Re-recording an already-stored
+// (identity, version) never creates a transition and never restamps anything,
+// so replayed webhooks and periodic re-reads are inert against the ledger.
+// The condition kinds (merge_state / merge_conflict) carry one stable identity
+// per PR, making this row the durable per-condition baseline that survives
+// bounded-cache eviction and unrelated dispositions. Rows are never pruned on
+// a live item; terminal items may be pruned by follow-up cleanup.
+model PrFixEvidence {
+  id               String         @id @default(cuid())
+  itemId           String
+  item             PrFixQueueItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  // Forge-authoritative identity (review:<repo>#<pr>:<id>, ..., or the stable
+  // condition identity merge_state:<repo>#<pr> / merge_conflict:<repo>#<pr>).
+  identity         String
+  kind             String
+  version          String
+  contentSignature String?
+  // Forge-side event timestamp (review submitted_at, comment updated_at,
+  // check completed_at). AUDIT ONLY — never a freshness predicate: late
+  // discovery stays fresh and replays stay inert via transition position.
+  observedAt       DateTime?
+  headSha          String?
+  source           String?
+  // Whether the CURRENT version is actionable by kind
+  // (`isActionableEvidenceVersion`). Settlement's durable post-dispatch set
+  // only counts actionable rows; cleared/dismissed/resolved versions stay
+  // recorded for audit without forcing a reopen.
+  actionable       Boolean        @default(true)
+  // Per-item monotonic transition position assigned from
+  // PrFixQueueItem.evidenceSequence when the CURRENT version was recorded.
+  sequence         Int
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([itemId, identity])
+  @@index([itemId, sequence])
+  @@index([itemId, contentSignature])
 }
 
 model AgentRun {

@@ -137,6 +137,10 @@ export function asPrFixQueueClient(client: PrismaClient): PrFixQueueClient {
     prFixQueueItem: client.prFixQueueItem,
     prFixHistory: client.prFixHistory,
     capacityHandoff: client.capacityHandoff,
+    // #1249: without this delegate every route handler's queue client was
+    // ledger-inert — `readEvidenceLedgerView`/`recordEvidenceTransition` no-op
+    // and settlement falls back to the bounded #1119 cache.
+    prFixEvidence: client.prFixEvidence,
     $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>): Promise<T> =>
       client.$transaction(fn as (tx: Prisma.TransactionClient) => Promise<T>),
   };

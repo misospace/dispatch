@@ -69,11 +69,20 @@ async function confirmPrFixHandOut(
   // observe concurrent re-issues; differing from candidate.generation
   // marks that a move was observed.
   let nextGeneration = candidate.generation;
+  // #1249: the generation whose dispatch stamp THIS pass flipped from
+  // undispatched (updateMany count === 1). Only that first hand-out of a
+  // generation stamps the evidence watermark.
+  let newlyDispatchedGeneration: number | null = null;
+  // The ledger counter read in the same snapshot as the payload this hand-out
+  // ships (#1249). Null when no confirming snapshot was taken (the catch
+  // fallback below), which leaves the watermark unstamped rather than
+  // guessing past undelivered evidence.
+  let dispatchEvidenceSequence: number | null = null;
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       const stampGeneration = nextGeneration;
       if (excluded(candidate.repo, candidate.pr, stampGeneration)) return null;
-      await prisma.prFixQueueItem.updateMany({
+      const stamp = await prisma.prFixQueueItem.updateMany({
         where: {
           id: candidate.id,
           generation: stampGeneration,
@@ -89,9 +98,23 @@ async function confirmPrFixHandOut(
           postDispatchEvidenceKeys: [],
         },
       });
+      if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
       const fresh = await prisma.prFixQueueItem.findUnique({
         where: { id: candidate.id },
-        select: { reason: true, feedback: true, generation: true, status: true, lane: true, agentHandouts: true },
+        select: {
+          reason: true,
+          feedback: true,
+          generation: true,
+          status: true,
+          lane: true,
+          agentHandouts: true,
+          // #1249: read the durable ledger counter in the SAME snapshot as the
+          // payload it bounds. Reading it separately would let a transition
+          // recorded in between raise the watermark past evidence this hand-out
+          // never delivered — settlement would then absorb exactly the loss
+          // class #1119 exists to prevent.
+          evidenceSequence: true,
+        },
       });
       if (
         !fresh ||
@@ -114,6 +137,8 @@ async function confirmPrFixHandOut(
       // The re-read confirms the row is still at the stamped
       // generation: the token may ship.
       confirmedGeneration = typeof fresh.generation === "number" ? fresh.generation : stampGeneration;
+      dispatchEvidenceSequence =
+        typeof fresh.evidenceSequence === "number" ? fresh.evidenceSequence : null;
       break;
     }
   } catch (error) {
@@ -133,7 +158,79 @@ async function confirmPrFixHandOut(
     console.warn(`next-task pr-fix hand-out for ${candidate.repo}#${candidate.pr}: no confirmed generation; deferring the item to the next poll`);
     return null;
   }
+  // #1249: stamp the evidence-snapshot boundary ONLY when this pass actually
+  // transitioned the dispatch stamp (count === 1 — the first hand-out of this
+  // generation). A repeat hand-out of an already-dispatched generation to a
+  // second agent must NOT raise the watermark: transitions recorded since the
+  // first stamp stay durably fresh, so settlement against any agent's report
+  // reopens rather than absorbs evidence the first worker never received.
+  // (The per-agent feedback re-read above still gives every worker the full
+  // current picture; the watermark guards settlement, not delivery.)
+  if (confirmedGeneration !== null && newlyDispatchedGeneration === confirmedGeneration) {
+    await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration, dispatchEvidenceSequence);
+  }
   return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane };
+}
+
+/**
+ * Stamp the durable evidence-snapshot boundary of this hand-out (#1249): the
+ * ledger sequence at dispatch is the durable record of what the worker was
+ * actually given — settlement reopens only on transitions recorded AFTER it.
+ *
+ * `evidenceSequence` is the value from the same row snapshot that assembled the
+ * payload this hand-out ships, so the boundary covers exactly the delivered
+ * evidence and can never sit above evidence the worker never received.
+ *
+ * Pinned as a LOWER BOUND (`gte`) on the counter, not an equality: a
+ * transition that lands after the payload snapshot moves the counter past it,
+ * and such evidence is exactly what this worker never received — so the stamp
+ * still applies, at the delivered position, and settlement reopens on that
+ * transition. An equality pin (or the reverse `lte` this replaced) instead
+ * rejects the stamp once the counter advanced and silently degrades the
+ * attempt to the bounded #1119 cache — losing durable post-dispatch freshness
+ * after cache eviction, the exact loss class #1249 exists to close. `gte`
+ * keeps the stamp at the DELIVERED position (the row's counter is monotonic and
+ * never reset, so it can only have moved on, never below), which is what
+ * prevents the watermark from ever sitting above evidence this worker never
+ * received.
+ *
+ * `attemptEvidenceWatermark: null` makes the stamp idempotent and
+ * first-hand-out-only: the watermark is cleared with every fresh attempt
+ * (`freshAttemptGeneration`, the sole generation bump), so a NULL watermark is
+ * exactly the pre-dispatch state of this generation. A retry — or anything
+ * that already stamped — can never overwrite a boundary another reader
+ * established, and the count stays an honest signal that this hand-out set it.
+ *
+ * Best-effort like the dispatch stamp around it: a failure here loses durable
+ * freshness tracking, never the task.
+ */
+async function stampAttemptEvidenceWatermark(
+  itemId: string,
+  generation: number,
+  evidenceSequence: number | null,
+): Promise<void> {
+  if (evidenceSequence === null) return;
+  try {
+    const { count } = await prisma.prFixQueueItem.updateMany({
+      where: {
+        id: itemId,
+        generation,
+        evidenceSequence: { gte: evidenceSequence },
+        attemptEvidenceWatermark: null,
+      },
+      data: { attemptEvidenceWatermark: evidenceSequence },
+    });
+    if (count !== 1) {
+      console.warn(
+        `next-task pr-fix evidence watermark stamp did not apply for item ${itemId} (generation ${generation}); durable post-dispatch freshness is unavailable for this attempt and settlement falls back to the bounded cache`,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `next-task pr-fix evidence watermark stamp failed for item ${itemId}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
 }
 
 export async function GET(

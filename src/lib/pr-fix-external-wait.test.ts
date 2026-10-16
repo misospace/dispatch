@@ -39,7 +39,7 @@ function clientFor(item: any, hooks: { beforeUpdate?: (where: any, data: any) =>
   return { client: client as PrFixQueueClient, history };
 }
 
-const item = () => ({ id: "pf1", repo: "org/repo", pr: 7, status: "QUEUED", lane: "NORMAL", generation: 4, fixAttempts: 5, attemptHeadSha: null as string | null, retryAt: null as Date | null, dispatchedGeneration: 4, dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"], postDispatchEvidenceKeys: [], outcome: null as string | null, externalWait: null as unknown });
+const item = () => ({ id: "pf1", repo: "org/repo", pr: 7, status: "QUEUED", lane: "NORMAL", generation: 4, fixAttempts: 5, attemptHeadSha: null as string | null, retryAt: null as Date | null, dispatchedGeneration: 4, dispatchedAt: new Date(), agentHandouts: ["worker@4"], handoutAcks: ["worker@4"], postDispatchEvidenceKeys: [] as string[], attemptEvidenceWatermark: null as number | null, outcome: null as string | null, externalWait: null as unknown });
 
 // #1250: every new WAITING_EXTERNAL mark/report must name a concrete,
 // verifiable dependency — this is the shared conforming payload.
@@ -269,6 +269,11 @@ describe("structured external-wait contract (#1250)", () => {
 
   it("downgrades a dependency-less wait mark to a fail-closed PARKED, generation-pinned", async () => {
     const row = item();
+    // A dispatched attempt's evidence snapshot must not survive the park
+    // (#1249/#1250 boundary): a terminal disposition clears it like every
+    // other sticky settle.
+    row.attemptEvidenceWatermark = 3;
+    row.postDispatchEvidenceKeys = ["review:org/repo#7:r1"];
     const { client, history } = clientFor(row);
     const result = await markPrFixItem(client, { repo: row.repo, pr: row.pr, status: "WAITING_EXTERNAL", expectedGeneration: 4, note: "no patch yet" });
     expect(result.mutated).toBe(true);
@@ -276,6 +281,8 @@ describe("structured external-wait contract (#1250)", () => {
     expect(row.lane).toBe("NORMAL");
     expect(row.outcome).toBe("invalid_wait");
     expect(row.retryAt).toBeNull();
+    expect(row.attemptEvidenceWatermark).toBeNull();
+    expect(row.postDispatchEvidenceKeys).toEqual([]);
     // #1250 review: the downgrade writes SQL NULL (Prisma.DbNull), not a
     // JSON null document.
     expect(row.externalWait).toBe(Prisma.DbNull);
@@ -322,6 +329,45 @@ describe("structured external-wait contract (#1250)", () => {
     expect(row.retryAt).toBeNull();
     expect(history[0].note).toContain("Fail-closed park");
     expect(history[0].note).toContain("still nothing to push");
+  });
+
+  it("downgrades a malformed wait contract arriving through the report path fail-closed", async () => {
+    const row = item();
+    // The dispatched attempt's snapshot must not survive the park either way
+    // (#1249/#1250 boundary), so the assertions pin both halves of the
+    // requirement: an invalid contract is not parked as a wait, and every
+    // terminal disposition clears the attempt snapshot.
+    row.attemptEvidenceWatermark = 3;
+    row.postDispatchEvidenceKeys = ["review:org/repo#7:r1"];
+    const { client, history } = clientFor(row);
+
+    const result = await resolvePrFixFromAgentReport({
+      repoFullName: row.repo,
+      pullRequestNumber: row.pr,
+      outcome: "waiting-external",
+      summary: "waiting on the upstream release",
+      attempt: { itemId: row.id, generation: 4 },
+      externalWait: { kind: "hope", ref: "nope", evidence: "trust me", trigger: "later" },
+      client,
+    });
+
+    // Not "deferred": the report named no verifiable dependency, so the single
+    // markPrFixItem writer parked it instead of parking it as a valid wait.
+    expect(result.action).toBe("parked");
+    expect(result.reason).toContain("invalid_wait");
+    expect(row.status).toBe("PARKED");
+    expect(row.outcome).toBe("invalid_wait");
+    expect(row.lane).toBe("NORMAL");
+    expect(row.retryAt).toBeNull();
+    // Terminal disposition ⇒ the attempt's evidence snapshot is retired, so a
+    // later settlement cannot key off this attempt's watermark.
+    expect(row.attemptEvidenceWatermark).toBeNull();
+    expect(row.postDispatchEvidenceKeys).toEqual([]);
+    // The invalid contract is never persisted as a wait contract.
+    expect(row.externalWait).toBe(Prisma.DbNull);
+    expect(history).toHaveLength(1);
+    expect(history[0].status).toBe("PARKED");
+    expect(history[0].outcome).toBe("invalid_wait");
   });
 
   it("reports a conforming wait as deferred, not parked", async () => {

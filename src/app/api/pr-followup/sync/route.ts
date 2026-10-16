@@ -6,6 +6,7 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
 import { fetchPullRequestCommitMessages } from "@/lib/github";
+import { fetchPullRequestReviewThreadStates } from "@/lib/github-prs";
 import { processPrFollowupEvents, extractLinkedIssue, isAllowedBotAuthor, ingestMergeConflict, clearResolvedConflictItems } from "@/lib/pr-followup-ingestion";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { acquireLock, releaseLock, type AcquiredLock, type LockConflict } from "@/lib/sync-lock";
@@ -52,6 +53,7 @@ interface GithubReview {
   state: string;
   user: { login: string };
   submitted_at: string;
+  commit_id: string;
 }
 
 /**
@@ -69,6 +71,8 @@ interface GithubReviewComment {
   path?: string;
   line?: number | null;
   original_line?: number | null;
+  updated_at?: string;
+  commit_id?: string;
 }
 
 interface GithubCheckRun {
@@ -79,6 +83,8 @@ interface GithubCheckRun {
   pull_requests: { url: string }[];
   html_url: string;
   details_url?: string;
+  status?: string;
+  completed_at?: string;
   output?: { title?: string; summary?: string };
 }
 
@@ -204,6 +210,15 @@ export async function POST(request: NextRequest) {
         // and the FIXED guard degrades to the legacy behaviour (accept).
         const prHeadSha = pr.head?.sha ?? null;
 
+        // #1249: REST doesn't expose whether an inline review comment's thread
+        // is resolved/outdated. One GraphQL read per PR (only when there are
+        // inline comments); fail-closed null leaves every comment's thread
+        // flags undefined.
+        const reviewThreadStates =
+          reviewComments.length > 0
+            ? await fetchPullRequestReviewThreadStates(repoFullName, pr.number)
+            : null;
+
         // Collect comment events
         for (const comment of comments) {
           // Ignore self-comments from the same bot identity
@@ -221,6 +236,9 @@ export async function POST(request: NextRequest) {
             id: String(comment.id),
             linkedIssue,
             headSha: prHeadSha,
+            actorLogin: comment.user.login,
+            updatedAt: comment.updated_at,
+            source: "sync",
           });
         }
 
@@ -245,31 +263,48 @@ export async function POST(request: NextRequest) {
             prState: pr.state,
             prMergedAt: pr.merged_at,
             headSha: prHeadSha,
+            actorLogin: rc.user?.login ?? null,
+            // #1249: the comment's own commit anchors the version/signature so
+            // "same body at the same commit" stays the anti-repetition rule and
+            // a re-paste against a NEWER commit remains fresh.
+            commitId: rc.commit_id ?? null,
+            updatedAt: rc.updated_at,
+            threadResolved: reviewThreadStates?.get(String(rc.id))?.resolved,
+            threadOutdated: reviewThreadStates?.get(String(rc.id))?.outdated,
+            source: "sync",
           });
         }
 
-        // Collect review events
+        // Collect review events. EVERY state present in the API response is
+        // pushed (#1276): a review that left CHANGES_REQUESTED (APPROVED,
+        // DISMISSED, COMMENTED) is a real state transition, and ingestion
+        // records it on the durable evidence ledger for the existing item
+        // WITHOUT enqueueing work. Dropping them here was what kept the
+        // ledger's actionable baseline stale forever.
         for (const review of reviews) {
-          if (review.state === "CHANGES_REQUESTED") {
-            allEvents.push({
-              eventType: "review" as const,
-              repoFullName,
-              prNumber: pr.number,
-              branch: pr.head?.ref ?? null,
-              url: pr.url,
-              title: pr.title,
-              author: pr.user.login,
-              body: review.body,
-              id: String(review.id),
-              state: review.state,
-              linkedIssue,
-              prState: pr.state,
-              prMergedAt: pr.merged_at,
-              headSha: prHeadSha,
-            });
-          } else {
-            totalSkipped++; // APPROVED/COMMENTED don't trigger PR-fix work
-          }
+          allEvents.push({
+            eventType: "review" as const,
+            repoFullName,
+            prNumber: pr.number,
+            branch: pr.head?.ref ?? null,
+            url: pr.url,
+            title: pr.title,
+            author: pr.user.login,
+            body: review.body,
+            id: String(review.id),
+            state: review.state,
+            linkedIssue,
+            prState: pr.state,
+            prMergedAt: pr.merged_at,
+            headSha: prHeadSha,
+            actorLogin: review.user.login,
+            commitId: review.commit_id,
+            submittedAt: review.submitted_at,
+            source: "sync",
+          });
+          // No `totalSkipped++` here: the event IS delivered, and ingestion
+          // reports it as not-enqueued (it enqueues no work — it only records
+          // the transition). Counting it on both sides would double it.
         }
 
         // Collect failing check run events
@@ -282,59 +317,73 @@ export async function POST(request: NextRequest) {
             // summary/"" when the log can't be read (e.g. no Actions:read).
             const jobId = jobIdFromCheckRunUrl(checkRun.html_url);
             const excerpt = jobId ? await fetchFailedJobLogExcerpt(repoFullName, jobId) : "";
-            allEvents.push({
-              eventType: "check_run" as const,
-              repoFullName,
-              prNumber: pr.number,
-              branch: pr.head?.ref ?? null,
-              url: pr.url,
-              checkRunUrl: checkRun.html_url,
-              title: checkRun.name,
-              author: pr.user.login,
-              body: excerpt || checkRun.output?.summary || "",
-              id: String(checkRun.id),
-              conclusion: checkRun.conclusion,
-              checkName: checkRun.name,
-              linkedIssue,
-              headSha: prHeadSha,
-            });
+              allEvents.push({
+                eventType: "check_run" as const,
+                repoFullName,
+                prNumber: pr.number,
+                branch: pr.head?.ref ?? null,
+                url: pr.url,
+                checkRunUrl: checkRun.html_url,
+                title: checkRun.name,
+                author: pr.user.login,
+                body: excerpt || checkRun.output?.summary || "",
+                id: String(checkRun.id),
+                conclusion: checkRun.conclusion,
+                checkName: checkRun.name,
+                linkedIssue,
+                headSha: prHeadSha,
+                checkStatus: checkRun.status,
+                completedAt: checkRun.completed_at,
+                source: "sync",
+              });
           } else {
             totalSkipped++;
           }
         }
 
-        // Track merge state
-        if (pr.mergeable_state && pr.mergeable_state !== "clean") {
-          allEvents.push({
-            eventType: "merge_state" as const,
-            repoFullName,
-            prNumber: pr.number,
-            branch: pr.head?.ref ?? null,
-            url: pr.url,
-            title: pr.title,
-            author: pr.user.login,
-            mergeStateStatus: pr.mergeable_state,
-            id: String(pr.id ?? Date.now()),
-            linkedIssue,
-            prState: pr.state,
-            prMergedAt: pr.merged_at,
-            headSha: prHeadSha,
-          });
+        // Track merge state — every reported state, `clean` included (#1276
+        // review). The descriptor decides what each state means: a problematic
+        // one enqueues work, a definite non-problematic one records the cleared
+        // baseline on the durable `merge_state:<repo>#<pr>` ledger row, and
+        // `unknown` (GitHub still computing) is dropped by both — the same
+        // defer rule the conflict block above documents. The `clean` exclusion
+        // this replaces made the record-only branch unreachable from the only
+        // timer-driven producer, so a cleared condition could never retire its
+        // actionable baseline and the row stayed actionable until something else
+        // overwrote it.
+        if (pr.mergeable_state) {
+            allEvents.push({
+              eventType: "merge_state" as const,
+              repoFullName,
+              prNumber: pr.number,
+              branch: pr.head?.ref ?? null,
+              url: pr.url,
+              title: pr.title,
+              author: pr.user.login,
+              mergeStateStatus: pr.mergeable_state,
+              id: String(pr.id ?? Date.now()),
+              linkedIssue,
+              prState: pr.state,
+              prMergedAt: pr.merged_at,
+              headSha: prHeadSha,
+              source: "sync",
+            });
         }
 
         // Detect merge conflicts (CONFLICTING mergeable status)
         if (pr.mergeable && pr.mergeable.toUpperCase() === "CONFLICTING") {
-          const conflictKey = await ingestMergeConflict(asPrFixQueueClient(prisma), {
-            repoFullName,
-            prNumber: pr.number,
-            branch: pr.head?.ref ?? null,
-            url: pr.url,
-            title: pr.title,
-            author: pr.user.login,
-            mergeable: pr.mergeable,
-            linkedIssue,
-            headSha: prHeadSha,
-          });
+            const conflictKey = await ingestMergeConflict(asPrFixQueueClient(prisma), {
+              repoFullName,
+              prNumber: pr.number,
+              branch: pr.head?.ref ?? null,
+              url: pr.url,
+              title: pr.title,
+              author: pr.user.login,
+              mergeable: pr.mergeable,
+              linkedIssue,
+              headSha: prHeadSha,
+              source: "sync",
+            });
           if (conflictKey) {
             totalEnqueued++;
           }
@@ -345,6 +394,10 @@ export async function POST(request: NextRequest) {
               repoFullName,
               prNumber: pr.number,
               mergeable: pr.mergeable,
+              // #1276 review: the cleared `merge_conflict` ledger version names
+              // the head the clearing was observed at, so a re-conflict at this
+              // head still reads as a transition rather than a replay.
+              headSha: prHeadSha,
             });
           }
         }

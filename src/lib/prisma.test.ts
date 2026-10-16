@@ -90,6 +90,29 @@ describe("prisma module lazy initialization", () => {
   });
 });
 
+describe("asPrFixQueueClient delegate surface (#1249)", () => {
+  it("exposes the durable evidence ledger, or every route handler is ledger-inert", async () => {
+    const mod = await import("./prisma");
+    const delegates = {
+      issue: { name: "issue" },
+      prFixQueueItem: { name: "prFixQueueItem" },
+      prFixHistory: { name: "prFixHistory" },
+      capacityHandoff: { name: "capacityHandoff" },
+      prFixEvidence: { name: "prFixEvidence" },
+    };
+    const client = mod.asPrFixQueueClient({
+      ...delegates,
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(delegates),
+    } as any);
+
+    // The queue's durable read/write path (readEvidenceLedgerView,
+    // recordEvidenceTransition, listDurablePostDispatchEntries) no-ops when the
+    // client carries no ledger surface, which silently degrades production to
+    // the pre-#1249 bounded cache.
+    expect((client as any).prFixEvidence).toBe(delegates.prFixEvidence);
+  });
+});
+
 describe("prisma DATABASE_URL sslmode handling", () => {
   let adapterCtor: ReturnType<typeof vi.fn<(...args: unknown[]) => void>>;
   let PrismaPgMock: any;
