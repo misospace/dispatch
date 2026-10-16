@@ -70,6 +70,15 @@ export async function POST(request: Request) {
         return errorResponse("Issue not found in local cache", 404);
       }
 
+      // #1206: refuse closed issues, mirroring the claim/unclaim guards
+      // (cached state is fine for this check). Runs before the live-label
+      // fetch and the #1129 assigned-issue gate: a closed issue is rejected
+      // no matter who asks — no status label write, no cache update, no
+      // success audit row.
+      if (issue.state === "closed") {
+        return errorResponse("Cannot set status on a closed issue", 400);
+      }
+
       // Update GitHub labels
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
       const effectiveNumber = issue.number;
