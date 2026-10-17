@@ -60,6 +60,15 @@ export async function POST(request: Request) {
       // client only knew about one of them. Falls back to the client-sent
       // oldLabels when the issue isn't in the local cache.
       const issue = await prisma.issue.findUnique({ where: { id: issueId as string } });
+
+      // #1206: refuse closed issues, mirroring the claim/unclaim/status guards
+      // (cached state is fine for this check). Runs before any GitHub label
+      // write: no status swap, no cache update, no lifecycle event, and no
+      // audit row (refusal, not failure).
+      if (issue?.state === "closed") {
+        return errorResponse("Cannot move a closed issue", 400);
+      }
+
       const effectiveCurrentLabels = issue?.labels ?? (oldLabels as string[]);
 
       if (newStatusLabel) {
