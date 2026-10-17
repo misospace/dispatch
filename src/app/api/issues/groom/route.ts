@@ -101,6 +101,15 @@ export async function POST(request: Request) {
         return errorResponse("Issue not found in local cache", 404);
       }
 
+      // #1206: refuse closed issues, mirroring the claim/unclaim/status guards
+      // and the hosted groomer's own refusal at POST /api/groomer/run (cached
+      // state is fine for this check). Runs before any status transition or
+      // grooming write: no GitHub label write, no cache update, and no audit
+      // row (refusal, not failure).
+      if (issue.state === "closed") {
+        return errorResponse("Cannot groom a closed issue", 400);
+      }
+
       const effectiveRepo = (issue.repository?.fullName ?? repoFullName) as string;
       const effectiveNumber = issue.number;
       const effectiveIssueId = issue.id;
