@@ -120,6 +120,7 @@ function makeClient(): PrFixQueueClient & { items: any[]; ledger: any[]; history
           disposedAt: null,
           disposedEvidence: null,
           recoveryAppliedAt: null,
+          triggerEvaluatedAt: null,
           status: "QUEUED",
           lane: "NORMAL",
           feedback: [],
@@ -151,7 +152,51 @@ function makeClient(): PrFixQueueClient & { items: any[]; ledger: any[]; history
         for (const row of hits) applyData(row, data);
         return { count: hits.length };
       },
-      findMany: async ({ where }: any) => items.filter((r) => matches(r, where ?? {})),
+      findMany: async ({ where, orderBy, take }: any) => {
+        let out = items.filter((r) => matches(r, where ?? {}));
+        // Clause value is either a bare direction ("asc" / "desc") or a
+        // Prisma SortOrderInput ({ sort, nulls? }).
+        const clauses = (Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : []).flatMap((clause: any) =>
+          Object.entries(clause ?? {}).map(([key, value]) => {
+            if (value !== null && typeof value === "object") {
+              const input = value as { sort?: string; nulls?: string };
+              return [key, input.sort ?? "asc", input.nulls ?? null] as [string, string, string | null];
+            }
+            return [key, value as string, null] as [string, string, string | null];
+          }),
+        );
+        if (clauses.length > 0) {
+          // One composite comparator so later clauses only break ties of the
+          // earlier ones (matching Postgres ORDER BY semantics).
+          const compare = (a: any, b: any): number => {
+            for (const [key, dir, nulls] of clauses) {
+              const sign = dir === "desc" ? -1 : 1;
+              const av = a[key] ?? null;
+              const bv = b[key] ?? null;
+              if (av === bv) continue;
+              if (av === null || bv === null) {
+                // Postgres orders NULL as larger than every non-null value, so
+                // the DEFAULT is nulls LAST on ASC and nulls FIRST on DESC; an
+                // explicit `nulls` clause overrides that.
+                const nullsFirst = nulls === "first" || (nulls !== "last" && dir === "desc");
+                if (av === null && bv === null) continue;
+                if (av === null) return nullsFirst ? -1 : 1;
+                return nullsFirst ? 1 : -1;
+              }
+              if (av instanceof Date && bv instanceof Date) return sign * (av.getTime() - bv.getTime());
+              // `item-<n>` ids sort by creation, as real cuid ids do; plain
+              // string order would interleave item-10 before item-2.
+              const na = /^item-(\d+)$/.exec(String(av));
+              const nb = /^item-(\d+)$/.exec(String(bv));
+              if (na && nb) return sign * (Number(na[1]) - Number(nb[1]));
+              return sign * (String(av) < String(bv) ? -1 : 1);
+            }
+            return 0;
+          };
+          out = [...out].sort(compare);
+        }
+        return typeof take === "number" ? out.slice(0, take) : out;
+      },
     },
     prFixHistory: {
       create: async ({ data }: any) => {
@@ -233,6 +278,63 @@ const freshEnqueue = (evidenceKey: string) => ({
   feedback: "reviewer insists",
   headSha: "bbb2",
   ...ledgerFields(evidenceKey),
+});
+
+// The rotation stamp's fairness depends on NULL ordering, and a fake that
+// hard-codes the wrong default would green-light a starving query (#1253
+// review). Pin real Postgres semantics: NULL is larger than every non-null
+// value, so ASC defaults to nulls LAST and DESC to nulls FIRST; an explicit
+// `nulls` clause overrides it.
+describe("test fake findMany ordering mirrors Postgres null ordering", () => {
+  async function seedStamps(): Promise<any> {
+    const client: any = makeClient();
+    const old = new Date("2026-10-18T00:00:00Z");
+    const newer = new Date("2026-10-18T06:00:00Z");
+    await client.prFixQueueItem.create({ data: { repo: "acme/w", pr: 1, triggerEvaluatedAt: old } });
+    await client.prFixQueueItem.create({ data: { repo: "acme/w", pr: 2, triggerEvaluatedAt: null } });
+    await client.prFixQueueItem.create({ data: { repo: "acme/w", pr: 3, triggerEvaluatedAt: newer } });
+    await client.prFixQueueItem.create({ data: { repo: "acme/w", pr: 4, triggerEvaluatedAt: null } });
+    return client;
+  }
+
+  it("bare asc puts NULLs LAST and desc puts NULLs FIRST", async () => {
+    const client = await seedStamps();
+
+    expect((await client.prFixQueueItem.findMany({ orderBy: { triggerEvaluatedAt: "asc" } })).map((r: any) => r.pr))
+      .toEqual([1, 3, 2, 4]);
+    expect((await client.prFixQueueItem.findMany({ orderBy: { triggerEvaluatedAt: "desc" } })).map((r: any) => r.pr))
+      .toEqual([2, 4, 3, 1]);
+  });
+
+  it("an explicit nulls clause wins, and is what the reconciliation query relies on", async () => {
+    const client = await seedStamps();
+
+    expect((await client.prFixQueueItem.findMany({ orderBy: { triggerEvaluatedAt: { sort: "asc", nulls: "first" } } })).map((r: any) => r.pr))
+      .toEqual([2, 4, 1, 3]);
+    expect((await client.prFixQueueItem.findMany({ orderBy: { triggerEvaluatedAt: { sort: "asc", nulls: "last" } } })).map((r: any) => r.pr))
+      .toEqual([1, 3, 2, 4]);
+    expect((await client.prFixQueueItem.findMany({ orderBy: { triggerEvaluatedAt: { sort: "desc", nulls: "last" } } })).map((r: any) => r.pr))
+      .toEqual([3, 1, 2, 4]);
+  });
+
+  it("the reconciliation read orders never-considered rows first", async () => {
+    const client: any = makeClient();
+    const rows: any[] = [];
+    for (let i = 0; i < 3; i++) {
+      rows.push(await client.prFixQueueItem.create({ data: { repo: "acme/w", pr: i + 1, status: "WAITING_EXTERNAL" } }));
+    }
+    // Stamp the first two with the newest instant, as a prior pass would.
+    const newest = new Date("2026-10-18T06:00:00Z");
+    await client.prFixQueueItem.updateMany({ where: { id: { in: rows.slice(0, 2).map((r) => r.id) } }, data: { triggerEvaluatedAt: newest } });
+
+    const read = await client.prFixQueueItem.findMany({
+      where: { status: "WAITING_EXTERNAL" },
+      orderBy: [{ triggerEvaluatedAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
+      take: 500,
+    });
+
+    expect(read.map((r: any) => r.pr)).toEqual([3, 1, 2]);
+  });
 });
 
 describe("enqueue reactivation of a budget-available PARKED item (row 8, #1253)", () => {
@@ -788,9 +890,12 @@ describe("reconcileExternalWaitTriggers (row 12, #1253)", () => {
     const historyBefore = client.history.length;
 
     const originalUpdateMany = client.prFixQueueItem.updateMany.bind(client.prFixQueueItem);
-    let calls = 0;
+    const pinnedWheres: any[] = [];
     client.prFixQueueItem.updateMany = async (args: any) => {
-      calls += 1;
+      // The rotation stamp is not generation-pinned (#1253 review): let it
+      // through and race only the reactivation write.
+      if (args.where.generation === undefined) return originalUpdateMany(args);
+      pinnedWheres.push(args.where);
       // A concurrent requeue bumped the generation before the pinned write
       // evaluated: count 0, no retry loop in the reconciliation pass.
       expect(args.where.generation).toBe(waiting.generation);
@@ -800,7 +905,8 @@ describe("reconcileExternalWaitTriggers (row 12, #1253)", () => {
 
     const result = await reconcileExternalWaitTriggers(client);
 
-    expect(calls).toBe(1);
+    expect(pinnedWheres).toHaveLength(1);
+    expect(pinnedWheres[0]).toMatchObject({ id: waiting.id, status: "WAITING_EXTERNAL", generation: 1 });
     expect(result).toEqual({ evaluated: 1, reactivated: 0 });
     expect(waiting.status).toBe("WAITING_EXTERNAL");
     expect(client.history).toHaveLength(historyBefore);
@@ -854,6 +960,103 @@ describe("reconcileExternalWaitTriggers (row 12, #1253)", () => {
     expect(result).toEqual({ evaluated: 0, reactivated: 0 });
     expect(githubPrsMocks.fetchPullRequestState).not.toHaveBeenCalled();
     expect(client.items[0].status).toBe("WAITING_EXTERNAL");
+  });
+
+  // Seeds one WAITING_EXTERNAL row on its own (repo, pr) whose live `merged`
+  // trigger watches `ref`.
+  async function seedWaitingOn(pr: number, ref: string): Promise<any> {
+    await enqueuePrFixItem(client, {
+      repo: "acme/widgets",
+      pr,
+      lane: "NORMAL",
+      reason: "r",
+      feedback: "f",
+      headSha: "aaa1",
+      ...ledgerFields(`review:acme/widgets#${pr}:r1`, "aaa1"),
+    });
+    await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr,
+      status: "WAITING_EXTERNAL",
+      expectedGeneration: client.items.at(-1).generation,
+      note: "waiting",
+      externalWait: { kind: "upstream_pr", ref, evidence: "upstream open", trigger: { kind: "merged" } },
+    });
+    return client.items.at(-1);
+  }
+
+  it("rotates the scan head so a satisfied wait behind >maxEvaluations unsatisfied ones is still reached (#1253 review)", async () => {
+    // 21 unknown dependencies ahead of one satisfied dependency: more rows
+    // than the default 20-evaluation forge-read bound.
+    const head: any[] = [];
+    for (let i = 0; i < 21; i++) head.push(await seedWaitingOn(200 + i, `acme/deps#${i + 1}`));
+    const tail = await seedWaitingOn(299, "acme/deps#99");
+    // Only the LAST row's upstream ref is merged; every other dependency
+    // evaluates UNKNOWN (fetch returns no state).
+    githubPrsMocks.fetchPullRequestState.mockImplementation(async (repo: string, pr: number) =>
+      repo === "acme/deps" && pr === 99 ? { state: "merged", mergedAt: "2026-10-18T00:00:00Z" } : { state: null, mergedAt: null },
+    );
+
+    const first = await reconcileExternalWaitTriggers(client);
+
+    // Pass 1: bound hit on the head rows, tail never evaluated.
+    expect(first).toEqual({ evaluated: 20, reactivated: 0 });
+    expect(tail.status).toBe("WAITING_EXTERNAL");
+    // Considered rows are stamped; rows cut off by the forge-read bound are
+    // not, so they lead the next pass.
+    expect(head.slice(0, 20).every((r) => r.triggerEvaluatedAt instanceof Date)).toBe(true);
+    expect(head[20].triggerEvaluatedAt).toBeNull();
+    expect(tail.triggerEvaluatedAt).toBeNull();
+
+    const second = await reconcileExternalWaitTriggers(client);
+
+    // Pass 2: the two never-considered rows lead the fairness order, so the
+    // satisfied tail is reached (the pass then spends the rest of its bound on
+    // stamped head rows, which stay unsatisfied).
+    expect(second).toEqual({ evaluated: 20, reactivated: 1 });
+    expect(tail.status).toBe("QUEUED");
+    expect(tail.generation).toBe(2);
+    expect(tail.fixAttempts).toBe(1); // uncharged recheck
+    expect(client.history.at(-1)).toMatchObject({
+      note: "External-wait dependency satisfied; rechecking prerequisite (#1253).",
+    });
+    expect(head.filter((r) => r.status === "QUEUED")).toHaveLength(0);
+  });
+
+  it("does not let invalid/non-live rows at the head pin discovery behind the scan cap (#1253 review)", async () => {
+    // 500 rows the pass can never evaluate (legacy free-text contract and a
+    // non-live trigger) saturate EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT, with
+    // the satisfied row just past them.
+    const SATISFIED_PR = 400;
+    for (let i = 0; i < 500; i++) {
+      await client.prFixQueueItem.create({
+        data: {
+          repo: "acme/widgets",
+          pr: 500 + i,
+          headSha: "aaa1",
+          status: "WAITING_EXTERNAL",
+          lane: "NORMAL",
+          externalWait: i % 2 === 0 ? "waiting on the vendor to land the patch" : { kind: "external_service", ref: "vendor-api", evidence: "5xx", trigger: { kind: "service_ready" } },
+        },
+      });
+    }
+    const satisfied = await seedWaitingOn(SATISFIED_PR, "acme/deps#99");
+    githubPrsMocks.fetchPullRequestState.mockResolvedValue({ state: "merged", mergedAt: "2026-10-18T00:00:00Z" });
+
+    const first = await reconcileExternalWaitTriggers(client);
+
+    // Pass 1 reads the 500-row cap of unevaluable rows and stamps them all,
+    // spending no forge reads; the satisfied row is behind the cap.
+    expect(first).toEqual({ evaluated: 0, reactivated: 0 });
+    expect(githubPrsMocks.fetchPullRequestState).not.toHaveBeenCalled();
+    expect(satisfied.status).toBe("WAITING_EXTERNAL");
+
+    const second = await reconcileExternalWaitTriggers(client);
+
+    // Pass 2: stamped head rotates behind the never-considered row.
+    expect(second).toEqual({ evaluated: 1, reactivated: 1 });
+    expect(satisfied.status).toBe("QUEUED");
+    expect(client.items.filter((r: any) => r.status === "WAITING_EXTERNAL")).toHaveLength(500);
   });
 });
 

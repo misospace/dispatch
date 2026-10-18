@@ -795,9 +795,10 @@ const EXTERNAL_WAIT_REACTIVATION_BATCH = 100;
 // Per-sweep scan bound (#1250 review): the query already excludes legacy
 // (SQL NULL) contracts at the database level, so in-memory skips only defend
 // against rows whose stored JSON no longer validates — a shape writers can
-// no longer produce. Pagination past skipped rows is deterministic (id
-// cursor) and stops after this many scanned rows so pathological garbage
-// rows can stall discovery but never turn the sweep unbounded.
+// no longer produce. The scan stops after this many read rows so
+// pathological garbage rows can stall discovery but never turn the sweep
+// unbounded; which rows land inside the bound is decided by the fairness
+// order in `reconcileExternalWaitTriggers`, not by id position.
 const EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT = 500;
 
 async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): Promise<void> {
@@ -853,13 +854,26 @@ const LIVE_EXTERNAL_WAIT_TRIGGERS = new Set(["merged", "closed", "check_success"
  * of the prerequisite, not new work — no attempt is consumed; the cap still
  * applies to the recheck when it runs).
  *
- * Bounds: batch/scan pagination identical to `reactivateDueExternalWaits`
- * (reuse of its constants), plus `maxEvaluations` (default 20) — each
- * evaluation is a network read through the forge, so a backlog of waiting
- * rows must never turn this pass into an unbounded fan-out. "unsatisfied"
- * and "unknown" (including any fetch failure, which
+ * Bounds: one read of at most `EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT` rows
+ * (shared with `reactivateDueExternalWaits`) plus `maxEvaluations`
+ * (default 20) — each evaluation is a network read through the forge, so a
+ * backlog of waiting rows must never turn this pass into an unbounded
+ * fan-out. "unsatisfied" and "unknown" (including any fetch failure, which
  * `evaluateExternalWaitTrigger` already resolves to "unknown") mutate
  * nothing and are never retried here — the next pass re-evaluates.
+ *
+ * Fairness (#1253 review): the read is NOT ordered by id from a per-process
+ * cursor, which let the first `maxEvaluations` unsatisfied waits be re-read
+ * every pass while later waits were never reached. Rows are ordered
+ * least-recently-considered first — explicitly `nulls: "first"`, because the
+ * Postgres default for ASC is NULLS LAST and would otherwise rank the newest
+ * stamps first — then `id` as the deterministic tiebreak — and EVERY row the
+ * pass considered — evaluated, unparseable, or non-live — is stamped in one
+ * bulk write at the end of the pass, so the head of the order rotates and no
+ * wait can starve behind an earlier unsatisfied or invalid row. Rows the
+ * `maxEvaluations` forge-read bound cut off before the pass examined them stay
+ * unstamped and therefore lead the next one: each pass advances a bounded
+ * slice of the backlog instead of re-reading the same head.
  *
  * Returns counts for logging/audit. Never throws for a per-row failure
  * shape the evaluator swallows; unexpected client errors propagate to the
@@ -872,59 +886,77 @@ export async function reconcileExternalWaitTriggers(
   const maxEvaluations = options.maxEvaluations ?? 20;
   let evaluated = 0;
   let reactivated = 0;
-  let cursor: string | undefined;
-  let scanned = 0;
-  while (scanned < EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT && evaluated < maxEvaluations) {
-    const rows: any[] = await client.prFixQueueItem.findMany({
-      where: { status: "WAITING_EXTERNAL", externalWait: { not: Prisma.DbNull } },
-      orderBy: { id: "asc" },
-      ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-      take: EXTERNAL_WAIT_REACTIVATION_BATCH,
-    });
-    if (rows.length === 0) break;
-    scanned += rows.length;
-    for (const row of rows) {
-      cursor = row.id;
-      if (evaluated >= maxEvaluations) break;
-      if (row.status !== "WAITING_EXTERNAL") continue;
-      // A stored contract that no longer validates is a legacy wait: held
-      // for operator action, never evaluated or auto-requeued (#1250).
-      const wait = parseStoredExternalWait(row.externalWait);
-      if (!wait) continue;
-      if (!LIVE_EXTERNAL_WAIT_TRIGGERS.has(wait.trigger.kind)) continue;
-      evaluated += 1;
-      const evaluation = await evaluateExternalWaitTrigger(wait, row.repo);
-      if (evaluation !== "satisfied") continue;
-      const count = await client.$transaction(async (tx) => {
-        const { count } = await tx.prFixQueueItem.updateMany({
-          where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation },
-          data: {
-            status: "QUEUED",
-            ...freshAttemptGeneration(),
-            retryAt: null,
-            dispatchedGeneration: null,
-            dispatchedAt: null,
-            postDispatchEvidenceKeys: [],
-            attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
-            outcome: null,
-            decisionDetail: null,
-            agentHandouts: [],
-            handoutAcks: [],
-            handoutReceipts: [],
-            externalWait: Prisma.DbNull,
-            staleDisposition: false,
-          },
-        });
-        if (count === 1) {
-          await tx.prFixHistory.create({
-            data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait dependency satisfied; rechecking prerequisite (#1253)." },
-          });
-        }
-        return count;
+  const considered: string[] = [];
+  // Fair eligibility (#1253 review): least-recently-considered first, never-
+// considered (NULL) rows leading. `nulls: "first"` is REQUIRED, not cosmetic:
+  // Postgres treats NULL as larger than every non-null value, so the default
+  // for ASC is NULLS LAST and a bare `triggerEvaluatedAt: "asc"` would order
+  // the most recently stamped rows first — pinning the head and starving later
+  // waits. `id` only breaks ties. No in-process cursor exists to reset between
+  // passes.
+  const rows: any[] = await client.prFixQueueItem.findMany({
+    where: { status: "WAITING_EXTERNAL", externalWait: { not: Prisma.DbNull } },
+    orderBy: [{ triggerEvaluatedAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
+    take: EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT,
+  });
+  for (const row of rows) {
+    if (evaluated >= maxEvaluations) break;
+    // Reached by this pass: examined and about to be either evaluated or
+    // skipped in memory. Both count as considered (the stamp rotates them out
+    // of the head alike) — only rows the forge-read bound cut off before this
+    // point stay unstamped, so they lead the next pass.
+    considered.push(row.id);
+    if (row.status !== "WAITING_EXTERNAL") continue;
+    // A stored contract that no longer validates is a legacy wait: held
+    // for operator action, never evaluated or auto-requeued (#1250).
+    const wait = parseStoredExternalWait(row.externalWait);
+    if (!wait) continue;
+    if (!LIVE_EXTERNAL_WAIT_TRIGGERS.has(wait.trigger.kind)) continue;
+    evaluated += 1;
+    const evaluation = await evaluateExternalWaitTrigger(wait, row.repo);
+    if (evaluation !== "satisfied") continue;
+    const count = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation },
+        data: {
+          status: "QUEUED",
+          ...freshAttemptGeneration(),
+          retryAt: null,
+          dispatchedGeneration: null,
+          dispatchedAt: null,
+          postDispatchEvidenceKeys: [],
+          attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
+          outcome: null,
+          decisionDetail: null,
+          agentHandouts: [],
+          handoutAcks: [],
+          handoutReceipts: [],
+          externalWait: Prisma.DbNull,
+          staleDisposition: false,
+        },
       });
-      if (count === 1) reactivated += 1;
-    }
-    if (rows.length < EXTERNAL_WAIT_REACTIVATION_BATCH) break;
+      if (count === 1) {
+        await tx.prFixHistory.create({
+          data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait dependency satisfied; rechecking prerequisite (#1253)." },
+        });
+      }
+      return count;
+    });
+    if (count === 1) reactivated += 1;
+  }
+  // Rotate the scan head: stamp EVERY row this pass considered — including
+  // rows skipped in memory (invalid/legacy contract, non-live trigger), which
+  // would otherwise pin the head of the order forever and starve later waits.
+  // Rows the `maxEvaluations` forge-read bound cut off before examining are
+  // deliberately left unstamped so they lead the next pass (a single shared
+  // stamp would re-sort them behind the same head forever). Scoped to rows
+  // still WAITING_EXTERNAL so nothing that already left the state is written.
+  // One bulk write per pass.
+  if (considered.length > 0) {
+    await client.prFixQueueItem.updateMany({
+      where: { id: { in: considered }, status: "WAITING_EXTERNAL" },
+      data: { triggerEvaluatedAt: new Date() },
+    });
   }
   return { evaluated, reactivated };
 }

@@ -415,6 +415,10 @@ must be:
 
 - **Bounded** per run (page/cap, like `reclaimStalePrFixHandouts`,
   `:822`), so a backlog never becomes a thundering herd;
+- **Fair-rotating** — the bounded external-wait trigger pass
+  (`reconcileExternalWaitTriggers`) reads waits least-recently-considered first
+  and stamps every row it considered in `triggerEvaluatedAt`, so an earlier
+  unsatisfied or invalid wait can never starve a later one out of discovery;
 - **Idempotent** — it re-computes `(identity, version)` and no-ops on anything
   already in the ledger, **except** the `#940` re-observation at `FIXED` with an
   unchanged head (row 6 — ledger dedupe must not swallow that net on the

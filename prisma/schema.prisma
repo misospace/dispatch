@@ -282,6 +282,14 @@ model PrFixQueueItem {
   // (#1253): set on every reactivation. Paces PARKED/no_progress reopen so
   // reconciliation cannot loop; budget and attempt caps still bound the cycle.
   recoveryAppliedAt        DateTime?
+  // Fair-eligibility stamp for the bounded external-wait trigger
+  // reconciliation pass (#1253): the last time the pass CONSIDERED this row
+  // (reached it during a scan, whether or not it was evaluable). The scan
+  // orders least-recently-considered first with an explicit
+  // `nulls: "first"`, so an earlier unsatisfied, invalid, or non-live row
+  // cannot starve a later wait out of discovery. Audit only — never a
+  // freshness or satisfaction predicate; NULL = never considered.
+  triggerEvaluatedAt       DateTime?
   author                   String?
   history                  PrFixHistory[]
   evidence                 PrFixEvidence[]
