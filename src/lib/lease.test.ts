@@ -229,6 +229,96 @@ describe("upsertLease", () => {
       expect(updateData.retryAfter).toBeNull();
       expect(updateData.waitReason).toBeNull();
     });
+
+    it("rotates the claim token and resets ownership provenance when reactivating a live-but-disposed row (#1251/#1256)", async () => {
+      // The claim route reuses the row instead of creating one, so the
+      // retired incarnation's token must not survive into the new attempt.
+      mocks.leaseFindUnique.mockImplementation(() =>
+        Promise.resolve(
+          makeLease({
+            id: "l-1",
+            claimToken: "claim_retired",
+            disposition: "released",
+            dispositionNote: "done",
+            successorRef: "next-agent",
+            dispositionOccurredAt: new Date(),
+            dispositionObservedAt: new Date(),
+            retryAfter: new Date(),
+            waitReason: "dep",
+            runRef: "run-old",
+            registeredAt: new Date(),
+            registrationOccurredAt: new Date(),
+            renewCount: 7,
+            lastRenewalObservedAt: new Date(),
+            lastRenewalOccurredAt: new Date(),
+          }),
+        ),
+      );
+      mocks.leaseUpdate.mockImplementation((args: any) =>
+        Promise.resolve({ ...makeLease(args.where), ...args.data }),
+      );
+
+      const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+      expect(result.created).toBe(false);
+      const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+      // New attempt ⇒ new fencing token, minted with the clear.
+      expect(updateData.claimToken).toEqual(expect.stringMatching(/^claim_/));
+      expect(updateData.claimToken).not.toBe("claim_retired");
+      // The returned lease carries the rotated token, never the stale one.
+      expect(result.lease.claimToken).toBe(updateData.claimToken);
+      expect(result.lease.claimToken).not.toBe("claim_retired");
+      // Terminal evidence cleared.
+      expect(updateData.disposition).toBeNull();
+      expect(updateData.dispositionNote).toBeNull();
+      expect(updateData.successorRef).toBeNull();
+      expect(updateData.dispositionOccurredAt).toBeNull();
+      expect(updateData.dispositionObservedAt).toBeNull();
+      expect(updateData.retryAfter).toBeNull();
+      expect(updateData.waitReason).toBeNull();
+      // Retired attempt's ownership provenance reset to fresh defaults.
+      expect(updateData.runRef).toBeNull();
+      expect(updateData.registeredAt).toBeNull();
+      expect(updateData.registrationOccurredAt).toBeNull();
+      expect(updateData.renewCount).toBe(0);
+      expect(updateData.lastRenewalObservedAt).toBeNull();
+      expect(updateData.lastRenewalOccurredAt).toBeNull();
+    });
+
+    it("keeps the claim token and registration evidence when renewing a live non-disposed row", async () => {
+      mocks.leaseFindUnique.mockImplementation(() =>
+        Promise.resolve(
+          makeLease({
+            id: "l-1",
+            claimToken: "claim_live",
+            disposition: null,
+            runRef: "run-live",
+            registeredAt: new Date(),
+            registrationOccurredAt: new Date(),
+            renewCount: 3,
+            lastRenewalObservedAt: new Date(),
+            lastRenewalOccurredAt: new Date(),
+          }),
+        ),
+      );
+      mocks.leaseUpdate.mockImplementation((args: any) =>
+        Promise.resolve({ ...makeLease(args.where), claimToken: "claim_live", ...args.data }),
+      );
+
+      const result = await upsertLease({ agentName: "saffron", issueId: "i-1", checkpoint: "branch_created" });
+
+      expect(result.created).toBe(false);
+      expect(result.lease.claimToken).toBe("claim_live");
+      const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+      // A heartbeating worker keeps its receipt and its liveness evidence.
+      expect(updateData.claimToken).toBeUndefined();
+      expect(updateData.runRef).toBeUndefined();
+      expect(updateData.registeredAt).toBeUndefined();
+      expect(updateData.registrationOccurredAt).toBeUndefined();
+      expect(updateData.renewCount).toBeUndefined();
+      expect(updateData.lastRenewalObservedAt).toBeUndefined();
+      expect(updateData.lastRenewalOccurredAt).toBeUndefined();
+    });
   });
 });
 

@@ -77,6 +77,24 @@ export async function upsertLease(params: {
     // live-but-disposed row instead of creating a new one). Terminal
     // evidence for the retired attempt lives in the lifecycle stream; the
     // lease row describes the CURRENT attempt only.
+    //
+    // #1256 fencing: reactivating a DISPOSED row is a NEW attempt, not a
+    // renewal of the old one. Any disposition on the row means the previous
+    // incarnation ended there (worker-ownership refuses register / renew /
+    // disposition against a disposed row), so the write clears the terminal
+    // fields AND rotates the claim token to a fresh one, atomically with the
+    // clear. Keeping the retired token would re-validate the old
+    // incarnation's receipt against the new active attempt: it could then
+    // register / renew / dispose — or release through capacity-handoff —
+    // work it no longer owns. The retired attempt's ownership provenance is
+    // reset for the same reason: registration and renewal evidence belong to
+    // the attempt that recorded them, and the row now describes the new one.
+    //
+    // A row with NO disposition is an ordinary renewal / heartbeat of the
+    // SAME attempt (a live worker's own row): it keeps its claim token and
+    // its registration + renewal evidence untouched, because a heartbeating
+    // worker must not lose its receipt or have its liveness erased.
+    const reactivating = Boolean(existing.disposition);
     const lease = await prisma.lease.update({
       where: { id: existing.id },
       data: {
@@ -92,6 +110,18 @@ export async function upsertLease(params: {
         dispositionObservedAt: null,
         retryAfter: null,
         waitReason: null,
+        ...(reactivating
+          ? {
+              // Fresh attempt: new fencing token, no inherited provenance.
+              claimToken: newClaimToken(),
+              runRef: null,
+              registeredAt: null,
+              registrationOccurredAt: null,
+              renewCount: 0,
+              lastRenewalObservedAt: null,
+              lastRenewalOccurredAt: null,
+            }
+          : {}),
       },
     });
     return { created: false, lease };

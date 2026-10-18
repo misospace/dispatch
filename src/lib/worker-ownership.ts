@@ -26,6 +26,13 @@
 // 4. **Serialization.** Lease-mutating operations run under the per-issue
 //    `IssueMutationGuard` anchor (#1259) so a renewal cannot interleave with a
 //    claim or a fenced capacity release on the same issue.
+// 5. **Atomicity.** A lease CAS and the projections it implies (AgentWork
+//    settlement, history, lifecycle event, audit row) commit in ONE
+//    `prisma.$transaction`. That guard anchor has no resume branch and is
+//    deleted on throw, so a CAS committed without its evidence would be
+//    unreachable on retry: the replay branch would report success for a
+//    disposition whose work was never settled and whose required lifecycle
+//    event does not exist.
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
@@ -203,7 +210,11 @@ export interface RegisterOwnershipInput extends OwnershipOpInput {
 }
 
 export interface RegisterOwnershipSuccess {
-  replayed: false;
+  /**
+   * True when this attempt had already registered and the persisted record is
+   * returned verbatim. A replay writes nothing.
+   */
+  replayed: boolean;
   leaseId: string;
   registeredAt: Date;
   registrationOccurredAt: Date;
@@ -212,9 +223,15 @@ export interface RegisterOwnershipSuccess {
 
 /**
  * Record durable ownership for a live claim: proves a real process intends to
- * own the work (§6.1). Idempotent per (issue, agent, token) — a replayed
- * register refreshes the run reference but the lifecycle event dedupes on the
- * claim token, so the stream records exactly one registration per attempt.
+ * own the work (§6.1).
+ *
+ * Idempotent per (issue, agent, token): once this attempt's lease row carries
+ * `registeredAt`, a repeat returns the PERSISTED registration with
+ * `replayed: true` and writes nothing at all — no timestamp refresh, no run
+ * reference overwrite, no lifecycle event, no audit row — so the evidence
+ * describes exactly the first registration of that attempt. Reclaiming rotates
+ * the claim token and resets `registeredAt` (`lease.ts`), so a fresh attempt
+ * still registers normally.
  */
 export async function registerOwnership(input: RegisterOwnershipInput): Promise<{ ok: true; value: RegisterOwnershipSuccess } | OwnershipOpFailure> {
   const now = input.now ?? new Date();
@@ -226,53 +243,79 @@ export async function registerOwnership(input: RegisterOwnershipInput): Promise<
 
     if (lease.disposition) return fail("disposed");
 
-    const updated = await prisma.lease.update({
-      where: { id: lease.id },
-      data: {
-        registeredAt: now,
-        registrationOccurredAt: occurred,
-        ...(input.runRef ? { runRef: input.runRef } : {}),
-      },
-    });
+    // Replay of an already-registered attempt: hand back what the row
+    // persists. Registering again would move `registeredAt` onto a clock tick
+    // that observed nothing and overwrite the run reference of a live
+    // registration with a retried one — provenance must describe the first
+    // registration of the attempt, not the last request that mentioned it.
+    if (lease.registeredAt) {
+      return {
+        ok: true as const,
+        value: {
+          replayed: true,
+          leaseId: lease.id,
+          registeredAt: lease.registeredAt,
+          // A row written before occurrence tracking existed still answers
+          // with the observed time rather than null.
+          registrationOccurredAt: lease.registrationOccurredAt ?? lease.registeredAt,
+          expiresAt: lease.expiredAt,
+        },
+      };
+    }
 
-    await recordLifecycleEvent(prisma, {
-      issueId: issue.id,
-      repoFullName: issue.repository.fullName,
-      issueNumber: issue.number,
-      kind: "ownership_registered",
-      source: "api:ownership",
-      actor: input.actor,
-      agentName: input.agentName,
-      dedupeKey: lifecycleDedupeKey("ownership_registered", issue.id, input.agentName, input.claimToken),
-      occurredAt: occurred,
-      observedAt: now,
-      metadata: { runRef: input.runRef ?? lease.runRef ?? null },
-    });
+    // One transaction: the registration, its lifecycle event and its audit row
+    // are one local fact. A throw rolls all three back, so the retry re-enters
+    // this path instead of short-circuiting into a register whose evidence
+    // never landed.
+    return prisma.$transaction(async (tx): Promise<{ ok: true; value: RegisterOwnershipSuccess } | OwnershipOpFailure> => {
+      const updated = await tx.lease.update({
+        where: { id: lease.id },
+        data: {
+          registeredAt: now,
+          registrationOccurredAt: occurred,
+          ...(input.runRef ? { runRef: input.runRef } : {}),
+        },
+      });
 
-    await prisma.auditLog.create({
-      data: {
-        actor: input.actor,
-        action: "ownership_register",
+      await recordLifecycleEvent(tx, {
+        issueId: issue.id,
         repoFullName: issue.repository.fullName,
         issueNumber: issue.number,
-        issueId: issue.id,
-        beforeLabels: issue.labels,
-        afterLabels: issue.labels,
-        success: true,
-        notes: input.runRef ? `runRef=${input.runRef}` : undefined,
-      },
-    });
+        kind: "ownership_registered",
+        source: "api:ownership",
+        actor: input.actor,
+        agentName: input.agentName,
+        dedupeKey: lifecycleDedupeKey("ownership_registered", issue.id, input.agentName, input.claimToken),
+        occurredAt: occurred,
+        observedAt: now,
+        metadata: { runRef: input.runRef ?? lease.runRef ?? null },
+      });
 
-    return {
-      ok: true as const,
-      value: {
-        replayed: false as const,
-        leaseId: lease.id,
-        registeredAt: now,
-        registrationOccurredAt: occurred,
-        expiresAt: updated.expiredAt,
-      },
-    };
+      await tx.auditLog.create({
+        data: {
+          actor: input.actor,
+          action: "ownership_register",
+          repoFullName: issue.repository.fullName,
+          issueNumber: issue.number,
+          issueId: issue.id,
+          beforeLabels: issue.labels,
+          afterLabels: issue.labels,
+          success: true,
+          notes: input.runRef ? `runRef=${input.runRef}` : undefined,
+        },
+      });
+
+      return {
+        ok: true as const,
+        value: {
+          replayed: false,
+          leaseId: lease.id,
+          registeredAt: now,
+          registrationOccurredAt: occurred,
+          expiresAt: updated.expiredAt,
+        },
+      };
+    });
   });
 }
 
@@ -385,6 +428,17 @@ const DISPOSITION_AGENT_WORK_STATE: Record<OwnershipDisposition, "DONE" | "RELEA
  * same disposition is an idempotent replay; a *different* disposition after
  * a terminal one is rejected (`disposition_conflict`) — an incarnation
  * cannot rewrite its own terminal record.
+ *
+ * Atomicity: the terminal lease compare-and-set and every required local
+ * effect (AgentWork settlement, history, lifecycle event, audit row) commit
+ * as ONE `prisma.$transaction`, and the lifecycle event is written through
+ * that transaction's client. The `ownership` guard has no resume branch, so a
+ * throw here deletes it — a retry must re-enter the full path, which it only
+ * can while the lease CAS never committed alone. Otherwise the replay branch
+ * below would report success for a disposition whose AgentWork was left
+ * `IN_PROGRESS` and whose `ownership_dispositioned` event never existed.
+ * The guarded reads above stay outside the transaction: they only decide
+ * whether there is anything to settle.
  */
 export async function dispositionOwnership(input: DispositionOwnershipInput): Promise<{ ok: true; value: DispositionOwnershipSuccess } | OwnershipOpFailure> {
   const now = input.now ?? new Date();
@@ -412,82 +466,88 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
           : {})
       : { retryAfter: null, waitReason: null };
 
-    const updated = await prisma.lease.updateMany({
-      where: { id: lease.id, claimToken: input.claimToken, disposition: null },
-      data: {
-        disposition: input.disposition,
-        dispositionNote: input.note ?? null,
-        successorRef: input.successorRef ?? null,
-        dispositionOccurredAt: occurred,
-        dispositionObservedAt: now,
-        ...waitPatch,
-      },
-    });
-    if (updated.count === 0) return fail("disposition_conflict", "Disposition changed concurrently; re-read and retry");
-
-    // Settle a matching active AgentWork (if any) to its terminal state so
-    // the execution record agrees with the declared disposition. History is
-    // written by the same call; the lease row itself is retained as evidence.
-    const work = await prisma.agentWork.findFirst({
-      where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-    });
-    if (work) {
-      const terminalState = DISPOSITION_AGENT_WORK_STATE[input.disposition];
-      await prisma.agentWork.update({
-        where: { id: work.id },
+    // Everything from the terminal compare-and-set onward is one local fact
+    // and commits together: a partial write would strand an IN_PROGRESS
+    // AgentWork next to a terminal lease, or lose the required
+    // `ownership_dispositioned` event behind a replay that reports success.
+    return prisma.$transaction(async (tx): Promise<{ ok: true; value: DispositionOwnershipSuccess } | OwnershipOpFailure> => {
+      const updated = await tx.lease.updateMany({
+        where: { id: lease.id, claimToken: input.claimToken, disposition: null },
         data: {
-          state: terminalState,
-          ...(input.disposition === "blocked" ? { blockerReason: input.note ?? work.blockerReason } : {}),
+          disposition: input.disposition,
+          dispositionNote: input.note ?? null,
+          successorRef: input.successorRef ?? null,
+          dispositionOccurredAt: occurred,
+          dispositionObservedAt: now,
+          ...waitPatch,
         },
       });
-      await prisma.agentWorkHistory.create({
-        data: {
-          workId: work.id,
-          action: "ownership_dispositioned",
-          state: terminalState,
-          summary: input.note ?? `disposition=${input.disposition}`,
-          blockerReason: input.disposition === "blocked" ? input.note ?? undefined : undefined,
-        },
+      if (updated.count === 0) return fail("disposition_conflict", "Disposition changed concurrently; re-read and retry");
+
+      // Settle a matching active AgentWork (if any) to its terminal state so
+      // the execution record agrees with the declared disposition. History is
+      // written by the same call; the lease row itself is retained as evidence.
+      const work = await tx.agentWork.findFirst({
+        where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
       });
-    }
+      if (work) {
+        const terminalState = DISPOSITION_AGENT_WORK_STATE[input.disposition];
+        await tx.agentWork.update({
+          where: { id: work.id },
+          data: {
+            state: terminalState,
+            ...(input.disposition === "blocked" ? { blockerReason: input.note ?? work.blockerReason } : {}),
+          },
+        });
+        await tx.agentWorkHistory.create({
+          data: {
+            workId: work.id,
+            action: "ownership_dispositioned",
+            state: terminalState,
+            summary: input.note ?? `disposition=${input.disposition}`,
+            blockerReason: input.disposition === "blocked" ? input.note ?? undefined : undefined,
+          },
+        });
+      }
 
-    await recordLifecycleEvent(prisma, {
-      issueId: issue.id,
-      repoFullName: issue.repository.fullName,
-      issueNumber: issue.number,
-      kind: "ownership_dispositioned",
-      source: "api:ownership",
-      actor: input.actor,
-      agentName: input.agentName,
-      dedupeKey: lifecycleDedupeKey("ownership_dispositioned", issue.id, input.agentName, input.claimToken, input.disposition),
-      occurredAt: occurred,
-      observedAt: now,
-      metadata: {
-        disposition: input.disposition,
-        note: input.note ?? null,
-        successorRef: input.successorRef ?? null,
-        retryAfter: input.retryAfter ? input.retryAfter.toISOString() : null,
-      },
-    });
-
-    await prisma.auditLog.create({
-      data: {
-        actor: input.actor,
-        action: "ownership_disposition",
+      await recordLifecycleEvent(tx, {
+        issueId: issue.id,
         repoFullName: issue.repository.fullName,
         issueNumber: issue.number,
-        issueId: issue.id,
-        beforeLabels: issue.labels,
-        afterLabels: issue.labels,
-        success: true,
-        notes: [
-          `disposition=${input.disposition}`,
-          input.successorRef ? `successor=${input.successorRef}` : null,
-          input.retryAfter ? `retryAfter=${input.retryAfter.toISOString()}` : null,
-        ].filter(Boolean).join(" | ") || undefined,
-      },
-    });
+        kind: "ownership_dispositioned",
+        source: "api:ownership",
+        actor: input.actor,
+        agentName: input.agentName,
+        dedupeKey: lifecycleDedupeKey("ownership_dispositioned", issue.id, input.agentName, input.claimToken, input.disposition),
+        occurredAt: occurred,
+        observedAt: now,
+        metadata: {
+          disposition: input.disposition,
+          note: input.note ?? null,
+          successorRef: input.successorRef ?? null,
+          retryAfter: input.retryAfter ? input.retryAfter.toISOString() : null,
+        },
+      });
 
-    return { ok: true as const, value: { replayed: false, leaseId: lease.id, disposition: input.disposition } };
+      await tx.auditLog.create({
+        data: {
+          actor: input.actor,
+          action: "ownership_disposition",
+          repoFullName: issue.repository.fullName,
+          issueNumber: issue.number,
+          issueId: issue.id,
+          beforeLabels: issue.labels,
+          afterLabels: issue.labels,
+          success: true,
+          notes: [
+            `disposition=${input.disposition}`,
+            input.successorRef ? `successor=${input.successorRef}` : null,
+            input.retryAfter ? `retryAfter=${input.retryAfter.toISOString()}` : null,
+          ].filter(Boolean).join(" | ") || undefined,
+        },
+      });
+
+      return { ok: true as const, value: { replayed: false, leaseId: lease.id, disposition: input.disposition } };
+    });
   });
 }

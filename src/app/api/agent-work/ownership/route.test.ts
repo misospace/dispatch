@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   authedRequest,
   makeDispatchEnvMock,
@@ -34,6 +34,9 @@ const { mocks, db, applyData } = vi.hoisted(() => {
     applyData,
     mocks: {
       guardBusy: false,
+      // One-shot write-failure injection: the named delegate throws the first
+      // time it is reached after being armed, so the retry runs clean.
+      failAt: null as null | "agentWork.update" | "lifecycle" | "audit",
     },
     db: {
       issue: null as any,
@@ -45,6 +48,7 @@ const { mocks, db, applyData } = vi.hoisted(() => {
       updateManyCount: undefined as number | undefined,
       audit: [] as any[],
       lifecycleEvents: [] as any[],
+      txCount: 0,
     },
   };
 });
@@ -59,8 +63,14 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
   },
 }));
 
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
+vi.mock("@/lib/prisma", () => {
+  const maybeFail = (point: string) => {
+    if (mocks.failAt !== point) return;
+    mocks.failAt = null;
+    throw new Error(`injected failure at ${point}`);
+  };
+
+  const client: any = {
     issue: {
       findUnique: async ({ where }: any) =>
         db.issue && db.issue.id === where.id ? db.issue : null,
@@ -101,6 +111,7 @@ vi.mock("@/lib/prisma", () => ({
         return db.agentWork;
       },
       update: async ({ where, data }: any) => {
+        maybeFail("agentWork.update");
         if (db.agentWork && db.agentWork.id === where.id) {
           db.agentWorkUpdates.push({ where, data });
           db.agentWork = { ...db.agentWork, ...data };
@@ -116,26 +127,60 @@ vi.mock("@/lib/prisma", () => ({
     },
     auditLog: {
       create: async ({ data }: any) => {
+        maybeFail("audit");
         db.audit.push(data);
         return data;
       },
     },
     issueLifecycleEvent: {
       create: async ({ data }: any) => {
+        maybeFail("lifecycle");
         db.lifecycleEvents.push(data);
         return data;
       },
       upsert: async ({ where, create }: any) => {
+        maybeFail("lifecycle");
         const existing = db.lifecycleEvents.find((e) => e.dedupeKey === where.dedupeKey);
         if (existing) return existing;
         db.lifecycleEvents.push(create);
         return create;
       },
     },
-  },
-}));
+  };
+
+  // Interactive transaction over the same delegates, rolling the in-memory
+  // store back when the callback throws — so a test can prove that a failed
+  // disposition leaves no committed lease CAS behind (#1251 review MAJOR).
+  client.$transaction = async (fn: (tx: any) => Promise<any>) => {
+    db.txCount += 1;
+    const snapshot = {
+      lease: db.lease,
+      agentWork: db.agentWork,
+      leaseUpdates: db.leaseUpdates.length,
+      agentWorkUpdates: db.agentWorkUpdates.length,
+      history: db.agentWorkHistory.length,
+      audit: db.audit.length,
+      lifecycle: db.lifecycleEvents.length,
+    };
+    try {
+      return await fn(client);
+    } catch (error) {
+      db.lease = snapshot.lease;
+      db.agentWork = snapshot.agentWork;
+      db.leaseUpdates.length = snapshot.leaseUpdates;
+      db.agentWorkUpdates.length = snapshot.agentWorkUpdates;
+      db.agentWorkHistory.length = snapshot.history;
+      db.audit.length = snapshot.audit;
+      db.lifecycleEvents.length = snapshot.lifecycle;
+      throw error;
+    }
+  };
+
+  return { prisma: client };
+});
 
 import { POST } from "./route";
+import { upsertLease } from "@/lib/lease";
 import { getAuthorizedActor, authorizeRequest, resetAuthCaches } from "@/lib/auth";
 import { resetRateLimits } from "@/lib/rate-limit";
 import { lifecycleDedupeKey } from "@/lib/issue-lifecycle";
@@ -215,12 +260,7 @@ function baseBody(overrides: Record<string, unknown> = {}) {
   return { agentName: AGENT, issueId: "iss1", claimToken: CLAIM_TOKEN, ...overrides };
 }
 
-beforeEach(() => {
-  vi.clearAllMocks();
-  resetAuthCaches();
-  resetRateLimits();
-  delete process.env.DISPATCH_AUTH_MODE;
-  mocks.guardBusy = false;
+function seedDb() {
   db.issue = makeIssue();
   db.lease = makeLease();
   db.agentWork = null;
@@ -230,6 +270,17 @@ beforeEach(() => {
   db.updateManyCount = undefined;
   db.audit = [];
   db.lifecycleEvents = [];
+  db.txCount = 0;
+  mocks.failAt = null;
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  resetAuthCaches();
+  resetRateLimits();
+  delete process.env.DISPATCH_AUTH_MODE;
+  mocks.guardBusy = false;
+  seedDb();
 });
 
 describe("POST /api/agent-work/ownership — auth", () => {
@@ -377,6 +428,35 @@ describe("POST /api/agent-work/ownership — register", () => {
     expect(replay.status).toBe(200);
     expect((await replay.json()).ok).toBe(true);
     expect(db.lifecycleEvents).toHaveLength(1);
+  });
+
+  it("returns the persisted registration on a replay and writes nothing (#1251 review)", async () => {
+    const first = await post(baseBody({ operation: "register", runRef: "run-1" }));
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+    const registeredAt = db.lease.registeredAt;
+    const occurredAt = db.lease.registrationOccurredAt;
+    expect(db.audit.filter((a) => a.action === "ownership_register")).toHaveLength(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const replay = await post(baseBody({ operation: "register", runRef: "run-2" }));
+    expect(replay.status).toBe(200);
+    const replayBody = await replay.json();
+    // Truthful replay: the same response shape as the first call, flagged as a
+    // replay, carrying the FIRST registration's persisted values.
+    expect(replayBody.replayed).toBe(true);
+    expect(replayBody.leaseId).toBe("lease-1");
+    expect(replayBody.registeredAt).toBe(registeredAt.toISOString());
+    expect(replayBody.registrationOccurredAt).toBe(occurredAt.toISOString());
+    expect(replayBody.expiresAt).toBe(firstBody.expiresAt);
+    // Not one write: no timestamp refresh, no run-reference overwrite, no
+    // second lifecycle event, no second audit row.
+    expect(db.lease.registeredAt).toEqual(registeredAt);
+    expect(db.lease.registrationOccurredAt).toEqual(occurredAt);
+    expect(db.lease.runRef).toBe("run-1");
+    expect(db.leaseUpdates).toHaveLength(1);
+    expect(db.lifecycleEvents).toHaveLength(1);
+    expect(db.audit.filter((a) => a.action === "ownership_register")).toHaveLength(1);
   });
 
   it("rejects an over-long runRef with 400", async () => {
@@ -625,6 +705,122 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     const res = await post(baseBody({ operation: "disposition", disposition: "yanked" }));
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/Invalid disposition/);
+  });
+});
+
+describe("POST /api/agent-work/ownership — disposition atomicity (#1251 review)", () => {
+  // The `ownership` guard has no resume branch: a throw deletes it and the
+  // route 500s. So the terminal lease CAS and every local effect it implies
+  // must commit together — otherwise the retry hits the `lease.disposition`
+  // replay branch and returns `replayed: true` for a disposition whose
+  // AgentWork settlement, history and `ownership_dispositioned` event never
+  // landed (#1251 review MAJOR).
+  let consoleError: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleError.mockRestore();
+  });
+
+  const assertNothingCommitted = () => {
+    expect(db.lease.disposition).toBeNull();
+    expect(db.lease.dispositionObservedAt).toBeNull();
+    expect(db.agentWork.state).toBe("IN_PROGRESS");
+    expect(db.agentWorkUpdates).toHaveLength(0);
+    expect(db.agentWorkHistory).toHaveLength(0);
+    expect(db.lifecycleEvents).toHaveLength(0);
+    expect(db.audit.filter((a) => a.action === "ownership_disposition")).toHaveLength(0);
+  };
+
+  it("surfaces a 500 and commits nothing when the AgentWork settlement fails right after the lease CAS", async () => {
+    db.agentWork = makeAgentWork();
+    mocks.failAt = "agentWork.update";
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+
+    expect(res.status).toBe(500);
+    expect(db.txCount).toBe(1);
+    // The CAS rolled back with the effect it implies: a retry is not
+    // short-circuited into a replay of a disposition that never settled.
+    assertNothingCommitted();
+  });
+
+  it("surfaces a 500 and commits nothing when the lifecycle write fails after the AgentWork settlement", async () => {
+    db.agentWork = makeAgentWork();
+    mocks.failAt = "lifecycle";
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+
+    expect(res.status).toBe(500);
+    expect(db.txCount).toBe(1);
+    // AgentWork + history had been written inside the transaction; the
+    // missing lifecycle event rolls them back with the lease CAS.
+    assertNothingCommitted();
+  });
+
+  it("converges on retry of the same disposition after either injected post-CAS failure", async () => {
+    for (const point of ["agentWork.update", "lifecycle"] as const) {
+      seedDb();
+      db.agentWork = makeAgentWork();
+      mocks.failAt = point;
+
+      const failed = await post(baseBody({ operation: "disposition", disposition: "completed", note: "shipped" }));
+      expect(failed.status).toBe(500);
+      assertNothingCommitted();
+
+      // Same disposition, retry: the guard is gone and nothing was committed,
+      // so the full path re-runs and reports a real (non-replayed) success.
+      const retry = await post(baseBody({ operation: "disposition", disposition: "completed", note: "shipped" }));
+      expect(retry.status).toBe(200);
+      const body = await retry.json();
+      expect(body.ok).toBe(true);
+      expect(body.replayed).toBe(false);
+      expect(body.disposition).toBe("completed");
+
+      expect(db.lease.disposition).toBe("completed");
+      expect(db.agentWork.state).toBe("DONE");
+      expect(db.agentWorkHistory).toHaveLength(1);
+      expect(db.agentWorkHistory[0].action).toBe("ownership_dispositioned");
+      expect(db.lifecycleEvents).toHaveLength(1);
+      expect(db.lifecycleEvents[0].kind).toBe("ownership_dispositioned");
+      expect(db.audit.filter((a) => a.action === "ownership_disposition")).toHaveLength(1);
+    }
+  });
+
+  it("fences the retired claim token after the claim path reactivates a disposed lease (#1251/#1256)", async () => {
+    const disposed = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+    expect(disposed.status).toBe(200);
+    expect(db.lease.disposition).toBe("completed");
+
+    // The claim path reuses the live row: it clears the terminal marker and
+    // rotates the fencing token, so the row now describes a NEW attempt
+    // (lease.ts). Registration evidence is reset with it.
+    const reclaimed = await upsertLease({ agentName: AGENT, issueId: "iss1" });
+    expect(reclaimed.created).toBe(false);
+    const freshToken = db.lease.claimToken as string;
+    expect(freshToken).toMatch(/^claim_/);
+    expect(freshToken).not.toBe(CLAIM_TOKEN);
+    expect(db.lease.disposition).toBeNull();
+    expect(db.lease.registeredAt).toBeNull();
+
+    // The retired incarnation's receipt is inert against the new attempt…
+    const retired = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+    expect(retired.status).toBe(409);
+    expect((await retired.json()).code).toBe("stale_claim_token");
+    expect(db.lease.disposition).toBeNull();
+
+    // …while the new one registers and disposes normally. Registration is not
+    // a replay of the retired attempt's, because reactivation reset it.
+    const registered = await post(baseBody({ operation: "register", claimToken: freshToken, runRef: "run-new" }));
+    expect(registered.status).toBe(200);
+    expect((await registered.json()).replayed).toBe(false);
+    const settled = await post(baseBody({ operation: "disposition", disposition: "released", claimToken: freshToken }));
+    expect(settled.status).toBe(200);
+    expect((await settled.json()).disposition).toBe("released");
+    expect(db.lease.disposition).toBe("released");
   });
 });
 

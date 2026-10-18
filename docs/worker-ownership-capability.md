@@ -85,6 +85,16 @@ central tiering):
 - `GET /api/issues/ownership` — cached-list inspection over every issue with a
   claim signal (agent label / active lease / active AgentWork).
   `?state=<OWNERSHIP_STATES>` filter, `limit` (default 50, max 200).
+  Bounded scan: each of the three candidate sources is read newest-first
+  (`Issue.updatedAt`, `Lease.renewedAt` nulls-last → `createdAt` → `id`,
+  `AgentWork.updatedAt` → `id`) capped at 1000 rows, and at most 500
+  candidates are derived with chunked concurrency. The response reports
+  `{ items, counts, examined, truncated, sourcesTruncated, limit, windows }`:
+  `truncated` means candidates were dropped before derivation (so
+  `counts`/`examined` describe only the inspected set), while
+  `sourcesTruncated: { labeled, leased, working }` says **which** source had
+  rows beyond its cap, so an operator can tell an overflowed signal from a
+  genuinely small population.
 
 Both are pure reads: no writes, no audits, no releases.
 

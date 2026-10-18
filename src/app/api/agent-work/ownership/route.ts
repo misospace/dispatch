@@ -20,6 +20,14 @@
 //
 // Nothing here writes GitHub labels or releases leases; forge reads are not
 // needed for these operations (the fencing is entirely on the claim receipt).
+//
+// Replay is reported truthfully and identically per operation: a `register`
+// or a same-kind `disposition` replayed for an attempt that already recorded
+// it answers `200` with `replayed: true` and the persisted record, and writes
+// nothing (no timestamp refresh, no lifecycle event, no audit row). A
+// `disposition` whose first attempt failed mid-write leaves no terminal lease
+// (the CAS and its evidence share one transaction), so the retry re-enters the
+// full path and answers `replayed: false`.
 
 import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";

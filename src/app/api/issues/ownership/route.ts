@@ -41,9 +41,14 @@ interface OwnershipListItem {
  * `inspectIssueOwnership` the per-issue route uses (with `live: false`, so no
  * per-candidate GitHub call). Not-found and closed issues are dropped.
  *
- * Bounded: the label sweep is capped and only the first `MAX_INSPECTED`
- * candidates are derived; `truncated: true` says candidates were dropped, so
- * `counts`/`examined` describe the inspected set, not the whole population.
+ * Bounded: every source read is capped at `MAX_CANDIDATE_SCAN` rows in a
+ * deterministic most-recent-first order, and only the first `MAX_INSPECTED`
+ * candidates are derived. `truncated: true` says candidates were dropped
+ * *before* derivation, so `counts`/`examined` describe the inspected set, not
+ * the whole population. `sourcesTruncated` separately reports, per source
+ * (`labeled` = label sweep, `leased` = active lease, `working` = active
+ * AgentWork), whether that source had more rows than the cap — so an operator
+ * can tell which signal overflowed rather than only that something did.
  *
  * Operator-only: worker-tier callers get 403 by the central tiering (this
  * route is not in `WORKER_ALLOWLIST`), not by any local check.
@@ -53,9 +58,9 @@ interface OwnershipListItem {
  *   `OWNERSHIP_STATES` (400 otherwise).
  * - `limit` — cap on returned items (default 50, clamped to 1..200).
  *
- * Response: `{ items, counts, examined, truncated, limit, windows }`, where
- * `counts` and `examined` reflect the inspected (open) population before the
- * state filter and limit are applied.
+ * Response: `{ items, counts, examined, truncated, sourcesTruncated, limit,
+ * windows }`, where `counts` and `examined` reflect the inspected (open)
+ * population before the state filter and limit are applied.
  */
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -83,36 +88,61 @@ export async function GET(request: Request) {
 
   const now = new Date();
 
-  // Bounded scan: this is an operator inspection surface, not an index. The
-  // open-issue sweep is capped (most recently updated first) and the total
-  // number of per-candidate derivations is capped with chunked concurrency so
-  // one maintainer request cannot amplify into an unbounded query storm.
+  // Bounded scan: this is an operator inspection surface, not an index. Every
+  // source read is capped (most recently touched first, so the kept slice is
+  // stable and reproducible rather than arbitrary) and the total number of
+  // per-candidate derivations is capped with chunked concurrency so one
+  // maintainer request cannot amplify into an unbounded query storm.
   const MAX_CANDIDATE_SCAN = 1000;
   const MAX_INSPECTED = 500;
   const INSPECT_CONCURRENCY = 25;
 
+  // Each source is read with ONE probe row past the cap and the probe row is
+  // dropped before candidates are seeded. Overflow is therefore exact — a
+  // length of exactly MAX_CANDIDATE_SCAN + 1 means the source really had more
+  // rows — rather than inferred from a filled-up page.
+  const SCAN_TAKE = MAX_CANDIDATE_SCAN + 1;
+
   // (a) open issues holding an agent/* label (cached set)
-  const openLabeled = await prisma.issue.findMany({
+  const labeledRows = await prisma.issue.findMany({
     where: { repository: { enabled: true }, state: "open" },
     select: { id: true, labels: true },
     orderBy: { updatedAt: "desc" },
-    take: MAX_CANDIDATE_SCAN,
+    take: SCAN_TAKE,
   });
-  // (b) issues referenced by an active (non-expired) lease
-  const activeLeased = await prisma.lease.findMany({
+  const openLabeled = labeledRows.slice(0, MAX_CANDIDATE_SCAN);
+  const labeledTruncated = labeledRows.length > MAX_CANDIDATE_SCAN;
+  // (b) issues referenced by an active (non-expired) lease. `renewedAt` is the
+  // freshest signal on the row (null for never-renewed leases, hence
+  // nulls: last), with `createdAt` then `id` as tiebreakers so equal
+  // timestamps cannot reorder between runs.
+  const leasedRows = await prisma.lease.findMany({
     where: { expiredAt: { gt: now } },
     select: { issueId: true },
+    orderBy: [
+      { renewedAt: { sort: "desc", nulls: "last" } },
+      { createdAt: "desc" },
+      { id: "asc" },
+    ],
+    take: SCAN_TAKE,
   });
-  // (c) issues with an active AgentWork row
-  const activeWorking = await prisma.agentWork.findMany({
+  const activeLeased = leasedRows.slice(0, MAX_CANDIDATE_SCAN);
+  const leasedTruncated = leasedRows.length > MAX_CANDIDATE_SCAN;
+  // (c) issues with an active AgentWork row. `updatedAt` moves on every
+  // checkpoint/heartbeat write, so it is the row's most recent activity.
+  const workingRows = await prisma.agentWork.findMany({
     where: { issueId: { not: null }, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
     select: { issueId: true },
+    orderBy: [{ updatedAt: "desc" }, { id: "asc" }],
+    take: SCAN_TAKE,
   });
+  const activeWorking = workingRows.slice(0, MAX_CANDIDATE_SCAN);
+  const workingTruncated = workingRows.length > MAX_CANDIDATE_SCAN;
 
   // Seed the Set with the STRONGEST ownership signals first so the bounded
   // `cappedIds` slice below drops label-only candidates before ever dropping
-  // an issue with an active lease or active AgentWork (both are naturally
-  // bounded by the number of live claims).
+  // an issue with an active lease or active AgentWork (both sources are
+  // themselves capped at `MAX_CANDIDATE_SCAN` newest rows).
   const candidateIds = new Set<string>();
   for (const lease of activeLeased) candidateIds.add(lease.issueId);
   for (const work of activeWorking) {
@@ -162,6 +192,11 @@ export async function GET(request: Request) {
     counts,
     examined: openResults.length,
     truncated,
+    sourcesTruncated: {
+      labeled: labeledTruncated,
+      leased: leasedTruncated,
+      working: workingTruncated,
+    },
     limit,
     windows: {
       activeMs: ownershipActiveWindowMs(),

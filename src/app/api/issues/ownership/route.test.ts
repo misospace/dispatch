@@ -22,50 +22,90 @@ vi.mock(
 // One in-memory db shared by the list-route candidate queries and the
 // per-candidate inspectIssueOwnership re-reads (issue.findUnique,
 // lease.findMany({issueId}), agentWork.findFirst, prFixQueueItem.findFirst).
-const { db } = vi.hoisted(() => ({
-  db: {
-    issues: [] as any[],
-    leases: [] as any[],
-    agentWorks: [] as any[],
-    prFixes: [] as any[],
-  },
-}));
+const { db, applyListArgs } = vi.hoisted(() => {
+  // The mock prisma applies the route's `orderBy` + `take` so the bounded scan
+  // (and its probe-row overflow signal) is exercised for real instead of
+  // returning every row in insertion order.
+  function applyListArgs<T extends Record<string, any>>(rows: T[], args?: any): T[] {
+    const orderBy = args?.orderBy;
+    let out = rows;
+    if (orderBy) {
+      const clauses = Array.isArray(orderBy) ? orderBy : [orderBy];
+      out = [...rows].sort((a, b) => {
+        for (const clause of clauses) {
+          const field = Object.keys(clause)[0];
+          const spec = clause[field];
+          const dir = typeof spec === "string" ? spec : (spec?.sort ?? "asc");
+          const av = a[field] ?? null;
+          const bv = b[field] ?? null;
+          if (av === bv) continue;
+          // nulls last on a desc sort, matching the route's `nulls: "last"`
+          if (av === null) return 1;
+          if (bv === null) return -1;
+          return dir === "asc" ? (av > bv ? -1 : 1) : av > bv ? 1 : -1;
+        }
+        return 0;
+      });
+    }
+    const take = args?.take;
+    return typeof take === "number" ? out.slice(0, take) : out;
+  }
+
+  return {
+    db: {
+      issues: [] as any[],
+      leases: [] as any[],
+      agentWorks: [] as any[],
+      prFixes: [] as any[],
+    },
+    applyListArgs,
+  };
+});
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     issue: {
-      // list route: { where: { repository: { enabled }, state } }
-      findMany: async ({ where }: any) =>
-        db.issues.filter(
-          (i) =>
-            i.state === where.state &&
-            (!where.repository ||
-              i.repository?.enabled === where.repository.enabled),
+      // list route: { where: { repository: { enabled }, state }, orderBy, take }
+      findMany: async (args?: any) =>
+        applyListArgs(
+          db.issues.filter(
+            (i) =>
+              i.state === args?.where?.state &&
+              (!args?.where?.repository ||
+                i.repository?.enabled === args.where.repository.enabled),
+          ),
+          args,
         ),
       // inspectIssueOwnership: { where: { id }, include: { repository } }
       findUnique: async ({ where }: any) =>
         db.issues.find((i) => i.id === where.id) ?? null,
     },
     lease: {
-      // list route: { where: { expiredAt: { gt } } }
+      // list route: { where: { expiredAt: { gt } }, orderBy, take }
       // inspect:     { where: { issueId } }
       findMany: async (args?: any) => {
         const w = args?.where;
-        if (w?.issueId) return db.leases.filter((l) => l.issueId === w.issueId);
-        if (w?.expiredAt?.gt) {
-          const t = new Date(w.expiredAt.gt).getTime();
-          return db.leases.filter((l) => l.expiredAt.getTime() > t);
-        }
-        return db.leases;
+        const rows =
+          w?.issueId
+            ? db.leases.filter((l) => l.issueId === w.issueId)
+            : w?.expiredAt?.gt
+              ? db.leases.filter(
+                  (l) => l.expiredAt.getTime() > new Date(w.expiredAt.gt).getTime(),
+                )
+              : db.leases;
+        return applyListArgs(rows, args);
       },
     },
     agentWork: {
-      // list route: { where: { issueId: { not: null }, state: { in } } }
-      findMany: async ({ where }: any) =>
-        db.agentWorks.filter(
-          (w) =>
-            w.issueId !== null &&
-            (where.state?.in ?? []).includes(w.state),
+      // list route: { where: { issueId: { not: null }, state: { in } }, orderBy, take }
+      findMany: async (args: any) =>
+        applyListArgs(
+          db.agentWorks.filter(
+            (w) =>
+              w.issueId !== null &&
+              (args?.where?.state?.in ?? []).includes(w.state),
+          ),
+          args,
         ),
       // inspect: { where: { issueId, state: { in } }, orderBy heartbeat desc }
       findFirst: async ({ where }: any) => {
@@ -126,6 +166,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     blockedReason: null,
     linkedPrNumber: null,
     linkedPrMergeState: null,
+    updatedAt: inMin(-3),
     repository: { fullName: "org/repo", enabled: true },
     ...overrides,
   };
@@ -159,6 +200,7 @@ function makeAgentWork(overrides: Record<string, unknown> = {}) {
     issueId: "issue-1",
     state: "CLAIMED",
     lastHeartbeatAt: inMin(-1),
+    updatedAt: inMin(-1),
     blockerReason: null,
     ...overrides,
   };
@@ -443,6 +485,98 @@ describe("GET /api/issues/ownership — token hygiene + windows", () => {
     expect(typeof body.windows.longRunGraceMs).toBe("number");
     expect(body.windows.activeMs).toBe(15 * 60 * 1000);
     expect(body.windows.longRunGraceMs).toBe(45 * 60 * 1000);
+  });
+});
+
+describe("GET /api/issues/ownership — bounded source scan", () => {
+  // The route caps every candidate source at MAX_CANDIDATE_SCAN (1000) rows and
+  // reads one probe row past it, so `sourcesTruncated` says exactly which
+  // source overflowed. `truncated` keeps its own meaning: candidates dropped
+  // before derivation.
+  const CAP = 1000;
+  const overflow = () => Array.from({ length: CAP + 1 }, (_, i) => i);
+
+  beforeEach(() => {
+    reset();
+  });
+
+  it("reports only `labeled` when the open-issue label sweep overflows its cap", async () => {
+    db.issues = overflow().map((i) =>
+      makeIssue({ id: `issue-${i}`, labels: ["agent/alpha"] }),
+    );
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.sourcesTruncated).toEqual({
+      labeled: true,
+      leased: false,
+      working: false,
+    });
+    // the label cap drops candidates before derivation (MAX_INSPECTED = 500),
+    // which is `truncated`'s job — unchanged by the per-source signal.
+    expect(body.truncated).toBe(true);
+    expect(body.examined).toBe(500);
+  });
+
+  it("reports only `leased` when active leases overflow their cap", async () => {
+    db.issues = [makeIssue()];
+    // Lease is unique on (agentName, issueId): one agent per issue, so the
+    // overflow is many distinct claims on the one issue.
+    db.leases = overflow().map((i) =>
+      makeLease({ id: `lease-${i}`, agentName: `alpha-${i}`, issueId: "issue-1" }),
+    );
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.sourcesTruncated).toEqual({
+      labeled: false,
+      leased: true,
+      working: false,
+    });
+    expect(body.examined).toBe(1);
+  });
+
+  it("reports only `working` when active AgentWork rows overflow their cap", async () => {
+    db.issues = [makeIssue()];
+    db.agentWorks = overflow().map((i) =>
+      makeAgentWork({ id: `aw-${i}`, agentName: `alpha-${i}`, issueId: "issue-1" }),
+    );
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.sourcesTruncated).toEqual({
+      labeled: false,
+      leased: false,
+      working: true,
+    });
+    expect(body.examined).toBe(1);
+  });
+
+  it("does not over-report: a source with exactly the cap's worth of rows is not truncated", async () => {
+    db.issues = Array.from({ length: CAP }, (_, i) => makeIssue({ id: `issue-${i}` }));
+    db.leases = Array.from({ length: CAP }, (_, i) =>
+      makeLease({ id: `lease-${i}`, agentName: `alpha-${i}`, issueId: "issue-0" }),
+    );
+    db.agentWorks = Array.from({ length: CAP }, (_, i) =>
+      makeAgentWork({ id: `aw-${i}`, agentName: `alpha-${i}`, issueId: "issue-0" }),
+    );
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // toEqual, not property-by-property: a missing flag fails this assertion.
+    expect(body.sourcesTruncated).toEqual({
+      labeled: false,
+      leased: false,
+      working: false,
+    });
   });
 });
 
