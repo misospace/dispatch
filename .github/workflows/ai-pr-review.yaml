@@ -60,6 +60,7 @@ jobs:
           ai-fallback-api-key: ${{ secrets.LITELLM_API_KEY }}
           review-routing-mode: auto
           repository-skills: "true"
+          review-verbosity: concise
           # Default flags minus public_route_changes: every Next.js App Router
           # API handler is a route.<ext>, so it would escalate nearly every PR.
           escalate-on-risk-flags: "linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes"
