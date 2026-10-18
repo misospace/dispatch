@@ -42,7 +42,8 @@ const { db, applyListArgs } = vi.hoisted(() => {
           // nulls last on a desc sort, matching the route's `nulls: "last"`
           if (av === null) return 1;
           if (bv === null) return -1;
-          return dir === "asc" ? (av > bv ? -1 : 1) : av > bv ? 1 : -1;
+          // desc puts the LARGER value first, so a greater `a` sorts before `b`.
+          return dir === "asc" ? (av > bv ? -1 : 1) : av > bv ? -1 : 1;
         }
         return 0;
       });
@@ -580,7 +581,101 @@ describe("GET /api/issues/ownership — bounded source scan", () => {
   });
 });
 
-describe("GET /api/issues/ownership — known bug (route.ts:122-126)", () => {
+describe("GET /api/issues/ownership — lease scan freshness order (#1251 review)", () => {
+  const CAP = 1000;
+
+  beforeEach(() => {
+    reset();
+  });
+
+  // `upsertLease`'s CREATE path never sets `renewedAt` (src/lib/lease.ts), so
+  // every brand-new claim carries NULL there. Keying the scan's freshness on
+  // `renewedAt` first therefore sorts the newest claims to the BACK — and, past
+  // the cap, off the end of the scan entirely. Freshness is `createdAt` first.
+  it("orders a never-renewed lease created most recently ahead of an older long-renewed one", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-old", number: 1 }),
+      makeIssue({ id: "issue-new", number: 2 }),
+    ];
+    db.leases = [
+      // Claimed a week ago, renewed a minute ago: freshest by `renewedAt`.
+      makeLease({
+        id: "lease-old",
+        issueId: "issue-old",
+        createdAt: inMin(-60 * 24 * 7),
+        renewedAt: inMin(-1),
+      }),
+      // Claimed a minute ago and never renewed: NULL `renewedAt`.
+      makeLease({
+        id: "lease-new",
+        issueId: "issue-new",
+        createdAt: inMin(-1),
+        renewedAt: null,
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.sourcesTruncated).toEqual({
+      labeled: false,
+      leased: false,
+      working: false,
+    });
+    // Candidates are seeded from the lease scan in scan order, so `items`
+    // mirrors it: the freshest lease first.
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-new",
+      "issue-old",
+    ]);
+  });
+
+  it("keeps the freshest never-renewed claim when the lease source overflows its cap", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-old", number: 1 }),
+      makeIssue({ id: "issue-new", number: 2 }),
+    ];
+    // One probe row past the cap: the oldest long-renewed claim is the row the
+    // scan must drop — never the freshest, never-renewed one.
+    db.leases = [
+      ...Array.from({ length: CAP }, (_, i) =>
+        makeLease({
+          id: `lease-old-${String(i).padStart(4, "0")}`,
+          agentName: `alpha-${i}`,
+          issueId: "issue-old",
+          createdAt: inMin(-60 * 24 * 7),
+          renewedAt: inMin(-1),
+        }),
+      ),
+      makeLease({
+        id: "lease-new",
+        agentName: "alpha-new",
+        issueId: "issue-new",
+        createdAt: inMin(-1),
+        renewedAt: null,
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.sourcesTruncated).toEqual({
+      labeled: false,
+      leased: true,
+      working: false,
+    });
+    // The cap drops exactly one row, and it is a long-renewed old claim.
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-new",
+      "issue-old",
+    ]);
+    expect(body.examined).toBe(2);
+  });
+});
+
+describe("GET /api/issues/ownership — known bug (the no-filter branch)", () => {
   beforeEach(() => {
     reset();
     db.issues = [makeIssue({ labels: ["agent/alpha"] })];

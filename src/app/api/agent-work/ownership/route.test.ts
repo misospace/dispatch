@@ -49,6 +49,11 @@ const { mocks, db, applyData } = vi.hoisted(() => {
       audit: [] as any[],
       lifecycleEvents: [] as any[],
       txCount: 0,
+      // Every mutating delegate call, tagged with the client it was issued
+      // through: "prisma" (root) or "tx#<n>" (a transaction client). The
+      // atomicity assertions read this to prove each write actually rode the
+      // transaction rather than the ambient root client.
+      writes: [] as Array<{ op: string; client: string }>,
     },
   };
 });
@@ -67,111 +72,152 @@ vi.mock("@/lib/prisma", () => {
   const maybeFail = (point: string) => {
     if (mocks.failAt !== point) return;
     mocks.failAt = null;
+    // Arranged BEFORE the throw and issued through the ROOT client, i.e. an
+    // out-of-transaction write that must survive the rollback.
+    client.auditLog.create({ data: { action: "ambient_out_of_transaction" } });
     throw new Error(`injected failure at ${point}`);
   };
 
-  const client: any = {
-    issue: {
-      findUnique: async ({ where }: any) =>
-        db.issue && db.issue.id === where.id ? db.issue : null,
-    },
-    lease: {
-      findUnique: async ({ where }: any) => {
-        if (where.agentName_issueId) {
-          const { agentName, issueId } = where.agentName_issueId;
-          return db.lease && db.lease.agentName === agentName && db.lease.issueId === issueId
-            ? db.lease
-            : null;
-        }
-        return db.lease && db.lease.id === where.id ? db.lease : null;
+  type Undo = () => void;
+
+  /**
+   * Build a client over the shared in-memory store.
+   *
+   * `journal` is what makes `$transaction` honest: only a client handed a
+   * journal registers its writes as undoable, and a rollback replays that
+   * journal alone. The root client has no journal, so a write issued through it
+   * is NOT rolled back — which means swapping `tx.*` for `prisma.*` inside a
+   * transaction leaves real writes behind and the atomicity assertions fail,
+   * rather than passing on a mock that made both spellings equivalent.
+   */
+  const makeClient = (tag: string, journal: Undo[] | null) => {
+    const note = (op: string) => {
+      db.writes.push({ op, client: tag });
+    };
+    // Pushing onto a bookkeeping array and undoing that push are one write.
+    const pushRow = (op: string, rows: any[], row: any) => {
+      const length = rows.length;
+      note(op);
+      journal?.push(() => {
+        rows.length = length;
+      });
+      rows.push(row);
+    };
+
+    return {
+      issue: {
+        findUnique: async ({ where }: any) =>
+          db.issue && db.issue.id === where.id ? db.issue : null,
       },
-      update: async ({ where, data }: any) => {
-        if (db.lease && db.lease.id === where.id) {
-          db.leaseUpdates.push({ where, data });
+      lease: {
+        findUnique: async ({ where }: any) => {
+          if (where.agentName_issueId) {
+            const { agentName, issueId } = where.agentName_issueId;
+            return db.lease && db.lease.agentName === agentName && db.lease.issueId === issueId
+              ? db.lease
+              : null;
+          }
+          return db.lease && db.lease.id === where.id ? db.lease : null;
+        },
+        // Honors a claim-token fence in `where` the way Prisma does: no match
+        // means the row does not carry that token.
+        update: async ({ where, data }: any) => {
+          if (where.claimToken !== undefined && db.lease && db.lease.claimToken !== where.claimToken) {
+            throw new Error(`lease ${where.id} does not carry claim token ${where.claimToken}`);
+          }
+          if (db.lease && db.lease.id === where.id) {
+            const previous = db.lease;
+            pushRow("lease.update", db.leaseUpdates, { where, data });
+            db.lease = applyData(db.lease, data);
+            journal?.push(() => {
+              db.lease = previous;
+            });
+          }
+          return db.lease;
+        },
+        // Honors the fenced compare-and-set (id + claimToken + null disposition).
+        updateMany: async ({ where, data }: any) => {
+          if (db.updateManyCount !== undefined) return { count: db.updateManyCount };
+          if (!db.lease || db.lease.id !== where.id) return { count: 0 };
+          if (where.claimToken !== undefined && db.lease.claimToken !== where.claimToken) return { count: 0 };
+          if (where.disposition !== undefined && db.lease.disposition !== where.disposition) return { count: 0 };
+          const previous = db.lease;
+          note("lease.updateMany");
+          journal?.push(() => {
+            db.lease = previous;
+          });
           db.lease = applyData(db.lease, data);
-        }
-        return db.lease;
+          return { count: 1 };
+        },
       },
-      // Honors the fenced compare-and-set (id + claimToken + null disposition).
-      updateMany: async ({ where, data }: any) => {
-        if (db.updateManyCount !== undefined) return { count: db.updateManyCount };
-        if (!db.lease || db.lease.id !== where.id) return { count: 0 };
-        if (where.claimToken !== undefined && db.lease.claimToken !== where.claimToken) return { count: 0 };
-        if (where.disposition !== undefined && db.lease.disposition !== where.disposition) return { count: 0 };
-        db.lease = applyData(db.lease, data);
-        return { count: 1 };
+      agentWork: {
+        findFirst: async ({ where }: any) => {
+          if (!db.agentWork) return null;
+          if (db.agentWork.agentName !== where.agentName) return null;
+          if (db.agentWork.issueId !== where.issueId) return null;
+          if (where.state?.in && !where.state.in.includes(db.agentWork.state)) return null;
+          return db.agentWork;
+        },
+        update: async ({ where, data }: any) => {
+          maybeFail("agentWork.update");
+          if (db.agentWork && db.agentWork.id === where.id) {
+            const previous = db.agentWork;
+            pushRow("agentWork.update", db.agentWorkUpdates, { where, data });
+            db.agentWork = { ...db.agentWork, ...data };
+            journal?.push(() => {
+              db.agentWork = previous;
+            });
+          }
+          return db.agentWork;
+        },
       },
-    },
-    agentWork: {
-      findFirst: async ({ where }: any) => {
-        if (!db.agentWork) return null;
-        if (db.agentWork.agentName !== where.agentName) return null;
-        if (db.agentWork.issueId !== where.issueId) return null;
-        if (where.state?.in && !where.state.in.includes(db.agentWork.state)) return null;
-        return db.agentWork;
+      agentWorkHistory: {
+        create: async ({ data }: any) => {
+          pushRow("agentWorkHistory.create", db.agentWorkHistory, data);
+          return data;
+        },
       },
-      update: async ({ where, data }: any) => {
-        maybeFail("agentWork.update");
-        if (db.agentWork && db.agentWork.id === where.id) {
-          db.agentWorkUpdates.push({ where, data });
-          db.agentWork = { ...db.agentWork, ...data };
-        }
-        return db.agentWork;
+      auditLog: {
+        create: async ({ data }: any) => {
+          maybeFail("audit");
+          pushRow("auditLog.create", db.audit, data);
+          return data;
+        },
       },
-    },
-    agentWorkHistory: {
-      create: async ({ data }: any) => {
-        db.agentWorkHistory.push(data);
-        return data;
+      issueLifecycleEvent: {
+        create: async ({ data }: any) => {
+          maybeFail("lifecycle");
+          pushRow("issueLifecycleEvent.create", db.lifecycleEvents, data);
+          return data;
+        },
+        // A dedupe hit writes nothing at all, so it is not recorded either.
+        upsert: async ({ where, create }: any) => {
+          maybeFail("lifecycle");
+          const existing = db.lifecycleEvents.find((e) => e.dedupeKey === where.dedupeKey);
+          if (existing) return existing;
+          pushRow("issueLifecycleEvent.upsert", db.lifecycleEvents, create);
+          return create;
+        },
       },
-    },
-    auditLog: {
-      create: async ({ data }: any) => {
-        maybeFail("audit");
-        db.audit.push(data);
-        return data;
-      },
-    },
-    issueLifecycleEvent: {
-      create: async ({ data }: any) => {
-        maybeFail("lifecycle");
-        db.lifecycleEvents.push(data);
-        return data;
-      },
-      upsert: async ({ where, create }: any) => {
-        maybeFail("lifecycle");
-        const existing = db.lifecycleEvents.find((e) => e.dedupeKey === where.dedupeKey);
-        if (existing) return existing;
-        db.lifecycleEvents.push(create);
-        return create;
-      },
-    },
+    };
   };
 
-  // Interactive transaction over the same delegates, rolling the in-memory
-  // store back when the callback throws — so a test can prove that a failed
-  // disposition leaves no committed lease CAS behind (#1251 review MAJOR).
+  // The root client carries no journal: nothing it writes is undoable.
+  const client: any = makeClient("prisma", null);
+
+  // Interactive transaction over a DISTINCT client object. A write only lands
+  // in the store through the transaction client and only that client's writes
+  // are undone when the callback throws — so the suite proves the lease CAS,
+  // the AgentWork settlement, its history, the lifecycle event and the audit
+  // row all ride this transaction (#1251 review MAJOR), and that a rollback
+  // leaves writes made outside it alone.
   client.$transaction = async (fn: (tx: any) => Promise<any>) => {
     db.txCount += 1;
-    const snapshot = {
-      lease: db.lease,
-      agentWork: db.agentWork,
-      leaseUpdates: db.leaseUpdates.length,
-      agentWorkUpdates: db.agentWorkUpdates.length,
-      history: db.agentWorkHistory.length,
-      audit: db.audit.length,
-      lifecycle: db.lifecycleEvents.length,
-    };
+    const journal: Undo[] = [];
     try {
-      return await fn(client);
+      return await fn(makeClient(`tx#${db.txCount}`, journal));
     } catch (error) {
-      db.lease = snapshot.lease;
-      db.agentWork = snapshot.agentWork;
-      db.leaseUpdates.length = snapshot.leaseUpdates;
-      db.agentWorkUpdates.length = snapshot.agentWorkUpdates;
-      db.agentWorkHistory.length = snapshot.history;
-      db.audit.length = snapshot.audit;
-      db.lifecycleEvents.length = snapshot.lifecycle;
+      for (let i = journal.length - 1; i >= 0; i -= 1) journal[i]();
       throw error;
     }
   };
@@ -271,6 +317,7 @@ function seedDb() {
   db.audit = [];
   db.lifecycleEvents = [];
   db.txCount = 0;
+  db.writes = [];
   mocks.failAt = null;
 }
 
@@ -457,6 +504,16 @@ describe("POST /api/agent-work/ownership — register", () => {
     expect(db.leaseUpdates).toHaveLength(1);
     expect(db.lifecycleEvents).toHaveLength(1);
     expect(db.audit.filter((a) => a.action === "ownership_register")).toHaveLength(1);
+  });
+
+  it("fences the in-transaction registration write with the presented claim token (#1251 review)", async () => {
+    const res = await post(baseBody({ operation: "register", runRef: "run-1" }));
+    expect(res.status).toBe(200);
+    // The lease update names the token, so a row that rotated to a fresh
+    // attempt under it can never be stamped with a retired registration.
+    expect(db.leaseUpdates).toHaveLength(1);
+    expect(db.leaseUpdates[0].where).toEqual({ id: "lease-1", claimToken: CLAIM_TOKEN });
+    expect(db.lease.registeredAt).toBeInstanceOf(Date);
   });
 
   it("rejects an over-long runRef with 400", async () => {
@@ -788,6 +845,45 @@ describe("POST /api/agent-work/ownership — disposition atomicity (#1251 review
       expect(db.lifecycleEvents[0].kind).toBe("ownership_dispositioned");
       expect(db.audit.filter((a) => a.action === "ownership_disposition")).toHaveLength(1);
     }
+  });
+
+  it("rolls back only transaction-issued writes: an out-of-transaction write survives (#1251 review)", async () => {
+    db.agentWork = makeAgentWork();
+    // The injector writes through the ROOT client just before it throws — a
+    // write that is not part of the transaction.
+    mocks.failAt = "agentWork.update";
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+
+    expect(res.status).toBe(500);
+    // The ambient write rode no transaction, so the rollback cannot reach it…
+    expect(db.audit.filter((a) => a.action === "ambient_out_of_transaction")).toHaveLength(1);
+    // …while everything the transaction itself wrote is gone. A rollback that
+    // unwound the whole store would fail the first assertion; one that undid
+    // nothing would fail assertNothingCommitted.
+    assertNothingCommitted();
+  });
+
+  it("issues every local effect on the transaction client, lifecycle included (#1251 review)", async () => {
+    db.agentWork = makeAgentWork();
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+
+    expect(res.status).toBe(200);
+    expect(db.txCount).toBe(1);
+    // The lease CAS, the AgentWork settlement, its history, the lifecycle event
+    // and the audit row all went out on the transaction client…
+    expect(db.writes.map((w) => w.op)).toEqual([
+      "lease.updateMany",
+      "agentWork.update",
+      "agentWorkHistory.create",
+      "issueLifecycleEvent.upsert",
+      "auditLog.create",
+    ]);
+    // …and `recordLifecycleEvent` was handed that transaction client, not
+    // `prisma`. Nothing escaped to the ambient root client.
+    expect(db.writes.find((w) => w.op === "issueLifecycleEvent.upsert")?.client).toMatch(/^tx#\d+$/);
+    expect(db.writes.filter((w) => w.client === "prisma")).toEqual([]);
   });
 
   it("fences the retired claim token after the claim path reactivates a disposed lease (#1251/#1256)", async () => {

@@ -24,7 +24,13 @@ Semantics that never change:
   A token that does not match the live lease row is rejected
   (`409`, `code: "stale_claim_token"`), so a superseded incarnation can never
   renew or dispose a newer claim. A lease re-created by a re-claim carries a
-  fresh token; pre-#1256 token-less leases are rejected until re-claimed.
+  fresh token, and reactivating a **disposed** lease row (the claim path reuses
+  the row instead of creating one) rotates `claimToken` atomically with the
+  terminal-field clear and resets the retired attempt's registration/renewal
+  provenance — so the retired receipt is fenced out of the new attempt. An
+  ordinary renewal of a live, undisposed row keeps its token and evidence: a
+  heartbeating worker never loses its receipt. Pre-#1256 token-less leases are
+  rejected until re-claimed.
 - **Late renewals are accepted; dead claims are not.** A renewal whose lease
   has lapsed but whose row still exists is accepted (transient outage /
   restart). A renewal for a lease whose row was released/pruned gets
@@ -35,14 +41,25 @@ Semantics that never change:
   server time (same posture as `tasks/report`'s `startedAt`).
 - **Replay.** `register` and a same-kind `disposition` are idempotent per
   (issue, agent, token); a *different* disposition after a terminal one is
-  `409 disposition_conflict`.
+  `409 disposition_conflict`. A replayed `register` returns the persisted
+  registration with `replayed: true` and writes nothing — no timestamp refresh,
+  no run-reference overwrite, no second audit row.
+- **Atomicity.** The operations that assert a new fact about an attempt commit
+  their evidence together in one transaction: `register` (registration +
+  lifecycle event + audit row) and `disposition` (terminal CAS + AgentWork
+  settlement + history + lifecycle event + audit row). A write that fails
+  mid-way rolls the whole fact back, so the retry re-enters the full path
+  instead of hitting a replay that reports success for evidence which never
+  landed. This matters because the issue mutation guard has no resume branch
+  and is deleted on throw.
 - **No releases.** Nothing here writes GitHub labels, deletes a lease, or
   moves issue status. A missing heartbeat or an unrenewed claim never revokes
   anything. A disposed-but-unexpired lease likewise stays in place (still
   surfaced as resumable by `active-work`, still excluding the issue from other
   agents' queues) until it expires naturally or the same agent re-claims —
-  and a claim-path `upsertLease` renewal clears the terminal marker so the
-  fresh attempt never inherits the retired one's disposition.
+  and reactivating it in the claim path rotates the claim token and clears the
+  retired attempt's terminal marker and provenance, so the fresh attempt never
+  inherits the retired one's evidence or leaves its owner unfenced.
 
 ### Identity boundaries
 
@@ -86,7 +103,7 @@ central tiering):
   claim signal (agent label / active lease / active AgentWork).
   `?state=<OWNERSHIP_STATES>` filter, `limit` (default 50, max 200).
   Bounded scan: each of the three candidate sources is read newest-first
-  (`Issue.updatedAt`, `Lease.renewedAt` nulls-last → `createdAt` → `id`,
+  (`Issue.updatedAt`, `Lease.createdAt` → `renewedAt` nulls-last → `id`,
   `AgentWork.updatedAt` → `id`) capped at 1000 rows, and at most 500
   candidates are derived with chunked concurrency. The response reports
   `{ items, counts, examined, truncated, sourcesTruncated, limit, windows }`:

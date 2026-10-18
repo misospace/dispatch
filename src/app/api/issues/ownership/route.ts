@@ -112,16 +112,19 @@ export async function GET(request: Request) {
   });
   const openLabeled = labeledRows.slice(0, MAX_CANDIDATE_SCAN);
   const labeledTruncated = labeledRows.length > MAX_CANDIDATE_SCAN;
-  // (b) issues referenced by an active (non-expired) lease. `renewedAt` is the
-  // freshest signal on the row (null for never-renewed leases, hence
-  // nulls: last), with `createdAt` then `id` as tiebreakers so equal
-  // timestamps cannot reorder between runs.
+  // (b) issues referenced by an active (non-expired) lease. Freshness keys on
+  // `createdAt` FIRST, not `renewedAt`: `upsertLease`'s create path never sets
+  // `renewedAt`, so every newly claimed lease is NULL there, and a nulls-last
+  // primary key on `renewedAt` would sort those past the cap — keeping
+  // long-renewed claims and dropping the newest ones, backwards for a "who owns
+  // what right now" surface. `renewedAt` (nulls-last) then `id` break ties
+  // deterministically so equal timestamps cannot reorder between runs.
   const leasedRows = await prisma.lease.findMany({
     where: { expiredAt: { gt: now } },
     select: { issueId: true },
     orderBy: [
-      { renewedAt: { sort: "desc", nulls: "last" } },
       { createdAt: "desc" },
+      { renewedAt: { sort: "desc", nulls: "last" } },
       { id: "asc" },
     ],
     take: SCAN_TAKE,

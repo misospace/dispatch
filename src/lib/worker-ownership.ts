@@ -26,13 +26,19 @@
 // 4. **Serialization.** Lease-mutating operations run under the per-issue
 //    `IssueMutationGuard` anchor (#1259) so a renewal cannot interleave with a
 //    claim or a fenced capacity release on the same issue.
-// 5. **Atomicity.** A lease CAS and the projections it implies (AgentWork
-//    settlement, history, lifecycle event, audit row) commit in ONE
-//    `prisma.$transaction`. That guard anchor has no resume branch and is
-//    deleted on throw, so a CAS committed without its evidence would be
-//    unreachable on retry: the replay branch would report success for a
-//    disposition whose work was never settled and whose required lifecycle
-//    event does not exist.
+// 5. **Atomicity.** The two operations that assert a *new fact* about an
+//    attempt — `register` (registration + lifecycle event + audit row) and
+//    `disposition` (terminal CAS + AgentWork settlement + history + lifecycle
+//    event + audit row) — commit in ONE `prisma.$transaction`, the lifecycle
+//    event through that transaction's client. That guard anchor has no resume
+//    branch and is deleted on throw, so a CAS committed without its evidence
+//    would be unreachable on retry: the replay branch would report success for
+//    a disposition whose work was never settled and whose required lifecycle
+//    event does not exist. `renew` is deliberately NOT in this class — it
+//    extends a TTL that a retry can safely re-extend and heartbeats a
+//    matching `AgentWork` as best-effort evidence whose absence it reports
+//    truthfully (`agentWorkHeartbeated: false`), so there is nothing for it
+//    to lie about.
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
@@ -268,8 +274,13 @@ export async function registerOwnership(input: RegisterOwnershipInput): Promise<
     // this path instead of short-circuiting into a register whose evidence
     // never landed.
     return prisma.$transaction(async (tx): Promise<{ ok: true; value: RegisterOwnershipSuccess } | OwnershipOpFailure> => {
+      // Fenced exactly like the disposition CAS below: the write names the
+      // presented token, so a lease that rotated to a fresh attempt between the
+      // guarded read and here is never stamped with a retired incarnation's
+      // registration (defence in depth — the issue guard already serializes
+      // every lease writer, so this cannot match today).
       const updated = await tx.lease.update({
-        where: { id: lease.id },
+        where: { id: lease.id, claimToken: input.claimToken },
         data: {
           registeredAt: now,
           registrationOccurredAt: occurred,
@@ -482,6 +493,10 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
           ...waitPatch,
         },
       });
+      // Returning (rather than throwing) commits whatever ran before this
+      // line — which is exactly nothing: the CAS is the transaction's first
+      // statement, so a lost race commits an empty transaction. Keep it
+      // first: any write placed above it would survive this early return.
       if (updated.count === 0) return fail("disposition_conflict", "Disposition changed concurrently; re-read and retry");
 
       // Settle a matching active AgentWork (if any) to its terminal state so
