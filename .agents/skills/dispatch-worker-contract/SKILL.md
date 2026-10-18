@@ -5,7 +5,7 @@ description: Review Dispatch changes to agent task APIs, queue ordering, authent
 
 ## Agent Workflow Contract
 
-This section is the source of truth for how any agent (Saffron, or any other harness) interacts with Dispatch. It supersedes all prior workflow guidance.
+This section is the source of truth for how any worker or harness interacts with Dispatch. It supersedes all prior workflow guidance.
 
 ### Canonical One-Task Worker Loop
 
@@ -22,7 +22,9 @@ Every agent heartbeat follows this loop:
 
 ```python
 def heartbeat(agent_name, dispatch_url):
-    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
+    # WORKER_BEARER_TOKEN is a client-side secret containing this agent's
+    # bound token provisioned through the server's DISPATCH_WORKER_TOKENS map.
+    auth = {"Authorization": f"Bearer {WORKER_BEARER_TOKEN}"}
 
     # Step 1: fetch next task (auth required)
     task = get(
@@ -51,18 +53,18 @@ def heartbeat(agent_name, dispatch_url):
 
 ### Auth Requirements
 
-Both `next-task` and `tasks/report` require bearer token authentication via `DISPATCH_AGENT_TOKEN`. Use the existing Dispatch bearer token model — no new environment variables or auth schemes.
+Both `next-task` and `tasks/report` require bearer authentication. Worker processes must use a token bound to their own agent through the server's `DISPATCH_WORKER_TOKENS` setting (`agentName:token` pairs). In the examples below, `WORKER_BEARER_TOKEN` is a client-side secret containing that agent's bound token; it is an example variable name, not a Dispatch server setting. `DISPATCH_AGENT_TOKEN` and its `DISPATCH_MAINTAINER_TOKEN` alias are maintainer-tier credentials with full rights, not the normal worker credential.
 
 ```bash
 # Fetch next task
-curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
-  "$DISPATCH_URL/api/agents/saffron/next-task?lane=normal"
+curl -s -H "Authorization: Bearer $WORKER_BEARER_TOKEN" \
+  "$DISPATCH_URL/api/agents/$AGENT_NAME/next-task?lane=normal"
 
 # Report outcome
-curl -s -X POST -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+curl -s -X POST -H "Authorization: Bearer $WORKER_BEARER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"taskType":"implement","outcome":"pr_opened","repoFullName":"org/repo","issueNumber":42,"pullRequestUrl":"https://github.com/org/repo/pull/50"}' \
-  "$DISPATCH_URL/api/agents/saffron/tasks/report"
+  "$DISPATCH_URL/api/agents/$AGENT_NAME/tasks/report"
 ```
 
 ### Task Types
@@ -96,7 +98,7 @@ Queue-backed `followup-pr` reports must echo the `prFixItem.{id, generation}` to
 
 Workers may report `outcome: "capacity-exhausted"` only when a recognized execution capacity is genuinely unavailable, with a non-empty `capacity` identifier (an opaque worker-chosen name, for example a provider/model or runner pool) and the issued `prFixItem: { id, generation, handoutToken }` token. Dispatch fences the settlement to the **exact issued hand-out**: the `handoutToken` is a per-hand-out receipt next-task mints (rotated on every issuance), and the release removes only the reporting agent's receipt/hand-out/ack — other agents' live hand-outs at that generation are preserved, and the hand-out stamps clear only when the last live hand-out is consumed. While the item is still `QUEUED` the attempt token is consumed but the item **stays `QUEUED` at the same generation with the same `fixAttempts` count, branch, and PR identity** — no repair budget is spent and there is no global wait. The suppression is **capacity-scoped**: Dispatch records a bounded cooldown (`DISPATCH_CAPACITY_COOLDOWN_MS`, default 15m, clamped to 1m–6h) for that capacity on that item only. `next-task` requests may declare `?capacity=`; a request whose capacity matches the exhausted one skips the item until the cooldown expires, an unrelated capacity is never suppressed, and a request that declares no capacity conservatively skips cooled items. The capacity is caller-declared trusted *scoping*, never identity: settlement authority comes only from the issued receipt token, the cooldown deliberately does not filter by agent (the same worker with a different, unrelated capacity is legitimately allowed), and lying about a capacity grants nothing beyond re-acquiring work for the capacity one claims to have exhausted. A `capacity_handoff` history row and a `CapacityHandoff` row record the transition. A changed generation, an already-settled status, or a human hold (BLOCKED/PARKED/NEEDS_HUMAN) is never overwritten — the report settles as a no-op. Do not use this outcome for worker-local failures, ordinary errors, or an unrecognized capacity.
 
-For **claimed issue work** the fenced counterpart is `POST /api/issues/capacity-handoff` (bearer-auth; bound workers only for their own agent). The worker presents the `claimToken` that `POST /api/issues/claim` issued on the claim (also surfaced by `active-work` resume context and the MCP `claim_issue` result). A persistent per-issue `IssueMutationGuard` serializes cooperating claim, `upsertLease`, and release mutations under a PostgreSQL advisory lock. Dispatch fences release to that exact claim (agent + lease row + token, verified against live GitHub labels); if ownership changed during verification, cleanup removes only this worker's agent label and never changes status. Human holds (closed/done, any live `status/blocked`, a cached block carrying a `blockedReason`) and changed/missing ownership are refused. The lease remains until remote label cleanup succeeds; then it is consumed, active AgentWork rows are retired with history, an audit row is written, and the same capacity-scoped cooldown applies to issue pickup. Failed cleanup retains the lease and guard so an exact-token retry can resume. Guards are persistent and have no automatic timeout: after a process crash, an operator must confirm the process stopped and reconcile live GitHub state before removing one. Branch/PR identity on the lease and work history is retained; nothing is re-pushed and no repair budget exists for issue work. See [docs/capacity-handoff.md](./docs/capacity-handoff.md) for the lease/label effects and the GitHub-vs-database consistency boundary.
+For **claimed issue work** the fenced counterpart is `POST /api/issues/capacity-handoff` (bearer-auth; bound workers only for their own agent). The worker presents the `claimToken` that `POST /api/issues/claim` issued on the claim (also surfaced by `active-work` resume context and the MCP `claim_issue` result). A persistent per-issue `IssueMutationGuard` serializes cooperating claim, `upsertLease`, and release mutations under a PostgreSQL advisory lock. Dispatch fences release to that exact claim (agent + lease row + token, verified against live GitHub labels); if ownership changed during verification, cleanup removes only this worker's agent label and never changes status. Human holds (closed/done, any live `status/blocked`, a cached block carrying a `blockedReason`) and changed/missing ownership are refused. The lease remains until remote label cleanup succeeds; then it is consumed, active AgentWork rows are retired with history, an audit row is written, and the same capacity-scoped cooldown applies to issue pickup. Failed cleanup retains the lease and guard so an exact-token retry can resume. Guards are persistent and have no automatic timeout: after a process crash, an operator must confirm the process stopped and reconcile live GitHub state before removing one. Branch/PR identity on the lease and work history is retained; nothing is re-pushed and no repair budget exists for issue work. See [docs/capacity-handoff.md](../../../docs/capacity-handoff.md) for the lease/label effects and the GitHub-vs-database consistency boundary.
 
 The report body also accepts an optional `startedAt` — an extended ISO 8601 timestamp with timezone (`Z` or `±HH:MM`), for example `2026-10-03T04:20:58Z` or `2026-10-03T04:20:58.123456+00:00`, marking when the worker began the task. When it parses, is not in the future, and is no more than 24 hours before the report, it is stored as the run's start time so the run records a real duration; missing, malformed, future, or too-old values silently fall back to the report time (never a 400). The raw body value participates in the idempotency payload identity, so an identical-body retry always replays as a duplicate. An accepted `startedAt` is normalized to UTC (`Z`) form when stored and echoed back in the response. The echo reflects re-validation of the current request, so on an idempotent duplicate replay the echoed `startedAt` may be absent even though the original accepted run stored it — for example when an identical-body retry lands more than 24 hours after the reported start (the stored AgentRun is unaffected).
 
@@ -124,7 +126,7 @@ Workers must respect these constraints:
 * **`next-task` failure:** If the endpoint returns an error, log a warning and stop — do not start the model.
 * **`tasks/report` failure:** If reporting fails after execution, log a warning and stop. The work was completed; the report is best-effort visibility.
 * **Optional sync failure:** Log as a freshness warning. Never block task execution.
-* **Tokens are secrets.** `DISPATCH_AGENT_TOKEN` and `GITHUB_TOKEN` must never be logged, echoed, or persisted to disk.
+* **Tokens are secrets.** Never log, echo, or persist `DISPATCH_WORKER_TOKENS`, a worker's `WORKER_BEARER_TOKEN`, `DISPATCH_AGENT_TOKEN`, `DISPATCH_MAINTAINER_TOKEN`, or `GITHUB_TOKEN`. Keep maintainer-tier credentials out of ordinary worker processes.
 
 ### Auditability
 
@@ -149,15 +151,15 @@ The following endpoints remain available for internal use and backward compatibi
 
 ### Detailed Worker Contract
 
-For the detailed worker execution contract (PR fix queue precedence, duplicate PR avoidance, hard completion gates, branch naming conventions, failure response format), see [docs/worker-execution-contract.md](./docs/worker-execution-contract.md). This supersedes ad-hoc behavior and applies to all agent workers.
+For the detailed worker execution contract (PR fix queue precedence, duplicate PR avoidance, hard completion gates, branch naming conventions, failure response format), see [docs/worker-execution-contract.md](../../../docs/worker-execution-contract.md). This supersedes ad-hoc behavior and applies to all agent workers.
 
 ### Generic Harness Loop
 
-For harness-agnostic integration examples (curl, OpenClaw, Codex, Claude Code), see [docs/generic-harness-loop.md](./docs/generic-harness-loop.md).
+For harness-agnostic integration examples (curl, OpenClaw, Codex, Claude Code), see [docs/generic-harness-loop.md](../../../docs/generic-harness-loop.md).
 
 ### Worker Cron Prompt Migration
 
-Worker cron prompts have been migrated from GitHub Project board readers to Dispatch queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](./docs/worker-cron-prompt-migration.md).
+Worker cron prompts have been migrated from GitHub Project board readers to Dispatch queue APIs. For migration details, affected cron jobs, and the deprecation of board-reading scripts, see [docs/worker-cron-prompt-migration.md](../../../docs/worker-cron-prompt-migration.md).
 
 ### Release cut process
 
