@@ -300,6 +300,10 @@ model PrFixQueueItem {
   @@index([status, lane])
   @@index([type])
   @@index([status, type])
+  // Fair-eligibility read of the external-wait trigger pass (#1253): NULLS
+  // FIRST is part of the index key order because it is part of the ORDER BY;
+  // the trailing `id` matches the deterministic tiebreak.
+  @@index([status, triggerEvaluatedAt(sort: Asc, nulls: First), id])
 }
 
 model PrFixHistory {

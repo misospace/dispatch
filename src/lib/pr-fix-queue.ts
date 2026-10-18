@@ -951,7 +951,11 @@ export async function reconcileExternalWaitTriggers(
   // deliberately left unstamped so they lead the next pass (a single shared
   // stamp would re-sort them behind the same head forever). Scoped to rows
   // still WAITING_EXTERNAL so nothing that already left the state is written.
-  // One bulk write per pass.
+  // One bulk write per pass. Writing through Prisma Client also advances
+  // `updatedAt` (@updatedAt) on those rows; that bump is inherent to the client
+  // and harmless here — the write is scoped to rows still WAITING_EXTERNAL,
+  // the fairness read depends on `triggerEvaluatedAt` alone, and `updatedAt`
+  // stays informational (never a staleness or ordering predicate).
   if (considered.length > 0) {
     await client.prFixQueueItem.updateMany({
       where: { id: { in: considered }, status: "WAITING_EXTERNAL" },

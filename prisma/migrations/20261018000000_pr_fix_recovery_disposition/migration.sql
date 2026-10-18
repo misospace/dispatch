@@ -10,3 +10,11 @@ ADD COLUMN "disposedAt" TIMESTAMP(3),
 ADD COLUMN "disposedEvidence" TEXT,
 ADD COLUMN "recoveryAppliedAt" TIMESTAMP(3),
 ADD COLUMN "triggerEvaluatedAt" TIMESTAMP(3);
+
+-- Serves the fairness read of `reconcileExternalWaitTriggers`
+-- (WHERE status = 'WAITING_EXTERNAL' AND "externalWait" IS NOT NULL
+--  ORDER BY "triggerEvaluatedAt" ASC NULLS FIRST, "id" ASC LIMIT 500).
+-- A btree only delivers that order when the index declares the same NULL
+-- placement and the same trailing tiebreak. CREATE INDEX is additive and
+-- takes no lock that blocks writes on the existing ones in this file.
+CREATE INDEX "PrFixQueueItem_status_triggerEvaluatedAt_id_idx" ON "PrFixQueueItem"("status", "triggerEvaluatedAt" ASC NULLS FIRST, "id" ASC);

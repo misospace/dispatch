@@ -67,6 +67,12 @@ function matches(row: any, where: any): boolean {
         if (op === "equals") {
           if (!sameValue(value, operand)) return false;
         } else if (op === "not") {
+          // `not: Prisma.DbNull` is the database-level "IS NOT NULL" filter:
+          // real Postgres excludes SQL-NULL rows, so the fake must too.
+          if (operand === Prisma.DbNull) {
+            if (value === null || value === undefined) return false;
+            continue;
+          }
           if (sameValue(value, operand)) return false;
         } else if (op === "in") {
           if (!(operand as unknown[]).includes(value)) return false;
