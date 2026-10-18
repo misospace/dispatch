@@ -245,6 +245,7 @@ describe("GET /api/issues/ownership — candidate gathering + derivation", () =>
     expect(body.counts.CLAIMED_ACTIVE).toBe(1);
     expect(body.counts.HELD).toBe(0);
     expect(body.examined).toBe(1);
+    expect(body.truncated).toBe(false);
     expect(body.limit).toBe(50);
     expect(typeof body.windows.activeMs).toBe("number");
     expect(typeof body.windows.longRunGraceMs).toBe("number");

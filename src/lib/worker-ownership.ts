@@ -401,13 +401,16 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
       return fail("disposition_conflict");
     }
 
-    // Defensive: the external-wait marker only belongs to a `blocked`
-    // disposition. The route rejects other combinations with 400; direct
-    // library callers that pass retryAfter elsewhere get it ignored rather
-    // than parking a gone owner as EXTERNAL_WAIT in the read model.
-    const waitPatch = input.retryAfter && input.disposition === "blocked"
-      ? { retryAfter: input.retryAfter, waitReason: input.waitReason ?? input.note ?? null }
-      : {};
+    // The external-wait marker only belongs to a `blocked` disposition. The
+    // route rejects retryAfter on other kinds with 400; here, a terminal
+    // non-blocked disposition additionally CLEARS any wait marker recorded by
+    // an earlier renew, so a gone owner is never parked as EXTERNAL_WAIT in
+    // the read model (which would shadow the terminal evidence).
+    const waitPatch = input.disposition === "blocked"
+      ? (input.retryAfter
+          ? { retryAfter: input.retryAfter, waitReason: input.waitReason ?? input.note ?? null }
+          : {})
+      : { retryAfter: null, waitReason: null };
 
     const updated = await prisma.lease.updateMany({
       where: { id: lease.id, claimToken: input.claimToken, disposition: null },

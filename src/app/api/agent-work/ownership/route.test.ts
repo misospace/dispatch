@@ -583,6 +583,17 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     expect(db.lease.waitReason).toBe("infra cooldown");
   });
 
+  it("clears a stale external wait when the disposition is not blocked (#1251 review)", async () => {
+    // An earlier renew parked an external wait; a terminal completed
+    // disposition must drop it so the gone owner is not EXTERNAL_WAIT.
+    db.lease = { ...db.lease, retryAfter: new Date(Date.now() + 3600_000), waitReason: "dep" };
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+    expect(res.status).toBe(200);
+    expect(db.lease.disposition).toBe("completed");
+    expect(db.lease.retryAfter).toBeNull();
+    expect(db.lease.waitReason).toBeNull();
+  });
+
   it("rejects a past retryAfter with 400", async () => {
     const res = await post(
       baseBody({
