@@ -15,6 +15,14 @@ ADD COLUMN "triggerEvaluatedAt" TIMESTAMP(3);
 -- (WHERE status = 'WAITING_EXTERNAL' AND "externalWait" IS NOT NULL
 --  ORDER BY "triggerEvaluatedAt" ASC NULLS FIRST, "id" ASC LIMIT 500).
 -- A btree only delivers that order when the index declares the same NULL
--- placement and the same trailing tiebreak. CREATE INDEX is additive and
--- takes no lock that blocks writes on the existing ones in this file.
+-- placement and the same trailing tiebreak.
+--
+-- Built with ordinary CREATE INDEX, not CREATE INDEX CONCURRENTLY: Prisma
+-- Migrate runs each migration as one transaction, and CONCURRENTLY is
+-- forbidden inside a transaction block. The build therefore takes a lock
+-- that blocks writes on "PrFixQueueItem" for its duration, but
+-- docker-entrypoint.sh runs `prisma migrate deploy` before the server
+-- starts, so on an instance being started there is no application traffic
+-- to block; only other replicas writing during a rolling deploy are
+-- affected, and the build is short on this bounded dispatch queue.
 CREATE INDEX "PrFixQueueItem_status_triggerEvaluatedAt_id_idx" ON "PrFixQueueItem"("status", "triggerEvaluatedAt" ASC NULLS FIRST, "id" ASC);
