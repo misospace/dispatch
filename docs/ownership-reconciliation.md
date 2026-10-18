@@ -1,8 +1,13 @@
 # Ownership Reconciliation Design
 
-> **Status:** Design only — not implemented. No claim release, label cleanup,
-> requeue, worker-credential migration, or deployment change is authorised by
-> this document.
+> **Status:** Partially implemented. #1251 landed the §6 optional worker
+> capability (register/renew/disposition on `Lease`), the §4 derived
+> ownership read model, and the §9 inspect surfaces — see
+> [Worker Ownership Capability](./worker-ownership-capability.md). The §8
+> reconciliation/release protocol (confirmation ladder, two-sided intent
+> protocol) remains design-only: no claim release, label cleanup, requeue,
+> worker-credential migration, or deployment change is authorised by this
+> document.
 >
 > **Issue:** [misospace/dispatch#1245](https://github.com/misospace/dispatch/issues/1245)
 > **Date:** 2026-10-13

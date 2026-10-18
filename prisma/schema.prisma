@@ -962,6 +962,25 @@ model Lease {
   // but a released/expired lease that is re-claimed gets a fresh row and a
   // fresh token, so a stale worker's token can never release a newer claim.
   claimToken String?  @unique
+  // #1251: optional worker ownership capability (docs/ownership-reconciliation.md §6).
+  // The durable registration / fenced renewal / terminal disposition reuse this
+  // row instead of a parallel lease table. Every column is nullable: a client
+  // that never adopts the capability leaves them unset and stays conservatively
+  // unverified (never auto-abandoned). Renew/claim mutations serialize against
+  // these writes through the per-issue IssueMutationGuard.
+  runRef                  String?   // worker-supplied durable run reference recorded at registration
+  registeredAt            DateTime? // server-observed time a durable owner registered
+  registrationOccurredAt  DateTime? // worker-reported occurrence time of the registration
+  renewCount              Int       @default(0)
+  lastRenewalObservedAt   DateTime? // server clock of the last accepted renewal
+  lastRenewalOccurredAt   DateTime? // worker-reported occurrence time of the last accepted renewal
+  retryAfter              DateTime? // external-wait marker; ownership defers until this time
+  waitReason              String?
+  disposition             String?   // terminal: completed | released | blocked | handed_off
+  dispositionNote         String?
+  successorRef            String?   // successor agent / PR link supplied with the disposition
+  dispositionOccurredAt   DateTime?
+  dispositionObservedAt   DateTime?
   createdAt  DateTime @default(now())
 
   @@unique([agentName, issueId])

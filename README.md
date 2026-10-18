@@ -64,6 +64,7 @@ Issues are classified into execution lanes that control agent queue behavior and
 
 ### Claim Ownership and Reconciliation
 - A claim is not proof of active execution and missing telemetry is not proof of abandonment. The proposed ownership state model, evidence hierarchy, compatibility/migration policy, and bounded reconciliation transitions are specified in [Ownership Reconciliation Design](docs/ownership-reconciliation.md).
+- The optional worker ownership capability (register/renew/disposition, fenced on the claim token) and the derived ownership operator inspection shipped in #1251 are documented in [Worker Ownership Capability](docs/worker-ownership-capability.md).
 
 ### Project Labels
 - Optional: `project/*` labels may exist on issues, but Dispatch Projects groups issues by repository by default.

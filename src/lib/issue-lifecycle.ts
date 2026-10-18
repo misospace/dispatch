@@ -46,6 +46,10 @@ export const LIFECYCLE_EVENT_KINDS = [
   "issue_reopened",
   /** A PR that references this item was observed merged. */
   "pr_merged",
+  /** A worker durably registered ownership of its claim (#1251). */
+  "ownership_registered",
+  /** A worker recorded a terminal ownership disposition (#1251). */
+  "ownership_dispositioned",
 ] as const;
 
 export type LifecycleEventKind = (typeof LIFECYCLE_EVENT_KINDS)[number];
@@ -73,6 +77,8 @@ export const LIFECYCLE_SOURCES = [
   "webhook",
   /** POST /api/agents/{agent}/tasks/report. */
   "agent-report",
+  /** POST /api/agent-work/ownership (#1251 register/disposition records). */
+  "api:ownership",
 ] as const;
 
 export type LifecycleSource = (typeof LIFECYCLE_SOURCES)[number];
