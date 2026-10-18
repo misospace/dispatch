@@ -78,10 +78,20 @@ export async function GET(request: Request) {
 
   const now = new Date();
 
+  // Bounded scan: this is an operator inspection surface, not an index. The
+  // open-issue sweep is capped (most recently updated first) and the total
+  // number of per-candidate derivations is capped with chunked concurrency so
+  // one maintainer request cannot amplify into an unbounded query storm.
+  const MAX_CANDIDATE_SCAN = 1000;
+  const MAX_INSPECTED = 500;
+  const INSPECT_CONCURRENCY = 25;
+
   // (a) open issues holding an agent/* label (cached set)
   const openLabeled = await prisma.issue.findMany({
     where: { repository: { enabled: true }, state: "open" },
     select: { id: true, labels: true },
+    orderBy: { updatedAt: "desc" },
+    take: MAX_CANDIDATE_SCAN,
   });
   // (b) issues referenced by an active (non-expired) lease
   const activeLeased = await prisma.lease.findMany({
@@ -105,9 +115,12 @@ export async function GET(request: Request) {
     if (work.issueId !== null) candidateIds.add(work.issueId);
   }
 
-  const inspected = await Promise.all(
-    [...candidateIds].map((id) => inspectIssueOwnership(id, { now, live: false })),
-  );
+  const cappedIds = [...candidateIds].slice(0, MAX_INSPECTED);
+  const inspected: Awaited<ReturnType<typeof inspectIssueOwnership>>[] = [];
+  for (let i = 0; i < cappedIds.length; i += INSPECT_CONCURRENCY) {
+    const batch = cappedIds.slice(i, i + INSPECT_CONCURRENCY);
+    inspected.push(...(await Promise.all(batch.map((id) => inspectIssueOwnership(id, { now, live: false })))));
+  }
 
   // Keep existing, open issues only (closed issues are terminal and dropped).
   const openResults = inspected.filter(

@@ -138,6 +138,12 @@ export async function POST(request: Request) {
               if (input.successorRef != null && successorRef === null) return { invalid: "successorRef must be a string of at most 500 characters" } as const;
               const retry = parseRetryAfter(input.retryAfter, now);
               if (retry.error) return { invalid: retry.error } as const;
+              // An external wait only belongs to a `blocked` disposition:
+              // a terminal completed/released/handed_off record must not
+              // classify a gone owner as EXTERNAL_WAIT in the read model.
+              if (retry.value && disposition !== "blocked") {
+                return { invalid: "retryAfter is only valid with disposition \"blocked\"" } as const;
+              }
               const waitReason = input.waitReason === undefined || input.waitReason === null ? null : nonEmptyString(input.waitReason, 500);
               if (input.waitReason != null && waitReason === null) return { invalid: "waitReason must be a string of at most 500 characters" } as const;
               return await dispositionOwnership({

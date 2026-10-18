@@ -276,7 +276,7 @@ export function deriveOwnershipState(
   const openLinkedPr =
     evidence.linkedPrNumber != null && evidence.linkedPrMergeState !== MERGED_PR_STATE;
   if (inReview && (openPrFix || openLinkedPr)) {
-    return assessment("REVIEW_OWNED", ["open_linked_pr"]);
+    return assessment("REVIEW_OWNED", openLinkedPr ? ["open_linked_pr"] : ["open_pr_fix_queue"]);
   }
   if (openPrFix && hasClaim) {
     return assessment("REVIEW_OWNED", ["open_pr_fix_queue"]);

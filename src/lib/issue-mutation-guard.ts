@@ -57,7 +57,11 @@ export async function withIssueMutationGuard<T>(
     await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });
     return { status: "retained", ownerToken: guard.ownerToken, value: result.value };
   } catch (error) {
-    if (request.operation === "lease" && !resuming) {
+    // #1251: "ownership" writes are idempotent, Postgres-only, and fenced on
+    // the claim token — there is no partial remote effect to preserve, so a
+    // failed ownership attempt must not leave an unrecoverable guard behind
+    // (its resume branch does not exist by design). Same posture as "lease".
+    if ((request.operation === "lease" || request.operation === "ownership") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

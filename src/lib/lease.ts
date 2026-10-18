@@ -70,10 +70,29 @@ export async function upsertLease(params: {
   });
 
   if (existing) {
-    // Renew: push expiry forward and record renewal timestamp
+    // Renew: push expiry forward and record renewal timestamp.
+    // #1251: a claim-path lease write is a fresh assertion of ACTIVE
+    // ownership, so it must not inherit a previous terminal disposition or
+    // external-wait marker from the same row (the claim route reuses a
+    // live-but-disposed row instead of creating a new one). Terminal
+    // evidence for the retired attempt lives in the lifecycle stream; the
+    // lease row describes the CURRENT attempt only.
     const lease = await prisma.lease.update({
       where: { id: existing.id },
-      data: { expiredAt, renewedAt: now, checkpoint, branch: params.branch, prUrl: params.prUrl },
+      data: {
+        expiredAt,
+        renewedAt: now,
+        checkpoint,
+        branch: params.branch,
+        prUrl: params.prUrl,
+        disposition: null,
+        dispositionNote: null,
+        successorRef: null,
+        dispositionOccurredAt: null,
+        dispositionObservedAt: null,
+        retryAfter: null,
+        waitReason: null,
+      },
     });
     return { created: false, lease };
   }

@@ -349,7 +349,7 @@ describe("deriveOwnershipState", () => {
       expect(result.reasonCodes).toEqual(["open_linked_pr"]);
     });
 
-    it("returns REVIEW_OWNED with open_linked_pr for status/in-review with an open PR-fix row", () => {
+    it("returns REVIEW_OWNED with open_pr_fix_queue for status/in-review with only an open PR-fix row", () => {
       const result = deriveOwnershipState(
         makeEvidence({
           labels: ["status/in-review"],
@@ -360,7 +360,7 @@ describe("deriveOwnershipState", () => {
         NOW,
       );
       expect(result.state).toBe("REVIEW_OWNED");
-      expect(result.reasonCodes).toEqual(["open_linked_pr"]);
+      expect(result.reasonCodes).toEqual(["open_pr_fix_queue"]);
     });
 
     it("returns REVIEW_OWNED with open_pr_fix_queue for an open PR-fix row with a claim outside in-review", () => {

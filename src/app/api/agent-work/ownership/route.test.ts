@@ -595,6 +595,21 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     expect((await res.json()).error).toMatch(/future/);
   });
 
+  it("rejects retryAfter on a non-blocked disposition with 400 (#1251 review)", async () => {
+    const res = await post(
+      baseBody({
+        operation: "disposition",
+        disposition: "completed",
+        retryAfter: new Date(Date.now() + 3600_000).toISOString(),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/blocked/);
+    // Nothing was written: the terminal record must not park as EXTERNAL_WAIT.
+    expect(db.lease.disposition).toBeNull();
+    expect(db.lease.retryAfter ?? null).toBeNull();
+  });
+
   it("rejects an unknown disposition value with 400", async () => {
     const res = await post(baseBody({ operation: "disposition", disposition: "yanked" }));
     expect(res.status).toBe(400);

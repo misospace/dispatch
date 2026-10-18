@@ -401,7 +401,11 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
       return fail("disposition_conflict");
     }
 
-    const waitPatch = input.retryAfter
+    // Defensive: the external-wait marker only belongs to a `blocked`
+    // disposition. The route rejects other combinations with 400; direct
+    // library callers that pass retryAfter elsewhere get it ignored rather
+    // than parking a gone owner as EXTERNAL_WAIT in the read model.
+    const waitPatch = input.retryAfter && input.disposition === "blocked"
       ? { retryAfter: input.retryAfter, waitReason: input.waitReason ?? input.note ?? null }
       : {};
 

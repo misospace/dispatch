@@ -38,7 +38,11 @@ Semantics that never change:
   `409 disposition_conflict`.
 - **No releases.** Nothing here writes GitHub labels, deletes a lease, or
   moves issue status. A missing heartbeat or an unrenewed claim never revokes
-  anything.
+  anything. A disposed-but-unexpired lease likewise stays in place (still
+  surfaced as resumable by `active-work`, still excluding the issue from other
+  agents' queues) until it expires naturally or the same agent re-claims —
+  and a claim-path `upsertLease` renewal clears the terminal marker so the
+  fresh attempt never inherits the retired one's disposition.
 
 ### Identity boundaries
 

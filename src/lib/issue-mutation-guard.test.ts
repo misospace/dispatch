@@ -27,6 +27,22 @@ describe("issue mutation guard", () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  it("removes a freshly created ownership guard when the operation throws (#1251)", async () => {
+    vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ operation: "ownership", executing: true }) as never);
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+    const boom = new Error("db blip");
+    await expect(
+      withIssueMutationGuard({ issueId: "issue-1", operation: "ownership", agentName: "alpha", claimToken: "t1" }, async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+    // Ownership writes are local + idempotent: a failed attempt must not leave
+    // an unrecoverable guard (no resume branch exists for "ownership").
+    expect(prisma.issueMutationGuard.deleteMany).toHaveBeenCalledWith({ where: { issueId: "issue-1", ownerToken: "existing", executing: true } });
+    expect(prisma.issueMutationGuard.updateMany).not.toHaveBeenCalled();
+  });
+
   it("allows only the exact nonexecuting release to CAS-resume", async () => {
     vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ operation: "capacity-release", agentName: "worker", claimToken: "token" }) as never);

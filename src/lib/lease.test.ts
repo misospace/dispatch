@@ -208,6 +208,27 @@ describe("upsertLease", () => {
       expect(updateData.checkpoint).toBe("branch_created");
       expect(updateData.branch).toBe("fix/123");
     });
+
+    it("clears terminal ownership evidence on a claim-path re-claim of a live row (#1251)", async () => {
+      mocks.leaseFindUnique.mockImplementation(() =>
+        Promise.resolve(makeLease({ id: "l-1", disposition: "released", dispositionNote: "done", retryAfter: new Date(), waitReason: "dep" })),
+      );
+      mocks.leaseUpdate.mockImplementation((args: any) => Promise.resolve({ ...makeLease(args.where), ...args.data }));
+
+      const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+      expect(result.created).toBe(false);
+      const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+      // A fresh claim assertion must not inherit the previous attempt's
+      // terminal disposition or external-wait marker (#1251 review MAJOR-2).
+      expect(updateData.disposition).toBeNull();
+      expect(updateData.dispositionNote).toBeNull();
+      expect(updateData.successorRef).toBeNull();
+      expect(updateData.dispositionOccurredAt).toBeNull();
+      expect(updateData.dispositionObservedAt).toBeNull();
+      expect(updateData.retryAfter).toBeNull();
+      expect(updateData.waitReason).toBeNull();
+    });
   });
 });
 
