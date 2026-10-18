@@ -268,3 +268,91 @@ describe("recordReconciledAction — lifecycle evidence (#1202)", () => {
     expect(rows).toHaveLength(0);
   });
 });
+
+describe("recordReconciledAction — linked-merge evidence (#1203)", () => {
+  function makeClient() {
+    const rows: Array<Record<string, any>> = [];
+    const client = {
+      issueLifecycleEvent: {
+        create: vi.fn(async ({ data }: any) => {
+          rows.push({ ...data });
+          return data;
+        }),
+        upsert: vi.fn(async ({ where, create }: any) => {
+          const existing = rows.find((row) => row.dedupeKey === where.dedupeKey);
+          if (existing) return existing;
+          rows.push({ ...create });
+          return create;
+        }),
+      },
+    };
+    return { client, rows };
+  }
+
+  const repo = { id: "repo-1", fullName: "org/repo" };
+  const closeExecuted = {
+    action: { type: "close_issue" as const, issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+    success: true,
+    beforeLabels: ["status/in-review"],
+    afterLabels: [],
+  };
+
+  it("records one merge event per explicitly linked PR with its provenance", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      mergedPrs: [
+        { prNumber: 7, mergedAt: "2026-10-02T08:00:00Z", prUrl: "https://github.com/org/repo/pull/7", linkSource: "body-keyword" },
+        { prNumber: 9, mergedAt: "2026-10-01T09:00:00Z", prUrl: "https://github.com/org/repo/pull/9", linkSource: "branch-name" },
+      ],
+      executed: closeExecuted,
+      client,
+    });
+
+    const merges = rows.filter((row) => row.kind === "pr_merged");
+    expect(merges).toHaveLength(2);
+    expect(merges.map((row) => row.metadata.pullRequestNumber).sort()).toEqual([7, 9]);
+    expect(merges[0].metadata).toMatchObject({ pullRequestUrl: "https://github.com/org/repo/pull/7", linkSource: "body-keyword" });
+    expect(merges[1].metadata).toMatchObject({ linkSource: "branch-name" });
+  });
+
+  it("never infers a link from a title: a PR without explicit evidence records only the honest close-trigger provenance", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      mergedPrs: null,
+      executed: closeExecuted,
+      client,
+    });
+
+    const merge = rows.find((row) => row.kind === "pr_merged")!;
+    expect(merge.metadata.linkSource).toBe("reconcile-close-trigger");
+    expect(merge.metadata.linkSource).not.toBe("title-keyword");
+  });
+
+  it("keys a Date-form merge onto the same row as the pre-#1203 string form", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+    const base = { repo, issueNumber: 42, existingIssue: { id: "issue-1" }, executed: closeExecuted, client };
+
+    await recordReconciledAction({ ...base, mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" } });
+    await recordReconciledAction({
+      ...base,
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      mergedPrs: [{ prNumber: 7, mergedAt: new Date("2026-10-02T08:00:00Z"), linkSource: "body-keyword" }],
+    });
+
+    expect(rows.filter((row) => row.kind === "pr_merged")).toHaveLength(1);
+    expect(rows.filter((row) => row.kind === "issue_closed")).toHaveLength(1);
+  });
+});

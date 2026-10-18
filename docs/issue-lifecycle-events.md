@@ -32,7 +32,7 @@ landed with #1203.
 | `completed` | A worker report closed the item as already done (`status/done` + GitHub close). Not evidence that a PR merged. | `agent-report` |
 | `issue_closed` | The GitHub issue was observed closing — or closed by the hosted groomer. Distinct from the card reaching Done. | `reconciler`, `sync`, `hosted-groomer` |
 | `issue_reopened` | The issue was observed reopening after a close. | `sync` |
-| `pr_merged` | A PR referencing the item was observed merged. Only ever recorded from an observation of a merge — never from a worker's success report. Metadata carries the PR number/url, GitHub's own `mergedAt`, and `headSha` / `mergeCommitSha` when the observer had them, plus a `linkSource` (`body-keyword`, `branch-name`, `title-keyword`, `agent-run-touch`) saying how the PR is correlated to the issue. Multiple linked PRs record one row each. | `reconciler`, `backfill` |
+| `pr_merged` | A PR referencing the item was observed merged. Only ever recorded from an observation of a merge — never from a worker's success report. Metadata carries the PR number/url, GitHub's own `mergedAt`, and `headSha` / `mergeCommitSha` when the observer had them, plus a `linkSource` (`body-keyword`, `branch-name`, `reconcile-close-trigger`, `agent-run-touch`) saying how the PR is correlated to the issue. Multiple linked PRs record one row each; a title-only match is never a link. | `reconciler`, `backfill` |
 
 `kind` and `source` are stored as strings, not enums, so a new writer can be
 added without a migration; `LIFECYCLE_EVENT_KINDS` and `LIFECYCLE_SOURCES` in
@@ -109,9 +109,15 @@ Merge evidence is written only through `recordPrMergedEvent`
 (`reconciler|<repo>|<issue>|pr_merged|<pr>|<mergedAt>`) is shared by every
 observer — reconcile, and the backfill — so the same physical merge observed
 twice lands on one row. The reconciler records one `pr_merged` per *linked*
-merged PR (#1203), each with its `linkSource`; a title-derived correlation is
-explicitly labeled `title-keyword` and links are never inferred from titles
-alone.
+merged PR (#1203), each with its `linkSource`. Link evidence comes only from
+an explicit correlation — a body Fixes/Closes/Resolves keyword or a
+branch-name pattern; a title-derived match never produces a link. The single
+exception is honest by construction: the PR that actually drove a recorded
+close is always noted, with `linkSource: "reconcile-close-trigger"`, because
+that correlation is the observed action rather than a text guess. The dedupe
+stamp is canonicalized so a `Date` and GitHub's second-precision string form
+of the same merge produce the same key, keeping reconcile, sync, and backfill
+on one row per physical merge.
 
 `POST /api/issues/[issueId]/lifecycle` (operator auth only — agent bearer
 tokens get 403) backfills legacy issues **only from verifiable records**: an

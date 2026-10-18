@@ -544,11 +544,30 @@ export function prMergedDedupeKey(
   prNumber: number,
   mergedAt?: Date | string | null,
 ): string {
-  const stamp =
-    mergedAt instanceof Date
-      ? mergedAt.toISOString()
-      : (mergedAt ?? "unknown");
-  return lifecycleDedupeKey("reconciler", repoFullName, issueNumber, "pr_merged", prNumber, stamp);
+  return lifecycleDedupeKey(
+    "reconciler",
+    repoFullName,
+    issueNumber,
+    "pr_merged",
+    prNumber,
+    prMergeStamp(mergedAt),
+  );
+}
+
+/**
+ * Canonical stamp text for a merge identity. GitHub emits second-precision
+ * `Z` timestamps and the pre-#1203 reconcile keyed on that raw string, so a
+ * `Date` (which `toISOString` renders with `.000Z`) and the string form of the
+ * same instant must produce the same stamp — otherwise the backfill and a
+ * later reconcile would land on different keys for one physical merge. An
+ * unparseable non-null value keeps its raw text as identity: it is garbage
+ * input, but it must stay stable across observers.
+ */
+export function prMergeStamp(mergedAt?: Date | string | null): string {
+  if (mergedAt === null || mergedAt === undefined) return "unknown";
+  const iso = prMergeTimestamp(mergedAt);
+  if (iso === null) return String(mergedAt);
+  return iso.replace(/\.000Z$/, "Z");
 }
 
 /** Normalize an observation's merge time to the ISO string stored in metadata. */
@@ -585,6 +604,11 @@ export async function recordPrMergedEvent(
     pullRequestNumber: input.pr.prNumber,
     ...(input.pr.prUrl ? { pullRequestUrl: input.pr.prUrl } : null),
     ...(mergedAtIso ? { mergedAt: mergedAtIso } : null),
+    // A present-but-unparseable source stamp stays visible as provenance even
+    // though it cannot become the event time — no silent provenance drop.
+    ...(input.pr.mergedAt !== null && input.pr.mergedAt !== undefined && mergedAtIso === null
+      ? { mergedAtRaw: String(input.pr.mergedAt) }
+      : null),
     ...(input.pr.mergeCommitSha ? { mergeCommitSha: input.pr.mergeCommitSha } : null),
     ...(input.pr.headSha ? { headSha: input.pr.headSha } : null),
     ...(input.pr.linkSource ? { linkSource: input.pr.linkSource } : null),

@@ -82,12 +82,20 @@ export async function recordReconciledAction(input: {
       // Every linked merged PR records its own event (#1203); the canonical
       // dedupe identity is shared with the pre-#1203 single-PR shape, so a
       // re-observed merge lands on the row that already exists.
-      const mergeObservations: readonly PrMergeObservation[] =
-        input.mergedPrs && input.mergedPrs.length > 0
-          ? input.mergedPrs
-          : mergedPr
-            ? [{ prNumber: mergedPr.number, mergedAt: mergedPr.merged_at ?? null }]
-            : [];
+      // Evidence list first; the PR that actually drove this close is always
+      // recorded too — the correlation is the observed action itself, so it
+      // carries `reconcile-close-trigger` provenance rather than pretending a
+      // text match. A close whose only link was a title match therefore still
+      // gets its (authoritative) merge recorded, honestly labeled.
+      const observations: PrMergeObservation[] = [...(input.mergedPrs ?? [])];
+      if (mergedPr && !observations.some((obs) => obs.prNumber === mergedPr.number)) {
+        observations.push({
+          prNumber: mergedPr.number,
+          mergedAt: mergedPr.merged_at ?? null,
+          linkSource: "reconcile-close-trigger",
+        });
+      }
+      const mergeObservations: readonly PrMergeObservation[] = observations;
       for (const pr of mergeObservations) {
         await recordPrMergedEvent(client, {
           issueId: existingIssue.id,
@@ -232,10 +240,12 @@ export async function POST(request: Request) {
         // `mergedFixingIssues` stays first-PR-wins because it drives the close
         // decision. `mergedPrLinkEvidence` keeps *every* merged PR per issue
         // with its link provenance (#1203): merge evidence records one event
-        // per linked PR, and a title-only match is recorded as `title-keyword`
-        // so a reader can tell a keyword link from a weak one — the link is
-        // never *inferred* from a title alone without the PR also being the
-        // merged PR the close is reacting to.
+        // per linked PR. Only explicit correlations qualify — a body Fixes/
+        // Closes/Resolves keyword or a branch-name pattern. A title-only match
+        // is never recorded as a link: links are not inferred from PR titles.
+        // The one exception is provenance-honest: the PR that actually drove
+        // a recorded close is noted as `reconcile-close-trigger`, because that
+        // correlation is the observed action, not a text guess.
         const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
         const mergedPrLinkEvidence = new Map<number, PrMergeObservation[]>();
         const recordLinkEvidence = (num: number, pr: (typeof allPrs)[number], linkSource: string) => {
@@ -260,7 +270,11 @@ export async function POST(request: Request) {
             if (!mergedFixingIssues.has(num)) {
               mergedFixingIssues.set(num, pr);
             }
-            recordLinkEvidence(num, pr, bodyKeywordNumbers.has(num) ? "body-keyword" : "title-keyword");
+            // Title-derived matches map the close (existing behavior) but are
+            // deliberately not link evidence (#1203).
+            if (bodyKeywordNumbers.has(num)) {
+              recordLinkEvidence(num, pr, "body-keyword");
+            }
           }
           // 2. Fallback: check branch name pattern
           if (!mergedFixingIssues.has(pr.number)) {
@@ -382,6 +396,7 @@ export async function POST(request: Request) {
                   mergedFixingIssues.get(exec.action.issueNumber) ??
                   openPrToIssue.get(exec.action.issueNumber) ??
                   null,
+                mergedPrs: mergedPrLinkEvidence.get(exec.action.issueNumber) ?? null,
                 executed: exec,
                 client: prisma,
               });
