@@ -2,9 +2,13 @@
 
 > **Issue:** [misospace/dispatch#1244](https://github.com/misospace/dispatch/issues/1244)
 >
-> **Status: design only.** This document specifies behavior; it does not
-> implement it. No schema, route, budget, credential, or deployment change is
-> authorized by this design alone. See [Non-goals](#non-goals).
+> **Status: partially implemented (#1253).** The recovery transition table
+> (rows 8-16 semantics: the recovery cooldown, stale-disposition flag,
+> disposition audit stamps, and evidence-driven reactivation of
+> budget-available PARKED and structured WAITING_EXTERNAL items) is
+> implemented in `src/lib/pr-fix-recovery.ts` (`evaluateRecovery`) and wired
+> into the enqueue path and `reconcileExternalWaitTriggers` as of #1253.
+> The rest of this document remains the specification.
 
 **Reading this document.** Every claim is marked:
 
