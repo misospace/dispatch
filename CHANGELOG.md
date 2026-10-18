@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.5.71](https://github.com/misospace/dispatch/compare/v0.5.70...v0.5.71) (2026-10-18)
+
+
+### Features
+
+* **deps:** update dependency astro (5.18.2 → 7.4.0) ([#1281](https://github.com/misospace/dispatch/issues/1281)) ([f548ef8](https://github.com/misospace/dispatch/commit/f548ef8423af4fc33533fb40fbdd6e42c4ac2139))
+* **deps:** update dependency eslint (10.12.0 → 10.13.0) ([#1288](https://github.com/misospace/dispatch/issues/1288)) ([89b6f22](https://github.com/misospace/dispatch/commit/89b6f22fd4d9060e5d8891c091aa50995b11c496))
+* **deps:** update dependency lucide-react (1.57.0 → 1.58.0) ([#1284](https://github.com/misospace/dispatch/issues/1284)) ([a5f3305](https://github.com/misospace/dispatch/commit/a5f33059568f8c735449e204142ad4fc958ad144))
+* **deps:** update dependency lucide-react (1.58.0 → 1.59.0) ([#1290](https://github.com/misospace/dispatch/issues/1290)) ([91a78b4](https://github.com/misospace/dispatch/commit/91a78b479f1eb7a31ced278d363dffba5246a381))
+* **pr-fix:** persist authoritative evidence versions and attempt-snapshot freshness ([#1249](https://github.com/misospace/dispatch/issues/1249)) ([#1276](https://github.com/misospace/dispatch/issues/1276)) ([d292094](https://github.com/misospace/dispatch/commit/d2920948ce2c54bcaec5992fdb49eee89216978e))
+* **pr-fix:** structured external-wait dependency contract and fail-closed holds ([#1273](https://github.com/misospace/dispatch/issues/1273)) ([ef4feaa](https://github.com/misospace/dispatch/commit/ef4feaa4df892960a6371e1d536de7417b4cb43b))
+* **review:** adopt repository skills and v3.6.0 ([#1301](https://github.com/misospace/dispatch/issues/1301)) ([b093bbd](https://github.com/misospace/dispatch/commit/b093bbd616c47261eeae99ac9b400d8782f2967a))
+
+
+### Bug Fixes
+
+* **api:** reject status transitions on closed issues in POST /api/issues/status ([#1285](https://github.com/misospace/dispatch/issues/1285)) ([d4e532a](https://github.com/misospace/dispatch/commit/d4e532a0abca10756e3bd2003d8b5817a3cb9698)), closes [#1206](https://github.com/misospace/dispatch/issues/1206)
+* **auth:** accept pkcs1 github app keys ([#1302](https://github.com/misospace/dispatch/issues/1302)) ([5bce482](https://github.com/misospace/dispatch/commit/5bce482e9f5393aca63aa7a5aa9a0d8ea8f8e643))
+* **ci:** isolate external-wait queue assertions ([#1283](https://github.com/misospace/dispatch/issues/1283)) ([c2ea489](https://github.com/misospace/dispatch/commit/c2ea489aea6d71c127ab05f0ee4b0f29a529a26c))
+* **deps:** update dependency @prisma/adapter-pg (7.10.0 → 7.10.1) ([#1267](https://github.com/misospace/dispatch/issues/1267)) ([8f7284c](https://github.com/misospace/dispatch/commit/8f7284cdea42642bccd4bdb6fdc092c8ba345b65))
+* **deps:** update dependency @prisma/client (7.10.0 → 7.10.1) ([#1268](https://github.com/misospace/dispatch/issues/1268)) ([24ee983](https://github.com/misospace/dispatch/commit/24ee9837a13008d467b0e6cb925b8cbcebe608b2))
+* **deps:** update dependency jsdom (30.1.2 → 30.1.3) ([#1264](https://github.com/misospace/dispatch/issues/1264)) ([f8d8537](https://github.com/misospace/dispatch/commit/f8d853730482a6ccc6d52ca4a6068f75446b5096))
+* **deps:** update dependency prisma (7.10.0 → 7.10.1) ([#1269](https://github.com/misospace/dispatch/issues/1269)) ([270ac1a](https://github.com/misospace/dispatch/commit/270ac1ac7bc62ae14f5efad73eae70cc682ed2a9))
+* **deps:** update nextjs monorepo (16.4.1 → 16.4.2) ([#1272](https://github.com/misospace/dispatch/issues/1272)) ([4132528](https://github.com/misospace/dispatch/commit/4132528ea64b78d355824fc030ea4fa562435b59))
+* **deps:** update vitest monorepo (5.0.4 → 5.0.5) ([#1265](https://github.com/misospace/dispatch/issues/1265)) ([0021632](https://github.com/misospace/dispatch/commit/00216329deb0c0f4087f4f992fba045c5667fd6a))
+* **groomer:** sanitize evidence-snapshot errorMessage so captured GitHub warnings cannot carry control bytes ([#1298](https://github.com/misospace/dispatch/issues/1298)) ([3aa0d58](https://github.com/misospace/dispatch/commit/3aa0d58daa97a7eca647688796026818edf2f99c))
+* **issues:** reject status transitions on closed issues in move and legacy groom ([#1286](https://github.com/misospace/dispatch/issues/1286)) ([#1292](https://github.com/misospace/dispatch/issues/1292)) ([aa5fd8e](https://github.com/misospace/dispatch/commit/aa5fd8eab969337b05ed2fc796b7945d997c5018))
+* **test:** pin PR-fix comment footer clock and drop brittle 99 guard ([#1257](https://github.com/misospace/dispatch/issues/1257)) ([#1271](https://github.com/misospace/dispatch/issues/1271)) ([572d2fa](https://github.com/misospace/dispatch/commit/572d2fa2b9a418631d7b4b73cc9ca9a65f71b163))
+* **webhook:** guard issue-label cache writes with compare-and-swap ([#1220](https://github.com/misospace/dispatch/issues/1220)) ([#1266](https://github.com/misospace/dispatch/issues/1266)) ([1b4b976](https://github.com/misospace/dispatch/commit/1b4b976b68c0672be3bd640b269c8e9894d9c02f))
+
+
+### Chores
+
+* **ci:** disable experimental requirement tracing ([#1289](https://github.com/misospace/dispatch/issues/1289)) ([c50c838](https://github.com/misospace/dispatch/commit/c50c838578d23c22f3bb223d720d1fb80c594d2e))
+
+
+### Documentation
+
+* **recovery:** design PR-fix reactivation on fresh evidence ([#1244](https://github.com/misospace/dispatch/issues/1244)) ([#1248](https://github.com/misospace/dispatch/issues/1248)) ([bce947c](https://github.com/misospace/dispatch/commit/bce947c950416189d3bf13337fb8d298deb845b3))
+
 ## [0.5.70](https://github.com/misospace/dispatch/compare/v0.5.69...v0.5.70) (2026-10-14)
 
 
