@@ -96,14 +96,18 @@ export function capacityEquals(a: string, b: string): boolean {
 
 /**
  * Persist a handoff with its bounded cooldown. Returns the row (including
- * `cooldownUntil`) so callers can echo the deadline to the worker.
+ * `cooldownUntil`) so callers can echo the deadline to the worker. An explicit
+ * `cooldownUntilOverride` pins the deadline (the issue handoff shares the
+ * exact value with its durable settlement record, #1262); otherwise it is
+ * computed from `now`.
  */
 export async function recordCapacityHandoff(
   client: CapacityHandoffClient,
   record: CapacityHandoffRecord,
   now: Date = new Date(),
+  cooldownUntilOverride?: Date,
 ): Promise<{ cooldownUntil: Date }> {
-  const cooldownUntil = new Date(now.getTime() + capacityCooldownMs(now.getTime()));
+  const cooldownUntil = cooldownUntilOverride ?? new Date(now.getTime() + capacityCooldownMs(now.getTime()));
   await client.capacityHandoff.create({
     data: {
       kind: record.kind,

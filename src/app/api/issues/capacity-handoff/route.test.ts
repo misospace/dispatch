@@ -34,8 +34,10 @@ const { mocks, db } = vi.hoisted(() => {
     agentWorkUpdates: [] as any[],
     agentWorkHistory: [] as any[],
     handoffs: [] as any[],
+    settlements: [] as any[],
     audit: [] as any[],
     leaseDeletes: 0,
+    failSettlementUpsert: false,
   };
   return { mocks, db };
 });
@@ -100,6 +102,37 @@ vi.mock("@/lib/prisma", () => ({
         return data;
       },
     },
+    issueHandoffSettlement: {
+      findUnique: async ({ where }: any) => {
+        const key = where.agentName_issueId_settlementKey;
+        return db.settlements.find((r: any) =>
+          r.agentName === key.agentName && r.issueId === key.issueId && r.settlementKey === key.settlementKey,
+        ) ?? null;
+      },
+      upsert: async ({ where, create }: any) => {
+        if (db.failSettlementUpsert) throw new Error("settlement write failed");
+        const key = where.agentName_issueId_settlementKey;
+        const existing = db.settlements.find((r: any) =>
+          r.agentName === key.agentName && r.issueId === key.issueId && r.settlementKey === key.settlementKey,
+        );
+        // First write wins: update: {} never rewrites an existing proof.
+        if (existing) return existing;
+        const row = { id: `settle-${db.settlements.length + 1}`, ...create };
+        db.settlements.push(row);
+        return row;
+      },
+      deleteMany: async ({ where }: any) => {
+        const key = where.agentName_issueId_settlementKey ?? where;
+        const before = db.settlements.length;
+        db.settlements = db.settlements.filter((r: any) => {
+          if (!(r.agentName === key.agentName && r.issueId === key.issueId && r.settlementKey === key.settlementKey)) return true;
+          if (where.claimToken && r.claimToken !== where.claimToken) return true;
+          if (where.expiresAt?.lte && new Date(r.expiresAt).getTime() > where.expiresAt.lte.getTime()) return true;
+          return false;
+        });
+        return { count: before - db.settlements.length };
+      },
+    },
   },
 }));
 
@@ -118,6 +151,7 @@ vi.mock("@/lib/github-prs", () => ({
 
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 const CLAIM_TOKEN = "claim_test-token-1";
 
@@ -145,9 +179,11 @@ function makeState(overrides: Record<string, unknown> = {}) {
   db.agentWorkUpdates = [];
   db.agentWorkHistory = [];
   db.handoffs = [];
+  db.settlements = (overrides.settlements as any[]) ?? [];
   db.audit = [];
   db.leaseDeletes = 0;
   db.failHandoffCreate = false;
+  db.failSettlementUpsert = false;
   mocks.getLiveIssueLabels.mockResolvedValue(
     (overrides.liveLabels as string[] | undefined) ?? ["agent/alpha", "status/in-progress"],
   );
@@ -177,6 +213,7 @@ describe("POST /api/issues/capacity-handoff (#1256)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetAuthCaches();
+    resetRateLimits();
     delete process.env.DISPATCH_AUTH_MODE;
     delete process.env.DISPATCH_CAPACITY_COOLDOWN_MS;
     makeState();
@@ -457,5 +494,101 @@ describe("POST /api/issues/capacity-handoff (#1256)", () => {
     expect(db.audit[0]).toMatchObject({ action: "issue_capacity_handoff", success: false });
     expect(db.audit[0].errorMessage).toMatch(/lease retained/i);
     expect(db.handoffs).toHaveLength(0);
+  });
+
+  // ── durable settlement replay (#1262) ──────────────────────────────────────
+
+  it("rejects a malformed settlementKey", async () => {
+    expect((await postRequest({ settlementKey: "" })).status).toBe(400);
+    expect((await postRequest({ settlementKey: "k".repeat(201) })).status).toBe(400);
+    expect((await postRequest({ settlementKey: 42 })).status).toBe(400);
+    expect(db.leaseDeletes).toBe(0);
+  });
+
+  it("accepts an explicit null settlementKey as the pre-#1262 path", async () => {
+    expect((await postRequest({ settlementKey: null })).status).toBe(200);
+    expect(db.settlements).toHaveLength(0);
+  });
+
+  it("records the settlement on a keyed release and echoes replayed:false", async () => {
+    const response = await postRequest({ settlementKey: "run-1:handoff" });
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.replayed).toBe(false);
+    expect(db.settlements).toHaveLength(1);
+    expect(db.settlements[0]).toMatchObject({
+      agentName: "alpha",
+      issueId: "issue-1",
+      settlementKey: "run-1:handoff",
+      claimToken: CLAIM_TOKEN,
+      capacity: "provider/model-a",
+      labels: expect.arrayContaining(["status/ready"]),
+      status: "status/ready",
+    });
+    expect(new Date(db.settlements[0].expiresAt).getTime()).toBeGreaterThan(Date.now());
+    expect(db.audit[0].notes).toContain("settlementKey=run-1:handoff");
+  });
+
+  it("replays the recorded success for the same key and claim token after the lease is gone", async () => {
+    db.lease = null;
+    db.settlements = [{
+      id: "settle-seed",
+      agentName: "alpha",
+      issueId: "issue-1",
+      settlementKey: "run-1:handoff",
+      claimToken: CLAIM_TOKEN,
+      capacity: "provider/model-a",
+      labels: ["status/ready"],
+      status: "status/ready",
+      statusNote: null,
+      cooldownUntil: new Date(Date.now() + 600_000),
+      settledAt: new Date(Date.now() - 60_000),
+      expiresAt: new Date(Date.now() + 6 * 24 * 3600_000),
+    }];
+    const response = await postRequest({ settlementKey: "run-1:handoff" });
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.replayed).toBe(true);
+    expect(json.labels).toEqual(["status/ready"]);
+    expect(json.cooldownUntil).not.toBeNull();
+    // Zero mutation: no label writes, no lease delete, no cooldown row.
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(db.leaseDeletes).toBe(0);
+    expect(db.handoffs).toHaveLength(0);
+    expect(db.audit[0].notes).toContain("replayed");
+  });
+
+  it("never replays a foreign token over a settled key", async () => {
+    db.lease = null;
+    db.settlements = [{
+      id: "settle-seed",
+      agentName: "alpha",
+      issueId: "issue-1",
+      settlementKey: "run-1:handoff",
+      claimToken: "claim_other-token",
+      capacity: "provider/model-a",
+      labels: ["status/ready"],
+      status: "status/ready",
+      statusNote: null,
+      cooldownUntil: new Date(Date.now() + 600_000),
+      settledAt: new Date(Date.now() - 60_000),
+      expiresAt: new Date(Date.now() + 6 * 24 * 3600_000),
+    }];
+    const response = await postRequest({ settlementKey: "run-1:handoff" });
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toMatch(/different claim token/i);
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the settlement record cannot be persisted", async () => {
+    db.failSettlementUpsert = true;
+    const response = await postRequest({ settlementKey: "run-1:handoff" });
+    expect(response.status).toBe(500);
+    // Proof must be durable or the release does not report success.
+    expect(db.lease).not.toBeNull();
+    expect(db.leaseDeletes).toBe(0);
+    expect(db.audit[0]).toMatchObject({ action: "issue_capacity_handoff", success: false });
+    expect(db.audit[0].errorMessage).toMatch(/settlement/i);
   });
 });

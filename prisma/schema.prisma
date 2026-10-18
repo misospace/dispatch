@@ -46,6 +46,7 @@ model Issue {
   groomingChildClaims   GroomingChildClaim[]
   groomerPendingReplies GroomerPendingReply[]
   lifecycleEvents       IssueLifecycleEvent[]
+  handoffSettlements    IssueHandoffSettlement[]
 
   // Escalated lane outcome tracking
   decomposed    Boolean  @default(false)
@@ -1006,4 +1007,44 @@ model CapacityHandoff {
   @@index([kind, repoFullName, issueNumber, cooldownUntil])
   @@index([kind, repoFullName, prNumber, cooldownUntil])
   @@index([cooldownUntil])
+}
+
+// ---------------------------------------------------------------------------
+// Issue handoff settlements (#1262) — durable idempotent replay records.
+//
+// A completed issue capacity handoff is recorded here, bound to the exact
+// issued claim token and a caller settlement key. When both the HTTP success
+// response and the best-effort audit row are lost, a retry with the same key
+// and the original claim token replays the recorded success without touching
+// any newer claim, label, or human hold. Rows are bounded (settledAt +
+// retention) and pruned lazily; they are proof of a past release, never
+// dispatch state, and never a substitute for live ownership verification.
+// ---------------------------------------------------------------------------
+
+model IssueHandoffSettlement {
+  id            String    @id @default(cuid())
+  agentName     String
+  issueId       String
+  issue         Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  // The exact claim incarnation settled. Replay requires token equality; a
+  // newer claim's token never matches and is refused, never replayed over.
+  claimToken    String
+  // Caller-chosen idempotency key for the settlement operation (opaque, at
+  // most 200 chars). One settlement per (agent, issue, key); first write wins
+  // so a crash-resumed attempt can never rewrite the original proof.
+  settlementKey String
+  capacity      String
+  // Recorded successful release result, replayed verbatim.
+  labels        String[]
+  status        String?
+  statusNote    String?
+  cooldownUntil DateTime?
+  settledAt     DateTime
+  // Bounded retention deadline; expired rows are pruned lazily on lookup and
+  // an expired proof is refused, never replayed.
+  expiresAt     DateTime
+  createdAt     DateTime  @default(now())
+
+  @@unique([agentName, issueId, settlementKey])
+  @@index([expiresAt])
 }

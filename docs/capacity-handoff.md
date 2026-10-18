@@ -15,7 +15,7 @@ executor, provider, or source product.
 | Work form | Operation | Fencing token (issued by) |
 |---|---|---|
 | PR-fix queue attempt | `POST /api/agents/{agent}/tasks/report` with `outcome: "capacity-exhausted"`, `capacity`, and the issued `prFixItem: { id, generation, handoutToken }` | `next-task` hand-out (#1074 token + #1256 per-hand-out receipt token) |
-| Claimed issue | `POST /api/issues/capacity-handoff` with `issueId`, `repoFullName`, `issueNumber`, `agentName`, `claimToken`, `capacity` | `POST /api/issues/claim` response `claimToken` (also in the `active-work` resume context) |
+| Claimed issue | `POST /api/issues/capacity-handoff` with `issueId`, `repoFullName`, `issueNumber`, `agentName`, `claimToken`, `capacity` (optional `settlementKey` for durable replay, #1262) | `POST /api/issues/claim` response `claimToken` (also in the `active-work` resume context) |
 
 Both require bearer auth; a bound worker credential (`DISPATCH_WORKER_TOKENS`)
 may only hand off its **own** agent's work, and the unbound legacy worker token
@@ -92,9 +92,14 @@ mutation; ownership-only cleanup is reserved for genuine changed owners.
    (immediately discoverable to another compatible worker); `status/in-review`
    is retained with a status note. If ownership changed during verification,
    cleanup removes only our own agent label and never changes status.
-3. Only after remote label cleanup succeeds is the exact lease CAS-deleted.
+3. When the caller supplied a `settlementKey` (#1262), a durable
+   `IssueHandoffSettlement` record is written **before** the lease CAS-delete
+   (see the next section). A record-write failure fails closed: 500
+   `release_failed`, lease and guard retained for the exact-token retry.
+4. Only after remote label cleanup succeeds is the exact lease CAS-deleted.
    Active `AgentWork` rows are then retired with history, followed by the
-   `CapacityHandoff` cooldown (`kind: "issue"`) and audit record.
+   `CapacityHandoff` cooldown (`kind: "issue"`, pinned to the same deadline as
+   the settlement record) and audit record.
 
 **PR-fix handoff** (`capacity_handoff` PrFixHistory action):
 
@@ -124,6 +129,64 @@ mutation; ownership-only cleanup is reserved for genuine changed owners.
    scoped cooldown (it was legitimately dispatched alongside or after the
    first hand-off, with its own receipt); an older generation's window never
    absorbs a fresh attempt.
+
+## Durable settlement replay (#1262)
+
+A successful issue handoff can lose its HTTP success response, and the success
+audit row is best-effort — so the completed release was unprovable: a retry
+found no lease and could only be refused (`no_active_claim`), forcing the
+caller into a conservative hold. The optional request field `settlementKey`
+(at most 200 chars, opaque, caller-chosen) closes that gap without redesigning
+the existing path; callers that omit it keep the previous behavior exactly.
+
+* **The record.** A successful keyed release persists an
+  `IssueHandoffSettlement` row: unique `(agentName, issueId, settlementKey)`,
+  bound to the exact settled `claimToken`, carrying the released
+  `labels`/`status`/`statusNote`, the pinned `cooldownUntil`, and a bounded
+  retention deadline (`ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS`, 7 days). It is
+  written **before** the lease CAS-delete — a crash between the two leaves
+  the lease intact for the exact-token resume, and the first-write-wins
+  upsert can never rewrite the original proof (a resumed attempt therefore
+  replays the *first* attempt's recorded result, even if its own would differ
+  in `statusNote`/label details). Retention is enforced at read time: expired
+  rows are pruned when looked up, rows for never-retried keys live until the
+  issue row is hard-deleted (FK cascade). A lease CAS miss (bypass race)
+  retracts the row just written — and only its own row (pinned to its claim
+  token); a retraction failure is logged for operator reconciliation.
+* **Replay.** A retry with the same key + original claim token while the lease
+  is gone replays the recorded result verbatim (`replayed: true`) with **zero
+  ownership mutation**: no label write, no lease change, no cooldown row, no
+  cache mirror — only a best-effort replay audit row and (when the request
+  enters the mutation guard) the transient guard row itself. The replay is
+  checked before the cached state refusals, so a later close or human block
+  can never mask the recorded outcome (a replay mutates nothing, so it cannot
+  reverse a hold). A record found while the lease is **still present** is a
+  crash-before-CAS window: it is never replayed; the exact-token resume
+  finishes the release instead. The replay also answers while the issue's
+  mutation guard is **held** (busy path): after a post-release crash the
+  orphaned executing guard would otherwise hide the durably completed release
+  behind a busy 409 — the replay is gated on lease absence, so a release that
+  is genuinely still in flight (lease live) is never announced early.
+* **Refusals (fail-closed, no synthetic success).**
+  * Newer claim epoch (lease re-issued with a fresh token) → 409
+    `stale_claim_token` — the existing fence; replacement ownership is never
+    touched.
+  * Key settled under a **different** claim token: with the lease gone → 409
+    `no_active_claim` (foreign token to a settled key); with a live matching
+    lease → 409 `settlement_key_conflict` before any remote work. A fresh key
+    is the caller's recovery — keys are never reused across claim incarnations,
+    and the token binding wins even when the old proof has already expired.
+  * Expired proof → 409 `no_active_claim` with an explicit expiry note; the
+    expired row is pruned.
+  * Settlement-record write failure after cleanup → 500 `release_failed`;
+    lease and guard retained for the exact-token retry (proof must be durable
+    or the release does not report success).
+* **Keys are caller data**, persisted in the database and echoed into audit
+  notes — do not embed secrets in them. Dispatch derives nothing from the key
+  except idempotency; capacity remains the only (opaque) scoping value. A
+  replay echoes the request's `capacity` field while the audit note records
+  the settled one; neither is interpreted, and nothing behavioral derives
+  from either string.
 
 ## Capacity-scoped cooldown
 
@@ -223,6 +286,11 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
 | Another cooperating issue mutation is active / guard is not the exact resumable release | 409 busy response; no remote mutation |
 | Cleanup fails after guard acquisition | Lease and durable guard retained; exact-token retry can resume |
 | Lease CAS unexpectedly misses after remote cleanup (bypassing writer) | 409 `handoff_race_lost`; no cooldown is recorded; reconcile GitHub and lease state |
-| Guard remains after process crash | Operator confirms prior process stopped and reconciles GitHub before removal; no automatic timeout |
+| Retry with same `settlementKey` + original claim token after lease release | replayed recorded success (`replayed: true`), zero ownership mutation |
+| Same replay while the issue mutation guard is held (post-release crash) | still replayed — lease absence gates the answer; a live release (lease present) stays 409 busy |
+| `settlementKey` bound to a different claim token | 409 (`no_active_claim` or `settlement_key_conflict`); no replay, no mutation |
+| Settlement proof expired (7-day retention, read-time prune) | 409 `no_active_claim` with expiry note |
+| Settlement record write fails after cleanup | 500 `release_failed`; lease + guard retained for exact-token retry |
+| Guard remains after process crash | Operator confirms prior process stopped and reconciles GitHub before removal; no automatic timeout; a recorded settlement lets the retry answer definitively even while the guard is held |
 | PR-fix generation moved / status settled | report `skipped`, queue untouched |
 | Repeat PR-fix report | `deferred`, one cooldown window only |
