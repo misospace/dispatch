@@ -90,11 +90,28 @@ describe("GET /api/groomer/runs", () => {
   });
 
   it("returns runs on success", async () => {
+    mocks.listGroomingRuns.mockResolvedValue([
+      {
+        id: "run-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        status: "completed",
+        dryRun: false,
+        model: "gpt-4o-mini",
+        validatedOutput: { schemaVersion: 1, verdict: { actionability: "ready" } },
+        view: { stage: "applied", evidence: { headSha: "a".repeat(40), pinned: true }, plan: { format: "grooming-plan" } },
+        issue: { title: "Fix login", state: "open" },
+      },
+    ]);
     const res = await GET(request());
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(Array.isArray(body)).toBe(true);
     expect(body[0].id).toBe("run-1");
+    expect(body[0].view.evidence.pinned).toBe(true);
+    expect(body[0]).not.toHaveProperty("rawOutput");
+    expect(body[0]).not.toHaveProperty("contextSummary");
+    expect(body[0]).not.toHaveProperty("commentBodyPreview");
   });
 
   it("returns 500 when list throws", async () => {

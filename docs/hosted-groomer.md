@@ -207,7 +207,7 @@ A decomposition that fails any rule is withheld: no child is created and the par
 
 ### Compatibility
 
-`GroomingRun.validatedOutput` stores the full plan. `mutationPlan` keeps its existing fields and adds `planSchemaVersion`, `evidenceDigest`, `readiness`, `closeRecommendation`, `applicationKey`, `preconditions` and `willCreateChildren` (true when the plan's decomposition children will be created; forced false for in-flight plans, including their dry-run previews, which apply nothing) and, when a policy withheld something, `withheld`. The run path applies mutations through `toGroomerOutput`, the legacy view that `POST /api/groomer/run` still returns as `output` (with the plan alongside as `plan`). A rejected plan's raw output and `validationErrors` are kept on the run. Runs recorded before the plan contract still render on `/automation/groomer`, marked `legacy`, with no readiness claim.
+`GroomingRun.validatedOutput` stores the full plan. `mutationPlan` keeps its existing fields and adds `planSchemaVersion`, `evidenceDigest`, `readiness`, `closeRecommendation`, `applicationKey`, `preconditions` and `willCreateChildren` (true when the plan's decomposition children will be created; forced false for in-flight plans, including their dry-run previews, which apply nothing) and, when a policy withheld something, `withheld`. The run path applies mutations through `toGroomerOutput`, the legacy view that `POST /api/groomer/run` still returns as `output` (with the plan alongside as `plan`). A rejected plan's raw output and `validationErrors` are kept on the run. Runs recorded before the plan contract still render on `/groomer` (also reachable via `/automation/groomer`, which redirects there), marked `legacy`, with no readiness claim.
 
 ## Applying a plan
 
@@ -260,13 +260,22 @@ Every run captures its own snapshot, so the key only recurs when the issue, its 
 
 Dry runs use the same preconditions, diff and policies without writing: `mutationPlan.applyOutcome` is `dry_run`, `stale` or `unverifiable` (with `preconditionFailures`), or `would_replay` when the key was already applied. A dry run never claims a key, so it never reports `busy`, and it never writes a backoff.
 
-Out of scope here, and still to come: worker admission gating on these results (#1065), and UI exposure of the new history fields (#1067).
+Worker admission gating on these results (#1065) is shipped and documented under [Worker admission](#worker-admission); the operator view of run history evidence, freshness and mutation validation (#1067) is described under [History and Audit](#history-and-audit).
 
 ## History and Audit
 
-Every hosted grooming run is recorded in a dedicated `GroomingRun` table. Operators can inspect recent runs at `/automation/groomer`, including dry-run plans, write-mode applied mutations, context warnings, the LLM output summary, labels before/after, lane before/after, and the failure stage when a run fails.
+Every hosted grooming run is recorded in a dedicated `GroomingRun` table. Operators can inspect recent runs at `/groomer` (also reachable via `/automation/groomer`, which redirects there), including dry-run plans, write-mode applied mutations, context warnings, the LLM output summary, labels before/after, lane before/after, and the failure stage when a run fails.
 
-`AgentRun` and `AuditLog` rows are still written for compatibility with existing activity and audit views. `GroomingRun` is the detailed drilldown for hosted grooming and is the source of truth for `/automation/groomer`.
+Each run's row also carries an operator view (#1067) that answers the debugging questions without reading Postgres JSON by hand:
+
+- **Evidence and provenance** — the exact default-branch head SHA the run analyzed (or an explicit "unpinned" marker when none could be captured), the evidence digest and issue fingerprint the plan is bound to, counts of repository paths read at the pinned revision versus merely surfaced, and related GitHub issue/PR/commit refs. Comment provenance distinguishes human (authoritative) from automation comments, which are visibly marked non-authoritative.
+- **Pipeline and freshness** — the run's status and stage (evidence collection, plan validation, precondition validation, mutation application are all distinguishable via the `stage` progression), plus the apply-time precondition result: each check (issue, comments, head) with pass/changed/unverifiable status and what changed, so a stale-aborted run shows exactly why it was refused.
+- **Idempotent application** — the `applicationKey` and `applyOutcome`, with a replay visibly marked and described as "nothing was written", distinct from a fresh application, along with how many applications were recorded for the key.
+- **High-impact decisions** — the close recommendation's reason, rationale and cited evidence refs; a ready promotion with its admission (implementation or escalation) and the evidence refs that authorized it; and a decomposition with its reason and links to the child issues created or reused.
+
+The primary operator view never carries comment bodies, proposed bodies, raw model output or file contents. Those raw debugging fields remain available on the detail API (`GET /api/groomer/runs/[id]`), which returns the full row; the list API strips them and attaches the operator view.
+
+`AgentRun` and `AuditLog` rows are still written for compatibility with existing activity and audit views. `GroomingRun` is the detailed drilldown for hosted grooming and is the source of truth for `/groomer` (also reachable via `/automation/groomer`, which redirects there).
 
 Two history API endpoints back the UI and integrations:
 

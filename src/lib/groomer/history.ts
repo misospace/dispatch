@@ -1,3 +1,7 @@
+import { buildGroomingRunView, serializeGroomingRunSummary } from "./run-view";
+
+export { buildGroomingRunView, serializeGroomingRunSummary };
+
 interface GroomingRunDelegateLike {
   create(args: any): Promise<any>;
   update(args: any): Promise<any>;
@@ -120,20 +124,29 @@ export async function listGroomingRuns(
     include: {
       issue: { select: { title: true, state: true } },
       agentRun: true,
+      _count: { select: { applications: true } },
     },
-  });
+  }).then((rows) => rows.map((row: any) => serializeGroomingRunSummary(row)));
 }
 
 export async function getGroomingRunDetail(
   prisma: PrismaLike,
   id: string,
 ) {
-  return prisma.groomingRun.findUnique({
+  const run = await prisma.groomingRun.findUnique({
     where: { id },
     include: {
       issue: { include: { repository: true } },
       repo: true,
       agentRun: true,
+      applications: {
+        orderBy: { createdAt: "desc" },
+        select: { id: true, status: true, attempts: true, createdAt: true, updatedAt: true },
+      },
     },
   });
+  if (run === null) return null;
+  // Raw model output and full context stay on the detail view for debugging;
+  // the operator view adds the evidence/precondition/idempotency summary.
+  return { ...run, view: buildGroomingRunView(run) };
 }

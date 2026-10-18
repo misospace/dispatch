@@ -345,7 +345,7 @@ describe("listGroomingRuns", () => {
     );
   });
 
-  it("includes issue title/state and agentRun", async () => {
+  it("includes issue title/state, agentRun and application count", async () => {
     await listGroomingRuns(mockPrisma, {});
 
     expect(mocks.findMany).toHaveBeenCalledWith(
@@ -353,9 +353,42 @@ describe("listGroomingRuns", () => {
         include: {
           issue: { select: { title: true, state: true } },
           agentRun: true,
+          _count: { select: { applications: true } },
         },
       }),
     );
+  });
+
+  it("strips heavy debug fields and attaches the operator view", async () => {
+    mocks.findMany.mockResolvedValue([
+      {
+        id: "run-1",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        status: "completed",
+        stage: "applied",
+        dryRun: false,
+        model: "gpt-4o-mini",
+        rawOutput: { RAW: "output" },
+        contextSummary: { evidence: { headSha: "a".repeat(40) } },
+        commentBodyPreview: "comment body text",
+        validatedOutput: { schemaVersion: 1, verdict: { actionability: "ready" } },
+        issue: { title: "Fix login", state: "open" },
+        _count: { applications: 1 },
+      },
+    ]);
+
+    const rows = (await listGroomingRuns(mockPrisma, {})) as Array<Record<string, unknown>>;
+
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row).not.toHaveProperty("rawOutput");
+    expect(row).not.toHaveProperty("contextSummary");
+    expect(row).not.toHaveProperty("commentBodyPreview");
+    expect(row.validatedOutput).toBeDefined();
+    const view = row.view as { evidence: { headSha: string | null }; plan: { format: string } };
+    expect(view.evidence.headSha).toBe("a".repeat(40));
+    expect(view.plan.format).toBe("grooming-plan");
   });
 
   it("combines multiple filters", async () => {
@@ -377,6 +410,7 @@ describe("listGroomingRuns", () => {
       include: {
         issue: { select: { title: true, state: true } },
         agentRun: true,
+        _count: { select: { applications: true } },
       },
     });
   });
@@ -393,10 +427,13 @@ describe("getGroomingRunDetail", () => {
       issue: { title: "Fix login", state: "open", repository: { name: "repo" } },
       repo: { name: "repo", fullName: "org/repo" },
       agentRun: { id: "agent-run-1", agentName: "hosted-groomer" },
+      applications: [
+        { id: "app-1", status: "applied", attempts: 1, createdAt: new Date("2026-10-09T00:00:00.000Z"), updatedAt: new Date("2026-10-09T00:00:00.000Z") },
+      ],
     });
   });
 
-  it("calls findUnique by id", async () => {
+  it("calls findUnique by id with applications included", async () => {
     await getGroomingRunDetail(mockPrisma, "run-1");
 
     expect(mocks.findUnique).toHaveBeenCalledWith({
@@ -405,6 +442,10 @@ describe("getGroomingRunDetail", () => {
         issue: { include: { repository: true } },
         repo: true,
         agentRun: true,
+        applications: {
+          orderBy: { createdAt: "desc" },
+          select: { id: true, status: true, attempts: true, createdAt: true, updatedAt: true },
+        },
       },
     });
   });
@@ -417,12 +458,15 @@ describe("getGroomingRunDetail", () => {
     expect(result).toBeNull();
   });
 
-  it("returns the full detail object", async () => {
-    const result = await getGroomingRunDetail(mockPrisma, "run-1");
+  it("returns the full detail object with the operator view attached", async () => {
+    const result = (await getGroomingRunDetail(mockPrisma, "run-1")) as unknown as Record<string, unknown>;
 
     expect(result).not.toBeNull();
-    expect(result!.id).toBe("run-1");
-    expect(result!.issue).toBeDefined();
-    expect(result!.repo).toBeDefined();
+    expect(result.id).toBe("run-1");
+    expect(result.issue).toBeDefined();
+    expect(result.repo).toBeDefined();
+    expect(result.applications).toHaveLength(1);
+    const view = result.view as { application: { applicationCount: number | null } };
+    expect(view.application.applicationCount).toBe(1);
   });
 });

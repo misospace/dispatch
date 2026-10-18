@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import Link from "next/link";
 import { authedFetch } from "@/lib/client-auth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,8 +8,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { ExternalLink, Play, RefreshCw, Loader2, AlertCircle, CheckCircle2, Hash, GitBranch, MessageSquareWarning } from "lucide-react";
+import { ExternalLink, Play, RefreshCw, Loader2, AlertCircle, CheckCircle2, Hash, GitBranch, MessageSquareWarning, ChevronRight, ChevronDown, ShieldAlert, Pin, Link2 } from "lucide-react";
 import { summarizeGroomingOutput } from "@/lib/groomer/plan-summary";
+import type { GroomingRunView } from "@/lib/groomer/run-view";
 
 interface PendingReplyRow {
   id: string;
@@ -37,6 +38,215 @@ interface GroomingRunRow {
   createdAt: string;
   validatedOutput?: unknown;
   issue?: { title: string; state: string };
+  view?: GroomingRunView;
+}
+
+function short(value: string | null | undefined, take = 12): string {
+  if (!value) return "-";
+  return value.slice(0, take);
+}
+
+function EvidenceCell({ view }: { view?: GroomingRunView }) {
+  if (!view || !view.evidence.available) {
+    return <span className="text-xs text-muted-foreground">no snapshot</span>;
+  }
+  const evidence = view.evidence;
+  return (
+    <div className="text-xs space-y-1">
+      <div className="flex items-center gap-1" title={evidence.headSha ?? undefined}>
+        <Pin className={`h-3 w-3 ${evidence.pinned ? "text-green-600" : "text-amber-600"}`} />
+        {evidence.pinned ? (
+          <span className="font-mono" title={evidence.headSha ?? undefined}>{short(evidence.headSha)}</span>
+        ) : (
+          <span className="font-mono text-amber-700">unpinned</span>
+        )}
+      </div>
+      <div className="font-mono text-muted-foreground" title={evidence.evidenceDigest ?? undefined}>
+        digest {short(evidence.evidenceDigest, 12)}
+      </div>
+      <div className="text-muted-foreground">
+        {evidence.humanCommentCount} human / {evidence.automationCommentCount} automation
+      </div>
+    </div>
+  );
+}
+
+function preconditionBadge(view: GroomingRunView) {
+  if (view.precondition.stale) return <Badge className="bg-amber-100 text-amber-800">stale</Badge>;
+  if (view.precondition.unverifiable) return <Badge className="bg-amber-100 text-amber-800">unverifiable</Badge>;
+  if (view.precondition.ok === true) return <Badge className="bg-green-100 text-green-700">preconditions ok</Badge>;
+  if (view.precondition.ok === false) return <Badge className="bg-red-100 text-red-700">preconditions failed</Badge>;
+  return null;
+}
+
+function RunEvidencePanel({ run }: { run: GroomingRunRow }) {
+  const view = run.view;
+  if (!view) {
+    return <p className="text-xs text-muted-foreground">No operator view recorded for this run.</p>;
+  }
+  const evidence = view.evidence;
+  const decision = view.decision;
+  return (
+    <div className="rounded-lg border bg-muted/30 p-4 text-sm space-y-4" data-testid="run-evidence-panel">
+      <div>
+        <h4 className="font-medium mb-1">Evidence &amp; provenance</h4>
+        {evidence.available ? (
+          <div className="space-y-1 text-xs">
+            <div>
+              Repository revision:{" "}
+              {evidence.headSha ? (
+                <span className="font-mono">{evidence.headSha}</span>
+              ) : (
+                <span className="text-amber-700">unpinned (no head SHA captured)</span>
+              )}
+              {evidence.defaultBranch ? <> on <span className="font-mono">{evidence.defaultBranch}</span></> : null}
+            </div>
+            <div className="font-mono text-muted-foreground">evidence digest: {evidence.evidenceDigest ?? "-"}</div>
+            <div className="font-mono text-muted-foreground">issue fingerprint: {evidence.issueFingerprint ?? "-"}</div>
+            <div>
+              Sources: {evidence.repositoryReadCount} read at the pinned revision, {evidence.repositorySurfacedCount} surfaced
+              (unpinned), {evidence.relatedWorkCount} GitHub issue/PR/commit refs
+            </div>
+            <div>
+              Comments: {evidence.humanCommentCount} human (authoritative),{" "}
+              {evidence.automationCommentCount} automation (<span className="text-amber-700">non-authoritative</span>)
+            </div>
+            {evidence.capturedAt && (
+              <div className="text-muted-foreground">Captured {new Date(evidence.capturedAt).toLocaleString()}</div>
+            )}
+            {evidence.warnings.length > 0 && (
+              <ul className="list-disc pl-4 text-muted-foreground">
+                {evidence.warnings.map((warning, index) => (
+                  <li key={index}>{warning}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">No evidence snapshot was captured for this run (legacy run).</p>
+        )}
+      </div>
+
+      <div>
+        <h4 className="font-medium mb-1">Pipeline</h4>
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <Badge variant="outline">{view.status ?? "unknown"}</Badge>
+          <Badge variant="outline">stage: {view.stage ?? "unknown"}</Badge>
+          <Badge variant="outline">plan schema: {view.plan.schemaVersion ?? "legacy"}</Badge>
+          {preconditionBadge(view)}
+          {view.application.replayed && <Badge className="bg-blue-100 text-blue-700">replayed</Badge>}
+          {view.application.freshApplication && <Badge className="bg-green-100 text-green-700">fresh application</Badge>}
+        </div>
+      </div>
+
+      <div>
+        <h4 className="font-medium mb-1">Precondition validation</h4>
+        {view.precondition.recorded ? (
+          <div className="space-y-1 text-xs">
+            {view.precondition.checks.map((check, index) => (
+              <div key={index} className="flex items-start gap-2">
+                {check.status === "passed" ? (
+                  <CheckCircle2 className="h-3.5 w-3.5 text-green-600 mt-0.5 shrink-0" />
+                ) : check.status === "changed" ? (
+                  <AlertCircle className="h-3.5 w-3.5 text-red-600 mt-0.5 shrink-0" />
+                ) : (
+                  <AlertCircle className="h-3.5 w-3.5 text-amber-600 mt-0.5 shrink-0" />
+                )}
+                <span>
+                  <span className="font-medium">{check.name}</span> — {check.status}
+                  {check.detail ? `: ${check.detail}` : ""}
+                </span>
+              </div>
+            ))}
+            {view.precondition.failures.length > 0 && (
+              <div className="text-destructive">{view.precondition.failures.join("; ")}</div>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">No apply-time precondition result recorded.</p>
+        )}
+      </div>
+
+      <div>
+        <h4 className="font-medium mb-1">Idempotent application</h4>
+        <div className="text-xs space-y-1">
+          <div>
+            Outcome: <span className="font-medium">{view.application.applyOutcome ?? "not recorded"}</span>
+            {view.application.replayed && " — a previous run with the same application key already applied this plan; nothing was written"}
+          </div>
+          {view.application.applicationKey && (
+            <div className="font-mono text-muted-foreground">application key: {view.application.applicationKey}</div>
+          )}
+          {view.application.applicationCount !== null && (
+            <div className="text-muted-foreground">Recorded applications: {view.application.applicationCount}</div>
+          )}
+          {view.application.lastApplicationAt && (
+            <div className="text-muted-foreground">
+              Last applied {new Date(view.application.lastApplicationAt).toLocaleString()}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div>
+        <h4 className="font-medium mb-1">High-impact decisions</h4>
+        {decision.close && (
+          <div className="text-xs space-y-1 mb-2">
+            <div className="flex items-center gap-1">
+              <ShieldAlert className="h-3.5 w-3.5 text-red-600" />
+              Close as <span className="font-medium">{decision.close.reason}</span>
+            </div>
+            {decision.close.rationale && <div className="text-muted-foreground">{decision.close.rationale}</div>}
+            {decision.close.evidenceRefs.length > 0 && (
+              <div className="font-mono text-muted-foreground">evidence: {decision.close.evidenceRefs.join(", ")}</div>
+            )}
+          </div>
+        )}
+        {decision.readyPromotion && (
+          <div className="text-xs space-y-1 mb-2">
+            <div className="flex items-center gap-1">
+              <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
+              Ready promotion{decision.readyPromotion.admission ? ` (${decision.readyPromotion.admission})` : ""}
+            </div>
+            {decision.readyPromotion.evidenceRefs.length > 0 && (
+              <div className="font-mono text-muted-foreground">evidence: {decision.readyPromotion.evidenceRefs.join(", ")}</div>
+            )}
+          </div>
+        )}
+        {decision.decomposition && (
+          <div className="text-xs space-y-1">
+            <div className="flex items-center gap-1">
+              <Link2 className="h-3.5 w-3.5 text-blue-600" />
+              Decomposition{decision.decomposition.reason ? `: ${decision.decomposition.reason}` : ""}
+            </div>
+            {decision.decomposition.childrenCreated.length > 0 && (
+              <div>
+                Created:{" "}
+                {decision.decomposition.childrenCreated.map((child, index) => (
+                  <a key={child.number} href={child.url ?? undefined} target="_blank" rel="noopener noreferrer" className="hover:underline mr-2">
+                    #{child.number}
+                  </a>
+                ))}
+              </div>
+            )}
+            {decision.decomposition.childrenReused.length > 0 && (
+              <div>
+                Reused:{" "}
+                {decision.decomposition.childrenReused.map((child, index) => (
+                  <a key={child.number} href={child.url ?? undefined} target="_blank" rel="noopener noreferrer" className="hover:underline mr-2">
+                    #{child.number}
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {!decision.close && !decision.readyPromotion && !decision.decomposition && (
+          <p className="text-xs text-muted-foreground">No close, ready-promotion or decomposition decision on this run.</p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 interface GroomResult {
@@ -144,6 +354,9 @@ export default function GroomerHistoryPage() {
   const [repliesLoading, setRepliesLoading] = useState(true);
   const [replyError, setReplyError] = useState("");
   const [replyActionId, setReplyActionId] = useState<string | null>(null);
+
+  // Run detail expansion state (run id -> expanded)
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
 
   // Groom trigger state
   const [grooming, setGrooming] = useState(false);
@@ -485,10 +698,12 @@ export default function GroomerHistoryPage() {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead className="w-8"></TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Issue</TableHead>
                   <TableHead>Mode</TableHead>
                   <TableHead>Verdict</TableHead>
+                  <TableHead>Evidence</TableHead>
                   <TableHead>Lane</TableHead>
                   <TableHead>Labels</TableHead>
                   <TableHead>Model</TableHead>
@@ -498,10 +713,23 @@ export default function GroomerHistoryPage() {
               </TableHeader>
               <TableBody>
                 {runs.map((run) => (
-                  <TableRow key={run.id}>
-                    <TableCell>
-                      <StatusBadge status={run.status} />
-                    </TableCell>
+                  <Fragment key={run.id}>
+                    <TableRow
+                      className={run.view ? "cursor-pointer" : undefined}
+                      onClick={() => run.view && setExpandedRunId(expandedRunId === run.id ? null : run.id)}
+                    >
+                      <TableCell>
+                        {run.view ? (
+                          expandedRunId === run.id ? (
+                            <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                          )
+                        ) : null}
+                      </TableCell>
+                      <TableCell>
+                        <StatusBadge status={run.status} />
+                      </TableCell>
                     <TableCell>
                       <div className="font-medium">{run.repoFullName}#{run.issueNumber}</div>
                       <div className="text-xs text-muted-foreground line-clamp-1">
@@ -518,6 +746,9 @@ export default function GroomerHistoryPage() {
                     </TableCell>
                     <TableCell>
                       <VerdictCell validatedOutput={run.validatedOutput} />
+                    </TableCell>
+                    <TableCell>
+                      <EvidenceCell view={run.view} />
                     </TableCell>
                     <TableCell className="text-sm">
                       {run.laneBefore || "-"} &rarr; {run.laneAfter || "-"}
@@ -542,6 +773,14 @@ export default function GroomerHistoryPage() {
                       </a>
                     </TableCell>
                   </TableRow>
+                  {expandedRunId === run.id && run.view && (
+                    <TableRow className="hover:bg-transparent">
+                      <TableCell colSpan={11}>
+                        <RunEvidencePanel run={run} />
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </Fragment>
                 ))}
               </TableBody>
             </Table>
