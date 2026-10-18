@@ -239,6 +239,10 @@ The detailed worker API and lifecycle contract lives in
 Load it before changing agent queue, auth, task execution, reporting, or worker
 lifecycle behavior. It is normative for those areas.
 
+### Source of Truth
+
+GitHub Issues and PRs remain authoritative; Dispatch's Postgres is a cache, not a replacement source of truth. See the worker-contract skill for the full operational rules.
+
 ## Filing issues for the autonomous loop
 
 Issues here are picked up by an autonomous coding loop (dispatch → foreman), and two
