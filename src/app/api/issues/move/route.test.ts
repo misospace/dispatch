@@ -462,3 +462,54 @@ describe("POST /api/issues/move — lifecycle evidence (#1202)", () => {
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /api/issues/move — closed-issue guard (#1206)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    delete process.env.DISPATCH_AUTH_USERNAME;
+    delete process.env.DISPATCH_AUTH_PASSWORD;
+    resetAuthCaches();
+    resetRateLimits();
+    vi.clearAllMocks();
+    mocks.auth.mockReset();
+    mocks.findIssue.mockResolvedValue(null);
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+  });
+
+  it("refuses a move on a closed issue with no writes (#1206)", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "closed",
+      labels: ["status/done"],
+      number: 42,
+    });
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot move a closed issue");
+    // Rejected from the cached state alone: no GitHub label writes, no cache
+    // update, no lifecycle event, and no audit row (refusal, not failure).
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("refuses a move on a closed issue even when no status label changes", async () => {
+    mocks.findIssue.mockResolvedValueOnce({
+      id: "issue-1",
+      state: "closed",
+      labels: ["status/done"],
+      number: 42,
+    });
+    const res = await postRequest(
+      makePayload({ oldLabels: ["status/done"], newLabels: ["status/done", "priority/p0"] }),
+    );
+    expect(res.status).toBe(400);
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+});

@@ -989,3 +989,64 @@ describe("POST /api/issues/groom — lifecycle evidence (#1202)", () => {
     expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /api/issues/groom — closed-issue guard (#1206)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRateLimits();
+    mocks.findFirstIssue.mockResolvedValue(null);
+    process.env.DISPATCH_AGENT_TOKEN = "test-token";
+    process.env.DISPATCH_AUTH_MODE = "disabled";
+  });
+
+  afterEach(() => {
+    delete process.env.DISPATCH_AGENT_TOKEN;
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+  });
+
+  it("refuses promote_to_ready on a closed issue with no writes (#1206)", async () => {
+    mockIssue({ state: "closed" });
+    const res = await groomRequest({ issueId: "i1", repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot groom a closed issue");
+    // Rejected from the cached state alone: no GitHub label writes, no cache
+    // update, no lifecycle event, and no audit row (refusal, not failure).
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createLifecycleEvent).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("refuses non-status groom actions on a closed issue too", async () => {
+    mockIssue({ state: "closed" });
+    const res = await groomRequest({
+      issueId: "i1",
+      repoFullName: "r/r",
+      issueNumber: 42,
+      action: "mark_blocked",
+      blockedReason: "waiting on upstream",
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot groom a closed issue");
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("refuses a closed issue found via the repoFullName fallback lookup", async () => {
+    mocks.findIssue.mockResolvedValue(null);
+    mocks.findFirstIssue.mockResolvedValue({
+      id: "issue-1",
+      number: 42,
+      state: "closed",
+      labels: ["status/backlog"],
+      repository: { fullName: "r/r" },
+    });
+    const res = await groomRequest({ repoFullName: "r/r", issueNumber: 42, action: "promote_to_ready" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Cannot groom a closed issue");
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+});
