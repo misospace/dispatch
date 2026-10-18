@@ -10,10 +10,11 @@ description: Review Dispatch API routes, bearer-token authorization, Prisma data
 Dispatch is a Next.js/TypeScript Kanban and work dispatch layer. Contains both application logic and infrastructure concerns.
 
 Security-sensitive areas:
-- **API routes** (`src/app/api/`): bearer-token auth (`DISPATCH_AGENT_TOKEN`), input validation before DB operations
+- **API routes** (`src/app/api/`): enforce the correct bearer-token tier and authorization before DB operations. `DISPATCH_WORKER_TOKENS` binds worker credentials to an agent identity; `DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN` are full-rights maintainer credentials.
 - **Prisma ORM**: schema migrations, relation integrity (nullable foreign keys hide bugs — keep them strict)
 - **GitHub tokens** (`GITHUB_TOKEN`): never log or persist to disk
-- **Agent tokens** (`DISPATCH_AGENT_TOKEN`): bearer auth for agent API, never log
+- **Worker credentials** (`DISPATCH_WORKER_TOKENS`): each `agentName:token` pair binds one worker token to one agent; never trust caller-supplied identity over the token binding. The legacy unbound `DISPATCH_WORKER_TOKEN` is rejected on identity-scoped routes.
+- **Maintainer credentials** (`DISPATCH_AGENT_TOKEN`, `DISPATCH_MAINTAINER_TOKEN`): full-rights bearer credentials; never expose to ordinary workers, log, or persist outside their intended secret/configuration path.
 - **Automation sync**: pipeline syncs issue data from GitHub; validate incoming data shapes
 - **Webhook/ingestion endpoints** (`pr-followup`, `pr-fix-queue`): validate webhook payloads, authenticate sources
 
