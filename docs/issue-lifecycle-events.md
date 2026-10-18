@@ -16,8 +16,10 @@ product-specific table or side channel), and is written through one contract —
 `src/lib/issue-lifecycle.ts` — so the taxonomy, the idempotency rules and the
 timestamps cannot drift between routes.
 
-Non-goals for now: PR merge/link backfill, a duration API or UI, and worker
-attempt telemetry/cohorts.
+Non-goals for now: a board UI over the timeline, and worker attempt
+telemetry/cohorts (downstream #1183/#1184 build on the read contract below).
+The read contract, the authoritative merge linkage, and the bounded backfill
+landed with #1203.
 
 ## Taxonomy
 
@@ -30,7 +32,7 @@ attempt telemetry/cohorts.
 | `completed` | A worker report closed the item as already done (`status/done` + GitHub close). Not evidence that a PR merged. | `agent-report` |
 | `issue_closed` | The GitHub issue was observed closing — or closed by the hosted groomer. Distinct from the card reaching Done. | `reconciler`, `sync`, `hosted-groomer` |
 | `issue_reopened` | The issue was observed reopening after a close. | `sync` |
-| `pr_merged` | A PR referencing the item was observed merged. Only ever recorded from an observation of a merge — never from a worker's success report. | `reconciler` |
+| `pr_merged` | A PR referencing the item was observed merged. Only ever recorded from an observation of a merge — never from a worker's success report. Metadata carries the PR number/url, GitHub's own `mergedAt`, and `headSha` / `mergeCommitSha` when the observer had them, plus a `linkSource` (`body-keyword`, `branch-name`, `title-keyword`, `agent-run-touch`) saying how the PR is correlated to the issue. Multiple linked PRs record one row each. | `reconciler`, `backfill` |
 
 `kind` and `source` are stored as strings, not enums, so a new writer can be
 added without a migration; `LIFECYCLE_EVENT_KINDS` and `LIFECYCLE_SOURCES` in
@@ -65,6 +67,61 @@ added without a migration; `LIFECYCLE_EVENT_KINDS` and `LIFECYCLE_SOURCES` in
 | Issue sync | `src/lib/issue-sync.ts` (`makePrismaIssueStore`, `makePrismaReconcileIssueStore`) | `status_changed`, `issue_closed`, `issue_reopened` |
 | GitHub webhook | `src/app/api/issues/webhook/route.ts` | `status_changed` |
 | Worker report | `src/app/api/agents/[agentName]/tasks/report/route.ts`, `src/lib/report-close.ts` | `attempt_failed`, `completed` |
+| Lifecycle merge backfill (operator, per issue) | `src/lib/lifecycle-backfill.ts`, `POST /api/issues/[issueId]/lifecycle` | `pr_merged`, only from a run record naming the PR plus that PR's persisted GitHub merge time |
+
+## Reading the stream: the lifecycle timeline (#1203)
+
+`GET /api/issues/[issueId]/lifecycle` (any authorized caller) projects the
+stream into a typed, source-neutral read contract —
+`dispatch.issue-lifecycle-timeline/v1` — built by
+`buildIssueLifecycleTimeline` in `src/lib/issue-lifecycle-read.ts` (pure, no
+I/O). It exposes, per work item:
+
+- `claims[]` (every observed claim, in occurrence order) and `firstClaim` —
+  **a missing first claim is `{ at: null, provenance: "unknown" }`, never
+  zero and never the issue creation time**. A reclaim never replaces the
+  first claim.
+- `doneAt` / `closedAt` / `lastReopenAt` milestones. A close observed without
+  a merge is `delivery: "closed-unmerged"` — never labeled shipped. Reopening
+  preserves the earlier close milestone; it only changes `delivery`.
+- `pullRequests[]`: one entry per distinct merged PR (multi-PR issues are
+  first-class), each with the authoritative `mergedAt`, `mergeCommitSha`,
+  `headSha`, and `linkSource` provenance, plus `firstMergedAt`.
+- `claimToDoneMs` / `claimToMergeMs`, in **milliseconds**, null whenever
+  either endpoint is unknown. A merge preceding the first observed claim
+  yields a negative value plus a note — reported, not hidden.
+- Every timestamp carries `provenance`: `observed` (a lifecycle event or the
+  issue-cache fallback), `backfilled` (`metadata.backfilled === true`), or
+  `unknown`. Rows written by the backfill are therefore never mistaken for
+  real-time observations.
+
+The read is bounded (`take` window of 500 events, `truncated: true` beyond
+it) — no full-history GitHub scan on a routine request. Duplicate
+observations (the documented `api:*` vs `webhook` pair) collapse in the
+projection with a note. The raw window ships alongside the timeline as
+`events[]` for downstream consumers (#1183 attempts, #1184 cohorts); the
+contract assumes nothing Courier- or Dispatch-writer-specific.
+
+### Merge linkage and the bounded backfill
+
+Merge evidence is written only through `recordPrMergedEvent`
+(`src/lib/issue-lifecycle.ts`), whose canonical dedupe identity
+(`reconciler|<repo>|<issue>|pr_merged|<pr>|<mergedAt>`) is shared by every
+observer — reconcile, and the backfill — so the same physical merge observed
+twice lands on one row. The reconciler records one `pr_merged` per *linked*
+merged PR (#1203), each with its `linkSource`; a title-derived correlation is
+explicitly labeled `title-keyword` and links are never inferred from titles
+alone.
+
+`POST /api/issues/[issueId]/lifecycle` (operator auth only — agent bearer
+tokens get 403) backfills legacy issues **only from verifiable records**: an
+`AgentRun` attached to the issue whose `touchedIssueUrls` name a PR,
+correlated with that PR's authoritative merge timestamp already persisted in
+Dispatch (`GithubPullRequest.mergedAt`, written by the automation PR sync).
+It never fabricates a first claim, never reads `startedAt`/`createdAt` as
+claim evidence, skips PRs without an authoritative merge time, and replays
+idempotently onto the shared dedupe identity. Unknown stays unknown; nothing
+here estimates.
 
 ## Idempotency
 

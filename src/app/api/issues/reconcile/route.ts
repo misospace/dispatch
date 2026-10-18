@@ -15,8 +15,10 @@ import {
   lifecycleDedupeKey,
   lifecycleStatusLabel,
   recordLifecycleEvent,
+  recordPrMergedEvent,
   recordStatusTransition,
   type LifecycleEventClient,
+  type PrMergeObservation,
 } from "@/lib/issue-lifecycle";
 import { isBacklogLane } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
@@ -47,6 +49,13 @@ export async function recordReconciledAction(input: {
   existingIssue: { id: string } | undefined;
   /** The PR whose state drove the action, when the action came from one. */
   mergedPr: { number: number; merged_at?: string | null } | null;
+  /**
+   * Every merged PR correlated to this issue (#1203), richest observation
+   * first. An issue may legitimately carry several linked PRs; each one
+   * records its own `pr_merged` event with its authoritative merge time and
+   * link provenance. Absent, the single `mergedPr` is recorded as before.
+   */
+  mergedPrs?: readonly PrMergeObservation[] | null;
   executed: {
     action: ReconciliationAction;
     success: boolean;
@@ -70,20 +79,25 @@ export async function recordReconciledAction(input: {
       // A merge is recorded separately from the close it causes: "the PR
       // merged" and "someone closed the issue" are different facts, and a
       // worker reporting success must never be able to assert either.
-      if (mergedPr && prIdentity) {
-        await recordLifecycleEvent(client, {
+      // Every linked merged PR records its own event (#1203); the canonical
+      // dedupe identity is shared with the pre-#1203 single-PR shape, so a
+      // re-observed merge lands on the row that already exists.
+      const mergeObservations: readonly PrMergeObservation[] =
+        input.mergedPrs && input.mergedPrs.length > 0
+          ? input.mergedPrs
+          : mergedPr
+            ? [{ prNumber: mergedPr.number, mergedAt: mergedPr.merged_at ?? null }]
+            : [];
+      for (const pr of mergeObservations) {
+        await recordPrMergedEvent(client, {
           issueId: existingIssue.id,
           repoFullName: repo.fullName,
           issueNumber,
-          kind: "pr_merged",
           source: "reconciler",
           actor: "reconciler",
           fromStatus: lifecycleStatusLabel(executed.beforeLabels),
           toStatus: lifecycleStatusLabel(executed.afterLabels),
-          sourceEventId: `pr-${mergedPr.number}`,
-          dedupeKey: lifecycleDedupeKey(identity, "pr_merged", prIdentity),
-          occurredAt: mergedPr.merged_at ? new Date(mergedPr.merged_at) : undefined,
-          metadata: { pullRequestNumber: mergedPr.number },
+          pr,
         });
       }
 
@@ -215,14 +229,38 @@ export async function POST(request: Request) {
         // Extract issue numbers from merged PRs: scan body keywords first, then
         // fall back to branch name patterns so we catch "Fixes #NNN", "Closes #NNN",
         // "Resolves #NNN" references that workers write in PR bodies.
+        // `mergedFixingIssues` stays first-PR-wins because it drives the close
+        // decision. `mergedPrLinkEvidence` keeps *every* merged PR per issue
+        // with its link provenance (#1203): merge evidence records one event
+        // per linked PR, and a title-only match is recorded as `title-keyword`
+        // so a reader can tell a keyword link from a weak one — the link is
+        // never *inferred* from a title alone without the PR also being the
+        // merged PR the close is reacting to.
         const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
+        const mergedPrLinkEvidence = new Map<number, PrMergeObservation[]>();
+        const recordLinkEvidence = (num: number, pr: (typeof allPrs)[number], linkSource: string) => {
+          const existing = mergedPrLinkEvidence.get(num);
+          if (existing?.some((obs) => obs.prNumber === pr.number)) return;
+          const observation: PrMergeObservation = {
+            prNumber: pr.number,
+            prUrl: pr.html_url ?? pr.url ?? null,
+            mergedAt: pr.merged_at ?? null,
+            mergeCommitSha: pr.merge_commit_sha ?? null,
+            headSha: pr.head?.sha ?? null,
+            linkSource,
+          };
+          if (existing) existing.push(observation);
+          else mergedPrLinkEvidence.set(num, [observation]);
+        };
         for (const [, pr] of mergedPrsMap) {
           // 1. Check PR body for keyword references (Fixes #, Closes #, Resolves #)
           const bodyNumbers = extractFixingIssueNumbers(pr.body ?? pr.title ?? null);
+          const bodyKeywordNumbers = new Set(extractFixingIssueNumbers(pr.body ?? null));
           for (const num of bodyNumbers) {
             if (!mergedFixingIssues.has(num)) {
               mergedFixingIssues.set(num, pr);
             }
+            recordLinkEvidence(num, pr, bodyKeywordNumbers.has(num) ? "body-keyword" : "title-keyword");
           }
           // 2. Fallback: check branch name pattern
           if (!mergedFixingIssues.has(pr.number)) {
@@ -234,6 +272,7 @@ export async function POST(request: Request) {
                 if (!mergedFixingIssues.has(issueNum)) {
                   mergedFixingIssues.set(issueNum, pr);
                 }
+                recordLinkEvidence(issueNum, pr, "branch-name");
               }
             }
           }
