@@ -111,21 +111,24 @@ observer — reconcile, and the backfill — so the same physical merge observed
 twice lands on one row. The reconciler records one `pr_merged` per *linked*
 merged PR (#1203), each with its `linkSource`. Link evidence comes only from
 an explicit correlation — a body Fixes/Closes/Resolves keyword or a
-branch-name pattern; a title-derived match never produces a link. The single
-exception is honest by construction: the PR that actually drove a recorded
-close is always noted, with `linkSource: "reconcile-close-trigger"`, because
-that correlation is the observed action rather than a text guess. The dedupe
-stamp is canonicalized so a `Date` and GitHub's second-precision string form
-of the same merge produce the same key, keeping reconcile, sync, and backfill
-on one row per physical merge.
+branch-name pattern. PR titles are never consulted, for links or for the
+close decision: a merged PR that only names an issue in its title neither
+closes it nor records a merge for it. When a caller supplies no evidence
+list at all, the PR that actually drove a recorded close is still noted,
+with `linkSource: "reconcile-close-trigger"`, because that correlation is
+the observed action rather than a text guess. The dedupe stamp is
+canonicalized so a `Date` and GitHub's second-precision string form of the
+same merge produce the same key, keeping reconcile, sync, and backfill on
+one row per physical merge.
 
-Reconcile also records linked merges for issues it no longer acts on because
-they are already closed: a PR that merges after its issue closed never reaches
-the open-issue loop, so a second bounded pass inside the same reconcile run
-records the merge for those linked numbers (`recordClosedIssueMergeEvidence`,
-merges only — no close or status writes). It re-derives links from the
-already-fetched merged-PR window, so it adds no GitHub calls, skips numbers
-the open loop processed, and replays idempotently onto the same dedupe key.
+Merge recording is decoupled from the reconcile action loop: a linked merge
+records whether the issue is open or closed and whether the close action
+executed. A second bounded pass inside the same reconcile run records the
+merge for every linked number in the fetched window
+(`recordLinkedMergeEvidence`, merges only — no close or status writes). It
+re-derives links from the already-fetched merged-PR window, so it adds no
+GitHub calls, and replays idempotently onto the same dedupe key — rows the
+close path already wrote converge on the same row.
 
 `POST /api/issues/[issueId]/lifecycle` (operator auth only — agent bearer
 tokens get 403) backfills legacy issues **only from verifiable records**: an
