@@ -68,12 +68,30 @@ describe("GET /api/groomer/runs/[id]", () => {
   });
 
   it("returns run detail on success", async () => {
+    mocks.getGroomingRunDetail.mockResolvedValue({
+      id: "run-1",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      status: "completed",
+      dryRun: false,
+      model: "gpt-4o-mini",
+      rawOutput: { RAW: "output" },
+      view: { stage: "applied", application: { replayed: false }, precondition: { stale: false } },
+      applications: [{ id: "app-1", status: "applied", attempts: 1 }],
+      issue: { title: "Fix login", state: "open", repository: { name: "repo" } },
+      repo: { name: "repo", fullName: "org/repo" },
+      agentRun: { id: "agent-run-1", agentName: "hosted-groomer" },
+    });
     const res = await GET(request(), { params: params() });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.id).toBe("run-1");
     expect(body.repoFullName).toBe("org/repo");
     expect(body.issueNumber).toBe(42);
+    // Detail keeps raw debugging fields and exposes the operator view.
+    expect(body.rawOutput).toEqual({ RAW: "output" });
+    expect(body.view.application.replayed).toBe(false);
+    expect(body.applications).toHaveLength(1);
   });
 
   it("returns 500 when get throws", async () => {
