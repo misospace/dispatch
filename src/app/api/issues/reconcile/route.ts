@@ -149,6 +149,84 @@ export async function recordReconciledAction(input: {
 }
 
 /**
+ * Client shape the late-merge pass needs: the lifecycle write client plus the
+ * issue-row loader it batch-reads through. Structurally satisfied by the
+ * Prisma client, the same way `LifecycleEventClient` is.
+ */
+type ReconcileLifecycleClient = LifecycleEventClient & {
+  issue: {
+    findMany(args: {
+      where: { repositoryId: string; number: { in: number[] } };
+    }): Promise<Array<{ id: string; number: number }>>;
+  };
+};
+
+/**
+ * Record merge evidence for linked PRs of issues the open-issue loop no
+ * longer acts on because they are already closed (#1203).
+ *
+ * `fetchIssues` returns open issues, so a linked PR that merges after its
+ * issue closed — or while the issue sits outside the open-issue fetch window —
+ * would otherwise never be recorded, and the timeline would lose its
+ * authoritative merge. This pass re-derives the link from the already-fetched
+ * merged-PR window (`fetchPullRequests` / `fetchClosedPullRequests`, maxItems
+ * 100): no extra GitHub calls. It is bounded to issue numbers the open loop
+ * did not already process — that loop remains the recorder for the issues it
+ * acts on — and records through the shared `recordPrMergedEvent` path with no
+ * close or status writes (merges only: the issue is already closed, and a late
+ * merge must not invent a transition). Idempotent via the canonical merge
+ * dedupe key, so a replaying reconcile upserts onto the row that exists.
+ *
+ * Failures are logged, never thrown, like `recordReconciledAction`: the pass
+ * has already done its GitHub work, so an evidence-row problem must not abort
+ * the remaining repos.
+ */
+export async function recordClosedIssueMergeEvidence(input: {
+  repo: { id: string; fullName: string };
+  /** Issue numbers the open-issue loop already iterated this pass. */
+  processedIssueNumbers: ReadonlySet<number>;
+  /** Every merged PR per linked issue, richest observation first (#1203). */
+  mergedPrLinkEvidence: ReadonlyMap<number, readonly PrMergeObservation[]>;
+  client: ReconcileLifecycleClient;
+}): Promise<void> {
+  const unprocessed = [...input.mergedPrLinkEvidence.keys()].filter(
+    (issueNumber) => !input.processedIssueNumbers.has(issueNumber),
+  );
+  if (unprocessed.length === 0) return;
+
+  try {
+    const existingIssues = await input.client.issue.findMany({
+      where: { repositoryId: input.repo.id, number: { in: unprocessed } },
+    });
+    for (const existingIssue of existingIssues) {
+      const observations = input.mergedPrLinkEvidence.get(existingIssue.number) ?? [];
+      for (const pr of observations) {
+        // Per-observation containment, like `recordReconciledAction`: one
+        // failed row must not drop the remaining evidence in this repo.
+        try {
+          await recordPrMergedEvent(input.client, {
+            issueId: existingIssue.id,
+            repoFullName: input.repo.fullName,
+            issueNumber: existingIssue.number,
+            source: "reconciler",
+            actor: "reconciler",
+            pr,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(
+            `reconciler late-merge lifecycle evidence for ${input.repo.fullName}#${existingIssue.number} was not recorded: ${message}`,
+          );
+        }
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`reconciler late-merge evidence lookup for ${input.repo.fullName} failed: ${message}`);
+  }
+}
+
+/**
  * Reconcile issue state against PR state for all tracked repos.
  *
  * This endpoint replaces the grooming logic that previously lived in
@@ -332,8 +410,10 @@ export async function POST(request: Request) {
         const existingIssueByNumber = new Map(existingIssues.map((i) => [i.number, i]));
 
         // Reconcile each issue
+        const processedIssueNumbers = new Set<number>();
         for (const issue of issues) {
           if (issue.state !== "open") continue;
+          processedIssueNumbers.add(issue.number);
 
           const currentLabels = issue.labels.map((l) => l.name);
           // Resolved before the action loop so a reconciled action can be
@@ -454,6 +534,16 @@ export async function POST(request: Request) {
 
           totalIssuesReconciled++;
         }
+
+        // (#1203) Late merges: a linked PR that merged after its issue closed
+        // never reaches the open-issue loop above, so its authoritative merge
+        // is recorded here for the linked numbers the loop did not act on.
+        await recordClosedIssueMergeEvidence({
+          repo,
+          processedIssueNumbers,
+          mergedPrLinkEvidence,
+          client: prisma,
+        });
 
         // Reconcile pr-fix-queue items: mark stale when the upstream PR is
         // merged or closed. Uses the mergedPrsMap already built above. No
