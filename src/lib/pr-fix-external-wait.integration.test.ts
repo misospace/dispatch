@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { enqueuePrFixItem, markPrFixItem, listQueuedPrFixItems } from "./pr-fix-queue";
+import { enqueuePrFixItem, markPrFixItem, listQueuedPrFixItems, reconcileExternalWaitTriggers } from "./pr-fix-queue";
 import { asPrFixQueueClient } from "@/lib/prisma";
 
 vi.mock("@/lib/pr-fix-surfacing", () => ({
@@ -29,6 +29,19 @@ vi.mock("@/lib/pr-fix-surfacing", () => ({
 
 import { vi } from "vitest";
 import { parseStoredExternalWait, type ExternalWaitContract } from "./pr-fix-external-wait";
+
+// Real-DB cases below must make zero network calls, so the trigger evaluator
+// (the only forge read in the pass) is stubbed and keyed on the contract ref.
+const evaluatorMock = vi.hoisted(() => ({
+  evaluateExternalWaitTrigger: vi.fn(async (wait: ExternalWaitContract) =>
+    wait.ref.endsWith("#999") ? ("satisfied" as const) : ("unsatisfied" as const),
+  ),
+}));
+
+vi.mock("./pr-fix-external-wait", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./pr-fix-external-wait")>()),
+  evaluateExternalWaitTrigger: evaluatorMock.evaluateExternalWaitTrigger,
+}));
 
 const url = process.env.DATABASE_URL;
 const enabled = process.env.RUN_DB_INTEGRATION === "1" && Boolean(url);
@@ -192,5 +205,94 @@ suite("external-wait contract against a real PostgreSQL", () => {
     const staleRows = await prisma.prFixQueueItem.findMany({ where: { repo: REPO, pr: { gte: 2000 } } });
     expect(staleRows).toHaveLength(120);
     expect(staleRows.every((row) => row.status === "WAITING_EXTERNAL")).toBe(true);
+  });
+
+  // #1253 fairness: a rotation stamp (`triggerEvaluatedAt` ASC NULLS FIRST)
+  // that was not honoured by real Postgres would re-read the same head rows
+  // forever and starve a later satisfied wait. These two cases are the
+  // real-DB proof; the mocked suite cannot observe NULL placement.
+  const SATISFIED_REF = "org/deps#999";
+
+  function waitContract(ref: string) {
+    return { kind: "upstream_pr", ref, evidence: "upstream open", trigger: { kind: "merged" } } as unknown as Prisma.InputJsonValue;
+  }
+
+  it("reaches a satisfied wait sitting behind more than maxEvaluations unsatisfied ones (#1253 review)", async () => {
+    // 21 unsatisfied live-trigger waits (more than the default 20-evaluation
+    // bound) with the satisfied one behind them. Ids pin the first-pass order
+    // (all stamps NULL -> id tiebreak); later passes order by the rotation
+    // stamp, which is what the NULLS FIRST clause buys.
+    await prisma.prFixQueueItem.createMany({
+      data: Array.from({ length: 21 }, (_, index) => ({
+        id: `a-external-wait-rot-${String(index).padStart(3, "0")}`,
+        repo: REPO,
+        pr: 3000 + index,
+        lane: "NORMAL",
+        reason: "waiting on upstream",
+        status: "WAITING_EXTERNAL" as const,
+        externalWait: waitContract(`org/deps#${index + 1}`),
+      })),
+    });
+    await prisma.prFixQueueItem.create({
+      data: {
+        id: "z-external-wait-rot-target",
+        repo: REPO,
+        pr: 3900,
+        lane: "NORMAL",
+        reason: "waiting on upstream",
+        status: "WAITING_EXTERNAL",
+        externalWait: waitContract(SATISFIED_REF),
+      },
+    });
+
+    const client = asPrFixQueueClient(prisma);
+    const first = await reconcileExternalWaitTriggers(client);
+    // The evaluation bound stopped the pass before the target row.
+    expect(first).toEqual({ evaluated: 20, reactivated: 0 });
+    const afterFirst = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 3900 } } });
+    expect(afterFirst?.status).toBe("WAITING_EXTERNAL");
+
+    // A later pass rotates past the stamped head and reaches it.
+    const second = await reconcileExternalWaitTriggers(client);
+    expect(second.reactivated).toBe(1);
+    const target = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 3900 } } });
+    expect(target?.status).toBe("QUEUED");
+    // Uncharged recheck: no attempt consumed.
+    expect(target?.fixAttempts).toBe(1);
+    expect(target?.generation).toBe(2);
+    expect(parseStoredExternalWait(target?.externalWait)).toBeNull();
+    // Every unsatisfied wait stayed held.
+    const held = await prisma.prFixQueueItem.findMany({ where: { repo: REPO, pr: { gte: 3000, lt: 3900 } } });
+    expect(held).toHaveLength(21);
+    expect(held.every((row) => row.status === "WAITING_EXTERNAL")).toBe(true);
+  });
+
+  it("persists the rotation stamp as a real timestamp column (#1253 review)", async () => {
+    // Existence proof, loud on a missing column: the exact regression class of
+    // "column PrFixQueueItem.triggerEvaluatedAt does not exist" — Prisma
+    // raises on the select/update instead of silently skipping the write.
+    const columns = await prisma.$queryRaw<{ column_name: string }[]>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'PrFixQueueItem' AND column_name = 'triggerEvaluatedAt'`;
+    expect(columns.map((entry) => entry.column_name)).toEqual(["triggerEvaluatedAt"]);
+
+    await prisma.prFixQueueItem.create({
+      data: {
+        id: "y-external-wait-stamp",
+        repo: REPO,
+        pr: 4000,
+        lane: "NORMAL",
+        reason: "waiting on upstream",
+        status: "WAITING_EXTERNAL",
+        externalWait: waitContract("org/deps#1"),
+      },
+    });
+
+    const result = await reconcileExternalWaitTriggers(asPrFixQueueClient(prisma));
+    expect(result.evaluated).toBe(1);
+
+    const row = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 4000 } } });
+    expect(row?.triggerEvaluatedAt).toBeInstanceOf(Date);
+    expect(Number.isNaN(new Date(row?.triggerEvaluatedAt as Date).getTime())).toBe(false);
   });
 });
