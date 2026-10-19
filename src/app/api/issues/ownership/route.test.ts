@@ -44,8 +44,11 @@ const { db, applyListArgs } = vi.hoisted(() => {
           // Postgres: ASC puts NULLs last, DESC puts them first, unless the
           // query overrides it with `nulls`.
           const nulls =
-            (typeof spec === "object" && spec?.nulls) ??
-            (dir === "asc" ? "last" : "first");
+            typeof spec === "object" && spec?.nulls
+              ? spec.nulls
+              : dir === "asc"
+                ? "last"
+                : "first";
           const av = a[field] ?? null;
           const bv = b[field] ?? null;
           if (av === null && bv === null) continue;
@@ -700,6 +703,104 @@ describe("GET /api/issues/ownership — lease scan activity order (#1251 review)
       "issue-old",
     ]);
     expect(body.examined).toBe(1);
+  });
+
+  it("orders the renewed run by renewal time, not by claim time", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-x", number: 1 }),
+      makeIssue({ id: "issue-y", number: 2 }),
+    ];
+    // Both leases were renewed, so their activity is the renewal — and the
+    // claim times sort the other way round, so only a renewal-time order puts
+    // `issue-x` first.
+    db.leases = [
+      makeLease({
+        id: "lease-x",
+        issueId: "issue-x",
+        createdAt: inMin(-10),
+        renewedAt: inMin(-1),
+      }),
+      makeLease({
+        id: "lease-y",
+        issueId: "issue-y",
+        createdAt: inMin(-1),
+        renewedAt: inMin(-10),
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-x",
+      "issue-y",
+    ]);
+  });
+
+  it("orders the never-renewed run by claim time, not by lease id", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-a", number: 1 }),
+      makeIssue({ id: "issue-z", number: 2 }),
+    ];
+    // Both claims were never renewed, so their activity is the claim time —
+    // and the ids sort the OTHER way round, so only a claim-time order puts
+    // `issue-z` first.
+    db.leases = [
+      makeLease({
+        id: "lease-a",
+        issueId: "issue-a",
+        createdAt: inMin(-10),
+        renewedAt: null,
+      }),
+      makeLease({
+        id: "lease-z",
+        issueId: "issue-z",
+        createdAt: inMin(-1),
+        renewedAt: null,
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-z",
+      "issue-a",
+    ]);
+  });
+
+  it("breaks equal-activity ties by ascending lease id in the never-renewed run too", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-z", number: 2 }),
+      makeIssue({ id: "issue-a", number: 1 }),
+    ];
+    // Same claim instant, and the ids sort the opposite way to the insertion
+    // order — so only the query's `id: "asc"` tie-break puts `issue-a` first.
+    db.leases = [
+      makeLease({
+        id: "lease-z",
+        issueId: "issue-z",
+        createdAt: inMin(-1),
+        renewedAt: null,
+      }),
+      makeLease({
+        id: "lease-a",
+        issueId: "issue-a",
+        createdAt: inMin(-1),
+        renewedAt: null,
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-a",
+      "issue-z",
+    ]);
   });
 
   it("breaks equal-activity ties by ascending lease id", async () => {

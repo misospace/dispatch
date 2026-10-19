@@ -39,9 +39,10 @@ interface LeaseScanRow {
 
 /**
  * Effective activity of a lease: its last renewal, or its claim time when it
- * was never renewed. Both renewal paths (`upsertLease` and the ownership
- * capability) stamp `renewedAt`, so this is the row's most recent touch in
- * every case.
+ * was never renewed. The renewal paths (`upsertLease` and the ownership
+ * capability's renew) stamp `renewedAt`; `register` and `disposition` are not
+ * renewals and deliberately leave it alone, so a lease that was only ever
+ * registered falls back to its claim time.
  */
 function leaseActivity(row: LeaseScanRow): number {
   return (row.renewedAt ?? row.createdAt).getTime();
@@ -153,7 +154,9 @@ export async function GET(request: Request) {
   // Each source is read with ONE probe row past the cap and the probe row is
   // dropped before candidates are seeded. Overflow is therefore exact — a
   // length of exactly MAX_CANDIDATE_SCAN + 1 means the source really had more
-  // rows — rather than inferred from a filled-up page.
+  // rows — rather than inferred from a filled-up page. The lease source reads
+  // two runs, so it has two probe rows; both are older than the cap worth of
+  // rows their own run returned, so the merged slice below drops them.
   const SCAN_TAKE = MAX_CANDIDATE_SCAN + 1;
 
   // (a) open issues holding an agent/* label (cached set)
@@ -178,27 +181,27 @@ export async function GET(request: Request) {
   // timestamp — renewed leases by `renewedAt`, never-renewed leases by
   // `createdAt` — and merged below on the same key. `id` breaks ties in both
   // the query and the merge, so equal timestamps cannot reorder between runs.
-  const renewedRows = await prisma.lease.findMany({
-    where: { expiredAt: { gt: now }, renewedAt: { not: null } },
-    select: { id: true, issueId: true, createdAt: true, renewedAt: true },
-    orderBy: [{ renewedAt: "desc" }, { id: "asc" }],
-    take: SCAN_TAKE,
-  });
-  const neverRenewedRows = await prisma.lease.findMany({
-    where: { expiredAt: { gt: now }, renewedAt: null },
-    select: { id: true, issueId: true, createdAt: true, renewedAt: true },
-    orderBy: [{ createdAt: "desc" }, { id: "asc" }],
-    take: SCAN_TAKE,
-  });
+  const [renewedRows, neverRenewedRows] = await Promise.all([
+    prisma.lease.findMany({
+      where: { expiredAt: { gt: now }, renewedAt: { not: null } },
+      select: { id: true, issueId: true, createdAt: true, renewedAt: true },
+      orderBy: [{ renewedAt: "desc" }, { id: "asc" }],
+      take: SCAN_TAKE,
+    }),
+    prisma.lease.findMany({
+      where: { expiredAt: { gt: now }, renewedAt: null },
+      select: { id: true, issueId: true, createdAt: true, renewedAt: true },
+      orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+      take: SCAN_TAKE,
+    }),
+  ]);
   // The merged pool is capped too: each run's probe row is older than the cap
   // worth of rows the run itself returned, so slicing the merged pool drops
-  // exactly the rows the probe rows stand for.
+  // exactly the rows the probe rows stand for. The pool holds every row both
+  // runs returned, so its length above the cap is the exact overflow signal.
   const mergedLeases = mergeLeaseRuns(renewedRows, neverRenewedRows);
   const activeLeased = mergedLeases.slice(0, MAX_CANDIDATE_SCAN);
-  const leasedTruncated =
-    renewedRows.length > MAX_CANDIDATE_SCAN ||
-    neverRenewedRows.length > MAX_CANDIDATE_SCAN ||
-    mergedLeases.length > MAX_CANDIDATE_SCAN;
+  const leasedTruncated = mergedLeases.length > MAX_CANDIDATE_SCAN;
   // (c) issues with an active AgentWork row. `updatedAt` moves on every
   // checkpoint/heartbeat write, so it is the row's most recent activity.
   const workingRows = await prisma.agentWork.findMany({
