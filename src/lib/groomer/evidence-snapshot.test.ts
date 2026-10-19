@@ -296,6 +296,26 @@ describe("collectGroomingEvidenceSnapshot", () => {
     // Comments are still mapped from the provided input.
     expect(snapshot.comments).toHaveLength(4);
   });
+
+  it("strips NUL and C0 controls from captured error warnings while keeping newlines and tabs (dispatch#1214)", async () => {
+    const deps = makeDeps();
+    deps.fetchRepositoryMetadata.mockRejectedValue(
+      new Error("GitHub API 502\u0000 bad\u0001 gateway\nretry \t later\u001B[31m"),
+    );
+    deps.fetchIssue.mockRejectedValue("raw thrown \u0000\u0007 string");
+
+    const snapshot = await collectGroomingEvidenceSnapshot(input, deps);
+
+    expect(snapshot.warnings.length).toBeGreaterThan(0);
+    for (const warning of snapshot.warnings) {
+      expect(warning).not.toMatch(/[\u0000-\u0008\u000B-\u001F]/);
+    }
+    const headWarning = snapshot.warnings.find((warning) => /default-branch head SHA/.test(warning));
+    expect(headWarning).toContain("GitHub API 502 bad gateway\nretry \t later");
+    expect(headWarning).toContain("[31m");
+    const issueWarning = snapshot.warnings.find((warning) => /live issue state/.test(warning));
+    expect(issueWarning).toContain("raw thrown  string");
+  });
 });
 
 describe("addEvidenceSources", () => {

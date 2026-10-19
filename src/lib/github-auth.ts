@@ -1,4 +1,6 @@
 // Internal shared helper, do not re-export from barrel
+import { createPrivateKey } from "node:crypto";
+
 const GITHUB_API = "https://api.github.com";
 
 interface CachedToken {
@@ -9,6 +11,7 @@ interface CachedToken {
 let installationTokenCache: CachedToken | null = null;
 let useGitHubApp = false;
 let appNotConfigured = false;
+let appInitFailed = false;
 let inFlightTokenFetch: Promise<void> | null = null;
 
 function base64urlEncodeArrayBuffer(buffer: ArrayBuffer): string {
@@ -24,12 +27,23 @@ function base64urlEncode(data: string): string {
   return Buffer.from(data).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function pemToArrayBuffer(pem: string): ArrayBuffer {
-  const lines = pem.split("\n").filter((line) => !line.startsWith("-----"));
-  const base64 = lines.join("");
-  const bytes = Buffer.from(base64, "base64");
-  const copy = Buffer.alloc(bytes.length);
-  copy.set(bytes);
+/**
+ * Normalize a PEM private key (PKCS1 "BEGIN RSA PRIVATE KEY" or PKCS8
+ * "BEGIN PRIVATE KEY") to PKCS8 DER, which is the only format
+ * crypto.subtle.importKey accepts. GitHub App keys are generated as PKCS1,
+ * so importing the raw PEM as pkcs8 fails without this step.
+ * Never include key material or raw parser output in error messages.
+ */
+function privateKeyPemToPkcs8Buffer(pem: string): ArrayBuffer {
+  let key;
+  try {
+    key = createPrivateKey({ key: pem, format: "pem" });
+  } catch {
+    throw new Error("GitHub App private key is not a valid PKCS1 or PKCS8 PEM private key");
+  }
+  const der = key.export({ type: "pkcs8", format: "der" });
+  const copy = Buffer.alloc(der.length);
+  copy.set(der);
   return copy.buffer as ArrayBuffer;
 }
 
@@ -45,7 +59,7 @@ async function generateAppJwt(privateKey: string): Promise<string> {
 
   const cryptoKey = await crypto.subtle.importKey(
     "pkcs8",
-    pemToArrayBuffer(privateKey),
+    privateKeyPemToPkcs8Buffer(privateKey),
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"]
@@ -127,7 +141,13 @@ async function ensureInit(): Promise<void> {
 
   try {
     await fetchAndCacheInstallationToken();
+    appInitFailed = false;
   } catch {
+    // Keep retrying on later calls, but remember the failure so getGitHubToken
+    // can report a useful error instead of a misleading missing-GITHUB_TOKEN
+    // when no PAT fallback exists. Error details are intentionally not
+    // retained — they may contain response bodies.
+    appInitFailed = true;
   }
 }
 
@@ -149,6 +169,13 @@ export async function getGitHubToken(): Promise<string> {
 
   const token = process.env.GITHUB_TOKEN;
   if (!token) {
+    if (appInitFailed) {
+      throw new Error(
+        "GitHub App authentication is configured but failed to obtain an installation token. " +
+          "Verify GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and GITHUB_APP_PRIVATE_KEY " +
+          "(PKCS1 and PKCS8 PEM keys are both supported). GITHUB_TOKEN is not set, so there is no fallback."
+      );
+    }
     throw new Error("GITHUB_TOKEN environment variable is not set");
   }
   return token;
@@ -234,6 +261,7 @@ export function __resetGitHubAppState(): void {
   installationTokenCache = null;
   useGitHubApp = false;
   appNotConfigured = false;
+  appInitFailed = false;
   inFlightTokenFetch = null;
 }
 

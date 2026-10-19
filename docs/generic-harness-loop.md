@@ -46,7 +46,9 @@ The report endpoint accepts these outcomes:
 
 ```python
 def worker_heartbeat(agent_name, dispatch_url):
-    auth = {"Authorization": f"Bearer {DISPATCH_AGENT_TOKEN}"}
+    # WORKER_BEARER_TOKEN is this agent's bound worker token, provisioned
+    # through the server's DISPATCH_WORKER_TOKENS map.
+    auth = {"Authorization": f"Bearer {WORKER_BEARER_TOKEN}"}
 
     # Fetch next task (auth required)
     task = get(
@@ -74,7 +76,7 @@ def worker_heartbeat(agent_name, dispatch_url):
     # Stop
 ```
 
-Autonomous workers may authenticate the loop above with `DISPATCH_WORKER_TOKEN` (worker tier); operator and MCP-bridge agents keep the maintainer token (`DISPATCH_AGENT_TOKEN`).
+For these identity-scoped worker endpoints, use a token bound to the agent through the server's `DISPATCH_WORKER_TOKENS` setting. The examples call the client-side secret `WORKER_BEARER_TOKEN`; that is an example variable name, not a server setting. The legacy unbound `DISPATCH_WORKER_TOKEN` receives 403 on these routes, and ordinary worker loops should not use the full-rights maintainer credentials `DISPATCH_AGENT_TOKEN` / `DISPATCH_MAINTAINER_TOKEN`. Use maintainer credentials only for operations that actually require maintainer privileges.
 
 **Optional preflight sync:** Agents may call `POST /api/sync` before fetching their next task to refresh Dispatch's issue cache. This is a best-effort, out-of-band operation — not required for the worker loop and not something agents depend on before every task. Sync failures should be logged as freshness warnings and must not block task execution.
 
@@ -92,10 +94,10 @@ Each example uses the same Dispatch contract. None implies OpenClaw is required.
 
 ```bash
 DISPATCH="https://dispatch.example.com"
-AGENT="saffron"
+AGENT="${AGENT_NAME:?set AGENT_NAME to this worker's bound identity}"
 
 # Idle check (auth required)
-TASK=$(curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+TASK=$(curl -s -H "Authorization: Bearer $WORKER_BEARER_TOKEN" \
   "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
 echo "$TASK" | python3 -c "import sys,json; t=json.load(sys.stdin); sys.exit(0 if t['shouldRun'] else 1)" || exit 0
 
@@ -104,7 +106,7 @@ echo "$TASK" | python3 -c "import sys,json; t=json.load(sys.stdin); sys.exit(0 i
 
 # Report result (auth required)
 curl -s -X POST "$DISPATCH/api/agents/$AGENT/tasks/report" \
-  -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  -H "Authorization: Bearer $WORKER_BEARER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"taskType":"implement","outcome":"pr_opened"}'
 ```
@@ -116,7 +118,7 @@ Configure the scheduler to run a one-shot job per heartbeat:
 ```yaml
 schedule: "*/15 * * * *"
 command: |
-  TASK=$(curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+  TASK=$(curl -s -H "Authorization: Bearer $WORKER_BEARER_TOKEN" \
     "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
   SHOULD_RUN=$(echo "$TASK" | jq -r '.shouldRun')
   [ "$SHOULD_RUN" = "false" ] && exit 0
@@ -136,7 +138,7 @@ Manually invoke the endpoint, read the task, and execute:
 
 ```bash
 # One-shot: fetch task, feed to model, report (auth required)
-TASK=$(curl -s -H "Authorization: Bearer $DISPATCH_AGENT_TOKEN" \
+TASK=$(curl -s -H "Authorization: Bearer $WORKER_BEARER_TOKEN" \
   "$DISPATCH/api/agents/$AGENT/next-task?lane=normal")
 echo "$TASK" | codex --one-shot
 # Report outcome after execution
