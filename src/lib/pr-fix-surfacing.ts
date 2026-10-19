@@ -32,6 +32,13 @@ export interface PrFixSurfaceContext {
   failingRunLinks?: string[];
   /** Summary/context from the last attempt, when any data is available. */
   lastAttemptSummary?: string | null;
+  /**
+   * #1253: fresh actionable evidence arrived while the item sat in a
+   * disposition evidence must not override (BLOCKED human decision,
+   * cap-exhausted or fail-closed PARKED). Surfaced for operators; the flag
+   * never reopens anything by itself.
+   */
+  staleDisposition?: boolean;
   /** Retained for back-compat; do NOT render it as "attempts" (#1218). */
   totalAttempts?: number | null;
 }
@@ -158,6 +165,13 @@ export function buildNeedsHumanComment(input: SurfacePrFixBlockedInput): string 
     lines.push("", `**Last attempt:** ${context.lastAttemptSummary}`);
   }
 
+  if (context.staleDisposition) {
+    lines.push(
+      "",
+      "**Note:** Fresh actionable feedback arrived after this disposition was recorded; it did not reopen the item (#1253).",
+    );
+  }
+
   lines.push(...formatDecision(input.decision));
 
   if (input.latestNote) {
@@ -217,6 +231,13 @@ export function buildParkedComment(input: SurfacePrFixParkedInput): string {
 
   if (context.lastAttemptSummary) {
     lines.push("", `**Last attempt:** ${context.lastAttemptSummary}`);
+  }
+
+  if (context.staleDisposition) {
+    lines.push(
+      "",
+      "**Note:** Fresh actionable feedback arrived after this disposition was recorded; it did not reopen the item (#1253).",
+    );
   }
 
   if (input.latestNote) {
