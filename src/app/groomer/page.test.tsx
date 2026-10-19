@@ -54,6 +54,7 @@ function appliedView(overrides: Record<string, unknown> = {}): Record<string, un
       relatedWorkCount: 1,
       humanCommentCount: 2,
       automationCommentCount: 1,
+      sources: [],
       warnings: [],
     },
     plan: { schemaVersion: 1, format: "grooming-plan", actionability: "ready", ready: true, admission: "implementation", summary: "Ready" },
@@ -111,11 +112,13 @@ describe("Hosted Groomer history page", () => {
               baseRun({
                 view: appliedView({
                   decision: {
-                    close: { reason: "already_done", rationale: "verified at pinned head", evidenceRefs: ["repo:src/a.ts"] },
+                    close: { reason: "already_done", rationale: "verified at pinned head", confidence: "high", evidenceRefs: ["repo:src/a.ts"] },
                     readyPromotion: null,
                     decomposition: {
                       required: true,
                       reason: "parent audit",
+                      confidence: null,
+                      evidenceRefs: [],
                       childrenCreated: [{ number: 1300, url: "https://github.com/org/repo/issues/1300" }],
                       childrenReused: [],
                     },
@@ -141,6 +144,7 @@ describe("Hosted Groomer history page", () => {
     expect(panel).toHaveTextContent("automation");
     expect(panel).toHaveTextContent("non-authoritative");
     expect(panel).toHaveTextContent("Close as already_done");
+    expect(panel).toHaveTextContent("confidence: high");
     expect(panel).toHaveTextContent("verified at pinned head");
     expect(panel).toHaveTextContent("evidence: repo:src/a.ts");
     expect(panel).toHaveTextContent("Decomposition: parent audit");
@@ -259,6 +263,7 @@ describe("Hosted Groomer history page", () => {
                     relatedWorkCount: 0,
                     humanCommentCount: 0,
                     automationCommentCount: 0,
+                    sources: [],
                     warnings: [],
                   },
                   plan: { schemaVersion: null, format: "legacy", actionability: "ready", ready: null, admission: null, summary: "legacy" },
@@ -277,5 +282,63 @@ describe("Hosted Groomer history page", () => {
 
     const panel = await screen.findByTestId("run-evidence-panel");
     expect(panel).toHaveTextContent("No evidence snapshot was captured for this run (legacy run).");
+  });
+
+  it("lists evidence source identities and shows unknown confidence when unverifiable", async () => {
+    mockAuthedFetch.mockImplementation((url: string) => {
+      if (String(url).includes("/api/groomer/runs")) {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve([
+              baseRun({
+                view: appliedView({
+                  evidence: {
+                    ...(appliedView().evidence as Record<string, unknown>),
+                    repositoryReadCount: 1,
+                    repositorySurfacedCount: 1,
+                    relatedWorkCount: 1,
+                    sources: [
+                      { kind: "repository", path: "src/pinned.ts", via: "read", ref: HEAD_SHA },
+                      { kind: "repository", path: "src/surfaced.ts", via: "surfaced", ref: null },
+                      {
+                        kind: "github_pull_request",
+                        key: "github:pr:org/repo#12",
+                        state: "merged",
+                        url: "https://github.com/org/repo/pull/12",
+                        via: "read",
+                        observedAt: "2026-10-10T00:00:00.000Z",
+                        closes: ["owner/repo#7"],
+                      },
+                    ],
+                  },
+                  decision: {
+                    close: { reason: "already_done", rationale: "legacy close", confidence: null, evidenceRefs: ["repo:src/a.ts"] },
+                    readyPromotion: null,
+                    decomposition: null,
+                  },
+                }),
+              }),
+            ]),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+    });
+
+    render(<GroomerHistoryPage />);
+
+    const row = await screen.findByText(/org\/repo#42/);
+    fireEvent.click(row);
+
+    const panel = await screen.findByTestId("run-evidence-panel");
+    expect(panel).toHaveTextContent("src/pinned.ts");
+    expect(panel).toHaveTextContent("read at " + HEAD_SHA.slice(0, 12));
+    expect(panel).toHaveTextContent("src/surfaced.ts");
+    expect(panel).toHaveTextContent("surfaced, unpinned");
+    const prLink = panel.querySelector('a[href="https://github.com/org/repo/pull/12"]');
+    expect(prLink).not.toBeNull();
+    expect(prLink).toHaveTextContent("github:pr:org/repo#12");
+    expect(panel).toHaveTextContent("pull_request, merged, read");
+    expect(panel).toHaveTextContent("confidence: unknown");
   });
 });

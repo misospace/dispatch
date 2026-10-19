@@ -18,6 +18,37 @@ import { summarizeGroomingOutput } from "./plan-summary";
 
 type Obj = Record<string, unknown>;
 
+/**
+ * Bounded identity of one persisted evidence source. Repository sources
+ * carry the path that was read (never its contents); related-work sources
+ * carry the forge key/state/url observed. Nothing here carries bodies,
+ * raw model output or file contents.
+ */
+export interface GroomingRunRepositorySourceView {
+  kind: "repository";
+  path: string | null;
+  /** "read" = fetched at the pinned ref; "surfaced" = code-search/model hit, never pinned. */
+  via: string | null;
+  /** Pinned head SHA the read happened at, or null when surfaced/unpinned. */
+  ref: string | null;
+}
+
+export interface GroomingRunRelatedWorkSourceView {
+  kind: "github_issue" | "github_pull_request" | "github_commit";
+  /** Stable identity, e.g. "github:pr:org/repo#12". */
+  key: string | null;
+  state: string | null;
+  url: string | null;
+  /** "read" = direct read; "search" = search-index hit (may lag). */
+  via: string | null;
+  observedAt: string | null;
+  closes: string[];
+}
+
+export type GroomingRunEvidenceSourceView =
+  | GroomingRunRepositorySourceView
+  | GroomingRunRelatedWorkSourceView;
+
 export interface GroomingRunEvidenceView {
   available: boolean;
   capturedAt: string | null;
@@ -33,6 +64,7 @@ export interface GroomingRunEvidenceView {
   relatedWorkCount: number;
   humanCommentCount: number;
   automationCommentCount: number;
+  sources: GroomingRunEvidenceSourceView[];
   warnings: string[];
 }
 
@@ -64,16 +96,24 @@ export interface GroomingRunApplicationView {
 }
 
 export interface GroomingRunDecisionView {
-  close: { reason: string; rationale: string; evidenceRefs: string[] } | null;
+  close: {
+    reason: string;
+    rationale: string;
+    confidence: string | null;
+    evidenceRefs: string[];
+  } | null;
   readyPromotion: {
     ready: boolean;
     admission: string | null;
+    confidence: string | null;
     evidenceRefs: string[];
     reasons: string[];
   } | null;
   decomposition: {
     required: boolean;
     reason: string | null;
+    confidence: string | null;
+    evidenceRefs: string[];
     childrenCreated: Array<{ number: number; url: string | null }>;
     childrenReused: Array<{ number: number; url: string | null }>;
   } | null;
@@ -94,6 +134,7 @@ const MAX_EVIDENCE_REFS = 20;
 const MAX_WARNINGS = 20;
 const MAX_TEXT = 400;
 const MAX_REF = 120;
+const CONFIDENCE_VALUES: ReadonlySet<string> = new Set(["high", "medium", "low"]);
 
 function isObj(value: unknown): value is Obj {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -101,6 +142,28 @@ function isObj(value: unknown): value is Obj {
 
 function str(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+/**
+ * Accept a Prisma `Date` or an ISO string and normalize to a JSON-safe ISO
+ * string. Detail queries return real `Date` objects, not strings.
+ */
+function dateStr(value: unknown): string | null {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  return null;
+}
+
+/** Verdict confidence when it is one of the plan-contract values; null (unknown) otherwise. */
+function verdictConfidence(validatedOutput: unknown): string | null {
+  if (!isObj(validatedOutput) || !isObj(validatedOutput.verdict)) return null;
+  const confidence = str(validatedOutput.verdict.confidence);
+  return confidence !== null && CONFIDENCE_VALUES.has(confidence) ? confidence : null;
 }
 
 function clip(value: unknown, max: number): string | null {
@@ -150,8 +213,37 @@ const EMPTY_EVIDENCE: GroomingRunEvidenceView = {
   relatedWorkCount: 0,
   humanCommentCount: 0,
   automationCommentCount: 0,
+  sources: [],
   warnings: [],
 };
+
+const RELATED_WORK_KINDS: ReadonlySet<string> = new Set([
+  "github_issue",
+  "github_pull_request",
+  "github_commit",
+]);
+
+function evidenceSourceView(source: Obj): GroomingRunEvidenceSourceView | null {
+  if (source.provenance === "repository") {
+    return {
+      kind: "repository",
+      path: clip(source.path, MAX_REF),
+      via: str(source.via),
+      ref: str(source.ref),
+    };
+  }
+  const kind = str(source.provenance);
+  if (kind === null || !RELATED_WORK_KINDS.has(kind)) return null;
+  return {
+    kind: kind as GroomingRunRelatedWorkSourceView["kind"],
+    key: clip(source.key, MAX_REF),
+    state: str(source.state),
+    url: clip(source.url, MAX_REF),
+    via: str(source.via),
+    observedAt: dateStr(source.observedAt),
+    closes: strArray(source.closes, MAX_EVIDENCE_REFS).map((entry) => clip(entry, MAX_REF) ?? entry),
+  };
+}
 
 function evidenceView(contextSummary: unknown): GroomingRunEvidenceView {
   const evidence = isObj(contextSummary) ? contextSummary.evidence : null;
@@ -164,13 +256,19 @@ function evidenceView(contextSummary: unknown): GroomingRunEvidenceView {
     if (source.provenance === "repository") {
       if (source.via === "read") repositoryReadCount += 1;
       else repositorySurfacedCount += 1;
-    } else {
+    } else if (typeof source.provenance === "string" && RELATED_WORK_KINDS.has(source.provenance)) {
       relatedWorkCount += 1;
     }
   }
+  const sourceViews: GroomingRunEvidenceSourceView[] = [];
+  for (const source of sources) {
+    if (sourceViews.length >= MAX_EVIDENCE_REFS) break;
+    const view = evidenceSourceView(source);
+    if (view !== null) sourceViews.push(view);
+  }
   return {
     available: true,
-    capturedAt: str(evidence.capturedAt),
+    capturedAt: dateStr(evidence.capturedAt),
     headSha: str(evidence.headSha),
     pinnedRef: str(evidence.pinnedRef),
     defaultBranch: str(evidence.defaultBranch),
@@ -182,6 +280,7 @@ function evidenceView(contextSummary: unknown): GroomingRunEvidenceView {
     relatedWorkCount,
     humanCommentCount: typeof evidence.humanCommentCount === "number" ? evidence.humanCommentCount : 0,
     automationCommentCount: typeof evidence.automationCommentCount === "number" ? evidence.automationCommentCount : 0,
+    sources: sourceViews,
     warnings: strArray(evidence.warnings, MAX_WARNINGS),
   };
 }
@@ -224,7 +323,7 @@ function applicationView(
   const countFromRows = applications.length > 0 ? applications.length : null;
   let lastApplicationAt: string | null = null;
   for (const application of applications) {
-    const createdAt = str(application.createdAt);
+    const createdAt = dateStr(application.createdAt);
     if (createdAt && (!lastApplicationAt || createdAt > lastApplicationAt)) lastApplicationAt = createdAt;
   }
   return {
@@ -251,6 +350,7 @@ function closeDecision(mutationPlan: Obj | null, validatedOutput: unknown): Groo
   return {
     reason,
     rationale: clip(source.rationale, MAX_TEXT) ?? "",
+    confidence: verdictConfidence(validatedOutput),
     evidenceRefs: refArray(source.evidenceRefs),
   };
 }
@@ -263,6 +363,7 @@ function readyPromotionDecision(validatedOutput: unknown): GroomingRunDecisionVi
   return {
     ready: true,
     admission: str(readiness.admission),
+    confidence: verdictConfidence(validatedOutput),
     evidenceRefs: refArray(verdict.evidenceRefs),
     reasons: strArray(readiness.reasons, MAX_EVIDENCE_REFS),
   };
@@ -281,9 +382,12 @@ function decompositionDecision(
   const childrenCreated = isObj(appliedMutations) ? childLinks(appliedMutations.childrenCreated) : [];
   const childrenReused = isObj(appliedMutations) ? childLinks(appliedMutations.childrenReused) : [];
   if (!required && childrenCreated.length === 0 && childrenReused.length === 0) return null;
+  const verdict = isObj(validatedOutput) && isObj(validatedOutput.verdict) ? validatedOutput.verdict : {};
   return {
     required,
     reason: outputDecomposition !== null ? clip(outputDecomposition.reason, MAX_TEXT) : null,
+    confidence: verdictConfidence(validatedOutput),
+    evidenceRefs: refArray(verdict.evidenceRefs),
     childrenCreated,
     childrenReused,
   };

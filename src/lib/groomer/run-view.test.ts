@@ -115,6 +115,18 @@ describe("buildGroomingRunView", () => {
     expect(view.evidence.relatedWorkCount).toBe(1);
     expect(view.evidence.humanCommentCount).toBe(2);
     expect(view.evidence.automationCommentCount).toBe(1);
+    expect(view.evidence.sources).toEqual([
+      { kind: "repository", path: "src/a.ts", via: "read", ref: HEAD },
+      {
+        kind: "github_pull_request",
+        key: "github:pr:org/repo#12",
+        state: "open",
+        url: "https://github.com/org/repo/pull/12",
+        via: "read",
+        observedAt: "2026-10-10T00:00:00.000Z",
+        closes: [],
+      },
+    ]);
 
     expect(view.plan.schemaVersion).toBe(1);
     expect(view.plan.format).toBe("grooming-plan");
@@ -140,6 +152,7 @@ describe("buildGroomingRunView", () => {
     expect(view.decision.close).toBeNull();
     expect(view.decision.readyPromotion).not.toBeNull();
     expect(view.decision.readyPromotion?.admission).toBe("implementation");
+    expect(view.decision.readyPromotion?.confidence).toBe("high");
     expect(view.decision.readyPromotion?.evidenceRefs).toEqual(["issue", "repo:src/a.ts"]);
     expect(view.decision.decomposition).toBeNull();
   });
@@ -178,6 +191,7 @@ describe("buildGroomingRunView", () => {
     expect(view.decision.close).toEqual({
       reason: "already_done",
       rationale: "Acceptance criteria verified at pinned head",
+      confidence: null,
       evidenceRefs: ["repo:src/a.ts"],
     });
     expect(view.decision.readyPromotion).toBeNull();
@@ -210,6 +224,8 @@ describe("buildGroomingRunView", () => {
     expect(view.decision.decomposition).toEqual({
       required: true,
       reason: "parent audit issue needs splitting",
+      confidence: null,
+      evidenceRefs: [],
       childrenCreated: [
         { number: 1300, url: "https://github.com/org/repo/issues/1300" },
         { number: 1301, url: "https://github.com/org/repo/issues/1301" },
@@ -278,6 +294,178 @@ describe("buildGroomingRunView", () => {
     expect(view.application.lastApplicationAt).toBe("2026-10-09T00:00:00.000Z");
   });
 
+  it("surfaces decision confidence for close, ready and decomposition, unknown for legacy", () => {
+    const verdict = {
+      actionability: "already_done",
+      summary: "done",
+      confidence: "high",
+      evidenceRefs: ["issue", "repo:src/a.ts"],
+    };
+
+    const closeRun = appliedPlanRun({
+      validatedOutput: {
+        schemaVersion: 1,
+        verdict,
+        readiness: { ready: false, admission: null, lane: "backlog", evidenceDigest: DIGEST, reasons: ["already_done"] },
+        mutations: {
+          close: { reason: "already_done", rationale: "done", evidenceRefs: ["repo:src/a.ts"], criteria: [] },
+        },
+        decomposition: { required: false, reason: null, childBriefs: [] },
+      },
+      mutationPlan: {
+        planSchemaVersion: 1,
+        evidenceDigest: DIGEST,
+        closeRecommendation: { reason: "already_done", rationale: "done", evidenceRefs: ["repo:src/a.ts"] },
+        willCreateChildren: false,
+        applicationKey: "app-key-close",
+      },
+      applyOutcome: "applied",
+    });
+    const closeView = buildGroomingRunView(closeRun);
+    expect(closeView.decision.close?.confidence).toBe("high");
+    expect(closeView.decision.readyPromotion).toBeNull();
+    expect(closeView.decision.decomposition).toBeNull();
+
+    const readyRun = appliedPlanRun({
+      validatedOutput: {
+        schemaVersion: 1,
+        verdict: { ...verdict, actionability: "ready", confidence: "medium" },
+        readiness: { ready: true, admission: "implementation", lane: "local", evidenceDigest: DIGEST, reasons: [] },
+        mutations: { close: null },
+        decomposition: { required: false, reason: null, childBriefs: [] },
+      },
+    });
+    expect(buildGroomingRunView(readyRun).decision.readyPromotion?.confidence).toBe("medium");
+
+    const decomposeRun = appliedPlanRun({
+      mutationPlan: {
+        planSchemaVersion: 1,
+        willCreateChildren: true,
+        applicationKey: "app-key-decomp",
+      },
+      validatedOutput: {
+        schemaVersion: 1,
+        verdict: { ...verdict, actionability: "backlog", confidence: "low" },
+        decomposition: { required: true, reason: "umbrella", childBriefs: [] },
+      },
+      appliedMutations: {
+        outcome: "applied",
+        steps: {},
+        childrenCreated: [{ number: 1300, url: "https://github.com/org/repo/issues/1300" }],
+        childrenReused: [],
+      },
+    });
+    const decomposeView = buildGroomingRunView(decomposeRun);
+    expect(decomposeView.decision.decomposition?.confidence).toBe("low");
+    expect(decomposeView.decision.decomposition?.evidenceRefs).toEqual(["issue", "repo:src/a.ts"]);
+
+    // Unknown: verdict carries an out-of-contract value (degraded/legacy output).
+    const unknownRun = appliedPlanRun({
+      validatedOutput: {
+        schemaVersion: 1,
+        verdict: { actionability: "ready", summary: "x", confidence: "certain", evidenceRefs: ["issue"] },
+        readiness: { ready: true, admission: "implementation", lane: "local", evidenceDigest: DIGEST, reasons: [] },
+        mutations: { close: null },
+        decomposition: { required: false, reason: null, childBriefs: [] },
+      },
+    });
+    expect(buildGroomingRunView(unknownRun).decision.readyPromotion?.confidence).toBeNull();
+
+    // Unknown: no verdict at all (legacy shape) but a persisted plan decision.
+    const legacyCloseRun = appliedPlanRun({
+      validatedOutput: { actionability: "already_done", summary: "legacy" },
+      mutationPlan: {
+        planSchemaVersion: 1,
+        evidenceDigest: DIGEST,
+        closeRecommendation: { reason: "already_done", rationale: "legacy close", evidenceRefs: ["repo:src/a.ts"] },
+        willCreateChildren: false,
+        applicationKey: "app-key-legacy-close",
+      },
+      applyOutcome: "applied",
+    });
+    expect(buildGroomingRunView(legacyCloseRun).decision.close?.confidence).toBeNull();
+  });
+
+  it("preserves bounded source identities with attribution", () => {
+    const run = appliedPlanRun({
+      contextSummary: evidenceSummary({
+        sources: [
+          { path: "src/pinned.ts", provenance: "repository", via: "read", ref: HEAD },
+          { path: "src/surfaced.ts", provenance: "repository", via: "surfaced", ref: null },
+          {
+            key: "github:pr:org/repo#12",
+            provenance: "github_pull_request",
+            state: "merged",
+            url: "https://github.com/org/repo/pull/12",
+            via: "read",
+            observedAt: "2026-10-10T00:00:00.000Z",
+            ref: null,
+            closes: ["owner/repo#7", "owner/repo#8"],
+          },
+          { key: "github:issue:org/repo#3", provenance: "github_issue", state: "open", url: null, via: "search", observedAt: "2026-10-10T01:00:00.000Z", ref: null },
+        ],
+      }),
+    });
+
+    const view = buildGroomingRunView(run);
+    expect(view.evidence.sources).toEqual([
+      { kind: "repository", path: "src/pinned.ts", via: "read", ref: HEAD },
+      { kind: "repository", path: "src/surfaced.ts", via: "surfaced", ref: null },
+      {
+        kind: "github_pull_request",
+        key: "github:pr:org/repo#12",
+        state: "merged",
+        url: "https://github.com/org/repo/pull/12",
+        via: "read",
+        observedAt: "2026-10-10T00:00:00.000Z",
+        closes: ["owner/repo#7", "owner/repo#8"],
+      },
+      {
+        kind: "github_issue",
+        key: "github:issue:org/repo#3",
+        state: "open",
+        url: null,
+        via: "search",
+        observedAt: "2026-10-10T01:00:00.000Z",
+        closes: [],
+      },
+    ]);
+  });
+
+  it("bounds the source list and drops unknown provenance shapes", () => {
+    const run = appliedPlanRun({
+      contextSummary: evidenceSummary({
+        sources: [
+          ...Array.from({ length: 15 }, (_, i) => ({ path: `src/f${i}.ts`, provenance: "repository", via: "read", ref: HEAD })),
+          ...Array.from({ length: 10 }, (_, i) => ({ key: `github:issue:${i}`, provenance: "github_issue", state: "open", url: null, via: "search", observedAt: "2026-10-10T00:00:00.000Z", ref: null })),
+          { provenance: "mystery", data: "whatever" },
+          "not-an-object",
+        ],
+      }),
+    });
+
+    const view = buildGroomingRunView(run);
+    expect(view.evidence.sources).toHaveLength(20);
+    expect(view.evidence.sources.every((source) => source.kind !== ("mystery" as never))).toBe(true);
+    expect(view.evidence.repositoryReadCount).toBe(15);
+    expect(view.evidence.relatedWorkCount).toBe(10);
+  });
+
+  it("normalizes Prisma Date application timestamps to JSON-safe ISO strings", () => {
+    const run = appliedPlanRun({
+      status: "completed",
+      applyOutcome: "applied",
+      _count: { applications: 2 },
+      applications: [
+        { id: "app-1", status: "applied", attempts: 1, createdAt: new Date("2026-10-09T00:00:00.000Z"), updatedAt: new Date("2026-10-09T00:00:00.000Z") },
+        { id: "app-2", status: "applied", attempts: 1, createdAt: new Date("2026-10-08T00:00:00.000Z"), updatedAt: new Date("2026-10-08T00:00:00.000Z") },
+      ],
+    });
+
+    const view = buildGroomingRunView(run);
+    expect(view.application.lastApplicationAt).toBe("2026-10-09T00:00:00.000Z");
+  });
+
   it("degrades a legacy run without evidence or plan JSON", () => {
     const view = buildGroomingRunView({
       id: "run-legacy",
@@ -290,6 +478,7 @@ describe("buildGroomingRunView", () => {
     expect(view.evidence.available).toBe(false);
     expect(view.evidence.pinned).toBe(false);
     expect(view.evidence.warnings).toEqual([]);
+    expect(view.evidence.sources).toEqual([]);
     expect(view.plan.format).toBe("legacy");
     expect(view.plan.actionability).toBe("ready");
     expect(view.plan.schemaVersion).toBeNull();
@@ -336,6 +525,8 @@ describe("buildGroomingRunView", () => {
     expect(json).not.toContain("comment body text");
     expect(json).not.toContain("proposed body text");
     expect(json).not.toContain("full file contents");
+    // The source identity survives (bounded redaction), but its content does not.
+    expect(view.evidence.sources).toEqual([{ kind: "repository", path: "src/a.ts", via: "read", ref: HEAD }]);
   });
 
   it("clips and bounds oversized strings and arrays", () => {
@@ -355,6 +546,7 @@ describe("buildGroomingRunView", () => {
 
     const view = buildGroomingRunView(run);
     expect(view.evidence.warnings).toHaveLength(20);
+    expect(view.evidence.sources).toHaveLength(20);
     expect(view.evidence.repositoryReadCount).toBe(10);
     expect(view.evidence.relatedWorkCount).toBe(10);
     expect(view.decision.close?.rationale.length).toBeLessThanOrEqual(400);

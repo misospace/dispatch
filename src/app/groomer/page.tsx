@@ -107,6 +107,36 @@ function RunEvidencePanel({ run }: { run: GroomingRunRow }) {
               Sources: {evidence.repositoryReadCount} read at the pinned revision, {evidence.repositorySurfacedCount} surfaced
               (unpinned), {evidence.relatedWorkCount} GitHub issue/PR/commit refs
             </div>
+            {evidence.sources.length > 0 && (
+              <ul className="list-disc pl-4">
+                {evidence.sources.map((source, index) => {
+                  if (source.kind === "repository") {
+                    return (
+                      <li key={`src-${index}`} className="font-mono">
+                        {source.path ?? "unknown path"}{" "}
+                        <span className="text-muted-foreground">
+                          ({source.via === "surfaced" ? "surfaced, unpinned" : source.via === "read" ? `read at ${short(source.ref, 12)}` : "unknown provenance"})
+                        </span>
+                      </li>
+                    );
+                  }
+                  return (
+                    <li key={`src-${index}`} className="font-mono">
+                      {source.url ? (
+                        <a href={source.url} target="_blank" rel="noopener noreferrer" className="hover:underline">{source.key ?? source.url}</a>
+                      ) : (
+                        source.key ?? "unknown ref"
+                      )}{" "}
+                      <span className="text-muted-foreground">
+                        ({source.kind.replace(/^github_/, "")}
+                        {source.state ? `, ${source.state}` : ""}
+                        {source.via ? `, ${source.via}` : ""})
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
             <div>
               Comments: {evidence.humanCommentCount} human (authoritative),{" "}
               {evidence.automationCommentCount} automation (<span className="text-amber-700">non-authoritative</span>)
@@ -195,6 +225,7 @@ function RunEvidencePanel({ run }: { run: GroomingRunRow }) {
             <div className="flex items-center gap-1">
               <ShieldAlert className="h-3.5 w-3.5 text-red-600" />
               Close as <span className="font-medium">{decision.close.reason}</span>
+              <span className="text-muted-foreground">(confidence: {decision.close.confidence ?? "unknown"})</span>
             </div>
             {decision.close.rationale && <div className="text-muted-foreground">{decision.close.rationale}</div>}
             {decision.close.evidenceRefs.length > 0 && (
@@ -207,6 +238,7 @@ function RunEvidencePanel({ run }: { run: GroomingRunRow }) {
             <div className="flex items-center gap-1">
               <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
               Ready promotion{decision.readyPromotion.admission ? ` (${decision.readyPromotion.admission})` : ""}
+              <span className="text-muted-foreground">(confidence: {decision.readyPromotion.confidence ?? "unknown"})</span>
             </div>
             {decision.readyPromotion.evidenceRefs.length > 0 && (
               <div className="font-mono text-muted-foreground">evidence: {decision.readyPromotion.evidenceRefs.join(", ")}</div>
@@ -218,7 +250,11 @@ function RunEvidencePanel({ run }: { run: GroomingRunRow }) {
             <div className="flex items-center gap-1">
               <Link2 className="h-3.5 w-3.5 text-blue-600" />
               Decomposition{decision.decomposition.reason ? `: ${decision.decomposition.reason}` : ""}
+              <span className="text-muted-foreground">(confidence: {decision.decomposition.confidence ?? "unknown"})</span>
             </div>
+            {decision.decomposition.evidenceRefs.length > 0 && (
+              <div className="font-mono text-muted-foreground">evidence: {decision.decomposition.evidenceRefs.join(", ")}</div>
+            )}
             {decision.decomposition.childrenCreated.length > 0 && (
               <div>
                 Created:{" "}
