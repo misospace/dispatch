@@ -13,7 +13,8 @@ import {
   normalizeEvidenceContentSignature,
   type PrFixEvidenceKind,
 } from "./pr-fix-evidence";
-import { parseExternalWaitInput, parseStoredExternalWait, type ExternalWaitContract } from "./pr-fix-external-wait";
+import { parseExternalWaitInput, parseStoredExternalWait, evaluateExternalWaitTrigger, type ExternalWaitContract } from "./pr-fix-external-wait";
+import { evaluateRecovery, recoveryCooldownMs, type RecoveryDecision } from "./pr-fix-recovery";
 
 export type PrFixQueueClient = {
   issue: {
@@ -671,9 +672,14 @@ function laneLabel(lane: string | null | undefined): string {
  */
 export async function buildPrFixBlockedContext(
   client: PrFixQueueClient,
-  item: { repo: string; pr: number; feedback?: string[] | null; fixAttempts?: number | null },
+  item: { repo: string; pr: number; feedback?: string[] | null; fixAttempts?: number | null; staleDisposition?: boolean | null },
 ): Promise<import("./pr-fix-surfacing").PrFixSurfaceContext> {
   const context: import("./pr-fix-surfacing").PrFixSurfaceContext = {};
+
+  // #1253: surface the stale-disposition flag when it is set — fresh
+  // actionable evidence arrived while the item sat in a hold evidence must
+  // not override. Read-only hint; never reopens anything.
+  if (item.staleDisposition === true) context.staleDisposition = true;
 
   const feedback = Array.isArray(item.feedback) ? item.feedback : [];
 
@@ -789,9 +795,10 @@ const EXTERNAL_WAIT_REACTIVATION_BATCH = 100;
 // Per-sweep scan bound (#1250 review): the query already excludes legacy
 // (SQL NULL) contracts at the database level, so in-memory skips only defend
 // against rows whose stored JSON no longer validates — a shape writers can
-// no longer produce. Pagination past skipped rows is deterministic (id
-// cursor) and stops after this many scanned rows so pathological garbage
-// rows can stall discovery but never turn the sweep unbounded.
+// no longer produce. The scan stops after this many read rows so
+// pathological garbage rows can stall discovery but never turn the sweep
+// unbounded; which rows land inside the bound is decided by the fairness
+// order in `reconcileExternalWaitTriggers`, not by id position.
 const EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT = 500;
 
 async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): Promise<void> {
@@ -829,6 +836,133 @@ async function reactivateDueExternalWaits(client: PrFixQueueClient, now: Date): 
     }
     if (due.length < EXTERNAL_WAIT_REACTIVATION_BATCH) break;
   }
+}
+
+// External-wait triggers with a LIVE predicate (#1253, row 12): the
+// evaluator can actually verify these against the forge.
+// `cooldown_recheck` recovers via `retryAt` (reactivateDueExternalWaits)
+// and `service_ready` is inherently unverifiable — neither belongs here.
+const LIVE_EXTERNAL_WAIT_TRIGGERS = new Set(["merged", "closed", "check_success"]);
+
+/**
+ * Bounded periodic reconciliation of structured external waits (#1253,
+ * row 12): evaluate each WAITING_EXTERNAL row whose recorded recovery
+ * trigger has a live predicate (`merged` / `closed` / `check_success`) and,
+ * when the dependency now SATISFIES the predicate, run the same
+ * generation-pinned, UNCHARGED reactivation write
+ * `reactivateDueExternalWaits` performs (a resolved dependency is a recheck
+ * of the prerequisite, not new work — no attempt is consumed; the cap still
+ * applies to the recheck when it runs).
+ *
+ * Bounds: one read of at most `EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT` rows
+ * (shared with `reactivateDueExternalWaits`) plus `maxEvaluations`
+ * (default 20) — each evaluation is a network read through the forge, so a
+ * backlog of waiting rows must never turn this pass into an unbounded
+ * fan-out. "unsatisfied" and "unknown" (including any fetch failure, which
+ * `evaluateExternalWaitTrigger` already resolves to "unknown") mutate
+ * nothing and are never retried here — the next pass re-evaluates.
+ *
+ * Fairness (#1253 review): the read is NOT ordered by id from a per-process
+ * cursor, which let the first `maxEvaluations` unsatisfied waits be re-read
+ * every pass while later waits were never reached. Rows are ordered
+ * least-recently-considered first — explicitly `nulls: "first"`, because the
+ * Postgres default for ASC is NULLS LAST and would otherwise rank the newest
+ * stamps first — then `id` as the deterministic tiebreak — and EVERY row the
+ * pass considered — evaluated, unparseable, or non-live — is stamped in one
+ * bulk write at the end of the pass, so the head of the order rotates and no
+ * wait can starve behind an earlier unsatisfied or invalid row. Rows the
+ * `maxEvaluations` forge-read bound cut off before the pass examined them stay
+ * unstamped and therefore lead the next one: each pass advances a bounded
+ * slice of the backlog instead of re-reading the same head.
+ *
+ * Returns counts for logging/audit. Never throws for a per-row failure
+ * shape the evaluator swallows; unexpected client errors propagate to the
+ * caller, which treats this pass as best-effort.
+ */
+export async function reconcileExternalWaitTriggers(
+  client: PrFixQueueClient,
+  options: { maxEvaluations?: number } = {},
+): Promise<{ evaluated: number; reactivated: number }> {
+  const maxEvaluations = options.maxEvaluations ?? 20;
+  let evaluated = 0;
+  let reactivated = 0;
+  const considered: string[] = [];
+  // Fair eligibility (#1253 review): least-recently-considered first, never-
+// considered (NULL) rows leading. `nulls: "first"` is REQUIRED, not cosmetic:
+  // Postgres treats NULL as larger than every non-null value, so the default
+  // for ASC is NULLS LAST and a bare `triggerEvaluatedAt: "asc"` would order
+  // the most recently stamped rows first — pinning the head and starving later
+  // waits. `id` only breaks ties. No in-process cursor exists to reset between
+  // passes.
+  const rows: any[] = await client.prFixQueueItem.findMany({
+    where: { status: "WAITING_EXTERNAL", externalWait: { not: Prisma.DbNull } },
+    orderBy: [{ triggerEvaluatedAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
+    take: EXTERNAL_WAIT_REACTIVATION_SCAN_LIMIT,
+  });
+  for (const row of rows) {
+    if (evaluated >= maxEvaluations) break;
+    // Reached by this pass: examined and about to be either evaluated or
+    // skipped in memory. Both count as considered (the stamp rotates them out
+    // of the head alike) — only rows the forge-read bound cut off before this
+    // point stay unstamped, so they lead the next pass.
+    considered.push(row.id);
+    if (row.status !== "WAITING_EXTERNAL") continue;
+    // A stored contract that no longer validates is a legacy wait: held
+    // for operator action, never evaluated or auto-requeued (#1250).
+    const wait = parseStoredExternalWait(row.externalWait);
+    if (!wait) continue;
+    if (!LIVE_EXTERNAL_WAIT_TRIGGERS.has(wait.trigger.kind)) continue;
+    evaluated += 1;
+    const evaluation = await evaluateExternalWaitTrigger(wait, row.repo);
+    if (evaluation !== "satisfied") continue;
+    const count = await client.$transaction(async (tx) => {
+      const { count } = await tx.prFixQueueItem.updateMany({
+        where: { id: row.id, status: "WAITING_EXTERNAL", generation: row.generation },
+        data: {
+          status: "QUEUED",
+          ...freshAttemptGeneration(),
+          retryAt: null,
+          dispatchedGeneration: null,
+          dispatchedAt: null,
+          postDispatchEvidenceKeys: [],
+          attemptHeadSha: row.headSha ?? row.attemptHeadSha ?? null,
+          outcome: null,
+          decisionDetail: null,
+          agentHandouts: [],
+          handoutAcks: [],
+          handoutReceipts: [],
+          externalWait: Prisma.DbNull,
+          staleDisposition: false,
+        },
+      });
+      if (count === 1) {
+        await tx.prFixHistory.create({
+          data: { itemId: row.id, action: "mark", status: "QUEUED", lane: row.lane, note: "External-wait dependency satisfied; rechecking prerequisite (#1253)." },
+        });
+      }
+      return count;
+    });
+    if (count === 1) reactivated += 1;
+  }
+  // Rotate the scan head: stamp EVERY row this pass considered — including
+  // rows skipped in memory (invalid/legacy contract, non-live trigger), which
+  // would otherwise pin the head of the order forever and starve later waits.
+  // Rows the `maxEvaluations` forge-read bound cut off before examining are
+  // deliberately left unstamped so they lead the next pass (a single shared
+  // stamp would re-sort them behind the same head forever). Scoped to rows
+  // still WAITING_EXTERNAL so nothing that already left the state is written.
+  // One bulk write per pass. Writing through Prisma Client also advances
+  // `updatedAt` (@updatedAt) on those rows; that bump is inherent to the client
+  // and harmless here — the write is scoped to rows still WAITING_EXTERNAL,
+  // the fairness read depends on `triggerEvaluatedAt` alone, and `updatedAt`
+  // stays informational (never a staleness or ordering predicate).
+  if (considered.length > 0) {
+    await client.prFixQueueItem.updateMany({
+      where: { id: { in: considered }, status: "WAITING_EXTERNAL" },
+      data: { triggerEvaluatedAt: new Date() },
+    });
+  }
+  return { evaluated, reactivated };
 }
 
 /**
@@ -1223,6 +1357,14 @@ export async function reclaimStalePrFixHandouts(
                 lane: "NORMAL",
                 outcome: "no_progress",
                 decisionDetail: null,
+                // #1253: audit stamp of the CURRENT disposition. Stamped
+                // unconditionally at every disposition write site — a
+                // same-status re-mark merely refreshes the audit timestamp,
+                // which is acceptable because the fields are audit-only and
+                // never freshness predicates (the ledger + watermark decide
+                // freshness, #1249).
+                disposedAt: now,
+                disposedEvidence: null,
                 agentHandouts: [],
                 handoutAcks: [],
                 handoutReceipts: [],
@@ -1350,6 +1492,12 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
     // from fresher snapshots, and the post-transaction BLOCKED-surfacing
     // comparison keeps its pre-#1134 meaning.
     previousStatus = existing?.status;
+    // One wall-clock instant per enqueue decision (#1253): every
+    // disposition stamp (`disposedAt`) and reactivation stamp
+    // (`recoveryAppliedAt`) this decision writes uses the same `now`, so the
+    // pinned-loop re-derivations stay internally consistent instead of
+    // drifting per loop iteration.
+    const now = new Date();
     if (existing) {
       // buildUpdate: the per-snapshot decision + write payload. Everything the
       // write and the history row depend on is derived from ONE row snapshot,
@@ -1413,16 +1561,51 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           snapshot.headSha === input.headSha;
         const reopenFixStale = identityKnown && headShaUnchanged && !isConditionKind;
 
-        // Human-decision BLOCKED and operational PARKED states are sticky too
-        // (#1218): a fresh enqueue must not auto-reopen either. Only an
-        // explicit operator requeue (or a mark to QUEUED) releases them. A
-        // FIXED tombstone keeps its existing reopen paths (#940 + new evidence).
+        // STALE/IGNORED stay sticky inline (#1000): terminal states never
+        // reactivate on evidence and are operator-only, so they are kept OUT
+        // of the recovery module's decision path entirely. The three
+        // dispositions below (BLOCKED human hold, PARKED operational hold,
+        // WAITING_EXTERNAL) DO route through `evaluateRecovery` (#1253):
+        // fresh actionable evidence may reactivate an operational hold
+        // (rows 8/13) and must surface as a stale disposition on the holds
+        // evidence must not override (rows 9/10/11/16).
         const isTerminalStatus =
           snapshot.status === "STALE" ||
-          snapshot.status === "IGNORED" ||
+          snapshot.status === "IGNORED";
+        const isDispositionedStatus =
           snapshot.status === "BLOCKED" ||
           snapshot.status === "PARKED" ||
           snapshot.status === "WAITING_EXTERNAL";
+
+        // #1253: fresh actionable evidence = a NEW ledger transition that is
+        // actionable by kind. `isKnownEvidence` already covers
+        // version-unchanged replays, repeated review text, and
+        // non-actionable versions; the explicit `evidenceActionable !==
+        // false` guard keeps the predicate self-contained even if the
+        // isKnownEvidence composition changes.
+        const freshEvidence = !isKnownEvidence && input.evidenceActionable !== false;
+        const recovery: RecoveryDecision | null = isDispositionedStatus
+          ? evaluateRecovery({
+              status: snapshot.status,
+              outcome: snapshot.outcome ?? null,
+              fixAttempts: snapshot.fixAttempts,
+              handoutReclaims: snapshot.handoutReclaims,
+              hasValidExternalWait:
+                snapshot.status === "WAITING_EXTERNAL" ? !!parseStoredExternalWait(snapshot.externalWait) : false,
+              freshEvidence,
+              // #1253 control 8: a REACTIVATION requires durable-ledger
+              // provenance — an observation the pre-#1249 cache semantics
+              // call fresh but no ledger row recorded cannot mint one. The
+              // HOLD + stale-flag rows keep working on the cache semantics.
+              ledgerProvenance: ledgerView.records,
+              now,
+              disposedAt: snapshot.disposedAt ?? null,
+              recoveryAppliedAt: snapshot.recoveryAppliedAt ?? null,
+              maxAttempts: maxPrFixAttempts(),
+              maxReclaims: maxPrFixReclaims(),
+              cooldownMs: recoveryCooldownMs(),
+            })
+          : null;
 
         const nextEvidenceKeys = uniqueAppend(snapshot.evidenceKeys ?? [], input.evidenceKey, 40);
 
@@ -1431,12 +1614,28 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         let statusNote: string | null = null;
         let resolvedOutcome: PrFixOutcome | null = null;
         let resolvedDecision: PrFixDecisionContext | null = null;
+        let recoveryNote: string | null = null;
         if (isTerminalStatus) {
           resolvedStatus = snapshot.status; // sticky — never resurrect a gone PR
-          // Preserve the stored lane: a sticky BLOCKED must stay NEEDS_HUMAN
-          // and a sticky PARKED must stay NORMAL, regardless of the enqueue's
-          // lane argument (#1218).
+          // Preserve the stored lane: a sticky terminal item keeps its lane,
+          // regardless of the enqueue's lane argument (#1218).
           resolvedLane = snapshot.lane ?? resolvedLane;
+        } else if (recovery?.action === "reactivate") {
+          // #1253 row 8/13: fresh actionable evidence reopens an operational
+          // hold as a QUEUED fresh attempt. The lane is preserved from the
+          // snapshot when it is NORMAL, else NORMAL — evidence must never
+          // manufacture a human lane (never NEEDS_HUMAN).
+          resolvedStatus = "QUEUED";
+          resolvedLane = snapshot.lane === "NEEDS_HUMAN" ? "NORMAL" : (snapshot.lane ?? "NORMAL");
+          recoveryNote = recovery.reason;
+        } else if (recovery) {
+          // #1253 hold rows (16/9/10/11/15/19-via-inline): the disposition
+          // stands. `setStaleDisposition` surfaces fresh evidence without
+          // reopening; a hold without the flag leaves the row untouched
+          // apart from the evidence recording shared below.
+          resolvedStatus = snapshot.status; // sticky
+          resolvedLane = snapshot.lane ?? resolvedLane;
+          if (recovery.setStaleDisposition) recoveryNote = recovery.reason;
         } else if (reopenFixStale) {
           resolvedStatus = nextStatus; // #940 recovery from a no-progress FIXED tombstone
         } else if (isKnownEvidence) {
@@ -1451,8 +1650,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
         // (#1103). Past the cap, stop re-queuing and PARK the PR (#1218): this
         // is bounded exhaustion, not a human decision, so it must not carry the
         // needs-human label. Otherwise a human CHANGES_REQUESTED that N
-        // automated fixes never satisfy loops forever.
+        // automated fixes never satisfy loops forever. This check runs AFTER
+        // the recovery decision (#1253): a budget-available reactivation that
+        // lands at the cap parks here with the stale-disposition flag (row 9
+        // semantics — the fresh evidence that justified the reopen is still
+        // unaddressed and must surface to the operator).
         const priorAttempts = snapshot.fixAttempts ?? 1;
+        let capParked = false;
         if (
           resolvedStatus === "QUEUED" &&
           snapshot.status !== "QUEUED" &&
@@ -1462,6 +1666,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           resolvedLane = "NORMAL";
           resolvedOutcome = normalizePrFixOutcome(input.outcome) ?? "no_progress";
           statusNote = `Bounded at ${priorAttempts} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}); parked instead of re-queuing (#1001).`;
+          capParked = true;
         }
 
         if (resolvedStatus === "BLOCKED") {
@@ -1553,15 +1758,58 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // A fresh attempt resets the post-dispatch list AND the per-agent
           // hand-out records: the prior generation's records are dead either
           // way, and the skip check must match only the current identity
-          // (#1119, #1133, #1211).
+          // (#1119, #1133, #1211). It also clears the #1253 recovery
+          // bookkeeping — the stale-disposition flag and the disposition
+          // audit stamp — so ANY fresh attempt (not just a recovery
+          // reactivation; e.g. the #940 reopen of a previously-flagged FIXED
+          // row) starts clean.
           ...(isFreshAttempt
-            ? { postDispatchEvidenceKeys: [], agentHandouts: [], handoutAcks: [], handoutReceipts: [] }
+            ? {
+                postDispatchEvidenceKeys: [],
+                agentHandouts: [],
+                handoutAcks: [],
+                handoutReceipts: [],
+                staleDisposition: false,
+                disposedAt: null,
+                disposedEvidence: null,
+              }
             : {}),
           // Structured outcome (#1218): recorded on the same write as the
           // status. Only BLOCKED/PARKED carry one; decisionDetail is persisted
           // only for a human-decision BLOCKED.
           ...(resolvedOutcome ? { outcome: resolvedOutcome } : {}),
           ...(resolvedStatus === "BLOCKED" && resolvedDecision ? { decisionDetail: resolvedDecision } : {}),
+          // #1253: a recovery reactivation sheds the disposition it was held
+          // under. `retryAt`/`externalWait`/`recoveryAppliedAt`/
+          // `staleDisposition` apply EVEN when the cap check above flipped
+          // the row to PARKED (the later `capParked` spread re-sets
+          // staleDisposition true — spread order makes it win);
+          // `outcome`/`decisionDetail` only clear on an actual fresh attempt
+          // so the cap park's `no_progress` outcome survives.
+          ...(recovery?.action === "reactivate"
+            ? {
+                retryAt: null,
+                externalWait: Prisma.DbNull,
+                recoveryAppliedAt: now,
+                staleDisposition: false,
+                ...(isFreshAttempt ? { outcome: null, decisionDetail: null } : {}),
+              }
+            : {}),
+          // #1253: a hold whose fresh evidence must be surfaced writes the
+          // stale-disposition flag without touching status; a cap park (row
+          // 9 semantics — the fresh evidence that forced the reopen is still
+          // unaddressed) flags too.
+          ...(recovery?.action === "hold" && recovery.setStaleDisposition ? { staleDisposition: true } : {}),
+          ...(capParked ? { staleDisposition: true } : {}),
+          // #1253: disposition stamps — written only when THIS decision
+          // transitions the row INTO a disposition from a different status.
+          // Idempotent sticky re-marks (the sync's duplicate enqueues onto a
+          // held row) never restamp, so they cannot keep pushing a PARKED
+          // item's recovery-cooldown anchor forward. Audit-only: never a
+          // freshness predicate (#1249).
+          ...((resolvedStatus === "PARKED" || resolvedStatus === "BLOCKED") && snapshot.status !== resolvedStatus
+            ? { disposedAt: now, disposedEvidence: input.evidenceKey || null }
+            : {}),
           // #1249: the ledger row itself is upserted AFTER the (pinned) item
           // write succeeds, with `assignedEvidenceSequence`; the item only
           // carries the atomic counter bump here.
@@ -1576,6 +1824,7 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           outcome: resolvedOutcome,
           isNewLedgerTransition,
           assignedEvidenceSequence,
+          recoveryNote,
           // #1134: the append above is computed from THIS snapshot's key list,
           // so the write must be pinned on exactly that list. The
           // isFreshAttempt reset-to-[] is mutually exclusive with the append
@@ -1588,6 +1837,12 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // re-decide loop recomputes both the decision and the sequence from
           // the fresh row instead of double-issuing or skipping a sequence.
           pinnedEvidenceSequence: isNewLedgerTransition ? (snapshot.evidenceSequence ?? 0) : null,
+          // #1253: a decision computed from a NON-QUEUED snapshot (a sticky
+          // hold, a recovery reactivation, FIXED tombstone handling) is also
+          // pinned on the generation it decided from — a concurrent
+          // requeue/settlement that bumped the generation in the read→write
+          // gap misses the pin and the loop re-decides from the fresh row.
+          pinnedGeneration: snapshot.status !== "QUEUED" ? (snapshot.generation ?? null) : null,
         };
       };
 
@@ -1609,15 +1864,21 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       // True when the exhausted-loop fallback below wrote the item without its
       // pins; suppresses the ledger record for that write (see there).
       let unpinnedLedgerWrite = false;
-      if (decided.pinnedKeys !== null || decided.pinnedEvidenceSequence !== null) {
+      if (
+        decided.pinnedKeys !== null ||
+        decided.pinnedEvidenceSequence !== null ||
+        decided.pinnedGeneration !== null
+      ) {
         let pinnedKeys: string[] | null = decided.pinnedKeys;
         let pinnedEvidenceSequence: number | null = decided.pinnedEvidenceSequence;
+        let pinnedGeneration: number | null = decided.pinnedGeneration;
         for (let i = 0; i < maxPinnedEnqueueWrites; i += 1) {
           const { count } = await tx.prFixQueueItem.updateMany({
             where: {
               id: existing.id,
               ...(pinnedKeys !== null ? { postDispatchEvidenceKeys: { equals: pinnedKeys } } : {}),
               ...(pinnedEvidenceSequence !== null ? { evidenceSequence: pinnedEvidenceSequence } : {}),
+              ...(pinnedGeneration !== null ? { generation: pinnedGeneration } : {}),
             },
             data: decided.data,
           });
@@ -1625,10 +1886,11 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
             updated = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
             break;
           }
-          // The pin missed: a concurrent append or ledger transition landed in
-          // the read→write gap (or the row was deleted). Re-read in-transaction
-          // and re-decide from the fresh snapshot — no decision is reused from
-          // the stale read.
+          // The pin missed: a concurrent append, ledger transition, or
+          // generation bump (requeue/settlement) landed in the read→write gap
+          // (or the row was deleted). Re-read in-transaction and re-decide
+          // from the fresh snapshot — no decision is reused from the stale
+          // read.
           const fresh = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
           // Row deleted mid-loop: stop re-deciding; the exhausted-loop fallback
           // below runs its plain `update`, which surfaces Prisma's P2025 exactly
@@ -1640,10 +1902,12 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // instead of replaying the stale ledger snapshot's decision.
           ledgerView = await readEvidenceLedgerView(tx, existing.id, input);
           decided = buildUpdate(fresh, ledgerView);
-          // Pin the retry against the key list / counter value the NEW write
-          // was computed from, so a further gap write no-ops it the same way.
+          // Pin the retry against the key list / counter value / generation
+          // the NEW write was computed from, so a further gap write no-ops it
+          // the same way.
           pinnedKeys = decided.pinnedKeys;
           pinnedEvidenceSequence = decided.pinnedEvidenceSequence;
+          pinnedGeneration = decided.pinnedGeneration;
         }
         if (updated === undefined) {
           // The pin kept missing under sustained contention, or the row was
@@ -1653,7 +1917,10 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           // pre-#1134 worst case (a concurrent entry in the final gap can
           // still be clobbered) only when the gap loses 3 writes in a row; no
           // network call runs in here, so the #1124 transaction-timeout hazard
-          // does not apply.
+          // does not apply. The same degradation now also applies to the
+          // operator-facing staleDisposition/recoveryAppliedAt stamps a
+          // concurrent decision tried to write — bounded, and self-healing on
+          // the next observation.
           await tx.prFixQueueItem.update({ where: { id: existing.id }, data: decided.data });
           updated = await tx.prFixQueueItem.findUnique({ where: { id: existing.id } });
           // #1249: the counter this write bumped belongs to a row nobody pinned,
@@ -1697,8 +1964,17 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
       if (decided.outcome) historyData.outcome = decided.outcome;
       if (decided.reopenFixStale) {
         historyData.note = `Reopened: PR head SHA unchanged since FIXED (${snapshot.headSha}); re-detected evidence on a no-progress tombstone (#940).`;
+      } else if (decided.statusNote && decided.recoveryNote) {
+        // #1253: a cap-flipped reactivation carries BOTH notes — the
+        // recovery rationale and the cap park — composed deterministically
+        // (recovery reason first) instead of one shadowing the other.
+        historyData.note = `${decided.recoveryNote} ${decided.statusNote}`;
       } else if (decided.statusNote) {
         historyData.note = decided.statusNote;
+      } else if (decided.recoveryNote) {
+        // #1253: the recovery decision's rationale (reactivation or
+        // stale-disposition surfacing) is the audit note.
+        historyData.note = decided.recoveryNote;
       }
       await tx.prFixHistory.create({ data: historyData });
       return updated;
@@ -2136,6 +2412,11 @@ export async function markPrFixItem(
             outcome: "invalid_wait",
             decisionDetail: null,
             retryAt: null,
+            // #1253: disposition audit stamp (fail-closed park). Stamped
+            // unconditionally at every disposition write site — see the
+            // enqueue-side note.
+            disposedAt: new Date(),
+            disposedEvidence: null,
             // A park is a terminal disposition: drop the attempt's evidence
             // snapshot like every other sticky PARKED settle, so a later
             // maintainer-tier mark never reopens on the parked attempt's
@@ -2177,6 +2458,11 @@ export async function markPrFixItem(
     data.outcome = null;
     data.decisionDetail = null;
     data.postDispatchEvidenceKeys = [];
+    // #1253: disposition audit stamp (the write site below is the single
+    // WAITING_EXTERNAL status writer). Audit-only, never a freshness
+    // predicate (#1249).
+    data.disposedAt = new Date();
+    data.disposedEvidence = null;
     // A wait is not a hand-out: drop the previous attempt's evidence snapshot
     // so durable freshness never keys off a superseded boundary (#1249).
     data.attemptEvidenceWatermark = null;
@@ -2251,6 +2537,9 @@ export async function markPrFixItem(
           lane: "NORMAL",
           outcome: "no_progress",
           decisionDetail: null,
+          // #1253: disposition audit stamp (capped give-up park).
+          disposedAt: new Date(),
+          disposedEvidence: null,
           postDispatchEvidenceKeys: [],
           agentHandouts: [],
           handoutAcks: [],
@@ -2365,10 +2654,16 @@ export async function markPrFixItem(
     data.lane = "NEEDS_HUMAN";
     data.outcome = "human_decision";
     if (input.decision) data.decisionDetail = input.decision;
+    // #1253: disposition audit stamp (human-decision BLOCKED).
+    data.disposedAt = new Date();
+    data.disposedEvidence = null;
   } else if (nextStatus === "PARKED") {
     data.lane = "NORMAL";
     data.outcome = resolvePrFixOutcome("PARKED", input.outcome);
     data.decisionDetail = null;
+    // #1253: disposition audit stamp (operational park).
+    data.disposedAt = new Date();
+    data.disposedEvidence = null;
   } else if (nextStatus === "QUEUED") {
     data.lane = "NORMAL";
     // A mark back to QUEUED releases a BLOCKED/PARKED item: clear the outcome
@@ -2377,6 +2672,12 @@ export async function markPrFixItem(
     data.outcome = null;
     data.decisionDetail = null;
     data.externalWait = Prisma.DbNull;
+    // #1253: an operator release (maintainer mark to QUEUED) clears the
+    // recovery bookkeeping along with everything else the hold recorded.
+    data.staleDisposition = false;
+    data.disposedAt = null;
+    data.disposedEvidence = null;
+    data.recoveryAppliedAt = null;
     // Marking a non-QUEUED item back to QUEUED creates a fresh dispatchable
     // attempt (same semantics as requeuePrFixItem) — bump the generation
     // alongside the status flip so the work identity changes (#1044).
@@ -2398,15 +2699,26 @@ export async function markPrFixItem(
     // QUEUED → QUEUED: leave the key list untouched — the entries still refer
     // to the current generation and must survive the mark.
   } else if (nextStatus === "STALE" || nextStatus === "IGNORED") {
-    // Terminal: the recorded entries are moot; clear them (#1119).
+    // Terminal: the recorded entries are moot; clear them (#1119). The
+    // #1253 recovery bookkeeping dies with the item's active life too.
     data.postDispatchEvidenceKeys = [];
     data.outcome = null;
     data.decisionDetail = null;
+    data.staleDisposition = false;
+    data.disposedAt = null;
+    data.disposedEvidence = null;
+    data.recoveryAppliedAt = null;
   } else {
     // FIXED (and any other status): a settled item carries no BLOCKED/PARKED
-    // classification.
+    // classification, and the #1253 recovery bookkeeping of any prior hold
+    // dies with the settlement (a later #940/new-evidence reopen mints a
+    // fresh attempt that must not inherit a stale flag or stamp).
     data.outcome = null;
     data.decisionDetail = null;
+    data.staleDisposition = false;
+    data.disposedAt = null;
+    data.disposedEvidence = null;
+    data.recoveryAppliedAt = null;
   }
 
   // #1249: every disposition that ENDS the attempt retires its evidence
@@ -2445,6 +2757,9 @@ export async function markPrFixItem(
             lane: "NORMAL",
             outcome: "no_progress",
             decisionDetail: null,
+            // #1253: disposition audit stamp (refused-FIXED cap park).
+            disposedAt: new Date(),
+            disposedEvidence: null,
             postDispatchEvidenceKeys: [],
             agentHandouts: [],
             handoutAcks: [],
@@ -2737,6 +3052,9 @@ export async function markPrFixItem(
         lane: "NORMAL",
         outcome: "no_progress",
         decisionDetail: null,
+        // #1253: disposition audit stamp (racing-evidence cap park).
+        disposedAt: new Date(),
+        disposedEvidence: null,
         postDispatchEvidenceKeys: [],
         agentHandouts: [],
         handoutAcks: [],
@@ -2834,22 +3152,29 @@ export async function reconcileStalePrFixItems(
     for (const item of staleCandidates) {
       try {
         const state = prStateByRepo.get(repo)?.get(item.pr) ?? "merged";
-        await client.$transaction(async (tx) => {
-          await tx.prFixQueueItem.update({
-            where: { id: item.id },
-            data: { status: "STALE", attemptEvidenceWatermark: null },
+        // #1253: the terminal reap write is generation-AND-status pinned — a
+        // concurrent requeue/settlement that bumped the generation or moved
+        // the status in the read→write gap wins, and this reap no-ops
+        // (count 0, no history row) instead of clobbering it.
+        const count = await client.$transaction(async (tx) => {
+          const result = await tx.prFixQueueItem.updateMany({
+            where: { id: item.id, status: item.status, generation: item.generation },
+            data: { status: "STALE", attemptEvidenceWatermark: null, staleDisposition: false },
           });
-          await tx.prFixHistory.create({
-            data: {
-              itemId: item.id,
-              action: "mark",
-              status: "STALE",
-              lane: item.lane,
-              note: `Upstream PR state=${state} at reconcile time`,
-            },
-          });
+          if (result.count === 1) {
+            await tx.prFixHistory.create({
+              data: {
+                itemId: item.id,
+                action: "mark",
+                status: "STALE",
+                lane: item.lane,
+                note: `Upstream PR state=${state} at reconcile time`,
+              },
+            });
+          }
+          return result.count;
         });
-        markedStale++;
+        if (count === 1) markedStale++;
       } catch (err) {
         errored++;
       }
@@ -2897,22 +3222,27 @@ export async function reconcileArchivedRepoPrFixItems(
     if (!(await isArchived(repo))) continue;
     for (const item of items) {
       try {
-        await client.$transaction(async (tx) => {
-          await tx.prFixQueueItem.update({
-            where: { id: item.id },
-            data: { status: "STALE", attemptEvidenceWatermark: null },
+        // #1253: generation-AND-status pinned terminal reap — same fencing as
+        // reconcileStalePrFixItems above; a concurrent requeue wins.
+        const count = await client.$transaction(async (tx) => {
+          const result = await tx.prFixQueueItem.updateMany({
+            where: { id: item.id, status: item.status, generation: item.generation },
+            data: { status: "STALE", attemptEvidenceWatermark: null, staleDisposition: false },
           });
-          await tx.prFixHistory.create({
-            data: {
-              itemId: item.id,
-              action: "mark",
-              status: "STALE",
-              lane: item.lane,
-              note: "Upstream repo archived at reconcile time (#1106)",
-            },
-          });
+          if (result.count === 1) {
+            await tx.prFixHistory.create({
+              data: {
+                itemId: item.id,
+                action: "mark",
+                status: "STALE",
+                lane: item.lane,
+                note: "Upstream repo archived at reconcile time (#1106)",
+              },
+            });
+          }
+          return result.count;
         });
-        markedStale++;
+        if (count === 1) markedStale++;
       } catch (err) {
         errored++;
       }
@@ -3089,6 +3419,10 @@ export function toAgentQueuePrFixItem(item: any) {
     // Per-agent hand-out records for the current generation (#1133); the
     // next-task route reads these to skip items this agent already has.
     agentHandouts: item.agentHandouts ?? [],
+    // #1253: fresh actionable evidence arrived while the item sat in a
+    // disposition evidence must not override — operator-visible on queue
+    // listings, cleared on reactivation or operator requeue.
+    staleDisposition: item.staleDisposition ?? false,
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,
@@ -3142,6 +3476,13 @@ export async function requeuePrFixItem(client: PrFixQueueClient, rawInput: Reque
         // The operator release clears the BLOCKED/PARKED classification (#1218).
         outcome: null,
         decisionDetail: null,
+        // #1253: the operator reset also clears the recovery bookkeeping —
+        // the stale-disposition flag, the disposition audit stamp, and the
+        // reactivation cooldown.
+        staleDisposition: false,
+        disposedAt: null,
+        disposedEvidence: null,
+        recoveryAppliedAt: null,
         ...freshAttemptGeneration(),
         fixAttempts: 1,
         attemptHeadSha: existing.headSha ?? null,
@@ -3669,6 +4010,9 @@ export async function resolvePrFixFromAgentReport(
             lane: "NORMAL",
             outcome: "no_progress",
             decisionDetail: null,
+            // #1253: disposition audit stamp (failed-report cap park).
+            disposedAt: new Date(),
+            disposedEvidence: null,
             postDispatchEvidenceKeys: [],
             agentHandouts: [],
             handoutAcks: [],

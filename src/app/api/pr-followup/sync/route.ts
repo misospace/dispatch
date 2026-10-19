@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
-import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems } from "@/lib/pr-fix-queue";
+import { reconcileStalePrFixItems, reconcileArchivedRepoPrFixItems, reconcileExternalWaitTriggers } from "@/lib/pr-fix-queue";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { getTrackedRepos } from "@/lib/config";
 import { getGitHubToken, fetchPaginated, fetchPullRequests, fetchPullRequestMergeState, fetchFailedJobLogExcerpt, fetchClosedPullRequests, jobIdFromCheckRunUrl, type GithubPR as GithubPRBase } from "@/lib/github";
@@ -448,6 +448,20 @@ export async function POST(request: NextRequest) {
       ? { markedStale: 0 }
       : await reconcileArchivedRepoPrFixItems(asPrFixQueueClient(prisma));
 
+    // #1253: bounded trigger reconciliation for structured external waits —
+    // a recorded dependency that now satisfies its predicate reactivates the
+    // wait (uncharged recheck). Best-effort: a failed pass must never fail
+    // the sync; the next tick re-evaluates.
+    let waitTriggerResult = { evaluated: 0, reactivated: 0 };
+    try {
+      waitTriggerResult = await reconcileExternalWaitTriggers(asPrFixQueueClient(prisma));
+    } catch (error) {
+      console.warn(
+        "[pr-followup] external-wait trigger reconciliation failed (best-effort):",
+        error instanceof Error ? error.message : error,
+      );
+    }
+
     if (reposFailed > 0) {
       console.warn(
         `[pr-followup] Sync completed with ${reposFailed} repo failure(s). ` +
@@ -464,6 +478,7 @@ export async function POST(request: NextRequest) {
       skipped: totalSkipped + result.skipped,
       staleReaped: staleResult.markedStale,
       archivedReaped: archivedResult.markedStale,
+      externalWaitRechecked: waitTriggerResult.reactivated,
       rateLimited,
     });
   } catch (error) {

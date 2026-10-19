@@ -19,40 +19,40 @@ model Repository {
 }
 
 model Issue {
-  id            String     @id @default(cuid())
-  number        Int
-  repositoryId  String
-  repository    Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
-  title         String
-  body          String?
-  state         String
-  url           String
-  labels        String[]
-  assignees     String[]
-  commentsCount Int        @default(0)
-  createdAt     DateTime
-  updatedAt     DateTime
-  closedAt      DateTime?
-  lastSyncedAt  DateTime   @default(now())
-  currentLane   String?
-  agentRuns     AgentRun[]
-  auditLogs     AuditLog[]
-  laneHistory   IssueLane[]
-  agentWork     AgentWork[]
-  leases        Lease[]
-  mutationGuard IssueMutationGuard?
-  groomingRuns  GroomingRun[]
+  id                    String                @id @default(cuid())
+  number                Int
+  repositoryId          String
+  repository            Repository            @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  title                 String
+  body                  String?
+  state                 String
+  url                   String
+  labels                String[]
+  assignees             String[]
+  commentsCount         Int                   @default(0)
+  createdAt             DateTime
+  updatedAt             DateTime
+  closedAt              DateTime?
+  lastSyncedAt          DateTime              @default(now())
+  currentLane           String?
+  agentRuns             AgentRun[]
+  auditLogs             AuditLog[]
+  laneHistory           IssueLane[]
+  agentWork             AgentWork[]
+  leases                Lease[]
+  mutationGuard         IssueMutationGuard?
+  groomingRuns          GroomingRun[]
   groomingApplications  GroomingApplication[]
   groomingChildClaims   GroomingChildClaim[]
   groomerPendingReplies GroomerPendingReply[]
   lifecycleEvents       IssueLifecycleEvent[]
 
   // Escalated lane outcome tracking
-  decomposed    Boolean  @default(false)
-  decomposedAt  DateTime?
-  decomposedBy  String?  @db.Text
-  decomposedNote String? @db.Text
-  followUpUrls  String[] @default([])
+  decomposed     Boolean   @default(false)
+  decomposedAt   DateTime?
+  decomposedBy   String?   @db.Text
+  decomposedNote String?   @db.Text
+  followUpUrls   String[]  @default([])
 
   // Native GitHub blocked_by dependencies (#1086): canonical `owner/repo#N`
   // keys for issues that natively block this one. Ingested by sync; merged
@@ -60,13 +60,13 @@ model Issue {
   nativeBlockedBy String[] @default([])
 
   // Backlog grooming state
-  groomedAt        DateTime?
-  groomedBy        String?  @db.Text
-  groomingSummary  String?  @db.Text
-  notReadyReason   String?  @db.Text
-  blockedReason    String?  @db.Text
-  needsInfoReason  String?  @db.Text
-  nextGroomingAction String? @db.Text
+  groomedAt          DateTime?
+  groomedBy          String?   @db.Text
+  groomingSummary    String?   @db.Text
+  notReadyReason     String?   @db.Text
+  blockedReason      String?   @db.Text
+  needsInfoReason    String?   @db.Text
+  nextGroomingAction String?   @db.Text
 
   // Grooming freshness (#1064): the evidence identity the latest applied
   // grooming result was validated against, and whether it has gone stale.
@@ -98,11 +98,11 @@ model Issue {
   // freshness baseline above with groomedRunId = admissionOverrideId, so it
   // goes stale under the same checks as a grooming result; it is current only
   // while groomedRunId still equals admissionOverrideId.
-  admissionOverrideId       String?
-  admissionOverrideBy       String?
-  admissionOverrideAt       DateTime?
-  admissionOverrideReason   String?   @db.Text
-  admissionOverrideHeadSha  String?
+  admissionOverrideId      String?
+  admissionOverrideBy      String?
+  admissionOverrideAt      DateTime?
+  admissionOverrideReason  String?   @db.Text
+  admissionOverrideHeadSha String?
 
   // Linked PR health (persisted by reconcile, refreshable on demand)
   linkedPrNumber          Int?
@@ -159,48 +159,47 @@ enum PrFixType {
   OTHER
 }
 
-
 model PrFixQueueItem {
-  id           String         @id @default(cuid())
-  repo         String
-  pr           Int
-  issue        Int?
-  branch       String?
-  lane         PrFixLane      @default(NORMAL)
-  type         PrFixType      @default(OTHER)
-  reason       String         @db.Text
-  feedback     String[]       @default([])
-  evidenceKeys String[]       @default([])
-  status       PrFixStatus    @default(QUEUED)
+  id                       String          @id @default(cuid())
+  repo                     String
+  pr                       Int
+  issue                    Int?
+  branch                   String?
+  lane                     PrFixLane       @default(NORMAL)
+  type                     PrFixType       @default(OTHER)
+  reason                   String          @db.Text
+  feedback                 String[]        @default([])
+  evidenceKeys             String[]        @default([])
+  status                   PrFixStatus     @default(QUEUED)
   // Structured outcome classification (#1218): why the item is in its current
   // non-active terminal-ish state. Only meaningful for BLOCKED (human_decision)
   // and PARKED (no_progress | infra_failure | security_failure).
-  outcome      String?
+  outcome                  String?
   // Human-decision payload for a BLOCKED item (#1218): the question, options,
   // and evidence an operator needs to make the call. Null for non-human states.
-  decisionDetail Json?
+  decisionDetail           Json?
   // Dispatch-owned work generation (#1044): 1 on creation, bumped when a
   // non-QUEUED item becomes dispatchable again as a fresh attempt. Workers
   // consume (id, generation) as an opaque work identity via next-task.
-  generation   Int            @default(1)
-  queuedAt     DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
-  url          String?
-  title        String?
-  headSha      String?
+  generation               Int             @default(1)
+  queuedAt                 DateTime        @default(now())
+  updatedAt                DateTime        @updatedAt
+  url                      String?
+  title                    String?
+  headSha                  String?
   // Immutable head baseline for the current attempt/generation (#1074),
   // captured when the attempt becomes dispatchable. The FIXED guard compares
   // the PR head against this baseline, not the mutable enqueue-time headSha.
-  attemptHeadSha String?
+  attemptHeadSha           String?
   // Dispatchable fix attempts since creation or the last operator requeue
   // (#1103): 1 on creation, +1 per fresh attempt. PR_FIX_MAX_ATTEMPTS bounds
   // this, not evidence keys — one review can carry many comment keys.
-  fixAttempts  Int            @default(1)
+  fixAttempts              Int             @default(1)
   // Last next-task hand-out of this item (#1119): the generation handed to
   // the worker (NULL = never dispatched in its current life) and the
   // wall-clock of that hand-out.
-  dispatchedGeneration Int?
-  dispatchedAt       DateTime?
+  dispatchedGeneration     Int?
+  dispatchedAt             DateTime?
   // #1256: authoritative per-hand-out receipts. One entry per live hand-out
   // issued by next-task, format "<token>@<agentName>@<generation>" (token is
   // an opaque random value containing no "@"; the agent name may contain "@",
@@ -213,7 +212,7 @@ model PrFixQueueItem {
   // every clear site clears both), so a hand-out that was released, reclaimed,
   // or superseded by a generation bump can never be settled with its old
   // token, and each new hand-out rotates in a fresh token.
-  handoutReceipts    String[]       @default([])
+  handoutReceipts          String[]        @default([])
   // New (previously-unrecorded) evidence arrived AFTER the current generation
   // was handed out (#1119): the in-flight worker cannot see it, so settlement
   // must reopen a fresh attempt instead of absorbing it. Records the evidence
@@ -221,7 +220,7 @@ model PrFixQueueItem {
   // `<evidenceKey>@<head>` where <head> is the enqueue's observed headSha
   // (trimmed) or the literal "unknown" when none was recorded. Empty list =
   // nothing to act on; cleared on every fresh attempt and settlement.
-  postDispatchEvidenceKeys String[] @default([])
+  postDispatchEvidenceKeys String[]        @default([])
   // Agents this item was already handed to, per generation (#1133): each
   // entry is `<agentName>@<generation>`. next-task skips an item for an
   // agent that already received its CURRENT generation — a polling worker
@@ -230,7 +229,7 @@ model PrFixQueueItem {
   // the item, and the same agent gets it again when a fresh attempt bumps
   // the generation; entries for older generations are inert, and every
   // fresh attempt clears the list.
-  agentHandouts String[] @default([])
+  agentHandouts            String[]        @default([])
   // Acknowledged hand-outs, per generation (#1211): each entry is
   // `<agentName>@<generation>`, written when a worker durably materialized the
   // attempt (e.g. created the executor run that owns the work). next-task
@@ -239,7 +238,7 @@ model PrFixQueueItem {
   // re-offer — and the item is stranded. The reclaimer refuses to reclaim a
   // generation any agent acknowledged; entries for older generations are inert
   // and every fresh attempt clears the list.
-  handoutAcks  String[] @default([])
+  handoutAcks              String[]        @default([])
   // Bounded automatic reclamations of stale unacknowledged hand-outs (#1211):
   // counts how many times the reclaimer has reopened this item because a
   // stamped hand-out was never acknowledged. Past PR_FIX_MAX_RECLAIMS the item
@@ -247,14 +246,14 @@ model PrFixQueueItem {
   // bounded no-progress exhaustion, never a human decision, so the
   // `needs-human` label is never applied. Release requires an explicit
   // operator requeue or a maintainer mark to QUEUED.
-  handoutReclaims Int @default(0)
+  handoutReclaims          Int             @default(0)
   // Cooldown deadline for external dependency waits; due items are reissued lazily.
-  retryAt DateTime?
+  retryAt                  DateTime?
   // Durable evidence ledger position counter (#1249): every recorded ledger
   // transition assigns the next sequence from this column (atomic increment on
   // the same pinned write that records it). Monotonic for the item's life;
   // never reset by fresh attempts — the ledger is per-item, not per-attempt.
-  evidenceSequence Int @default(0)
+  evidenceSequence         Int             @default(0)
   // Evidence-snapshot boundary of the CURRENT hand-out (#1249): the ledger
   // sequence at dispatch — the durable record of what the worker was actually
   // given. A transition recorded AFTER it was not in the issued snapshot and
@@ -267,18 +266,44 @@ model PrFixQueueItem {
   // trigger } validated at every WAITING_EXTERNAL writer. Null on a
   // WAITING_EXTERNAL row means a legacy free-text wait (pre-#1250) — surfaced
   // for operator action, never auto-downgraded.
-  externalWait Json?
-  author       String?
-  history      PrFixHistory[]
-  evidence     PrFixEvidence[]
+  externalWait             Json?
+  // #1253 stale-disposition flag: set when fresh actionable evidence arrived
+  // while the item sat in a disposition evidence must not override
+  // (BLOCKED human decision, cap-exhausted or fail-closed PARKED). Operator-
+  // visible via queue listings and blocked-context surfacing; cleared on the
+  // next reactivation or operator requeue. Never reopens anything by itself.
+  staleDisposition         Boolean         @default(false)
+  // Audit stamp of the CURRENT disposition (#1253): when it was recorded and
+  // the evidence key that caused it. Audit only — never a freshness
+  // predicate; the durable ledger + watermark decide freshness (#1249).
+  disposedAt               DateTime?
+  disposedEvidence         String?
+  // Cooldown timestamp for evidence-driven reactivation of operational holds
+  // (#1253): set on every reactivation. Paces PARKED/no_progress reopen so
+  // reconciliation cannot loop; budget and attempt caps still bound the cycle.
+  recoveryAppliedAt        DateTime?
+  // Fair-eligibility stamp for the bounded external-wait trigger
+  // reconciliation pass (#1253): the last time the pass CONSIDERED this row
+  // (reached it during a scan, whether or not it was evaluable). The scan
+  // orders least-recently-considered first with an explicit
+  // `nulls: "first"`, so an earlier unsatisfied, invalid, or non-live row
+  // cannot starve a later wait out of discovery. Audit only — never a
+  // freshness or satisfaction predicate; NULL = never considered.
+  triggerEvaluatedAt       DateTime?
+  author                   String?
+  history                  PrFixHistory[]
+  evidence                 PrFixEvidence[]
 
   @@unique([repo, pr])
   @@index([status])
   @@index([lane])
   @@index([status, lane])
-
   @@index([type])
   @@index([status, type])
+  // Fair-eligibility read of the external-wait trigger pass (#1253): NULLS
+  // FIRST is part of the index key order because it is part of the ORDER BY;
+  // the trailing `id` matches the deterministic tiebreak.
+  @@index([status, triggerEvaluatedAt(sort: Asc, nulls: First), id])
 }
 
 model PrFixHistory {
@@ -365,9 +390,9 @@ model AgentRun {
   issue            Issue?    @relation(fields: [issueId], references: [id])
 
   // Escalated lane outcome tracking
-  outcome          EscalatedOutcome?
-  groomingRuns     GroomingRun[]
-  reportDedupes    AgentReportDedupe[]
+  outcome       EscalatedOutcome?
+  groomingRuns  GroomingRun[]
+  reportDedupes AgentReportDedupe[]
 
   @@index([agentName])
   @@index([runType])
@@ -393,7 +418,7 @@ enum EscalatedOutcome {
 // effects. The key is opaque worker-chosen state — no producer-specific
 // semantics.
 model AgentReportDedupe {
-  id              String   @id @default(cuid())
+  id              String    @id @default(cuid())
   agentName       String
   idempotencyKey  String
   payloadHash     String
@@ -404,7 +429,7 @@ model AgentReportDedupe {
   // digest), persisted so an idempotent retry replays the close outcome instead
   // of re-running the GitHub close.
   closeResolution Json?
-  createdAt       DateTime @default(now())
+  createdAt       DateTime  @default(now())
 
   @@unique([agentName, idempotencyKey])
   @@index([agentName])
@@ -436,22 +461,22 @@ model AgentReportDedupe {
 // ---------------------------------------------------------------------------
 
 model IssueLifecycleEvent {
-  id           String @id @default(cuid())
-  issueId      String
-  issue        Issue  @relation(fields: [issueId], references: [id], onDelete: Cascade)
-  repoFullName String
-  issueNumber  Int
+  id            String   @id @default(cuid())
+  issueId       String
+  issue         Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  repoFullName  String
+  issueNumber   Int
   // Taxonomy: claim | claim_released | attempt_failed | status_changed |
   // completed | issue_closed | issue_reopened | pr_merged.
-  kind         String
+  kind          String
   // The writer that produced this event (see LIFECYCLE_SOURCES).
-  source       String
+  source        String
   // The identity responsible: an agent name, an operator actor, or the
   // automation's own name.
-  actor        String
-  agentName    String?
-  fromStatus   String?
-  toStatus     String?
+  actor         String
+  agentName     String?
+  fromStatus    String?
+  toStatus      String?
   // Identity of the event in its source system, when the source has one
   // (GitHub delivery id, PR number + merged_at, webhook action). NULL for
   // writes Dispatch authors itself.
@@ -485,7 +510,7 @@ model AuditLog {
   afterLabels  String[]
   success      Boolean
   errorMessage String?
-  notes        String? @db.Text
+  notes        String?  @db.Text
   createdAt    DateTime @default(now())
 
   @@index([repoFullName])
@@ -688,7 +713,7 @@ model AutomationSyncRun {
   workflowsFetched Int            @default(0)
   runsFetched      Int            @default(0)
   errorMessage     String?
-  notes            String? @db.Text
+  notes            String?        @db.Text
   startedAt        DateTime       @default(now())
   completedAt      DateTime?
 
@@ -701,58 +726,58 @@ model AutomationSyncRun {
 // ---------------------------------------------------------------------------
 
 model GroomingRun {
-  id                String         @id @default(cuid())
-  issueId           String
-  issue             Issue          @relation(fields: [issueId], references: [id], onDelete: Cascade)
-  repoId            String
-  repo              AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
-  agentRunId        String?
-  agentRun          AgentRun?      @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  id         String         @id @default(cuid())
+  issueId    String
+  issue      Issue          @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  repoId     String
+  repo       AutomationRepo @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  agentRunId String?
+  agentRun   AgentRun?      @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
 
-  repoFullName      String
-  issueNumber       Int
-  issueUrl          String
-  status            String
-  dryRun            Boolean
-  candidateSource   String         @default("selector")
-  staleReasons      String[]       @default([])
-  stage             String         @default("selected")
+  repoFullName    String
+  issueNumber     Int
+  issueUrl        String
+  status          String
+  dryRun          Boolean
+  candidateSource String   @default("selector")
+  staleReasons    String[] @default([])
+  stage           String   @default("selected")
 
-  model             String?
-  provider          String?
-  promptVersion     String         @default("hosted-groomer-v1")
-  timeoutMs         Int?
-  maxContextBytes   Int?
+  model           String?
+  provider        String?
+  promptVersion   String  @default("hosted-groomer-v1")
+  timeoutMs       Int?
+  maxContextBytes Int?
 
-  contextSummary    Json?
-  contextWarnings   String[]       @default([])
-  rawOutput         Json?
-  validatedOutput   Json?
-  validationErrors  String[]       @default([])
+  contextSummary   Json?
+  contextWarnings  String[] @default([])
+  rawOutput        Json?
+  validatedOutput  Json?
+  validationErrors String[] @default([])
 
-  labelsBefore      String[]       @default([])
-  labelsAfter       String[]       @default([])
-  labelsToAdd       String[]       @default([])
-  labelsToRemove    String[]       @default([])
-  laneBefore        String?
-  laneAfter         String?
-  mutationPlan      Json?
-  appliedMutations  Json?
-  commentBodyPreview String?       @db.Text
-  commentUrl        String?
+  labelsBefore       String[] @default([])
+  labelsAfter        String[] @default([])
+  labelsToAdd        String[] @default([])
+  labelsToRemove     String[] @default([])
+  laneBefore         String?
+  laneAfter          String?
+  mutationPlan       Json?
+  appliedMutations   Json?
+  commentBodyPreview String?  @db.Text
+  commentUrl         String?
 
-  errorMessage      String?        @db.Text
-  retryable         Boolean        @default(false)
-  startedAt         DateTime       @default(now())
-  completedAt       DateTime?
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  errorMessage String?   @db.Text
+  retryable    Boolean   @default(false)
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   // Apply-time validation and idempotent application (#1063).
   applicationKey       String?
   applyOutcome         String?
   preconditions        Json?
-  preconditionFailures String[]            @default([])
+  preconditionFailures String[]              @default([])
   applications         GroomingApplication[]
 
   @@index([repoFullName])
@@ -797,22 +822,22 @@ model GroomingApplication {
 /// children whose rows already carry their URLs and creates only the missing
 /// ones.
 model GroomingChildClaim {
-  id            String   @id @default(cuid())
-  childKey      String   @unique
-  parentIssueId String
-  repoFullName  String
-  parentNumber  Int
-  title         String   @db.Text
-  childNumber   Int?
-  childUrl      String?  @db.Text
+  id             String   @id @default(cuid())
+  childKey       String   @unique
+  parentIssueId  String
+  repoFullName   String
+  parentNumber   Int
+  title          String   @db.Text
+  childNumber    Int?
+  childUrl       String?  @db.Text
   /// The application that claimed this child. Same-key attempts are not
   /// expected to run concurrently (the GroomingApplication resume CAS
   /// serializes fresh claims, and the groomer is confined to a single
   /// replica), so a null claim under my key is my own abandoned create.
   /// No FK: the application row may be deleted later.
-  applicationKey String? @db.Text
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  applicationKey String?  @db.Text
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   parentIssue Issue @relation(fields: [parentIssueId], references: [id], onDelete: Cascade)
 
@@ -820,24 +845,24 @@ model GroomingChildClaim {
 }
 
 model GroomerPendingReply {
-  id             String   @id @default(cuid())
-  applicationKey String   @unique
+  id             String    @id @default(cuid())
+  applicationKey String    @unique
   repoFullName   String
   issueNumber    Int
   issueId        String
-  issue          Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  issue          Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
   groomingRunId  String?
-  commentBody    String   @db.Text
+  commentBody    String    @db.Text
   reason         String
   trustContext   Json
-  status         String   @default("pending")
+  status         String    @default("pending")
   approvedBy     String?
   approvedAt     DateTime?
   postedUrl      String?
   resolvedBy     String?
   resolvedAt     DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   @@index([issueId])
   @@index([status])
@@ -849,15 +874,15 @@ model GroomerPendingReply {
 // ---------------------------------------------------------------------------
 
 model IssueSyncRun {
-  id               String   @id @default(cuid())
-  status           String
-  reposFetched     Int      @default(0)
-  syncedCount      Int      @default(0)
-  errorMessage     String?
-  notes            String?  @db.Text
-  syncType         String   @default("scheduled") // "scheduled" | "manual" | "automation"
-  startedAt        DateTime @default(now())
-  completedAt      DateTime?
+  id           String    @id @default(cuid())
+  status       String
+  reposFetched Int       @default(0)
+  syncedCount  Int       @default(0)
+  errorMessage String?
+  notes        String?   @db.Text
+  syncType     String    @default("scheduled") // "scheduled" | "manual" | "automation"
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
 
   @@index([startedAt])
   @@index([status])
@@ -869,9 +894,9 @@ model IssueSyncRun {
 // ---------------------------------------------------------------------------
 
 model SyncLock {
-  id          String   @id
-  syncRunId   String?
-  acquiredAt  DateTime @default(now())
+  id         String   @id
+  syncRunId  String?
+  acquiredAt DateTime @default(now())
 
   @@map("sync_lock")
 }
@@ -901,23 +926,23 @@ enum AgentWorkCheckpoint {
 }
 
 model AgentWork {
-  id              String            @id @default(cuid())
-  agentName       String
-  issueId         String?
-  issue           Issue?            @relation(fields: [issueId], references: [id])
-  runId           String?
-  state           AgentWorkState    @default(CLAIMED)
-  checkpoint      AgentWorkCheckpoint @default(CLAIMED)
-  branch          String?
-  prUrl           String?
-  leaseExpiresAt            DateTime?
-  lastHeartbeatAt           DateTime          @default(now())
-  staleClaimReleasePending Boolean           @default(false)
-  summary                   String?           @db.Text
-  blockerReason   String?           @db.Text
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-  history         AgentWorkHistory[]
+  id                       String              @id @default(cuid())
+  agentName                String
+  issueId                  String?
+  issue                    Issue?              @relation(fields: [issueId], references: [id])
+  runId                    String?
+  state                    AgentWorkState      @default(CLAIMED)
+  checkpoint               AgentWorkCheckpoint @default(CLAIMED)
+  branch                   String?
+  prUrl                    String?
+  leaseExpiresAt           DateTime?
+  lastHeartbeatAt          DateTime            @default(now())
+  staleClaimReleasePending Boolean             @default(false)
+  summary                  String?             @db.Text
+  blockerReason            String?             @db.Text
+  createdAt                DateTime            @default(now())
+  updatedAt                DateTime            @updatedAt
+  history                  AgentWorkHistory[]
 
   @@index([agentName])
   @@index([state])
@@ -925,15 +950,15 @@ model AgentWork {
 }
 
 model AgentWorkHistory {
-  id            String             @id @default(cuid())
+  id            String               @id @default(cuid())
   workId        String
-  work          AgentWork          @relation(fields: [workId], references: [id], onDelete: Cascade)
-  at            DateTime           @default(now())
+  work          AgentWork            @relation(fields: [workId], references: [id], onDelete: Cascade)
+  at            DateTime             @default(now())
   action        String
   state         AgentWorkState?
   checkpoint    AgentWorkCheckpoint?
-  summary       String?            @db.Text
-  blockerReason String?            @db.Text
+  summary       String?              @db.Text
+  blockerReason String?              @db.Text
 
   @@index([workId])
   @@index([at])
@@ -948,21 +973,21 @@ model AgentWorkHistory {
 // ---------------------------------------------------------------------------
 
 model Lease {
-  id         String   @id @default(cuid())
+  id         String    @id @default(cuid())
   agentName  String
   issueId    String
-  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
-  checkpoint String   // e.g. "issue_claimed", "branch_created", etc.
-  branch     String?  // working branch name
-  prUrl      String?  // associated PR URL if one exists
+  issue      Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  checkpoint String // e.g. "issue_claimed", "branch_created", etc.
+  branch     String? // working branch name
+  prUrl      String? // associated PR URL if one exists
   expiredAt  DateTime // absolute expiry; default TTL is set at creation time
   renewedAt  DateTime?
   // #1256: opaque attempt/claim token issued to the worker on claim. It fences
   // a capacity-handoff release to the EXACT claim: renewals keep the token,
   // but a released/expired lease that is re-claimed gets a fresh row and a
   // fresh token, so a stale worker's token can never release a newer claim.
-  claimToken String?  @unique
-  createdAt  DateTime @default(now())
+  claimToken String?   @unique
+  createdAt  DateTime  @default(now())
 
   @@unique([agentName, issueId])
   @@index([agentName, expiredAt])
@@ -984,7 +1009,7 @@ model Lease {
 
 model CapacityHandoff {
   id            String   @id @default(cuid())
-  capacity      String   // opaque worker-declared capacity identifier
+  capacity      String // opaque worker-declared capacity identifier
   // Which subsystem owns the handed-off work: "issue" (claim/lease release)
   // or "pr_fix" (PR-fix queue attempt).
   kind          String
@@ -993,7 +1018,7 @@ model CapacityHandoff {
   prNumber      Int?
   // The worker that handed the work off, for audit/history.
   agentName     String
-  issueId       String?  // issue-form handoffs: the local Issue row
+  issueId       String? // issue-form handoffs: the local Issue row
   // The attempt generation the handoff settles (pr_fix rows). The replay
   // check is keyed on it so a fresh attempt is never absorbed by an older
   // generation's cooldown window.
