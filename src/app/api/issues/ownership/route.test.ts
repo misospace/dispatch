@@ -31,19 +31,32 @@ const { db, applyListArgs } = vi.hoisted(() => {
     let out = rows;
     if (orderBy) {
       const clauses = Array.isArray(orderBy) ? orderBy : [orderBy];
+      // Compare by VALUE: two rows holding the same instant are two distinct
+      // Date objects, and a reference comparison would never treat them as
+      // equal — so the next `orderBy` clause (the id tie-break) would be
+      // skipped.
+      const value = (v: any) => (v instanceof Date ? v.getTime() : v);
       out = [...rows].sort((a, b) => {
         for (const clause of clauses) {
           const field = Object.keys(clause)[0];
           const spec = clause[field];
           const dir = typeof spec === "string" ? spec : (spec?.sort ?? "asc");
+          // Postgres: ASC puts NULLs last, DESC puts them first, unless the
+          // query overrides it with `nulls`.
+          const nulls =
+            (typeof spec === "object" && spec?.nulls) ??
+            (dir === "asc" ? "last" : "first");
           const av = a[field] ?? null;
           const bv = b[field] ?? null;
-          if (av === bv) continue;
-          // nulls last on a desc sort, matching the route's `nulls: "last"`
-          if (av === null) return 1;
-          if (bv === null) return -1;
-          // desc puts the LARGER value first, so a greater `a` sorts before `b`.
-          return dir === "asc" ? (av > bv ? -1 : 1) : av > bv ? -1 : 1;
+          if (av === null && bv === null) continue;
+          if (av === null) return nulls === "first" ? -1 : 1;
+          if (bv === null) return nulls === "first" ? 1 : -1;
+          const c = value(av);
+          const d = value(bv);
+          if (c === d) continue;
+          // asc: the SMALLER value first; desc: the LARGER value first.
+          if (dir === "asc") return c > d ? 1 : -1;
+          return c > d ? -1 : 1;
         }
         return 0;
       });
@@ -82,18 +95,30 @@ vi.mock("@/lib/prisma", () => ({
         db.issues.find((i) => i.id === where.id) ?? null,
     },
     lease: {
-      // list route: { where: { expiredAt: { gt } }, orderBy, take }
+      // list route: { where: { expiredAt: { gt }, renewedAt }, orderBy, take }
       // inspect:     { where: { issueId } }
       findMany: async (args?: any) => {
         const w = args?.where;
-        const rows =
-          w?.issueId
-            ? db.leases.filter((l) => l.issueId === w.issueId)
-            : w?.expiredAt?.gt
-              ? db.leases.filter(
-                  (l) => l.expiredAt.getTime() > new Date(w.expiredAt.gt).getTime(),
-                )
-              : db.leases;
+        let rows = db.leases;
+        if (w?.issueId) {
+          rows = rows.filter((l) => l.issueId === w.issueId);
+        } else {
+          if (w?.expiredAt?.gt) {
+            const cutoff = new Date(w.expiredAt.gt).getTime();
+            rows = rows.filter((l) => l.expiredAt.getTime() > cutoff);
+          }
+          // The scan reads the source as two runs: renewed leases
+          // (`renewedAt: { not: null }`) and never-renewed ones
+          // (`renewedAt: null`).
+          if (w && "renewedAt" in w) {
+            const renewed = w.renewedAt;
+            if (renewed === null) {
+              rows = rows.filter((l) => l.renewedAt === null);
+            } else if (renewed && typeof renewed === "object" && renewed.not === null) {
+              rows = rows.filter((l) => l.renewedAt !== null);
+            }
+          }
+        }
         return applyListArgs(rows, args);
       },
     },
@@ -581,35 +606,37 @@ describe("GET /api/issues/ownership — bounded source scan", () => {
   });
 });
 
-describe("GET /api/issues/ownership — lease scan freshness order (#1251 review)", () => {
+describe("GET /api/issues/ownership — lease scan activity order (#1251 review)", () => {
   const CAP = 1000;
 
   beforeEach(() => {
     reset();
   });
 
-  // `upsertLease`'s CREATE path never sets `renewedAt` (src/lib/lease.ts), so
-  // every brand-new claim carries NULL there. Keying the scan's freshness on
-  // `renewedAt` first therefore sorts the newest claims to the BACK — and, past
-  // the cap, off the end of the scan entirely. Freshness is `createdAt` first.
-  it("orders a never-renewed lease created most recently ahead of an older long-renewed one", async () => {
+  // Freshness is the lease's most recent ACTIVITY, not its creation time: a
+  // long-lived claim that its owner is still renewing is live ownership
+  // evidence, and a claim that was never renewed falls back to its creation
+  // time. Ordering on `createdAt` alone ranked a freshly claimed,
+  // never-renewed lease above an old lease that is still heartbeating — and
+  // past the cap, dropped the live one while keeping the stale one.
+  it("orders an old lease renewed moments ago ahead of a newer-created lease that was never renewed", async () => {
     db.issues = [
       makeIssue({ id: "issue-old", number: 1 }),
       makeIssue({ id: "issue-new", number: 2 }),
     ];
     db.leases = [
-      // Claimed a week ago, renewed a minute ago: freshest by `renewedAt`.
+      // Claimed a week ago, renewed a minute ago: activity is the renewal.
       makeLease({
         id: "lease-old",
         issueId: "issue-old",
         createdAt: inMin(-60 * 24 * 7),
         renewedAt: inMin(-1),
       }),
-      // Claimed a minute ago and never renewed: NULL `renewedAt`.
+      // Claimed ten minutes ago and never renewed: activity is the claim.
       makeLease({
         id: "lease-new",
         issueId: "issue-new",
-        createdAt: inMin(-1),
+        createdAt: inMin(-10),
         renewedAt: null,
       }),
     ];
@@ -624,20 +651,20 @@ describe("GET /api/issues/ownership — lease scan freshness order (#1251 review
       working: false,
     });
     // Candidates are seeded from the lease scan in scan order, so `items`
-    // mirrors it: the freshest lease first.
+    // mirrors it: the most recently touched lease first.
     expect(body.items.map((item: { id: string }) => item.id)).toEqual([
-      "issue-new",
       "issue-old",
+      "issue-new",
     ]);
   });
 
-  it("keeps the freshest never-renewed claim when the lease source overflows its cap", async () => {
+  it("keeps the recently renewed lease and drops the stale never-renewed one when the lease source overflows its cap", async () => {
     db.issues = [
       makeIssue({ id: "issue-old", number: 1 }),
       makeIssue({ id: "issue-new", number: 2 }),
     ];
-    // One probe row past the cap: the oldest long-renewed claim is the row the
-    // scan must drop — never the freshest, never-renewed one.
+    // 1000 long-lived claims, all renewed a minute ago, plus one claim that
+    // was never renewed and is therefore the stalest row in the source.
     db.leases = [
       ...Array.from({ length: CAP }, (_, i) =>
         makeLease({
@@ -652,7 +679,7 @@ describe("GET /api/issues/ownership — lease scan freshness order (#1251 review
         id: "lease-new",
         agentName: "alpha-new",
         issueId: "issue-new",
-        createdAt: inMin(-1),
+        createdAt: inMin(-10),
         renewedAt: null,
       }),
     ];
@@ -666,12 +693,78 @@ describe("GET /api/issues/ownership — lease scan freshness order (#1251 review
       leased: true,
       working: false,
     });
-    // The cap drops exactly one row, and it is a long-renewed old claim.
+    // The cap drops the stalest row — the never-renewed claim — and keeps the
+    // live one. Under a `createdAt`-first order the live, long-lived claim was
+    // the row that fell off the end of the scan.
     expect(body.items.map((item: { id: string }) => item.id)).toEqual([
-      "issue-new",
       "issue-old",
     ]);
-    expect(body.examined).toBe(2);
+    expect(body.examined).toBe(1);
+  });
+
+  it("breaks equal-activity ties by ascending lease id", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-b", number: 2 }),
+      makeIssue({ id: "issue-a", number: 1 }),
+    ];
+    // Same renewal instant: only the id tie-break separates the two, so this
+    // fails if the test double does not honour the query's `id: "asc"`.
+    db.leases = [
+      makeLease({
+        id: "lease-b",
+        issueId: "issue-b",
+        createdAt: inMin(-5),
+        renewedAt: inMin(-1),
+      }),
+      makeLease({
+        id: "lease-a",
+        issueId: "issue-a",
+        createdAt: inMin(-5),
+        renewedAt: inMin(-1),
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-a",
+      "issue-b",
+    ]);
+  });
+
+  it("applies the same id tie-break across the renewed and never-renewed runs", async () => {
+    db.issues = [
+      makeIssue({ id: "issue-z", number: 2 }),
+      makeIssue({ id: "issue-a", number: 1 }),
+    ];
+    db.leases = [
+      // Renewed lease: its activity is the renewal.
+      makeLease({
+        id: "lease-z",
+        issueId: "issue-z",
+        createdAt: inMin(-10),
+        renewedAt: inMin(-1),
+      }),
+      // Never-renewed lease: its activity is the claim time — the SAME
+      // instant, so only the id tie-break separates the two runs.
+      makeLease({
+        id: "lease-a",
+        issueId: "issue-a",
+        createdAt: inMin(-1),
+        renewedAt: null,
+      }),
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.items.map((item: { id: string }) => item.id)).toEqual([
+      "issue-a",
+      "issue-z",
+    ]);
   });
 });
 

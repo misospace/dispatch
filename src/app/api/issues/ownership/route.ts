@@ -29,6 +29,55 @@ interface OwnershipListItem {
   evidence: OwnershipEvidenceView;
 }
 
+/** The `Lease` columns the bounded scan orders on. */
+interface LeaseScanRow {
+  id: string;
+  issueId: string;
+  createdAt: Date;
+  renewedAt: Date | null;
+}
+
+/**
+ * Effective activity of a lease: its last renewal, or its claim time when it
+ * was never renewed. Both renewal paths (`upsertLease` and the ownership
+ * capability) stamp `renewedAt`, so this is the row's most recent touch in
+ * every case.
+ */
+function leaseActivity(row: LeaseScanRow): number {
+  return (row.renewedAt ?? row.createdAt).getTime();
+}
+
+/**
+ * Most recent activity first; `id` ascending breaks ties deterministically.
+ * The id is a cuid (lower-case alphanumeric), so the JS comparison and the
+ * database's `id ASC` order agree.
+ */
+function compareLeaseActivity(x: LeaseScanRow, y: LeaseScanRow): number {
+  const ax = leaseActivity(x);
+  const ay = leaseActivity(y);
+  if (ax !== ay) return ay - ax;
+  return x.id < y.id ? -1 : x.id > y.id ? 1 : 0;
+}
+
+/**
+ * Merge two runs that are each already sorted by (activity desc, id asc) into
+ * one run with the same order. Only the heads are compared — the runs are
+ * never re-sorted — so the query's `orderBy` stays the single source of
+ * ordering truth and the `id` tie-break is the same on both sides of the
+ * merge.
+ */
+function mergeLeaseRuns(a: LeaseScanRow[], b: LeaseScanRow[]): LeaseScanRow[] {
+  const merged: LeaseScanRow[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    const takeA =
+      j >= b.length || (i < a.length && compareLeaseActivity(a[i], b[j]) <= 0);
+    merged.push(takeA ? a[i++] : b[j++]);
+  }
+  return merged;
+}
+
 /**
  * GET /api/issues/ownership — operator debug surface: the derived ownership
  * state for every issue that plausibly has a claim (#1251,
@@ -49,6 +98,10 @@ interface OwnershipListItem {
  * (`labeled` = label sweep, `leased` = active lease, `working` = active
  * AgentWork), whether that source had more rows than the cap — so an operator
  * can tell which signal overflowed rather than only that something did.
+ *
+ * "Most recent" means the row's most recent ACTIVITY: for a lease that is its
+ * last renewal (falling back to its claim time when it was never renewed), for
+ * an issue or an AgentWork row its last update.
  *
  * Operator-only: worker-tier callers get 403 by the central tiering (this
  * route is not in `WORKER_ALLOWLIST`), not by any local check.
@@ -112,25 +165,40 @@ export async function GET(request: Request) {
   });
   const openLabeled = labeledRows.slice(0, MAX_CANDIDATE_SCAN);
   const labeledTruncated = labeledRows.length > MAX_CANDIDATE_SCAN;
-  // (b) issues referenced by an active (non-expired) lease. Freshness keys on
-  // `createdAt` FIRST, not `renewedAt`: `upsertLease`'s create path never sets
-  // `renewedAt`, so every newly claimed lease is NULL there, and a nulls-last
-  // primary key on `renewedAt` would sort those past the cap — keeping
-  // long-renewed claims and dropping the newest ones, backwards for a "who owns
-  // what right now" surface. `renewedAt` (nulls-last) then `id` break ties
-  // deterministically so equal timestamps cannot reorder between runs.
-  const leasedRows = await prisma.lease.findMany({
-    where: { expiredAt: { gt: now } },
-    select: { issueId: true },
-    orderBy: [
-      { createdAt: "desc" },
-      { renewedAt: { sort: "desc", nulls: "last" } },
-      { id: "asc" },
-    ],
+  // (b) issues referenced by an active (non-expired) lease. Freshness is the
+  // row's most recent ACTIVITY, not its creation: a lease renewed a moment
+  // ago is live ownership evidence even when the claim itself is old, and a
+  // never-renewed claim's activity is its creation time. Ordering on
+  // `createdAt` alone ranked a freshly claimed, never-renewed lease above an
+  // old lease its owner is still heartbeating — and past the cap, dropped the
+  // live one while keeping the stale one.
+  //
+  // Prisma's `orderBy` cannot express that combined timestamp, so the source
+  // is read as two runs that are each already sorted by their activity
+  // timestamp — renewed leases by `renewedAt`, never-renewed leases by
+  // `createdAt` — and merged below on the same key. `id` breaks ties in both
+  // the query and the merge, so equal timestamps cannot reorder between runs.
+  const renewedRows = await prisma.lease.findMany({
+    where: { expiredAt: { gt: now }, renewedAt: { not: null } },
+    select: { id: true, issueId: true, createdAt: true, renewedAt: true },
+    orderBy: [{ renewedAt: "desc" }, { id: "asc" }],
     take: SCAN_TAKE,
   });
-  const activeLeased = leasedRows.slice(0, MAX_CANDIDATE_SCAN);
-  const leasedTruncated = leasedRows.length > MAX_CANDIDATE_SCAN;
+  const neverRenewedRows = await prisma.lease.findMany({
+    where: { expiredAt: { gt: now }, renewedAt: null },
+    select: { id: true, issueId: true, createdAt: true, renewedAt: true },
+    orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+    take: SCAN_TAKE,
+  });
+  // The merged pool is capped too: each run's probe row is older than the cap
+  // worth of rows the run itself returned, so slicing the merged pool drops
+  // exactly the rows the probe rows stand for.
+  const mergedLeases = mergeLeaseRuns(renewedRows, neverRenewedRows);
+  const activeLeased = mergedLeases.slice(0, MAX_CANDIDATE_SCAN);
+  const leasedTruncated =
+    renewedRows.length > MAX_CANDIDATE_SCAN ||
+    neverRenewedRows.length > MAX_CANDIDATE_SCAN ||
+    mergedLeases.length > MAX_CANDIDATE_SCAN;
   // (c) issues with an active AgentWork row. `updatedAt` moves on every
   // checkpoint/heartbeat write, so it is the row's most recent activity.
   const workingRows = await prisma.agentWork.findMany({

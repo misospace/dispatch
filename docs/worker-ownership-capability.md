@@ -102,10 +102,16 @@ central tiering):
 - `GET /api/issues/ownership` — cached-list inspection over every issue with a
   claim signal (agent label / active lease / active AgentWork).
   `?state=<OWNERSHIP_STATES>` filter, `limit` (default 50, max 200).
-  Bounded scan: each of the three candidate sources is read newest-first
-  (`Issue.updatedAt`, `Lease.createdAt` → `renewedAt` nulls-last → `id`,
-  `AgentWork.updatedAt` → `id`) capped at 1000 rows, and at most 500
-  candidates are derived with chunked concurrency. The response reports
+  Bounded scan: each of the three candidate sources is read
+  most-recently-touched-first, capped at 1000 rows, and at most 500
+  candidates are derived with chunked concurrency. "Most recent" is the row's
+  last ACTIVITY: an issue or AgentWork row's last update, and a lease's last
+  renewal — falling back to its claim time when it was never renewed. The
+  lease source is read as two runs (renewed leases by `renewedAt`,
+  never-renewed leases by `createdAt`) and merged on that activity timestamp,
+  with `id` ascending as the tie-break; so a long-lived claim that its owner
+  is still renewing outranks a newer claim that was never renewed, and the
+  bounded scan cannot drop a live owner while keeping a stale one. The response reports
   `{ items, counts, examined, truncated, sourcesTruncated, limit, windows }`:
   `truncated` means candidates were dropped before derivation (so
   `counts`/`examined` describe only the inspected set), while
