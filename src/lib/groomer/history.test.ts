@@ -345,7 +345,7 @@ describe("listGroomingRuns", () => {
     );
   });
 
-  it("includes issue title/state, agentRun and application count", async () => {
+  it("includes issue title/state, agentRun, application count and latest application", async () => {
     await listGroomingRuns(mockPrisma, {});
 
     expect(mocks.findMany).toHaveBeenCalledWith(
@@ -354,6 +354,7 @@ describe("listGroomingRuns", () => {
           issue: { select: { title: true, state: true } },
           agentRun: true,
           _count: { select: { applications: true } },
+          applications: { orderBy: { createdAt: "desc" }, take: 1, select: { createdAt: true } },
         },
       }),
     );
@@ -373,8 +374,11 @@ describe("listGroomingRuns", () => {
         contextSummary: { evidence: { headSha: "a".repeat(40) } },
         commentBodyPreview: "comment body text",
         validatedOutput: { schemaVersion: 1, verdict: { actionability: "ready" } },
+        mutationPlan: { applicationKey: "key-1" },
+        appliedMutations: { outcome: "applied" },
         issue: { title: "Fix login", state: "open" },
-        _count: { applications: 1 },
+        _count: { applications: 2 },
+        applications: [{ createdAt: new Date("2026-10-09T00:00:00.000Z") }],
       },
     ]);
 
@@ -385,10 +389,19 @@ describe("listGroomingRuns", () => {
     expect(row).not.toHaveProperty("rawOutput");
     expect(row).not.toHaveProperty("contextSummary");
     expect(row).not.toHaveProperty("commentBodyPreview");
-    expect(row.validatedOutput).toBeDefined();
-    const view = row.view as { evidence: { headSha: string | null }; plan: { format: string } };
+    expect(row).not.toHaveProperty("validatedOutput");
+    expect(row).not.toHaveProperty("mutationPlan");
+    expect(row).not.toHaveProperty("appliedMutations");
+    expect(row).not.toHaveProperty("applications");
+    const view = row.view as {
+      evidence: { headSha: string | null };
+      plan: { format: string };
+      application: { applicationCount: number | null; lastApplicationAt: string | null };
+    };
     expect(view.evidence.headSha).toBe("a".repeat(40));
     expect(view.plan.format).toBe("grooming-plan");
+    expect(view.application.applicationCount).toBe(2);
+    expect(view.application.lastApplicationAt).toBe("2026-10-09T00:00:00.000Z");
   });
 
   it("combines multiple filters", async () => {
@@ -411,6 +424,7 @@ describe("listGroomingRuns", () => {
         issue: { select: { title: true, state: true } },
         agentRun: true,
         _count: { select: { applications: true } },
+        applications: { orderBy: { createdAt: "desc" }, take: 1, select: { createdAt: true } },
       },
     });
   });

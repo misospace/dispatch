@@ -125,6 +125,9 @@ export async function listGroomingRuns(
       issue: { select: { title: true, state: true } },
       agentRun: true,
       _count: { select: { applications: true } },
+      // Latest application only: the list view needs `lastApplicationAt`;
+      // full application rows stay on the detail API.
+      applications: { orderBy: { createdAt: "desc" }, take: 1, select: { createdAt: true } },
     },
   }).then((rows) => rows.map((row: any) => serializeGroomingRunSummary(row)));
 }

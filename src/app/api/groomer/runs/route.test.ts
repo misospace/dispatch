@@ -98,7 +98,6 @@ describe("GET /api/groomer/runs", () => {
         status: "completed",
         dryRun: false,
         model: "gpt-4o-mini",
-        validatedOutput: { schemaVersion: 1, verdict: { actionability: "ready" } },
         view: { stage: "applied", evidence: { headSha: "a".repeat(40), pinned: true }, plan: { format: "grooming-plan" } },
         issue: { title: "Fix login", state: "open" },
       },
@@ -112,6 +111,7 @@ describe("GET /api/groomer/runs", () => {
     expect(body[0]).not.toHaveProperty("rawOutput");
     expect(body[0]).not.toHaveProperty("contextSummary");
     expect(body[0]).not.toHaveProperty("commentBodyPreview");
+    expect(body[0]).not.toHaveProperty("validatedOutput");
   });
 
   it("returns 500 when list throws", async () => {

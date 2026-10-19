@@ -75,6 +75,8 @@ export interface GroomingRunPlanView {
   ready: boolean | null;
   admission: string | null;
   summary: string | null;
+  citationCount: number;
+  materialUncertaintyCount: number;
 }
 
 export interface GroomingRunPreconditionView {
@@ -421,6 +423,8 @@ export function buildGroomingRunView(run: unknown): GroomingRunView {
       ready: summary.ready,
       admission: summary.admission,
       summary: summary.summary,
+      citationCount: summary.citationCount,
+      materialUncertaintyCount: summary.materialUncertaintyCount,
     },
     precondition: preconditionView(
       row.preconditions,
@@ -438,15 +442,31 @@ export function buildGroomingRunView(run: unknown): GroomingRunView {
 
 /**
  * Strip the heavy/debug-only fields a list response should not carry and
- * attach the operator view. Raw model output, the raw context summary and
- * the comment preview stay available on the detail API only.
+ * attach the operator view. Raw model output, the raw context summary, the
+ * comment preview, the full validated plan (proposed bodies, comment drafts,
+ * briefs), the mutation plan and the applied mutations stay available on the
+ * detail API only; the included latest-application row is folded into the
+ * view's `lastApplicationAt` and then dropped.
  */
 export function serializeGroomingRunSummary(row: unknown): Obj {
   const base = isObj(row) ? row : {};
-  const { rawOutput: _raw, contextSummary: _context, commentBodyPreview: _preview, ...rest } = base as Obj & {
+  const {
+    rawOutput: _raw,
+    contextSummary: _context,
+    commentBodyPreview: _preview,
+    validatedOutput: _validated,
+    mutationPlan: _plan,
+    appliedMutations: _applied,
+    applications: _applications,
+    ...rest
+  } = base as Obj & {
     rawOutput?: unknown;
     contextSummary?: unknown;
     commentBodyPreview?: unknown;
+    validatedOutput?: unknown;
+    mutationPlan?: unknown;
+    appliedMutations?: unknown;
+    applications?: unknown;
   };
   return { ...rest, view: buildGroomingRunView(row) };
 }

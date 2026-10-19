@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ExternalLink, Play, RefreshCw, Loader2, AlertCircle, CheckCircle2, Hash, GitBranch, MessageSquareWarning, ChevronRight, ChevronDown, ShieldAlert, Pin, Link2 } from "lucide-react";
-import { summarizeGroomingOutput } from "@/lib/groomer/plan-summary";
 import type { GroomingRunView } from "@/lib/groomer/run-view";
 
 interface PendingReplyRow {
@@ -36,7 +35,6 @@ interface GroomingRunRow {
   laneAfter: string | null;
   errorMessage: string | null;
   createdAt: string;
-  validatedOutput?: unknown;
   issue?: { title: string; state: string };
   view?: GroomingRunView;
 }
@@ -309,30 +307,32 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 /**
- * The run's verdict. Plan-contract runs show evidence-checked readiness;
- * runs recorded before it (legacy output) show their actionability only.
+ * The run's verdict, rendered from the operator view's plan summary. List rows
+ * carry no raw `validatedOutput`; the full validated plan stays on the detail
+ * API. Legacy rows show their actionability only.
  */
-function VerdictCell({ validatedOutput }: { validatedOutput: unknown }) {
-  const verdict = summarizeGroomingOutput(validatedOutput);
-  if (verdict.format === "unknown") return <span className="text-xs text-muted-foreground">-</span>;
-  const label = verdict.actionability?.replace(/_/g, " ") ?? "unknown";
+function VerdictCell({ plan }: { plan?: GroomingRunView["plan"] }) {
+  const format = plan?.format ?? "unknown";
+  if (format === "unknown") return <span className="text-xs text-muted-foreground">-</span>;
+  const label = plan?.actionability?.replace(/_/g, " ") ?? "unknown";
   const cls =
-    verdict.ready === true
+    plan?.ready === true
       ? "bg-green-100 text-green-700"
-      : verdict.ready === false
+      : plan?.ready === false
         ? "bg-amber-100 text-amber-800"
         : "bg-muted text-muted-foreground";
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1">
         <Badge className={cls}>{label}</Badge>
-        {verdict.admission && <Badge variant="outline" className="text-xs">{verdict.admission}</Badge>}
-        {verdict.format === "legacy" && <Badge variant="outline" className="text-xs">legacy</Badge>}
+        {plan?.admission && <Badge variant="outline" className="text-xs">{plan.admission}</Badge>}
+        {format === "legacy" && <Badge variant="outline" className="text-xs">legacy</Badge>}
       </div>
-      {verdict.format === "grooming-plan" && (
+      {format === "grooming-plan" && (
         <div className="text-xs text-muted-foreground">
-          {verdict.citationCount} cited
-          {verdict.materialUncertaintyCount > 0 && `, ${verdict.materialUncertaintyCount} open question${verdict.materialUncertaintyCount === 1 ? "" : "s"}`}
+          {plan?.citationCount ?? 0} cited
+          {(plan?.materialUncertaintyCount ?? 0) > 0 &&
+            `, ${plan?.materialUncertaintyCount} open question${plan?.materialUncertaintyCount === 1 ? "" : "s"}`}
         </div>
       )}
     </div>
@@ -781,7 +781,7 @@ export default function GroomerHistoryPage() {
                       <Badge variant="secondary">{run.dryRun ? "dry-run" : "write"}</Badge>
                     </TableCell>
                     <TableCell>
-                      <VerdictCell validatedOutput={run.validatedOutput} />
+                      <VerdictCell plan={run.view?.plan} />
                     </TableCell>
                     <TableCell>
                       <EvidenceCell view={run.view} />

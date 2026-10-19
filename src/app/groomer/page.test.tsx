@@ -31,7 +31,6 @@ function baseRun(overrides: Record<string, unknown> = {}): Record<string, unknow
     laneAfter: "local",
     errorMessage: null,
     createdAt: "2026-10-10T00:00:00.000Z",
-    validatedOutput: { schemaVersion: 1, verdict: { actionability: "ready" }, readiness: { ready: true } },
     ...overrides,
   };
 }
@@ -87,7 +86,7 @@ describe("Hosted Groomer history page", () => {
           json: () =>
             Promise.resolve([
               baseRun({ view: appliedView() }),
-              baseRun({ id: "run-legacy", issueNumber: 7, validatedOutput: undefined, view: undefined }),
+              baseRun({ id: "run-legacy", issueNumber: 7, view: undefined }),
             ]),
         });
       }
@@ -340,5 +339,34 @@ describe("Hosted Groomer history page", () => {
     expect(prLink).toHaveTextContent("github:pr:org/repo#12");
     expect(panel).toHaveTextContent("pull_request, merged, read");
     expect(panel).toHaveTextContent("confidence: unknown");
+  });
+
+  it("renders the verdict cell from the view plan without validatedOutput", async () => {
+    mockAuthedFetch.mockImplementation((url: string) => {
+      if (String(url).includes("/api/groomer/runs")) {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve([
+              baseRun({ view: appliedView({ plan: { schemaVersion: 1, format: "grooming-plan", actionability: "ready", ready: true, admission: "implementation", summary: "Ready", citationCount: 2, materialUncertaintyCount: 1 } }) }),
+              baseRun({
+                id: "run-legacy",
+                issueNumber: 7,
+                view: appliedView({ plan: { schemaVersion: null, format: "legacy", actionability: "blocked", ready: null, admission: null, summary: "legacy", citationCount: 0, materialUncertaintyCount: 0 } }),
+              }),
+              baseRun({ id: "run-unknown", issueNumber: 9, view: undefined }),
+            ]),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+    });
+
+    render(<GroomerHistoryPage />);
+
+    expect(await screen.findByText("ready")).toBeInTheDocument();
+    expect(screen.getByText("implementation")).toBeInTheDocument();
+    expect(screen.getByText("2 cited, 1 open question")).toBeInTheDocument();
+    expect(screen.getByText("blocked")).toBeInTheDocument();
+    expect(screen.getByText("legacy")).toBeInTheDocument();
   });
 });

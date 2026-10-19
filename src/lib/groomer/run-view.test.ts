@@ -582,12 +582,65 @@ describe("serializeGroomingRunSummary", () => {
     expect(serialized).not.toHaveProperty("rawOutput");
     expect(serialized).not.toHaveProperty("contextSummary");
     expect(serialized).not.toHaveProperty("commentBodyPreview");
+    expect(serialized).not.toHaveProperty("validatedOutput");
+    expect(serialized).not.toHaveProperty("mutationPlan");
+    expect(serialized).not.toHaveProperty("appliedMutations");
+    expect(serialized).not.toHaveProperty("applications");
     expect(serialized).toHaveProperty("view");
-    const view = serialized.view as { evidence: { headSha: string | null } };
+    // The verdict cell renders from the view's plan summary alone.
+    const view = serialized.view as {
+      evidence: { headSha: string | null };
+      plan: { format: string; actionability: string | null; ready: boolean | null; citationCount: number };
+    };
     expect(view.evidence.headSha).toBe(HEAD);
-    // validatedOutput stays so the UI verdict cell keeps working.
-    expect(serialized).toHaveProperty("validatedOutput");
-    expect(serialized).toHaveProperty("mutationPlan");
+    expect(view.plan.format).toBe("grooming-plan");
+    expect(view.plan.actionability).toBe("ready");
+    expect(view.plan.ready).toBe(true);
+    expect(typeof view.plan.citationCount).toBe("number");
+  });
+
+  it("never leaks proposed bodies or comment drafts through list rows", () => {
+    const run = appliedPlanRun({
+      validatedOutput: {
+        schemaVersion: 1,
+        verdict: { actionability: "ready", confidence: "high", summary: "Ready to implement" },
+        mutations: {
+          proposedTitle: "secret title",
+          proposedBody: "proposed body text",
+          githubComment: "comment body text",
+          close: { reason: "already_done", rationale: "close criterion excerpt text" },
+        },
+        childBriefs: [{ title: "child brief", body: "child brief body" }],
+      },
+      rawOutput: "raw model output text",
+      commentBodyPreview: "comment preview text",
+      contextSummary: { evidence: { issueFingerprint: "fp" }, commentBodies: ["comment body text"] },
+      appliedMutations: { outcome: "applied", appliedBody: "applied body text" },
+    });
+    const serialized = JSON.stringify(serializeGroomingRunSummary(run));
+
+    expect(serialized).not.toContain("proposed body text");
+    expect(serialized).not.toContain("comment body text");
+    expect(serialized).not.toContain("raw model output text");
+    expect(serialized).not.toContain("comment preview text");
+    expect(serialized).not.toContain("applied body text");
+    // The operator verdict summary still renders.
+    const view = (JSON.parse(serialized) as { view: { plan: { format: string; actionability: string | null } } }).view;
+    expect(view.plan.format).toBe("grooming-plan");
+    expect(view.plan.actionability).toBe("ready");
+  });
+
+  it("derives lastApplicationAt from a latest-application list include", () => {
+    const run = appliedPlanRun({
+      applications: [{ id: "app-9", status: "applied", createdAt: "2026-10-11T00:00:00.000Z" }],
+      _count: { applications: 3 },
+    });
+    const serialized = serializeGroomingRunSummary(run) as {
+      view: { application: { applicationCount: number | null; lastApplicationAt: string | null } };
+    };
+    expect(serialized.view.application.lastApplicationAt).toBe("2026-10-11T00:00:00.000Z");
+    // Count still comes from `_count`, not the single included row.
+    expect(serialized.view.application.applicationCount).toBe(3);
   });
 
   it("passes through non-object rows safely", () => {
