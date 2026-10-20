@@ -591,3 +591,41 @@ describe("POST /api/issues/actions — #1037 live label gate", () => {
     });
   });
 });
+
+describe("POST /api/issues/actions — rate limit", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findIssue.mockResolvedValue({
+      id: "issue-1",
+      state: "open",
+      labels: ["status/backlog"],
+    });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/backlog"]);
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 10s)", async () => {
+    // Fake timers freeze Date.now(), so the 10s window cannot roll mid-burst
+    // on a slow runner and the 31st request is still rejected.
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 30; i++) {
+        const res = await postRequest(makePayload());
+        expect(res.status).toBe(200);
+      }
+
+      const res = await postRequest(makePayload());
+      expect(res.status).toBe(429);
+      expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+      expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+      // The 31st request is rejected before any GitHub label write or cache write.
+      expect(mocks.updateIssueLabels).toHaveBeenCalledTimes(30);
+      expect(mocks.updateIssue).toHaveBeenCalledTimes(30);
+      expect(mocks.createAuditLog).toHaveBeenCalledTimes(30);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

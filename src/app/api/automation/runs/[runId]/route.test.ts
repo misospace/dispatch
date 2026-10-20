@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
@@ -9,6 +10,8 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     findUnique: vi.fn().mockResolvedValue(null),
     auditLog: { create: vi.fn().mockResolvedValue({ id: "log-1" }) },
+    rerunWorkflow: vi.fn().mockResolvedValue(undefined),
+    triggerWorkflowDispatch: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -21,11 +24,17 @@ vi.mock("@/lib/prisma", () => ({
 }));
 
 vi.mock("@/lib/github", () => ({
-  rerunWorkflow: vi.fn().mockResolvedValue(undefined),
-  triggerWorkflowDispatch: vi.fn().mockResolvedValue(undefined),
+  rerunWorkflow: mocks.rerunWorkflow,
+  triggerWorkflowDispatch: mocks.triggerWorkflowDispatch,
 }));
 
 import { POST } from "./route";
+
+// The rate limiter keeps module-global state — reset it so the per-actor
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 describe("POST /api/automation/runs/[runId] — auth", () => {
   it("returns 401 when no authorization header is provided", async () => {
@@ -120,5 +129,33 @@ describe("POST /api/automation/runs/[runId] — validation", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
+  });
+});
+
+describe("POST /api/automation/runs/[runId] — rate limit", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "wr-1", workflowId: "gw-1" });
+  });
+
+  it("returns 429 after exceeding the rate limit (10 per 60s)", async () => {
+    for (let i = 0; i < 10; i++) {
+      const res = await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=rerun", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+      }), { params: Promise.resolve({ runId: "123" }) });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(new Request("http://localhost/api/automation/runs/123?repo=org/repo&action=rerun", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+    }), { params: Promise.resolve({ runId: "123" }) });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The 11th request is rejected before any GitHub call is made.
+    expect(mocks.rerunWorkflow).toHaveBeenCalledTimes(10);
+    expect(mocks.triggerWorkflowDispatch).not.toHaveBeenCalled();
   });
 });

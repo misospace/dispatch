@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN, authedRequest, makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 const mocks = vi.hoisted(() => ({
   authorizeRequest: vi.fn(),
@@ -34,6 +35,9 @@ import { POST } from "./route";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The rate limiter keeps module-global state — reset it so the per-actor
+  // window never leaks between tests.
+  resetRateLimits();
   mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "bearer", actor: "scheduler" });
   mocks.acquireLock.mockResolvedValue({ locked: true, runId: "run-1" });
   mocks.reclaimStalePrFixHandouts.mockResolvedValue({
@@ -114,5 +118,20 @@ describe("POST /api/pr-fix-queue/sweep", () => {
     const body = await res.json();
     expect(body.error).toBe("PR-fix hand-out sweep failed");
     expect(mocks.releaseLock).toHaveBeenCalledWith("run-1");
+  });
+
+  it("returns 429 after exceeding the rate limit (6 per 60s)", async () => {
+    for (let i = 0; i < 6; i++) {
+      const res = await POST(authedRequest("http://localhost/api/pr-fix-queue/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(authedRequest("http://localhost/api/pr-fix-queue/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The 7th request is rejected before the sweep touches the queue.
+    expect(mocks.acquireLock).toHaveBeenCalledTimes(6);
+    expect(mocks.reclaimStalePrFixHandouts).toHaveBeenCalledTimes(6);
   });
 });
