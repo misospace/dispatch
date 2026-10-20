@@ -2,9 +2,13 @@
 
 > **Issue:** [misospace/dispatch#1244](https://github.com/misospace/dispatch/issues/1244)
 >
-> **Status: design only.** This document specifies behavior; it does not
-> implement it. No schema, route, budget, credential, or deployment change is
-> authorized by this design alone. See [Non-goals](#non-goals).
+> **Status: partially implemented (#1253).** The recovery transition table
+> (rows 8-16 semantics: the recovery cooldown, stale-disposition flag,
+> disposition audit stamps, and evidence-driven reactivation of
+> budget-available PARKED and structured WAITING_EXTERNAL items) is
+> implemented in `src/lib/pr-fix-recovery.ts` (`evaluateRecovery`) and wired
+> into the enqueue path and `reconcileExternalWaitTriggers` as of #1253.
+> The rest of this document remains the specification.
 
 **Reading this document.** Every claim is marked:
 
@@ -411,6 +415,10 @@ must be:
 
 - **Bounded** per run (page/cap, like `reclaimStalePrFixHandouts`,
   `:822`), so a backlog never becomes a thundering herd;
+- **Fair-rotating** — the bounded external-wait trigger pass
+  (`reconcileExternalWaitTriggers`) reads waits least-recently-considered first
+  and stamps every row it considered in `triggerEvaluatedAt`, so an earlier
+  unsatisfied or invalid wait can never starve a later one out of discovery;
 - **Idempotent** — it re-computes `(identity, version)` and no-ops on anything
   already in the ledger, **except** the `#940` re-observation at `FIXED` with an
   unchanged head (row 6 — ledger dedupe must not swallow that net on the

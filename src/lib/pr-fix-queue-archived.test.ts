@@ -22,7 +22,19 @@ function makeClient(items: any[]): PrFixQueueClient & { items: any[]; history: a
         throw new Error("unused");
       },
       update: async ({ where, data }: any) => Object.assign(items.find((i) => i.id === where.id), data),
-      updateMany: async () => ({ count: 0 }),
+      // #1253: the reap writes are generation-AND-status pinned updateMany
+      // calls; the fake honors the where clause like the real client so a
+      // concurrent requeue in the read→write gap no-ops the reap.
+      updateMany: async ({ where, data }: any) => {
+        const hits = items.filter(
+          (i) =>
+            (where.id === undefined || i.id === where.id) &&
+            (where.generation === undefined || i.generation === where.generation) &&
+            (where.status === undefined || i.status === where.status),
+        );
+        for (const hit of hits) Object.assign(hit, data);
+        return { count: hits.length };
+      },
     },
     prFixHistory: { create: async ({ data }: any) => history.push(data) },
   };
@@ -61,6 +73,33 @@ describe("archived repos (#1106)", () => {
     // carries no attempt for a durable snapshot to bound, and a stale one would
     // reopen the item on evidence this attempt already had.
     expect(client.items[0].attemptEvidenceWatermark).toBeNull();
+  });
+
+  it("a concurrent requeue in the read→write gap wins over the reap (pinned write, #1253)", async () => {
+    const client = makeClient([{ ...item("a", "org/archived", 1, "QUEUED"), generation: 3 }]);
+    // Simulate the row moving between the reap's read and its write: the
+    // where pin (status + generation) no longer matches, so the write no-ops
+    // and no history row is written.
+    client.prFixQueueItem.updateMany = async ({ where }: any) => {
+      // The concurrent requeue lands BEFORE the write evaluates: it bumped
+      // the generation and flipped the status, so the pin misses.
+      client.items[0].generation = 4;
+      client.items[0].status = "QUEUED";
+      const hit = client.items.find(
+        (i: any) =>
+          i.id === where.id &&
+          i.status === where.status &&
+          i.generation === where.generation,
+      );
+      return { count: hit ? 1 : 0 };
+    };
+
+    const result = await reconcileArchivedRepoPrFixItems(client, vi.fn(async () => true));
+
+    expect(result.markedStale).toBe(0);
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(4);
+    expect(client.history).toHaveLength(0);
   });
 
   it("refuses to requeue an item in an archived repo", async () => {
