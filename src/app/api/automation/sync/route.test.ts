@@ -94,6 +94,7 @@ vi.mock("@/lib/github", () => ({
   fetchRecentRunsAllWorkflows: vi.fn().mockResolvedValue([]),
   fetchReleases: vi.fn().mockResolvedValue([]),
   fetchPullRequests: vi.fn().mockResolvedValue([]),
+  fetchClosedPullRequests: vi.fn().mockResolvedValue([]),
   fetchLatestCommit: vi.fn().mockResolvedValue({ sha: "abc123" }),
   fetchPackages: vi.fn().mockResolvedValue([]),
 }));
