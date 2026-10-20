@@ -73,6 +73,8 @@ export const LIFECYCLE_SOURCES = [
   "webhook",
   /** POST /api/agents/{agent}/tasks/report. */
   "agent-report",
+  /** A bounded backfill over already-observed records (#1203). */
+  "backfill",
 ] as const;
 
 export type LifecycleSource = (typeof LIFECYCLE_SOURCES)[number];
@@ -501,4 +503,130 @@ export async function recordStatusTransitionQuietly(
     );
     return false;
   }
+}
+
+/**
+ * One merge of one PR, as observed from an authoritative source. Never build
+ * this from a worker's success report: a merge is only ever evidence that
+ * GitHub says the PR merged (`mergedAt`), correlated to the issue through an
+ * explicit link (`linkSource`), never inferred from a PR title.
+ */
+export interface PrMergeObservation {
+  prNumber: number;
+  prUrl?: string | null;
+  /** GitHub's own merge time. Required — a merge without a time is "unknown". */
+  mergedAt?: Date | string | null;
+  mergeCommitSha?: string | null;
+  headSha?: string | null;
+  /**
+   * How the PR is correlated to the issue: `body-keyword` (Fixes/Closes
+   * keyword in the PR body), `closing-issues-references` (GitHub's own
+   * link graph), `agent-run-touch` (a worker run record naming this PR), or
+   * `branch-name` (weakest — kept only so reconcile's existing close
+   * heuristic stays auditable). Title matches are never a link source.
+   */
+  linkSource?: string | null;
+}
+
+/**
+ * Canonical idempotency identity for "PR <n> merged into <repo>, closing /
+ * referenced by issue <n>".
+ *
+ * The `reconciler` prefix is historical (it is the writer that introduced the
+ * key) and deliberately shared by every merge observer — reconcile, sync, and
+ * the bounded backfill — so the same physical merge observed twice lands on
+ * one row instead of one row per observer. A merge without a timestamp keys on
+ * the literal `unknown`, matching the pre-existing reconcile rows.
+ */
+export function prMergedDedupeKey(
+  repoFullName: string,
+  issueNumber: number,
+  prNumber: number,
+  mergedAt?: Date | string | null,
+): string {
+  return lifecycleDedupeKey(
+    "reconciler",
+    repoFullName,
+    issueNumber,
+    "pr_merged",
+    prNumber,
+    prMergeStamp(mergedAt),
+  );
+}
+
+/**
+ * Canonical stamp text for a merge identity. GitHub emits second-precision
+ * `Z` timestamps and the pre-#1203 reconcile keyed on that raw string, so a
+ * `Date` (which `toISOString` renders with `.000Z`) and the string form of the
+ * same instant must produce the same stamp — otherwise the backfill and a
+ * later reconcile would land on different keys for one physical merge. An
+ * unparseable non-null value keeps its raw text as identity: it is garbage
+ * input, but it must stay stable across observers.
+ */
+export function prMergeStamp(mergedAt?: Date | string | null): string {
+  if (mergedAt === null || mergedAt === undefined) return "unknown";
+  const iso = prMergeTimestamp(mergedAt);
+  if (iso === null) return String(mergedAt);
+  return iso.replace(/\.000Z$/, "Z");
+}
+
+/** Normalize an observation's merge time to the ISO string stored in metadata. */
+export function prMergeTimestamp(mergedAt?: Date | string | null): string | null {
+  if (mergedAt === null || mergedAt === undefined) return null;
+  const date = mergedAt instanceof Date ? mergedAt : new Date(mergedAt);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/**
+ * Record `pr_merged` for one observed merge of one PR on one issue. This is
+ * the single write path for merge evidence (#1203): every observer calls it so
+ * the dedupe identity and the metadata shape (PR number/url, authoritative
+ * merge time, head and merge commit shas, link provenance) cannot drift per
+ * route. Multiple linked PRs record one row each; a redelivered observation of
+ * the same PR at the same merge time upserts onto the existing row.
+ */
+export async function recordPrMergedEvent(
+  client: LifecycleEventClient,
+  input: {
+    issueId: string;
+    repoFullName: string;
+    issueNumber: number;
+    source: LifecycleSource;
+    actor: string;
+    pr: PrMergeObservation;
+    fromStatus?: string | null;
+    toStatus?: string | null;
+    extraMetadata?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  const mergedAtIso = prMergeTimestamp(input.pr.mergedAt);
+  const metadata: Record<string, unknown> = {
+    pullRequestNumber: input.pr.prNumber,
+    ...(input.pr.prUrl ? { pullRequestUrl: input.pr.prUrl } : null),
+    ...(mergedAtIso ? { mergedAt: mergedAtIso } : null),
+    // A present-but-unparseable source stamp stays visible as provenance even
+    // though it cannot become the event time — no silent provenance drop.
+    ...(input.pr.mergedAt !== null && input.pr.mergedAt !== undefined && mergedAtIso === null
+      ? { mergedAtRaw: String(input.pr.mergedAt) }
+      : null),
+    ...(input.pr.mergeCommitSha ? { mergeCommitSha: input.pr.mergeCommitSha } : null),
+    ...(input.pr.headSha ? { headSha: input.pr.headSha } : null),
+    ...(input.pr.linkSource ? { linkSource: input.pr.linkSource } : null),
+    ...input.extraMetadata,
+  };
+
+  await recordLifecycleEvent(client, {
+    issueId: input.issueId,
+    repoFullName: input.repoFullName,
+    issueNumber: input.issueNumber,
+    kind: "pr_merged",
+    source: input.source,
+    actor: input.actor,
+    fromStatus: input.fromStatus ?? null,
+    toStatus: input.toStatus ?? null,
+    sourceEventId: `pr-${input.pr.prNumber}`,
+    dedupeKey: prMergedDedupeKey(input.repoFullName, input.issueNumber, input.pr.prNumber, input.pr.mergedAt),
+    occurredAt: mergedAtIso ? new Date(mergedAtIso) : undefined,
+    metadata,
+  });
 }
