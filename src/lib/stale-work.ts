@@ -76,8 +76,13 @@ interface StaleWorkOutcome {
  * negated form of the sweeper's own clause would therefore make a row with a
  * fresh heartbeat and a NULL expiry invisible — but such a row is NOT stale
  * under the sweeper's own `OR` predicate (the NULL arm is neither `< cutoff`),
- * so it must count as live here. Only the row being processed is excluded
- * (`id: { not: work.id }`).
+ * so it must count as live here.
+ *
+ * The row being processed is excluded (`id: { not: work.id }`). That exclusion
+ * is defence in depth, not the load-bearing part: the predicate above is the
+ * exact complement of the sweeper's own candidate clause, so a candidate row
+ * can never be live. The exclusion keeps the lookup correct even if the
+ * candidate clause is ever widened.
  */
 async function findLiveSiblingWork(
   tx: StaleWorkTransactionClient,

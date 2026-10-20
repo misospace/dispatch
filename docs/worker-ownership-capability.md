@@ -17,11 +17,12 @@ label cleanup, requeue, or credential rotation happens through this capability
 | `renew` | `runRef?`, `externalWait?` (`{reason, retryAfter}` or `null` to clear) | Extends the single ownership TTL (`expiredAt = now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`), increments `renewCount`, records observed + occurred renewal times, heartbeats a matching active `AgentWork` row and refreshes that row's `leaseExpiresAt` to the renewed ownership expiry — so the stale-work sweep (which reclaims on `leaseExpiresAt` as well as on the heartbeat) cannot reclaim a renewed long-running worker. Progress is **not** required. |
 | `disposition` | `disposition` ∈ `completed`/`released`/`blocked`/`handed_off`, `note?`, `successorRef?`, `retryAfter?`/`waitReason?` | Durable terminal record on the lease (`disposition*` columns), settles a matching active `AgentWork` (DONE/RELEASED/BLOCKED), records an `ownership_dispositioned` lifecycle event and audit row. |
 
-**Stale-work sweep and claim incarnations.** The sweep reclaims a stale
-`AgentWork` row only when no live sibling row for the same (agent, issue) still
-owns the claim: an older `BLOCKED` row that falls past the sweep cutoff never
+**Stale-work sweep and claim incarnations.** The sweep releases the claim of a
+stale `AgentWork` row only when no live sibling row for the same (agent, issue)
+still owns it: an older `BLOCKED` row that falls past the sweep cutoff never
 releases the lease or the `agent/*` label that a freshly renewed `IN_PROGRESS`
-row still holds. Such a reclaim is reported as `claimRetained` (audited as
+row still holds. The stale row itself is still reclaimed (marked `STALE`), but
+the claim is retained — reported as `claimRetained` (audited as
 `stale_agentwork_claim_retained`, labels unchanged) instead of `released`, and
 no `claim_released` event is written for it.
 

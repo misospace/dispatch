@@ -195,7 +195,9 @@ function makeSweepClient(options: {
     return select ? { id: matched.id } : matched;
   });
 
+  const candidateClauses: unknown[] = [];
   const agentWorkFindMany = vi.fn(async ({ where, orderBy, take }: any) => {
+    candidateClauses.push(where);
     const selected = candidates.filter((row) =>
       matchesWhere(row as unknown as Record<string, unknown>, where),
     );
@@ -230,7 +232,7 @@ function makeSweepClient(options: {
     $transaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
   } as unknown as StaleWorkClient;
 
-  return { client, eventRows, auditRows, leaseDeleteMany, agentWorkFindFirst, rows };
+  return { client, eventRows, auditRows, leaseDeleteMany, agentWorkFindFirst, candidateClauses, rows };
 }
 
 function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
@@ -336,14 +338,20 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
       id: "work-live",
       issue,
       state: "IN_PROGRESS",
+      // Exactly what `renewOwnership` writes onto the freshest active row:
+      // the operation's own clock as the heartbeat, and the renewed ownership
+      // expiry (`now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`, default 30 min) as
+      // the lease expiry.
       lastHeartbeatAt: new Date(),
       leaseExpiresAt: minutesAhead(30),
     });
 
-    const { client, eventRows, auditRows, leaseDeleteMany } = makeSweepClient({
+    const { client, eventRows, auditRows, leaseDeleteMany, candidateClauses } = makeSweepClient({
       candidates: [stale],
       rows: [stale, live],
     });
+    const liveHeartbeatBefore = live.lastHeartbeatAt.getTime();
+    const liveExpiryBefore = live.leaseExpiresAt?.getTime() ?? null;
 
     const report = await sweepStaleWork(client);
 
@@ -354,6 +362,18 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
     expect(report.claimRetained).toBe(1);
     expect(report.released).toBe(0);
     expect(report.skipped).toBe(0);
+
+    // The reclaimed row stops asking for a release: the retry marker is down,
+    // so the next sweep does not pick it up again.
+    expect(stale.staleClaimReleasePending).toBe(false);
+    // The live sibling is untouched by the reclaim of its stale sibling.
+    expect(live.state).toBe("IN_PROGRESS");
+    expect(live.lastHeartbeatAt.getTime()).toBe(liveHeartbeatBefore);
+    expect(live.leaseExpiresAt?.getTime() ?? null).toBe(liveExpiryBefore);
+    // The live sibling was never a reclaim candidate in the first place — it
+    // is the STALE sibling's reclaim that must not take the claim down.
+    const [candidateClause] = candidateClauses;
+    expect(matchesWhere(live as unknown as Record<string, unknown>, candidateClause)).toBe(false);
 
     // The live claim survives: no lease delete.
     expect(leaseDeleteMany).not.toHaveBeenCalled();
@@ -495,6 +515,101 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
     const { client, leaseDeleteMany } = makeSweepClient({
       candidates: [stale],
       rows: [stale, done],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat an already reclaimed STALE sibling as live", async () => {
+    // A previously reclaimed row is `STALE`, not an active one. Counting it as
+    // live would withhold the pending release of a later retry forever — the
+    // claim would never be released at all.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const reclaimed = makeWork({
+      id: "work-reclaimed",
+      issue,
+      state: "STALE",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, reclaimed],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("needs BOTH arms of the live predicate: a fresh heartbeat alone is not live", async () => {
+    // The sweeper reclaims a row when its heartbeat OR its expiry falls past
+    // the cutoff, so "live" is the exact complement: BOTH must be fresh. A
+    // sibling that is fresh by heartbeat but whose expiry has lapsed is itself
+    // reclaimable, and must not shield the claim forever.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const freshHeartbeatStaleExpiry = makeWork({
+      id: "work-half-fresh",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAgo(25),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, freshHeartbeatStaleExpiry],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("needs BOTH arms of the live predicate: a fresh expiry alone is not live", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const staleHeartbeatFreshExpiry = makeWork({
+      id: "work-half-stale",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, staleHeartbeatFreshExpiry],
     });
 
     const report = await sweepStaleWork(client);
