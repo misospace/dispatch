@@ -143,7 +143,7 @@ export function parseCheckpointAgentWorkInput(body: unknown): CheckpointAgentWor
     checkpoint: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
     blockerReason: typeof input.blockerReason === "string" ? input.blockerReason : null,
-    issueId: typeof input.issueId === "string" ? input.issueId : null,
+    issueId: typeof input.issueId === "string" && nonEmpty(input.issueId.trim()) ? input.issueId.trim() : null,
   };
 }
 

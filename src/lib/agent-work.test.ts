@@ -128,18 +128,22 @@ describe("parseCheckpointAgentWorkInput", () => {
     expect(result).toEqual({ error: "Missing required field: checkpoint (one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)" });
   });
 
-it("returns error when agentName is empty string", () => {
-const result = parseCheckpointAgentWorkInput({ agentName: "", checkpoint: "DONE" });
-expect(result).toEqual({ error: "Missing required field: agentName (string)" });
-});
-it("passes through an optional issueId", () => {
-const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "issue-A" });
-expect(result).toEqual(expect.objectContaining({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "issue-A" }));
-});
-it("treats a non-string issueId as absent", () => {
-const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: 42 });
-expect(result).toEqual(expect.objectContaining({ issueId: null }));
-});
+  it("returns error when agentName is empty string", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "", checkpoint: "DONE" });
+    expect(result).toEqual({ error: "Missing required field: agentName (string)" });
+  });
+  it("passes through an optional issueId", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "issue-A" });
+    expect(result).toEqual(expect.objectContaining({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "issue-A" }));
+  });
+  it("treats a non-string issueId as absent", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: 42 });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
+  it("treats an empty-string issueId as absent", () => {
+    const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "  " });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
 });
 
 describe("parseFinishAgentWorkInput", () => {
