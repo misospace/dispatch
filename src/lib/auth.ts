@@ -197,7 +197,10 @@ export const WORKER_ALLOWLIST: ReadonlyArray<{ method: string | "*"; pattern: Re
   // own work. The root POST action surface (release/reassign any agent's work)
   // and POST /api/agent-work/sweep (stale-work recovery) stay maintainer-only.
   { method: "GET", pattern: /^\/api\/agent-work$/ },
-  { method: "POST", pattern: /^\/api\/agent-work\/(?:start|checkpoint|finish)$/ },
+  // The ownership capability (#1251 register/renew/disposition) is worker-tier
+  // and identity-scoped in-route (`enforceWorkerAgentScope`): a bound worker
+  // may only operate for its own agent; the unbound legacy token is refused.
+  { method: "POST", pattern: /^\/api\/agent-work\/(?:start|checkpoint|finish|ownership)$/ },
   // Issue state changes a worker performs on its own claimed work
   { method: "POST", pattern: /^\/api\/issues\/claim$/ },
   { method: "POST", pattern: /^\/api\/issues\/unclaim$/ },

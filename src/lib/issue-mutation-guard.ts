@@ -39,7 +39,17 @@ export async function withIssueMutationGuard<T>(
       && guard.agentName === request.agentName && guard.claimToken === request.claimToken;
     const exactClaim = request.operation === "claim" && guard.operation === "claim"
       && request.agentName !== undefined && guard.agentName === request.agentName;
-    if ((!exactRelease && !exactClaim) || guard.executing) return { status: "busy", ownerToken: guard.ownerToken, operation: guard.operation };
+    // #1251: the stale-work sweep fences its whole decide-and-release pipeline
+    // under this operation. Its recovery path is the next sweep: every step is
+    // a conditional update keyed off the persisted row state (STALE + the
+    // pending-release marker) and the external release is deduped per claim
+    // epoch, so re-entering after a crash mid-guard is safe. A guard left
+    // `executing` by a dead sweep process stays fail-closed (never
+    // time-expired) exactly like a crashed claim guard: operator-visible, not
+    // silently stolen.
+    const exactStaleRelease = request.operation === "stale-release" && guard.operation === "stale-release"
+      && request.agentName !== undefined && guard.agentName === request.agentName;
+    if ((!exactRelease && !exactClaim && !exactStaleRelease) || guard.executing) return { status: "busy", ownerToken: guard.ownerToken, operation: guard.operation };
     const acquired = await prisma.issueMutationGuard.updateMany({
       where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: false }, data: { executing: true },
     });
@@ -57,7 +67,11 @@ export async function withIssueMutationGuard<T>(
     await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });
     return { status: "retained", ownerToken: guard.ownerToken, value: result.value };
   } catch (error) {
-    if (request.operation === "lease" && !resuming) {
+    // #1251: "ownership" writes are idempotent, Postgres-only, and fenced on
+    // the claim token — there is no partial remote effect to preserve, so a
+    // failed ownership attempt must not leave an unrecoverable guard behind
+    // (its resume branch does not exist by design). Same posture as "lease".
+    if ((request.operation === "lease" || request.operation === "ownership") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

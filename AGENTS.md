@@ -50,6 +50,9 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DISPATCH_PR_FOLLOWUP_INTERVAL_MS` | No | PR-followup sync interval (default 900000 = 15m; `0` disables) |
 | `DISPATCH_PRUNE_CLOSED_INTERVAL_MS` | No | Closed-issue prune interval (default 86400000 = 24h; `0` disables) |
 | `DISPATCH_CAPACITY_COOLDOWN_MS` | No | Bounded cooldown for explicit capacity-exhaustion handoffs (default 900000 = 15m, clamped 1m–6h). Scoped to the exhausted capacity on the handed item only; unrelated capacities keep dispatch. See [docs/capacity-handoff.md](./docs/capacity-handoff.md) |
+| `DISPATCH_OWNERSHIP_ACTIVE_WINDOW_MS` | No | Ownership liveness window (#1251): renewals inside it keep a claim `CLAIMED_ACTIVE` (default 900000 = 15m, clamped 1m–6h). See [docs/worker-ownership-capability.md](./docs/worker-ownership-capability.md) |
+| `DISPATCH_OWNERSHIP_LONG_RUN_GRACE_MS` | No | Long-run grace (#1251): sustained silence inside it is `CLAIMED_LONG_RUNNING`, never release (default 2700000 = 45m, clamped ≥ active window, ≤24h) |
+| `DISPATCH_OWNERSHIP_RENEW_TTL_MS` | No | Expiry a renewed lease receives (#1251) (default 1800000 = 30m, clamped 1m–24h) |
 | `DISPATCH_QUEUE_ADMISSION_MODE` | No | Grooming freshness admission for worker pickup: `off` (default, unchanged), `audit` (annotate queue items, filter nothing) or `enforce` (withhold ready issues without a current applied grooming decision or operator override). See [docs/hosted-groomer.md](./docs/hosted-groomer.md#worker-admission). |
 
 Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` for agent API bearer auth.
@@ -213,6 +216,7 @@ Cross-cutting concerns and where they live. Read these first when working in tha
 | Assign / unassign (label-only, no lease) | `app/api/issues/actions/route.ts`, `app/api/issues/unassign/route.ts`, `lib/assignment-conflicts.ts` |
 | AgentWork lifecycle | `app/api/agent-work/route.ts`, `app/api/agent-work/{start,checkpoint,finish}/route.ts`, `lib/agent-work.ts` |
 | Fenced capacity handoff (#1256) | `app/api/issues/capacity-handoff/route.ts`, `lib/issue-capacity-handoff.ts`, `lib/capacity-handoff.ts`, `lib/issue-handoff-settlement.ts` (durable replay, #1262), `lib/pr-fix-queue.ts` (report resolver), `lib/lease.ts` (claim token), [docs/capacity-handoff.md](./docs/capacity-handoff.md) |
+| Worker ownership capability + derived states (#1251) | `app/api/agent-work/ownership/route.ts` (register/renew/disposition), `lib/worker-ownership.ts`, `lib/ownership-state.ts` (derivation), `lib/ownership-inspect.ts`, `app/api/issues/[issueId]/ownership/` + `app/api/issues/ownership/` (operator inspect), [docs/worker-ownership-capability.md](./docs/worker-ownership-capability.md) |
 | Auth & audit actor identity | `lib/auth.ts` (`authorizeRequest`, `getAuthorizedActor`) |
 | Lifecycle event stream (claim/status evidence, #1202) | `lib/issue-lifecycle.ts`, `docs/issue-lifecycle-events.md` |
 | Board UI component tree | `app/board/page.tsx` → `kanban-board-client.tsx` → `components/kanban-board.tsx` → `components/issue-card.tsx` |
