@@ -22,7 +22,10 @@ import { parseCheckpointAgentWorkInput, checkpointAgentWork } from "@/lib/agent-
  *                                    //   CHANGES_MADE | TESTS_RUNNING | PR_OPENED
  *                                    //   DONE | BLOCKED
  *   "summary": "...",                // string, optional — progress description
- *   "blockerReason": "..."           // string, optional — required when checkpoint is BLOCKED
+ *   "blockerReason": "...",          // string, optional — required when checkpoint is BLOCKED
+ *   "issueId": "GH_issue_abc123"     // string, optional — scopes selection to this
+ *                                    //   issue's active work (#1328); when omitted
+ *                                    //   the freshest active row for the agent is used
  * }
  *
  * ─── Response Schema ──────────────────────────────────────────────────────
