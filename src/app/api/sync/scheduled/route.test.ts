@@ -1,5 +1,6 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 function createPrismaMock() {
   let transactionRunId: string | null = null;
@@ -142,6 +143,14 @@ function setupModules(prismaMock: ReturnType<typeof createPrismaMock>, githubMoc
 function makeRequest(body?: Record<string, unknown>, extraHeaders: Record<string, string> = {}) {
   return authedRequest("http://localhost/api/sync/scheduled", { method: "POST", body: body ?? {}, headers: extraHeaders });
 }
+
+// The rate limiter keeps module-global state — reset it so the per-actor
+// window never leaks between tests. This clears the statically imported
+// limiter instance; the rate-limit suite re-imports the limiter from the
+// fresh registry to clear the window of the route it imports dynamically.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 // ---------------------------------------------------------------------------
 // Auth tests
@@ -624,5 +633,52 @@ describe("POST /api/sync/scheduled — closed issue reconciliation", () => {
     const body = await res.json();
     expect(body.closedIssueReconcile).toBeDefined();
     expect(body.closedIssueReconcile.issuesChecked).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limit tests
+// ---------------------------------------------------------------------------
+
+describe("POST /api/sync/scheduled — rate limit", () => {
+  let prismaMock: ReturnType<typeof createPrismaMock>;
+  let githubMock: ReturnType<typeof createGithubMock>;
+  let configMock: ReturnType<typeof createConfigMock>;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    prismaMock = createPrismaMock();
+    githubMock = createGithubMock();
+    configMock = createConfigMock();
+    setupModules(prismaMock, githubMock, configMock);
+    // The route is imported dynamically from a fresh module registry, so it
+    // gets a fresh limiter instance — reset THAT instance's window, not the
+    // one the file-level static import holds.
+    const { resetRateLimits: resetFreshRateLimits } = await import("@/lib/rate-limit");
+    resetFreshRateLimits();
+  });
+
+  afterEach(() => {
+    vi.doUnmock("@/lib/sync-lock");
+  });
+
+  it("returns 429 after exceeding the rate limit (6 per 60s)", async () => {
+    const acquireLock = vi.fn().mockResolvedValue({ locked: true, runId: "run-1" });
+    const releaseLock = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/sync-lock", () => ({ acquireLock, releaseLock }));
+
+    const { POST } = await import("./route");
+
+    for (let i = 0; i < 6; i++) {
+      const res = await POST(makeRequest());
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The 7th request is rejected before the sync lock is acquired.
+    expect(acquireLock).toHaveBeenCalledTimes(6);
   });
 });

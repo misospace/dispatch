@@ -1,5 +1,6 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
@@ -101,6 +102,14 @@ vi.mock("@/lib/github", () => ({
 
 import { POST } from "./route";
 
+// The rate limiter keeps module-global state — reset it so the per-actor
+// window never leaks between tests. This clears the window of the statically
+// imported route; the rate-limit suite re-imports the limiter from the fresh
+// registry to clear the dynamically imported route's window.
+beforeEach(() => {
+  resetRateLimits();
+});
+
 describe("POST /api/automation/sync — auth", () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
@@ -129,5 +138,50 @@ describe("POST /api/automation/sync — auth", () => {
       body: JSON.stringify({}),
     }));
     expect(res.status).toBe(200);
+  });
+});
+
+describe("POST /api/automation/sync — rate limit", () => {
+  let acquireLock: ReturnType<typeof vi.fn>;
+  let releaseLock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    acquireLock = vi.fn().mockResolvedValue({ locked: true, runId: "run-1" });
+    releaseLock = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/sync-lock", () => ({ acquireLock, releaseLock }));
+    vi.resetModules();
+    // The route is imported dynamically from a fresh module registry, so it
+    // gets a fresh limiter instance — reset THAT instance's window, not the
+    // one the file-level static import holds.
+    const { resetRateLimits: resetFreshRateLimits } = await import("@/lib/rate-limit");
+    resetFreshRateLimits();
+  });
+
+  afterEach(() => {
+    vi.doUnmock("@/lib/sync-lock");
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 60s)", async () => {
+    const { POST: POSTRateLimited } = await import("./route");
+
+    for (let i = 0; i < 30; i++) {
+      const res = await POSTRateLimited(new Request("http://localhost/api/automation/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+        body: JSON.stringify({}),
+      }));
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POSTRateLimited(new Request("http://localhost/api/automation/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The 31st request is rejected before the automation lock is acquired.
+    expect(acquireLock).toHaveBeenCalledTimes(30);
   });
 });
