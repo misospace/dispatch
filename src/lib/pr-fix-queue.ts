@@ -1559,7 +1559,13 @@ export async function enqueuePrFixItem(client: PrFixQueueClient, rawInput: Enque
           !!snapshot.headSha &&
           typeof input.headSha === "string" &&
           snapshot.headSha === input.headSha;
-        const reopenFixStale = identityKnown && headShaUnchanged && !isConditionKind;
+        // #1303: the #940 net reopens on re-observed ACTIONABLE evidence only.
+        // A non-actionable version of a known identity (`evidenceActionable
+        // === false`, e.g. a re-read review in an APPROVED/DISMISSED/COMMENTED
+        // state) at a FIXED/unchanged head falls through to the sticky
+        // `isKnownEvidence` branch (control 4) — the tombstone stays closed.
+        const reopenFixStale =
+          identityKnown && headShaUnchanged && !isConditionKind && !isNonActionableVersion;
 
         // STALE/IGNORED stay sticky inline (#1000): terminal states never
         // reactivate on evidence and are operator-only, so they are kept OUT

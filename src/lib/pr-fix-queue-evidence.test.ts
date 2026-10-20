@@ -479,6 +479,59 @@ describe("anti-repetition and #940 precedence (#1249)", () => {
     expect(client.items[0].generation).toBe(2);
   });
 
+  it("#1303: a NON-actionable version of a known review stays sticky at FIXED/unchanged head, but is audited (control 4)", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // r1, seq 1 (actionable)
+    headShaMock.current = "ccc9";
+    await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      status: "FIXED",
+      expectedGeneration: client.items[0].generation,
+    } as any);
+    expect(client.items[0].status).toBe("FIXED");
+
+    // Same identity re-observed, but the re-read version is not actionable
+    // (review left CHANGES_REQUESTED): recorded for audit, yet the #940 net
+    // must not reopen the tombstone — the sticky isKnownEvidence branch holds.
+    await seedReviewItem(client, {
+      ...reviewEvidence("r1", {
+        evidenceVersion: "state=dismissed|commit=aaa1",
+        evidenceActionable: false,
+      }),
+    });
+    expect(client.items[0].status).toBe("FIXED");
+    expect(client.items[0].generation).toBe(1);
+    // The non-actionable transition is still recorded (a NEW version).
+    expect(client.items[0].evidenceSequence).toBe(2);
+    expect(client.ledger[0]).toMatchObject({
+      version: "state=dismissed|commit=aaa1",
+      actionable: false,
+    });
+  });
+
+  it("#1303 paired: a NEW actionable version of the same review still reopens at FIXED/unchanged head", async () => {
+    const client = makeFake();
+    await seedReviewItem(client); // r1, seq 1 (state=changes_requested|commit=aaa1)
+    headShaMock.current = "ccc9";
+    await markPrFixItem(client, {
+      repo: "acme/widgets",
+      pr: 7,
+      status: "FIXED",
+      expectedGeneration: client.items[0].generation,
+    } as any);
+    expect(client.items[0].status).toBe("FIXED");
+
+    // Same identity, a NEW actionable version (a later review round on the
+    // same head): not a non-actionable version, so the #1303 restriction does
+    // not over-block and the #940 net still reopens the tombstone.
+    await seedReviewItem(client, {
+      ...reviewEvidence("r1", { evidenceVersion: "state=changes_requested_v2|commit=aaa1" }),
+    });
+    expect(client.items[0].status).toBe("QUEUED");
+    expect(client.items[0].generation).toBe(2);
+  });
+
   it("condition kinds are exempt from #940: an unchanged persistent condition never reopens (control 19)", async () => {
     const client = makeFake();
     await seedReviewItem(client);
