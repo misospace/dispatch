@@ -5,7 +5,7 @@ import { rejectAgentCaller } from "@/lib/operator-only";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { prisma } from "@/lib/prisma";
 import { buildIssueLifecycleTimeline, type LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
-import { backfillMergesFromRunHistory } from "@/lib/lifecycle-backfill";
+import { backfillMergesFromRunHistory, touchedPullRequestNumbers } from "@/lib/lifecycle-backfill";
 
 const BACKFILL_RATE_LIMIT = { limit: 5, windowMs: 60_000 };
 
@@ -124,7 +124,8 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
  * authoritative GitHub merge time already persisted in Dispatch. It never
  * fabricates claim events or first-claim times, never treats an unmerged PR
  * as merged, and is idempotent across replays via the canonical merge dedupe
- * identity shared with the reconciler.
+ * identity shared with the reconciler. Its PR read is bounded to the PRs this
+ * issue's runs touch; the repo's merged-PR total is an aggregate count.
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
@@ -157,12 +158,25 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
       prisma.automationRepo.findUnique({ where: { fullName: issue.repository.fullName } }),
     ]);
 
-    const pullRequests = automationRepo
-      ? await prisma.githubPullRequest.findMany({
-          where: { repoId: automationRepo.id },
+    let pullRequests: Array<{ number: number; url: string; mergedAt: Date | null }> = [];
+    let repoMergedPrCount = 0;
+    if (automationRepo) {
+      // Bounded read: only the PR rows for the numbers this issue's runs
+      // touch, never every PR of the repo. The repo's merged-PR total comes
+      // from an aggregate count, so no unbounded row set is materialized.
+      const candidateNumbers = touchedPullRequestNumbers(agentRuns, issue.repository.fullName);
+      const [rows, mergedCount] = await Promise.all([
+        prisma.githubPullRequest.findMany({
+          where: { repoId: automationRepo.id, number: { in: candidateNumbers } },
           select: { number: true, url: true, mergedAt: true },
-        })
-      : [];
+        }),
+        prisma.githubPullRequest.count({
+          where: { repoId: automationRepo.id, mergedAt: { not: null } },
+        }),
+      ]);
+      pullRequests = rows;
+      repoMergedPrCount = mergedCount;
+    }
 
     const result = await backfillMergesFromRunHistory(prisma, {
       issueId,
@@ -170,6 +184,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
       issueNumber: issue.number,
       agentRuns,
       pullRequests,
+      repoMergedPrCount,
     });
 
     return NextResponse.json({ success: true, ...result });

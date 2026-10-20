@@ -26,6 +26,9 @@ import type { LifecycleEventClient } from "./issue-lifecycle";
  *   canonical merge identity shared with the reconciler and sync observers,
  *   so re-running the backfill over the same records upserts onto the rows
  *   that already exist instead of duplicating them.
+ * - The read is bounded: the PR rows it consumes are only the ones for the
+ *   PRs this issue's runs touch, and the count of merged PRs no run touched
+ *   comes from a repo-wide aggregate count, never from a full repo scan.
  *
  * A client failure propagates to the caller; this module never swallows one.
  */
@@ -74,6 +77,30 @@ export function pullRequestHtmlUrl(repoFullName: string, prNumber: number): stri
   return `https://github.com/${repoFullName}/pull/${prNumber}`;
 }
 
+/**
+ * The distinct PR numbers of `repoFullName` that the given runs touched.
+ *
+ * A URL that is not a PR reference, or that names a PR of another repo, is
+ * not a candidate: repo comparison is case-insensitive, as on GitHub itself.
+ * The result is ascending, so a caller can use it as a bounded query scope.
+ */
+export function touchedPullRequestNumbers(
+  agentRuns: readonly BackfillAgentRunRecord[],
+  repoFullName: string,
+): number[] {
+  const repoKey = repoFullName.toLowerCase();
+  const numbers = new Set<number>();
+  for (const run of agentRuns) {
+    for (const url of run.touchedIssueUrls) {
+      const ref = parsePullRequestReference(url);
+      if (!ref) continue;
+      if (ref.repo.toLowerCase() !== repoKey) continue;
+      numbers.add(ref.number);
+    }
+  }
+  return [...numbers].sort((a, b) => a - b);
+}
+
 export async function backfillMergesFromRunHistory(
   client: LifecycleEventClient,
   input: {
@@ -81,8 +108,10 @@ export async function backfillMergesFromRunHistory(
     repoFullName: string;
     issueNumber: number;
     agentRuns: readonly BackfillAgentRunRecord[];
-    /** Merged-or-not PR rows for the repo. */
+    /** PR rows for the PRs this issue's runs touch (a bounded subset of the repo's rows). */
     pullRequests: readonly BackfillPullRequestRecord[];
+    /** Number of merged PR rows persisted for this repo. */
+    repoMergedPrCount: number;
     actor?: string;
   },
 ): Promise<BackfillResult> {
@@ -115,9 +144,9 @@ export async function backfillMergesFromRunHistory(
     const touched = touchedUrls.has(normalizeUrl(pr.url)) || touchedPrRefs.has(rowRepoKey);
 
     if (!touched) {
-      // Only a merged PR that the issue's runs never name is a "no link"
-      // skip; a closed-unmerged PR is simply not merge evidence at all.
-      if (mergedAtIso !== null) result.skippedNoLink += 1;
+      // A row no run of this issue names is not this issue's merge evidence;
+      // the merged PRs of the repo it never touched are counted from the
+      // repo-wide aggregate, not from this row.
       continue;
     }
 
@@ -147,6 +176,10 @@ export async function backfillMergesFromRunHistory(
     });
     result.recorded += 1;
   }
+
+  // Merged PRs of the repo that no run of this issue touched: the repo's
+  // merged-PR total minus the ones this issue recorded.
+  result.skippedNoLink = Math.max(0, input.repoMergedPrCount - result.recorded);
 
   return result;
 }

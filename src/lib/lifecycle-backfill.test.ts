@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { prMergedDedupeKey, type LifecycleEventClient } from "./issue-lifecycle";
-import { backfillMergesFromRunHistory } from "./lifecycle-backfill";
+import { backfillMergesFromRunHistory, touchedPullRequestNumbers } from "./lifecycle-backfill";
 
 /**
  * Same in-memory stand-in as the lifecycle recorder's own tests: rows are
@@ -48,6 +48,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(pr7)],
       pullRequests: [mergedPr7],
+      repoMergedPrCount: 1,
     });
 
     expect(result).toEqual({ recorded: 1, skippedUnmerged: 0, skippedNoLink: 0 });
@@ -79,6 +80,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(pr7)],
       pullRequests: [mergedPr7],
+      repoMergedPrCount: 1,
     });
 
     expect(rows.filter((row) => row.kind === "claim")).toHaveLength(0);
@@ -92,6 +94,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(pr7)],
       pullRequests: [{ number: 7, url: pr7, mergedAt: null }],
+      repoMergedPrCount: 0,
     });
 
     expect(result).toEqual({ recorded: 0, skippedUnmerged: 1, skippedNoLink: 0 });
@@ -105,6 +108,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(pr7)],
       pullRequests: [{ number: 7, url: pr7, mergedAt: "not-a-timestamp" }],
+      repoMergedPrCount: 0,
     });
 
     expect(result).toEqual({ recorded: 0, skippedUnmerged: 1, skippedNoLink: 0 });
@@ -118,6 +122,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(issueUrl)],
       pullRequests: [mergedPr7],
+      repoMergedPrCount: 1,
     });
 
     expect(result).toEqual({ recorded: 0, skippedUnmerged: 0, skippedNoLink: 1 });
@@ -131,9 +136,52 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(issueUrl)],
       pullRequests: [{ number: 7, url: pr7, mergedAt: null }],
+      repoMergedPrCount: 0,
     });
 
     expect(result).toEqual({ recorded: 0, skippedUnmerged: 0, skippedNoLink: 0 });
+    expect(rows).toHaveLength(0);
+  });
+
+  it("derives skippedNoLink from the repo's merged-PR count", async () => {
+    const { client, rows } = makeClient();
+
+    const result = await backfillMergesFromRunHistory(client, {
+      ...base,
+      agentRuns: [run(pr7)],
+      pullRequests: [mergedPr7],
+      repoMergedPrCount: 5,
+    });
+
+    expect(result).toEqual({ recorded: 1, skippedUnmerged: 0, skippedNoLink: 4 });
+    expect(rows).toHaveLength(1);
+  });
+
+  it("never reports a negative skippedNoLink when the repo count is below the recorded count", async () => {
+    const { client, rows } = makeClient();
+
+    const result = await backfillMergesFromRunHistory(client, {
+      ...base,
+      agentRuns: [run(pr7)],
+      pullRequests: [mergedPr7],
+      repoMergedPrCount: 0,
+    });
+
+    expect(result).toEqual({ recorded: 1, skippedUnmerged: 0, skippedNoLink: 0 });
+    expect(rows).toHaveLength(1);
+  });
+
+  it("counts a merged row the touched-check rejects as a merged PR this issue never touched", async () => {
+    const { client, rows } = makeClient();
+
+    const result = await backfillMergesFromRunHistory(client, {
+      ...base,
+      agentRuns: [run(pr7)],
+      pullRequests: [{ number: 7, url: "https://github.com/other-owner/hello-world/pull/7", mergedAt }],
+      repoMergedPrCount: 1,
+    });
+
+    expect(result).toEqual({ recorded: 0, skippedUnmerged: 0, skippedNoLink: 1 });
     expect(rows).toHaveLength(0);
   });
 
@@ -144,6 +192,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(`  ${pr7}/ `)],
       pullRequests: [{ number: 7, url: `${pr7}/`, mergedAt }],
+      repoMergedPrCount: 1,
     });
 
     expect(result).toEqual({ recorded: 1, skippedUnmerged: 0, skippedNoLink: 0 });
@@ -161,6 +210,7 @@ describe("backfillMergesFromRunHistory", () => {
       pullRequests: [
         { number: 7, url: "https://api.github.com/repos/octocat/hello-world/pulls/7", mergedAt },
       ],
+      repoMergedPrCount: 1,
     });
 
     expect(result).toEqual({ recorded: 1, skippedUnmerged: 0, skippedNoLink: 0 });
@@ -175,6 +225,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run("https://github.com/other-owner/hello-world/pull/7")],
       pullRequests: [mergedPr7],
+      repoMergedPrCount: 1,
     });
 
     expect(result).toEqual({ recorded: 0, skippedUnmerged: 0, skippedNoLink: 1 });
@@ -188,6 +239,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(pr7), run(pr7, issueUrl)],
       pullRequests: [mergedPr7],
+      repoMergedPrCount: 1,
     });
 
     expect(result).toEqual({ recorded: 1, skippedUnmerged: 0, skippedNoLink: 0 });
@@ -200,6 +252,7 @@ describe("backfillMergesFromRunHistory", () => {
       ...base,
       agentRuns: [run(pr7)],
       pullRequests: [mergedPr7],
+      repoMergedPrCount: 1,
     };
 
     await backfillMergesFromRunHistory(client, input);
@@ -221,7 +274,37 @@ describe("backfillMergesFromRunHistory", () => {
         ...base,
         agentRuns: [run(pr7)],
         pullRequests: [mergedPr7],
+        repoMergedPrCount: 1,
       }),
     ).rejects.toThrow("db down");
+  });
+});
+
+describe("touchedPullRequestNumbers", () => {
+  it("returns the distinct PR numbers of the repo the runs touched, ascending", () => {
+    expect(
+      touchedPullRequestNumbers(
+        [
+          run("https://github.com/octocat/hello-world/pull/9"),
+          run(pr7, "https://github.com/octocat/hello-world/pull/9"),
+        ],
+        "octocat/hello-world",
+      ),
+    ).toEqual([7, 9]);
+  });
+
+  it("compares the repo case-insensitively", () => {
+    expect(
+      touchedPullRequestNumbers([run(pr7)], "Octocat/Hello-World"),
+    ).toEqual([7]);
+  });
+
+  it("excludes non-PR URLs and other repos' PRs", () => {
+    expect(
+      touchedPullRequestNumbers(
+        [run(issueUrl, "https://github.com/other-owner/hello-world/pull/7")],
+        "octocat/hello-world",
+      ),
+    ).toEqual([]);
   });
 });

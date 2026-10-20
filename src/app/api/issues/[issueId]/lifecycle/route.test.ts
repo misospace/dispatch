@@ -14,6 +14,7 @@ const { mocks } = vi.hoisted(() => ({
     agentRunFindMany: vi.fn(),
     automationRepoFindUnique: vi.fn(),
     githubPullRequestFindMany: vi.fn(),
+    githubPullRequestCount: vi.fn(),
     auth: vi.fn(),
   },
 }));
@@ -28,7 +29,10 @@ vi.mock("@/lib/prisma", () => ({
     },
     agentRun: { findMany: mocks.agentRunFindMany },
     automationRepo: { findUnique: mocks.automationRepoFindUnique },
-    githubPullRequest: { findMany: mocks.githubPullRequestFindMany },
+    githubPullRequest: {
+      findMany: mocks.githubPullRequestFindMany,
+      count: mocks.githubPullRequestCount,
+    },
   },
 }));
 
@@ -101,6 +105,7 @@ beforeEach(() => {
   mocks.agentRunFindMany.mockResolvedValue([]);
   mocks.automationRepoFindUnique.mockResolvedValue({ id: "repo-1" });
   mocks.githubPullRequestFindMany.mockResolvedValue([]);
+  mocks.githubPullRequestCount.mockResolvedValue(0);
   mocks.auth.mockResolvedValue(null);
 });
 
@@ -224,6 +229,7 @@ describe("POST /api/issues/[issueId]/lifecycle (backfill)", () => {
         mergedAt: new Date("2026-10-02T08:00:00Z"),
       },
     ]);
+    mocks.githubPullRequestCount.mockResolvedValue(1);
 
     const res = await operatorPost();
     expect(res.status).toBe(200);
@@ -247,6 +253,62 @@ describe("POST /api/issues/[issueId]/lifecycle (backfill)", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toMatchObject({ success: true, recorded: 0 });
+    expect(mocks.eventUpsert).not.toHaveBeenCalled();
+    expect(mocks.eventCreate).not.toHaveBeenCalled();
+    expect(mocks.githubPullRequestFindMany).not.toHaveBeenCalled();
+    expect(mocks.githubPullRequestCount).not.toHaveBeenCalled();
+  });
+
+  it("scopes the PR read to the numbers the issue's runs touch", async () => {
+    mocks.agentRunFindMany.mockResolvedValue([
+      { touchedIssueUrls: ["https://github.com/org/repo/pull/7"] },
+    ]);
+    mocks.githubPullRequestCount.mockResolvedValue(3);
+
+    const res = await operatorPost();
+    expect(res.status).toBe(200);
+
+    expect(mocks.githubPullRequestFindMany).toHaveBeenCalledTimes(1);
+    const findManyArgs = mocks.githubPullRequestFindMany.mock.calls[0][0];
+    expect(findManyArgs.where).toEqual({ repoId: "repo-1", number: { in: [7] } });
+
+    expect(mocks.githubPullRequestCount).toHaveBeenCalledTimes(1);
+    const countArgs = mocks.githubPullRequestCount.mock.calls[0][0];
+    expect(countArgs.where).toEqual({ repoId: "repo-1", mergedAt: { not: null } });
+
+    const body = await res.json();
+    expect(body).toMatchObject({ success: true, recorded: 0, skippedUnmerged: 0, skippedNoLink: 3 });
+  });
+
+  it("excludes a touched PR of another repo from the scoped PR read", async () => {
+    mocks.agentRunFindMany.mockResolvedValue([
+      { touchedIssueUrls: ["https://github.com/other-owner/repo/pull/7"] },
+    ]);
+
+    const res = await operatorPost();
+    expect(res.status).toBe(200);
+
+    const findManyArgs = mocks.githubPullRequestFindMany.mock.calls[0][0];
+    expect(findManyArgs.where).toEqual({ repoId: "repo-1", number: { in: [] } });
+  });
+
+  it("counts a scoped PR without a merge time as unmerged and writes nothing", async () => {
+    mocks.agentRunFindMany.mockResolvedValue([
+      { touchedIssueUrls: ["https://github.com/org/repo/pull/7"] },
+    ]);
+    mocks.githubPullRequestFindMany.mockResolvedValue([
+      {
+        number: 7,
+        url: "https://api.github.com/repos/org/repo/pulls/7",
+        mergedAt: null,
+      },
+    ]);
+
+    const res = await operatorPost();
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body).toMatchObject({ success: true, recorded: 0, skippedUnmerged: 1 });
     expect(mocks.eventUpsert).not.toHaveBeenCalled();
     expect(mocks.eventCreate).not.toHaveBeenCalled();
   });

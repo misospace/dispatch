@@ -100,7 +100,10 @@ it) — no full-history GitHub scan on a routine request. Duplicate
 observations (the documented `api:*` vs `webhook` pair) collapse in the
 projection with a note. The raw window ships alongside the timeline as
 `events[]` for downstream consumers (#1183 attempts, #1184 cohorts); the
-contract assumes nothing Courier- or Dispatch-writer-specific.
+contract assumes nothing Courier- or Dispatch-writer-specific. That 500-event
+read window is a bound of its own, separate from the reconciler's 100-PR
+merged-PR window: the first caps how much of the stream a read projects, the
+second caps how many merged PRs reconcile can observe.
 
 ### Merge linkage and the bounded backfill
 
@@ -134,11 +137,37 @@ close path already wrote converge on the same row.
 tokens get 403) backfills legacy issues **only from verifiable records**: an
 `AgentRun` attached to the issue whose `touchedIssueUrls` name a PR,
 correlated with that PR's authoritative merge timestamp already persisted in
-Dispatch (`GithubPullRequest.mergedAt`, written by the automation PR sync).
+Dispatch (`GithubPullRequest.mergedAt`).
 It never fabricates a first claim, never reads `startedAt`/`createdAt` as
 claim evidence, skips PRs without an authoritative merge time, and replays
 idempotently onto the shared dedupe identity. Unknown stays unknown; nothing
 here estimates.
+
+The merge time has to be persisted before the backfill can use it. The
+automation sync currently upserts open PRs only, and an open PR never carries a
+merge, so a row it wrote holds no `mergedAt` and a PR that later merges is not
+updated either — the backfill recovers a merge only where the merge time is
+already in the table (#1313 tracks closing that gap). A PR without a persisted
+merge time stays unrecorded: the backfill never infers a merge from a merge
+state alone.
+
+The reconciler's merged-PR window is bounded: reconcile fetches each repo's open
+PRs and its most recently updated closed PRs (`fetchPullRequests` /
+`fetchClosedPullRequests`, 100 per page — up to 200 open, 100 closed), and
+merged PRs come from the closed side, since an open PR never carries a merge.
+A merge outside that closed window is never seen by reconcile and is therefore
+never recorded by reconcile — those merges are the operator backfill's
+territory.
+
+To recover merges for older issues, run `POST /api/issues/{issueId}/lifecycle`
+for that issue. Both of the backfill's preconditions must hold: an `AgentRun`
+attached to the issue whose `touchedIssueUrls` name the PR, and that PR's
+persisted `GithubPullRequest.mergedAt` — and the merge time is only there if
+it was persisted before the PR dropped out of the sync's open-PR listing
+(#1313). Without both, the PR stays unrecorded — the backfill never infers a
+merge from a merge state alone. Its own PR read is bounded to the PRs the
+issue's runs touch, and the count of merged PRs no run touched comes from a
+repo-wide aggregate count rather than a full repo scan.
 
 ## Idempotency
 
