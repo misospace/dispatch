@@ -42,6 +42,11 @@ const { mocks, db, applyData } = vi.hoisted(() => {
       issue: null as any,
       lease: null as any,
       agentWork: null as any,
+      // Additional active AgentWork rows sharing the (agent, issue) pair —
+      // an older BLOCKED row survives a new start, so several active rows
+      // coexist and the CURRENT claim's work must be picked by freshness,
+      // not pool position (#1251 review).
+      agentWorkRows: [] as any[],
       agentWorkUpdates: [] as any[],
       agentWorkHistory: [] as any[],
       leaseUpdates: [] as any[],
@@ -90,6 +95,41 @@ vi.mock("@/lib/prisma", () => {
    * transaction leaves real writes behind and the atomicity assertions fail,
    * rather than passing on a mock that made both spellings equivalent.
    */
+  // Sorts the active-row pool exactly like `orderBy` does in the database:
+  // the keys apply IN ORDER; `Date`s compare by instant, strings lexically.
+  // A key or direction this helper does not implement throws, so a selection
+  // rule change in production cannot silently read as "pool order won".
+  const compareRows = (orderBy: unknown) => {
+    const specs = (Array.isArray(orderBy) ? orderBy : [orderBy]) as Array<Record<string, "asc" | "desc">>;
+    return (a: any, b: any) => {
+      for (const spec of specs) {
+        for (const [key, direction] of Object.entries(spec)) {
+          if (direction !== "desc" && direction !== "asc") {
+            throw new Error(`test fake: unsupported orderBy direction ${String(direction)}`);
+          }
+          const left = a[key];
+          const right = b[key];
+          if (left === undefined || right === undefined) {
+            throw new Error(`test fake: orderBy on missing field ${key}`);
+          }
+          let cmp = 0;
+          if (left instanceof Date || right instanceof Date) {
+            if (!(left instanceof Date) || !(right instanceof Date)) {
+              throw new Error(`test fake: mixed Date/plain comparison on ${key}`);
+            }
+            cmp = left.getTime() - right.getTime();
+          } else if (typeof left === "number" && typeof right === "number") {
+            cmp = left - right;
+          } else {
+            cmp = String(left) < String(right) ? -1 : String(left) > String(right) ? 1 : 0;
+          }
+          if (cmp !== 0) return direction === "desc" ? -cmp : cmp;
+        }
+      }
+      return 0;
+    };
+  };
+
   const makeClient = (tag: string, journal: Undo[] | null) => {
     const note = (op: string) => {
       db.writes.push({ op, client: tag });
@@ -151,12 +191,17 @@ vi.mock("@/lib/prisma", () => {
         },
       },
       agentWork: {
-        findFirst: async ({ where }: any) => {
-          if (!db.agentWork) return null;
-          if (db.agentWork.agentName !== where.agentName) return null;
-          if (db.agentWork.issueId !== where.issueId) return null;
-          if (where.state?.in && !where.state.in.includes(db.agentWork.state)) return null;
-          return db.agentWork;
+        findFirst: async ({ where, orderBy }: any) => {
+          const pool = [db.agentWork, ...db.agentWorkRows].filter(Boolean);
+          const matches = pool.filter(
+            (row: any) =>
+              row.agentName === where.agentName &&
+              row.issueId === where.issueId &&
+              (!where.state?.in || where.state.in.includes(row.state)),
+          );
+          if (matches.length === 0) return null;
+          if (orderBy) matches.sort(compareRows(orderBy));
+          return matches[0];
         },
         update: async ({ where, data }: any) => {
           maybeFail("agentWork.update");
@@ -167,6 +212,17 @@ vi.mock("@/lib/prisma", () => {
             journal?.push(() => {
               db.agentWork = previous;
             });
+            return db.agentWork;
+          }
+          const pooled = db.agentWorkRows.find((row: any) => row.id === where.id);
+          if (pooled) {
+            const previous = { ...pooled };
+            pushRow("agentWork.update", db.agentWorkUpdates, { where, data });
+            Object.assign(pooled, data);
+            journal?.push(() => {
+              Object.assign(pooled, previous);
+            });
+            return pooled;
           }
           return db.agentWork;
         },
@@ -289,6 +345,9 @@ function makeAgentWork(overrides: Record<string, unknown> = {}) {
     leaseExpiresAt: inMin(5),
     staleClaimReleasePending: false,
     blockerReason: null,
+    // The current-claim-work tie-break sorts on `createdAt` when heartbeats
+    // tie, so every row needs one.
+    createdAt: inMin(-3),
     ...overrides,
   };
 }
@@ -402,6 +461,7 @@ function seedDb() {
   db.issue = makeIssue();
   db.lease = makeLease();
   db.agentWork = null;
+  db.agentWorkRows = [];
   db.agentWorkUpdates = [];
   db.agentWorkHistory = [];
   db.leaseUpdates = [];
@@ -865,6 +925,113 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     const audit = db.audit.find((a) => a.action === "ownership_disposition");
     expect(audit).toBeDefined();
     expect(audit.success).toBe(true);
+  });
+
+  it("settles the current claim's work, not an older active BLOCKED sibling (#1251 review)", async () => {
+    // An older BLOCKED row survives `startAgentWork` while the current
+    // IN_PROGRESS row owns the claim. A `completed` disposition must settle
+    // the CURRENT claim's work — an unordered pick that terminalized the old
+    // row would leave the live attempt active next to a terminal lease, and
+    // replay would report success without ever finishing it.
+    db.agentWork = makeAgentWork({ id: "work-current", state: "IN_PROGRESS", lastHeartbeatAt: inMin(-1) });
+    db.agentWorkRows.push(
+      makeAgentWork({
+        id: "work-old-blocked",
+        state: "BLOCKED",
+        lastHeartbeatAt: inMin(-60),
+        leaseExpiresAt: inMin(-55),
+      }),
+    );
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+    expect(res.status).toBe(200);
+
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    expect(db.agentWorkUpdates[0].where.id).toBe("work-current");
+    expect(db.agentWorkUpdates[0].data.state).toBe("DONE");
+    expect(db.agentWork.state).toBe("DONE");
+    const oldRow = db.agentWorkRows[0];
+    expect(oldRow.state).toBe("BLOCKED");
+    expect(db.agentWorkHistory).toHaveLength(1);
+    expect(db.agentWorkHistory[0].workId).toBe("work-current");
+    expect(db.agentWorkHistory[0].action).toBe("ownership_dispositioned");
+  });
+
+  it("picks the freshest active row regardless of which slot it lives in (#1251 review)", async () => {
+    // The mirror arrangement: the OLD row is the primary one. Selection is
+    // by freshness, never by pool position.
+    db.agentWork = makeAgentWork({
+      id: "work-old-blocked",
+      state: "BLOCKED",
+      lastHeartbeatAt: inMin(-60),
+      leaseExpiresAt: inMin(-55),
+    });
+    const oldRow = db.agentWork;
+    db.agentWorkRows.push(
+      makeAgentWork({ id: "work-current", state: "IN_PROGRESS", lastHeartbeatAt: inMin(-1) }),
+    );
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "released" }));
+    expect(res.status).toBe(200);
+
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    expect(db.agentWorkUpdates[0].where.id).toBe("work-current");
+    expect(db.agentWorkUpdates[0].data.state).toBe("RELEASED");
+    // The older row is untouched.
+    expect(oldRow.state).toBe("BLOCKED");
+    expect(db.agentWorkHistory[0].workId).toBe("work-current");
+  });
+
+  it("breaks freshness ties deterministically: createdAt, then id (#1251 review)", async () => {
+    const tied = inMin(-2);
+    db.agentWork = makeAgentWork({ id: "work-a", state: "IN_PROGRESS", lastHeartbeatAt: tied, createdAt: inMin(-90) });
+    db.agentWorkRows.push(
+      makeAgentWork({ id: "work-b", state: "IN_PROGRESS", lastHeartbeatAt: tied, createdAt: inMin(-5) }),
+    );
+
+    const res = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+    expect(res.status).toBe(200);
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    expect(db.agentWorkUpdates[0].where.id).toBe("work-b");
+
+    // Same heartbeat AND same createdAt: `id` decides, descending.
+    seedDb();
+    const tied2 = inMin(-2);
+    db.agentWork = makeAgentWork({ id: "work-a", state: "IN_PROGRESS", lastHeartbeatAt: tied2, createdAt: tied2 });
+    db.agentWorkRows.push(
+      makeAgentWork({ id: "work-b", state: "IN_PROGRESS", lastHeartbeatAt: tied2, createdAt: tied2 }),
+    );
+    const second = await post(baseBody({ operation: "disposition", disposition: "completed" }));
+    expect(second.status).toBe(200);
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    expect(db.agentWorkUpdates[0].where.id).toBe("work-b");
+  });
+
+  it("heartbeats the freshest active row, not an older BLOCKED sibling (#1251 review)", async () => {
+    // Renewal and disposition select through the same current-claim-work
+    // rule, so the row a renewal protects is the row a disposition settles.
+    db.agentWork = makeAgentWork({
+      id: "work-old-blocked",
+      state: "BLOCKED",
+      lastHeartbeatAt: inMin(-60),
+      leaseExpiresAt: inMin(-55),
+    });
+    const oldRow = db.agentWork;
+    const oldHeartbeat = oldRow.lastHeartbeatAt;
+    db.agentWorkRows.push(
+      makeAgentWork({ id: "work-current", state: "IN_PROGRESS", lastHeartbeatAt: inMin(-1) }),
+    );
+
+    const res = await post(baseBody({ operation: "renew" }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).agentWorkHeartbeated).toBe(true);
+
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    expect(db.agentWorkUpdates[0].where.id).toBe("work-current");
+    expect(db.agentWorkHistory).toHaveLength(1);
+    expect(db.agentWorkHistory[0].workId).toBe("work-current");
+    expect(oldRow.state).toBe("BLOCKED");
+    expect(oldRow.lastHeartbeatAt).toBe(oldHeartbeat);
   });
 
   it("replays the same disposition idempotently", async () => {

@@ -14,8 +14,8 @@ label cleanup, requeue, or credential rotation happens through this capability
 | `operation` | Body additions | Effect |
 |---|---|---|
 | `register` | `runRef?` (≤500 chars) | Records durable ownership on the lease (server `registeredAt` + worker-reported `registrationOccurredAt`), one deduplicated `ownership_registered` lifecycle event, one audit row. |
-| `renew` | `runRef?`, `externalWait?` (`{reason, retryAfter}` or `null` to clear) | Extends the single ownership TTL (`expiredAt = now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`), increments `renewCount`, records observed + occurred renewal times, heartbeats a matching active `AgentWork` row and refreshes that row's `leaseExpiresAt` to the renewed ownership expiry — so the stale-work sweep (which reclaims on `leaseExpiresAt` as well as on the heartbeat) cannot reclaim a renewed long-running worker. Progress is **not** required. |
-| `disposition` | `disposition` ∈ `completed`/`released`/`blocked`/`handed_off`, `note?`, `successorRef?`, `retryAfter?`/`waitReason?` | Durable terminal record on the lease (`disposition*` columns), settles a matching active `AgentWork` (DONE/RELEASED/BLOCKED), records an `ownership_dispositioned` lifecycle event and audit row. |
+| `renew` | `runRef?`, `externalWait?` (`{reason, retryAfter}` or `null` to clear) | Extends the single ownership TTL (`expiredAt = now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`), increments `renewCount`, records observed + occurred renewal times, heartbeats the **current claim's** active `AgentWork` row and refreshes that row's `leaseExpiresAt` to the renewed ownership expiry — so the stale-work sweep (which reclaims on `leaseExpiresAt` as well as on the heartbeat) cannot reclaim a renewed long-running worker. Progress is **not** required. |
+| `disposition` | `disposition` ∈ `completed`/`released`/`blocked`/`handed_off`, `note?`, `successorRef?`, `retryAfter?`/`waitReason?` | Durable terminal record on the lease (`disposition*` columns), settles the **current claim's** active `AgentWork` row (DONE/RELEASED/BLOCKED) — never an arbitrary active sibling (see *Current claim's work* below), records an `ownership_dispositioned` lifecycle event and audit row. |
 
 **Stale-work sweep and claim incarnations.** The sweep releases the claim of a
 stale `AgentWork` row only when no live sibling row for the same (agent, issue)
@@ -25,6 +25,43 @@ row still holds. The stale row itself is still reclaimed (marked `STALE`), but
 the claim is retained — reported as `claimRetained` (audited as
 `stale_agentwork_claim_retained`, labels unchanged) instead of `released`, and
 no `claim_released` event is written for it.
+
+The sibling lookup is a check, not a fence, so the sweep closes its
+decide-and-release window on two levels (#1251 review):
+
+1. **Per-issue mutation fence.** The whole pipeline for an issue-scoped claim —
+   sibling lookup, stale mark, lease delete, external GitHub label release,
+   finalization — runs under the same `IssueMutationGuard` fence
+   (`operation: "stale-release"`) that claim, lease, ownership renewal and
+   capacity release take. A concurrent renewal or fresh claim cannot commit
+   inside the window; it gets a retryable `409 mutation_busy` and re-decides
+   against post-sweep state. A busy fence skips the candidate for this sweep
+    (nothing is owed outside a completed fenced window). A guard demoted to
+    non-executing by a failed release is resumed by the next sweep of the same
+    (issue, agent) — safe because every step is a conditional update keyed off
+    persisted row state and the release is deduped per claim epoch. A guard
+    left `executing` by a crashed sweep process is never taken over
+    automatically: it stays fail-closed (same posture as a crashed claim
+    guard) and requires operator intervention.
+ 2. **Claim-epoch CAS.** The lease delete is compare-and-delete against a
+    snapshot of `{claimToken, expiredAt, lastRenewalObservedAt}` taken before
+    the sibling lookup, rechecked after the window for any lease left on the
+    pair (with no snapshot row, no delete is attempted at all — only the
+    recheck can then see a fresh claim). Any renew, re-claim or fresh claim
+    that commits between the snapshot and the delete changes at least one
+    fence field (or adds a row), the sweep backs off, and the claim/lease/
+    label survive untouched — belt-and-braces for any writer that skips the
+    fence. A terminal `disposition` changes none of the fence fields, so a
+    cleanly-disposed claim never makes the sweep back off forever.
+
+**Current claim's work.** Several active `AgentWork` rows can coexist for one
+(agent, issue) — `startAgentWork` releases the `CLAIMED`/`IN_PROGRESS` ones, so
+an older `BLOCKED` row survives. The row that *is* the current claim's work is
+selected by one deterministic rule shared by renewal heartbeat, terminal
+disposition and the operator inspect view: freshest `lastHeartbeatAt`, then
+`createdAt` desc, then `id` desc. A terminal disposition therefore can never
+settle an older sibling while the current attempt stays active, and the row a
+renewal protects is the same row a disposition settles.
 
 Semantics that never change:
 
@@ -137,7 +174,9 @@ Both are pure reads: no writes, no audits, no releases.
 
 Renew/register/disposition mutate the `Lease` under the per-issue
 `IssueMutationGuard` anchor (#1259), so they serialize with claim and fenced
-capacity-release mutations on the same issue. A concurrent operator release or
+capacity-release mutations on the same issue — and with the stale-work sweep,
+whose whole decide-and-release pipeline runs under the same fence as
+`operation: "stale-release"`. A concurrent operator release or
 re-claim therefore cannot interleave with a renewal; contention returns a
 retryable `409 mutation_busy`. GitHub is never consulted by these operations
 — their fencing is entirely against the claim receipt and the lease row — so

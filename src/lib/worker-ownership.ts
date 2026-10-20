@@ -200,6 +200,36 @@ function externalWaitData(externalWait?: OwnershipExternalWait | null): Record<s
 }
 
 /**
+ * The deterministic pick of the CURRENT claim's `AgentWork` row.
+ *
+ * Several active rows for the same (agent, issue) are reachable (`start`
+ * releases only the CLAIMED/IN_PROGRESS ones, so an older BLOCKED row can
+ * survive next to the current IN_PROGRESS row). The current claim's work is
+ * the FRESHEST active row — the one the latest start/heartbeat moved — with
+ * `createdAt` then `id` as deterministic tie-breaks so the pick never depends
+ * on database row order. Renewal heartbeat, ownership inspect and terminal
+ * disposition all select through this one rule, so "the row this claim owns"
+ * is the same row everywhere: a terminal disposition can never settle an
+ * older sibling while the current attempt stays active.
+ */
+export const CURRENT_CLAIM_WORK_ORDER_BY = [
+  { lastHeartbeatAt: "desc" as const },
+  { createdAt: "desc" as const },
+  { id: "desc" as const },
+];
+
+function findCurrentClaimWork<T extends { agentWork: { findFirst: (args: any) => Promise<any> } }>(
+  client: T,
+  agentName: string,
+  issueId: string,
+) {
+  return client.agentWork.findFirst({
+    where: { agentName, issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
+    orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
+  });
+}
+
+/**
  * Refresh the matching active `AgentWork` row of an ownership operation.
  *
  * The row carries the *execution* lease the sweeper reads: `sweepStaleWork`
@@ -212,11 +242,8 @@ function externalWaitData(externalWait?: OwnershipExternalWait | null): Record<s
  * expiry — the very ones written to the `Lease` row — never a second
  * `new Date()` that could drift from them.
  *
- * Several active rows for the same (agent, issue) are reachable (`start`
- * releases only the CLAIMED/IN_PROGRESS ones, so a BLOCKED row survives), and
- * the sweeper reclaims whichever row fell past its cutoff. The freshest
- * active row is therefore the one refreshed, so the row a renewal is about
- * cannot be a sibling the renewal left behind.
+ * The row refreshed is the CURRENT claim's work (`findCurrentClaimWork`), so
+ * the row a renewal is about cannot be a sibling the renewal left behind.
  */
 async function heartbeatMatchingAgentWork(
   input: OwnershipOpInput,
@@ -225,10 +252,7 @@ async function heartbeatMatchingAgentWork(
   now: Date,
   expiresAt: Date,
 ): Promise<boolean> {
-  const work = await prisma.agentWork.findFirst({
-    where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-    orderBy: { lastHeartbeatAt: "desc" },
-  });
+  const work = await findCurrentClaimWork(prisma, input.agentName, input.issueId);
   if (!work) return false;
   await prisma.agentWork.update({
     where: { id: work.id },
@@ -537,12 +561,14 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
       // first: any write placed above it would survive this early return.
       if (updated.count === 0) return fail("disposition_conflict", "Disposition changed concurrently; re-read and retry");
 
-      // Settle a matching active AgentWork (if any) to its terminal state so
-      // the execution record agrees with the declared disposition. History is
+      // Settle the CURRENT claim's active AgentWork (if any) to its terminal
+      // state so the execution record agrees with the declared disposition.
+      // The selection is the shared freshest-active-row rule, never an
+      // arbitrary active sibling: an older BLOCKED row surviving next to the
+      // current IN_PROGRESS row must not absorb a `completed`/`released`
+      // disposition while the current attempt stays active. History is
       // written by the same call; the lease row itself is retained as evidence.
-      const work = await tx.agentWork.findFirst({
-        where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-      });
+      const work = await findCurrentClaimWork(tx, input.agentName, input.issueId);
       if (work) {
         const terminalState = DISPOSITION_AGENT_WORK_STATE[input.disposition];
         await tx.agentWork.update({

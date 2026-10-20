@@ -15,6 +15,7 @@
 
 import { prisma } from "./prisma";
 import { getLiveIssueLabels } from "./claim-gate";
+import { CURRENT_CLAIM_WORK_ORDER_BY } from "./worker-ownership";
 import {
   deriveOwnershipState,
   type OwnershipAgentWorkEvidence,
@@ -191,9 +192,13 @@ export async function inspectIssueOwnership(
   const leaseRows = await prisma.lease.findMany({ where: { issueId: issue.id } });
   const lease = selectLease(leaseRows, now);
 
+  // The evidence view reports the CURRENT claim's work under the same
+  // deterministic freshest-active-row rule the write paths use (renewal
+  // heartbeat, terminal disposition), so inspect and the capability never
+  // disagree about which active row a claim owns.
   const agentWork = await prisma.agentWork.findFirst({
     where: { issueId: issue.id, state: { in: ACTIVE_AGENT_WORK_STATES } },
-    orderBy: { lastHeartbeatAt: "desc" },
+    orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
   });
 
   const prFixOrConditions: Array<Record<string, number>> = [{ issue: issue.number }];

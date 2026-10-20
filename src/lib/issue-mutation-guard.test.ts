@@ -134,6 +134,55 @@ describe("issue mutation guard", () => {
     expect(prisma.issueMutationGuard.create).toHaveBeenCalledTimes(2);
   });
 
+  it("allows only the exact same agent to resume a nonexecuting stale-release (#1251)", async () => {
+    // The stale-work sweep fences its whole decide-and-release pipeline under
+    // "stale-release". A failed release leaves the guard non-executing; the
+    // NEXT sweep of the same (issue, agent) must resume it — its steps are
+    // conditional updates keyed off persisted state plus an epoch-deduped
+    // release, so re-entry is safe.
+    vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(
+      row({ operation: "stale-release", agentName: "alpha" }) as never,
+    );
+    vi.mocked(prisma.issueMutationGuard.updateMany as any).mockResolvedValue({ count: 1 });
+    const callback = vi.fn(async (_tx, context) => ({ complete: true, value: context.resuming }));
+    await expect(
+      withIssueMutationGuard({ issueId: "issue-1", operation: "stale-release", agentName: "alpha" }, callback),
+    ).resolves.toMatchObject({ status: "completed", value: true });
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { operation: "stale-release", agentName: "beta" },
+    { operation: "claim", agentName: "alpha" },
+    { operation: "lease", agentName: "alpha" },
+  ])("does not let mismatched writers resume a stale-release guard", async (attempt) => {
+    // Resume is exact on operation AND agent: a different agent's sweep, or
+    // any claim-path writer, still gets `busy` and touches nothing.
+    vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(
+      row({ operation: "stale-release", agentName: "alpha" }) as never,
+    );
+    const callback = vi.fn();
+    expect(await withIssueMutationGuard({ issueId: "issue-1", ...attempt }, callback)).toMatchObject({ status: "busy" });
+    expect(callback).not.toHaveBeenCalled();
+    expect(prisma.issueMutationGuard.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps an executing stale-release guard fail-closed to its own agent", async () => {
+    // A crashed sweep leaves executing=true with no automatic takeover — the
+    // same fail-closed posture as a crashed claim guard (operator-visible,
+    // never silently stolen).
+    vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(
+      row({ operation: "stale-release", agentName: "alpha", executing: true }) as never,
+    );
+    expect(
+      await withIssueMutationGuard({ issueId: "issue-1", operation: "stale-release", agentName: "alpha" }, vi.fn()),
+    ).toMatchObject({ status: "busy" });
+    expect(prisma.issueMutationGuard.updateMany).not.toHaveBeenCalled();
+  });
+
   it("reopens a thrown callback but keeps the owner barrier", async () => {
     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
