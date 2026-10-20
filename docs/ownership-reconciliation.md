@@ -125,19 +125,34 @@ every 5 min when the in-process scheduler is enabled
 
 - Candidates: `AgentWork` in `CLAIMED/IN_PROGRESS/BLOCKED` whose
   `lastHeartbeatAt` or `leaseExpiresAt` is older than **5 min**
-  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:5`).
+  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:6`).
 - Two-phase, crash-safe: mark `STALE` + `staleClaimReleasePending` in one
-  transaction (also deleting the `Lease`), then release the GitHub claim via
-  `releaseIssueClaim` with `allowMissingAgent` + `preserveStatus`, then clear
-  the pending flag.
+  transaction (also releasing the marked epoch's `Lease`, narrowed per #1317:
+  the lease is released only when no live sibling `AgentWork` row shares the
+  `(agentName, issueId)` pair, and — absent one — only when it has expired,
+  or its last renewal (`renewedAt`, or `createdAt` when never renewed)
+  predates the row's snapshot `lastHeartbeatAt`), then release the GitHub
+  claim via `releaseIssueClaim` with `allowMissingAgent` + `preserveStatus`,
+  then clear the pending flag. The report carries `leasesReleased` alongside
+  `examined`/`released`/`skipped`/`errors` so operators can see when the
+  narrowed rule deferred a release.
 - `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:350`) deletes
   `AgentWork` rows with no matching active lease during a claim.
 
 **Gap:** the sweep's only liveness input is a 5-minute heartbeat age. A worker
 whose model call or test run exceeds 5 minutes, or that is disconnected but not
-dead, is released on the next tick. There is no confirmation, no grace
-escalation, no fencing against a concurrent renewal, and the release is driven
-by `AgentWork` age even though the queue filter is the label.
+dead, is released on the next tick. There is no confirmation and no grace
+escalation. The lease release is now fenced against concurrent renewal of the
+same pair (#1317), but the fence is conservative: a lease renewed after the
+swept row's last heartbeat survives the sweep even if its epoch is actually
+dead (e.g. a worker that starts work before claiming), keeping the issue
+lease-blocked for other agents until the lease TTL (30 min default) reaps it —
+while the board already shows the issue unowned, because the sweep stripped
+the `agent/<name>` label. That label half is itself unfenced: a swept stale
+sibling still strips the shared `agent/<name>` label even when a live epoch of
+the same agent holds the issue, dropping the issue out of every agent's queue
+while other agents' claims 409 on the surviving lease. The release also
+remains driven by `AgentWork` age even though the queue filter is the label.
 
 ### 3.6 Operator controls (escape hatch today)
 
@@ -310,8 +325,8 @@ as the claim route does (`src/app/api/issues/claim/route.ts:118-148`).
   `src/lib/scheduler.ts:129-133`), confined to one replica, guarded by the
   existing sync lock (`src/lib/sync-lock.ts`).
 - Bounded batch per tick; per-item try/catch so one failure cannot stall the
-  batch; structured report (`examined/released/skipped/errors`) as the current
-  sweep already emits.
+  batch; structured report (`examined/released/skipped/leasesReleased/errors`)
+  as the current sweep already emits.
 - Idempotent and resumable: a crash between "mark" and "release" is retried via
   the existing `staleClaimReleasePending` marker.
 

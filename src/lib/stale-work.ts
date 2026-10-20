@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { releaseIssueClaim, type IssueClaimClient } from "@/lib/issue-claim";
 import { lifecycleDedupeKey } from "@/lib/issue-lifecycle";
+import type { Prisma } from "@prisma/client";
 
 export const DEFAULT_STALE_WORK_MAX_AGE_MS = 5 * 60 * 1000;
 export const DEFAULT_STALE_WORK_BATCH_SIZE = 50;
@@ -10,15 +11,23 @@ export interface StaleWorkReport {
   examined: number;
   released: number;
   skipped: number;
+  /** Leases the narrowed release rule actually deleted (#1317). */
+  leasesReleased: number;
   errors: Array<{ workId: string; error: string }>;
+}
+
+interface MarkedOutcome {
+  marked: boolean;
+  leasesReleased: number;
 }
 
 interface StaleWorkTransactionClient {
   agentWork: {
     updateMany: (args: any) => Promise<{ count: number }>;
+    count: (args: Prisma.AgentWorkCountArgs) => Promise<number>;
   };
   lease: {
-    deleteMany: (args: any) => Promise<unknown>;
+    deleteMany: (args: Prisma.LeaseDeleteManyArgs) => Promise<{ count: number }>;
   };
   agentWorkHistory: {
     create: (args: any) => Promise<unknown>;
@@ -31,7 +40,7 @@ export interface StaleWorkClient {
   };
   issue: IssueClaimClient["issue"];
   lease: {
-    deleteMany: (args: any) => Promise<unknown>;
+    deleteMany: (args: Prisma.LeaseDeleteManyArgs) => Promise<{ count: number }>;
   };
   agentWorkHistory: {
     create: (args: any) => Promise<unknown>;
@@ -89,6 +98,7 @@ export async function sweepStaleWork(
     examined: candidates.length,
     released: 0,
     skipped: 0,
+    leasesReleased: 0,
     errors: [],
   };
 
@@ -97,13 +107,15 @@ export async function sweepStaleWork(
       // Claim the stale transition before external I/O. A heartbeat that
       // commits first makes the conditional update miss; a heartbeat after
       // this point sees a terminal STALE row and cannot revive it midway.
-      const marked = await client.$transaction(async (tx) => {
+      // Returns the number of leases the narrowed release deleted, counted
+      // into the report only after the transaction commits.
+      const marked = await client.$transaction(async (tx): Promise<MarkedOutcome> => {
         if (work.state === "STALE") {
           const result = await tx.agentWork.updateMany({
             where: { id: work.id, state: "STALE", staleClaimReleasePending: true },
             data: { leaseExpiresAt: now },
           });
-          if (result.count !== 1) return false;
+          if (result.count !== 1) return { marked: false, leasesReleased: 0 };
         } else {
           const result = await tx.agentWork.updateMany({
             where: {
@@ -121,7 +133,7 @@ export async function sweepStaleWork(
               staleClaimReleasePending: true,
             },
           });
-          if (result.count !== 1) return false;
+          if (result.count !== 1) return { marked: false, leasesReleased: 0 };
 
           await tx.agentWorkHistory.create({
             data: { workId: work.id, action: "stale" },
@@ -131,17 +143,59 @@ export async function sweepStaleWork(
         // Releasing the lease in the same transaction as the stale marker
         // keeps the database-side queue blockers consistent across retries.
         if (work.issueId) {
-          await tx.lease.deleteMany({
-            where: { agentName: work.agentName, issueId: work.issueId },
+          // Narrow the release to the lease of the claim epoch this row
+          // belongs to (#1317). The lease is a singleton per
+          // (agentName, issueId); upsertLease renews it at every claim and
+          // worker heartbeats never touch it, so its last renewal is the
+          // fingerprint of the newest claim epoch. A lease renewed after
+          // this row's snapshot lastHeartbeatAt belongs to a newer epoch of
+          // the same agent on the same issue — startAgentWork only releases
+          // CLAIMED/IN_PROGRESS rows, so a BLOCKED sibling row can still be
+          // swept while a live epoch holds the lease — and deleting by pair
+          // would kill that live claim. A lease that was never renewed has
+          // no renewedAt; its createdAt stands in. An already-expired lease
+          // blocks nothing, so the expiry branch releases it regardless of
+          // renewal time. The comparisons are strict lt: a lease that
+          // outlives its epoch is retained until lease TTL reaps it, while
+          // the inverse mistake — releasing a live epoch's lease — cannot
+          // self-heal. The snapshot lastHeartbeatAt is stable across a retry
+          // of the same STALE row, which keeps the narrowed delete
+          // idempotent.
+          const liveSiblings = await tx.agentWork.count({
+            where: {
+              agentName: work.agentName,
+              issueId: work.issueId,
+              id: { not: work.id },
+              state: { in: [...ACTIVE_WORK_STATES] },
+            },
           });
+          // A live sibling row can also be the lease's true owner even when
+          // the epoch rule says otherwise: a heartbeat can land on a stale
+          // sibling after a newer claim renewed the lease. With any live
+          // sibling present, leave the lease for its owner's own sweep.
+          if (liveSiblings === 0) {
+            const released = await tx.lease.deleteMany({
+              where: {
+                agentName: work.agentName,
+                issueId: work.issueId,
+                OR: [
+                  { expiredAt: { lte: now } },
+                  { renewedAt: { lt: work.lastHeartbeatAt } },
+                  { renewedAt: null, createdAt: { lt: work.lastHeartbeatAt } },
+                ],
+              },
+            });
+            return { marked: true, leasesReleased: released.count };
+          }
         }
-        return true;
+        return { marked: true, leasesReleased: 0 };
       });
 
-      if (!marked) {
+      if (!marked.marked) {
         report.skipped++;
         continue;
       }
+      report.leasesReleased += marked.leasesReleased;
 
       if (work.issue) {
         // The release is attributed to the sweep, not to the abandoned agent:
