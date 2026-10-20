@@ -211,6 +211,12 @@ function externalWaitData(externalWait?: OwnershipExternalWait | null): Record<s
  * is propagated here too, and both values are the operation's own clock and
  * expiry — the very ones written to the `Lease` row — never a second
  * `new Date()` that could drift from them.
+ *
+ * Several active rows for the same (agent, issue) are reachable (`start`
+ * releases only the CLAIMED/IN_PROGRESS ones, so a BLOCKED row survives), and
+ * the sweeper reclaims whichever row fell past its cutoff. The freshest
+ * active row is therefore the one refreshed, so the row a renewal is about
+ * cannot be a sibling the renewal left behind.
  */
 async function heartbeatMatchingAgentWork(
   input: OwnershipOpInput,
@@ -221,6 +227,7 @@ async function heartbeatMatchingAgentWork(
 ): Promise<boolean> {
   const work = await prisma.agentWork.findFirst({
     where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
+    orderBy: { lastHeartbeatAt: "desc" },
   });
   if (!work) return false;
   await prisma.agentWork.update({

@@ -100,6 +100,11 @@ disagree.
 - `leaseExpiresAt` set to **now + 5 min** on start and every checkpoint
   (`src/lib/agent-work.ts:168-169,221-226`); `lastHeartbeatAt` updated on
   checkpoint; `blockerReason` set on `BLOCKED`.
+- An ownership-capability `renew` also refreshes the matching active row's
+  `lastHeartbeatAt` and `leaseExpiresAt`, the latter to the renewed ownership
+  expiry (default 30m, `src/lib/worker-ownership.ts`) — the sweeper reclaims
+  on `leaseExpiresAt` as well as on the heartbeat, so a renewal that moved
+  only the heartbeat would still be reclaimable.
 - One active `AgentWork` per agent (a new `start` releases the prior one,
   `src/lib/agent-work.ts:173-184`).
 - `AgentWorkHistory` records each transition.

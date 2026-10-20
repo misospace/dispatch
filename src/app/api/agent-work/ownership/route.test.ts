@@ -302,9 +302,20 @@ function makeAgentWork(overrides: Record<string, unknown> = {}) {
 // a database — the clause is the one `sweepStaleWork` actually passes, not a
 // hand-copied predicate.
 
+/** The clause keys the sweeper's WHERE clause is allowed to use. */
+const SWEEP_CLAUSE_KEYS = new Set([
+  "OR",
+  "state",
+  "staleClaimReleasePending",
+  "lastHeartbeatAt",
+  "leaseExpiresAt",
+]);
+
 /**
- * Evaluate the operators the sweep's clause uses. An unsupported operator
- * throws, so the fake can never silently disagree with the clause.
+ * Evaluate the operators the sweep's clause uses. A clause key or operator
+ * this evaluator does not implement (`AND`, `NOT`, `NOT_IN`, …) throws, so
+ * the fake can never silently disagree with the clause — an unimplemented
+ * clause must not read as "no candidates".
  */
 function matchesWhere(row: Record<string, unknown>, where: unknown): boolean {
   if (where === null || typeof where !== "object") return true;
@@ -313,6 +324,9 @@ function matchesWhere(row: Record<string, unknown>, where: unknown): boolean {
       const clauses = cond as unknown[];
       if (!clauses.some((clause) => matchesWhere(row, clause))) return false;
       continue;
+    }
+    if (!SWEEP_CLAUSE_KEYS.has(key)) {
+      throw new Error(`test fake: unsupported where clause key ${key}`);
     }
     const value = row[key];
     if (cond !== null && typeof cond === "object" && !(cond instanceof Date) && !Array.isArray(cond)) {
@@ -794,6 +808,22 @@ describe("POST /api/agent-work/ownership — renew keeps the worker alive for th
     const controlReport = await sweepStaleWork(control.client);
     expect(controlReport.examined).toBe(1);
     expect(controlReport.released).toBe(0);
+  });
+});
+
+describe("stale-work clause evaluator (#1251)", () => {
+  it("throws on a clause key or operator it does not implement, instead of reading as 'no candidates'", () => {
+    // An unimplemented clause must not silently select nothing: the fake
+    // would then agree with a clause it does not actually understand.
+    expect(() => matchesWhere({ state: "IN_PROGRESS" }, { AND: [{ state: "IN_PROGRESS" }] })).toThrow(
+      /unsupported where clause key/,
+    );
+    expect(() => matchesWhere({ state: "IN_PROGRESS" }, { NOT: { state: "STALE" } })).toThrow(
+      /unsupported where clause key/,
+    );
+    expect(() => matchesWhere({ state: "IN_PROGRESS" }, { state: { notIn: ["STALE"] } })).toThrow(
+      /unsupported where operator/,
+    );
   });
 });
 
