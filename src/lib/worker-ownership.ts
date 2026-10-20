@@ -38,7 +38,10 @@
 //    extends a TTL that a retry can safely re-extend and heartbeats a
 //    matching `AgentWork` as best-effort evidence whose absence it reports
 //    truthfully (`agentWorkHeartbeated: false`), so there is nothing for it
-//    to lie about.
+//    to lie about. That heartbeat also carries the renewed expiry onto the
+//    AgentWork row: the stale-work sweeper reclaims on `leaseExpiresAt` too,
+//    so a renewal that moved only the heartbeat would still lose a renewed
+//    long-running worker to the sweeper (#1251).
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
@@ -196,12 +199,34 @@ function externalWaitData(externalWait?: OwnershipExternalWait | null): Record<s
   return { retryAfter: externalWait.retryAfter, waitReason: externalWait.reason };
 }
 
-async function heartbeatMatchingAgentWork(input: OwnershipOpInput, action: string, summary?: string | null): Promise<boolean> {
+/**
+ * Refresh the matching active `AgentWork` row of an ownership operation.
+ *
+ * The row carries the *execution* lease the sweeper reads: `sweepStaleWork`
+ * reclaims an active row whose `lastHeartbeatAt` OR whose `leaseExpiresAt`
+ * fell past its cutoff. Moving only the heartbeat therefore leaves a renewed
+ * long-running worker reclaimable — the old `leaseExpiresAt` (5 minutes, set
+ * by `startAgentWork`/`checkpointAgentWork`) passes the cutoff and the sweeper
+ * marks the freshly renewed worker STALE and deletes its lease. So the expiry
+ * is propagated here too, and both values are the operation's own clock and
+ * expiry — the very ones written to the `Lease` row — never a second
+ * `new Date()` that could drift from them.
+ */
+async function heartbeatMatchingAgentWork(
+  input: OwnershipOpInput,
+  action: string,
+  summary: string | null | undefined,
+  now: Date,
+  expiresAt: Date,
+): Promise<boolean> {
   const work = await prisma.agentWork.findFirst({
     where: { agentName: input.agentName, issueId: input.issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
   });
   if (!work) return false;
-  await prisma.agentWork.update({ where: { id: work.id }, data: { lastHeartbeatAt: new Date() } });
+  await prisma.agentWork.update({
+    where: { id: work.id },
+    data: { lastHeartbeatAt: now, leaseExpiresAt: expiresAt },
+  });
   await prisma.agentWorkHistory.create({
     data: { workId: work.id, action, summary: summary ?? undefined },
   });
@@ -387,10 +412,16 @@ export async function renewOwnership(input: RenewOwnershipInput): Promise<{ ok: 
     if (updated.count === 0) return fail("stale_claim_token", "Claim changed concurrently; re-read active work and retry");
 
     const row = await prisma.lease.findUnique({ where: { id: lease.id } });
+    // The same clock and the same expiry the lease was written with: the
+    // matching active AgentWork row is refreshed to the renewed ownership
+    // expiry, so the stale-work sweeper cannot reclaim a worker that is
+    // still renewing (#1251).
     const agentWorkHeartbeated = await heartbeatMatchingAgentWork(
       input,
       "ownership_renewed",
       input.externalWait && typeof input.externalWait === "object" ? `external wait: ${input.externalWait.reason}` : null,
+      now,
+      expiresAt,
     );
 
     return {

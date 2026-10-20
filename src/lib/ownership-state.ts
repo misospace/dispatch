@@ -19,7 +19,11 @@ import { AGENT_PREFIX } from "@/types";
  *   1. closed issue                  → UNOWNED (`issue_closed`)
  *   2. ownership conflicts           → CONFLICTED (`multiple_agent_labels`,
  *      `live_cache_divergence`, `lease_owner_mismatch`,
- *      `agent_work_owner_mismatch` — all applicable ones are collected)
+ *      `agent_work_owner_mismatch` — all applicable ones are collected).
+ *      The lease and the active AgentWork are compared against the sole
+ *      `agent/*` label owner INDEPENDENTLY of each other: a lease that
+ *      agrees with the label does not excuse an active AgentWork row
+ *      owned by somebody else.
  *   3. `status/blocked` + non-empty reason → HELD (`human_hold`); terminal,
  *      applies even with a live claim and even without any claim; a bare
  *      `status/blocked` without a reason does not hold
@@ -248,7 +252,12 @@ export function deriveOwnershipState(
     if (lease !== null && lease.agentName !== labelOwner) {
       conflictReasons.push("lease_owner_mismatch");
     }
-    if (lease === null && activeAgentWork !== null && activeAgentWork.agentName !== labelOwner) {
+    // The active-AgentWork comparison is independent of whether a lease
+    // exists: an active AgentWork row owned by somebody other than the sole
+    // label owner is contradictory ownership evidence in its own right. A
+    // lease that agrees with the label does not make the AgentWork row
+    // agree with it too (design §4 `CONFLICTED`).
+    if (activeAgentWork !== null && activeAgentWork.agentName !== labelOwner) {
       conflictReasons.push("agent_work_owner_mismatch");
     }
   }

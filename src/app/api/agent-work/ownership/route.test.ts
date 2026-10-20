@@ -227,6 +227,7 @@ vi.mock("@/lib/prisma", () => {
 
 import { POST } from "./route";
 import { upsertLease } from "@/lib/lease";
+import { sweepStaleWork, type StaleWorkClient } from "@/lib/stale-work";
 import { getAuthorizedActor, authorizeRequest, resetAuthCaches } from "@/lib/auth";
 import { resetRateLimits } from "@/lib/rate-limit";
 import { lifecycleDedupeKey } from "@/lib/issue-lifecycle";
@@ -283,9 +284,86 @@ function makeAgentWork(overrides: Record<string, unknown> = {}) {
     issueId: "iss1",
     state: "IN_PROGRESS",
     lastHeartbeatAt: inMin(-2),
+    // The stale-work sweeper reads both timestamps: a row is reclaimed when
+    // its heartbeat OR its lease expiry falls past the sweep cutoff.
+    leaseExpiresAt: inMin(5),
+    staleClaimReleasePending: false,
     blockerReason: null,
     ...overrides,
   };
+}
+
+// ─── Stale-work eligibility helpers (#1251) ─────────────────────────────────
+//
+// The sweeper selects its reclaim candidates with a WHERE clause over the
+// AgentWork row (`state`, `staleClaimReleasePending`, `lastHeartbeatAt`,
+// `leaseExpiresAt`). These helpers answer that clause against a row in
+// memory, so the sweeper's REAL candidate selection can be exercised without
+// a database — the clause is the one `sweepStaleWork` actually passes, not a
+// hand-copied predicate.
+
+/**
+ * Evaluate the operators the sweep's clause uses. An unsupported operator
+ * throws, so the fake can never silently disagree with the clause.
+ */
+function matchesWhere(row: Record<string, unknown>, where: unknown): boolean {
+  if (where === null || typeof where !== "object") return true;
+  for (const [key, cond] of Object.entries(where as Record<string, unknown>)) {
+    if (key === "OR") {
+      const clauses = cond as unknown[];
+      if (!clauses.some((clause) => matchesWhere(row, clause))) return false;
+      continue;
+    }
+    const value = row[key];
+    if (cond !== null && typeof cond === "object" && !(cond instanceof Date) && !Array.isArray(cond)) {
+      for (const [op, operand] of Object.entries(cond as Record<string, unknown>)) {
+        if (op === "in") {
+          if (!Array.isArray(operand) || !operand.includes(value)) return false;
+        } else if (op === "lt") {
+          const left = value instanceof Date ? value.getTime() : value;
+          const right = operand instanceof Date ? operand.getTime() : operand;
+          if (typeof left !== "number" || typeof right !== "number" || !(left < right)) return false;
+        } else {
+          throw new Error(`test fake: unsupported where operator ${key}.${op}`);
+        }
+      }
+      continue;
+    }
+    // Scalar equality: `state: "STALE"`, `staleClaimReleasePending: false`.
+    if (value !== cond) return false;
+  }
+  return true;
+}
+
+/**
+ * A sweep client whose `agentWork.findMany` evaluates the sweep's own clause
+ * against the row it is handed — the row the renewal actually wrote.
+ *
+ * The mark transaction is inert on purpose: the controls below only have to
+ * prove the sweeper SELECTED a row, never to release it (no forge call, no
+ * label write, no lease delete).
+ */
+function makeSweepClient(getRow: () => Record<string, unknown> | null) {
+  const capturedClauses: unknown[] = [];
+  const client = {
+    agentWork: {
+      findMany: vi.fn(async (args: any) => {
+        capturedClauses.push(args.where);
+        const row = getRow();
+        if (!row) return [];
+        return matchesWhere(row, args.where) ? [row] : [];
+      }),
+    },
+    issue: {
+      update: vi.fn(async () => ({})),
+      findUnique: vi.fn(async () => ({ labels: [] })),
+    },
+    lease: { deleteMany: vi.fn(async () => ({ count: 0 })) },
+    agentWorkHistory: { create: vi.fn(async () => ({})) },
+    auditLog: { create: vi.fn(async () => ({})) },
+    $transaction: vi.fn(async () => false),
+  };
+  return { client: client as unknown as StaleWorkClient, capturedClauses };
 }
 
 function post(
@@ -640,6 +718,82 @@ describe("POST /api/agent-work/ownership — renew", () => {
     const got = new Date(body.lastRenewalOccurredAt).getTime();
     expect(got).toBeGreaterThan(before - 5000);
     expect(got).toBeLessThanOrEqual(before + 5000);
+  });
+});
+
+describe("POST /api/agent-work/ownership — renew keeps the worker alive for the stale-work sweep (#1251)", () => {
+  // The sweeper reclaims an active AgentWork row whose `lastHeartbeatAt` OR
+  // whose `leaseExpiresAt` fell past its cutoff. The AgentWork lease is the
+  // short one (5 minutes, set by start/checkpoint), so a renewal that moved
+  // only the heartbeat would still be reclaimable — and a long-running
+  // worker that keeps renewing would be reclaimed anyway.
+
+  it("writes the renewed expiry and the operation clock onto the matching active AgentWork row", async () => {
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
+
+    const res = await post(baseBody({ operation: "renew" }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    const [update] = db.agentWorkUpdates;
+    // The renewed ownership expiry — the very one the lease received.
+    expect(update.data.leaseExpiresAt).toBeInstanceOf(Date);
+    expect(update.data.leaseExpiresAt.getTime()).toBe(new Date(body.expiresAt).getTime());
+    expect(update.data.leaseExpiresAt.getTime()).toBe(db.lease.expiredAt.getTime());
+    // The operation's own clock, not a second `new Date()`.
+    expect(update.data.lastHeartbeatAt.getTime()).toBe(db.lease.renewedAt.getTime());
+    // And the row itself carries both.
+    expect(db.agentWork.leaseExpiresAt.getTime()).toBe(update.data.leaseExpiresAt.getTime());
+    expect(db.agentWork.lastHeartbeatAt.getTime()).toBe(update.data.lastHeartbeatAt.getTime());
+  });
+
+  it("leaves the renewed worker out of the stale-work sweeper's reclaim candidates", async () => {
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
+    const res = await post(baseBody({ operation: "renew" }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).agentWorkHeartbeated).toBe(true);
+
+    // The row the renewal actually wrote.
+    const renewedRow = db.agentWork;
+    const { client, capturedClauses } = makeSweepClient(() => renewedRow);
+
+    const report = await sweepStaleWork(client);
+
+    // The sweeper's REAL candidate selection finds nothing to reclaim.
+    expect(report.examined).toBe(0);
+    expect(report.released).toBe(0);
+    expect(report.skipped).toBe(0);
+    expect(capturedClauses).toHaveLength(1);
+  });
+
+  it("negative control: the pre-fix write shape IS selected by the same clause", async () => {
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
+    const res = await post(baseBody({ operation: "renew" }));
+    expect(res.status).toBe(200);
+
+    const renewedRow = db.agentWork;
+    const { client, capturedClauses } = makeSweepClient(() => renewedRow);
+    await sweepStaleWork(client);
+    const [clause] = capturedClauses;
+
+    // What the renewal would have left behind WITHOUT the expiry
+    // propagation: a fresh heartbeat, the old (lapsed) lease expiry.
+    const preFixRow = { ...renewedRow, leaseExpiresAt: inMin(-10) };
+    expect(matchesWhere(preFixRow, clause)).toBe(true);
+    // And the fully pre-renewal row (old heartbeat, old expiry).
+    const preRenewalRow = { ...renewedRow, lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) };
+    expect(matchesWhere(preRenewalRow, clause)).toBe(true);
+    // The renewed row is not.
+    expect(matchesWhere(renewedRow, clause)).toBe(false);
+
+    // The sweeper itself selects the pre-fix shape: examined 1 means the
+    // clause returned it (the inert mark transaction keeps the release path
+    // out of this control).
+    const control = makeSweepClient(() => preFixRow);
+    const controlReport = await sweepStaleWork(control.client);
+    expect(controlReport.examined).toBe(1);
+    expect(controlReport.released).toBe(0);
   });
 });
 

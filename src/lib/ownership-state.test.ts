@@ -153,6 +153,54 @@ describe("deriveOwnershipState", () => {
       expect(result.ownerAgent).toBe("alice");
     });
 
+    it("flags an active AgentWork owned by a different agent than the sole label even when the lease agrees with the label (#1251)", () => {
+      // A lease owned by the label owner does NOT make the active AgentWork
+      // row agree with the label: contradictory active ownership evidence is
+      // a conflict whether or not a lease exists (design §4 `CONFLICTED`).
+      const result = deriveOwnershipState(
+        makeEvidence({
+          labels: ["agent/alice"],
+          lease: makeLease({ agentName: "alice" }),
+          agentWork: makeAgentWork({ agentName: "bob" }),
+        }),
+        WINDOWS,
+        NOW,
+      );
+      expect(result.state).toBe("CONFLICTED");
+      expect(result.reasonCodes).toEqual(["agent_work_owner_mismatch"]);
+      expect(result.ownerAgent).toBe("alice");
+    });
+
+    it("does not flag a lease-backed AgentWork owned by the sole label owner", () => {
+      const result = deriveOwnershipState(
+        makeEvidence({
+          labels: ["agent/alice"],
+          lease: makeLease({ agentName: "alice" }),
+          agentWork: makeAgentWork({ agentName: "alice" }),
+        }),
+        WINDOWS,
+        NOW,
+      );
+      expect(result.state).toBe("CLAIMED_ACTIVE");
+      expect(result.reasonCodes).not.toContain("agent_work_owner_mismatch");
+      expect(result.ownerAgent).toBe("alice");
+    });
+
+    it("keeps the lease mismatch first when both the lease and the active AgentWork disagree with the label (#1251)", () => {
+      const result = deriveOwnershipState(
+        makeEvidence({
+          labels: ["agent/alice"],
+          lease: makeLease({ agentName: "carol" }),
+          agentWork: makeAgentWork({ agentName: "bob" }),
+        }),
+        WINDOWS,
+        NOW,
+      );
+      expect(result.state).toBe("CONFLICTED");
+      expect(result.reasonCodes).toEqual(["lease_owner_mismatch", "agent_work_owner_mismatch"]);
+      expect(result.ownerAgent).toBe("alice");
+    });
+
     it("does not treat a non-active AgentWork as an owner mismatch", () => {
       const result = deriveOwnershipState(
         makeEvidence({ labels: ["agent/alice"], agentWork: makeAgentWork({ agentName: "bob", state: "STALE" }) }),

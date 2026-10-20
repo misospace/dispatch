@@ -14,7 +14,7 @@ label cleanup, requeue, or credential rotation happens through this capability
 | `operation` | Body additions | Effect |
 |---|---|---|
 | `register` | `runRef?` (≤500 chars) | Records durable ownership on the lease (server `registeredAt` + worker-reported `registrationOccurredAt`), one deduplicated `ownership_registered` lifecycle event, one audit row. |
-| `renew` | `runRef?`, `externalWait?` (`{reason, retryAfter}` or `null` to clear) | Extends the single ownership TTL (`expiredAt = now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`), increments `renewCount`, records observed + occurred renewal times, heartbeats a matching active `AgentWork` row. Progress is **not** required. |
+| `renew` | `runRef?`, `externalWait?` (`{reason, retryAfter}` or `null` to clear) | Extends the single ownership TTL (`expiredAt = now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`), increments `renewCount`, records observed + occurred renewal times, heartbeats a matching active `AgentWork` row and refreshes that row's `leaseExpiresAt` to the renewed ownership expiry — so the stale-work sweep (which reclaims on `leaseExpiresAt` as well as on the heartbeat) cannot reclaim a renewed long-running worker. Progress is **not** required. |
 | `disposition` | `disposition` ∈ `completed`/`released`/`blocked`/`handed_off`, `note?`, `successorRef?`, `retryAfter?`/`waitReason?` | Durable terminal record on the lease (`disposition*` columns), settles a matching active `AgentWork` (DONE/RELEASED/BLOCKED), records an `ownership_dispositioned` lifecycle event and audit row. |
 
 Semantics that never change:
@@ -89,7 +89,10 @@ Ownership is **derived, never stored** (design §4).
 with machine-readable reason codes. States: `UNOWNED`, `CLAIMED_ACTIVE`,
 `CLAIMED_LONG_RUNNING`, `REVIEW_OWNED`, `EXTERNAL_WAIT`, `HELD`,
 `ABANDONED_CANDIDATE`, `CONFLICTED`, `UNKNOWN`. Absent or conflicting
-evidence yields `UNKNOWN`/`CONFLICTED` — never abandonment.
+evidence yields `UNKNOWN`/`CONFLICTED` — never abandonment. The lease owner
+and the active `AgentWork` owner are each compared against the sole `agent/*`
+label owner **independently**: a lease that agrees with the label does not
+excuse an active `AgentWork` row owned by somebody else (`agent_work_owner_mismatch`).
 
 Operator read surfaces (maintainer-only; worker tokens are refused 403 by the
 central tiering):
