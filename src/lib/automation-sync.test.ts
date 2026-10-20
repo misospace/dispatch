@@ -43,6 +43,9 @@ vi.mock("@/lib/github", () => ({
   fetchRecentRunsAllWorkflows: vi.fn(),
   fetchReleases: vi.fn(),
   fetchPullRequests: vi.fn(),
+  // The closed listing is additive data (#1313); default it to empty so only
+  // the tests that care about merge persistence stub it explicitly.
+  fetchClosedPullRequests: vi.fn().mockResolvedValue([]),
   fetchLatestCommit: vi.fn(),
   fetchPackages: vi.fn(),
   fetchRunJobs: vi.fn(),
@@ -67,6 +70,8 @@ const fetchWorkflowsMock = github.fetchWorkflows as ReturnType<typeof vi.fn>;
 const fetchRunsMock = github.fetchRecentRunsAllWorkflows as ReturnType<typeof vi.fn>;
 const fetchReleasesMock = github.fetchReleases as ReturnType<typeof vi.fn>;
 const fetchPRsMock = github.fetchPullRequests as ReturnType<typeof vi.fn>;
+const fetchClosedPRsMock = github.fetchClosedPullRequests as ReturnType<typeof vi.fn>;
+const upsertPR = prisma.githubPullRequest.upsert as ReturnType<typeof vi.fn>;
 const fetchCommitMock = github.fetchLatestCommit as ReturnType<typeof vi.fn>;
 const fetchPackagesMock = github.fetchPackages as ReturnType<typeof vi.fn>;
 const fetchRunJobsMock = github.fetchRunJobs as ReturnType<typeof vi.fn>;
@@ -203,6 +208,7 @@ describe("syncAutomationRepo", () => {
       expect(fetchRunsMock).toHaveBeenCalledWith("octocat/hello-world", 20);
       expect(fetchReleasesMock).toHaveBeenCalledWith("octocat/hello-world", 10);
       expect(fetchPRsMock).toHaveBeenCalledWith("octocat/hello-world", 20);
+      expect(fetchClosedPRsMock).toHaveBeenCalledWith("octocat/hello-world", 50);
       expect(fetchPackagesMock).toHaveBeenCalledWith("octocat/hello-world");
     });
 
@@ -733,6 +739,133 @@ describe("syncAutomationRepo", () => {
       // Only the completed run (#201) triggers a job fetch.
       expect(fetchRunJobsMock).toHaveBeenCalledTimes(1);
       expect(fetchRunJobsMock).toHaveBeenCalledWith("o/r", 201);
+    });
+  });
+
+  describe("merged PR persistence (#1313)", () => {
+    function fixturePr(overrides: Record<string, unknown> & { number: number }) {
+      return {
+        url: `https://github.com/o/r/pull/${overrides.number}`,
+        title: `PR ${overrides.number}`,
+        state: "open",
+        user: { login: "u" },
+        head: { ref: `branch-${overrides.number}` },
+        base: { ref: "main" },
+        created_at: "2024-01-01T00:00:00Z",
+        updated_at: "2024-01-02T00:00:00Z",
+        merged_at: null,
+        draft: false,
+        ...overrides,
+      };
+    }
+
+    function stubFetches(
+      {
+        open = [],
+        closed = [],
+        closedError,
+      }: {
+        open?: ReturnType<typeof fixturePr>[];
+        closed?: ReturnType<typeof fixturePr>[];
+        closedError?: Error;
+      } = {},
+    ) {
+      upsertRepo.mockResolvedValueOnce(repoStub());
+      createSyncRun.mockResolvedValueOnce(syncRunStub());
+      fetchRepoMock.mockResolvedValueOnce({ name: "r", owner: { login: "o" }, default_branch: "main" });
+      fetchWorkflowsMock.mockResolvedValueOnce([]);
+      fetchRunsMock.mockResolvedValueOnce([]);
+      fetchReleasesMock.mockResolvedValueOnce([]);
+      fetchPRsMock.mockResolvedValueOnce(open);
+      if (closedError) {
+        fetchClosedPRsMock.mockRejectedValueOnce(closedError);
+      } else {
+        fetchClosedPRsMock.mockResolvedValueOnce(closed);
+      }
+      fetchPackagesMock.mockResolvedValueOnce([]);
+      fetchCommitMock.mockResolvedValueOnce(null);
+      updateSyncRun.mockResolvedValue({});
+      updateRepo.mockResolvedValue({});
+      createEvent.mockResolvedValue({});
+    }
+
+    it("persists the merge time of a merged PR the open listing no longer carries", async () => {
+      stubFetches({
+        closed: [fixturePr({ number: 7, state: "closed", merged_at: "2024-02-03T04:05:06Z" })],
+      });
+
+      const result = await syncAutomationRepo("o/r");
+
+      expect(result.success).toBe(true);
+      expect(upsertPR).toHaveBeenCalledTimes(1);
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 7 } },
+          create: expect.objectContaining({
+            number: 7,
+            state: "closed",
+            mergedAt: new Date("2024-02-03T04:05:06Z"),
+          }),
+          update: expect.objectContaining({
+            state: "closed",
+            mergedAt: new Date("2024-02-03T04:05:06Z"),
+          }),
+        }),
+      );
+    });
+
+    it("skips unmerged closed PRs and keeps an open PR's mergedAt null", async () => {
+      stubFetches({
+        open: [fixturePr({ number: 1 })],
+        closed: [fixturePr({ number: 2, state: "closed", merged_at: null })],
+      });
+
+      const result = await syncAutomationRepo("o/r");
+
+      expect(result.success).toBe(true);
+      expect(upsertPR).toHaveBeenCalledTimes(1);
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 1 } },
+          create: expect.objectContaining({ mergedAt: null }),
+          update: expect.objectContaining({ mergedAt: null }),
+        }),
+      );
+    });
+
+    it("upserts a PR present in both listings once, with the merged row winning", async () => {
+      // A PR merging between the two concurrent listings can be served as
+      // open by one call and as merged by the other; the open duplicate must
+      // not write mergedAt back to null.
+      stubFetches({
+        open: [fixturePr({ number: 3 })],
+        closed: [fixturePr({ number: 3, state: "closed", merged_at: "2024-05-05T00:00:00Z" })],
+      });
+
+      const result = await syncAutomationRepo("o/r");
+
+      expect(result.success).toBe(true);
+      expect(upsertPR).toHaveBeenCalledTimes(1);
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 3 } },
+          update: expect.objectContaining({ mergedAt: new Date("2024-05-05T00:00:00Z") }),
+        }),
+      );
+    });
+
+    it("degrades to the open-only sync when the closed listing fails", async () => {
+      stubFetches({ open: [fixturePr({ number: 4 })], closedError: new Error("closed listing 403") });
+
+      const result = await syncAutomationRepo("o/r");
+
+      expect(result.success).toBe(true);
+      expect(upsertPR).toHaveBeenCalledTimes(1);
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 4 } },
+        }),
+      );
     });
   });
 });
