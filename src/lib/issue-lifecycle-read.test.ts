@@ -252,6 +252,25 @@ describe("buildIssueLifecycleTimeline", () => {
     expect(timeline.delivery).toBe("unknown");
   });
 
+  it("reports closed-unmerged again when a close follows a reopen, keeping the first close milestone", () => {
+    // Regression (#1203 review): delivery follows the LATEST close/reopen
+    // ordering — a close after a reopen closes the item again — while
+    // `closedAt` keeps reporting the FIRST close.
+    const timeline = buildIssueLifecycleTimeline(
+      { ...issue, state: "closed", closedAt: "2026-10-04T00:00:00.000Z" },
+      [
+        event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+        event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-03T00:00:00.000Z" }),
+        event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-04T00:00:00.000Z" }),
+      ],
+    );
+
+    expect(timeline.delivery).toBe("closed-unmerged");
+    expect(timeline.closedAt.at).toBe("2026-10-02T00:00:00.000Z");
+    expect(timeline.lastReopenAt.at).toBe("2026-10-03T00:00:00.000Z");
+    expect(timeline.notes).toContain("delivery derived from a close after a reopen");
+  });
+
   it("establishes doneAt from a completed event or a status move to status/done", () => {
     const fromCompleted = buildIssueLifecycleTimeline(issue, [
       event({ kind: "completed", source: "agent-report", actor: "alpha", occurredAt: "2026-10-02T00:00:00.000Z" }),

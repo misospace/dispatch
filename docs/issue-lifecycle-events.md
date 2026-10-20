@@ -83,7 +83,9 @@ I/O). It exposes, per work item:
   first claim.
 - `doneAt` / `closedAt` / `lastReopenAt` milestones. A close observed without
   a merge is `delivery: "closed-unmerged"` — never labeled shipped. Reopening
-  preserves the earlier close milestone; it only changes `delivery`.
+  preserves the earlier close milestone in `closedAt`, while `delivery` follows
+  the latest close/reopen ordering: a close after a reopen reports
+  `closed-unmerged` again.
 - `pullRequests[]`: one entry per distinct merged PR (multi-PR issues are
   first-class), each with the authoritative `mergedAt`, `mergeCommitSha`,
   `headSha`, and `linkSource` provenance, plus `firstMergedAt`.

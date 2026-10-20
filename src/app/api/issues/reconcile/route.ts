@@ -320,11 +320,15 @@ export async function POST(request: Request) {
 
         // Extract issue numbers from merged PRs: scan PR bodies for the
         // "Fixes #NNN", "Closes #NNN", "Resolves #NNN" keywords workers write,
-        // then fall back to branch name patterns.
+        // then collect branch name patterns.
         // `mergedFixingIssues` stays first-PR-wins because it drives the close
         // decision. `mergedPrLinkEvidence` keeps *every* merged PR per issue
         // with its link provenance (#1203): merge evidence records one event
-        // per linked PR. Only explicit correlations qualify — a body Fixes/
+        // per linked PR. Branch-name evidence is collected independently of
+        // the close-decision map — a PR whose own number collides with an
+        // issue number already in that map still records its branch link —
+        // while the close decision itself stays first-PR-wins per issue
+        // number. Only explicit correlations qualify — a body Fixes/
         // Closes/Resolves keyword or a branch-name pattern. PR titles are
         // deliberately not consulted (#1203, review-required): a title-only
         // match is neither close evidence nor link evidence, so a merged PR
@@ -354,18 +358,19 @@ export async function POST(request: Request) {
             }
             recordLinkEvidence(num, pr, "body-keyword");
           }
-          // 2. Fallback: check branch name pattern
-          if (!mergedFixingIssues.has(pr.number)) {
-            const branch = pr.head?.ref ?? "";
-            const match = branch.match(/issue[-_/]?(\d+)/i);
-            if (match) {
-              const issueNum = parseInt(match[1], 10);
-              if (!isNaN(issueNum)) {
-                if (!mergedFixingIssues.has(issueNum)) {
-                  mergedFixingIssues.set(issueNum, pr);
-                }
-                recordLinkEvidence(issueNum, pr, "branch-name");
+          // 2. Branch name pattern — collected for every merged PR, not only
+          // for one whose own number is free in the close-decision map: the
+          // link evidence a branch name carries is independent of which PR
+          // the close decision picked for an issue number.
+          const branch = pr.head?.ref ?? "";
+          const match = branch.match(/issue[-_/]?(\d+)/i);
+          if (match) {
+            const issueNum = parseInt(match[1], 10);
+            if (!isNaN(issueNum)) {
+              if (!mergedFixingIssues.has(issueNum)) {
+                mergedFixingIssues.set(issueNum, pr);
               }
+              recordLinkEvidence(issueNum, pr, "branch-name");
             }
           }
         }

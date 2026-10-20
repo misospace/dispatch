@@ -339,26 +339,44 @@ export function buildIssueLifecycleTimeline(
       : { at: pullRequests[0].mergedAt, provenance: pullRequests[0].provenance, via: ["pr_merged"] };
 
   // Delivery: a merged PR is shipped. A close without an observed merge is
-  // not — a later reopen can undo the close, in which case the answer depends
-  // on the issue's current state, and an unrecognizable state is unknown.
-  const closedMs = closedAt.at !== null ? Date.parse(closedAt.at) : null;
+  // not — and delivery follows the LATEST close/reopen ordering, not the
+  // first close: a close after a reopen closes the item again, so it is
+  // closed-unmerged again. `closedAt` keeps reporting the FIRST close
+  // milestone; only `delivery` moves.
+  const lastCloseEventMs =
+    closedEvents.length > 0 ? closedEvents[closedEvents.length - 1].occurredAtMs : null;
+  // The issue cache's closedAt is close evidence too — a close the events
+  // never carried still happened — and the later of the two is the latest
+  // close.
+  const cacheClosedMs = toMillis(issue.closedAt);
+  const latestCloseMs =
+    lastCloseEventMs === null
+      ? cacheClosedMs
+      : cacheClosedMs === null
+        ? lastCloseEventMs
+        : Math.max(lastCloseEventMs, cacheClosedMs);
   const reopenMs = lastReopenAt.at !== null ? Date.parse(lastReopenAt.at) : null;
   let delivery: LifecycleDelivery;
   if (pullRequests.length > 0) {
     delivery = "merged";
-  } else if (closedMs !== null) {
-    delivery =
-      reopenMs !== null && reopenMs > closedMs
-        ? issue.state === "open"
-          ? "open"
-          : "unknown"
-        : "closed-unmerged";
+  } else if (reopenMs !== null && (latestCloseMs === null || reopenMs > latestCloseMs)) {
+    // A reopen after the latest close (or a reopen with no close at all)
+    // undoes the close, so the issue's present state decides.
+    delivery = issue.state === "open" ? "open" : "unknown";
+  } else if (latestCloseMs !== null) {
+    delivery = "closed-unmerged";
   } else if (issue.state === "closed") {
     delivery = "closed-unmerged";
   } else if (issue.state === "open") {
     delivery = "open";
   } else {
     delivery = "unknown";
+  }
+  // The note marks the case the first-close comparison could not see: a close
+  // that came after a reopen. It stays silent when no reopen is involved, so
+  // it never reports a delivery change that did not happen.
+  if (reopenMs !== null && latestCloseMs !== null && latestCloseMs > reopenMs) {
+    addNote("delivery derived from a close after a reopen");
   }
 
   // Intervals measured from the first observed claim. Negative values are kept

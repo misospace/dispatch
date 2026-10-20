@@ -679,6 +679,59 @@ describe("POST — merge evidence after close (#1203)", () => {
     });
   });
 
+  it("keeps the branch link when the PR number collides with an issue number in the close-decision map", async () => {
+    // Regression (#1203 review): the branch-name evidence used to be skipped
+    // whenever the PR's own number was already in the close-decision map, so
+    // PR #42 (body "Fixes #42") never recorded its branch link to issue #99
+    // and issue #99's merge went unrecorded.
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 42,
+        state: "closed",
+        title: "Fix the crash",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/42",
+        merge_commit_sha: "merge-sha",
+        head: { ref: "issue-99", sha: "head-sha" },
+      },
+    ]);
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "Open issue", body: null, state: "open", labels: [] },
+    ]);
+    const cachedRows = [
+      { id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-99", number: 99, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-5", number: 5, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+    ];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const merges = prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged");
+    const issue99Merge = merges.find((row) => row.issueNumber === 99)!;
+    expect(issue99Merge).toMatchObject({
+      kind: "pr_merged",
+      issueId: "issue-99",
+      issueNumber: 99,
+      source: "reconciler",
+      occurredAt: new Date("2026-10-02T08:00:00Z"),
+      metadata: { pullRequestNumber: 42, linkSource: "branch-name" },
+    });
+    // The body keyword was recorded first for issue #42 and keeps its
+    // provenance — the branch link is additive, never a replacement.
+    const issue42Merge = merges.find((row) => row.issueNumber === 42)!;
+    expect(issue42Merge).toMatchObject({
+      metadata: { pullRequestNumber: 42, linkSource: "body-keyword" },
+    });
+  });
+
   it("records the merge even when the close action fails", async () => {
     // Regression (#1203 review): pr_merged recording is decoupled from close
     // execution — a failed close must not lose the authoritative merge.
