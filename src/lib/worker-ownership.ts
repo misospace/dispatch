@@ -218,13 +218,23 @@ export const CURRENT_CLAIM_WORK_ORDER_BY = [
   { id: "desc" as const },
 ];
 
-function findCurrentClaimWork<T extends { agentWork: { findFirst: (args: any) => Promise<any> } }>(
+/**
+ * Select the CURRENT claim's `AgentWork` row for an agent, optionally scoped
+ * to one issue. When `issueId` is provided the search is restricted to that
+ * issue's rows; when omitted the ordering rule alone picks the freshest
+ * active row across the agent's issues (callers that know their issue —
+ * e.g. `checkpointAgentWork` since #1328 — must pass it so a checkpoint can
+ * never heartbeat another issue's active row).
+ */
+export function findCurrentClaimWork<T extends { agentWork: { findFirst: (args: any) => Promise<any> } }>(
   client: T,
   agentName: string,
-  issueId: string,
+  issueId?: string,
 ) {
   return client.agentWork.findFirst({
-    where: { agentName, issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
+    where: issueId
+      ? { agentName, issueId, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } }
+      : { agentName, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
     orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
   });
 }

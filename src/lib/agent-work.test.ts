@@ -9,6 +9,7 @@ import {
   getActiveWorkByAgent,
   releaseStaleWork,
 } from "./agent-work";
+import { CURRENT_CLAIM_WORK_ORDER_BY } from "./worker-ownership";
 
 describe("parseStartAgentWorkInput", () => {
   it("returns parsed input when valid", () => {
@@ -41,6 +42,7 @@ describe("parseCheckpointAgentWorkInput", () => {
       checkpoint: "CHANGES_MADE",
       summary: null,
       blockerReason: null,
+      issueId: null,
     });
   });
 
@@ -91,6 +93,7 @@ describe("parseCheckpointAgentWorkInput", () => {
       checkpoint: "BRANCH_CREATED",
       summary: null,
       blockerReason: null,
+      issueId: null,
     });
   });
 
@@ -101,6 +104,7 @@ describe("parseCheckpointAgentWorkInput", () => {
       checkpoint: "BLOCKED",
       summary: null,
       blockerReason: "waiting on API",
+      issueId: null,
     });
   });
 
@@ -124,10 +128,18 @@ describe("parseCheckpointAgentWorkInput", () => {
     expect(result).toEqual({ error: "Missing required field: checkpoint (one of: CLAIMED, REPO_PREPARED, BRANCH_CREATED, CHANGES_MADE, TESTS_RUNNING, PR_OPENED, DONE, BLOCKED)" });
   });
 
-  it("returns error when agentName is empty string", () => {
-    const result = parseCheckpointAgentWorkInput({ agentName: "", checkpoint: "DONE" });
-    expect(result).toEqual({ error: "Missing required field: agentName (string)" });
-  });
+it("returns error when agentName is empty string", () => {
+const result = parseCheckpointAgentWorkInput({ agentName: "", checkpoint: "DONE" });
+expect(result).toEqual({ error: "Missing required field: agentName (string)" });
+});
+it("passes through an optional issueId", () => {
+const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "issue-A" });
+expect(result).toEqual(expect.objectContaining({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: "issue-A" }));
+});
+it("treats a non-string issueId as absent", () => {
+const result = parseCheckpointAgentWorkInput({ agentName: "test-agent", checkpoint: "CHANGES_MADE", issueId: 42 });
+expect(result).toEqual(expect.objectContaining({ issueId: null }));
+});
 });
 
 describe("parseFinishAgentWorkInput", () => {
@@ -269,6 +281,49 @@ describe("checkpointAgentWork", () => {
 
     const result = await checkpointAgentWork(tx, { agentName: "agent-1", checkpoint: "BRANCH_CREATED" });
     expect(result).toBeNull();
+  });
+
+  // #1328 regression: selection must go through the shared current-claim-work
+  // rule (freshest lastHeartbeatAt, then createdAt, then id) instead of an
+  // unordered findFirst, so an older active sibling (e.g. a surviving BLOCKED
+  // row) can never be stamped with the freshest heartbeat while the current
+  // attempt stays behind it.
+  it("selects the active row through the shared current-claim-work ordering rule", async () => {
+    const tx = createMockTransaction();
+    tx.agentWork.findFirst.mockResolvedValue({ id: "work-1", state: "IN_PROGRESS" });
+
+    await checkpointAgentWork(tx, { agentName: "agent-1", checkpoint: "CHANGES_MADE" });
+
+    expect(tx.agentWork.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ agentName: "agent-1" }),
+        orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
+      })
+    );
+  });
+
+  it("scopes selection to the checkpoint's issue when the request identifies one", async () => {
+    const tx = createMockTransaction();
+    tx.agentWork.findFirst.mockResolvedValue({ id: "work-1", state: "IN_PROGRESS" });
+
+    await checkpointAgentWork(tx, { agentName: "agent-1", checkpoint: "CHANGES_MADE", issueId: "issue-A" });
+
+    expect(tx.agentWork.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ agentName: "agent-1", issueId: "issue-A" }),
+        orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
+      })
+    );
+  });
+
+  it("does not scope selection by issue when the request identifies none", async () => {
+    const tx = createMockTransaction();
+    tx.agentWork.findFirst.mockResolvedValue({ id: "work-1", state: "IN_PROGRESS" });
+
+    await checkpointAgentWork(tx, { agentName: "agent-1", checkpoint: "CHANGES_MADE" });
+
+    const call = tx.agentWork.findFirst.mock.calls[0][0];
+    expect(call.where).not.toHaveProperty("issueId");
   });
 });
 
