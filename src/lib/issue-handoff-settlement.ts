@@ -51,12 +51,18 @@ export function settlementExpiresAt(settledAt: Date): Date {
 export type SettlementLookup =
   | { state: "found"; record: any }
   | { state: "expired" }
-  | { state: "absent" };
+  | { state: "absent" }
+  /** The read itself failed: absence is NOT established. Callers that fence
+   *  on the record (key-conflict checks) must fail closed — treating a
+   *  failed read as absent would let a live newer claim bypass the
+   *  cross-claim settlement-key fence. */
+  | { state: "error" };
 
 /**
  * Look up the settlement for an exact (agent, issue, key). An expired proof
  * is pruned (best-effort, single row) and reported as `"expired"` so callers
  * can refuse with a clear expiry note instead of a bare "no claim" message.
+ * A failed read is reported as `"error"`, never as `"absent"`.
  */
 export async function lookupIssueHandoffSettlement(
   client: IssueHandoffSettlementClient,
@@ -67,9 +73,9 @@ export async function lookupIssueHandoffSettlement(
   try {
     record = await client.issueHandoffSettlement.findUnique({ where: { agentName_issueId_settlementKey: where } });
   } catch {
-    // A read failure must not mask the ownership path — report "absent" and
-    // let the caller proceed fail-closed (lease fence / live-label checks).
-    return { state: "absent" };
+    // A read failure establishes nothing: report "error" so fencing callers
+    // refuse retryably instead of releasing over an unverifiable proof.
+    return { state: "error" };
   }
   if (!record) return { state: "absent" };
   if (new Date(record.expiresAt).getTime() > now.getTime()) return { state: "found", record };

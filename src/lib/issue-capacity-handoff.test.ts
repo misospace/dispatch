@@ -262,6 +262,64 @@ describe("recoverIssueCapacityHandoff", () => {
     expect(client.mirrors).toHaveLength(0);
   });
 
+  it("fails closed with zero mutation when the settlement fence read fails over a foreign-token proof", async () => {
+    // T1 proof durably settled + live T2 lease + failed fence read: the read
+    // cannot establish absence, so releasing T2 would bypass the cross-claim
+    // key fence. Must refuse retryably before any GitHub or lease mutation.
+    const { client } = seededClient({ claimToken: "claim_other" });
+    client.issueHandoffSettlement.findUnique.mockRejectedValue(new Error("db down"));
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: false, httpStatus: 503, code: "settlement_unavailable" });
+    expect((result as any).message).toContain("nothing was released");
+    expect(claimGateMocks.getLiveIssueLabels).not.toHaveBeenCalled();
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(githubMocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.mirrors).toHaveLength(0);
+  });
+
+  it("refuses retryably when the settlement fence read fails without any record", async () => {
+    const client = makeClient();
+    client.issueHandoffSettlement.findUnique.mockRejectedValue(new Error("db down"));
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: false, httpStatus: 503, code: "settlement_unavailable" });
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not consume the lease when the settlement upsert returns a foreign-token row", async () => {
+    // Concurrent foreign insert between the (absent) fence read and the
+    // first-write-wins upsert: the returned proof is not ours, so the lease
+    // CAS must not proceed and no success may be reported.
+    const client = makeClient();
+    client.issueHandoffSettlement.upsert.mockResolvedValueOnce({ id: "settle-race", claimToken: "claim_other" });
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: false, httpStatus: 409, code: "settlement_key_conflict" });
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.audits.at(-1)).toMatchObject({ success: false });
+  });
+
+  it("reports cooldownUntil null on fresh success when the cooldown write fails, while replay echoes the pinned deadline", async () => {
+    // Documented split (#1262): the fresh response degrades to "no cooldown"
+    // when the best-effort cooldown write fails, while the durable settlement
+    // row pins the intended deadline and the replay echoes the recorded proof.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const client = makeClient({ capacityHandoff: { create: async () => { throw new Error("cooldown db down"); } } });
+      const result = await call(client);
+      expect(result).toMatchObject({ ok: true, replayed: false, cooldownUntil: null });
+      expect(client.settlements).toHaveLength(1);
+      const pinned = new Date(client.settlements[0].cooldownUntil).getTime();
+      expect(pinned).toBeGreaterThan(Date.now());
+      client.lease.findUnique = async () => null;
+      const replay = await call(client);
+      expect(replay).toMatchObject({ ok: true, replayed: true });
+      expect((replay as any).cooldownUntil.getTime()).toBe(pinned);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("records the settlement before consuming the lease, with bounded deadline and retention", async () => {
     const client = makeClient();
     const now = new Date("2026-10-18T00:00:00Z");

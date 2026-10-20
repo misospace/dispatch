@@ -98,6 +98,7 @@ export type IssueCapacityHandoffResult =
         | "ownership_changed"
         | "handoff_race_lost"
         | "settlement_key_conflict"
+        | "settlement_unavailable"
         | "github_unavailable"
         | "release_failed";
       message: string;
@@ -119,7 +120,7 @@ export async function recoverIssueCapacityHandoff(
     claimToken: input.claimToken,
   }, async (_tx, { resuming }) => {
     const value = await recoverIssueCapacityHandoffUnlocked(input, resuming);
-    return { complete: !(value.ok === false && (value.code === "release_failed" || value.code === "github_unavailable")), value };
+    return { complete: !(value.ok === false && (value.code === "release_failed" || value.code === "github_unavailable" || value.code === "settlement_unavailable")), value };
   });
   if (guarded.status === "busy") {
     // Same #1129 identity gate as the release path: every write — including
@@ -194,6 +195,11 @@ async function replayIssueHandoffSettlement(
     { agentName, issueId, settlementKey: input.settlementKey },
     now,
   );
+  if (lookup.state === "error") {
+    // Nothing verifiable: announce nothing. The key-conflict fence below
+    // re-reads and refuses retryably if the failure persists.
+    return null;
+  }
   if (lookup.state === "expired") return { kind: "expired" };
   let leaseRow = lease;
   if (leaseRow === undefined) {
@@ -359,10 +365,20 @@ async function recoverIssueCapacityHandoffUnlocked(
       existing = await client.issueHandoffSettlement.findUnique({
         where: { agentName_issueId_settlementKey: { agentName, issueId, settlementKey: input.settlementKey } },
       });
-    } catch {
-      // A transient read failure must not wedge the retained release guard
-      // (a thrown refusal loop): treat as absent — the first-write-wins
-      // upsert and the replay token equality still fence correctness.
+    } catch (error) {
+      // Fail closed: a failed read cannot establish that the key is unused.
+      // Proceeding as if absent would let a durable proof under an older
+      // claim token coexist with — and fail to fence — the release of a
+      // newer live claim (the first-write-wins upsert can never rewrite or
+      // validate the existing proof afterward). Refuse retryably with zero
+      // mutation; the retained guard lets the exact-token retry resume.
+      const message = error instanceof Error ? error.message : "Unknown error";
+      return {
+        ok: false,
+        httpStatus: 503,
+        code: "settlement_unavailable",
+        message: `Could not verify the settlement-key fence: ${message}; nothing was released — retry with the same claimToken and settlementKey`,
+      };
     }
     if (existing && existing.claimToken !== claimToken) {
       return {
@@ -470,7 +486,7 @@ async function recoverIssueCapacityHandoffUnlocked(
   const cooldownUntil = new Date(now.getTime() + capacityCooldownMs(now.getTime()));
   if (input.settlementKey) {
     try {
-      await recordIssueHandoffSettlement(client, {
+      const recorded = await recordIssueHandoffSettlement(client, {
         agentName,
         issueId,
         claimToken,
@@ -482,6 +498,26 @@ async function recoverIssueCapacityHandoffUnlocked(
         cooldownUntil,
         settledAt: now,
       });
+      // First-write-wins means a lost race against a concurrent foreign-token
+      // record returns that foreign row instead of ours. The lease CAS must
+      // not proceed on a proof we do not own: refuse before consuming the
+      // lease so the key fence can never silently pass (stale-recovery owns
+      // reconciling the retained lease from here).
+      if (recorded && recorded.claimToken !== claimToken) {
+        await writeFailureAudit(
+          client,
+          input,
+          liveLabels,
+          "Settlement key was concurrently recorded under a different claim token; lease retained, no replay proof for this release",
+        );
+        return {
+          ok: false,
+          httpStatus: 409,
+          code: "settlement_key_conflict",
+          message:
+            "settlementKey was concurrently recorded under a different claim token before the lease was consumed; no replay proof exists for this release and the lease is retained (use a fresh settlement key on retry)",
+        };
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       await writeFailureAudit(client, input, liveLabels, `Settlement record write failed; lease retained: ${message}`);

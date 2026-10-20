@@ -178,6 +178,16 @@ the existing path; callers that omit it keep the previous behavior exactly.
     and the token binding wins even when the old proof has already expired.
   * Expired proof → 409 `no_active_claim` with an explicit expiry note; the
     expired row is pruned.
+  * Settlement-key fence **read failure** → 503 `settlement_unavailable`
+    before any remote work: a failed read establishes nothing, so it is never
+    treated as "key unused" (that would let a durable proof under an older
+    claim token fail to fence the release of a newer live claim). Retryable
+    with the same `claimToken`/`settlementKey`; the guard is retained.
+  * Concurrent foreign insert → the first-write-wins upsert returns the other
+    claim's row; if its `claimToken` is not this one, the release refuses with
+    409 `settlement_key_conflict` **before** the lease CAS — a lease is never
+    consumed on a proof this claim does not own (stale-recovery owns
+    reconciling the retained lease; retry with a fresh key).
   * Settlement-record write failure after cleanup → 500 `release_failed`;
     lease and guard retained for the exact-token retry (proof must be durable
     or the release does not report success).
@@ -223,7 +233,10 @@ blocking the whole lane is not. Symmetrically, a cooldown **write** failure
 after the release already committed does not fail the handoff — the response
 returns `cooldownUntil: null` (audited), because the ownership release is the
 operation the worker asked for and a false 500 would invite a retry that can
-only 409.
+only 409. A durable settlement record keeps the **pinned** deadline regardless:
+a later replay echoes the recorded proof, so the fresh-response `null` and the
+replayed timestamp intentionally differ (bounded dispatch shaping self-expires;
+the replayed result is what the first caller earned).
 
 The exhausted capacity's own re-report is also fenced: the PR-fix attempt
 token is consumed and the issue lease is gone, so the same worker cannot
@@ -289,6 +302,8 @@ Dispatch's coordination layer — never write it as if GitHub were behind.**
 | Retry with same `settlementKey` + original claim token after lease release | replayed recorded success (`replayed: true`), zero ownership mutation |
 | Same replay while the issue mutation guard is held (post-release crash) | still replayed — lease absence gates the answer; a live release (lease present) stays 409 busy |
 | `settlementKey` bound to a different claim token | 409 (`no_active_claim` or `settlement_key_conflict`); no replay, no mutation |
+| Settlement-key fence read fails | 503 `settlement_unavailable` before any remote work; a failed read is never "absent"; retryable with the same token + key |
+| Concurrent foreign settle wins the upsert race | 409 `settlement_key_conflict` before the lease CAS; lease retained, no success reported |
 | Settlement proof expired (7-day retention, read-time prune) | 409 `no_active_claim` with expiry note |
 | Settlement record write fails after cleanup | 500 `release_failed`; lease + guard retained for exact-token retry |
 | Guard remains after process crash | Operator confirms prior process stopped and reconciles GitHub before removal; no automatic timeout; a recorded settlement lets the retry answer definitively even while the guard is held |

@@ -82,7 +82,7 @@ describe("lookupIssueHandoffSettlement", () => {
     expect(await lookupIssueHandoffSettlement(client, WHERE, now)).toEqual({ state: "expired" });
   });
 
-  it("reports absent when the lookup read fails", async () => {
+  it("reports error (not absent) when the lookup read fails", async () => {
     const client = makeClient(null, {
       issueHandoffSettlement: {
         findUnique: async () => { throw new Error("offline"); },
@@ -90,7 +90,7 @@ describe("lookupIssueHandoffSettlement", () => {
         deleteMany: async () => ({ count: 0 }),
       },
     });
-    expect(await lookupIssueHandoffSettlement(client, WHERE)).toEqual({ state: "absent" });
+    expect(await lookupIssueHandoffSettlement(client, WHERE)).toEqual({ state: "error" });
   });
 });
 
