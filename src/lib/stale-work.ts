@@ -19,9 +19,10 @@ export interface StaleWorkReport {
   skipped: number;
   /**
    * Lease rows the sweep actually deleted through its claim-epoch CAS-fenced
-   * delete (#1317 accounting). A retention deletes nothing and is never
-   * counted here; a row reclaimed without a lease row at snapshot contributes
-   * zero.
+   * delete (#1317 accounting). A retention deletes nothing and contributes
+   * zero; only the pathological race where the CAS consumed a row yet a fresh
+   * lease still stands on the pair reports a deletion alongside a retention.
+   * A row reclaimed without a lease row at snapshot contributes zero.
    */
   leasesReleased: number;
   errors: Array<{ workId: string; error: string }>;
