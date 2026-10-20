@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
 const { githubMocks, claimGateMocks, claimMocks, guardState } = vi.hoisted(() => ({
-  guardState: { resuming: false, busy: false },
+  guardState: { resuming: false, busy: false, lastComplete: undefined as boolean | undefined },
   githubMocks: { removeIssueLabel: vi.fn().mockResolvedValue(undefined) },
   claimGateMocks: { getLiveIssueLabels: vi.fn() },
   claimMocks: { releaseIssueClaim: vi.fn() },
@@ -13,9 +13,9 @@ vi.mock("./issue-claim", () => ({ releaseIssueClaim: claimMocks.releaseIssueClai
 vi.mock("./issue-mutation-guard", () => ({
   withIssueMutationGuard: async (_request: unknown, callback: (...args: any[]) => Promise<{ complete: boolean; value: unknown }>) => {
     if (guardState.busy) return { status: "busy", ownerToken: "owner-1", operation: "capacity-release" };
-    return {
-      status: "completed", value: (await callback(undefined, { resuming: guardState.resuming })).value,
-    };
+    const outcome = await callback(undefined, { resuming: guardState.resuming });
+    guardState.lastComplete = outcome.complete;
+    return { status: "completed", value: outcome.value };
   },
 }));
 
@@ -119,6 +119,7 @@ describe("recoverIssueCapacityHandoff", () => {
     vi.clearAllMocks();
     guardState.resuming = false;
     guardState.busy = false;
+    guardState.lastComplete = undefined;
     githubMocks.removeIssueLabel.mockResolvedValue(undefined);
     claimGateMocks.getLiveIssueLabels.mockResolvedValue(["agent/alpha", "status/in-progress"]);
     claimMocks.releaseIssueClaim.mockResolvedValue({ labels: ["status/ready"], status: "status/ready", statusNote: null });
@@ -271,6 +272,9 @@ describe("recoverIssueCapacityHandoff", () => {
     const result = await call(client);
     expect(result).toMatchObject({ ok: false, httpStatus: 503, code: "settlement_unavailable" });
     expect((result as any).message).toContain("nothing was released");
+    // Retryable refusal with nothing mutated: the guard must stay so the
+    // exact-token retry resumes once the database recovers.
+    expect(guardState.lastComplete).toBe(false);
     expect(claimGateMocks.getLiveIssueLabels).not.toHaveBeenCalled();
     expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
     expect(githubMocks.removeIssueLabel).not.toHaveBeenCalled();
@@ -297,6 +301,12 @@ describe("recoverIssueCapacityHandoff", () => {
     expect(result).toMatchObject({ ok: false, httpStatus: 409, code: "settlement_key_conflict" });
     expect(client.lease.deleteMany).not.toHaveBeenCalled();
     expect(client.audits.at(-1)).toMatchObject({ success: false });
+    // An unverifiable (null) upsert result proves nothing either: fail closed.
+    const client2 = makeClient();
+    client2.issueHandoffSettlement.upsert.mockResolvedValueOnce(null);
+    const result2 = await call(client2);
+    expect(result2).toMatchObject({ ok: false, httpStatus: 409, code: "settlement_key_conflict" });
+    expect(client2.lease.deleteMany).not.toHaveBeenCalled();
   });
 
   it("reports cooldownUntil null on fresh success when the cooldown write fails, while replay echoes the pinned deadline", async () => {

@@ -499,11 +499,12 @@ async function recoverIssueCapacityHandoffUnlocked(
         settledAt: now,
       });
       // First-write-wins means a lost race against a concurrent foreign-token
-      // record returns that foreign row instead of ours. The lease CAS must
-      // not proceed on a proof we do not own: refuse before consuming the
-      // lease so the key fence can never silently pass (stale-recovery owns
-      // reconciling the retained lease from here).
-      if (recorded && recorded.claimToken !== claimToken) {
+      // record returns that foreign row instead of ours (a null result would
+      // prove nothing either). The lease CAS must not proceed on a proof we
+      // do not own: refuse before consuming the lease so the key fence can
+      // never silently pass (stale-recovery owns reconciling the retained
+      // lease from here).
+      if (!recorded || recorded.claimToken !== claimToken) {
         await writeFailureAudit(
           client,
           input,
@@ -515,7 +516,7 @@ async function recoverIssueCapacityHandoffUnlocked(
           httpStatus: 409,
           code: "settlement_key_conflict",
           message:
-            "settlementKey was concurrently recorded under a different claim token before the lease was consumed; no replay proof exists for this release and the lease is retained (use a fresh settlement key on retry)",
+            "settlementKey was concurrently recorded under a different claim token before the lease was consumed; no replay proof exists for this release and the lease is retained (stale-claim recovery owns reconciling it; do not reuse this settlement key)",
         };
       }
     } catch (error) {
