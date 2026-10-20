@@ -271,6 +271,53 @@ describe("buildIssueLifecycleTimeline", () => {
     expect(timeline.notes).toContain("delivery derived from a close after a reopen");
   });
 
+  it("does not claim a close-after-reopen delivery when a merged PR decided it", () => {
+    // The note reports how delivery was derived — a merged delivery was
+    // decided by the merge, so the note stays silent.
+    const timeline = buildIssueLifecycleTimeline(
+      { ...issue, state: "closed", closedAt: "2026-10-04T00:00:00.000Z" },
+      [
+        event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+        event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-03T00:00:00.000Z" }),
+        event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-04T00:00:00.000Z" }),
+        event({
+          kind: "pr_merged",
+          source: "reconciler",
+          sourceEventId: "pr-7",
+          occurredAt: "2026-10-05T00:00:00.000Z",
+          metadata: { pullRequestNumber: 7 },
+        }),
+      ],
+    );
+
+    expect(timeline.delivery).toBe("merged");
+    expect(timeline.notes).not.toContain("delivery derived from a close after a reopen");
+  });
+
+  it("counts the issue cache's closedAt as the latest close when the second close has no event", () => {
+    // The cache is the only evidence of the second close, so the item is
+    // closed again — the milestone still reports the FIRST close.
+    const timeline = buildIssueLifecycleTimeline(
+      { ...issue, state: "closed", closedAt: "2026-10-04T00:00:00.000Z" },
+      [
+        event({ kind: "issue_closed", source: "sync", actor: "github", occurredAt: "2026-10-02T00:00:00.000Z" }),
+        event({ kind: "issue_reopened", source: "sync", actor: "github", occurredAt: "2026-10-03T00:00:00.000Z" }),
+      ],
+    );
+
+    expect(timeline.delivery).toBe("closed-unmerged");
+    expect(timeline.closedAt.at).toBe("2026-10-02T00:00:00.000Z");
+  });
+
+  it("does not let the issue cache certify a close for an open issue", () => {
+    const timeline = buildIssueLifecycleTimeline(
+      { ...issue, state: "open", closedAt: "2026-10-04T00:00:00.000Z" },
+      [],
+    );
+
+    expect(timeline.delivery).toBe("open");
+  });
+
   it("establishes doneAt from a completed event or a status move to status/done", () => {
     const fromCompleted = buildIssueLifecycleTimeline(issue, [
       event({ kind: "completed", source: "agent-report", actor: "alpha", occurredAt: "2026-10-02T00:00:00.000Z" }),

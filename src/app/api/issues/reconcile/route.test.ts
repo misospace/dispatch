@@ -732,6 +732,47 @@ describe("POST — merge evidence after close (#1203)", () => {
     });
   });
 
+  it("closes the branch-linked issue in the collision case — the branch claim still feeds the close decision", async () => {
+    // Regression (#1203 review): the branch claim feeds the close-decision map
+    // as well as the link evidence, so the collision case widens the
+    // reconciler's close reach — PR #42 (body "Fixes #42", head ref
+    // "issue-99") closes issue #99 by the same branch heuristic.
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 42,
+        state: "closed",
+        title: "Fix the crash",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/42",
+        merge_commit_sha: "merge-sha",
+        head: { ref: "issue-99", sha: "head-sha" },
+      },
+    ]);
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 99, title: "Another issue", body: null, state: "open", labels: [] },
+    ]);
+    const cachedRows = [
+      { id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-99", number: 99, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+    ];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledTimes(1);
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "close_issue", issueNumber: 99 })],
+      expect.any(Array),
+    );
+  });
+
   it("records the merge even when the close action fails", async () => {
     // Regression (#1203 review): pr_merged recording is decoupled from close
     // execution — a failed close must not lose the authoritative merge.

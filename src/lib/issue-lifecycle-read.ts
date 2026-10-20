@@ -345,10 +345,11 @@ export function buildIssueLifecycleTimeline(
   // milestone; only `delivery` moves.
   const lastCloseEventMs =
     closedEvents.length > 0 ? closedEvents[closedEvents.length - 1].occurredAtMs : null;
-  // The issue cache's closedAt is close evidence too — a close the events
-  // never carried still happened — and the later of the two is the latest
-  // close.
-  const cacheClosedMs = toMillis(issue.closedAt);
+  // The issue cache's closedAt is close evidence too, but only where the
+  // `closedAt` milestone accepts it: the cache fills a gap for a CLOSED
+  // issue. Gating it the same way keeps delivery from certifying a close
+  // the milestone itself refuses to.
+  const cacheClosedMs = issue.state === "closed" ? toMillis(issue.closedAt) : null;
   const latestCloseMs =
     lastCloseEventMs === null
       ? cacheClosedMs
@@ -359,23 +360,36 @@ export function buildIssueLifecycleTimeline(
   let delivery: LifecycleDelivery;
   if (pullRequests.length > 0) {
     delivery = "merged";
-  } else if (reopenMs !== null && (latestCloseMs === null || reopenMs > latestCloseMs)) {
-    // A reopen after the latest close (or a reopen with no close at all)
-    // undoes the close, so the issue's present state decides.
-    delivery = issue.state === "open" ? "open" : "unknown";
   } else if (latestCloseMs !== null) {
-    delivery = "closed-unmerged";
-  } else if (issue.state === "closed") {
-    delivery = "closed-unmerged";
-  } else if (issue.state === "open") {
-    delivery = "open";
+    // Close evidence exists. A reopen AFTER the latest close undoes it, so the
+    // issue's present state decides; otherwise the item is closed-unmerged.
+    delivery =
+      reopenMs !== null && reopenMs > latestCloseMs
+        ? issue.state === "open"
+          ? "open"
+          : "unknown"
+        : "closed-unmerged";
   } else {
-    delivery = "unknown";
+    // No close evidence at all: the issue's present state decides. A reopen
+    // without a close says nothing about delivery, so it never turns a closed
+    // issue "unknown" on its own.
+    delivery =
+      issue.state === "closed"
+        ? "closed-unmerged"
+        : issue.state === "open"
+          ? "open"
+          : "unknown";
   }
   // The note marks the case the first-close comparison could not see: a close
   // that came after a reopen. It stays silent when no reopen is involved, so
-  // it never reports a delivery change that did not happen.
-  if (reopenMs !== null && latestCloseMs !== null && latestCloseMs > reopenMs) {
+  // it never reports a delivery change that did not happen — and it stays
+  // silent for a merged delivery, which no close decided.
+  if (
+    delivery !== "merged" &&
+    latestCloseMs !== null &&
+    reopenMs !== null &&
+    latestCloseMs > reopenMs
+  ) {
     addNote("delivery derived from a close after a reopen");
   }
 

@@ -326,14 +326,16 @@ export async function POST(request: Request) {
         // with its link provenance (#1203): merge evidence records one event
         // per linked PR. Branch-name evidence is collected independently of
         // the close-decision map — a PR whose own number collides with an
-        // issue number already in that map still records its branch link —
-        // while the close decision itself stays first-PR-wins per issue
-        // number. Only explicit correlations qualify — a body Fixes/
-        // Closes/Resolves keyword or a branch-name pattern. PR titles are
-        // deliberately not consulted (#1203, review-required): a title-only
-        // match is neither close evidence nor link evidence, so a merged PR
-        // that only names an issue in its title neither closes it nor records
-        // a merge for it.
+        // issue number already in that map still records its branch link.
+        // The branch claim still feeds the close decision, so the collision
+        // case widens the reconciler's close reach: the branch-linked issue
+        // number is closed by the same branch heuristic, under the same
+        // first-PR-wins-per-issue-number rule. Only explicit correlations
+        // qualify — a body Fixes/Closes/Resolves keyword or a branch-name
+        // pattern. PR titles are deliberately not consulted (#1203,
+        // review-required): a title-only match is neither close evidence nor
+        // link evidence, so a merged PR that only names an issue in its title
+        // neither closes it nor records a merge for it.
         const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
         const mergedPrLinkEvidence = new Map<number, PrMergeObservation[]>();
         const recordLinkEvidence = (num: number, pr: (typeof allPrs)[number], linkSource: string) => {
@@ -361,7 +363,9 @@ export async function POST(request: Request) {
           // 2. Branch name pattern — collected for every merged PR, not only
           // for one whose own number is free in the close-decision map: the
           // link evidence a branch name carries is independent of which PR
-          // the close decision picked for an issue number.
+          // the close decision picked for an issue number. The claim still
+          // feeds the close decision, so in the collision case the
+          // branch-linked issue is closed by the same branch heuristic.
           const branch = pr.head?.ref ?? "";
           const match = branch.match(/issue[-_/]?(\d+)/i);
           if (match) {

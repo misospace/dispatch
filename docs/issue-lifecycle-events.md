@@ -84,8 +84,9 @@ I/O). It exposes, per work item:
 - `doneAt` / `closedAt` / `lastReopenAt` milestones. A close observed without
   a merge is `delivery: "closed-unmerged"` — never labeled shipped. Reopening
   preserves the earlier close milestone in `closedAt`, while `delivery` follows
-  the latest close/reopen ordering: a close after a reopen reports
-  `closed-unmerged` again.
+  the latest close/reopen ordering: the latest close is the later of the last
+  observed close and the issue cache's `closedAt` (the cache counts only for a
+  closed issue), so a close after a reopen reports `closed-unmerged` again.
 - `pullRequests[]`: one entry per distinct merged PR (multi-PR issues are
   first-class), each with the authoritative `mergedAt`, `mergeCommitSha`,
   `headSha`, and `linkSource` provenance, plus `firstMergedAt`.
