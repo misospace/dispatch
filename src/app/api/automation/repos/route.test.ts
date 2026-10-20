@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
@@ -15,6 +16,7 @@ const { mocks } = vi.hoisted(() => ({
       }),
     ),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
+    createTrackedRepo: vi.fn(),
   },
 }));
 
@@ -44,8 +46,23 @@ vi.mock("@prisma/client", () => ({
   },
 }));
 
+// The route creates the tracked repo through createTrackedRepo. Wrap the real
+// implementation in a spy so the test can count calls; the real one still
+// writes through the mocked prisma client.
+vi.mock("@/lib/tracked-repos", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/tracked-repos")>();
+  mocks.createTrackedRepo.mockImplementation(actual.createTrackedRepo);
+  return { ...actual, createTrackedRepo: mocks.createTrackedRepo };
+});
+
 import { POST } from "./route";
 import { Prisma } from "@prisma/client";
+
+// The rate limiter keeps module-global state — reset it so the per-actor
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function postRequest(body: unknown, includeAuth = true) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -158,5 +175,40 @@ describe("POST /api/automation/repos", () => {
         errorMessage: "boom",
       }),
     });
+  });
+});
+
+describe("POST /api/automation/repos — rate limit", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.createAutomationRepo.mockResolvedValue({
+      id: "repo-1",
+      fullName: "myorg/myrepo",
+      owner: "myorg",
+      name: "myrepo",
+      source: "user",
+    });
+    mocks.upsertRepository.mockResolvedValue({
+      id: "mirror-1",
+      fullName: "myorg/myrepo",
+      owner: "myorg",
+      name: "myrepo",
+      enabled: true,
+    });
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+  });
+
+  it("returns 429 after exceeding the rate limit (10 per 60s)", async () => {
+    for (let i = 0; i < 10; i++) {
+      const res = await postRequest({ fullName: "myorg/myrepo" });
+      expect(res.status).toBe(201);
+    }
+
+    const res = await postRequest({ fullName: "myorg/myrepo" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The 11th request is rejected before the tracked repo is created.
+    expect(mocks.createTrackedRepo).toHaveBeenCalledTimes(10);
   });
 });

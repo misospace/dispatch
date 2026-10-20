@@ -13,6 +13,7 @@ import {
   fetchRecentRunsAllWorkflows,
   fetchReleases,
   fetchPullRequests,
+  fetchClosedPullRequests,
   fetchLatestCommit,
   fetchPackages,
   fetchRunJobs,
@@ -47,12 +48,18 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
   });
 
   try {
-    const [githubRepo, workflows, runs, releases, prs, packages] = await Promise.all([
+    const [githubRepo, workflows, runs, releases, prs, closedPrs, packages] = await Promise.all([
       fetchRepo(repoFullName),
       fetchWorkflows(repoFullName),
       fetchRecentRunsAllWorkflows(repoFullName, 20),
       fetchReleases(repoFullName, 10),
       fetchPullRequests(repoFullName, 20),
+      // A merged PR drops out of the state=open listing, so the open-only
+      // fetch can never persist its merge time (#1313). One added listing per
+      // sync (newest-updated first, single page). Its failure degrades
+      // gracefully like packages: merge times land on the next sync instead
+      // of failing the whole run.
+      fetchClosedPullRequests(repoFullName, 50).catch(() => []),
       fetchPackages(repoFullName).catch(() => []),
     ]);
 
@@ -276,8 +283,18 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
       );
     }
 
-    // Batch PR upserts in a single transaction
-    const prsToUpsert = prs.slice(0, 50);
+    // Batch PR upserts in a single transaction.
+    // The merged rows from the closed listing carry the authoritative
+    // merged_at the open listing can never hold (#1313); the upsert already
+    // persists pr.merged_at. A PR that merges between the two listings can
+    // appear in both — the merged row wins, so the open duplicate is dropped
+    // rather than writing mergedAt back to null.
+    const mergedPrs = closedPrs.filter((pr) => pr.merged_at);
+    const mergedPrNumbers = new Set(mergedPrs.map((pr) => pr.number));
+    const prsToUpsert = [
+      ...mergedPrs.slice(0, 50),
+      ...prs.filter((pr) => !mergedPrNumbers.has(pr.number)).slice(0, 50),
+    ];
     if (prsToUpsert.length > 0) {
       await prisma.$transaction(
         prsToUpsert.map((pr) =>

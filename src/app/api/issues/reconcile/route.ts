@@ -15,8 +15,10 @@ import {
   lifecycleDedupeKey,
   lifecycleStatusLabel,
   recordLifecycleEvent,
+  recordPrMergedEvent,
   recordStatusTransition,
   type LifecycleEventClient,
+  type PrMergeObservation,
 } from "@/lib/issue-lifecycle";
 import { isBacklogLane } from "@/lib/lane-config";
 import { computeLinkedPrHealth, toPersistedLinkedPrHealth, type LinkedPrHealth } from "@/lib/linked-pr-health";
@@ -47,6 +49,13 @@ export async function recordReconciledAction(input: {
   existingIssue: { id: string } | undefined;
   /** The PR whose state drove the action, when the action came from one. */
   mergedPr: { number: number; merged_at?: string | null } | null;
+  /**
+   * Every merged PR correlated to this issue (#1203), richest observation
+   * first. An issue may legitimately carry several linked PRs; each one
+   * records its own `pr_merged` event with its authoritative merge time and
+   * link provenance. Absent, the single `mergedPr` is recorded as before.
+   */
+  mergedPrs?: readonly PrMergeObservation[] | null;
   executed: {
     action: ReconciliationAction;
     success: boolean;
@@ -70,20 +79,34 @@ export async function recordReconciledAction(input: {
       // A merge is recorded separately from the close it causes: "the PR
       // merged" and "someone closed the issue" are different facts, and a
       // worker reporting success must never be able to assert either.
-      if (mergedPr && prIdentity) {
-        await recordLifecycleEvent(client, {
+      // Every linked merged PR records its own event (#1203); the canonical
+      // dedupe identity is shared with the pre-#1203 single-PR shape, so a
+      // re-observed merge lands on the row that already exists.
+      // Evidence list first; when the caller supplies no evidence list, the
+      // PR that actually drove the close is still recorded — the correlation
+      // is the observed action itself, so it carries
+      // `reconcile-close-trigger` provenance rather than pretending a text
+      // match. PR titles are never consulted as evidence (#1203), so this
+      // fallback can only name a PR the caller already proved a link for.
+      const observations: PrMergeObservation[] = [...(input.mergedPrs ?? [])];
+      if (mergedPr && !observations.some((obs) => obs.prNumber === mergedPr.number)) {
+        observations.push({
+          prNumber: mergedPr.number,
+          mergedAt: mergedPr.merged_at ?? null,
+          linkSource: "reconcile-close-trigger",
+        });
+      }
+      const mergeObservations: readonly PrMergeObservation[] = observations;
+      for (const pr of mergeObservations) {
+        await recordPrMergedEvent(client, {
           issueId: existingIssue.id,
           repoFullName: repo.fullName,
           issueNumber,
-          kind: "pr_merged",
           source: "reconciler",
           actor: "reconciler",
           fromStatus: lifecycleStatusLabel(executed.beforeLabels),
           toStatus: lifecycleStatusLabel(executed.afterLabels),
-          sourceEventId: `pr-${mergedPr.number}`,
-          dedupeKey: lifecycleDedupeKey(identity, "pr_merged", prIdentity),
-          occurredAt: mergedPr.merged_at ? new Date(mergedPr.merged_at) : undefined,
-          metadata: { pullRequestNumber: mergedPr.number },
+          pr,
         });
       }
 
@@ -123,6 +146,89 @@ export async function recordReconciledAction(input: {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`reconciler lifecycle evidence for ${repo.fullName}#${issueNumber} was not recorded: ${message}`);
+  }
+}
+
+/**
+ * Client shape the merge-evidence pass needs: the lifecycle write client plus the
+ * issue-row loader it batch-reads through. Structurally satisfied by the
+ * Prisma client, the same way `LifecycleEventClient` is.
+ */
+type ReconcileLifecycleClient = LifecycleEventClient & {
+  issue: {
+    findMany(args: {
+      where: { repositoryId: string; number: { in: number[] } };
+    }): Promise<Array<{ id: string; number: number }>>;
+  };
+};
+
+/**
+ * Record merge evidence for every linked merged PR in the fetched window,
+ * decoupled from the action loop (#1203).
+ *
+ * `pr_merged` recording must not depend on a close executing, succeeding, or
+ * on the issue still being open: a linked PR that merged after its issue
+ * closed, while the issue sat outside the open-issue fetch window, or while
+ * its close action failed, is still an authoritative merge and the timeline
+ * would lose it. This pass re-derives the link from the already-fetched
+ * merged-PR window (`fetchPullRequests` / `fetchClosedPullRequests`, maxItems
+ * 100): no extra GitHub calls. It batch-loads the cached issue rows for every
+ * linked number and records through the shared `recordPrMergedEvent` path
+ * with no close or status writes (merges only: the merge must not invent a
+ * transition). Rows the close path already wrote carry the same canonical
+ * dedupe key, so they converge — a replaying reconcile produces exactly one
+ * event per PR. Bounded by the fetched window; merges outside it remain the
+ * operator-only backfill's territory.
+ *
+ * Failures are logged, never thrown, like `recordReconciledAction`: the pass
+ * has already done its GitHub work, so an evidence-row problem must not abort
+ * the remaining repos.
+ */
+export async function recordLinkedMergeEvidence(input: {
+  repo: { id: string; fullName: string };
+  /** Every merged PR per linked issue, richest observation first (#1203). */
+  mergedPrLinkEvidence: ReadonlyMap<number, readonly PrMergeObservation[]>;
+  client: ReconcileLifecycleClient;
+}): Promise<void> {
+  if (input.mergedPrLinkEvidence.size === 0) return;
+
+  try {
+    const existingIssues = await input.client.issue.findMany({
+      where: { repositoryId: input.repo.id, number: { in: [...input.mergedPrLinkEvidence.keys()] } },
+    });
+    const cachedNumbers = new Set(existingIssues.map((row) => row.number));
+    for (const issueNumber of input.mergedPrLinkEvidence.keys()) {
+      if (!cachedNumbers.has(issueNumber)) {
+        console.warn(
+          `reconciler merge-evidence pass found no cached issue row for ${input.repo.fullName}#${issueNumber}; its linked merge evidence was not recorded`,
+        );
+      }
+    }
+    for (const existingIssue of existingIssues) {
+      const observations = input.mergedPrLinkEvidence.get(existingIssue.number) ?? [];
+      for (const pr of observations) {
+        // Per-observation containment, like `recordReconciledAction`: one
+        // failed row must not drop the remaining evidence in this repo.
+        try {
+          await recordPrMergedEvent(input.client, {
+            issueId: existingIssue.id,
+            repoFullName: input.repo.fullName,
+            issueNumber: existingIssue.number,
+            source: "reconciler",
+            actor: "reconciler",
+            pr,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(
+            `reconciler merge-evidence lifecycle evidence for ${input.repo.fullName}#${existingIssue.number} was not recorded: ${message}`,
+          );
+        }
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`reconciler merge-evidence lookup for ${input.repo.fullName} failed: ${message}`);
   }
 }
 
@@ -212,29 +318,63 @@ export async function POST(request: Request) {
         totalMergedPrsFound += mergedPrsMap.size;
         totalOpenPrsChecked += openPrsMap.size;
 
-        // Extract issue numbers from merged PRs: scan body keywords first, then
-        // fall back to branch name patterns so we catch "Fixes #NNN", "Closes #NNN",
-        // "Resolves #NNN" references that workers write in PR bodies.
+        // Extract issue numbers from merged PRs: scan PR bodies for the
+        // "Fixes #NNN", "Closes #NNN", "Resolves #NNN" keywords workers write,
+        // then collect branch name patterns.
+        // `mergedFixingIssues` stays first-PR-wins because it drives the close
+        // decision. `mergedPrLinkEvidence` keeps *every* merged PR per issue
+        // with its link provenance (#1203): merge evidence records one event
+        // per linked PR. Branch-name evidence is collected independently of
+        // the close-decision map — a PR whose own number collides with an
+        // issue number already in that map still records its branch link.
+        // The branch claim still feeds the close decision, so the collision
+        // case widens the reconciler's close reach: the branch-linked issue
+        // number is closed by the same branch heuristic, under the same
+        // first-PR-wins-per-issue-number rule. Only explicit correlations
+        // qualify — a body Fixes/Closes/Resolves keyword or a branch-name
+        // pattern. PR titles are deliberately not consulted (#1203,
+        // review-required): a title-only match is neither close evidence nor
+        // link evidence, so a merged PR that only names an issue in its title
+        // neither closes it nor records a merge for it.
         const mergedFixingIssues = new Map<number, typeof allPrs[number]>();
+        const mergedPrLinkEvidence = new Map<number, PrMergeObservation[]>();
+        const recordLinkEvidence = (num: number, pr: (typeof allPrs)[number], linkSource: string) => {
+          const existing = mergedPrLinkEvidence.get(num);
+          if (existing?.some((obs) => obs.prNumber === pr.number)) return;
+          const observation: PrMergeObservation = {
+            prNumber: pr.number,
+            prUrl: pr.html_url ?? pr.url ?? null,
+            mergedAt: pr.merged_at ?? null,
+            mergeCommitSha: pr.merge_commit_sha ?? null,
+            headSha: pr.head?.sha ?? null,
+            linkSource,
+          };
+          if (existing) existing.push(observation);
+          else mergedPrLinkEvidence.set(num, [observation]);
+        };
         for (const [, pr] of mergedPrsMap) {
           // 1. Check PR body for keyword references (Fixes #, Closes #, Resolves #)
-          const bodyNumbers = extractFixingIssueNumbers(pr.body ?? pr.title ?? null);
-          for (const num of bodyNumbers) {
+          for (const num of extractFixingIssueNumbers(pr.body ?? null)) {
             if (!mergedFixingIssues.has(num)) {
               mergedFixingIssues.set(num, pr);
             }
+            recordLinkEvidence(num, pr, "body-keyword");
           }
-          // 2. Fallback: check branch name pattern
-          if (!mergedFixingIssues.has(pr.number)) {
-            const branch = pr.head?.ref ?? "";
-            const match = branch.match(/issue[-_/]?(\d+)/i);
-            if (match) {
-              const issueNum = parseInt(match[1], 10);
-              if (!isNaN(issueNum)) {
-                if (!mergedFixingIssues.has(issueNum)) {
-                  mergedFixingIssues.set(issueNum, pr);
-                }
+          // 2. Branch name pattern — collected for every merged PR, not only
+          // for one whose own number is free in the close-decision map: the
+          // link evidence a branch name carries is independent of which PR
+          // the close decision picked for an issue number. The claim still
+          // feeds the close decision, so in the collision case the
+          // branch-linked issue is closed by the same branch heuristic.
+          const branch = pr.head?.ref ?? "";
+          const match = branch.match(/issue[-_/]?(\d+)/i);
+          if (match) {
+            const issueNum = parseInt(match[1], 10);
+            if (!isNaN(issueNum)) {
+              if (!mergedFixingIssues.has(issueNum)) {
+                mergedFixingIssues.set(issueNum, pr);
               }
+              recordLinkEvidence(issueNum, pr, "branch-name");
             }
           }
         }
@@ -343,6 +483,7 @@ export async function POST(request: Request) {
                   mergedFixingIssues.get(exec.action.issueNumber) ??
                   openPrToIssue.get(exec.action.issueNumber) ??
                   null,
+                mergedPrs: mergedPrLinkEvidence.get(exec.action.issueNumber) ?? null,
                 executed: exec,
                 client: prisma,
               });
@@ -400,6 +541,16 @@ export async function POST(request: Request) {
 
           totalIssuesReconciled++;
         }
+
+        // (#1203) Merge evidence is decoupled from the action loop: a linked
+        // merge records whether the issue is open or closed and whether the
+        // close action executed. Rows the close path already wrote carry the
+        // same dedupe keys and converge; this pass catches every other case.
+        await recordLinkedMergeEvidence({
+          repo,
+          mergedPrLinkEvidence,
+          client: prisma,
+        });
 
         // Reconcile pr-fix-queue items: mark stale when the upstream PR is
         // merged or closed. Uses the mergedPrsMap already built above. No

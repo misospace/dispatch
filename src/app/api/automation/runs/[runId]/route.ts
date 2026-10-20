@@ -3,12 +3,21 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { rerunWorkflow, triggerWorkflowDispatch } from "@/lib/github";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// 10 requests / 60s: reruns and dispatches are externally visible GitHub
+// mutations that burn CI minutes, so a runaway caller is capped.
+const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 export async function POST(request: Request, { params }: { params: Promise<{ runId: string }> }) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`automation-run-action:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
+
   const auditActor = getAuthorizedActor(auth, request);
 
   const { searchParams } = new URL(request.url);

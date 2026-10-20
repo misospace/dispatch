@@ -163,15 +163,22 @@ export async function fetchPullRequestReviewThreadStates(
 export interface GithubPR {
   number: number;
   url: string;
+  /** Human-facing PR URL, present in the raw REST payload (#1203). */
+  html_url?: string;
   title: string;
   body?: string | null;
   state: string;
   user: { login: string };
-  head: { ref: string };
+  // `head.sha` / `merge_commit_sha` / `closed_at` are present in the raw REST
+  // payload and passed through by fetchPaginated; declared here so merge
+  // evidence can carry authoritative head and merge-commit provenance (#1203).
+  head: { ref: string; sha?: string };
   base: { ref: string };
   created_at: string;
   updated_at: string;
+  closed_at?: string | null;
   merged_at: string | null;
+  merge_commit_sha?: string | null;
   draft: boolean;
   reviewDecision?: string | null;
   mergeStateStatus?: string | null;

@@ -215,7 +215,7 @@ Cross-cutting concerns and where they live. Read these first when working in tha
 | Agent claim / unclaim (lease + status) | `app/api/issues/claim/route.ts`, `app/api/issues/unclaim/route.ts`, `lib/lease.ts` |
 | Assign / unassign (label-only, no lease) | `app/api/issues/actions/route.ts`, `app/api/issues/unassign/route.ts`, `lib/assignment-conflicts.ts` |
 | AgentWork lifecycle | `app/api/agent-work/route.ts`, `app/api/agent-work/{start,checkpoint,finish}/route.ts`, `lib/agent-work.ts` |
-| Fenced capacity handoff (#1256) | `app/api/issues/capacity-handoff/route.ts`, `lib/issue-capacity-handoff.ts`, `lib/capacity-handoff.ts`, `lib/pr-fix-queue.ts` (report resolver), `lib/lease.ts` (claim token), [docs/capacity-handoff.md](./docs/capacity-handoff.md) |
+| Fenced capacity handoff (#1256) | `app/api/issues/capacity-handoff/route.ts`, `lib/issue-capacity-handoff.ts`, `lib/capacity-handoff.ts`, `lib/issue-handoff-settlement.ts` (durable replay, #1262), `lib/pr-fix-queue.ts` (report resolver), `lib/lease.ts` (claim token), [docs/capacity-handoff.md](./docs/capacity-handoff.md) |
 | Worker ownership capability + derived states (#1251) | `app/api/agent-work/ownership/route.ts` (register/renew/disposition), `lib/worker-ownership.ts`, `lib/ownership-state.ts` (derivation), `lib/ownership-inspect.ts`, `app/api/issues/[issueId]/ownership/` + `app/api/issues/ownership/` (operator inspect), [docs/worker-ownership-capability.md](./docs/worker-ownership-capability.md) |
 | Auth & audit actor identity | `lib/auth.ts` (`authorizeRequest`, `getAuthorizedActor`) |
 | Lifecycle event stream (claim/status evidence, #1202) | `lib/issue-lifecycle.ts`, `docs/issue-lifecycle-events.md` |

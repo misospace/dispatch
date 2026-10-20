@@ -7,9 +7,11 @@ import {
   recordClaimEvent,
   recordLifecycleEvent,
   recordLifecycleEventQuietly,
+  recordPrMergedEvent,
   recordStatusTransition,
   recordStatusTransitionQuietly,
   recordSyncedIssueEvents,
+  prMergedDedupeKey,
   type LifecycleEventClient,
 } from "./issue-lifecycle";
 
@@ -498,5 +500,78 @@ describe("lifecycleDedupeKey", () => {
       lifecycleDedupeKey("sync", "org/repo", 7, null, undefined, "status/ready"),
     );
     expect(lifecycleDedupeKey("a", undefined, "b")).toBe("a||b");
+  });
+});
+describe("prMergedDedupeKey / recordPrMergedEvent (#1203)", () => {
+  it("keys the same instant identically as a GitHub string or a Date", () => {
+    const stamp = "2026-10-01T12:00:00Z";
+    expect(prMergedDedupeKey("org/repo", 42, 7, stamp)).toBe(
+      prMergedDedupeKey("org/repo", 42, 7, new Date(stamp)),
+    );
+  });
+
+  it("keeps the pre-#1203 reconciler key shape for second-precision stamps", () => {
+    expect(prMergedDedupeKey("org/repo", 42, 7, "2026-10-01T12:00:00Z")).toBe(
+      "reconciler|org/repo|42|pr_merged|7|2026-10-01T12:00:00Z",
+    );
+    expect(prMergedDedupeKey("org/repo", 42, 7, null)).toBe(
+      "reconciler|org/repo|42|pr_merged|7|unknown",
+    );
+  });
+
+  it("preserves sub-second precision when the source actually has it", () => {
+    expect(prMergedDedupeKey("org/repo", 42, 7, "2026-10-01T12:00:00.123Z")).toBe(
+      prMergedDedupeKey("org/repo", 42, 7, new Date("2026-10-01T12:00:00.123Z")),
+    );
+    expect(prMergedDedupeKey("org/repo", 42, 7, "2026-10-01T12:00:00.123Z")).toContain(".123Z");
+  });
+
+  it("records the full merge provenance metadata", async () => {
+    const { client, rows } = makeClient();
+    await recordPrMergedEvent(client, {
+      issueId: "issue-1",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      source: "reconciler",
+      actor: "reconciler",
+      pr: {
+        prNumber: 7,
+        prUrl: "https://github.com/org/repo/pull/7",
+        mergedAt: "2026-10-01T12:00:00Z",
+        mergeCommitSha: "a".repeat(40),
+        headSha: "b".repeat(40),
+        linkSource: "body-keyword",
+      },
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe("pr_merged");
+    expect(rows[0].occurredAt.getTime()).toBe(new Date("2026-10-01T12:00:00Z").getTime());
+    expect(rows[0].dedupeKey).toBe("reconciler|org/repo|42|pr_merged|7|2026-10-01T12:00:00Z");
+    expect(rows[0].metadata).toEqual({
+      pullRequestNumber: 7,
+      pullRequestUrl: "https://github.com/org/repo/pull/7",
+      mergedAt: "2026-10-01T12:00:00.000Z",
+      mergeCommitSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      linkSource: "body-keyword",
+    });
+  });
+
+  it("keeps an unparseable mergedAt visible and keys it by raw text", async () => {
+    const { client, rows } = makeClient();
+    await recordPrMergedEvent(client, {
+      issueId: "issue-1",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      source: "reconciler",
+      actor: "reconciler",
+      pr: { prNumber: 7, mergedAt: "sometime-last-week" },
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].dedupeKey).toBe("reconciler|org/repo|42|pr_merged|7|sometime-last-week");
+    expect(rows[0].metadata.mergedAt).toBeUndefined();
+    expect(rows[0].metadata.mergedAtRaw).toBe("sometime-last-week");
   });
 });

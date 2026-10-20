@@ -16,7 +16,12 @@ import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { removeIssueLabel } from "./github";
 import { getLiveIssueLabels } from "./claim-gate";
 import { releaseIssueClaim } from "./issue-claim";
-import { recordCapacityHandoff, type CapacityHandoffClient } from "./capacity-handoff";
+import { recordCapacityHandoff, capacityCooldownMs, type CapacityHandoffClient } from "./capacity-handoff";
+import {
+  lookupIssueHandoffSettlement,
+  recordIssueHandoffSettlement,
+  ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS,
+} from "./issue-handoff-settlement";
 import { withIssueMutationGuard } from "./issue-mutation-guard";
 
 export interface IssueCapacityHandoffClient extends CapacityHandoffClient {
@@ -38,6 +43,11 @@ export interface IssueCapacityHandoffClient extends CapacityHandoffClient {
   auditLog: {
     create: (args: any) => Promise<unknown>;
   };
+  issueHandoffSettlement: {
+    findUnique: (args: any) => Promise<any>;
+    upsert: (args: any) => Promise<any>;
+    deleteMany: (args: any) => Promise<{ count: number }>;
+  };
 }
 
 export type IssueCapacityHandoffInput = {
@@ -48,6 +58,11 @@ export type IssueCapacityHandoffInput = {
   agentName: string;
   claimToken: string;
   capacity: string;
+  /** Caller settlement idempotency key (#1262). Optional: when present the
+   *  release is recorded durably and an identical retry (same key + original
+   *  claim token) replays the recorded success; when absent the behavior is
+   *  exactly the pre-#1262 path. Opaque caller data — never a secret. */
+  settlementKey?: string | null;
   note?: string | null;
   /** Audit actor identity (token-derived for bound workers). */
   actor: string;
@@ -62,6 +77,9 @@ export type IssueCapacityHandoffResult =
       statusNote: string | null;
       /** null only when the best-effort post-release cooldown write failed. */
       cooldownUntil: Date | null;
+      /** true when this response replays a durable settlement record (#1262):
+       *  the recorded past success is echoed verbatim with zero mutation. */
+      replayed: boolean;
     }
   | {
       ok: false;
@@ -79,6 +97,8 @@ export type IssueCapacityHandoffResult =
         | "claim_expired"
         | "ownership_changed"
         | "handoff_race_lost"
+        | "settlement_key_conflict"
+        | "settlement_unavailable"
         | "github_unavailable"
         | "release_failed";
       message: string;
@@ -100,13 +120,129 @@ export async function recoverIssueCapacityHandoff(
     claimToken: input.claimToken,
   }, async (_tx, { resuming }) => {
     const value = await recoverIssueCapacityHandoffUnlocked(input, resuming);
-    return { complete: !(value.ok === false && (value.code === "release_failed" || value.code === "github_unavailable")), value };
+    return { complete: !(value.ok === false && (value.code === "release_failed" || value.code === "github_unavailable" || value.code === "settlement_unavailable")), value };
   });
-  if (guarded.status === "busy") return {
-    ok: false, httpStatus: 409, code: "handoff_race_lost",
-    message: "Issue mutation is in progress; retry after recovery completes",
-  };
+  if (guarded.status === "busy") {
+    // Same #1129 identity gate as the release path: every write — including
+    // the best-effort replay audit row — must carry verified repo/number
+    // identity.
+    const issue = await input.client.issue.findUnique({
+      where: { id: input.issueId },
+      include: { repository: true },
+    });
+    if (!issue) return { ok: false, httpStatus: 404, code: "issue_not_found", message: "Issue not found in local cache" };
+    if (issue.repository?.fullName !== input.repoFullName || issue.number !== input.issueNumber) {
+      return {
+        ok: false,
+        httpStatus: 400,
+        code: "identity_mismatch",
+        message: `issueId does not match repoFullName/issueNumber; expected ${issue.repository?.fullName}#${issue.number}`,
+      };
+    }
+    // A recorded settlement makes the answer definitive even while the guard
+    // is held: after a post-release crash the orphaned executing guard would
+    // otherwise hide a durably completed release behind a busy 409. The
+    // replay is a pure read gated on lease absence — while a release is
+    // genuinely in flight the lease is still present and this returns null.
+    const outcome = await replayIssueHandoffSettlement(input.client, input, undefined, input.now);
+    if (outcome?.kind === "replayed") return outcome.result;
+    return {
+      ok: false, httpStatus: 409, code: "handoff_race_lost",
+      message: "Issue mutation is in progress; retry after recovery completes",
+    };
+  }
   return guarded.value;
+}
+
+type ReplayOutcome =
+  | { kind: "replayed"; result: IssueCapacityHandoffResult }
+  | { kind: "foreign" }
+  | { kind: "expired" }
+  | null;
+
+/**
+ * Read-only replay of a recorded settlement (#1262). Returns `replayed` only
+ * for the exact (agent, issue, key, claimToken) while the lease row is gone —
+ * the one state in which the release is durably complete: the record is
+ * written after remote cleanup and before the lease CAS, and a CAS miss
+ * retracts it. (Between a record write and a CAS-miss retraction a bypassing
+ * lease deletion can therefore replay while the settler itself reports
+ * race-lost: the claim IS released in that state — labels were cleaned before
+ * the record exists — and only the bounded, self-expiring cooldown row is
+ * missing.) `foreign` marks a settled key presented under a different claim
+ * token, `expired` a proof past its retention deadline; every other case
+ * returns null and the caller proceeds fail-closed. The lookup runs before
+ * the lease gate so an expired proof is pruned and a resumed release
+ * re-records a fresh one (self-heal) even under a live lease — that lazy
+ * prune is a write performed outside the guard on this path. Otherwise replay
+ * mutates no ownership state; the only other writes are the best-effort
+ * replay audit row and (when inside the guard) the transient guard row.
+ *
+ * `lease` sentinel: `undefined` = read the lease row here (busy path; a read
+ * failure fails closed to null → busy 409); `null` = known absent; a row =
+ * known live, replay gated off.
+ */
+async function replayIssueHandoffSettlement(
+  client: IssueCapacityHandoffClient,
+  input: IssueCapacityHandoffInput,
+  lease?: { claimToken: string | null } | null,
+  now: Date = new Date(),
+): Promise<ReplayOutcome> {
+  if (!input.settlementKey) return null;
+  const { agentName, issueId, claimToken } = input;
+  const lookup = await lookupIssueHandoffSettlement(
+    client,
+    { agentName, issueId, settlementKey: input.settlementKey },
+    now,
+  );
+  if (lookup.state === "error") {
+    // Nothing verifiable: announce nothing. The key-conflict fence below
+    // re-reads and refuses retryably if the failure persists.
+    return null;
+  }
+  if (lookup.state === "expired") return { kind: "expired" };
+  let leaseRow = lease;
+  if (leaseRow === undefined) {
+    try {
+      leaseRow = await client.lease.findUnique({ where: { agentName_issueId: { agentName, issueId } } });
+    } catch {
+      // Fail closed: without a verified lease state, announce nothing.
+      return null;
+    }
+  }
+  if (leaseRow) return null;
+  if (lookup.state !== "found") return null;
+  if (lookup.record.claimToken !== claimToken) return { kind: "foreign" };
+  try {
+    await client.auditLog.create({
+      data: {
+        actor: input.actor,
+        action: "issue_capacity_handoff",
+        repoFullName: input.repoFullName,
+        issueNumber: input.issueNumber,
+        issueId,
+        beforeLabels: [],
+        afterLabels: lookup.record.labels,
+        success: true,
+        notes:
+          `replayed from durable settlement record ${lookup.record.id}; capacity=${lookup.record.capacity}; ` +
+          `settledAt=${new Date(lookup.record.settledAt).toISOString()}; zero mutation`,
+      },
+    });
+  } catch {
+    // Replay visibility is best-effort; the recorded result stands.
+  }
+  return {
+    kind: "replayed",
+    result: {
+      ok: true,
+      labels: lookup.record.labels,
+      status: lookup.record.status ?? null,
+      statusNote: lookup.record.statusNote ?? null,
+      cooldownUntil: lookup.record.cooldownUntil ? new Date(lookup.record.cooldownUntil) : null,
+      replayed: true,
+    },
+  };
 }
 
 async function recoverIssueCapacityHandoffUnlocked(
@@ -135,6 +271,40 @@ async function recoverIssueCapacityHandoffUnlocked(
       message: `issueId does not match repoFullName/issueNumber; expected ${issue.repository?.fullName}#${issue.number}`,
     };
   }
+
+  // ── 1a. Lease row read (shared by the replay check and the fence) ────────
+  // The lease row is read before the replay check (#1262): a settlement
+  // record proves a completed release only while the lease is gone. A record
+  // under a live lease is a crash-before-CAS window that the exact-token
+  // resume below must finish, never replay over.
+  const lease = await client.lease.findUnique({
+    where: { agentName_issueId: { agentName, issueId } },
+  });
+
+  // ── 1b. Durable settlement replay (#1262) ─────────────────────────────────
+  // A recorded success is a fact about the past: with the same key and the
+  // original claim token it replays verbatim with zero mutation, checked
+  // before state refusals so a later close/block can never mask the recorded
+  // outcome and leave the caller proving an unprovable release. Fail-closed
+  // refusals below cover every non-exact case; nothing synthetic is produced.
+  let expiredProof = false;
+  if (input.settlementKey) {
+    const outcome = await replayIssueHandoffSettlement(client, input, lease, now);
+    if (outcome?.kind === "replayed") return outcome.result;
+    if (outcome?.kind === "foreign" && !lease) {
+      // The key is settled under a different claim incarnation: presenting a
+      // foreign token to a settled key proves nothing and must never replay.
+      return {
+        ok: false,
+        httpStatus: 409,
+        code: "no_active_claim",
+        message:
+          "settlementKey is already settled under a different claim token; presenting a foreign token to a settled key is refused (no unsafe replay)",
+      };
+    }
+    if (outcome?.kind === "expired") expiredProof = true;
+  }
+
   if (issue.state === "closed") {
     return { ok: false, httpStatus: 400, code: "issue_closed", message: "Cannot hand off a closed issue" };
   }
@@ -154,16 +324,16 @@ async function recoverIssueCapacityHandoffUnlocked(
   }
 
   // ── 2. Fence to the exact claim (agent + lease row + issued token) ───────
-  const lease = await client.lease.findUnique({
-    where: { agentName_issueId: { agentName, issueId } },
-  });
   if (!lease || !lease.claimToken) {
     return {
       ok: false,
       httpStatus: 409,
       code: "no_active_claim",
       message:
-        "No active tokened claim exists for this agent+issue; this claim was already released, superseded, or predates claim tokens — re-claim to obtain a fresh fenced token (do not force an unclaim)",
+        "No active tokened claim exists for this agent+issue; this claim was already released, superseded, or predates claim tokens — re-claim to obtain a fresh fenced token (do not force an unclaim)" +
+        (expiredProof
+          ? `; a settlement proof for this key exists but has expired (retention ${ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS} ms) — no unsafe replay`
+          : ""),
     };
   }
   if (lease.claimToken !== claimToken) {
@@ -183,6 +353,42 @@ async function recoverIssueCapacityHandoffUnlocked(
       code: "claim_expired",
       message: "Claim has expired; stale-claim recovery owns release from here",
     };
+  }
+
+  // #1262: a settlement key is bound to exactly one claim incarnation. If the
+  // key is already recorded under a different token, this caller is reusing a
+  // key across claims — refuse before any remote work (zero mutation); a
+  // fresh key is the caller's recovery.
+  if (input.settlementKey) {
+    let existing: any = null;
+    try {
+      existing = await client.issueHandoffSettlement.findUnique({
+        where: { agentName_issueId_settlementKey: { agentName, issueId, settlementKey: input.settlementKey } },
+      });
+    } catch (error) {
+      // Fail closed: a failed read cannot establish that the key is unused.
+      // Proceeding as if absent would let a durable proof under an older
+      // claim token coexist with — and fail to fence — the release of a
+      // newer live claim (the first-write-wins upsert can never rewrite or
+      // validate the existing proof afterward). Refuse retryably with zero
+      // mutation; the retained guard lets the exact-token retry resume.
+      const message = error instanceof Error ? error.message : "Unknown error";
+      return {
+        ok: false,
+        httpStatus: 503,
+        code: "settlement_unavailable",
+        message: `Could not verify the settlement-key fence: ${message}; nothing was released — retry with the same claimToken and settlementKey`,
+      };
+    }
+    if (existing && existing.claimToken !== claimToken) {
+      return {
+        ok: false,
+        httpStatus: 409,
+        code: "settlement_key_conflict",
+        message:
+          "settlementKey is already bound to a different claim token; retry with a fresh settlement key (keys are never reused across claim incarnations)",
+      };
+    }
   }
 
   // ── 3. Ownership against LIVE GitHub labels (#1037), fail closed ─────────
@@ -270,11 +476,82 @@ async function recoverIssueCapacityHandoffUnlocked(
     };
   }
 
+  // ── 5b. Durable settlement record BEFORE the lease CAS (#1262) ────────────
+  // The proof must exist before the release becomes externally observable via
+  // lease removal: a crash after the CAS but before a late record write would
+  // re-open the unprovable-success gap. A crash before the CAS leaves the
+  // lease intact for the exact-token retry, and the first-write-wins upsert
+  // makes the re-record a no-op. The cooldown deadline is pinned here so the
+  // CapacityHandoff row and the settlement record carry the same value.
+  const cooldownUntil = new Date(now.getTime() + capacityCooldownMs(now.getTime()));
+  if (input.settlementKey) {
+    try {
+      const recorded = await recordIssueHandoffSettlement(client, {
+        agentName,
+        issueId,
+        claimToken,
+        settlementKey: input.settlementKey,
+        capacity,
+        labels,
+        status,
+        statusNote,
+        cooldownUntil,
+        settledAt: now,
+      });
+      // First-write-wins means a lost race against a concurrent foreign-token
+      // record returns that foreign row instead of ours (a null result would
+      // prove nothing either). The lease CAS must not proceed on a proof we
+      // do not own: refuse before consuming the lease so the key fence can
+      // never silently pass (stale-recovery owns reconciling the retained
+      // lease from here).
+      if (!recorded || recorded.claimToken !== claimToken) {
+        await writeFailureAudit(
+          client,
+          input,
+          liveLabels,
+          "Settlement key was concurrently recorded under a different claim token; lease retained, no replay proof for this release",
+        );
+        return {
+          ok: false,
+          httpStatus: 409,
+          code: "settlement_key_conflict",
+          message:
+            "settlementKey was concurrently recorded under a different claim token before the lease was consumed; no replay proof exists for this release and the lease is retained (stale-claim recovery owns reconciling it; do not reuse this settlement key)",
+        };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      await writeFailureAudit(client, input, liveLabels, `Settlement record write failed; lease retained: ${message}`);
+      return {
+        ok: false,
+        httpStatus: 500,
+        code: "release_failed",
+        message: `Could not persist the settlement record; lease and release guard retained: ${message}`,
+      };
+    }
+  }
+
   // Consume the exact lease only after GitHub cleanup succeeded.
   const { count } = await client.lease.deleteMany({
     where: { id: lease.id, agentName, issueId, claimToken },
   });
-  if (count !== 1) return { ok: false, httpStatus: 409, code: "handoff_race_lost", message: "Claim changed concurrently; no lease was released" };
+  if (count !== 1) {
+    // The release did not complete: retract our record so it can never replay
+    // a success for a lease this attempt failed to consume. Best-effort and
+    // pinned to our own claim token — a concurrent exact-key record survives.
+    if (input.settlementKey) {
+      try {
+        await client.issueHandoffSettlement.deleteMany({
+          where: { agentName, issueId, settlementKey: input.settlementKey, claimToken },
+        });
+      } catch (error) {
+        // A leftover record can only replay while the lease is absent; log the
+        // retraction failure so operators can reconcile the stray proof.
+        console.error(`capacity handoff: settlement retraction failed for ${repoFullName}#${issueNumber}:`, error);
+      }
+    }
+    return { ok: false, httpStatus: 409, code: "handoff_race_lost", message: "Claim changed concurrently; no lease was released" };
+  }
 
   // ── 6. Retire active AgentWork rows with history (audit trail) ───────────
   try {
@@ -308,9 +585,12 @@ async function recoverIssueCapacityHandoffUnlocked(
   // read 409 and the worker would believe nothing happened). Degrade to "no
   // cooldown": worst case the exhausted capacity may be re-handed and report
   // exhaustion again — bounded, and strictly better than a false failure.
-  let cooldownUntil: Date | null = null;
+  // The settlement record (#1262) keeps the pinned deadline regardless: a
+  // replay echoes the originally recorded result, and an unpersisted cooldown
+  // is bounded dispatch shaping that expires on its own.
+  let persistedCooldown: Date | null = null;
   try {
-    cooldownUntil = (await recordCapacityHandoff(
+    persistedCooldown = (await recordCapacityHandoff(
       client,
       {
         kind: "issue",
@@ -322,6 +602,7 @@ async function recoverIssueCapacityHandoffUnlocked(
         note: input.note ?? null,
       },
       now,
+      cooldownUntil,
     )).cooldownUntil;
   } catch (error) {
     console.error(`capacity handoff: cooldown write failed for ${repoFullName}#${issueNumber}; releasing without cooldown:`, error);
@@ -339,8 +620,10 @@ async function recoverIssueCapacityHandoffUnlocked(
         afterLabels: labels,
         success: true,
         notes:
-          `capacity=${capacity}; cooldownUntil=${cooldownUntil ? cooldownUntil.toISOString() : "none (cooldown write failed)"}; ` +
+          `capacity=${capacity}; cooldownUntil=${persistedCooldown ? persistedCooldown.toISOString() : "none (cooldown write failed)"}; ` +
           `lease ${lease.id} released by claim-token fence${
+            input.settlementKey ? `; settlementKey=${input.settlementKey}` : ""
+          }${
             ownershipChangedPostCas
               ? "; ownership changed before cleanup: ownership-only release of our label"
               : ""
@@ -351,7 +634,7 @@ async function recoverIssueCapacityHandoffUnlocked(
     // Audit failure is best-effort; the release already happened.
   }
 
-  return { ok: true, labels, status, statusNote, cooldownUntil };
+  return { ok: true, labels, status, statusNote, cooldownUntil: persistedCooldown, replayed: false };
 }
 
 /**

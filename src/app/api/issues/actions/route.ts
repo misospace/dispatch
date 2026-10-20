@@ -6,6 +6,11 @@ import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conf
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// 30 requests / 10s: this route writes live GitHub labels, so bursts stay tight
+// — the same ceiling the other agent-facing mutation routes use (status, claim).
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 
 type ActionPayload = {
   issueId?: string;
@@ -21,6 +26,10 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`issues-actions:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
+
   const auditActor = getAuthorizedActor(auth, request);
 
   try {
