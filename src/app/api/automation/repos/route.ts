@@ -6,6 +6,12 @@ import { jsonSafe } from "@/lib/json";
 import { isValidRepoName } from "@/lib/config";
 import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-repos";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// 10 requests / 60s — the SAME budget as the deprecated POST /api/repos
+// alias (same `repos:${actor}` key, same limit), so both tracked-repo-create
+// paths share one budget instead of doubling it.
+const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -78,6 +84,9 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`repos:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   let body: unknown;
   try {

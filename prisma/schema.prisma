@@ -46,6 +46,7 @@ model Issue {
   groomingChildClaims   GroomingChildClaim[]
   groomerPendingReplies GroomerPendingReply[]
   lifecycleEvents       IssueLifecycleEvent[]
+  handoffSettlements    IssueHandoffSettlement[]
 
   // Escalated lane outcome tracking
   decomposed     Boolean   @default(false)
@@ -973,21 +974,40 @@ model AgentWorkHistory {
 // ---------------------------------------------------------------------------
 
 model Lease {
-  id         String    @id @default(cuid())
-  agentName  String
-  issueId    String
-  issue      Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
-  checkpoint String // e.g. "issue_claimed", "branch_created", etc.
-  branch     String? // working branch name
-  prUrl      String? // associated PR URL if one exists
-  expiredAt  DateTime // absolute expiry; default TTL is set at creation time
-  renewedAt  DateTime?
+  id                     String    @id @default(cuid())
+  agentName              String
+  issueId                String
+  issue                  Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  checkpoint             String // e.g. "issue_claimed", "branch_created", etc.
+  branch                 String? // working branch name
+  prUrl                  String? // associated PR URL if one exists
+  expiredAt              DateTime // absolute expiry; default TTL is set at creation time
+  renewedAt              DateTime?
   // #1256: opaque attempt/claim token issued to the worker on claim. It fences
   // a capacity-handoff release to the EXACT claim: renewals keep the token,
   // but a released/expired lease that is re-claimed gets a fresh row and a
   // fresh token, so a stale worker's token can never release a newer claim.
-  claimToken String?   @unique
-  createdAt  DateTime  @default(now())
+  claimToken             String?   @unique
+  // #1251: optional worker ownership capability (docs/ownership-reconciliation.md §6).
+  // The durable registration / fenced renewal / terminal disposition reuse this
+  // row instead of a parallel lease table. Every column is nullable: a client
+  // that never adopts the capability leaves them unset and stays conservatively
+  // unverified (never auto-abandoned). Renew/claim mutations serialize against
+  // these writes through the per-issue IssueMutationGuard.
+  runRef                 String? // worker-supplied durable run reference recorded at registration
+  registeredAt           DateTime? // server-observed time a durable owner registered
+  registrationOccurredAt DateTime? // worker-reported occurrence time of the registration
+  renewCount             Int       @default(0)
+  lastRenewalObservedAt  DateTime? // server clock of the last accepted renewal
+  lastRenewalOccurredAt  DateTime? // worker-reported occurrence time of the last accepted renewal
+  retryAfter             DateTime? // external-wait marker; ownership defers until this time
+  waitReason             String?
+  disposition            String? // terminal: completed | released | blocked | handed_off
+  dispositionNote        String?
+  successorRef           String? // successor agent / PR link supplied with the disposition
+  dispositionOccurredAt  DateTime?
+  dispositionObservedAt  DateTime?
+  createdAt              DateTime  @default(now())
 
   @@unique([agentName, issueId])
   @@index([agentName, expiredAt])
@@ -1031,4 +1051,44 @@ model CapacityHandoff {
   @@index([kind, repoFullName, issueNumber, cooldownUntil])
   @@index([kind, repoFullName, prNumber, cooldownUntil])
   @@index([cooldownUntil])
+}
+
+// ---------------------------------------------------------------------------
+// Issue handoff settlements (#1262) — durable idempotent replay records.
+//
+// A completed issue capacity handoff is recorded here, bound to the exact
+// issued claim token and a caller settlement key. When both the HTTP success
+// response and the best-effort audit row are lost, a retry with the same key
+// and the original claim token replays the recorded success without touching
+// any newer claim, label, or human hold. Rows are bounded (settledAt +
+// retention) and pruned lazily; they are proof of a past release, never
+// dispatch state, and never a substitute for live ownership verification.
+// ---------------------------------------------------------------------------
+
+model IssueHandoffSettlement {
+  id            String    @id @default(cuid())
+  agentName     String
+  issueId       String
+  issue         Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  // The exact claim incarnation settled. Replay requires token equality; a
+  // newer claim's token never matches and is refused, never replayed over.
+  claimToken    String
+  // Caller-chosen idempotency key for the settlement operation (opaque, at
+  // most 200 chars). One settlement per (agent, issue, key); first write wins
+  // so a crash-resumed attempt can never rewrite the original proof.
+  settlementKey String
+  capacity      String
+  // Recorded successful release result, replayed verbatim.
+  labels        String[]
+  status        String?
+  statusNote    String?
+  cooldownUntil DateTime?
+  settledAt     DateTime
+  // Bounded retention deadline; expired rows are pruned lazily on lookup and
+  // an expired proof is refused, never replayed.
+  expiresAt     DateTime
+  createdAt     DateTime  @default(now())
+
+  @@unique([agentName, issueId, settlementKey])
+  @@index([expiresAt])
 }

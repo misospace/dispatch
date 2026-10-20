@@ -16,8 +16,10 @@ product-specific table or side channel), and is written through one contract —
 `src/lib/issue-lifecycle.ts` — so the taxonomy, the idempotency rules and the
 timestamps cannot drift between routes.
 
-Non-goals for now: PR merge/link backfill, a duration API or UI, and worker
-attempt telemetry/cohorts.
+Non-goals for now: a board UI over the timeline, and worker attempt
+telemetry/cohorts (downstream #1183/#1184 build on the read contract below).
+The read contract, the authoritative merge linkage, and the bounded backfill
+landed with #1203.
 
 ## Taxonomy
 
@@ -30,7 +32,7 @@ attempt telemetry/cohorts.
 | `completed` | A worker report closed the item as already done (`status/done` + GitHub close). Not evidence that a PR merged. | `agent-report` |
 | `issue_closed` | The GitHub issue was observed closing — or closed by the hosted groomer. Distinct from the card reaching Done. | `reconciler`, `sync`, `hosted-groomer` |
 | `issue_reopened` | The issue was observed reopening after a close. | `sync` |
-| `pr_merged` | A PR referencing the item was observed merged. Only ever recorded from an observation of a merge — never from a worker's success report. | `reconciler` |
+| `pr_merged` | A PR referencing the item was observed merged. Only ever recorded from an observation of a merge — never from a worker's success report. Metadata carries the PR number/url, GitHub's own `mergedAt`, and `headSha` / `mergeCommitSha` when the observer had them, plus a `linkSource` (`body-keyword`, `branch-name`, `reconcile-close-trigger`, `agent-run-touch`) saying how the PR is correlated to the issue. Multiple linked PRs record one row each; a title-only match is never a link. | `reconciler`, `backfill` |
 
 `kind` and `source` are stored as strings, not enums, so a new writer can be
 added without a migration; `LIFECYCLE_EVENT_KINDS` and `LIFECYCLE_SOURCES` in
@@ -65,6 +67,110 @@ added without a migration; `LIFECYCLE_EVENT_KINDS` and `LIFECYCLE_SOURCES` in
 | Issue sync | `src/lib/issue-sync.ts` (`makePrismaIssueStore`, `makePrismaReconcileIssueStore`) | `status_changed`, `issue_closed`, `issue_reopened` |
 | GitHub webhook | `src/app/api/issues/webhook/route.ts` | `status_changed` |
 | Worker report | `src/app/api/agents/[agentName]/tasks/report/route.ts`, `src/lib/report-close.ts` | `attempt_failed`, `completed` |
+| Lifecycle merge backfill (operator, per issue) | `src/lib/lifecycle-backfill.ts`, `POST /api/issues/[issueId]/lifecycle` | `pr_merged`, only from a run record naming the PR plus that PR's persisted GitHub merge time |
+
+## Reading the stream: the lifecycle timeline (#1203)
+
+`GET /api/issues/[issueId]/lifecycle` (any authorized caller) projects the
+stream into a typed, source-neutral read contract —
+`dispatch.issue-lifecycle-timeline/v1` — built by
+`buildIssueLifecycleTimeline` in `src/lib/issue-lifecycle-read.ts` (pure, no
+I/O). It exposes, per work item:
+
+- `claims[]` (every observed claim, in occurrence order) and `firstClaim` —
+  **a missing first claim is `{ at: null, provenance: "unknown" }`, never
+  zero and never the issue creation time**. A reclaim never replaces the
+  first claim.
+- `doneAt` / `closedAt` / `lastReopenAt` milestones. A close observed without
+  a merge is `delivery: "closed-unmerged"` — never labeled shipped. Reopening
+  preserves the earlier close milestone in `closedAt`, while `delivery` follows
+  the latest close/reopen ordering: the latest close is the later of the last
+  observed close and the issue cache's `closedAt` (the cache counts only for a
+  closed issue), so a close after a reopen reports `closed-unmerged` again.
+- `pullRequests[]`: one entry per distinct merged PR (multi-PR issues are
+  first-class), each with the authoritative `mergedAt`, `mergeCommitSha`,
+  `headSha`, and `linkSource` provenance, plus `firstMergedAt`.
+- `claimToDoneMs` / `claimToMergeMs`, in **milliseconds**, null whenever
+  either endpoint is unknown. A merge preceding the first observed claim
+  yields a negative value plus a note — reported, not hidden.
+- Every timestamp carries `provenance`: `observed` (a lifecycle event or the
+  issue-cache fallback), `backfilled` (`metadata.backfilled === true`), or
+  `unknown`. Rows written by the backfill are therefore never mistaken for
+  real-time observations.
+
+The read is bounded (`take` window of 500 events, `truncated: true` beyond
+it) — no full-history GitHub scan on a routine request. Duplicate
+observations (the documented `api:*` vs `webhook` pair) collapse in the
+projection with a note. The raw window ships alongside the timeline as
+`events[]` for downstream consumers (#1183 attempts, #1184 cohorts); the
+contract assumes nothing Courier- or Dispatch-writer-specific. That 500-event
+read window is a bound of its own, separate from the reconciler's 100-PR
+merged-PR window: the first caps how much of the stream a read projects, the
+second caps how many merged PRs reconcile can observe.
+
+### Merge linkage and the bounded backfill
+
+Merge evidence is written only through `recordPrMergedEvent`
+(`src/lib/issue-lifecycle.ts`), whose canonical dedupe identity
+(`reconciler|<repo>|<issue>|pr_merged|<pr>|<mergedAt>`) is shared by every
+observer — reconcile, and the backfill — so the same physical merge observed
+twice lands on one row. The reconciler records one `pr_merged` per *linked*
+merged PR (#1203), each with its `linkSource`. Link evidence comes only from
+an explicit correlation — a body Fixes/Closes/Resolves keyword or a
+branch-name pattern. PR titles are never consulted, for links or for the
+close decision: a merged PR that only names an issue in its title neither
+closes it nor records a merge for it. When a caller supplies no evidence
+list at all, the PR that actually drove a recorded close is still noted,
+with `linkSource: "reconcile-close-trigger"`, because that correlation is
+the observed action rather than a text guess. The dedupe stamp is
+canonicalized so a `Date` and GitHub's second-precision string form of the
+same merge produce the same key, keeping reconcile, sync, and backfill on
+one row per physical merge.
+
+Merge recording is decoupled from the reconcile action loop: a linked merge
+records whether the issue is open or closed and whether the close action
+executed. A second bounded pass inside the same reconcile run records the
+merge for every linked number in the fetched window
+(`recordLinkedMergeEvidence`, merges only — no close or status writes). It
+re-derives links from the already-fetched merged-PR window, so it adds no
+GitHub calls, and replays idempotently onto the same dedupe key — rows the
+close path already wrote converge on the same row.
+
+`POST /api/issues/[issueId]/lifecycle` (operator auth only — agent bearer
+tokens get 403) backfills legacy issues **only from verifiable records**: an
+`AgentRun` attached to the issue whose `touchedIssueUrls` name a PR,
+correlated with that PR's authoritative merge timestamp already persisted in
+Dispatch (`GithubPullRequest.mergedAt`).
+It never fabricates a first claim, never reads `startedAt`/`createdAt` as
+claim evidence, skips PRs without an authoritative merge time, and replays
+idempotently onto the shared dedupe identity. Unknown stays unknown; nothing
+here estimates.
+
+The merge time has to be persisted before the backfill can use it. The
+automation sync currently upserts open PRs only, and an open PR never carries a
+merge, so a row it wrote holds no `mergedAt` and a PR that later merges is not
+updated either — the backfill recovers a merge only where the merge time is
+already in the table (#1313 tracks closing that gap). A PR without a persisted
+merge time stays unrecorded: the backfill never infers a merge from a merge
+state alone.
+
+The reconciler's merged-PR window is bounded: reconcile fetches each repo's open
+PRs and its most recently updated closed PRs (`fetchPullRequests` /
+`fetchClosedPullRequests`, 100 per page — up to 200 open, 100 closed), and
+merged PRs come from the closed side, since an open PR never carries a merge.
+A merge outside that closed window is never seen by reconcile and is therefore
+never recorded by reconcile — those merges are the operator backfill's
+territory.
+
+To recover merges for older issues, run `POST /api/issues/{issueId}/lifecycle`
+for that issue. Both of the backfill's preconditions must hold: an `AgentRun`
+attached to the issue whose `touchedIssueUrls` name the PR, and that PR's
+persisted `GithubPullRequest.mergedAt` — and the merge time is only there if
+it was persisted before the PR dropped out of the sync's open-PR listing
+(#1313). Without both, the PR stays unrecorded — the backfill never infers a
+merge from a merge state alone. Its own PR read is bounded to the PRs the
+issue's runs touch, and the count of merged PRs no run touched comes from a
+repo-wide aggregate count rather than a full repo scan.
 
 ## Idempotency
 

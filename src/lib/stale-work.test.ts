@@ -12,21 +12,65 @@ vi.mock("@/lib/github-prs", () => ({
 // The default client is never used: every test passes its own fake.
 vi.mock("@/lib/prisma", () => ({ prisma: {} }));
 
+// A real MUTUAL-EXCLUSION fake of the per-issue mutation fence: while the
+// sweep holds an issue's fence, any other operation requesting it gets
+// `busy` and its callback never runs. This is what lets the interleaving
+// tests below deterministically prove a renewal cannot commit inside the
+// sweep's decide-and-release window.
+const { guard } = vi.hoisted(() => {
+  const held = new Map<string, { operation: string; agentName?: string }>();
+  const attempts: Array<{ issueId: string; operation: string; agentName?: string; status: string }> = [];
+  return {
+    guard: {
+      held,
+      attempts,
+      reset: () => {
+        held.clear();
+        attempts.length = 0;
+      },
+    },
+  };
+});
+
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  withIssueMutationGuard: async (request: any, callback: any) => {
+    const current = guard.held.get(request.issueId);
+    if (current) {
+      guard.attempts.push({ ...request, status: "busy" });
+      return { status: "busy", ownerToken: "other", operation: current.operation };
+    }
+    guard.held.set(request.issueId, { operation: request.operation, agentName: request.agentName });
+    guard.attempts.push({ ...request, status: "acquired" });
+    try {
+      const result = await callback(undefined, { resuming: false });
+      if (result.complete) return { status: "completed", value: result.value };
+      return { status: "retained", ownerToken: "self", value: result.value };
+    } finally {
+      guard.held.delete(request.issueId);
+    }
+  },
+}));
+
 import { removeIssueLabel } from "@/lib/github";
+import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 import { sweepStaleWork, type StaleWorkClient } from "./stale-work";
 
 const removeIssueLabelMock = removeIssueLabel as ReturnType<typeof vi.fn>;
 
 const REPO = "octocat/hello-world";
 
+const minutesAgo = (n: number) => new Date(Date.now() - n * 60_000);
+const minutesAhead = (n: number) => new Date(Date.now() + n * 60_000);
+
 interface WorkRow {
   id: string;
   agentName: string;
-  issueId: string | null;
+  issueId: string;
   state: string;
   staleClaimReleasePending: boolean;
   lastHeartbeatAt: Date;
-  leaseExpiresAt: Date;
+  /** Nullable in the schema: a row may carry no lease expiry at all. */
+  leaseExpiresAt: Date | null;
   issue: {
     id: string;
     number: number;
@@ -38,75 +82,143 @@ interface WorkRow {
   };
 }
 
+// ─── Clause evaluator ────────────────────────────────────────────────────────
+//
+// The sweeper selects reclaim candidates and live siblings with WHERE
+// clauses. These helpers answer those clauses against a row in memory, so the
+// REAL clause the production code passes is exercised — not a hand-copied
+// predicate. A clause key or operator this evaluator does not implement
+// throws, so the fake can never silently agree with a clause it does not
+// actually understand.
+
+/** The clause keys the sweeper's clauses are allowed to use. */
+const CLAUSE_KEYS = new Set([
+  "OR",
+  "id",
+  "agentName",
+  "issueId",
+  "state",
+  "staleClaimReleasePending",
+  "lastHeartbeatAt",
+  "leaseExpiresAt",
+  // Lease claim-epoch fence keys (#1251 review): the snapshot fields the
+  // CAS delete compares against.
+  "claimToken",
+  "expiredAt",
+  "lastRenewalObservedAt",
+]);
+
+/** Scalar equality honoring Prisma's by-value comparison for `Date`s. */
+function scalarEquals(value: unknown, cond: unknown): boolean {
+  if (value instanceof Date || cond instanceof Date) {
+    if (!(value instanceof Date) || !(cond instanceof Date)) return false;
+    return value.getTime() === cond.getTime();
+  }
+  return value === cond;
+}
+
+function matchesWhere(row: Record<string, unknown>, where: unknown): boolean {
+  if (where === null || typeof where !== "object") return true;
+  for (const [key, cond] of Object.entries(where as Record<string, unknown>)) {
+    if (key === "OR") {
+      const clauses = cond as unknown[];
+      if (!clauses.some((clause) => matchesWhere(row, clause))) return false;
+      continue;
+    }
+    if (!CLAUSE_KEYS.has(key)) {
+      throw new Error(`test fake: unsupported where clause key ${key}`);
+    }
+    const value = row[key];
+    if (cond !== null && typeof cond === "object" && !(cond instanceof Date) && !Array.isArray(cond)) {
+      for (const [op, operand] of Object.entries(cond as Record<string, unknown>)) {
+        if (op === "in") {
+          if (!Array.isArray(operand) || !operand.includes(value)) return false;
+        } else if (op === "not") {
+          if (value === operand) return false;
+        } else if (op === "lt" || op === "lte" || op === "gt" || op === "gte") {
+          // SQL three-valued logic: a NULL operand is never comparable, so the
+          // comparison is UNKNOWN — not true. This is what makes the sweeper's
+          // `leaseExpiresAt` NULL arm meaningful.
+          if (value === null || value === undefined) return false;
+          const left = value instanceof Date ? value.getTime() : value;
+          const right = operand instanceof Date ? operand.getTime() : operand;
+          if (typeof left !== "number" || typeof right !== "number") return false;
+          if (op === "lt" && !(left < right)) return false;
+          if (op === "lte" && !(left <= right)) return false;
+          if (op === "gt" && !(left > right)) return false;
+          if (op === "gte" && !(left >= right)) return false;
+        } else {
+          throw new Error(`test fake: unsupported where operator ${key}.${op}`);
+        }
+      }
+      continue;
+    }
+    // Scalar equality: `state: "STALE"`, `staleClaimReleasePending: false`,
+    // and by-value Date equality for the epoch fence timestamps.
+    if (!scalarEquals(value, cond)) return false;
+  }
+  return true;
+}
+
+/**
+ * A sweep client over an in-memory set of `AgentWork` rows, plus the narrow
+ * surfaces `sweepStaleWork` reads.
+ *
+ * The candidate `findMany` returns the rows the test declares as sweep
+ * candidates, filtered through the sweeper's OWN candidate clause — the clause
+ * is the one the production code passes, so a candidate that is not actually
+ * stale never enters the sweep. The sibling `findFirst` is evaluated
+ * faithfully against EVERY row in the pool (candidates and siblings alike), so
+ * a wrong predicate in the production lookup fails the test instead of
+ * agreeing with it by accident.
+ *
+ * The issue row is mutable so a release is visible to the retry, and the
+ * lifecycle event table keeps rows keyed by `dedupeKey` the way the unique
+ * index does — so "how many releases are in the stream" is counted, not
+ * inferred.
+ */
+/** A `Lease` row narrowed to the fields the epoch fence compares. */
 interface LeaseRow {
-  id: string;
   agentName: string;
   issueId: string;
-  createdAt: Date;
-  renewedAt: Date | null;
+  claimToken: string | null;
   expiredAt: Date;
+  lastRenewalObservedAt: Date | null;
+  createdAt: Date;
 }
 
-type NarrowedLeaseWhere = {
-  agentName: string;
-  issueId: string;
-  OR: Array<Record<string, any>>;
-};
-
-interface SiblingRow {
-  id: string;
-  agentName: string;
-  issueId: string;
-  state: string;
+function makeLease(overrides: Partial<LeaseRow> = {}): LeaseRow {
+  return {
+    agentName: "alpha",
+    issueId: "issue-1",
+    claimToken: "token-1",
+    expiredAt: minutesAgo(25),
+    lastRenewalObservedAt: null,
+    createdAt: minutesAgo(30),
+    ...overrides,
+  };
 }
 
-/**
- * Evaluate the live-sibling guard's where clause (#1317) the way Prisma
- * would: same pair, a different row, and a state that is still active.
- * Terminal (DONE/RELEASED/STALE) siblings must not count as live.
- */
-function matchesLiveSiblingWhere(row: SiblingRow, where: Record<string, any>): boolean {
-  if (row.agentName !== where.agentName || row.issueId !== where.issueId) return false;
-  if (row.id === where.id.not) return false;
-  return where.state.in.includes(row.state);
-}
-
-/**
- * Apply the narrowed lease-release where clause (#1317) the way Prisma would:
- * pair equality plus the OR branches. The sweeper releases a lease only when
- * it has expired, or its last renewal (or creation, when never renewed)
- * predates the stale row's last heartbeat — a lease renewed later belongs to a
- * newer claim epoch of the same agent on the same issue and must survive.
- */
-function matchesNarrowedLeaseWhere(row: LeaseRow, where: NarrowedLeaseWhere): boolean {
-  if (row.agentName !== where.agentName || row.issueId !== where.issueId) return false;
-  return where.OR.some((branch) => {
-    if ("expiredAt" in branch) return row.expiredAt <= branch.expiredAt.lte;
-    if ("renewedAt" in branch && branch.renewedAt === null) {
-      return row.renewedAt === null && row.createdAt < branch.createdAt.lt;
-    }
-    if ("renewedAt" in branch) {
-      return row.renewedAt !== null && row.renewedAt < branch.renewedAt.lt;
-    }
-    return false;
-  });
-}
-
-/**
- * A stale AgentWork row plus the narrow surfaces `sweepStaleWork` reads. The
- * issue row is mutable so a release is visible to the retry, and the lifecycle
- * event table keeps rows keyed by `dedupeKey` the way the unique index does —
- * so "how many releases are in the stream" is counted, not inferred. The lease
- * store is filtered by the sweep's actual where clause so the narrowing is
- * exercised, not assumed.
- */
-function makeSweepClient(options: { work: WorkRow; dieBeforeFinalize?: boolean; leases?: LeaseRow[]; siblings?: SiblingRow[] }) {
+function makeSweepClient(options: {
+  candidates: WorkRow[];
+  /** Every row visible to the sibling lookup. Defaults to the candidates. */
+  rows?: WorkRow[];
+  dieBeforeFinalize?: boolean;
+  /** Lease rows visible to the epoch snapshot and the fenced delete. */
+  leases?: LeaseRow[];
+  /**
+   * Runs INSIDE the sweep's decision window — after the claim-epoch snapshot
+   * and the live-sibling lookup, before the fenced lease delete. This is the
+   * deterministic stand-in for the interleaving the review demanded: a
+   * renewal / re-claim / fresh claim that commits exactly there.
+   */
+  afterSiblingLookup?: () => void | Promise<void>;
+}) {
   const eventRows: Array<Record<string, any>> = [];
-  const work = options.work;
+  const auditRows: Array<Record<string, any>> = [];
+  const candidates = options.candidates;
+  const rows = options.rows ?? options.candidates;
   let crashed = false;
-  const leaseRows: LeaseRow[] = options.leases ?? [
-    { id: "lease-1", agentName: work.agentName, issueId: work.issueId ?? "issue-1", createdAt: new Date("2026-09-01T00:00:00.000Z"), renewedAt: null, expiredAt: new Date("2027-01-01T00:00:00.000Z") },
-  ];
 
   const issueLifecycleEvent = {
     create: vi.fn(async ({ data }: { data: Record<string, any> }) => {
@@ -121,58 +233,110 @@ function makeSweepClient(options: { work: WorkRow; dieBeforeFinalize?: boolean; 
     }),
   };
 
+  const findIssue = (id: string) => rows.find((row) => row.issue?.id === id)?.issue ?? null;
+
   const issue = {
-    update: vi.fn(async ({ data }: { data: { labels?: string[] } }) => {
-      if (data.labels) issueRow.labels = [...data.labels];
-      return issueRow;
+    update: vi.fn(async ({ where, data }: { where: { id: string }; data: { labels?: string[] } }) => {
+      const target = findIssue(where.id);
+      if (target && data.labels) target.labels = [...data.labels];
+      return target;
     }),
-    findUnique: vi.fn(async () => ({ labels: [...issueRow.labels] })),
+    findUnique: vi.fn(async ({ where }: { where: { id: string } }) => {
+      const target = findIssue(where.id);
+      return target ? { labels: [...target.labels] } : null;
+    }),
   };
-  const issueRow = work.issue;
 
-  const agentWorkUpdateMany = vi.fn(async ({ data }: { data: Record<string, any> }) => {
-    // The finalization step is what a crash lands after: the release has
-    // committed, but the row is never cleared of its retry marker.
-    if (options.dieBeforeFinalize && data.staleClaimReleasePending === false && !crashed) {
-      crashed = true;
-      throw new Error("sweep died before finalizing");
+  const agentWorkUpdateMany = vi.fn(
+    async ({ where, data }: { where: unknown; data: Record<string, any> }) => {
+      // The finalization step is what a crash lands after: the release has
+      // committed, but the row is never cleared of its retry marker.
+      if (
+        options.dieBeforeFinalize &&
+        data.staleClaimReleasePending === false &&
+        data.state === undefined &&
+        !crashed
+      ) {
+        crashed = true;
+        throw new Error("sweep died before finalizing");
+      }
+      const matched = rows.filter((row) => matchesWhere(row as unknown as Record<string, unknown>, where));
+      for (const row of matched) {
+        if (data.state) row.state = data.state;
+        if (data.staleClaimReleasePending !== undefined) {
+          row.staleClaimReleasePending = data.staleClaimReleasePending;
+        }
+        if (data.leaseExpiresAt !== undefined) row.leaseExpiresAt = data.leaseExpiresAt;
+      }
+      return { count: matched.length };
+    },
+  );
+
+  // The live-sibling lookup: evaluated faithfully against every row in the
+  // pool, so the production predicate (agent, issue, `id not`, state, fresh
+  // heartbeat, fresh-or-null lease expiry) decides the answer. The
+  // `afterSiblingLookup` hook then runs — the scripted interleave lands
+  // between this lookup and the fenced lease delete.
+  const agentWorkFindFirst = vi.fn(async ({ where, select }: any) => {
+    const matched = rows.find((row) => matchesWhere(row as unknown as Record<string, unknown>, where));
+    if (options.afterSiblingLookup) await options.afterSiblingLookup();
+    if (!matched) return null;
+    return select ? { id: matched.id } : matched;
+  });
+
+  const candidateClauses: unknown[] = [];
+  const agentWorkFindMany = vi.fn(async ({ where, orderBy, take }: any) => {
+    candidateClauses.push(where);
+    const selected = candidates.filter((row) =>
+      matchesWhere(row as unknown as Record<string, unknown>, where),
+    );
+    if (orderBy?.lastHeartbeatAt === "asc") {
+      selected.sort((a, b) => a.lastHeartbeatAt.getTime() - b.lastHeartbeatAt.getTime());
     }
-    if (data.state) work.state = data.state;
-    if (data.staleClaimReleasePending !== undefined) work.staleClaimReleasePending = data.staleClaimReleasePending;
-    return { count: 1 };
+    return typeof take === "number" ? selected.slice(0, take) : selected;
   });
 
-  const leaseDeleteMany = vi.fn(async ({ where }: { where: NarrowedLeaseWhere }) => {
-    const kept = leaseRows.filter((row) => !matchesNarrowedLeaseWhere(row, where));
-    const removed = leaseRows.length - kept.length;
-    leaseRows.length = 0;
-    leaseRows.push(...kept);
-    return { count: removed };
+  // The lease pool the epoch snapshot reads and the fenced delete matches
+  // against — evaluated faithfully, so a fence the production code does not
+  // actually write (or writes wrongly) deletes nothing / deletes the wrong
+  // row here exactly as it would in the database.
+  const leases = options.leases ?? [];
+
+  const leaseFindFirst = vi.fn(async ({ where }: any) => {
+    const matched = leases.find((lease) => matchesWhere(lease as unknown as Record<string, unknown>, where));
+    return matched ? { ...matched } : null;
   });
-  const agentWorkCount = vi.fn(async ({ where }: { where: Record<string, any> }) => {
-    const siblings = options.siblings ?? [];
-    return siblings.filter((row) => matchesLiveSiblingWhere(row, where)).length;
+
+  const leaseDeleteMany = vi.fn(async ({ where }: any) => {
+    const doomed = leases.filter((lease) => matchesWhere(lease as unknown as Record<string, unknown>, where));
+    for (const doomed_ of doomed) leases.splice(leases.indexOf(doomed_), 1);
+    return { count: doomed.length };
   });
 
   const tx = {
-    agentWork: { updateMany: agentWorkUpdateMany, count: agentWorkCount },
-    lease: { deleteMany: leaseDeleteMany },
+    agentWork: { findFirst: agentWorkFindFirst, updateMany: agentWorkUpdateMany },
+    lease: { findFirst: leaseFindFirst, deleteMany: leaseDeleteMany },
     agentWorkHistory: { create: vi.fn().mockResolvedValue({ id: "h-1" }) },
     issue,
     issueLifecycleEvent,
   };
 
   const client = {
-    agentWork: { findMany: vi.fn(async () => [work]) },
+    agentWork: { findMany: agentWorkFindMany },
     issue,
     issueLifecycleEvent,
     lease: tx.lease,
     agentWorkHistory: tx.agentWorkHistory,
-    auditLog: { create: vi.fn().mockResolvedValue({ id: "a-1" }) },
+    auditLog: {
+      create: vi.fn(async ({ data }: { data: Record<string, any> }) => {
+        auditRows.push({ ...data });
+        return { id: "a-1" };
+      }),
+    },
     $transaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
   } as unknown as StaleWorkClient;
 
-  return { client, eventRows, work, leaseRows, leaseDeleteMany, agentWorkCount };
+  return { client, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases };
 }
 
 function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
@@ -182,8 +346,8 @@ function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
     issueId: "issue-1",
     state: "CLAIMED",
     staleClaimReleasePending: false,
-    lastHeartbeatAt: new Date("2026-10-01T00:00:00.000Z"),
-    leaseExpiresAt: new Date("2026-10-01T00:00:00.000Z"),
+    lastHeartbeatAt: minutesAgo(30),
+    leaseExpiresAt: minutesAgo(25),
     issue: {
       id: "issue-1",
       number: 42,
@@ -199,6 +363,7 @@ function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  guard.reset();
   removeIssueLabelMock.mockResolvedValue(undefined);
 });
 
@@ -207,7 +372,8 @@ describe("sweepStaleWork — one claim_released per claim epoch (#1202 review)",
     // The AgentWork row is the claim epoch and is stable across the retry, so
     // the release and the already-released repair the retry has to take are the
     // same release — one row, not two.
-    const { client, eventRows, work } = makeSweepClient({ work: makeWork(), dieBeforeFinalize: true });
+    const work = makeWork();
+    const { client, eventRows } = makeSweepClient({ candidates: [work], dieBeforeFinalize: true });
 
     const first = await sweepStaleWork(client);
     expect(first.released).toBe(0);
@@ -231,12 +397,12 @@ describe("sweepStaleWork — one claim_released per claim epoch (#1202 review)",
   it("records a reclaim as a second release, because the AgentWork row is new", async () => {
     // The issue was claimed again after the first sweep, so the second row is a
     // different claim epoch and its release is a different fact.
-    const first = makeSweepClient({ work: makeWork() });
+    const first = makeSweepClient({ candidates: [makeWork()] });
     await sweepStaleWork(first.client);
     expect(first.eventRows).toHaveLength(1);
 
     const reclaimed = makeWork({ id: "work-2", issue: makeWork().issue });
-    const second = makeSweepClient({ work: reclaimed });
+    const second = makeSweepClient({ candidates: [reclaimed] });
     await sweepStaleWork(second.client);
 
     expect(second.eventRows).toHaveLength(1);
@@ -245,12 +411,9 @@ describe("sweepStaleWork — one claim_released per claim epoch (#1202 review)",
   });
 
   it("skips a row another sweep already took over", async () => {
-    const { client, eventRows } = makeSweepClient({ work: makeWork() });
+    const { client, eventRows } = makeSweepClient({ candidates: [makeWork()] });
     // The conditional mark misses — a concurrent sweep owns this row now.
-    (client as unknown as { $transaction: any }).$transaction.mockImplementation(async () => ({
-      marked: false,
-      leasesReleased: 0,
-    }));
+    (client as unknown as { $transaction: any }).$transaction.mockImplementation(async () => false);
 
     const report = await sweepStaleWork(client);
 
@@ -259,272 +422,819 @@ describe("sweepStaleWork — one claim_released per claim epoch (#1202 review)",
   });
 });
 
-describe("sweepStaleWork — lease release is narrowed to the marked claim epoch (#1317)", () => {
-  const QUIET_AT = new Date("2026-10-01T00:00:00.000Z");
+// ─── Claim-incarnation safety ────────────────────────────────────────────────
+//
+// A stale row must never release a claim that a live worker still owns. An
+// older BLOCKED row and a freshly renewed IN_PROGRESS row can coexist for the
+// same (agent, issue) — the renewed one keeps the claim alive, so reclaiming
+// the older one must not delete the lease or the `agent/<name>` label.
 
-  it("does not release a lease renewed by a newer claim epoch of the same agent", async () => {
-    // The stale CLAIMED row went quiet at 00:00; the same agent later
-    // re-claimed the same issue, which renewed the pair's singleton lease at
-    // 02:00. The sweep marks the old row but must leave that live epoch's
-    // lease alone — deleting by (agentName, issueId) pair would kill it.
-    const { client, leaseRows, leaseDeleteMany } = makeSweepClient({
-      work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-      leases: [
-        {
-          id: "lease-live",
-          agentName: "alpha",
-          issueId: "issue-1",
-          createdAt: new Date("2026-09-01T00:00:00.000Z"),
-          renewedAt: new Date("2026-10-02T00:00:00.000Z"),
-          expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-        },
-      ],
+describe("sweepStaleWork — a stale row never releases a claim a live sibling owns", () => {
+  it("keeps the lease, the label and the claim of a freshly renewed sibling", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const live = makeWork({
+      id: "work-live",
+      issue,
+      state: "IN_PROGRESS",
+      // Exactly what `renewOwnership` writes onto the freshest active row:
+      // the operation's own clock as the heartbeat, and the renewed ownership
+      // expiry (`now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`, default 30 min) as
+      // the lease expiry.
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, eventRows, auditRows, leaseDeleteMany, candidateClauses } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, live],
+    });
+    const liveHeartbeatBefore = live.lastHeartbeatAt.getTime();
+    const liveExpiryBefore = live.leaseExpiresAt?.getTime() ?? null;
+
+    const report = await sweepStaleWork(client);
+
+    // The stale row was examined and reclaimed…
+    expect(report.examined).toBe(1);
+    expect(stale.state).toBe("STALE");
+    // …but the claim was retained, not released.
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(report.skipped).toBe(0);
+
+    // The reclaimed row stops asking for a release: the retry marker is down,
+    // so the next sweep does not pick it up again.
+    expect(stale.staleClaimReleasePending).toBe(false);
+    // The live sibling is untouched by the reclaim of its stale sibling.
+    expect(live.state).toBe("IN_PROGRESS");
+    expect(live.lastHeartbeatAt.getTime()).toBe(liveHeartbeatBefore);
+    expect(live.leaseExpiresAt?.getTime() ?? null).toBe(liveExpiryBefore);
+    // The live sibling was never a reclaim candidate in the first place — it
+    // is the STALE sibling's reclaim that must not take the claim down.
+    const [candidateClause] = candidateClauses;
+    expect(matchesWhere(live as unknown as Record<string, unknown>, candidateClause)).toBe(false);
+
+    // The live claim survives: no lease delete.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    // The GitHub agent label survives: no label removal, labels unchanged.
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(issue.labels).toEqual(["agent/alpha", "status/in-progress"]);
+    // No release was recorded in the lifecycle stream.
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(0);
+
+    // The retention is audited as a retention, with unchanged labels.
+    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
+    expect(audit).toBeDefined();
+    expect(audit?.actor).toBe("system");
+    expect(audit?.success).toBe(true);
+    expect(audit?.beforeLabels).toEqual(["agent/alpha", "status/in-progress"]);
+    expect(audit?.afterLabels).toEqual(audit?.beforeLabels);
+    // The notes name the reclaimed row, the agent, the issue and the live row
+    // that still owns the claim.
+    expect(audit?.notes).toContain("work-stale");
+    expect(audit?.notes).toContain("alpha");
+    expect(audit?.notes).toContain("issue-1");
+    expect(audit?.notes).toContain("work-live");
+    expect(auditRows.find((row) => row.action === "stale_agentwork_released")).toBeUndefined();
+  });
+
+  it("negative control: the same stale row with no live sibling still releases the claim", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+
+    const { client, eventRows, auditRows, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
     });
 
     const report = await sweepStaleWork(client);
 
     expect(report.released).toBe(1);
-    expect(report.leasesReleased).toBe(0);
-    expect(leaseRows).toHaveLength(1);
-    expect(leaseRows[0].id).toBe("lease-live");
-    // The delete is narrowed by claim epoch, not by pair: the where clause
-    // carries the expiry and renewal-time branches on top of the pair
-    // equality.
+    expect(report.claimRetained).toBe(0);
+    expect(report.skipped).toBe(0);
+
+    // The label is removed and exactly one release is recorded. With no
+    // lease row at the snapshot there is nothing legitimate to delete, so no
+    // delete is attempted at all — and a fresh claim created inside the
+    // window would be caught by the existence recheck instead.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+    expect(issue.labels).toEqual(["status/in-progress"]);
+    const releases = eventRows.filter((row) => row.kind === "claim_released");
+    expect(releases).toHaveLength(1);
+    expect(auditRows.find((row) => row.action === "stale_agentwork_released")).toBeDefined();
+    expect(auditRows.find((row) => row.action === "stale_agentwork_claim_retained")).toBeUndefined();
+  });
+
+  it("releases the claim when the only sibling is stale too", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const alsoStale = makeWork({
+      id: "work-older",
+      issue,
+      state: "CLAIMED",
+      lastHeartbeatAt: minutesAgo(45),
+      leaseExpiresAt: minutesAgo(40),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, alsoStale],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
-    const where = (leaseDeleteMany.mock.calls[0][0] as { where: NarrowedLeaseWhere }).where;
-    expect(where.agentName).toBe("alpha");
-    expect(where.issueId).toBe("issue-1");
-    expect(where.OR).toHaveLength(3);
-    expect(where.OR[1]).toEqual({ renewedAt: { lt: QUIET_AT } });
-    expect(where.OR[2]).toEqual({ renewedAt: null, createdAt: { lt: QUIET_AT } });
-    expect((where.OR[0] as { expiredAt: { lte: Date } }).expiredAt.lte).toBeInstanceOf(Date);
   });
 
-  it("does not release a fresh first-claim lease created after the row went quiet", async () => {
-    // A lease that was never renewed has no renewedAt, but its createdAt is
-    // after the swept row's last heartbeat: this is a newer epoch's first
-    // claim on the pair, and the createdAt branch must not swallow it.
-    const { client, leaseRows, leaseDeleteMany } = makeSweepClient({
-      work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-      leases: [
-        {
-          id: "lease-fresh",
-          agentName: "alpha",
-          issueId: "issue-1",
-          createdAt: new Date("2026-10-02T00:00:00.000Z"),
-          renewedAt: null,
-          expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-        },
-      ],
+  it("counts a live sibling with a NULL lease expiry as live", async () => {
+    // The sweeper's own staleness predicate cannot see a NULL expiry
+    // (`NULL < cutoff` is UNKNOWN), so such a row is NOT stale — and must
+    // therefore keep the claim alive.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const live = makeWork({
+      id: "work-live",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: null,
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, live],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a sibling in a non-active state as live", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const done = makeWork({
+      id: "work-done",
+      issue,
+      state: "DONE",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, done],
+      leases: [makeLease()],
     });
 
     const report = await sweepStaleWork(client);
 
     expect(report.released).toBe(1);
-    expect(report.leasesReleased).toBe(0);
-    expect(leaseRows).toHaveLength(1);
-    expect(leaseDeleteMany).toHaveBeenCalled();
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
   });
 
-  it("still releases the lease of the epoch the sweep actually marked", async () => {
-    // A lease whose last renewal predates the row's last heartbeat belongs to
-    // the marked epoch, so the narrowed delete still releases it.
-    const renewed = makeSweepClient({
-      work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-      leases: [
-        {
-          id: "lease-epoch",
-          agentName: "alpha",
-          issueId: "issue-1",
-          createdAt: new Date("2026-09-01T00:00:00.000Z"),
-          renewedAt: new Date("2026-09-30T00:00:00.000Z"),
-          expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-        },
-      ],
+  it("does not treat an already reclaimed STALE sibling as live", async () => {
+    // A previously reclaimed row is `STALE`, not an active one. Counting it as
+    // live would withhold the pending release of a later retry forever — the
+    // claim would never be released at all.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
     });
-    const renewedReport = await sweepStaleWork(renewed.client);
-    expect(renewedReport.released).toBe(1);
-    expect(renewedReport.leasesReleased).toBe(1);
-    expect(renewed.leaseRows).toHaveLength(0);
+    const reclaimed = makeWork({
+      id: "work-reclaimed",
+      issue,
+      state: "STALE",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
 
-    // A never-renewed lease created before the row went quiet is the marked
-    // epoch's own lease.
-    const neverRenewed = makeSweepClient({
-      work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-      leases: [
-        {
-          id: "lease-fresh",
-          agentName: "alpha",
-          issueId: "issue-1",
-          createdAt: new Date("2026-09-15T00:00:00.000Z"),
-          renewedAt: null,
-          expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-        },
-      ],
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, reclaimed],
+      leases: [makeLease()],
     });
-    const neverReport = await sweepStaleWork(neverRenewed.client);
-    expect(neverReport.released).toBe(1);
-    expect(neverReport.leasesReleased).toBe(1);
-    expect(neverRenewed.leaseRows).toHaveLength(0);
 
-    // An already-expired lease blocks nothing, so the sweep releases it even
-    // when its renewal time would otherwise preserve it.
-    const expired = makeSweepClient({
-      work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-      leases: [
-        {
-          id: "lease-expired",
-          agentName: "alpha",
-          issueId: "issue-1",
-          createdAt: new Date("2026-09-01T00:00:00.000Z"),
-          renewedAt: new Date("2026-10-02T00:00:00.000Z"),
-          expiredAt: new Date("2026-09-15T00:00:00.000Z"),
-        },
-      ],
-    });
-    const expiredReport = await sweepStaleWork(expired.client);
-    expect(expiredReport.released).toBe(1);
-    expect(expiredReport.leasesReleased).toBe(1);
-    expect(expired.leaseRows).toHaveLength(0);
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves the lease alone when a live sibling row shares the pair", async () => {
-    // A heartbeat can land on a stale sibling after a newer claim renewed the
-    // lease, so the epoch rule alone is not enough: with another
-    // CLAIMED/IN_PROGRESS/BLOCKED row for the same pair, the lease may belong
-    // to that sibling and the sweep defers entirely — even for an
-    // already-expired lease, because the guard gates the whole delete.
-    const liveSiblingStates = ["CLAIMED", "IN_PROGRESS", "BLOCKED"];
-    for (const siblingState of liveSiblingStates) {
-      const { client, leaseRows, leaseDeleteMany, agentWorkCount } = makeSweepClient({
-        work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-        leases: [
-          {
-            id: "lease-epoch",
-            agentName: "alpha",
-            issueId: "issue-1",
-            createdAt: new Date("2026-09-01T00:00:00.000Z"),
-            renewedAt: new Date("2026-09-30T00:00:00.000Z"),
-            expiredAt: new Date("2026-09-15T00:00:00.000Z"),
+  it("needs BOTH arms of the live predicate: a fresh heartbeat alone is not live", async () => {
+    // The sweeper reclaims a row when its heartbeat OR its expiry falls past
+    // the cutoff, so "live" is the exact complement: BOTH must be fresh. A
+    // sibling that is fresh by heartbeat but whose expiry has lapsed is itself
+    // reclaimable, and must not shield the claim forever.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const freshHeartbeatStaleExpiry = makeWork({
+      id: "work-half-fresh",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAgo(25),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, freshHeartbeatStaleExpiry],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("needs BOTH arms of the live predicate: a fresh expiry alone is not live", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const staleHeartbeatFreshExpiry = makeWork({
+      id: "work-half-stale",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, staleHeartbeatFreshExpiry],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat a sibling on another issue or another agent as live", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const otherIssue = makeWork({
+      id: "work-other-issue",
+      issueId: "issue-2",
+      issue: { ...makeWork().issue, id: "issue-2", number: 43 },
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+    const otherAgent = makeWork({
+      id: "work-other-agent",
+      agentName: "beta",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, otherIssue, otherAgent],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("withholds the release on the retry path too, and stops the retry loop", async () => {
+    // The row was already marked STALE with a pending release when the live
+    // sibling renewed. The retry must not delete the lease the live sibling
+    // now owns — and it must clear the retry marker so the row stops asking.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "STALE",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const live = makeWork({
+      id: "work-live",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, eventRows, auditRows, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, live],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(0);
+    // The retry marker is cleared: the row is not asked to release again.
+    expect(stale.staleClaimReleasePending).toBe(false);
+    expect(auditRows.find((row) => row.action === "stale_agentwork_claim_retained")).toBeDefined();
+  });
+});
+
+// ─── Fence + claim-epoch protection (#1251 review, TOCTOU blocker) ───────────
+//
+// The live-sibling lookup alone is a check, not a fence: a renewal or fresh
+// claim could commit between the lookup and the lease delete. Two layers now
+// close the window — the per-issue `IssueMutationGuard` fence (serializes
+// every claim-path writer out of the decide-and-release pipeline) and the
+// claim-epoch CAS on the delete itself (backs off if a writer commits inside
+// the decision window anyway).
+
+describe("sweepStaleWork — decide-and-release under the per-issue fence and claim-epoch CAS", () => {
+  const staleRow = (overrides: Partial<WorkRow> = {}) =>
+    makeWork({
+      id: "work-stale",
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+      ...overrides,
+    });
+
+  it("holds the issue-scoped stale-release fence around the whole pipeline", async () => {
+    const stale = staleRow();
+    const { client, eventRows } = makeSweepClient({ candidates: [stale], rows: [stale] });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(guard.attempts).toEqual([
+      { issueId: "issue-1", operation: "stale-release", agentName: "alpha", status: "acquired" },
+    ]);
+    // The fence is released when the pipeline finishes.
+    expect(guard.held.size).toBe(0);
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(1);
+  });
+
+  it("skips the candidate while a claim-path writer holds the issue fence, touching nothing", async () => {
+    // A claim/renewal holds the issue fence RIGHT NOW. The sweep must not
+    // mark, not delete the lease, and not touch the label — it defers to the
+    // next sweep instead of racing the writer.
+    guard.held.set("issue-1", { operation: "ownership", agentName: "alpha" });
+    const stale = staleRow();
+    const lease = makeLease();
+    const { client, eventRows, auditRows, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ examined: 1, released: 0, claimRetained: 0, skipped: 1, errors: [] });
+    // Nothing moved: no mark, no delete, no release, no audit.
+    expect(stale.state).toBe("BLOCKED");
+    expect(stale.staleClaimReleasePending).toBe(false);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(eventRows).toHaveLength(0);
+    expect(auditRows).toHaveLength(0);
+    expect(guard.attempts).toEqual([
+      { issueId: "issue-1", operation: "stale-release", agentName: "alpha", status: "busy" },
+    ]);
+  });
+
+  it("a renewal committing between the sibling lookup and the delete keeps lease, label and claim", async () => {
+    // The exact interleaving the review demanded, scripted deterministically:
+    // the sibling is stale at lookup, and the renewal commits inside the
+    // window — after the epoch snapshot and lookup, before the fenced delete.
+    const lease = makeLease({ claimToken: "token-1", expiredAt: minutesAgo(25), lastRenewalObservedAt: null });
+    const renewedExpiry = minutesAhead(30);
+    const stale = staleRow();
+
+    const { client, eventRows, auditRows, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [lease],
+      afterSiblingLookup: () => {
+        // Exactly what an accepted `renewOwnership` commits onto the lease:
+        // the renewed expiry and the renewal clock; the claim token is kept
+        // (same attempt).
+        lease.expiredAt = renewedExpiry;
+        lease.lastRenewalObservedAt = new Date();
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    // The sweep tried its fenced delete…
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    // …and backed off: the epoch no longer matches the snapshot.
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+
+    // The renewed claim survives in full: lease row with the renewed expiry…
+    expect(leases).toHaveLength(1);
+    expect(leases[0].expiredAt.getTime()).toBe(renewedExpiry.getTime());
+    // …no label removal…
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(stale.issue.labels).toEqual(["agent/alpha", "status/in-progress"]);
+    // …no release in the lifecycle stream.
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(0);
+
+    // The reclaimed row stops asking: STALE, but the retry marker is down.
+    expect(stale.state).toBe("STALE");
+    expect(stale.staleClaimReleasePending).toBe(false);
+
+    // The retention is audited as an epoch-moved retention, not a sibling one.
+    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
+    expect(audit).toBeDefined();
+    expect(audit?.notes).toContain("claim epoch moved");
+  });
+
+  it("the fence itself refuses a renewal that tries to commit inside the sweep window", async () => {
+    // The serialization proof: with the sweep holding the issue fence, the
+    // real fence entry point a renewal uses comes back `busy` and its write
+    // never runs — the interleaving cannot happen at all, independent of the
+    // epoch CAS.
+    const renewalOutcomes: string[] = [];
+    let renewalCallbackRan = 0;
+
+    const stale = staleRow();
+    const { client } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      afterSiblingLookup: async () => {
+        const result = await withIssueMutationGuard(
+          { issueId: "issue-1", operation: "ownership", agentName: "alpha", claimToken: "token-1" },
+          async () => {
+            renewalCallbackRan += 1;
+            return { complete: true, value: "renewed" };
           },
-        ],
-        siblings: [{ id: "work-2", agentName: "alpha", issueId: "issue-1", state: siblingState }],
-      });
+        );
+        renewalOutcomes.push(result.status);
+      },
+    });
 
-      const report = await sweepStaleWork(client);
+    const report = await sweepStaleWork(client);
 
-      expect(report.released).toBe(1);
-      expect(report.leasesReleased).toBe(0);
-      expect(agentWorkCount).toHaveBeenCalledTimes(1);
-      // The guard is pair-scoped, excludes the swept row itself, and only
-      // counts rows that are still active.
-      const countWhere = (agentWorkCount.mock.calls[0][0] as { where: Record<string, any> }).where;
-      expect(countWhere).toEqual({
+    expect(renewalOutcomes).toEqual(["busy"]);
+    expect(renewalCallbackRan).toBe(0);
+    // The stale claim itself is reclaimed normally (the renewal lost the race
+    // and will retry against post-sweep state).
+    expect(report.released).toBe(1);
+    expect(guard.held.size).toBe(0);
+  });
+
+  it("a fresh claim created inside the decision window is neither deleted nor released", async () => {
+    // No lease at the snapshot; a brand-new claim (new row, new token)
+    // commits inside the window. The null-snapshot fence must not consume it,
+    // and the post-delete recheck must force the back-off.
+    const stale = staleRow();
+    const { client, eventRows, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [],
+      afterSiblingLookup: () => {
+        leases.push(
+          makeLease({ claimToken: "token-2", createdAt: new Date(), expiredAt: minutesAhead(30) }),
+        );
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    // With no snapshot row the sweep never deletes: the existence recheck is
+    // what catches the fresh claim.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(leases).toHaveLength(1);
+    expect(leases[0].claimToken).toBe("token-2");
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(0);
+  });
+
+  it("negative control: the same candidate with no interleaved write releases normally through the epoch fence", async () => {
+    const lease = makeLease({ claimToken: "token-1", expiredAt: minutesAgo(25), lastRenewalObservedAt: null });
+    const expiryBefore = lease.expiredAt;
+    const stale = staleRow();
+    const { client, eventRows, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    // The delete is CAS-fenced on the exact epoch the snapshot read.
+    expect(leaseDeleteMany).toHaveBeenCalledWith({
+      where: {
         agentName: "alpha",
         issueId: "issue-1",
-        id: { not: "work-1" },
-        state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
-      });
-      expect(leaseRows).toHaveLength(1);
-      expect(leaseDeleteMany).not.toHaveBeenCalled();
-    }
-  });
-
-  it("ignores terminal siblings and releases the epoch's lease", async () => {
-    // DONE/RELEASED/STALE siblings are not live owners: the guard must not
-    // count them, so the marked epoch's own lease is still released.
-    const terminalStates = ["DONE", "RELEASED", "STALE"];
-    for (const siblingState of terminalStates) {
-      const { client, leaseRows, leaseDeleteMany, agentWorkCount } = makeSweepClient({
-        work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-        leases: [
-          {
-            id: "lease-epoch",
-            agentName: "alpha",
-            issueId: "issue-1",
-            createdAt: new Date("2026-09-01T00:00:00.000Z"),
-            renewedAt: new Date("2026-09-30T00:00:00.000Z"),
-            expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-          },
-        ],
-        siblings: [{ id: "work-2", agentName: "alpha", issueId: "issue-1", state: siblingState }],
-      });
-
-      const report = await sweepStaleWork(client);
-
-      expect(report.released).toBe(1);
-      expect(report.leasesReleased).toBe(1);
-      expect(agentWorkCount).toHaveBeenCalledTimes(1);
-      expect(leaseRows).toHaveLength(0);
-      expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
-    }
-  });
-
-  it("only considers leases for the swept pair, and only deletes when the row has an issue", async () => {
-    // Another agent's lease on the same issue is outside the sweep's pair and
-    // must survive untouched.
-    const scoped = makeSweepClient({
-      work: makeWork({ lastHeartbeatAt: QUIET_AT }),
-      leases: [
-        {
-          id: "lease-other-agent",
-          agentName: "beta",
-          issueId: "issue-1",
-          createdAt: new Date("2026-09-01T00:00:00.000Z"),
-          renewedAt: null,
-          expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-        },
-      ],
+        claimToken: "token-1",
+        expiredAt: expiryBefore,
+        lastRenewalObservedAt: null,
+      },
     });
-    const scopedReport = await sweepStaleWork(scoped.client);
-    expect(scopedReport.released).toBe(1);
-    expect(scopedReport.leasesReleased).toBe(0);
-    expect(scoped.leaseRows).toHaveLength(1);
-
-    // A row with no issue never touches the lease store.
-    const noIssue = makeSweepClient({ work: makeWork({ issueId: null, lastHeartbeatAt: QUIET_AT }) });
-    const noIssueReport = await sweepStaleWork(noIssue.client);
-    expect(noIssueReport.released).toBe(1);
-    expect(noIssueReport.leasesReleased).toBe(0);
-    expect(noIssue.leaseDeleteMany).not.toHaveBeenCalled();
-    expect(noIssue.agentWorkCount).not.toHaveBeenCalled();
+    expect(leases).toHaveLength(0);
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(1);
   });
 
-  it("retries the same narrowed delete, leaving a renewed lease untouched", async () => {
-    // The retry re-marks the same STALE row, so the same snapshot heartbeat
-    // bounds the delete — the newer epoch's lease survives both passes and
-    // the renewal-bound branches of the two where clauses are identical.
-    const { client, leaseRows, leaseDeleteMany } = makeSweepClient({
-      work: makeWork({
-        state: "STALE",
-        staleClaimReleasePending: true,
-        lastHeartbeatAt: QUIET_AT,
-      }),
-      leases: [
-        {
-          id: "lease-live",
-          agentName: "alpha",
-          issueId: "issue-1",
-          createdAt: new Date("2026-09-01T00:00:00.000Z"),
-          renewedAt: new Date("2026-10-02T00:00:00.000Z"),
-          expiredAt: new Date("2027-01-01T00:00:00.000Z"),
-        },
-      ],
+  it("a terminal disposition is not a claim-epoch move: the disposed lease is still deleted", async () => {
+    // The fence keys on renewal/re-claim evidence ONLY. A worker cleanly
+    // disposing its claim inside the window must not make the sweep back off
+    // forever.
+    const lease = makeLease({ claimToken: "token-1" });
+    const stale = staleRow();
+    const { client, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [lease],
+      afterSiblingLookup: () => {
+        (lease as unknown as Record<string, unknown>).disposition = "completed";
+      },
     });
 
-    const first = await sweepStaleWork(client);
-    const second = await sweepStaleWork(client);
+    const report = await sweepStaleWork(client);
 
-    expect(first.released).toBe(1);
-    expect(second.released).toBe(1);
-    expect(leaseRows).toHaveLength(1);
-    expect(leaseDeleteMany).toHaveBeenCalledTimes(2);
-    const firstWhere = (leaseDeleteMany.mock.calls[0][0] as { where: NarrowedLeaseWhere }).where;
-    const secondWhere = (leaseDeleteMany.mock.calls[1][0] as { where: NarrowedLeaseWhere }).where;
-    expect(firstWhere.agentName).toEqual(secondWhere.agentName);
-    expect(firstWhere.issueId).toEqual(secondWhere.issueId);
-    // The expiry branch is keyed to each run's clock; the epoch bounds are
-    // keyed to the row snapshot and must be identical across retries.
-    expect(firstWhere.OR.slice(1)).toEqual(secondWhere.OR.slice(1));
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leases).toHaveLength(0);
+  });
+});
+
+// ─── No guard wedge behind a failed post-decision audit (#1251 review) ───────
+//
+// Once the row is marked STALE without a pending release (retention) or
+// finalized (release), it is no longer a sweep candidate — so a throwing
+// trailing audit write must not escape the pipeline. An escaped error would
+// demote the mutation guard with nothing left to resume it, freezing every
+// claim-path write on the issue.
+
+describe("sweepStaleWork — a failed post-decision audit never strands the fence", () => {
+  it("release still completes and the guard is released when the release audit throws", async () => {
+    const stale = makeWork({ id: "work-stale", state: "BLOCKED" });
+    const { client, eventRows } = makeSweepClient({ candidates: [stale], rows: [stale] });
+    (client as unknown as { auditLog: { create: any } }).auditLog.create = vi.fn(
+      async () => {
+        throw new Error("audit store unreachable");
+      },
+    );
+
+    const report = await sweepStaleWork(client);
+
+    // The release itself happened and the fence came back clean.
+    expect(report.released).toBe(1);
+    expect(guard.held.size).toBe(0);
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(1);
+    // The audit failure is visible in the report, not swallowed.
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0].error).toContain("release audit failed");
+  });
+
+  it("retention still completes and the guard is released when the retention audit throws", async () => {
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const live = makeWork({
+      id: "work-live",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, live],
+    });
+    (client as unknown as { auditLog: { create: any } }).auditLog.create = vi.fn(
+      async () => {
+        throw new Error("audit store unreachable");
+      },
+    );
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(guard.held.size).toBe(0);
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0].error).toContain("claim-retention audit failed");
+  });
+});
+
+// ─── #1317: lease-release accounting over the fenced epoch delete ────────────
+//
+// #1317's hazard: a re-claim only releases CLAIMED/IN_PROGRESS sibling rows,
+// so a BLOCKED sibling survives the re-claim; sweeping that stale sibling must
+// never consume the NEWER claim epoch's lease. Under the merged mechanism this
+// is closed structurally — the live-sibling guard defers the sweep while the
+// newer epoch is live, and the claim-epoch CAS delete can only consume the
+// exact lease the snapshot read (any renew / re-claim / fresh claim makes it
+// match nothing). `leasesReleased` reports how many leases the sweep actually
+// deleted, so operators can see the difference between a release that consumed
+// a lease and a no-lease reclaim.
+
+describe("sweepStaleWork — leasesReleased accounting (#1317)", () => {
+  it("counts the lease consumed by the epoch-fenced delete on a normal release", async () => {
+    const lease = makeLease({ claimToken: "token-1" });
+    const stale = makeWork({ id: "work-stale", state: "BLOCKED" });
+    const { client, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.leasesReleased).toBe(1);
+    expect(leases).toHaveLength(0);
+  });
+
+  it("reports zero when the marked row's pair has no lease row at snapshot", async () => {
+    const stale = makeWork({ id: "work-stale", state: "BLOCKED" });
+    const { client } = makeSweepClient({ candidates: [stale], rows: [stale] });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.leasesReleased).toBe(0);
+  });
+
+  it("a live-sibling retention counts no lease release (#1317 scenario: BLOCKED sibling surviving a re-claim)", async () => {
+    // The exact #1317 setup in current terms: the newer claim epoch of the
+    // SAME agent on the SAME issue is live — its row heartbeats and its lease
+    // was renewed with a fresh claim token — while an older BLOCKED row from
+    // before the re-claim goes stale and enters the sweep.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-blocked-old",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const live = makeWork({
+      id: "work-new-epoch",
+      issue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+    const renewedLease = makeLease({
+      claimToken: "token-epoch-2",
+      expiredAt: minutesAhead(30),
+      lastRenewalObservedAt: new Date(),
+    });
+
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, live],
+      leases: [renewedLease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(report.leasesReleased).toBe(0);
+    // The live epoch's lease is untouched — not even a delete attempt.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toHaveLength(1);
+    expect(leases[0].claimToken).toBe("token-epoch-2");
+    expect(live.state).toBe("IN_PROGRESS");
+  });
+
+  it("an epoch move inside the decision window consumes no lease and counts zero (#1317 accounting)", async () => {
+    const lease = makeLease({ claimToken: "token-1", expiredAt: minutesAgo(25), lastRenewalObservedAt: null });
+    const stale = makeWork({ id: "work-stale", state: "BLOCKED" });
+    const { client, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale],
+      leases: [lease],
+      afterSiblingLookup: () => {
+        lease.expiredAt = minutesAhead(30);
+        lease.lastRenewalObservedAt = new Date();
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(report.leasesReleased).toBe(0);
+    expect(leases).toHaveLength(1);
+  });
+
+  it("accumulates across a batch: only rows whose fenced delete consumed a lease are counted (#1317)", async () => {
+    const baseIssue = makeWork().issue;
+    const otherIssue = { ...baseIssue, id: "issue-2", number: 43, labels: ["agent/alpha", "status/in-progress"] };
+    const releasable = makeWork({ id: "work-1", state: "BLOCKED" });
+    const lease = makeLease({ claimToken: "token-1" });
+    const withheld = makeWork({
+      id: "work-2",
+      issueId: "issue-2",
+      issue: otherIssue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(40),
+      leaseExpiresAt: minutesAgo(35),
+    });
+    const liveSibling = makeWork({
+      id: "work-3",
+      issueId: "issue-2",
+      issue: otherIssue,
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leases } = makeSweepClient({
+      candidates: [releasable, withheld],
+      rows: [releasable, withheld, liveSibling],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.examined).toBe(2);
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(1);
+    expect(report.leasesReleased).toBe(1);
+    expect(leases).toHaveLength(0);
   });
 });

@@ -4,6 +4,12 @@ import { errorResponse } from "@/lib/api-errors";
 import { prisma, asPrFixQueueClient } from "@/lib/prisma";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 import { reclaimStalePrFixHandouts } from "@/lib/pr-fix-queue";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// 6 requests / 60s: operator-triggered sweeps are far below this ceiling
+// (the scheduled sweep job is disabled by default), so bursts are capped
+// without slowing real sweeps down.
+const RATE_LIMIT = { limit: 6, windowMs: 60_000 };
 
 /**
  * Reclaim stale unacknowledged PR-fix hand-outs (#1211). Maintainer-only by
@@ -16,6 +22,9 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`pr-fix-sweep:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   const lock = await acquireLock("pr-fix-handout-sweep");
   if (!lock.locked) {

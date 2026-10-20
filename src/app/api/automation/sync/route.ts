@@ -5,6 +5,12 @@ import { getTrackedRepos } from "@/lib/config";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 import { syncAutomationRepo } from "@/lib/automation-sync";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// 30 requests / 60s: each call syncs the tracked repos (expensive), so
+// bursts are capped — while the automation UI's per-repo Sync buttons (one
+// click per repo card) stay usable.
+const RATE_LIMIT = { limit: 30, windowMs: 60_000 };
 
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -25,6 +31,9 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`automation-sync:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   const body = await request.json().catch(() => ({}));
   const repoFullName = body.repo || body.fullName;

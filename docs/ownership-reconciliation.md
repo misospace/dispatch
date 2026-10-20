@@ -1,8 +1,13 @@
 # Ownership Reconciliation Design
 
-> **Status:** Design only — not implemented. No claim release, label cleanup,
-> requeue, worker-credential migration, or deployment change is authorised by
-> this document.
+> **Status:** Partially implemented. #1251 landed the §6 optional worker
+> capability (register/renew/disposition on `Lease`), the §4 derived
+> ownership read model, and the §9 inspect surfaces — see
+> [Worker Ownership Capability](./worker-ownership-capability.md). The §8
+> reconciliation/release protocol (confirmation ladder, two-sided intent
+> protocol) remains design-only: no claim release, label cleanup, requeue,
+> worker-credential migration, or deployment change is authorised by this
+> document.
 >
 > **Issue:** [misospace/dispatch#1245](https://github.com/misospace/dispatch/issues/1245)
 > **Date:** 2026-10-13
@@ -95,6 +100,11 @@ disagree.
 - `leaseExpiresAt` set to **now + 5 min** on start and every checkpoint
   (`src/lib/agent-work.ts:168-169,221-226`); `lastHeartbeatAt` updated on
   checkpoint; `blockerReason` set on `BLOCKED`.
+- An ownership-capability `renew` also refreshes the matching active row's
+  `lastHeartbeatAt` and `leaseExpiresAt`, the latter to the renewed ownership
+  expiry (default 30m, `src/lib/worker-ownership.ts`) — the sweeper reclaims
+  on `leaseExpiresAt` as well as on the heartbeat, so a renewal that moved
+  only the heartbeat would still be reclaimable.
 - One active `AgentWork` per agent (a new `start` releases the prior one,
   `src/lib/agent-work.ts:173-184`).
 - `AgentWorkHistory` records each transition.
@@ -125,34 +135,50 @@ every 5 min when the in-process scheduler is enabled
 
 - Candidates: `AgentWork` in `CLAIMED/IN_PROGRESS/BLOCKED` whose
   `lastHeartbeatAt` or `leaseExpiresAt` is older than **5 min**
-  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:6`).
-- Two-phase, crash-safe: mark `STALE` + `staleClaimReleasePending` in one
-  transaction (also releasing the marked epoch's `Lease`, narrowed per #1317:
-  the lease is released only when no live sibling `AgentWork` row shares the
-  `(agentName, issueId)` pair, and — absent one — only when it has expired,
-  or its last renewal (`renewedAt`, or `createdAt` when never renewed)
-  predates the row's snapshot `lastHeartbeatAt`), then release the GitHub
-  claim via `releaseIssueClaim` with `allowMissingAgent` + `preserveStatus`,
-  then clear the pending flag. The report carries `leasesReleased` alongside
-  `examined`/`released`/`skipped`/`errors` so operators can see when the
-  narrowed rule deferred a release.
+  (`DEFAULT_STALE_WORK_MAX_AGE_MS`, `src/lib/stale-work.ts:6`), plus
+  `STALE` rows still owing a release (`staleClaimReleasePending`).
+- Two-phase, crash-safe: mark `STALE` (+ `staleClaimReleasePending` when a
+  release is owed), then release the GitHub claim via `releaseIssueClaim` with
+  `allowMissingAgent` + `preserveStatus`, then clear the pending flag. For
+  issue-scoped claims the whole decide-and-release pipeline runs inside the
+  per-issue `IssueMutationGuard` fence (#1259) that claim, lease, ownership
+  renewal and capacity release also take, so no claim-path writer can commit
+  between the sweep's lookups and its lease delete.
+- The lease release is fenced against the claim epoch (#1317). Because
+  `upsertLease` renews the singleton `(agentName, issueId)` row on every claim
+  while `startAgentWork` only releases `CLAIMED`/`IN_PROGRESS` siblings, a
+  swept stale row (typically a surviving `BLOCKED` row) could previously
+  delete the lease of a NEWER live claim epoch of the same agent on the same
+  issue. Two guards close it:
+  1. **Live-sibling deferral** — if another `CLAIMED`/`IN_PROGRESS`/`BLOCKED`
+     row for the same pair is still live (fresh heartbeat AND fresh-or-null
+     lease expiry), the sweep defers entirely: no lease delete, no label
+     removal, no release. The row is still reclaimed and reported
+     `claimRetained`.
+  2. **Claim-epoch CAS** — the lease delete compares against a snapshot of
+     `{claimToken, expiredAt, lastRenewalObservedAt}` taken before the sibling
+     lookup, and a post-delete existence recheck catches a fresh claim that
+     raced in. Any renew / re-claim / fresh claim committing inside the
+     decision window makes the delete match nothing and the sweep back off
+     (`retention: "claim_epoch_moved"`).
+- The report distinguishes the outcomes: `released`, `claimRetained`,
+  `skipped`, and `leasesReleased` — the number of lease rows the CAS-fenced
+  delete actually consumed, so operators can see when a reclaim ran without a
+  lease and when a retention deleted nothing (#1317 accounting).
 - `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:350`) deletes
   `AgentWork` rows with no matching active lease during a claim.
 
-**Gap:** the sweep's only liveness input is a 5-minute heartbeat age. A worker
-whose model call or test run exceeds 5 minutes, or that is disconnected but not
-dead, is released on the next tick. There is no confirmation and no grace
-escalation. The lease release is now fenced against concurrent renewal of the
-same pair (#1317), but the fence is conservative: a lease renewed after the
-swept row's last heartbeat survives the sweep even if its epoch is actually
-dead (e.g. a worker that starts work before claiming), keeping the issue
-lease-blocked for other agents until the lease TTL (30 min default) reaps it —
-while the board already shows the issue unowned, because the sweep stripped
-the `agent/<name>` label. That label half is itself unfenced: a swept stale
-sibling still strips the shared `agent/<name>` label even when a live epoch of
-the same agent holds the issue, dropping the issue out of every agent's queue
-while other agents' claims 409 on the surviving lease. The release also
-remains driven by `AgentWork` age even though the queue filter is the label.
+**Gap:** the sweep's liveness inputs are still heartbeat and lease-expiry age
+only. A worker whose model call or test run exceeds the heartbeat window, or
+that is disconnected but not dead, is reclaimed on a later tick. The fencing is
+deliberately conservative in the other direction too: when the epoch cannot be
+proved stable, the sweep retains the claim — so a lease whose epoch is actually
+dead (e.g. a worker that starts work before claiming) can keep the issue
+lease-blocked for other agents until the lease TTL (30 min default) reaps it.
+Heartbeat routing also still matters upstream: `checkpointAgentWork`'s row
+selection previously could route a heartbeat to a stale sibling row, which
+counted as liveness for the pair and made the sweep defer (#1328 tightened the
+selection to the current claim's row).
 
 ### 3.6 Operator controls (escape hatch today)
 
@@ -325,7 +351,7 @@ as the claim route does (`src/app/api/issues/claim/route.ts:118-148`).
   `src/lib/scheduler.ts:129-133`), confined to one replica, guarded by the
   existing sync lock (`src/lib/sync-lock.ts`).
 - Bounded batch per tick; per-item try/catch so one failure cannot stall the
-  batch; structured report (`examined/released/skipped/leasesReleased/errors`)
+  batch; structured report (`examined/released/claimRetained/skipped/leasesReleased/errors`)
   as the current sweep already emits.
 - Idempotent and resumable: a crash between "mark" and "release" is retried via
   the existing `staleClaimReleasePending` marker.

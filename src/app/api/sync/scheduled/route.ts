@@ -16,6 +16,12 @@ import { syncAutomationRepo } from "@/lib/automation-sync";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 import { runGroomingFreshnessPassBestEffort, type FreshnessPassResult } from "@/lib/groomer/freshness-invalidation";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// 6 requests / 60s: the scheduler's default 15-minute cadence is well inside
+// this ceiling; an operator-configured DISPATCH_SYNC_INTERVAL_MS below 10s
+// would exceed it.
+const RATE_LIMIT = { limit: 6, windowMs: 60_000 };
 
 // ---------------------------------------------------------------------------
 // Route handlers
@@ -27,6 +33,9 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`sync-scheduled:${auth.actor}`, RATE_LIMIT);
+  if (limited) return limited;
 
   let body: unknown;
   try {

@@ -1,5 +1,6 @@
 import { normalizeAgentWorkState, normalizeAgentWorkCheckpoint, AgentWorkState, AgentWorkCheckpoint } from "@/types";
 import { nonEmpty } from "./pr-fix-queue";
+import { findCurrentClaimWork } from "./worker-ownership";
 
 export type AgentWorkClient = {
   agentWork: {
@@ -59,6 +60,12 @@ export interface CheckpointAgentWorkInput {
   checkpoint: string;
   summary?: string | null;
   blockerReason?: string | null;
+  /**
+   * Optional GitHub issue ID identifying the checkpoint's issue (#1328).
+   * When present, selection is scoped to this issue's active rows so a
+   * checkpoint can never heartbeat another issue's active work.
+   */
+  issueId?: string | null;
 }
 
 /**
@@ -136,6 +143,7 @@ export function parseCheckpointAgentWorkInput(body: unknown): CheckpointAgentWor
     checkpoint: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
     blockerReason: typeof input.blockerReason === "string" ? input.blockerReason : null,
+    issueId: typeof input.issueId === "string" && nonEmpty(input.issueId.trim()) ? input.issueId.trim() : null,
   };
 }
 
@@ -209,9 +217,14 @@ export async function checkpointAgentWork(client: AgentWorkClient, input: Checkp
   const leaseDuration = 5 * 60 * 1000;
 
   return client.$transaction(async (tx) => {
-    const existing = await tx.agentWork.findFirst({
-      where: { agentName: input.agentName, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-    });
+    // #1328: select the current claim's work through the shared deterministic
+    // rule (freshest lastHeartbeatAt, then createdAt, then id), scoped to the
+    // checkpoint's issue when the request identifies one. An unordered
+    // findFirst could land on an older active sibling (e.g. a surviving
+    // BLOCKED row) and stamp it with the freshest heartbeat while the real
+    // attempt stays behind it; without issueId scoping it could heartbeat a
+    // different issue's active row entirely.
+    const existing = await findCurrentClaimWork(tx, input.agentName, input.issueId ?? undefined);
 
     if (!existing) {
       return null;

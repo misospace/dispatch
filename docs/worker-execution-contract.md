@@ -331,11 +331,16 @@ an explicit, token-fenced handoff instead of failing or silently stalling:
   scoping — never identity, never agent-filtered).
 - Claimed issue: `POST /api/issues/capacity-handoff` with the `claimToken`
   issued by the claim. Release is fenced to the exact claim and refuses human
-  holds and changed ownership.
+  holds and changed ownership. An optional `settlementKey` (≤200 chars) makes
+  the settlement durable: a retry with the same key and original claim token
+  after the lease is gone replays the recorded success (`replayed: true`)
+  with zero mutation, so a lost HTTP response cannot make a completed
+  settlement unprovable (#1262).
 
 Full contract, lease/label effects, and the GitHub-vs-database consistency
 boundary: [capacity-handoff.md](./capacity-handoff.md).
 
 ## History
+- **2026-10-18** — Durable settlement replay for issue capacity handoffs (#1262): optional `settlementKey` records a first-write-wins `IssueHandoffSettlement` proof before the lease CAS; identical retries replay verbatim, expired proofs and cross-claim key reuse are refused fail-closed.
 - **2026-10-14** — Review follow-up (#1256): per-hand-out `handoutToken` receipts bind capacity-exhausted settlement to the exact issued source attempt (unrelated agents and rotated same-agent tokens are refused); the release preserves other agents' live receipts/acks and the dispatch stamps while any hand-out is live; a failed post-CAS live-label re-read now takes the ownership-only path (never a status transition).
 - **2026-10-14** — Added fenced capacity-exhaustion handoff (#1256): capacity-scoped cooldowns for PR-fix attempts and claim-token-fenced issue recovery.

@@ -5,23 +5,74 @@ process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 
-const { mocks } = vi.hoisted(() => ({
+const { mocks, prismaMocks, githubMocks, configMocks, reconciliationMocks } = vi.hoisted(() => ({
   mocks: {
     acquireLock: vi.fn().mockResolvedValue({ locked: true, runId: "test-run" }),
     releaseLock: vi.fn().mockResolvedValue(undefined),
     auditLogFindMany: vi.fn().mockResolvedValue([]),
   },
+  prismaMocks: {
+    issueFindMany: vi.fn((_args?: unknown) => Promise.resolve([] as any)),
+    issueUpdate: vi.fn(() => Promise.resolve({} as any)),
+    auditLogCreate: vi.fn(() => Promise.resolve({} as any)),
+    prFixQueueItemFindMany: vi.fn(() => Promise.resolve([] as any)),
+    lifecycleRows: [] as Array<Record<string, any>>,
+  },
+  githubMocks: {
+    fetchPullRequests: vi.fn(() => Promise.resolve([] as any)),
+    fetchClosedPullRequests: vi.fn(() => Promise.resolve([] as any)),
+    fetchIssues: vi.fn(() => Promise.resolve([] as any)),
+    fetchLinkedPrHealthInput: vi.fn(),
+  },
+  configMocks: {
+    getSyncRepos: vi.fn(() => Promise.resolve([] as any)),
+  },
+  reconciliationMocks: {
+    executeActions: vi.fn(() => Promise.resolve([] as any)),
+  },
 }));
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    auditLog: { findMany: mocks.auditLogFindMany },
+    auditLog: { findMany: mocks.auditLogFindMany, create: prismaMocks.auditLogCreate },
+    issue: { findMany: prismaMocks.issueFindMany, update: prismaMocks.issueUpdate },
+    prFixQueueItem: { findMany: prismaMocks.prFixQueueItemFindMany },
+    issueLifecycleEvent: {
+      create: vi.fn(async ({ data }: any) => {
+        prismaMocks.lifecycleRows.push({ ...data });
+        return data;
+      }),
+      upsert: vi.fn(async ({ where, create }: any) => {
+        const existing = prismaMocks.lifecycleRows.find((row) => row.dedupeKey === where.dedupeKey);
+        if (existing) return existing;
+        prismaMocks.lifecycleRows.push({ ...create });
+        return create;
+      }),
+    },
   },
+}));
+
+vi.mock("@/lib/github", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/github")>()),
+  fetchPullRequests: githubMocks.fetchPullRequests,
+  fetchClosedPullRequests: githubMocks.fetchClosedPullRequests,
+  fetchIssues: githubMocks.fetchIssues,
+  fetchLinkedPrHealthInput: githubMocks.fetchLinkedPrHealthInput,
+}));
+
+vi.mock("@/lib/config", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/config")>()),
+  getSyncRepos: configMocks.getSyncRepos,
 }));
 
 vi.mock("@/lib/sync-lock", () => ({
   acquireLock: mocks.acquireLock,
   releaseLock: mocks.releaseLock,
+}));
+
+vi.mock("@/lib/issue-reconciliation", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/issue-reconciliation")>()),
+  executeActions: reconciliationMocks.executeActions,
 }));
 
 import { GET, POST } from "./route";
@@ -266,5 +317,494 @@ describe("recordReconciledAction — lifecycle evidence (#1202)", () => {
     });
 
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe("recordReconciledAction — linked-merge evidence (#1203)", () => {
+  function makeClient() {
+    const rows: Array<Record<string, any>> = [];
+    const client = {
+      issueLifecycleEvent: {
+        create: vi.fn(async ({ data }: any) => {
+          rows.push({ ...data });
+          return data;
+        }),
+        upsert: vi.fn(async ({ where, create }: any) => {
+          const existing = rows.find((row) => row.dedupeKey === where.dedupeKey);
+          if (existing) return existing;
+          rows.push({ ...create });
+          return create;
+        }),
+      },
+    };
+    return { client, rows };
+  }
+
+  const repo = { id: "repo-1", fullName: "org/repo" };
+  const closeExecuted = {
+    action: { type: "close_issue" as const, issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+    success: true,
+    beforeLabels: ["status/in-review"],
+    afterLabels: [],
+  };
+
+  it("records one merge event per explicitly linked PR with its provenance", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      mergedPrs: [
+        { prNumber: 7, mergedAt: "2026-10-02T08:00:00Z", prUrl: "https://github.com/org/repo/pull/7", linkSource: "body-keyword" },
+        { prNumber: 9, mergedAt: "2026-10-01T09:00:00Z", prUrl: "https://github.com/org/repo/pull/9", linkSource: "branch-name" },
+      ],
+      executed: closeExecuted,
+      client,
+    });
+
+    const merges = rows.filter((row) => row.kind === "pr_merged");
+    expect(merges).toHaveLength(2);
+    expect(merges.map((row) => row.metadata.pullRequestNumber).sort()).toEqual([7, 9]);
+    expect(merges[0].metadata).toMatchObject({ pullRequestUrl: "https://github.com/org/repo/pull/7", linkSource: "body-keyword" });
+    expect(merges[1].metadata).toMatchObject({ linkSource: "branch-name" });
+  });
+
+  it("never infers a link from a title: a PR without explicit evidence records only the honest close-trigger provenance", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+
+    await recordReconciledAction({
+      repo,
+      issueNumber: 42,
+      existingIssue: { id: "issue-1" },
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      mergedPrs: null,
+      executed: closeExecuted,
+      client,
+    });
+
+    const merge = rows.find((row) => row.kind === "pr_merged")!;
+    expect(merge.metadata.linkSource).toBe("reconcile-close-trigger");
+    expect(merge.metadata.linkSource).not.toBe("title-keyword");
+  });
+
+  it("keys a Date-form merge onto the same row as the pre-#1203 string form", async () => {
+    const { recordReconciledAction } = await import("./route");
+    const { client, rows } = makeClient();
+    const base = { repo, issueNumber: 42, existingIssue: { id: "issue-1" }, executed: closeExecuted, client };
+
+    await recordReconciledAction({ ...base, mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" } });
+    await recordReconciledAction({
+      ...base,
+      mergedPr: { number: 7, merged_at: "2026-10-02T08:00:00Z" },
+      mergedPrs: [{ prNumber: 7, mergedAt: new Date("2026-10-02T08:00:00Z"), linkSource: "body-keyword" }],
+    });
+
+    expect(rows.filter((row) => row.kind === "pr_merged")).toHaveLength(1);
+    expect(rows.filter((row) => row.kind === "issue_closed")).toHaveLength(1);
+  });
+});
+
+describe("recordLinkedMergeEvidence — decoupled merge evidence (#1203)", () => {
+  function makeClient(existingIssues: Array<{ id: string; number: number; repositoryId?: string }> = []) {
+    const rows: Array<Record<string, any>> = [];
+    const client = {
+      issueLifecycleEvent: {
+        create: vi.fn(async ({ data }: any) => {
+          rows.push({ ...data });
+          return data;
+        }),
+        upsert: vi.fn(async ({ where, create }: any) => {
+          const existing = rows.find((row) => row.dedupeKey === where.dedupeKey);
+          if (existing) return existing;
+          rows.push({ ...create });
+          return create;
+        }),
+      },
+      issue: {
+        // Faithful to the Prisma read: rows are scoped by repositoryId AND number.
+        findMany: vi.fn(async ({ where }: any) =>
+          existingIssues.filter(
+            (row: { number: number; repositoryId?: string }) =>
+              where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+          ),
+        ),
+      },
+    };
+    return { client, rows };
+  }
+
+  const repo = { id: "repo-1", fullName: "org/repo" };
+  const bodyKeywordMerge = {
+    prNumber: 7,
+    prUrl: "https://github.com/org/repo/pull/7",
+    mergedAt: "2026-10-02T08:00:00Z",
+    mergeCommitSha: "merge-sha",
+    headSha: "head-sha",
+    linkSource: "body-keyword",
+  };
+  const branchNameMerge = {
+    prNumber: 9,
+    prUrl: "https://github.com/org/repo/pull/9",
+    mergedAt: "2026-10-05T09:00:00Z",
+    mergeCommitSha: "merge-sha-9",
+    headSha: "head-sha-9",
+    linkSource: "branch-name",
+  };
+
+  it("records exactly one pr_merged for a closed issue's linked merged PR, with body-keyword provenance and no close/status writes", async () => {
+    const { recordLinkedMergeEvidence } = await import("./route");
+    const { client, rows } = makeClient([{ id: "issue-42", number: 42, repositoryId: "repo-1" }]);
+
+    await recordLinkedMergeEvidence({
+      repo,
+      mergedPrLinkEvidence: new Map([[42, [bodyKeywordMerge]]]),
+      client,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: "pr_merged",
+      issueId: "issue-42",
+      issueNumber: 42,
+      source: "reconciler",
+      actor: "reconciler",
+      fromStatus: null,
+      toStatus: null,
+      occurredAt: new Date("2026-10-02T08:00:00Z"),
+      metadata: {
+        pullRequestNumber: 7,
+        pullRequestUrl: "https://github.com/org/repo/pull/7",
+        linkSource: "body-keyword",
+      },
+    });
+  });
+
+  it("records nothing when a linked number has no cached issue row", async () => {
+    const { recordLinkedMergeEvidence } = await import("./route");
+    const { client, rows } = makeClient([]);
+
+    await recordLinkedMergeEvidence({
+      repo,
+      mergedPrLinkEvidence: new Map([[42, [bodyKeywordMerge]]]),
+      client,
+    });
+
+    expect(rows).toHaveLength(0);
+  });
+
+  it("records nothing when the cached row belongs to a different repository", async () => {
+    const { recordLinkedMergeEvidence } = await import("./route");
+    const { client, rows } = makeClient([{ id: "issue-42", number: 42, repositoryId: "repo-other" }]);
+
+    await recordLinkedMergeEvidence({
+      repo,
+      mergedPrLinkEvidence: new Map([[42, [bodyKeywordMerge]]]),
+      client,
+    });
+
+    expect(rows).toHaveLength(0);
+  });
+
+  it("records merge evidence for issues the open loop already acted on — decoupled from close execution and open-state", async () => {
+    const { recordLinkedMergeEvidence } = await import("./route");
+    const { client, rows } = makeClient([{ id: "issue-42", number: 42, repositoryId: "repo-1" }]);
+
+    await recordLinkedMergeEvidence({
+      repo,
+      mergedPrLinkEvidence: new Map([[42, [bodyKeywordMerge]]]),
+      client,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: "pr_merged", issueNumber: 42 });
+  });
+
+  it("records exactly one event per PR across sequential merges and repeated reconciliation", async () => {
+    const { recordLinkedMergeEvidence } = await import("./route");
+    const { client, rows } = makeClient([{ id: "issue-42", number: 42, repositoryId: "repo-1" }]);
+    // PR #7 merged and closed the issue; PR #9 merged later in the window.
+    const evidence = new Map([[42, [bodyKeywordMerge, branchNameMerge]]]);
+
+    await recordLinkedMergeEvidence({ repo, mergedPrLinkEvidence: evidence, client });
+    await recordLinkedMergeEvidence({ repo, mergedPrLinkEvidence: evidence, client });
+
+    const merges = rows.filter((row) => row.kind === "pr_merged");
+    expect(merges).toHaveLength(2);
+    expect(merges.map((row) => row.metadata.pullRequestNumber).sort()).toEqual([7, 9]);
+    expect(merges.map((row) => row.metadata.linkSource).sort()).toEqual(["body-keyword", "branch-name"]);
+  });
+});
+
+describe("POST — merge evidence after close (#1203)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    prismaMocks.lifecycleRows.length = 0;
+    mocks.acquireLock.mockResolvedValue({ locked: true, runId: "test-run" });
+    mocks.releaseLock.mockResolvedValue(undefined);
+    configMocks.getSyncRepos.mockResolvedValue([{ id: "repo-1", fullName: "org/repo" }]);
+    reconciliationMocks.executeActions.mockResolvedValue([]);
+    githubMocks.fetchPullRequests.mockResolvedValue([]);
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 7,
+        state: "closed",
+        title: "Fix the crash",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/7",
+        merge_commit_sha: "merge-sha",
+        head: { ref: "issue-42", sha: "head-sha" },
+      },
+    ]);
+    // The issue is closed on GitHub, so the open-issue fetch never returns it.
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "Open issue", body: null, state: "open", labels: [] },
+    ]);
+    const cachedRows = [
+      { id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-5", number: 5, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+    ];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+  });
+
+  it("records the closed issue's linked merge once and replays idempotently", async () => {
+    const run = async () => {
+      const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+      expect(res.status).toBe(200);
+      return res.json();
+    };
+
+    const first = await run();
+    const second = await run();
+
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    expect(prismaMocks.lifecycleRows).toHaveLength(1);
+    expect(prismaMocks.lifecycleRows[0]).toMatchObject({
+      kind: "pr_merged",
+      issueId: "issue-42",
+      issueNumber: 42,
+      source: "reconciler",
+      fromStatus: null,
+      toStatus: null,
+      occurredAt: new Date("2026-10-02T08:00:00Z"),
+      metadata: { pullRequestNumber: 7, linkSource: "body-keyword" },
+    });
+  });
+
+  it("never closes or records a merge from a title-only match", async () => {
+    // Regression (#1203 review): a merged PR with no body whose title says
+    // "Fixes #42" is not link evidence — it must neither close issue 42 nor
+    // record a pr_merged event for it.
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 7,
+        state: "closed",
+        title: "Fixes #42",
+        body: null,
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/7",
+        merge_commit_sha: "merge-sha",
+        head: { ref: "feature/other", sha: "head-sha" },
+      },
+    ]);
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    const cachedRows = [{ id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null }];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(reconciliationMocks.executeActions).not.toHaveBeenCalled();
+    expect(prismaMocks.lifecycleRows).toHaveLength(0);
+    expect(prismaMocks.auditLogCreate).not.toHaveBeenCalled();
+  });
+
+  it("converges to one pr_merged per PR when the close succeeds in the same run", async () => {
+    // Regression (#1203 review): the close path and the merge-evidence pass
+    // both observe the same linked merges in one run — exactly one event per
+    // PR, keeping the close's status-transition context on the row.
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    const cachedRows = [{ id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null }];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+    reconciliationMocks.executeActions.mockResolvedValue([
+      {
+        action: { type: "close_issue", issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: true,
+        beforeLabels: ["status/in-progress"],
+        afterLabels: [],
+      },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(1);
+    expect(prismaMocks.lifecycleRows.map((row) => row.kind).sort()).toEqual(["issue_closed", "pr_merged"]);
+    const merges = prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged");
+    expect(merges).toHaveLength(1);
+    expect(merges[0]).toMatchObject({
+      issueNumber: 42,
+      fromStatus: "status/in-progress",
+      toStatus: null,
+      metadata: { pullRequestNumber: 7, linkSource: "body-keyword" },
+    });
+  });
+
+  it("keeps the branch link when the PR number collides with an issue number in the close-decision map", async () => {
+    // Regression (#1203 review): the branch-name evidence used to be skipped
+    // whenever the PR's own number was already in the close-decision map, so
+    // PR #42 (body "Fixes #42") never recorded its branch link to issue #99
+    // and issue #99's merge went unrecorded.
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 42,
+        state: "closed",
+        title: "Fix the crash",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/42",
+        merge_commit_sha: "merge-sha",
+        head: { ref: "issue-99", sha: "head-sha" },
+      },
+    ]);
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 5, title: "Open issue", body: null, state: "open", labels: [] },
+    ]);
+    const cachedRows = [
+      { id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-99", number: 99, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-5", number: 5, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+    ];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const merges = prismaMocks.lifecycleRows.filter((row) => row.kind === "pr_merged");
+    const issue99Merge = merges.find((row) => row.issueNumber === 99)!;
+    expect(issue99Merge).toMatchObject({
+      kind: "pr_merged",
+      issueId: "issue-99",
+      issueNumber: 99,
+      source: "reconciler",
+      occurredAt: new Date("2026-10-02T08:00:00Z"),
+      metadata: { pullRequestNumber: 42, linkSource: "branch-name" },
+    });
+    // The body keyword was recorded first for issue #42 and keeps its
+    // provenance — the branch link is additive, never a replacement.
+    const issue42Merge = merges.find((row) => row.issueNumber === 42)!;
+    expect(issue42Merge).toMatchObject({
+      metadata: { pullRequestNumber: 42, linkSource: "body-keyword" },
+    });
+  });
+
+  it("closes the branch-linked issue in the collision case — the branch claim still feeds the close decision", async () => {
+    // Regression (#1203 review): the branch claim feeds the close-decision map
+    // as well as the link evidence, so the collision case widens the
+    // reconciler's close reach — PR #42 (body "Fixes #42", head ref
+    // "issue-99") closes issue #99 by the same branch heuristic.
+    githubMocks.fetchClosedPullRequests.mockResolvedValue([
+      {
+        number: 42,
+        state: "closed",
+        title: "Fix the crash",
+        body: "Fixes #42",
+        merged_at: "2026-10-02T08:00:00Z",
+        html_url: "https://github.com/org/repo/pull/42",
+        merge_commit_sha: "merge-sha",
+        head: { ref: "issue-99", sha: "head-sha" },
+      },
+    ]);
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 99, title: "Another issue", body: null, state: "open", labels: [] },
+    ]);
+    const cachedRows = [
+      { id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+      { id: "issue-99", number: 99, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null },
+    ];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledTimes(1);
+    expect(reconciliationMocks.executeActions).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: "close_issue", issueNumber: 99 })],
+      expect.any(Array),
+    );
+  });
+
+  it("records the merge even when the close action fails", async () => {
+    // Regression (#1203 review): pr_merged recording is decoupled from close
+    // execution — a failed close must not lose the authoritative merge.
+    githubMocks.fetchIssues.mockResolvedValue([
+      { number: 42, title: "Crash on save", body: null, state: "open", labels: ["status/in-progress"] },
+    ]);
+    const cachedRows = [{ id: "issue-42", number: 42, repositoryId: "repo-1", currentLane: "normal", linkedPrNumber: null }];
+    prismaMocks.issueFindMany.mockImplementation(async ({ where }: any) =>
+      cachedRows.filter(
+        (row: { number: number; repositoryId: string }) =>
+          where.number.in.includes(row.number) && row.repositoryId === where.repositoryId,
+      ),
+    );
+    reconciliationMocks.executeActions.mockResolvedValue([
+      {
+        action: { type: "close_issue", issueNumber: 42, repoFullName: "org/repo", reason: "fixed" },
+        success: false,
+        error: "github 500",
+        beforeLabels: ["status/in-progress"],
+        afterLabels: ["status/in-progress"],
+      },
+    ]);
+
+    const res = await POST(authedRequest("http://localhost/api/issues/reconcile", { method: "POST", body: {} }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuesClosed).toBe(0);
+    expect(prismaMocks.lifecycleRows.map((row) => row.kind)).toEqual(["pr_merged"]);
+    expect(prismaMocks.lifecycleRows[0]).toMatchObject({
+      issueNumber: 42,
+      metadata: { pullRequestNumber: 7, linkSource: "body-keyword" },
+    });
   });
 });
