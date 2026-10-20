@@ -849,7 +849,10 @@ describe("syncAutomationRepo", () => {
       expect(upsertPR).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { repoId_number: { repoId: "repo-1", number: 3 } },
-          update: expect.objectContaining({ mergedAt: new Date("2024-05-05T00:00:00Z") }),
+          update: expect.objectContaining({
+            state: "closed",
+            mergedAt: new Date("2024-05-05T00:00:00Z"),
+          }),
         }),
       );
     });

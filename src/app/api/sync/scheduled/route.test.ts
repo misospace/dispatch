@@ -114,6 +114,7 @@ function createGithubMock() {
     fetchRecentRunsAllWorkflows: vi.fn().mockResolvedValue([]),
     fetchReleases: vi.fn().mockResolvedValue([]),
     fetchPullRequests: vi.fn().mockResolvedValue([]),
+    fetchClosedPullRequests: vi.fn().mockResolvedValue([]),
     fetchPackages: vi.fn().mockResolvedValue([]),
     fetchLatestCommit: vi.fn().mockResolvedValue(null),
     fetchRunJobs: vi.fn().mockResolvedValue([]),
@@ -445,7 +446,10 @@ describe("POST /api/sync/scheduled — sync behavior", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.success).toBe(true);
-    expect(body.automation).toBeDefined();
+    // A real sync, not a swallowed internal failure: the tracked repo must
+    // report success, which requires every fetch automation-sync makes
+    // (including the closed-PR listing) to be mocked.
+    expect(body.automation).toEqual({ synced: 1, failed: 0 });
   });
 
   it("can disable issue sync", async () => {
