@@ -10,6 +10,12 @@ configuration are part of this design.
 
 - Tracking issue: misospace/dispatch#1237
 - Informational counterpart (not a prerequisite): misospace/courier#289
+- **Implementation status (#1252):** approach D (Snapshot API) from §7 is
+  implemented as `GET /api/observability` — a bounded, read-only JSON
+  snapshot of this catalogue. Its contract is specified in
+  docs/observability-snapshot.md. This document remains the design source of
+  truth; a `/metrics` scrape exporter, OTel push, and executable alert
+  assets remain deferred decisions (§10).
 
 ---
 
@@ -82,7 +88,10 @@ dependency choices require a later decision (see [§10](#10-open-questions-and-d
 Dispatch today has **no metrics endpoint, no `/metrics`, no OpenTelemetry, and
 no structured counters/timers**. Observability is limited to a health endpoint,
 in-process scheduler liveness, and append-only database tables. (Confirmed by
-searching the repository: no Prometheus/OTel/metrics integration exists.)
+searching the repository: no Prometheus/OTel/metrics integration exists.
+Update #1252: a bounded read-only snapshot endpoint of this catalogue now
+exists at `GET /api/observability`, see docs/observability-snapshot.md; a
+scrape `/metrics` exporter, OTel, and in-process counters remain absent.)
 
 | Source | Location | What it exposes | Limitation |
 |---|---|---|---|
@@ -713,5 +722,7 @@ executable check at `docs/observability.test.ts`, run as part of `npm run test`
   exactly the values the source writes.
 
 This verifies **structure and source drift only**. It does not exercise alert
-runtime behavior — no exporter exists yet, so there is nothing to evaluate
-against ([§10](#10-open-questions-and-deferred-decisions)).
+runtime behavior: the snapshot exporter (#1252) is tested against this
+catalogue by the unit suites for `src/lib/observability-signals.ts` and
+`src/lib/observability-snapshot.ts`, but no scrape exporter or alert
+evaluator exists yet ([§10](#10-open-questions-and-deferred-decisions)).

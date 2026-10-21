@@ -54,6 +54,7 @@ npm run db:deploy    # Deploy migrations (prod)
 | `DISPATCH_OWNERSHIP_LONG_RUN_GRACE_MS` | No | Long-run grace (#1251): sustained silence inside it is `CLAIMED_LONG_RUNNING`, never release (default 2700000 = 45m, clamped ≥ active window, ≤24h) |
 | `DISPATCH_OWNERSHIP_RENEW_TTL_MS` | No | Expiry a renewed lease receives (#1251) (default 1800000 = 30m, clamped 1m–24h) |
 | `DISPATCH_QUEUE_ADMISSION_MODE` | No | Grooming freshness admission for worker pickup: `off` (default, unchanged), `audit` (annotate queue items, filter nothing) or `enforce` (withhold ready issues without a current applied grooming decision or operator override). See [docs/hosted-groomer.md](./docs/hosted-groomer.md#worker-admission). |
+| `DISPATCH_OBSERVABILITY_STRANDED_ASSIGNMENT_MS` | No | Age threshold for the read-only `GET /api/observability` snapshot (#1252): known-age `agent/*` assignments with no observed Lease/AgentWork execution past this age count as aged un-picked-up (default 1800000 = 30m, clamped 1m–24h). Assignments without persisted age evidence stay `unknown` and are never reported aged. See [docs/observability-snapshot.md](./docs/observability-snapshot.md). |
 
 Resolution order: `DATABASE_URL` > `DISPATCH_DATABASE_URL`. `DISPATCH_AGENT_TOKEN` for agent API bearer auth.
 
@@ -178,6 +179,7 @@ src/
       automation/           # sync, runs, workflows, events, repos
       health/               # health check
       issues/               # listing, move, claim, unclaim, unassign, status, groom, lane, actions, reconcile, refresh, prune-closed, untriaged, webhook
+      observability/        # read-only standalone signal snapshot (#1252)
       pr-fix-queue/         # enqueue, queued, mark
       pr-followup/          # sync, webhook
       repos/                # repository config
@@ -219,6 +221,7 @@ Cross-cutting concerns and where they live. Read these first when working in tha
 | Worker ownership capability + derived states (#1251) | `app/api/agent-work/ownership/route.ts` (register/renew/disposition), `lib/worker-ownership.ts`, `lib/ownership-state.ts` (derivation), `lib/ownership-inspect.ts`, `app/api/issues/[issueId]/ownership/` + `app/api/issues/ownership/` (operator inspect), [docs/worker-ownership-capability.md](./docs/worker-ownership-capability.md) |
 | Auth & audit actor identity | `lib/auth.ts` (`authorizeRequest`, `getAuthorizedActor`) |
 | Lifecycle event stream (claim/status evidence, #1202) | `lib/issue-lifecycle.ts`, `docs/issue-lifecycle-events.md` |
+| Standalone observability snapshot (#1252) | `app/api/observability/route.ts`, `lib/observability-signals.ts` (pure derivation + allowlists), `lib/observability-snapshot.ts` (read-only collector), `docs/observability-snapshot.md` |
 | Board UI component tree | `app/board/page.tsx` → `kanban-board-client.tsx` → `components/kanban-board.tsx` → `components/issue-card.tsx` |
 | App shell / header / nav | `app/layout.tsx` |
 | Label & status constants | `types/index.ts` (`BOARD_COLUMNS`, `StatusLabel`, `AGENT_PREFIX`, `OWNER_PREFIX`) |
