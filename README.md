@@ -404,7 +404,7 @@ Without mise, the equivalent manual steps are:
 
 ```bash
 # Install dependencies (Node >= 24; exact pinned version in .mise/mise.lock)
-npm install
+npm ci --include=dev
 
 # Generate Prisma client
 npm run db:generate
