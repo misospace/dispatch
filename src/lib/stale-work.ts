@@ -17,6 +17,14 @@ export interface StaleWorkReport {
    */
   claimRetained: number;
   skipped: number;
+  /**
+   * Lease rows the sweep actually deleted through its claim-epoch CAS-fenced
+   * delete (#1317 accounting). A retention deletes nothing and contributes
+   * zero; only the pathological race where the CAS consumed a row yet a fresh
+   * lease still stands on the pair reports a deletion alongside a retention.
+   * A row reclaimed without a lease row at snapshot contributes zero.
+   */
+  leasesReleased: number;
   errors: Array<{ workId: string; error: string }>;
 }
 
@@ -89,6 +97,12 @@ interface StaleWorkOutcome {
   retained: boolean;
   retention?: "live_sibling" | "claim_epoch_moved";
   liveSiblingId?: string | null;
+  /**
+   * Lease rows the fenced delete removed in this marked transaction
+   * (#1317 accounting). Reported into `StaleWorkReport.leasesReleased`
+   * once the transaction commits.
+   */
+  leasesDeleted?: number;
 }
 
 /**
@@ -206,6 +220,7 @@ export async function sweepStaleWork(
     released: 0,
     claimRetained: 0,
     skipped: 0,
+    leasesReleased: 0,
     errors: [],
   };
 
@@ -286,6 +301,7 @@ export async function sweepStaleWork(
       // delete at all, so no delete is even attempted — a fresh claim created
       // inside the window can only be a row that postdates the snapshot, and
       // the existence recheck below catches it (no clock comparison needed).
+      let leasesDeleted = 0;
       if (work.issueId) {
         let epochMoved = false;
         if (epoch) {
@@ -299,6 +315,7 @@ export async function sweepStaleWork(
             },
           });
           if ((deleted?.count ?? 0) !== 1) epochMoved = true;
+          else leasesDeleted = deleted.count;
         }
         // A lease on the pair at the end of the window that the sweep did not
         // consume — a fresh claim that raced in during the window, or behind
@@ -319,16 +336,20 @@ export async function sweepStaleWork(
             data: { leaseExpiresAt: now, staleClaimReleasePending: false },
           });
           if (reverted.count !== 1) return { marked: false, retained: false };
-          return { marked: true, retained: true, retention: "claim_epoch_moved" };
+          // In the pathological case where the CAS delete consumed a row AND
+          // a recheck still found one, the consumed deletion is still real —
+          // report it honestly even though this row is retained.
+          return { marked: true, retained: true, retention: "claim_epoch_moved", leasesDeleted };
         }
       }
-      return { marked: true, retained: false, liveSiblingId: null };
+      return { marked: true, retained: false, liveSiblingId: null, leasesDeleted };
     });
 
     if (!outcome?.marked) {
       report.skipped++;
       return;
     }
+    report.leasesReleased += outcome.leasesDeleted ?? 0;
 
     if (outcome.retained) {
       // The row was reclaimed, but the claim it could have released is live:
