@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -39,6 +40,12 @@ vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { [WORKER_TOK
 
 import { GET, DELETE } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function deleteRequest(repoSegments: string[], includeAuth = true) {
   return DELETE(
@@ -234,6 +241,32 @@ describe("DELETE /api/automation/repos/[...repo]", () => {
         errorMessage: "db down",
       }),
     });
+  });
+});
+
+describe("DELETE /api/automation/repos/[...repo] — rate limit", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    resetRateLimits();
+    mocks.findUniqueAutomationRepo.mockResolvedValue({ id: "repo-1", source: "user" });
+    mocks.deleteAutomationRepo.mockResolvedValue(undefined);
+    mocks.updateManyRepository.mockResolvedValue({ count: 1 });
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+  });
+
+  it("returns 429 after exceeding the rate limit (10 per 60s) without deleting", async () => {
+    for (let i = 0; i < 10; i++) {
+      const res = await deleteRequest(["myorg", "myrepo"]);
+      expect(res.status).toBe(200);
+    }
+
+    const res = await deleteRequest(["myorg", "myrepo"]);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request deleted nothing.
+    expect(mocks.deleteAutomationRepo).toHaveBeenCalledTimes(10);
   });
 });
 

@@ -115,6 +115,13 @@ vi.mock("@/lib/claim-gate", () => ({
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 import { Prisma } from "@prisma/client";
+import { resetRateLimits } from "@/lib/rate-limit";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function postRequest(body: unknown, agentName = "test-agent", includeAuth = true) {
   return POST(
@@ -2480,5 +2487,28 @@ describe("POST /api/agents/[agentName]/tasks/report — lifecycle evidence (#120
 
     expect(res.status).toBe(200);
     expect(warn).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — rate limit", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 60s) without recording runs", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request recorded no AgentRun.
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(30);
   });
 });

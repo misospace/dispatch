@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 const mockAgentWork = {
   findFirst: vi.fn(),
@@ -37,6 +38,12 @@ vi.mock("@/lib/prisma", () => ({
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha" }));
 
 import { POST as handleFinish } from "./route";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function makeFinishRequest(payload: Record<string, unknown>) {
   return handleFinish(
@@ -294,6 +301,41 @@ describe("POST /api/agent-work/finish", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.state).toBe("IN_PROGRESS");
+  });
+});
+
+describe("POST /api/agent-work/finish — rate limit", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRateLimits();
+    mockAgentWork.findFirst.mockResolvedValue({
+      id: "work-1",
+      agentName: "test-agent",
+      state: "IN_PROGRESS",
+      checkpoint: "CHANGES_MADE",
+    });
+    mockAgentWork.update.mockResolvedValue({
+      id: "work-1",
+      agentName: "test-agent",
+      state: "DONE",
+      checkpoint: "DONE",
+      summary: "All changes applied and tested",
+    });
+    mockAgentWorkHistory.create.mockResolvedValue({ id: "hist-1" });
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 10s) without mutating work", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await makeFinishRequest({ agentName: "test-agent", state: "DONE" });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await makeFinishRequest({ agentName: "test-agent", state: "DONE" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request performed no work mutation.
+    expect(mockAgentWork.update).toHaveBeenCalledTimes(30);
   });
 });
 

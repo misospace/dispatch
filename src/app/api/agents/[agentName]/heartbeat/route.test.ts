@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
@@ -72,6 +73,12 @@ vi.mock("@/lib/heartbeat", async (importOriginal) => {
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 import * as heartbeatModule from "@/lib/heartbeat";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function makeRequest(
   agentName = "test-agent",
@@ -397,6 +404,33 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
     expect(body.status).toBe("error");
     expect(body.errors.length).toBe(2);
     expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("POST /api/agents/[agentName]/heartbeat — rate limit", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 60s) without recording runs", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await POST(makeRequest("my-agent"), {
+        params: Promise.resolve({ agentName: "my-agent" }),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(makeRequest("my-agent"), {
+      params: Promise.resolve({ agentName: "my-agent" }),
+    });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request recorded no AgentRun and ran no sync phases.
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(30);
   });
 });
 
