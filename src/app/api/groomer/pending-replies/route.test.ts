@@ -53,6 +53,18 @@ describe("GET /api/groomer/pending-replies", () => {
     expect(mocks.findMany).not.toHaveBeenCalled();
   });
 
+  it("keys the throttle window on the credential-derived throttleKey, not the header-derived actor (#1322)", async () => {
+    mocks.authorizeRequest.mockResolvedValue({
+      authorized: true,
+      type: "bearer",
+      actor: "header-rotated-name",
+      throttleKey: "maintainer-cred:0123456789abcdef0123456789abcdef",
+      tier: "maintainer",
+    });
+    await GET(request());
+    expect(mocks.enforceRateLimit).toHaveBeenCalledWith("groomer-reply-list:maintainer-cred:0123456789abcdef0123456789abcdef", { limit: 30, windowMs: 10_000 });
+  });
+
   it("lists newest pending replies with filters and a bounded limit", async () => {
     const response = await GET(request("http://localhost/api/groomer/pending-replies?repoFullName=org/repo&limit=500"));
     expect(response.status).toBe(200);

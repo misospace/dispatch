@@ -697,6 +697,7 @@ describe("bearer token tiers (#1111)", () => {
     await expect(authorizeGroomerRequest(groomerRequest)).resolves.toMatchObject({
       authorized: true,
       type: "bearer",
+      throttleKey: expect.stringMatching(/^groomer-cred:[0-9a-f]{32}$/),
       tier: "maintainer",
     });
   });
