@@ -32,10 +32,11 @@ function heartbeatGatedReclaimClause(cutoff: Date) {
  * external wait by moving its `leaseExpiresAt` to the park deadline
  * (`retryAfter`, #1316). So a BLOCKED row is reclaimable only once its park
  * deadline elapsed (`leaseExpiresAt < cutoff`) or when it never had one
- * (`leaseExpiresAt IS NULL` — no deadline means no park, the normal stale
- * path owns it). Reclaiming on the heartbeat instead would destroy the parked
- * claim while the park is still running, deleting the lease the `blocked`
- * disposition was recorded on.
+ * (`leaseExpiresAt IS NULL` — no deadline means no park, so it is reclaimable
+ * even with a fresh heartbeat; every row start/checkpoint/sweep writes always
+ * carries a real expiry). Reclaiming on the heartbeat instead would destroy
+ * the parked claim while the park is still running, deleting the lease the
+ * `blocked` disposition was recorded on.
  */
 function blockedReclaimClause(cutoff: Date) {
   return {

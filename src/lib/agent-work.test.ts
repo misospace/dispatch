@@ -350,6 +350,43 @@ describe("finishAgentWork", () => {
     const result = await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
     expect(result).toBeNull();
   });
+
+  it("selects the current claim's work through the shared ordering rule, not an unordered pick (#1316 review)", async () => {
+    // A `blocked` disposition parks its row as an external wait that survives
+    // `startAgentWork`. An unordered findFirst could terminalize that parked
+    // row (and its claim) while the attempt actually being finished stays
+    // active — finish must select through the same freshest-active-row rule
+    // as checkpoint/renew/disposition.
+    const tx = createMockTransaction();
+    const rows = [
+      {
+        id: "work-parked",
+        state: "BLOCKED",
+        lastHeartbeatAt: new Date(Date.now() - 90 * 60_000),
+        leaseExpiresAt: new Date(Date.now() + 60 * 60_000),
+      },
+      {
+        id: "work-current",
+        state: "IN_PROGRESS",
+        lastHeartbeatAt: new Date(Date.now() - 60_000),
+        leaseExpiresAt: new Date(Date.now() + 4 * 60_000),
+      },
+    ];
+    tx.agentWork.findFirst.mockImplementation(async ({ where, orderBy }: any) => {
+      expect(where).toEqual({ agentName: "agent-1", state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } });
+      expect(orderBy).toBe(CURRENT_CLAIM_WORK_ORDER_BY);
+      return [...rows].sort((a, b) => b.lastHeartbeatAt.getTime() - a.lastHeartbeatAt.getTime())[0];
+    });
+
+    await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
+
+    expect(tx.agentWork.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "work-current" } }),
+    );
+    expect(tx.agentWork.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "work-parked" } }),
+    );
+  });
 });
 
 describe("releaseStaleWork", () => {
@@ -361,12 +398,25 @@ describe("releaseStaleWork", () => {
     const result = await releaseStaleWork(tx, 5 * 60 * 1000); // 5 minute threshold
 
     expect(result).toHaveLength(1);
+    // Per-state gate (#1316): heartbeat-gated CLAIMED/IN_PROGRESS rows, and
+    // BLOCKED rows gated on the park deadline only — a parked BLOCKED row
+    // (future expiry) is never selected or terminalized here.
+    const perStateGate = [
+      {
+        state: { in: ["CLAIMED", "IN_PROGRESS"] },
+        OR: [{ lastHeartbeatAt: { lt: expect.any(Date) } }, { leaseExpiresAt: { lt: expect.any(Date) } }],
+      },
+      {
+        state: "BLOCKED",
+        OR: [{ leaseExpiresAt: { lt: expect.any(Date) } }, { leaseExpiresAt: null }],
+      },
+    ];
+    expect(tx.agentWork.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { OR: perStateGate } }),
+    );
     expect(tx.agentWork.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({
-          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
-          OR: expect.any(Array),
-        }),
+        where: expect.objectContaining({ OR: perStateGate }),
         data: expect.objectContaining({ state: "STALE" }),
       }),
     );
