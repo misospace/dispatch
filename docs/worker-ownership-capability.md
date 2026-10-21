@@ -93,16 +93,17 @@ Semantics that never change:
 - **Atomicity.** The operations that write lease state commit their local
   effects together in one transaction: `register` (registration + lifecycle
   event + audit row), `renew` (lease CAS + the matching `AgentWork` liveness
-  write + history — since #1300 that write is load-bearing for the stale-work
-  sweeper, so a crash between the CAS and the row write must not leave a
-  renewed lease whose row still carries the old lapsed expiry, #1315; a failed
-  write rolls the whole renewal back and never reports success) and
-  `disposition` (terminal CAS + AgentWork settlement + history + lifecycle
-  event + audit row). A write that fails
-  mid-way rolls the whole fact back, so the retry re-enters the full path
-  instead of hitting a replay that reports success for evidence which never
-  landed. This matters because the issue mutation guard has no resume branch
-  and is deleted on throw.
+  write + history) and `disposition` (terminal CAS + AgentWork settlement +
+  history + lifecycle event + audit row). A write that fails mid-way rolls
+  the whole fact back and never reports success — but for different reasons.
+  For `register`/`disposition` the reason is the replay: the issue mutation
+  guard has no resume branch and is deleted on throw, so the retry must
+  re-enter the full path instead of hitting a replay that reports success
+  for evidence which never landed. For `renew` there is no replay branch to
+  corrupt (a retry simply re-extends the TTL); the reason is the sweeper —
+  since #1300 the liveness write is load-bearing, so what must never happen
+  is a committed lease CAS whose AgentWork write was lost, leaving a renewed
+  lease whose row still carries the old lapsed expiry (#1315).
 - **No releases.** Nothing here writes GitHub labels, deletes a lease, or
   moves issue status. A missing heartbeat or an unrenewed claim never revokes
   anything. A disposed-but-unexpired lease likewise stays in place (still
