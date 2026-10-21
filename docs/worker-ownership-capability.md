@@ -31,6 +31,25 @@ parked row follows the normal reclaim path: marked `STALE`, its lease is
 deleted through the epoch-fenced delete, and the claim is released for
 re-dispatch.
 
+**Claim-path lease cleanup and blocked parks (#1334).** The park deadline
+lives on the parked `AgentWork` row only; the lease's own `expiredAt` (the
+claim-epoch lease TTL, an independent knob from the renew TTL) is not moved
+by a `blocked` disposition, so a
+park can outlive its lease TTL. The pre-claim cleanup in the claim route
+(`releaseExpiredLeases`) therefore **skips leases carrying a future
+`retryAfter`** even when `expiredAt` has elapsed: the park's evidence lives
+on the lease row (`retryAfter` is the `EXTERNAL_WAIT` read-model signal), and
+deleting the lease while the parked row still holds its deadline would erase
+that evidence and the claim receipt before the park expires. This is the
+deliberate choice among the three coherence options: (a) moving `expiredAt`
+to the park deadline was rejected because `expiredAt` is the claim-epoch
+fence field for the stale sweep (#1317) and is moved by every renew — a
+disposition write must not mutate it; (c) clamping the AgentWork park to
+`expiredAt` was rejected because it would shorten parks the route deliberately
+allows to run up to 7 days. Once the park deadline elapses (`retryAfter <=
+now`), the expired lease releases through the normal path and the parked row
+follows the normal reclaim path above.
+
 **Stale-work sweep and claim incarnations.** The sweep releases the claim of a
 stale `AgentWork` row only when no live sibling row for the same (agent, issue)
 still owns it: an older `BLOCKED` row that falls past the sweep cutoff never

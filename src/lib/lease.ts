@@ -199,11 +199,24 @@ export async function releaseLease(leaseId: string): Promise<any | null> {
 
 /**
  * Release all expired leases for a given issue. Returns count of released leases.
+ *
+ * #1334: a blocked park outlives its ownership TTL — the disposition moves
+ * only the parked AgentWork row's `leaseExpiresAt` to the park deadline, not
+ * the lease's `expiredAt` (the claim-epoch fence field, #1317). A lease
+ * carrying a future `retryAfter` is a live park: releasing it while the park
+ * still runs would erase the park evidence (`retryAfter` is the
+ * EXTERNAL_WAIT read-model signal) and the claim receipt the parked row was
+ * recorded against. Once the park deadline elapses (`retryAfter <= now`),
+ * the lease releases through this path as before.
  */
 export async function releaseExpiredLeases(issueId: string): Promise<number> {
   const now = new Date();
   const expired = await prisma.lease.findMany({
-    where: { issueId, expiredAt: { lte: now } },
+    where: {
+      issueId,
+      expiredAt: { lte: now },
+      OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
+    },
     select: { id: true },
   });
   if (expired.length === 0) return 0;

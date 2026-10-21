@@ -384,6 +384,34 @@ describe("releaseExpiredLeases", () => {
     expect(result).toBe(0);
     expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
   });
+
+  it("excludes leases with a future retryAfter from the expired set (#1334)", async () => {
+    mocks.leaseFindMany.mockImplementation(() => Promise.resolve([]));
+    const before = Date.now();
+    const result = await releaseExpiredLeases("i-1");
+
+    expect(result).toBe(0);
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The park filter rides on the same query: a lease past its ownership
+    // TTL but still inside its blocked park is not released by the claim
+    // path while the park runs.
+    const where = mocks.leaseFindMany.mock.calls[0][0].where;
+    expect(where.issueId).toBe("i-1");
+    expect(where.expiredAt.lte.getTime()).toBeGreaterThanOrEqual(before);
+    expect(where.OR).toEqual([{ retryAfter: null }, { retryAfter: { lte: where.expiredAt.lte } }]);
+  });
+
+  it("releases a parked lease whose retryAfter has also elapsed", async () => {
+    mocks.leaseFindMany.mockImplementation(() => Promise.resolve([{ id: "l-park" }]));
+    mocks.leaseDeleteMany.mockImplementation(() => Promise.resolve({ count: 1 }));
+
+    const result = await releaseExpiredLeases("i-1");
+
+    expect(result).toBe(1);
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ["l-park"] } },
+    });
+  });
 });
 
 describe("resolveActiveWork", () => {
