@@ -65,7 +65,7 @@ export interface ActiveStateFamilyPredicates {
  *   with a fresh heartbeat; every row start/checkpoint/sweep write always
  *   carries a real expiry). Reclaiming on the heartbeat instead would destroy
  *   the parked claim while the park is still running, deleting the lease the
-   *   `blocked` disposition was recorded on. Live is the 3VL complement of
+ *   `blocked` disposition was recorded on. Live is the 3VL complement of
  *   `IS NULL OR lt`: `NOT IS NULL AND notLt`, which collapses to the bare
  *   `{ gte }` arm — UNKNOWN (never TRUE) on a NULL expiry, so a NULL-deadline
  *   BLOCKED sibling never keeps a claim alive forever.
