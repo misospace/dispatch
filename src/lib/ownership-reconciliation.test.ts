@@ -133,6 +133,19 @@ function applyData(row: Row, data: any): Row {
   return row;
 }
 
+/**
+ * Honors `select` like the real client: a row projection only carries the
+ * selected fields, so code that reads a field its select dropped fails loudly
+ * here instead of silently passing against real Prisma rows (#1254 review:
+ * the reclaimCount bug was invisible because the fake ignored `select`).
+ */
+function projectRow(row: Row, select: any): Row {
+  if (!select) return row;
+  const out: Row = {};
+  for (const [key, keep] of Object.entries(select)) if (keep) out[key] = row[key];
+  return out;
+}
+
 function orderRows(rows: Row[], orderBy: any): Row[] {
   const list = [...rows];
   const keys = (Array.isArray(orderBy) ? orderBy : [orderBy]) as Array<Record<string, string>>;
@@ -190,16 +203,16 @@ function makeFakePrisma() {
         let found = rows().filter((r) => matchesWhere(r, args.where ?? {}));
         if (args.orderBy) found = orderRows(found, args.orderBy);
         if (args.take !== undefined) found = found.slice(0, args.take);
-        return CLONE(found);
+        return CLONE(found.map((r) => projectRow(r, args.select)));
       },
       findFirst: async (args: any = {}) => {
         let found = rows().filter((r) => matchesWhere(r, args.where ?? {}));
         if (args.orderBy) found = orderRows(found, args.orderBy);
-        return found.length ? CLONE(found[0]) : null;
+        return found.length ? CLONE(projectRow(found[0], args.select)) : null;
       },
       findUnique: async (args: any = {}) => {
         const row = findUniqueRow(args);
-        return row ? CLONE(row) : null;
+        return row ? CLONE(projectRow(row, args.select)) : null;
       },
       create: async (args: any) => {
         const row = { id: nextId(), ...CLONE(args.data) };
@@ -539,6 +552,133 @@ describe("ownership reconciliation (#1254)", () => {
       expect(report, JSON.stringify(report) + "AUDIT " + JSON.stringify(fixture.tables.auditLog.map(r=>[r.action,r.notes,r.errorMessage]))).toMatchObject({ retained: 1 });
       expect(report.released).toBe(0);
       expect(forgeShared.removeCalls).toHaveLength(0);
+    });
+  });
+
+  describe("commit-time re-check (#1254 acceptance)", () => {
+    // The ladder decision is made on one live read; Phase A must re-derive
+    // the CAS-unpinnable facts (maintainer hold, review ownership, external
+    // wait) at commit time. These tests land the facts between the ladder
+    // read and the Phase A transaction — instrumented on guard acquisition,
+    // the same seam control 1a uses for renewals (the guard window opens
+    // after the ladder read and before the transaction snapshot).
+    async function runWithMutateOnAcquire(fixture: ReturnType<typeof buildFixture>, now: Date, mutate: () => void) {
+      const baseGuard = fixture.guard.fake;
+      const mutateOnAcquire = async (request: any, callback: any) => {
+        if (request.operation === "reconcile-release") mutate();
+        return baseGuard(request, callback);
+      };
+      vi.stubEnv("DISPATCH_OWNERSHIP_RECONCILE_MODE", "enforce");
+      const { reconcileOwnership } = await import("@/lib/ownership-reconciliation");
+      return reconcileOwnership(
+        { prisma: fixture.client, forge: forgeShared, guard: mutateOnAcquire },
+        now,
+      );
+    }
+
+    function matureCandidate(now: Date) {
+      return {
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 1,
+        firstStaleAt: minutesAgo(now, 30),
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 0,
+        lastReclaimAt: null,
+      };
+    }
+
+    it("a maintainer hold that lands before Phase A withholds the release", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReconcileCandidate.push(matureCandidate(now));
+      const report = await runWithMutateOnAcquire(fixture, now, () => {
+        forgeShared.setLabels(REPO, 42, ["status/blocked", "agent/alpha"]);
+        fixture.tables.issue[0].blockedReason = "human hold, do not touch";
+      });
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      // Fail closed: the retired-token CAS must not have run either.
+      expect(fixture.tables.lease[0].claimToken).toBe("tok-g");
+      expect(report.errors.join("|")).toContain("maintainer hold");
+    });
+
+    it("review ownership (open linked PR) that lands before Phase A withholds the release", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReconcileCandidate.push(matureCandidate(now));
+      const report = await runWithMutateOnAcquire(fixture, now, () => {
+        forgeShared.setLabels(REPO, 42, ["status/in-review", "agent/alpha"]);
+        fixture.tables.issue[0].linkedPrNumber = 77;
+        fixture.tables.issue[0].linkedPrMergeState = "open";
+      });
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      expect(report.errors.join("|")).toContain("review ownership");
+    });
+
+    it("an external wait (retryAfter) committed before Phase A withholds the release", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReconcileCandidate.push(matureCandidate(now));
+      // The retryAfter write lands between the ladder decision and the
+      // Phase A transaction snapshot.
+      const report = await runWithMutateOnAcquire(fixture, now, () => {
+        fixture.tables.lease[0].retryAfter = new Date(now.getTime() + 30 * MIN);
+      });
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      expect(fixture.tables.lease[0].claimToken).toBe("tok-g");
+      expect(report.errors.join("|")).toContain("external wait");
+    });
+
+    it("dead ladder rows with reclaim history survive cleanup (loaded reclaimCount)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      // Released issue (no agent label) whose ladder row carries churn
+      // history: cleanup must KEEP it, so the churn bound survives
+      // release/reclaim cycles. This requires `selectCandidates` to load
+      // `reclaimCount` — the fake now honors `select` and would expose a
+      // projection that drops it.
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 1,
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 2,
+        lastReclaimAt: minutesAgo(now, 60),
+      });
+      fixture.tables.issue[0].labels = ["status/ready"];
+      fixture.tables.lease.length = 0;
+      fixture.tables.agentWork.length = 0;
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(1);
+    });
+
+    it("dead ladder rows without reclaim history are cleaned up", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 1,
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 0,
+        lastReclaimAt: null,
+      });
+      fixture.tables.issue[0].labels = ["status/ready"];
+      fixture.tables.lease.length = 0;
+      fixture.tables.agentWork.length = 0;
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.examined).toBe(0);
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(0);
     });
   });
 

@@ -44,3 +44,9 @@ CREATE UNIQUE INDEX "OwnershipReconcileCandidate_issueId_key" ON "OwnershipRecon
 
 ALTER TABLE "OwnershipReleaseIntent" ADD CONSTRAINT "OwnershipReleaseIntent_issueId_fkey" FOREIGN KEY ("issueId") REFERENCES "Issue"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 ALTER TABLE "OwnershipReconcileCandidate" ADD CONSTRAINT "OwnershipReconcileCandidate_issueId_fkey" FOREIGN KEY ("issueId") REFERENCES "Issue"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- #1254 review: the operator guard override is age-bounded (a live, request-
+-- scoped writer can never have held its guard longer than the bounded window,
+-- so only an older executing guard is evidence of a crashed holder). Age is
+-- measured from the LAST state transition so a resumed guard is not instantly
+-- stealable: IssueMutationGuard gains updatedAt.
+ALTER TABLE "IssueMutationGuard" ADD COLUMN "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;

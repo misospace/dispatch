@@ -466,13 +466,23 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > lease (fresh attempt token) *before* the remote label add and holds any claim
 > with a retryable 409 while an intent is pending — the maintainer force-claim (which may also take over a guard left
 > `executing` by a crashed process via the guard `override` — the deliberate
-> operator decision the fail-closed posture defers to), the owner/operator
+> operator decision the fail-closed posture defers to; the override is
+> age-fenced on the guard's `updatedAt` (`GUARD_OVERRIDE_MIN_AGE_MS`): every
+> holder is request- or pass-scoped with bounded timeouts, so only a guard
+> older than any legitimate hold can be a crashed holder, and a young
+> executing guard keeps the override fail-closed instead of racing a live
+> writer through the anchor), the owner/operator
 > unclaim and the operator agent-work release, and the direct `assign_agent`
 > path (which takes the same anchor as operation `assign`) instead supersede
 > a pending intent (audited) via `supersedeOwnershipReleaseIntent`;
 > `assign_owner` does not touch agent labels and never cancels a pending
 > release. Guards left `executing` by a hard crash surface on the ownership
-> inspect read view; only an operator clears them. Phase A CAS-fences on
+> inspect read view; only an operator clears them. Phase A re-derives the
+> CAS-unpinnable facts at commit time, under the anchor and before any CAS
+> write: a fresh live-label read fails closed on forge errors, and a
+> maintainer hold (`status/blocked` + reason), review ownership (open linked
+> PR or open PR-fix queue row), or a future lease `retryAfter` withholds the
+> intent (issue #1254 "re-check … at commit time"). Phase A CAS-fences on
 > the full claim epoch — `{claimToken, expiredAt, lastRenewalObservedAt,
 > disposition}` plus the observed `AgentWork` heartbeat (§8.6) — with the
 > heartbeat CAS sequenced before the token-retiring lease CAS so a failed

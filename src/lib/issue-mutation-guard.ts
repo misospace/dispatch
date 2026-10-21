@@ -11,9 +11,25 @@ export interface IssueMutationRequest {
    * path). Takes over a guard left `executing` by a crashed process — the
    * operator decision the fail-closed posture defers to. Never used by
    * automation: a normal conflicting writer still gets `busy`.
+   * Bounded by `GUARD_OVERRIDE_MIN_AGE_MS`: nothing here can prove a holder
+   * crashed instantly, so the override refuses a guard young enough to still
+   * belong to a live writer and only clears one older than any request-scoped
+   * holder could have held it.
    */
   override?: boolean;
 }
+
+/**
+ * #1254 review: minimum age before an operator override may clear an
+ * `executing` guard. Every guard holder is request-scoped (claim route) or
+ * scheduler-pass-scoped (reconcile/stale-release) with bounded remote/DB
+ * timeouts, so it cannot legitimately hold a guard across this window — an
+ * executing guard older than it is a crashed holder, and stealing a younger
+ * one would race a live writer through the §8.7 serialization boundary.
+ * The guard itself is still NEVER time-expired: this bounds only the
+ * deliberate operator override, never an automatic steal.
+ */
+export const GUARD_OVERRIDE_MIN_AGE_MS = 5 * 60_000;
 
 export interface IssueMutationContext { resuming: boolean }
 export type IssueMutationResult<T> =
@@ -50,9 +66,19 @@ export async function withIssueMutationGuard<T>(
     // operator decision removes it and the caller proceeds under a fresh
     // guard. Deliberately narrower than resuming: it does not run the stale
     // writer's callback, it discards it.
+    //
+    // #1254 review: the delete is age-fenced on `updatedAt` (the guard's last
+    // state transition, so a resumed guard restarts the clock). A holder is
+    // always request- or pass-scoped with bounded timeouts, so an executing
+    // guard younger than `GUARD_OVERRIDE_MIN_AGE_MS` may still belong to a
+    // LIVE writer — the override refuses it (retryable busy) instead of
+    // stealing the §8.7 serialization anchor out from under it. Only a guard
+    // older than any legitimate hold can be a crashed holder, and the CAS on
+    // ownerToken+executing still loses cleanly if the writer finished first.
     if (request.override === true && guard.executing) {
+      const overrideCutoff = new Date(Date.now() - GUARD_OVERRIDE_MIN_AGE_MS);
       const removed = await prisma.issueMutationGuard.deleteMany({
-        where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
+        where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true, updatedAt: { lte: overrideCutoff } },
       });
       if (removed.count !== 1) return { status: "busy", ownerToken: guard.ownerToken, operation: guard.operation };
       overrode = true;

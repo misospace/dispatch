@@ -94,6 +94,17 @@ export async function upsertLease(params: {
     // SAME attempt (a live worker's own row): it keeps its claim token and
     // its registration + renewal evidence untouched, because a heartbeating
     // worker must not lose its receipt or have its liveness erased.
+    //
+    // #1254: a NULL-token row is never a live attempt's receipt. The
+    // reconciler's Phase A retires the fence by setting `claimToken = null`
+    // while leaving `disposition = null`, so a claim that supersedes a
+    // pending release intent lands on exactly this shape — renewing it must
+    // mint a fresh attempt token, or the new claim would echo a null token
+    // and every later fence (capacity-handoff, worker ownership) would be
+    // inert. A live heartbeating worker on such a row (a pre-#1256 legacy
+    // row, or one whose Phase A retired fence it never renewed) only gains a
+    // token it did not have, so this mints the token WITHOUT clearing the
+    // row's liveness provenance.
     const reactivating = Boolean(existing.disposition);
     const lease = await prisma.lease.update({
       where: { id: existing.id },
@@ -121,7 +132,9 @@ export async function upsertLease(params: {
               lastRenewalObservedAt: null,
               lastRenewalOccurredAt: null,
             }
-          : {}),
+          : existing.claimToken === null || existing.claimToken === undefined
+            ? { claimToken: newClaimToken() }
+            : {}),
       },
     });
     return { created: false, lease };

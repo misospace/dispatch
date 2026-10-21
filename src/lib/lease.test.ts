@@ -319,6 +319,38 @@ describe("upsertLease", () => {
       expect(updateData.lastRenewalObservedAt).toBeUndefined();
       expect(updateData.lastRenewalOccurredAt).toBeUndefined();
     });
+
+    it("mints a fresh claim token when renewing a token-less row retired by Phase A (#1254)", async () => {
+      // The reconciler's Phase A retires the fence with `claimToken = null`
+      // while leaving `disposition = null`. A claim that supersedes the
+      // pending intent must NOT echo that null token into the new attempt.
+      mocks.leaseFindUnique.mockImplementation(() =>
+        Promise.resolve(
+          makeLease({
+            id: "l-1",
+            claimToken: null,
+            disposition: null,
+            registeredAt: new Date(),
+            renewCount: 4,
+            lastRenewalObservedAt: new Date(),
+          }),
+        ),
+      );
+      mocks.leaseUpdate.mockImplementation((args: any) =>
+        Promise.resolve({ ...makeLease(args.where), claimToken: null, ...args.data }),
+      );
+
+      const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+      expect(result.created).toBe(false);
+      const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+      expect(updateData.claimToken).toEqual(expect.stringMatching(/^claim_/));
+      expect(result.lease.claimToken).toBe(updateData.claimToken);
+      // Not a reactivation: the row's liveness provenance survives.
+      expect(updateData.runRef).toBeUndefined();
+      expect(updateData.registeredAt).toBeUndefined();
+      expect(updateData.renewCount).toBeUndefined();
+    });
   });
 });
 

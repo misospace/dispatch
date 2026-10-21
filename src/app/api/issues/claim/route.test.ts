@@ -19,6 +19,9 @@ const { mocks } = vi.hoisted(() => ({
     leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
     leaseCreate: vi.fn(), leaseUpdate: vi.fn(), leaseDelete: vi.fn(), leaseFindFirst: vi.fn(),
+    intentFindFirst: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
+    intentUpdateMany: vi.fn(async () => ({ count: 1 })),
+    supersedeAuditCreate: vi.fn(async () => ({ id: "audit-supersede" })),
     getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
     agentWorkFindMany: vi.fn().mockResolvedValue([]),
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
@@ -50,7 +53,7 @@ process.env.DISPATCH_WORKER_TOKENS = `worker-agent:${WORKER_TOKEN}`;
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     // #1254: the claim route checks for a pending reconciler release intent.
-    ownershipReleaseIntent: { findFirst: vi.fn(async () => null), findUnique: vi.fn(async () => null) },
+    ownershipReleaseIntent: { findFirst: mocks.intentFindFirst, findUnique: vi.fn(async () => null), updateMany: mocks.intentUpdateMany },
     issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
     auditLog: { create: mocks.createAuditLog },
     issueLifecycleEvent: {
@@ -847,5 +850,76 @@ describe("POST /api/issues/claim — lifecycle evidence (#1202)", () => {
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({ action: "claim_issue", success: false }),
     });
+  });
+});
+
+describe("POST /api/issues/claim — §8.7 pending release intent (#1254)", () => {
+  const intent = {
+    id: "int-1", issueId: "issue-1", agentName: "alpha", agentLabel: "agent/alpha",
+    phase: "pending", attemptToken: "claim_retired",
+  };
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/ready", "agent/alpha"] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready", "agent/alpha"]);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+        // supersedeOwnershipReleaseIntent drives the intent through tx.
+        ownershipReleaseIntent: { findFirst: vi.fn(async () => intent), updateMany: mocks.intentUpdateMany },
+        auditLog: { create: mocks.supersedeAuditCreate },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  it("holds a non-force claim with a retryable 409 while a release intent is pending", async () => {
+    mocks.intentFindFirst.mockResolvedValueOnce(intent);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("Ownership release is pending");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    // The supersede is the force-claim exemption only: a held claim cancels nothing.
+    expect(mocks.intentUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("force-claim supersedes the pending intent and mints a FRESH claim token over the Phase A retired lease", async () => {
+    // §8.7 control 1b through the production claim wiring: the reconciler's
+    // Phase A retired the fence (`claimToken = null`, `disposition = null`).
+    // Superseding the intent and re-claiming must NOT renew the token-less
+    // row into a null-token echo — the response and the persisted row must
+    // carry a fresh attempt token, or every later fence is inert.
+    mocks.intentFindFirst.mockResolvedValueOnce(intent);
+    const retired = {
+      id: "l-1", agentName: "test-agent", issueId: "issue-1",
+      claimToken: null, disposition: null, checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date(),
+      runRef: null, registeredAt: null, renewCount: 2, lastRenewalObservedAt: null,
+    };
+    mocks.leaseFindUnique.mockResolvedValue(retired);
+    mocks.leaseUpdate.mockImplementation((args: any) => Promise.resolve({ ...retired, ...args.data }));
+
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.claimToken).toBe("string");
+    expect(body.claimToken).toMatch(/^claim_/);
+    // The minted token is what got persisted on the lease row.
+    const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+    expect(updateData.claimToken).toBe(body.claimToken);
+    // The pending intent was superseded (force exemption), not raced.
+    expect(mocks.intentUpdateMany).toHaveBeenCalled();
+    expect(mocks.supersedeAuditCreate).toHaveBeenCalled();
   });
 });

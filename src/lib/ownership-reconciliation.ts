@@ -126,6 +126,10 @@ interface LifecycleEventStore {
 export interface OwnershipReconcileTransactionClient {
   issue: {
     update: (args: any) => Promise<any>;
+    findUnique: (args: any) => Promise<any>;
+  };
+  prFixQueueItem: {
+    findFirst: (args: any) => Promise<any>;
   };
   lease: {
     findFirst: (args: any) => Promise<any>;
@@ -197,6 +201,10 @@ const TERMINAL_DISPOSITIONS = ["completed", "released", "handed_off"] as const;
 
 /** The PR-fix queue states that represent work still in flight. */
 const OPEN_PR_FIX_STATES = ["QUEUED", "BLOCKED", "PARKED", "WAITING_EXTERNAL"] as const;
+
+const BLOCKED_LABEL = "status/blocked";
+const IN_REVIEW_LABEL = "status/in-review";
+const MERGED_PR_STATE = "merged";
 
 // ─── Report ──────────────────────────────────────────────────────────────────
 
@@ -650,6 +658,68 @@ async function driveReleaseIntent(
 
 // ─── Phase A (fenced intent commit) ──────────────────────────────────────────
 
+/**
+ * #1254 acceptance: "Re-check live renewal, open linked PR/review ownership,
+ * dependency and maintainer holds at commit time." Renewal is pinned by the
+ * epoch CAS; these are the facts the CAS cannot pin — the live forge labels,
+ * the deliberate block, the review owner, and the external-wait marker —
+ * re-derived under the anchor so a hold or review ownership that landed
+ * after the ladder decision cannot be released over. Mirrors the
+ * terminal short-circuits of `deriveOwnershipState` (§4 tiers HELD /
+ * EXTERNAL_WAIT / REVIEW_OWNED). Returns a machine-readable reason to
+ * withhold, or null when the commit may proceed.
+ */
+async function releaseWithheldAtCommitTime(
+  tx: OwnershipReconcileTransactionClient,
+  input: { issue: AuditIssueRef; agentLabel: string; hasLeaseEpoch: boolean },
+  liveLabels: string[],
+  now: Date,
+): Promise<string | null> {
+  const issueRow = await tx.issue.findUnique({
+    where: { id: input.issue.id },
+    select: { blockedReason: true, linkedPrNumber: true, linkedPrMergeState: true },
+  });
+  if (!issueRow) return "issue row missing at commit time";
+
+  // Maintainer hold: a deliberate block (status/blocked + non-blank reason).
+  const blockedReason = (issueRow.blockedReason ?? "").trim();
+  if (liveLabels.includes(BLOCKED_LABEL) && blockedReason.length > 0) {
+    return "maintainer hold observed at commit time";
+  }
+
+  // Review ownership: open linked PR or open PR-fix queue row.
+  const openPrFix = await tx.prFixQueueItem.findFirst({
+    where: {
+      repo: input.issue.repository.fullName,
+      status: { in: [...OPEN_PR_FIX_STATES] },
+      OR: [
+        { issue: input.issue.number },
+        ...(issueRow.linkedPrNumber != null ? [{ pr: issueRow.linkedPrNumber }] : []),
+      ],
+    },
+  });
+  const openLinkedPr =
+    issueRow.linkedPrNumber != null && issueRow.linkedPrMergeState !== MERGED_PR_STATE;
+  if (liveLabels.includes(IN_REVIEW_LABEL) && (openPrFix || openLinkedPr)) {
+    return "review ownership (open linked PR) observed at commit time";
+  }
+  if (openPrFix && liveLabels.includes(input.agentLabel)) {
+    return "review ownership (open PR-fix queue row) observed at commit time";
+  }
+
+  // Dependency/external wait: a future retryAfter committed since the
+  // decision defers the release (§4 EXTERNAL_WAIT).
+  if (input.hasLeaseEpoch) {
+    const leaseRow = await tx.lease.findFirst({
+      where: { agentName: input.agentLabel.slice(AGENT_PREFIX.length), issueId: input.issue.id },
+    });
+    if (leaseRow?.retryAfter instanceof Date && leaseRow.retryAfter.getTime() > now.getTime()) {
+      return "external wait (retryAfter) observed at commit time";
+    }
+  }
+  return null;
+}
+
 interface ClaimEpochSnapshot {
   claimToken: string | null;
   expiredAt: Date;
@@ -700,6 +770,30 @@ async function commitReleaseIntent(
           if (existing && existing.phase === "superseded") return { kind: "skipped" };
           if (existing && existing.phase === "pending") return { kind: "replay" };
 
+          // #1254 acceptance: commit-time re-check (fail closed on a forge
+          // read failure for BOTH paths — an unverifiable live label set can
+          // never authorize a release). Runs before any CAS write so a
+          // withheld release commits nothing, not even a retired token.
+          let liveLabels: string[];
+          try {
+            liveLabels = await forge.getLiveIssueLabels(
+              input.issue.repository.fullName,
+              input.issue.number,
+            );
+          } catch (error) {
+            return {
+              kind: "skipped",
+              error: `forge read failed during Phase A commit-time re-check: ${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+          const withheld = await releaseWithheldAtCommitTime(
+            tx,
+            { issue: input.issue, agentLabel: input.agentLabel, hasLeaseEpoch: input.epoch !== null },
+            liveLabels,
+            now,
+          );
+          if (withheld) return { kind: "skipped", error: `release withheld: ${withheld}` };
+
           if (input.epoch) {
             // CAS the ownership row on the exact claim epoch — the snapshot of
             // {claimToken, expiredAt, lastRenewalObservedAt, disposition} the
@@ -741,22 +835,11 @@ async function commitReleaseIntent(
             if (cas.count !== 1) throw new EpochMovedError();
           } else {
             // Intent-only Phase A: the live `agent/*` set must still be
-            // exactly this one label (re-read under the lock, §8.7) AND no
-            // lease may exist for the (agent, issue) pair — a lease row here
-            // is a fresh claim the decision never saw, and its label must
-            // never be deleted (fail closed, §12 "no stealing").
-            let liveLabels: string[];
-            try {
-              liveLabels = await forge.getLiveIssueLabels(
-                input.issue.repository.fullName,
-                input.issue.number,
-              );
-            } catch (error) {
-              return {
-                kind: "skipped",
-                error: `forge read failed during intent-only Phase A: ${error instanceof Error ? error.message : String(error)}`,
-              };
-            }
+            // exactly this one label (the commit-time live read above,
+            // §8.7) AND no lease may exist for the (agent, issue) pair — a
+            // lease row here is a fresh claim the decision never saw, and
+            // its label must never be deleted (fail closed, §12 "no
+            // stealing").
             const agentLabels = liveLabels.filter((l) => l.startsWith(AGENT_PREFIX));
             if (!(agentLabels.length === 1 && agentLabels[0] === input.agentLabel)) {
               return { kind: "skipped" };
@@ -938,10 +1021,13 @@ async function selectCandidates(
   graceCutoff: Date,
   batchSize: number,
 ): Promise<any[]> {
+  // `reclaimCount` must be loaded: the dead-row cleanup below keeps rows with
+  // churn history, and a select that drops it makes real Prisma rows look
+  // zero-history and deletes the churn bound (#1254 review).
   const ladderRows = await client.ownershipReconcileCandidate.findMany({
     orderBy: { updatedAt: "desc" },
     take: batchSize,
-    select: { issueId: true },
+    select: { issueId: true, reclaimCount: true },
   });
   const leaseRows = await client.lease.findMany({
     where: {

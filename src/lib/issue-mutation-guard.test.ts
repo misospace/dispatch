@@ -183,6 +183,45 @@ describe("issue mutation guard", () => {
     expect(prisma.issueMutationGuard.updateMany).not.toHaveBeenCalled();
   });
 
+  it("override refuses an executing guard too young to prove a crash (#1254 review)", async () => {
+    // A live request-scoped writer (claim route, reconciler pass) can hold
+    // its guard for seconds — stealing a YOUNG executing guard would race it
+    // through the §8.7 anchor. The age fence keeps the override fail-closed
+    // until no legitimate holder could still be running.
+    vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(
+      row({ operation: "reconcile-release", agentName: "alpha", executing: true, updatedAt: new Date() }) as never,
+    );
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockImplementation(
+      async ({ where }: any) => ({ count: where.updatedAt.lte >= new Date() ? 1 : 0 }),
+    );
+    const callback = vi.fn();
+    expect(
+      await withIssueMutationGuard({ issueId: "issue-1", operation: "claim", agentName: "beta", override: true }, callback),
+    ).toMatchObject({ status: "busy" });
+    expect(callback).not.toHaveBeenCalled();
+    expect(prisma.issueMutationGuard.deleteMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ updatedAt: { lte: expect.any(Date) } }) }),
+    );
+  });
+
+  it("override clears an executing guard older than any bounded live hold", async () => {
+    vi.mocked(prisma.issueMutationGuard.create)
+      .mockRejectedValueOnce({ code: "P2002" } as never)
+      .mockResolvedValueOnce({} as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique)
+      .mockResolvedValueOnce(row({ operation: "reconcile-release", agentName: "alpha", executing: true, updatedAt: new Date(Date.now() - 10 * 60_000) }) as never)
+      .mockResolvedValueOnce(row({ ownerToken: "fresh", executing: true }) as never);
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any)
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 });
+    const callback = vi.fn(async () => ({ complete: true, value: "force claimed" }));
+    await expect(
+      withIssueMutationGuard({ issueId: "issue-1", operation: "claim", agentName: "beta", override: true }, callback),
+    ).resolves.toMatchObject({ status: "completed", value: "force claimed" });
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
   it("reopens a thrown callback but keeps the owner barrier", async () => {
     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
