@@ -47,6 +47,8 @@ model Issue {
   groomerPendingReplies GroomerPendingReply[]
   lifecycleEvents       IssueLifecycleEvent[]
   handoffSettlements    IssueHandoffSettlement[]
+  ownershipReleaseIntents    OwnershipReleaseIntent[]
+  ownershipReconcileCandidate OwnershipReconcileCandidate?
 
   // Escalated lane outcome tracking
   decomposed     Boolean   @default(false)
@@ -1091,4 +1093,54 @@ model IssueHandoffSettlement {
 
   @@unique([agentName, issueId, settlementKey])
   @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// (#1254) Ownership reconciliation — the two-sided release boundary
+// (docs/ownership-reconciliation.md §8.7). The remote `agent/*` label write
+// cannot be fenced (GitHub label API has no conditional mutation), so both
+// automation sides commit a Postgres intent under the per-issue
+// IssueMutationGuard anchor before touching the forge:
+//   - a reconciler release intent (this table) is committed in Phase A and
+//     holds the claim path (409) until the Phase C settle clears it;
+//   - the claim path's intent is the `Lease` row itself (claimToken = the
+//     attempt token), committed before the remote add.
+// ---------------------------------------------------------------------------
+model OwnershipReleaseIntent {
+  id         String   @id @default(cuid())
+  issueId    String
+  issue      Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  agentName  String
+  agentLabel String
+  // The fencing token the intent pinned against. Null for an intent-only
+  // release of a label-only legacy claim (no Lease row to CAS).
+  attemptToken String?
+  phase      String   @default("pending") // pending | superseded
+  // Bounded Phase-B forge retries; past the cap the intent is parked for the
+  // operator (§8.7 fail-closed) instead of retried forever.
+  attempts   Int      @default(0)
+  parkedAt   DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([issueId, agentLabel])
+  @@index([createdAt])
+}
+
+// (#1254) Persisted confirmation-ladder state (§8.2): stale observations for
+// the multi-pass proof, the per-claim reclaim counter and its cooldown. One
+// row per issue under observation; a healthy re-derivation deletes it.
+model OwnershipReconcileCandidate {
+  id             String    @id @default(cuid())
+  issueId        String    @unique
+  issue          Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  agentName      String
+  staleCount     Int       @default(0)
+  firstStaleAt   DateTime?
+  lastObservedAt DateTime?
+  reclaimCount   Int       @default(0)
+  lastReclaimAt  DateTime?
+  lastReasons    String?   @db.Text
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 }

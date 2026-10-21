@@ -13,6 +13,7 @@ import { transitionIssueStatus } from "@/lib/issue-status";
 import { recordClaimEvent } from "@/lib/issue-lifecycle";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -77,7 +78,10 @@ export async function POST(request: Request) {
       return errorResponse("Force claim requires a maintainer token", 403);
     }
 
-    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string }, async (_tx, { resuming }) => {
+    // Maintainer force-claims may take over a guard left `executing` by a
+    // crashed process — the deliberate operator decision the fail-closed
+    // guard posture defers to (#1254). Automation never overrides.
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming }) => {
     let remoteStarted = false;
     const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
@@ -113,6 +117,31 @@ export async function POST(request: Request) {
     // Refuse closed issues (cached state is fine for this check)
     if (issue.state === "closed") {
       return errorResponse("Cannot claim a closed issue", 400);
+    }
+
+    // §8.7 Claim side: a pending reconciler release intent holds ANY claim on
+    // this issue with a retryable 409 until the Phase C settle lifts the
+    // barrier — a claim that slips in behind an in-flight release could have
+    // its fresh label deleted by the release's Phase B. The maintainer
+    // force-claim is the one deliberate exemption: under the anchor it
+    // supersedes the intent (audited) rather than racing it, and its own
+    // idempotent label writes converge the state (docs/ownership-reconciliation.md).
+    const pendingReleaseIntent = await prisma.ownershipReleaseIntent.findFirst({
+      where: { issueId: issueId as string, phase: "pending" },
+    });
+    if (pendingReleaseIntent) {
+      if (force === true) {
+        await supersedeOwnershipReleaseIntent({
+          issueId: issueId as string,
+          actor,
+          reason: "maintainer force-claim superseded the pending reconciler release intent",
+        });
+      } else {
+        return errorResponse(
+          "Ownership release is pending on this issue; retry shortly",
+          409,
+        );
+      }
     }
 
     // #1037: the claim decision must be made against the labels GitHub
@@ -216,10 +245,24 @@ export async function POST(request: Request) {
     const updatedLabels = [...labelsWithAgent.filter((l) => !l.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
+      // §8.7 Claim side, step 2: commit the claim intent — the lease row
+      // carrying the fresh attempt token — BEFORE the remote label add, in
+      // this same anchor window. The previous ordering wrote the lease after
+      // GitHub, which left no persisted claim intent a crash could replay.
+      // The lease is now the claim-side intent; the retry path replays the
+      // idempotent add below (crash-matrix "claim side" row).
+      const lease = await upsertLease({
+        agentName: agentName as string,
+        issueId: issueId as string,
+        checkpoint: "issue_claimed",
+        mutationGuardHeld: true,
+      });
+
       remoteStarted = true;
-      // A resumed claim already landed remotely. Repair only the local mirror,
-      // lifecycle event and lease; do not repeat GitHub label mutations.
-      if (!resuming) await addIssueLabel(repoFullName, issueNumber, agentLabel);
+      // The add is idempotent: a fresh claim lands it once; a resumed claim
+      // replays it, repairing a crash that died between the lease (intent)
+      // commit and the remote add without creating a second owner.
+      await addIssueLabel(repoFullName, issueNumber, agentLabel);
 
       // Remove ALL existing status labels (not just the first) before adding
       // status/in-progress — keeps GitHub and the Prisma cache from
@@ -262,15 +305,10 @@ export async function POST(request: Request) {
         });
       });
 
-      // Create or renew a lease for this agent (issue #166).
+      // Create or renew a lease for this agent (issue #166) — done above, as
+      // the §8.7 claim intent committed before the remote add.
       // #1256: the lease carries the opaque claim token that fences a later
       // capacity-handoff release to THIS exact claim; echo it to the worker.
-      const lease = await upsertLease({
-        agentName: agentName as string,
-        issueId: issueId as string,
-        checkpoint: "issue_claimed",
-        mutationGuardHeld: true,
-      });
 
       // Write audit log with conflict analysis details
       const auditNotesParts: string[] = [];

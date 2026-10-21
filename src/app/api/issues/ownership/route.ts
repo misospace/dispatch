@@ -14,6 +14,12 @@ import {
   ownershipActiveWindowMs,
   ownershipLongRunGraceMs,
 } from "@/lib/worker-ownership";
+import {
+  ownershipReconcileMode,
+  reconcileMaxReclaims,
+  reconcileRecheckIntervalMs,
+  reconcileMaxForgeRetries,
+} from "@/lib/ownership-reconciliation";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -261,6 +267,19 @@ export async function GET(request: Request) {
     evidence: r.evidence,
   }));
 
+  // #1254 reconciliation read surface (§9 inspect-first): the pending release
+  // intents (the §8.7 barrier state) and the confirmation-ladder candidates,
+  // so an operator can see what the reconciler observed without introducing
+  // another queue system. Tokens are never surfaced — only their presence.
+  const [releaseIntents, ladderCandidates, stuckGuards] = await Promise.all([
+    prisma.ownershipReleaseIntent.findMany({ where: { phase: "pending" }, orderBy: { createdAt: "desc" }, take: 50 }),
+    prisma.ownershipReconcileCandidate.findMany({ orderBy: { updatedAt: "desc" }, take: 50 }),
+    // #1254: guards left `executing` by a crashed process are fail-closed and
+    // only an operator can clear them (a maintainer force-claim overrides) —
+    // surface them so "stuck" is observable rather than silent.
+    prisma.issueMutationGuard.findMany({ where: { executing: true }, orderBy: { createdAt: "desc" }, take: 50 }),
+  ]);
+
   return NextResponse.json({
     items,
     counts,
@@ -275,6 +294,41 @@ export async function GET(request: Request) {
     windows: {
       activeMs: ownershipActiveWindowMs(),
       longRunGraceMs: ownershipLongRunGraceMs(),
+    },
+    reconciliation: {
+      mode: ownershipReconcileMode(),
+      maxReclaims: reconcileMaxReclaims(),
+      recheckIntervalMs: reconcileRecheckIntervalMs(),
+      maxForgeRetries: reconcileMaxForgeRetries(),
+      pendingIntents: releaseIntents.map((intent) => ({
+        id: intent.id,
+        issueId: intent.issueId,
+        agentLabel: intent.agentLabel,
+        attemptTokenPresent: intent.attemptToken !== null,
+        phase: intent.phase,
+        attempts: intent.attempts,
+        parkedAt: intent.parkedAt,
+        createdAt: intent.createdAt,
+      })),
+      candidates: ladderCandidates.map((candidate) => ({
+        issueId: candidate.issueId,
+        agentName: candidate.agentName,
+        staleCount: candidate.staleCount,
+        firstStaleAt: candidate.firstStaleAt,
+        lastObservedAt: candidate.lastObservedAt,
+        reclaimCount: candidate.reclaimCount,
+        lastReclaimAt: candidate.lastReclaimAt,
+        lastReasons: candidate.lastReasons,
+      })),
+      // Every in-flight guard, live or crashed — the operator distinguishes by
+      // age; a maintainer force-claim is the override that clears a crashed one.
+      executingGuards: stuckGuards.map((guard) => ({
+        issueId: guard.issueId,
+        operation: guard.operation,
+        agentName: guard.agentName,
+        ownerTokenPresent: guard.ownerToken !== "",
+        createdAt: guard.createdAt,
+      })),
     },
   });
 }

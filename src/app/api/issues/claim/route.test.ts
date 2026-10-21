@@ -49,6 +49,8 @@ process.env.DISPATCH_WORKER_TOKENS = `worker-agent:${WORKER_TOKEN}`;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
+    // #1254: the claim route checks for a pending reconciler release intent.
+    ownershipReleaseIntent: { findFirst: vi.fn(async () => null), findUnique: vi.fn(async () => null) },
     issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
     auditLog: { create: mocks.createAuditLog },
     issueLifecycleEvent: {
@@ -217,15 +219,33 @@ describe("POST /api/issues/claim — business logic", () => {
     guardState.resuming = false;
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready"]).mockResolvedValue(["agent/test-agent", "status/in-progress"]);
     mocks.transaction.mockRejectedValueOnce(new Error("db transaction failed"));
+    // §8.7 claim side: the first attempt commits the claim intent (the lease
+    // row, fresh attempt token) BEFORE the remote writes; the retry renews
+    // that same row instead of minting a second one.
+    const leaseRow = {
+      id: "l-1",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      claimToken: "claim_retry-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 60000),
+      renewedAt: new Date(),
+      createdAt: new Date(),
+    };
+    mocks.leaseFindUnique.mockResolvedValueOnce(null).mockResolvedValue(leaseRow);
+    mocks.leaseUpdate.mockResolvedValue(leaseRow);
     const first = await POST(makeRequest());
     expect(first.status).toBe(500);
     guardState.resuming = true;
     const retry = await POST(makeRequest());
     expect(retry.status).toBe(200);
-    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(2);
+    // The remote add is replayed idempotently on retry: a crash between the
+    // intent commit and the remote add must never leave the label un-added.
+    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(3); // agent + status on attempt 1, agent replay on retry
     expect(mocks.removeIssueLabel).toHaveBeenCalledTimes(1);
     expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(1);
-    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1); // attempt 1 only; the retry renewed
+    expect(mocks.leaseUpdate).toHaveBeenCalledTimes(1);
   });
 
   it("refuses a resumed claim after live ownership changes without writes", async () => {

@@ -323,6 +323,9 @@ function makeSweepClient(options: {
 
   const client = {
     agentWork: { findMany: agentWorkFindMany },
+    // #1254: the sweep defers to pending reconciler release intents; the fake
+    // always answers none.
+    ownershipReleaseIntent: { findMany: vi.fn(async () => []) },
     issue,
     issueLifecycleEvent,
     lease: tx.lease,
@@ -1236,5 +1239,32 @@ describe("sweepStaleWork — leasesReleased accounting (#1317)", () => {
     expect(report.claimRetained).toBe(1);
     expect(report.leasesReleased).toBe(1);
     expect(leases).toHaveLength(0);
+  });
+});
+
+describe("sweepStaleWork — defers to pending reconciler release intents (#1254)", () => {
+  it("skips a candidate whose issue has a pending release intent: no lease delete, no label release", async () => {
+    const work = makeWork();
+    const { client, auditRows, leaseDeleteMany } = makeSweepClient({ candidates: [work] });
+    (client.ownershipReleaseIntent.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { issueId: work.issueId, phase: "pending" },
+    ]);
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.skipped).toBe(1);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabel).not.toHaveBeenCalled();
+    expect(auditRows).toHaveLength(0);
+  });
+
+  it("still releases candidates whose issues have no pending intent", async () => {
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({ candidates: [work], leases: [makeLease()] });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.released).toBe(1);
+    expect(leaseDeleteMany).toHaveBeenCalled();
   });
 });

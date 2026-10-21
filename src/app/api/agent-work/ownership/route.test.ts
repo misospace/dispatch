@@ -433,6 +433,8 @@ function makeSweepClient(getRow: () => Record<string, unknown> | null) {
       findUnique: vi.fn(async () => ({ labels: [] })),
     },
     lease: { deleteMany: vi.fn(async () => ({ count: 0 })) },
+    // #1254: the sweep defers to pending reconciler release intents.
+    ownershipReleaseIntent: { findMany: vi.fn(async () => []) },
     agentWorkHistory: { create: vi.fn(async () => ({})) },
     auditLog: { create: vi.fn(async () => ({})) },
     $transaction: vi.fn(async () => false),

@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
+import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -72,15 +74,23 @@ export async function POST(request: Request) {
     }
 
     try {
+      // §8.7: the assign path is an intent-free writer, but when it coincides
+      // with a pending reconciler release intent it must serialize on the
+      // per-issue anchor rather than race the Phase-B delete — under the lock
+      // a pending intent is superseded (assign_agent only; assign_owner does
+      // not touch agent labels and must not cancel a pending release), then
+      // the explicit assignment's own idempotent label write converges the
+      // state. Busy means another claim-path writer holds the issue: 409.
+      const guarded = await withIssueMutationGuard({ issueId, operation: "assign" }, async (): Promise<{ complete: boolean; value: Response }> => {
       // Fetch current issue to get existing labels and state
       const issue = await prisma.issue.findUnique({ where: { id: issueId } });
       if (!issue) {
-        return errorResponse(`Issue not found: ${issueId}`, 404);
+        return { complete: true, value: errorResponse(`Issue not found: ${issueId}`, 404) };
       }
 
       // Policy §1: agents may only claim open issues
       if (issue.state !== "open") {
-        return errorResponse(`Cannot assign to closed issue (state: ${issue.state})`, 400);
+        return { complete: true, value: errorResponse(`Cannot assign to closed issue (state: ${issue.state})`, 400) };
       }
 
       // #1037: the assignment decision must be made against the labels
@@ -112,10 +122,23 @@ export async function POST(request: Request) {
           // Audit log failure should not mask the real error
         }
 
-        return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
+        return { complete: true, value: errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503) };
       }
 
       const currentLabels = liveLabels;
+
+      // §8.7 exemption: a direct operator/pipeline agent assignment supersedes
+      // a pending reconciler release intent (audited) rather than racing its
+      // Phase-B delete — the explicit human/pipeline choice converges the
+      // label state, the abandoned reconciler's intent does not. assign_owner
+      // does not touch agent labels and must not cancel a pending release.
+      if (payload.action === "assign_agent") {
+        await supersedeOwnershipReleaseIntent({
+          issueId,
+          actor: auditActor,
+          reason: "direct assign_agent assignment",
+        });
+      }
 
       // Analyze conflicts using the shared conflict resolution module
       const analysis = analyzeAssignmentConflict(currentLabels);
@@ -164,7 +187,13 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ success: true, labels: newLabels });
+      return { complete: true, value: NextResponse.json({ success: true, labels: newLabels }) };
+      });
+
+      if (guarded.status === "busy") {
+        return errorResponse("Issue mutation is in progress; retry shortly", 409);
+      }
+      return guarded.value;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
 

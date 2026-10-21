@@ -1,13 +1,20 @@
 # Ownership Reconciliation Design
 
-> **Status:** Partially implemented. #1251 landed the §6 optional worker
-> capability (register/renew/disposition on `Lease`), the §4 derived
-> ownership read model, and the §9 inspect surfaces — see
-> [Worker Ownership Capability](./worker-ownership-capability.md). The §8
-> reconciliation/release protocol (confirmation ladder, two-sided intent
-> protocol) remains design-only: no claim release, label cleanup, requeue,
-> worker-credential migration, or deployment change is authorised by this
-> document.
+> **Status:** Landed. #1251 landed the §6 optional worker capability
+> (register/renew/disposition on `Lease`), the §4 derived ownership read model,
+> and the §9 inspect surfaces — see
+> [Worker Ownership Capability](./worker-ownership-capability.md). #1254 landed
+> the §8 bounded reconciliation pass and the §8.7 two-sided release boundary:
+> `src/lib/ownership-reconciliation.ts` implements the confirmation ladder
+> (§8.2), the Phase A/B/C intent protocol (§8.7), the crash/replay matrix, and
+> the §8.5 release selection, mode-gated by
+> `DISPATCH_OWNERSHIP_RECONCILE_MODE` (`off` by default — no automatic release;
+> `audit` annotates only; `enforce` releases confirmed-abandoned claims). The
+> pass runs in the stale-work scheduler slot (`/api/agent-work/sweep`) under
+> the existing sync lock. Pending release intents and ladder candidates are
+> surfaced on the §9 read surface (`GET /api/issues/ownership` →
+> `reconciliation`). Still design-only: no worker-credential migration and no
+> deployment change.
 >
 > **Issue:** [misospace/dispatch#1245](https://github.com/misospace/dispatch/issues/1245)
 > **Date:** 2026-10-13
@@ -447,6 +454,44 @@ no such claim; §8.7 defines the actual cross-system boundary.
 
 ### 8.7 The two-sided release boundary (cross-system serialization)
 
+> **Implementation note (#1254).** Landed in `src/lib/ownership-reconciliation.ts`.
+> The anchor is the per-issue `IssueMutationGuard` fence with operation
+> `reconcile-release` (resumable after a demoted guard, like `stale-release`); the
+> release intent is the `OwnershipReleaseIntent` row (unique per
+> `(issue, agentLabel)`, carrying `attemptToken`, `phase`, a bounded Phase-B
+> `attempts` counter and a `parkedAt` fail-closed marker); the ladder state is
+> the `OwnershipReconcileCandidate` row (stale observations, per-claim reclaim
+> counter and cooldown — reset per owner, kept across release/reclaim churn).
+> The claim side's intent is the `Lease` row itself: the claim route commits the
+> lease (fresh attempt token) *before* the remote label add and holds any claim
+> with a retryable 409 while an intent is pending — the maintainer force-claim (which may also take over a guard left
+> `executing` by a crashed process via the guard `override` — the deliberate
+> operator decision the fail-closed posture defers to), the owner/operator
+> unclaim and the operator agent-work release, and the direct `assign_agent`
+> path (which takes the same anchor as operation `assign`) instead supersede
+> a pending intent (audited) via `supersedeOwnershipReleaseIntent`;
+> `assign_owner` does not touch agent labels and never cancels a pending
+> release. Guards left `executing` by a hard crash surface on the ownership
+> inspect read view; only an operator clears them. Phase A CAS-fences on
+> the full claim epoch — `{claimToken, expiredAt, lastRenewalObservedAt,
+> disposition}` plus the observed `AgentWork` heartbeat (§8.6) — with the
+> heartbeat CAS sequenced before the token-retiring lease CAS so a failed
+> heartbeat check cannot partially commit. Phase C refuses to settle over a
+> fresh claim (a lease still carrying its token, or any lease behind a
+> token-less intent), and clears the intent without a second lifecycle event
+> when another writer already released the claim. The stale-work sweep defers
+> to pending intents (the reconciler owns that release). The §8.5 status
+> selection is computed against a fresh live label read (#1037).
+> Mode semantics: `off` (default) starts no new release but still **replays**
+> intents already committed before the mode change — otherwise a pending
+> intent would hold the issue's claim path forever with no self-healing path;
+> `audit` performs no mutations at all, not even replay; `enforce` runs the
+> full protocol. A claim with zero Dispatch-side evidence still derives
+> `UNKNOWN` (#1251) and is never released — the intent-only Phase A (null
+> attempt token) is reachable only for claims whose ladder decision rested on
+> an active `AgentWork` row with no `Lease` row (a worker that started work
+> before claiming), and it aborts when a lease row appears under the lock.
+
 Because the remote write cannot be fenced, the design fences **admission** in
 Postgres and lets that barrier serialize the remote write against every other
 automation writer of the same label. The invariant:
@@ -697,15 +742,25 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 
 - Implement behind a mode flag (`off`/`audit`/`enforce`), mirroring
   `DISPATCH_QUEUE_ADMISSION_MODE` (#1065), so the reconciler can annotate
-  without acting first.
+  without acting first. **Landed (#1254)** as
+  `DISPATCH_OWNERSHIP_RECONCILE_MODE` (default `off`), with
+  `DISPATCH_RECONCILE_MAX_RECLAIMS`, `DISPATCH_RECONCILE_BATCH_SIZE`,
+  `DISPATCH_RECONCILE_RECHECK_INTERVAL_MS`,
+  `DISPATCH_RECONCILE_RECLAIM_COOLDOWN_MS` and
+  `DISPATCH_RECONCILE_MAX_FORGE_RETRIES` as the bounded-window knobs (§8.3).
 - **Open:** exact window defaults and whether `renew` should be a new endpoint
-  or an extension of `POST /api/agent-work/checkpoint`.
+  or an extension of `POST /api/agent-work/checkpoint`. (#1251 settled the
+  endpoint; the defaults remain operator-tunable.)
 - **Open:** whether explicit holds use a new `status/`-adjacent label or a
   Postgres marker; either way it must be auditable and operator-cleared.
+  (#1254 parks over-reclaimed claims via audit rows + the candidate read
+  surface; a first-class hold marker remains open.)
 - **Open:** whether the read model is computed on demand or materialised by the
-  reconcile job.
+  reconcile job. (#1254 persists only the ladder/candidate rows; the state
+  itself stays derived on demand.)
 - **Open:** how `CONFLICTED` ownership appears on the Board and in
-  `GET /api/issues` for operators.
+  `GET /api/issues` for operators. (`GET /api/issues/ownership` surfaces it;
+  Board rendering remains open.)
 
 ## 14. Requirements traceability (#1245)
 

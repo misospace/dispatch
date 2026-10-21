@@ -13,8 +13,10 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 // Mock dependencies — return the mock functions directly
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
+vi.mock("@/lib/prisma", () => {
+  const prisma = {
+    // #1254: assign supersedes any pending reconciler release intent.
+    ownershipReleaseIntent: { findFirst: vi.fn(async () => null) },
     issue: {
       findUnique: mocks.findIssue,
       update: mocks.updateIssue,
@@ -22,8 +24,10 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: {
       create: mocks.createAuditLog,
     },
-  },
-}));
+    $transaction: (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+  };
+  return { prisma };
+});
 
 vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
@@ -32,6 +36,14 @@ vi.mock("@/lib/github", () => ({
 }));
 
 vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  // #1254: the assign path serializes on the per-issue anchor; the fake
+  // always grants the lock.
+  withIssueMutationGuard: async (_req: unknown, cb: () => Promise<{ complete: boolean; value: unknown }>) => ({
+    status: "completed",
+    value: (await cb()).value,
+  }),
+}));
 
 // Import the route after mocks are set up
 process.env.DISPATCH_AGENT_TOKEN = mockToken;

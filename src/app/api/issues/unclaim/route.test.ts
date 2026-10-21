@@ -28,6 +28,8 @@ process.env.DISPATCH_WORKER_TOKENS = `test-agent:${WORKER_TOKEN}`;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
+    // #1254: the unclaim route supersedes any pending reconciler release intent.
+    ownershipReleaseIntent: { findFirst: vi.fn(async () => null) },
     issue: {
       findUnique: mocks.findUnique,
       update: mocks.updateIssue,
@@ -44,6 +46,8 @@ vi.mock("@/lib/prisma", () => ({
       Promise.resolve(
         typeof arg === "function"
           ? arg({
+              // #1254: the supersede helper runs its intent re-check in a tx.
+              ownershipReleaseIntent: { findFirst: vi.fn(async () => null) },
               issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
               issueLifecycleEvent: {
                 create: mocks.createLifecycleEvent,

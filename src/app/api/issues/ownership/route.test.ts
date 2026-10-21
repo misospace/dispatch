@@ -81,6 +81,11 @@ const { db, applyListArgs } = vi.hoisted(() => {
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
+    // #1254: the operator read surface lists pending release intents and
+    // ladder candidates.
+    ownershipReleaseIntent: { findMany: async () => [] },
+    ownershipReconcileCandidate: { findMany: async () => [] },
+    issueMutationGuard: { findMany: async () => [] },
     issue: {
       // list route: { where: { repository: { enabled }, state }, orderBy, take }
       findMany: async (args?: any) =>

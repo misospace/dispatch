@@ -68,6 +68,16 @@ export interface StaleWorkClient {
   agentWork: {
     findMany: (args: any) => Promise<any[]>;
   };
+  /**
+   * #1254: pending reconciler release intents. A claim the ownership
+   * reconciler is already releasing (intent pending) must not ALSO be
+   * released by the sweep — two writers releasing one claim double-records
+   * the lifecycle release and races the §8.5 status policies. The intent is
+   * the sole authorization for that delete; the sweep defers to it.
+   */
+  ownershipReleaseIntent: {
+    findMany: (args: any) => Promise<any[]>;
+  };
   issue: IssueClaimClient["issue"];
   lease: {
     findFirst: StaleWorkTransactionClient["lease"]["findFirst"];
@@ -215,11 +225,30 @@ export async function sweepStaleWork(
     },
   });
 
+  // #1254: defer rows whose issue has a pending reconciler release intent.
+  // Fetched BEFORE the candidate take so deferred rows cannot occupy the
+  // batch window and starve reclaimable work behind them.
+  const pendingIntentIssueIds = new Set(
+    (
+      await client.ownershipReleaseIntent.findMany({
+        where: { phase: "pending" },
+        take: 500,
+        select: { issueId: true },
+      })
+    ).map((row: any) => row.issueId),
+  );
+
+  const releasableCandidates = candidates.filter(
+    (work: any) => !(work.issueId && pendingIntentIssueIds.has(work.issueId)),
+  );
+
   const report: StaleWorkReport = {
     examined: candidates.length,
     released: 0,
     claimRetained: 0,
-    skipped: 0,
+    // Deferred rows are examined but not actioned: the reconciler owns their
+    // release (its intent holds the claim path until settle).
+    skipped: candidates.length - releasableCandidates.length,
     leasesReleased: 0,
     errors: [],
   };
@@ -460,7 +489,7 @@ export async function sweepStaleWork(
     }
   };
 
-  for (const work of candidates) {
+  for (const work of releasableCandidates) {
     try {
       if (work.issueId) {
         // Issue-scoped claim: run the whole decision-and-release pipeline
