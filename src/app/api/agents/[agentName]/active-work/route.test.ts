@@ -53,7 +53,7 @@ function makeActiveWorkRequest(agentName: string) {
 describe("GET /api/agents/:agentName/active-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", throttleKey: "disabled:test-agent", tier: "maintainer" });
     // Default: return the same lease for both findFirst calls (resolveActiveWork and leaseId fetch)
     mocks.leaseFindFirst.mockResolvedValue({
       id: "l-1",
@@ -325,6 +325,7 @@ describe("GET /api/agents/[agentName]/active-work — bound worker scope (#1129)
       authorized: true,
       type: "bearer",
       actor: "alpha",
+      throttleKey: "agent:alpha",
       tier: "worker",
       agentName: "alpha",
     });
@@ -338,6 +339,7 @@ describe("GET /api/agents/[agentName]/active-work — bound worker scope (#1129)
       authorized: true,
       type: "bearer",
       actor: "agent",
+      throttleKey: "worker-cred:test",
       tier: "worker",
     });
     const res = await makeActiveWorkRequest("alpha");

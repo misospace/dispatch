@@ -24,7 +24,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`comment:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`comment:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

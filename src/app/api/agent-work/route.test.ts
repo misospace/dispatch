@@ -114,7 +114,7 @@ function makeGetRequest(url: string) {
 describe("GET /api/agent-work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", throttleKey: "disabled:test-agent", tier: "maintainer" });
     agentWork.findMany.mockResolvedValue([]);
     lease.findMany.mockResolvedValue([]);
   });
@@ -733,7 +733,7 @@ describe("POST /api/agent-work", () => {
   describe("POST auth", () => {
     beforeEach(() => {
       vi.clearAllMocks();
-      mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+      mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", throttleKey: "disabled:test-agent", tier: "maintainer" });
     });
 
     it("returns 401 when token is invalid", async () => {
@@ -772,6 +772,7 @@ describe("GET /api/agent-work — bound worker scope (#1129)", () => {
       authorized: true,
       type: "bearer",
       actor: agentName,
+      throttleKey: `agent:${agentName}`,
       tier: "worker",
       agentName,
     });
@@ -805,7 +806,7 @@ describe("GET /api/agent-work — bound worker scope (#1129)", () => {
   });
 
   it("does not scope the stale-lease query for maintainer callers", async () => {
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", throttleKey: "disabled:test-agent", tier: "maintainer" });
     await makeGetRequest("http://localhost/api/agent-work");
     const callArgs = lease.findMany.mock.calls[0][0];
     expect(callArgs.where.agentName).toBeUndefined();
@@ -816,6 +817,7 @@ describe("GET /api/agent-work — bound worker scope (#1129)", () => {
       authorized: true,
       type: "bearer",
       actor: "agent",
+      throttleKey: "worker-cred:test",
       tier: "worker",
     });
     const res = await makeGetRequest("http://localhost/api/agent-work");

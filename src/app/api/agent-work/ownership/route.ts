@@ -82,7 +82,7 @@ export async function POST(request: Request) {
   const auth = await authorizeRequest(request);
   if (!auth.authorized) return authErrorResponse(auth);
 
-  const limited = enforceRateLimit(`ownership:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`ownership:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

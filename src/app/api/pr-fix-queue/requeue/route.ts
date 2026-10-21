@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`route:pr-fix-queue/requeue:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`route:pr-fix-queue/requeue:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
   let payload: unknown;
   try {

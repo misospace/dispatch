@@ -53,7 +53,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`route:agent-work/start:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`route:agent-work/start:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {
