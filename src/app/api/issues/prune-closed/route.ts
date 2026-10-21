@@ -12,7 +12,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`prune-closed:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`prune-closed:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
   const retentionDays = parseInt(process.env.DISPATCH_CLOSED_ISSUE_RETENTION_DAYS ?? "30", 10);
   const cutoffDate = new Date();

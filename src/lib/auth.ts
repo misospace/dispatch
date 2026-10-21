@@ -25,8 +25,13 @@
  * All mutating routes should use `authorizeRequest(request)` instead of
  * duplicating auth parsing logic. The middleware protects operator UI routes;
  * route handlers authorize API access for browsers and agents.
+ *
+ * Rate-limited routes key their window on `auth.throttleKey` (derived from
+ * the presented credential), never on `auth.actor` — the actor may be a
+ * caller-supplied `x-agent-name` value and is for attribution only (#1322).
  */
 
+import { createHash, randomBytes } from "node:crypto";
 import { NextResponse } from "next/server";
 import { errorResponse } from "./api-errors";
 import { getAuthMode, resetAuthModeCache } from "./auth-mode";
@@ -235,14 +240,75 @@ export function requiredTierForRoute(pathname: string, method: string): TokenTie
 }
 
 // ---------------------------------------------------------------------------
+// Throttle identity (credential-derived, #1322)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-process random salt for credential fingerprints. The rate limiter is a
+ * module-level in-memory map, so fingerprint keys only need to be stable
+ * within this process — and a salt that never leaves it means a leaked bucket
+ * key cannot be checked against guessed tokens offline. Never log or export
+ * the salt.
+ */
+const THROTTLE_FINGERPRINT_SALT = randomBytes(16).toString("hex");
+
+/**
+ * Salted, one-way (SHA-256) fingerprint of a bearer token, used as the
+ * throttle identity for credentials that carry no bound agent name. The raw
+ * token never appears in a limiter key, a log line, or an audit row.
+ */
+function credentialFingerprint(token: string): string {
+  return createHash("sha256")
+    .update(`${THROTTLE_FINGERPRINT_SALT}:${token}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+/**
+ * Throttle identity for a presented bearer token (#1322). Derived from the
+ * credential alone — never from the caller-supplied `x-agent-name` header —
+ * so a token holder cannot rotate the header to open a fresh rate-limit
+ * window:
+ *   - bound worker credential      → `agent:<agentName>` (per-agent bucket)
+ *   - legacy unbound worker token  → `worker-cred:<fingerprint>` (stable)
+ *   - maintainer token             → `maintainer-cred:<fingerprint>` (stable)
+ *
+ * The `unknown-credential` fallback is defensive: authorizeRequest only calls
+ * this after the same header has already resolved to a configured identity.
+ */
+function bearerThrottleKey(request: Request): string {
+  const parsed = parseAuthorizationHeader(request.headers.get("authorization"));
+  if (parsed?.type !== "bearer") return "unknown-credential";
+  const identity = getBearerTokenIdentity(parsed.token);
+  if (identity?.tier === "worker" && identity.agentName) {
+    return `agent:${identity.agentName}`;
+  }
+  if (identity?.tier === "worker") {
+    return `worker-cred:${credentialFingerprint(parsed.token)}`;
+  }
+  if (identity?.tier === "maintainer") {
+    return `maintainer-cred:${credentialFingerprint(parsed.token)}`;
+  }
+  return "unknown-credential";
+}
+
+// ---------------------------------------------------------------------------
 // Unified authorization entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * `throttleKey` is the credential-derived identity every rate-limited route
+ * must key its window on (#1322). It is intentionally separate from `actor`,
+ * which stays a human/agent-readable attribution string (and for bearer
+ * callers may still fall back to the self-reported `x-agent-name` header).
+ * Never build a rate-limit key from `actor`, an `x-agent-name` header, or a
+ * request-body agent name — all three are rotatable by the caller.
+ */
 export type AuthorizedRequest =
-  | { authorized: true; type: "basic"; username: string; actor: string; tier: "maintainer" }
-  | { authorized: true; type: "bearer"; actor: string; tier: TokenTier; agentName?: string }
-  | { authorized: true; type: "oidc"; actor: string; tier: "maintainer" }
-  | { authorized: true; type: "disabled"; actor: string; tier: "maintainer" }
+  | { authorized: true; type: "basic"; username: string; actor: string; throttleKey: string; tier: "maintainer" }
+  | { authorized: true; type: "bearer"; actor: string; throttleKey: string; tier: TokenTier; agentName?: string }
+  | { authorized: true; type: "oidc"; actor: string; throttleKey: string; tier: "maintainer" }
+  | { authorized: true; type: "disabled"; actor: string; throttleKey: string; tier: "maintainer" }
   | { authorized: false }
   | { authorized: false; forbidden: true; requiredTier: TokenTier };
 
@@ -297,6 +363,11 @@ export function authenticateRequest(request: Request):
   return { authorized: false };
 }
 
+/**
+ * Attribution-friendly actor for audit rows. Self-reported and rotatable, so
+ * it must never be used as a rate-limit / throttle key — use
+ * `auth.throttleKey` for that (#1322).
+ */
 function resolveBearerActor(request: Request): string {
   return request.headers.get("x-agent-name")?.trim() || "agent";
 }
@@ -313,18 +384,22 @@ function resolveSessionActor(user: { email?: string | null; name?: string | null
  *
  * The audit actor is the token-derived identity when one is available
  * (preferring the bound worker `agentName`); legacy unbound worker tokens
- * fall back to the self-reported `x-agent-name` header. Source from the
- * request header rather than a body argument so the bound identity cannot
- * be overridden by the caller, and so a denied worker cannot rotate header
- * values to evade the per-actor throttle or attribute the row to another
- * agent.
+ * fall back to the self-reported `x-agent-name` header for the row text only.
+ * Source from the request header rather than a body argument so the bound
+ * identity cannot be overridden by the caller. Throttling below keys on the
+ * credential-derived throttle identity, so a denied holder of the shared
+ * legacy token cannot rotate header values to open fresh buckets or
+ * write-amplify past the per-credential ceiling.
  *
  * Rows are throttled two ways so a misconfigured worker cannot write-amplify
- * the audit table: one row per (actor, method, pathname) per minute, with an
- * overall per-actor ceiling per minute (dynamic maintainer paths like
- * /api/issues/{id}/lane would otherwise each open a fresh bucket). The 403
- * response itself is never throttled — nothing here may change the auth
- * decision, so every step sits inside a try/catch.
+ * the audit table: one row per (throttle identity, method, pathname) per
+ * minute, with an overall per-credential ceiling per minute (dynamic
+ * maintainer paths like /api/issues/{id}/lane would otherwise each open a
+ * fresh bucket). Both buckets are keyed on the credential-derived throttle
+ * identity, not the row actor, so the legacy unbound token cannot rotate
+ * `x-agent-name` to open fresh buckets. The 403 response itself is never
+ * throttled — nothing here may change the auth decision, so every step sits
+ * inside a try/catch.
  */
 async function recordTierDenialAudit(
   headerAuth: {
@@ -339,12 +414,14 @@ async function recordTierDenialAudit(
 ): Promise<void> {
   try {
     // Prefer the token-derived identity over the self-reported header so a
-    // denied worker cannot attribute rows to another agent or rotate
-    // identities to evade per-actor throttling.
+    // denied worker cannot attribute rows to another agent. The throttle
+    // buckets use the credential-derived key (#1322), never this header-
+    // derived actor, so rotating `x-agent-name` cannot open a fresh window.
     const actor = headerAuth.agentName ?? resolveBearerActor(request);
+    const throttleKey = bearerThrottleKey(request);
     const { checkRateLimit } = await import("./rate-limit");
-    if (!checkRateLimit(`auth_tier_denied:${actor}`, { limit: 10, windowMs: 60_000 }).allowed) return;
-    if (!checkRateLimit(`auth_tier_denied:${actor}:${method}:${pathname}`, { limit: 1, windowMs: 60_000 }).allowed) return;
+    if (!checkRateLimit(`auth_tier_denied:${throttleKey}`, { limit: 10, windowMs: 60_000 }).allowed) return;
+    if (!checkRateLimit(`auth_tier_denied:${throttleKey}:${method}:${pathname}`, { limit: 1, windowMs: 60_000 }).allowed) return;
 
     const { prisma } = await import("./prisma");
     await prisma.auditLog.create({
@@ -382,13 +459,18 @@ export async function authorizeRequest(request: Request): Promise<AuthorizedRequ
   const authMode = getAuthMode();
 
   if (authMode === "disabled") {
-    return { authorized: true, type: "disabled", actor: "operator", tier: "maintainer" };
+    return { authorized: true, type: "disabled", actor: "operator", throttleKey: "disabled:operator", tier: "maintainer" };
   }
 
   const headerAuth = authenticateRequest(request);
   if (headerAuth.authorized) {
     if (headerAuth.type === "basic") {
-      return { ...headerAuth, actor: headerAuth.username, tier: "maintainer" };
+      return {
+        ...headerAuth,
+        actor: headerAuth.username,
+        throttleKey: `basic:${headerAuth.username}`,
+        tier: "maintainer",
+      };
     }
 
     if (headerAuth.type === "bearer" && headerAuth.tier === "worker") {
@@ -402,22 +484,30 @@ export async function authorizeRequest(request: Request): Promise<AuthorizedRequ
 
     // A bound worker credential's actor is its immutable token-derived agent
     // name; maintainer and legacy-unbound tokens keep the self-reported
-    // x-agent-name fallback.
+    // x-agent-name fallback for audit attribution. The throttle key is
+    // always credential-derived (#1322): per-agent for bound workers, a
+    // stable salted fingerprint for shared credentials.
     const actor =
       headerAuth.type === "bearer" && headerAuth.agentName
         ? headerAuth.agentName
         : resolveBearerActor(request);
-    return { ...headerAuth, actor };
+    const throttleKey =
+      headerAuth.type === "bearer" && headerAuth.agentName
+        ? `agent:${headerAuth.agentName}`
+        : bearerThrottleKey(request);
+    return { ...headerAuth, actor, throttleKey };
   }
 
   if (authMode === "oidc") {
     const { auth } = await import("@/lib/auth-next");
     const session = await auth();
     if (session?.user) {
+      const actor = resolveSessionActor(session.user);
       return {
         authorized: true,
         type: "oidc",
-        actor: resolveSessionActor(session.user),
+        actor,
+        throttleKey: `oidc:${actor}`,
         tier: "maintainer",
       };
     }
@@ -500,6 +590,7 @@ export async function authorizeGroomerRequest(request: Request): Promise<Authori
       authorized: true,
       type: "bearer",
       actor: "hosted-groomer-scheduler",
+      throttleKey: `groomer-cred:${credentialFingerprint(parsed.token)}`,
       tier: "maintainer",
     };
   }

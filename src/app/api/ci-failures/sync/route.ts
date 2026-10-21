@@ -75,7 +75,7 @@ export async function POST(request: NextRequest) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`ci-failures-sync:${auth.actor}`, {
+  const limited = enforceRateLimit(`ci-failures-sync:${auth.throttleKey}`, {
     limit: 10,
     windowMs: 60_000,
   });

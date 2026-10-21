@@ -13,7 +13,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`pr-fix-enqueue:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`pr-fix-enqueue:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   const auditActor = getAuthorizedActor(auth, request);

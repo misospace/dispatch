@@ -121,7 +121,7 @@ export async function POST(request: Request) {
       if (!auth.authorized) {
         return authErrorResponse(auth);
       }
-      actor = auth.actor ?? "webhook";
+      actor = auth.throttleKey;
     }
 
     const limited = enforceRateLimit(`issues-webhook:${actor}`, { limit: 30, windowMs: 10_000 });

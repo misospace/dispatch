@@ -15,7 +15,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`automation-run-action:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`automation-run-action:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   const auditActor = getAuthorizedActor(auth, request);
