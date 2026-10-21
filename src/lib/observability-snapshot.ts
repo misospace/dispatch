@@ -25,7 +25,11 @@ const STRANDED_ASSIGNMENT_DEFAULT_MS = 30 * 60 * 1000;
 const STRANDED_ASSIGNMENT_MIN_MS = 60_000;
 const STRANDED_ASSIGNMENT_MAX_MS = 86_400_000;
 const LONG_WINDOW_MS = 3_600_000;
-const ASSIGNMENT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+// Assignment age evidence horizon. Bounded on purpose; the horizon is
+// exported in the snapshot (`evidenceLookbackSeconds`) so assignments older
+// than it report as age-UNKNOWN (never aged) with the horizon visible,
+// instead of the alertable signal silently switching off.
+const ASSIGNMENT_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function strandedAssignmentThresholdMs(
   env: Record<string, string | undefined> = process.env,
@@ -260,6 +264,7 @@ export async function collectObservabilitySnapshot(
     admissionRuns,
     thresholds: {
       strandedAssignmentMs: strandedAssignmentThresholdMs(),
+      assignmentEvidenceLookbackMs: ASSIGNMENT_LOOKBACK_MS,
       prFixHandoutTimeoutMs: prFixHandoutTimeoutMs(),
     },
   });

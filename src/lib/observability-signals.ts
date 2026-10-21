@@ -352,6 +352,8 @@ export interface ObservabilitySnapshotInputs {
   thresholds: {
     /** A6 age threshold: past this, a known-age unexecuted assignment is aged. */
     strandedAssignmentMs: number;
+    /** How far back the collector loaded assign/unassign audit evidence. */
+    assignmentEvidenceLookbackMs: number;
     /** PR_FIX_HANDOUT_TIMEOUT_MS: age-tied overdue boundary for A7. */
     prFixHandoutTimeoutMs: number;
   };
@@ -425,6 +427,13 @@ export interface ObservabilitySnapshot {
     oldestKnownAgeSeconds: number | null;
     agedPastThreshold: number;
     thresholdSeconds: number;
+    /**
+     * Horizon of the loaded `assign_agent` evidence. An assignment older than
+     * this has no loaded age evidence and is reported as `ageUnknown` (never
+     * aged) — the horizon is declared so a consumer cannot mistake evidence
+     * expiry for "no waiting".
+     */
+    evidenceLookbackSeconds: number;
   };
   prFix: {
     byStatus: CountMap;
@@ -568,12 +577,16 @@ function isWorkerIdentity(agentName: string): boolean {
 }
 
 function ackedGenerations(handoutAcks: string[]): Set<number> {
+  // Mirrors the canonical `parseAgentHandoutToken` rule (pr-fix-queue): the
+  // agent name may contain "@", so the generation is what follows the LAST
+  // "@"; malformed entries (empty/zero/non-integer generation, or no "@")
+  // ack nothing.
   const acked = new Set<number>();
   for (const entry of handoutAcks) {
     const at = entry.lastIndexOf("@");
-    if (at === -1) continue;
+    if (at <= 0) continue;
     const gen = Number(entry.slice(at + 1));
-    if (Number.isFinite(gen)) acked.add(gen);
+    if (Number.isInteger(gen) && gen >= 1) acked.add(gen);
   }
   return acked;
 }
@@ -630,11 +643,14 @@ function evaluateAdmission(
 
 /**
  * Per-issue assignment age evidence. The latest successful `assign_agent`
- * audit row stamps when Dispatch last saw the assignment appear; any later
- * Lease/AgentWork creation (any state — even a completed attempt) proves the
- * assignment became execution, and a later `unassign_agent` ends the current
- * assignment. Issues with no audit evidence have an UNKNOWN age and are
- * never reported as aged (§6 A6 fail-open rule).
+ * audit row stamps when Dispatch last saw the assignment appear; ANY
+ * Lease/AgentWork creation for the issue (any time, any state — even a
+ * completed attempt) proves the assignment became execution at least once,
+ * and a later `unassign_agent` ends the current assignment. Presence (not
+ * ordering) is deliberate: a no-op re-assign of an already-delivered issue
+ * writes a fresh audit row, and an ordering rule would re-arm the A6 clock on
+ * work the fleet already delivered. Issues with no audit evidence have an
+ * UNKNOWN age and are never reported as aged (§6 A6 fail-open rule).
  */
 function observeAssignments(
   inputs: ObservabilitySnapshotInputs,
@@ -657,17 +673,15 @@ function observeAssignments(
   }
 
   // Any lease / AgentWork creation is execution evidence, regardless of the
-  // row's current state: an issue that was claimed and delivered is not
-  // "assigned but never picked up" even after the lease expired or the work
-  // reached a terminal state while the label lingers.
-  const lastExecutionEvidence = new Map<string, Date>();
-  const noteEvidence = (issueId: string | null, at: Date) => {
-    if (!issueId) return;
-    const prev = lastExecutionEvidence.get(issueId);
-    if (!prev || at > prev) lastExecutionEvidence.set(issueId, at);
-  };
-  for (const lease of inputs.leases) noteEvidence(lease.issueId, lease.createdAt);
-  for (const work of inputs.agentWork) noteEvidence(work.issueId, work.createdAt);
+  // row's current state or its order against the assignment audit: an issue
+  // that was claimed and delivered is not "assigned but never picked up"
+  // even after the lease expired, the work reached a terminal state while
+  // the label lingers, or a no-op re-assign wrote a newer audit row.
+  const executedIssueIds = new Set<string>();
+  for (const lease of inputs.leases) executedIssueIds.add(lease.issueId);
+  for (const work of inputs.agentWork) {
+    if (work.issueId) executedIssueIds.add(work.issueId);
+  }
 
   let aggregate = 0;
   let ageKnown = 0;
@@ -688,9 +702,8 @@ function observeAssignments(
       ageUnknown += 1;
       continue;
     }
-    const executedAt = lastExecutionEvidence.get(issue.id) ?? null;
-    if (executedAt && executedAt > assignedAt) {
-      // Promptly claimed: this assignment became execution, aged or not.
+    if (executedIssueIds.has(issue.id)) {
+      // Execution was observed for this issue at some point: never aged.
       continue;
     }
     ageKnown += 1;
@@ -706,6 +719,7 @@ function observeAssignments(
     oldestKnownAgeSeconds: oldestKnown,
     agedPastThreshold: aged,
     thresholdSeconds: Math.floor(thresholdMs / 1000),
+    evidenceLookbackSeconds: Math.floor(inputs.thresholds.assignmentEvidenceLookbackMs / 1000),
   };
 }
 
@@ -765,7 +779,9 @@ export function computeObservabilitySnapshot(
 
   const pickupTimes: Date[] = [
     ...workerLeases.filter((l) => l.createdAt <= now).map((l) => l.createdAt),
-    ...inputs.agentWork.filter((w) => w.createdAt <= now).map((w) => w.createdAt),
+    ...inputs.agentWork
+      .filter((w) => w.createdAt <= now && isWorkerIdentity(w.agentName))
+      .map((w) => w.createdAt),
   ];
   const taskRuns = inputs.agentRuns.filter((r) => OBSERVABILITY_TASK_RUN_TYPES.has(r.runType));
   const reportedTimes = taskRuns.filter((r) => r.createdAt <= now).map((r) => r.createdAt);
@@ -886,11 +902,12 @@ export function computeObservabilitySnapshot(
   const overdueJobs = jobs.filter((j) => j.overdue === 1).length;
   const secondsSinceLastSuccess = ageSeconds(inputs.sync.lastSuccessAt, now);
   const everSucceeded = inputs.sync.lastSuccessAt !== null;
-  const freshSyncWindowMs =
-    inputs.scheduler.syncIntervalMs > 0 ? inputs.scheduler.syncIntervalMs * 2 : Number.POSITIVE_INFINITY;
+  const syncIntervalKnown = inputs.scheduler.syncIntervalMs > 0;
+  const freshSyncWindowMs = inputs.scheduler.syncIntervalMs * 2;
   const syncStale =
     !everSucceeded ||
-    (secondsSinceLastSuccess !== null &&
+    (syncIntervalKnown &&
+      secondsSinceLastSuccess !== null &&
       secondsSinceLastSuccess * 1000 > freshSyncWindowMs);
 
   const failedSyncRows = inputs.sync.failed
@@ -917,14 +934,18 @@ export function computeObservabilitySnapshot(
   const schedulerHealthy = inputs.scheduler.enabled && overdueJobs === 0;
   const failedLong = failedSyncRows.filter((f) => now.getTime() - f.at.getTime() <= 3600 * 1000).length;
 
-  const eligibleWorkNotHandedOut: boolean | null = !inputs.scheduler.enabled
-    ? null
-    : openClaimableIssues.length > 0 &&
-      executionActive === 0 &&
-      pickups30m === 0 &&
-      reported30m === 0 &&
-      schedulerHealthy &&
-      !syncStale;
+  const eligibleWorkNotHandedOut: boolean | null =
+    !inputs.scheduler.enabled || (syncIntervalKnown === false && everSucceeded)
+      ? // Not evaluable: scheduler unarmed, or the fresh-sync guard has no
+        // interval to evaluate against (sync job disabled) while a success
+        // series exists. Explicit unknown, never a silent false.
+        null
+      : openClaimableIssues.length > 0 &&
+        executionActive === 0 &&
+        pickups30m === 0 &&
+        reported30m === 0 &&
+        schedulerHealthy &&
+        !syncStale;
 
   const agentWorkStale = (agentWorkByState["STALE"] ?? 0) > 0;
   const staleOwnership = expiredLeases > 0 || agentWorkStale;

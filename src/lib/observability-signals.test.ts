@@ -112,7 +112,11 @@ function baseInputs(
     },
     admissionMode: "off",
     admissionRuns: new Map(),
-    thresholds: { strandedAssignmentMs: 1_800_000, prFixHandoutTimeoutMs: 1_800_000 },
+    thresholds: {
+      strandedAssignmentMs: 1_800_000,
+      assignmentEvidenceLookbackMs: 30 * 24 * 60 * 60 * 1000,
+      prFixHandoutTimeoutMs: 1_800_000,
+    },
     ...overrides,
   };
 }
@@ -219,6 +223,13 @@ describe("observability signal derivation", () => {
       });
       expect(s.execution.pickupsInWindow["1800"]).toBe(0);
     });
+
+    it("system-emitter AgentWork rows never count as pickups", () => {
+      const s = snapshot({
+        agentWork: [makeWork({ agentName: "hosted-groomer", createdAt: ago(60) })],
+      });
+      expect(s.execution.pickupsInWindow["1800"]).toBe(0);
+    });
   });
 
   describe("aged specific assignments (A6 evidence)", () => {
@@ -297,6 +308,34 @@ describe("observability signal derivation", () => {
       expect(s.assignmentObservation.ageKnown).toBe(0);
       expect(s.assignmentObservation.agedPastThreshold).toBe(0);
     });
+
+    it("a re-assign of already-delivered work does not re-arm the aged clock", () => {
+      // Assigned T0, claimed and delivered (lease created then, gone since),
+      // operator re-runs the same assign 10 days later. Presence of the old
+      // execution evidence must keep this out of the aged count.
+      const s = snapshot({
+        issues: [makeIssue({ id: "i1", labels: ["status/in-progress", "agent/worker-a"] })],
+        assignmentAudit: [
+          { issueId: "i1", action: "assign_agent", createdAt: ago(10 * 86_400 + 3600) },
+          { issueId: "i1", action: "assign_agent", createdAt: ago(600) }, // no-op re-assign
+        ],
+        leases: [
+          makeLease({
+            issueId: "i1",
+            createdAt: ago(10 * 86_400),
+            expiredAt: ago(10 * 86_400 - 1800),
+          }),
+        ],
+      });
+      expect(s.assignmentObservation.ageKnown).toBe(0);
+      expect(s.assignmentObservation.agedPastThreshold).toBe(0);
+      expect(s.observations.agedUnpickedAssignments).toBe(false);
+    });
+
+    it("declares the evidence lookback horizon in the snapshot", () => {
+      const s = snapshot();
+      expect(s.assignmentObservation.evidenceLookbackSeconds).toBe(30 * 86_400);
+    });
   });
 
   describe("PR-fix hand-out / ack / settlement", () => {
@@ -347,6 +386,32 @@ describe("observability signal derivation", () => {
         ],
       });
       expect(s.prFix.handouts.unackedAggregate).toBe(1);
+    });
+
+    it("acks parse with @-bearing agent names and reject malformed entries", () => {
+      const acked = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(60),
+            dispatchedGeneration: 2,
+            generation: 2,
+            handoutAcks: ["worker@corp.example@2"], // name may contain "@"
+          }),
+        ],
+      });
+      expect(acked.prFix.handouts.unackedAggregate).toBe(0);
+
+      const malformed = snapshot({
+        prFixItems: [
+          makePrFix({
+            dispatchedAt: ago(60),
+            dispatchedGeneration: 2,
+            generation: 2,
+            handoutAcks: ["worker@", "@2", "worker@x"],
+          }),
+        ],
+      });
+      expect(malformed.prFix.handouts.unackedAggregate).toBe(1);
     });
 
     it("PARKED is operational exhaustion, BLOCKED is the human decision", () => {
@@ -490,6 +555,15 @@ describe("observability signal derivation", () => {
         scheduler: { enabled: false, syncIntervalMs: 0, jobs: [] },
       });
       expect(disabled.observations.eligibleWorkNotHandedOut).toBeNull();
+
+      // Scheduler armed but the sync job disabled: the fresh-sync guard has
+      // no interval to evaluate against while a success series exists, so
+      // A4-style state is unknown, never a silent false or true.
+      const syncJobDisabled = snapshot({
+        issues: [makeIssue({ id: "i1" })],
+        scheduler: { enabled: true, syncIntervalMs: 0, jobs: [] },
+      });
+      expect(syncJobDisabled.observations.eligibleWorkNotHandedOut).toBeNull();
     });
 
     it("grooming freshness: absent fingerprint is unknown, never fresh", () => {

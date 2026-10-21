@@ -44,8 +44,8 @@ to whatever backend it chose.
 
 | Section | Catalogue rows | Notes |
 |---|---|---|
-| `workSupply` | §4.2 `dispatch_issues`, `dispatch_issues_open_claimable`, ages, `dispatch_dependency_blocked` | open issues only; status/lane dimensions |
-| `execution` | §4.3 + §4.10 `dispatch_work_pickups_in_window`, `dispatch_agent_runs_reported_in_window`, `dispatch_agent_runs_started_in_window`, §4.4 AgentWork distribution | system-emitter exclusion: hosted-groomer leases and every non-task `AgentRun` row are filtered by `agentName`/`runType` allowlist, so a running groomer or a merely polling fleet cannot look busy; `BLOCKED` AgentWork never counts as active execution |
+| `workSupply` | §4.2 `dispatch_issues`, `dispatch_issues_open_claimable`, ages, `dispatch_dependency_blocked` | open issues only; status/lane dimensions on the issue gauges. `openClaimable` and `dependencyBlocked` are emitted aggregate-only — the per-`lane` split from the catalogue is not part of this snapshot |
+| `execution` | §4.3 + §4.10 `dispatch_work_pickups_in_window`, `dispatch_agent_runs_reported_in_window`, `dispatch_agent_runs_started_in_window`, §4.4 AgentWork distribution | system-emitter exclusion: hosted-groomer leases/AgentWork and every non-task `AgentRun` row are filtered by `agentName`/`runType` allowlist, so a running groomer or a merely polling fleet cannot look busy; `BLOCKED` AgentWork never counts as active execution |
 | `assignmentObservation` | §4.3 `dispatch_assigned_without_execution` + A6 inputs | see "aged specific assignments" below |
 | `prFix` | §4.5 hand-out/ack/reclaim, §4.6 settlement | `PARKED` (operational exhaustion, by outcome) is reported separately from `BLOCKED` (`human_decision`) and never inflates it; overdue is **age-tied** to `dispatchedAt` vs `PR_FIX_HANDOUT_TIMEOUT_MS` |
 | `admission` | §4.7 | reuses the canonical rule in `src/lib/queue-admission.ts`; withheld reason codes are the 12-code allowlist |
@@ -65,12 +65,14 @@ identify specific aged items, with the age evidence made explicit:
   `assign_agent` audit row (`DISPATCH_OBSERVABILITY_STRANDED_ASSIGNMENT_MS`
   is the consumer threshold, default 30m).
 - `ageUnknown` — assignments with no persisted age evidence (GitHub-side
-  label adds). These are **never** reported as aged (fail-open for alert
-  safety) and the split is surfaced so a consumer cannot mistake "no age
-  evidence" for "no waiting".
+  label adds, or assignments older than the loaded evidence horizon
+  `evidenceLookbackSeconds`, 30 days). These are **never** reported as aged
+  (fail-open for alert safety) and the split is surfaced so a consumer cannot
+  mistake "no age evidence" for "no waiting".
 - `agedPastThreshold` / `oldestKnownAgeSeconds` — counts ONLY known-age items
-  past the threshold. A lease or `AgentWork` row created after the assignment
-  (even expired/terminal) proves the assignment became execution.
+  past the threshold. Any `Lease` or `AgentWork` row ever created for the
+  issue (presence, not ordering — so a no-op re-assign of delivered work does
+  not re-arm the clock) proves the assignment became execution.
 
 The same age-tied rule governs PR-fix hand-outs: `unackedAggregate` is
 dashboard-only; `overdueUnacked` and `oldestUnackedHandoutAgeSeconds` are the
@@ -91,3 +93,9 @@ alertable, per-item evidence for A7.
 - `src/lib/observability-snapshot.ts` — read-only collector: loads the rows
   and calls the pure layer; window starts are computed from one `now`.
 - `src/app/api/observability/route.ts` — authenticated GET.
+
+Cost note: `Lease` and `AgentWork` are read in full per request (no time
+bound) so state gauges cover the whole table. Both are row-bounded by
+agent x issue uniqueness and the orphan sweep today; if scrape cost ever
+becomes a problem at scale, a bounded or pre-aggregated variant is the
+follow-up, not a change to the signal semantics.
