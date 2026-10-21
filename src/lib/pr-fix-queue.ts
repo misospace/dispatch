@@ -178,7 +178,12 @@ export interface MarkPrFixInput {
    * Caller's auth tier (#1218 review): used to gate the BLOCKED/PARKED status
    * pin at commit time. A worker-tier mark to BLOCKED/PARKED on an already
    * recorded BLOCKED/PARKED/FIXED row must no-op (return `generation-mismatch`)
-   * so a same-generation second mark cannot erase a genuine human decision.
+   * so a same-generation second mark cannot erase a genuine human decision —
+   * with one exception (#1340): a worker-tier BLOCKED mark may escalate a
+   * same-generation PARKED row to BLOCKED (bounded exhaustion that turned out
+   * to need a human decision); a recorded BLOCKED stays sticky against every
+   * other worker mark, and de-escalation (BLOCKED → PARKED/QUEUED) remains
+   * operator-only via `allowStickyReclassify`.
    * Defaults to `"worker"` (fail-closed): callers that don't explicitly assert
    * a maintainer tier cannot bypass the pin. The route handler is the only
    * trusted source of this value — `parseMarkPrFixInput` does not accept it
@@ -2480,13 +2485,13 @@ export async function markPrFixItem(
   }
 
   // #1218 review: a recorded human decision (BLOCKED) and a recorded operator
-  // PARKED are sticky to worker settlements — the commit-time status pin below
-  // refuses a worker-tier BLOCKED/PARKED mark on a row that already records
-  // BLOCKED/PARKED/FIXED, so a same-generation second mark (or a read→write
-  // gap that flipped the row) cannot erase the decision. Reclassification by
-  // an operator is a separate, explicitly-authenticated path (`allowStickyReclassify`
-  // honored only when `actorTier === "maintainer"`); worker callers cannot
-  // bypass the pin.
+  // PARKED are sticky to worker settlements — the commit-time status filter
+  // below refuses a worker-tier BLOCKED/PARKED mark on a row that already
+  // records BLOCKED/PARKED/FIXED, so a same-generation second mark (or a
+  // read→write gap that flipped the row) cannot erase the decision.
+  // Reclassification by an operator is a separate, explicitly-authenticated
+  // path (`allowStickyReclassify` honored only when `actorTier === "maintainer"`);
+  // worker callers cannot bypass the pin.
   const isOperatorReclassify =
     input.actorTier === "maintainer" && input.allowStickyReclassify === true;
   // #1218 review (follow-up): the pin covers every terminal outcome a worker
@@ -2499,15 +2504,22 @@ export async function markPrFixItem(
   // recorded BLOCKED/PARKED classification. FIXED/STALE are pinned for every
   // non-maintainer caller; maintainer-tier transitions (operator resolution
   // of a blocked item, internal reconciliation) stay unpinned.
-  const pinToQueuedForStickySettlement =
-    (
-      (nextStatus === "BLOCKED" || nextStatus === "PARKED") &&
-      !isOperatorReclassify
-    ) ||
-    (
-      (nextStatus === "FIXED" || nextStatus === "STALE") &&
-      input.actorTier !== "maintainer"
-    );
+  // #1340: the pin is relaxed in exactly one direction — a non-operator
+  // (worker-tier, or maintainer without reclassify opt-in) BLOCKED mark may
+  // land on a row that records PARKED, escalating a bounded no-progress park
+  // into a genuine human decision (a run that parks for no progress and later
+  // ends NeedsHuman reports `blocked`; refusing the escalation would strand
+  // the needs-human state). BLOCKED stays sticky against every other mark —
+  // a recorded BLOCKED/FIXED row still rejects worker BLOCKED — and
+  // de-escalation (BLOCKED → PARKED/QUEUED) remains operator-only via
+  // `allowStickyReclassify`. PARKED marks stay QUEUED-only: a park never
+  // overwrites any recorded classification.
+  const stickySettlementStatusFilter: Record<string, unknown> =
+    (nextStatus === "BLOCKED" || nextStatus === "PARKED") && !isOperatorReclassify
+      ? { status: nextStatus === "BLOCKED" ? { in: ["QUEUED", "PARKED"] } : "QUEUED" }
+      : (nextStatus === "FIXED" || nextStatus === "STALE") && input.actorTier !== "maintainer"
+        ? { status: "QUEUED" }
+        : {};
 
   if (nextStatus === "WAITING_EXTERNAL") {
     const result = await client.$transaction(async (tx) => {
@@ -2572,7 +2584,7 @@ export async function markPrFixItem(
       where: {
         id: row.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-        ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
+        ...stickySettlementStatusFilter,
         postDispatchEvidenceKeys: { equals: row.postDispatchEvidenceKeys ?? [] },
       },
       data: reopenData,
@@ -2659,7 +2671,19 @@ export async function markPrFixItem(
   if (nextStatus === "BLOCKED") {
     data.lane = "NEEDS_HUMAN";
     data.outcome = "human_decision";
-    if (input.decision) data.decisionDetail = input.decision;
+    // #1340: a BLOCKED mark without a structured decision still records a
+    // decision context — the needs-human surface and the operator need a
+    // question and evidence to act on, so synthesize them from the mark's
+    // diagnostic instead of leaving the payload empty.
+    data.decisionDetail =
+      input.decision ??
+      {
+        question: "The worker ended this PR-fix attempt needing a human decision; review the diagnostic and decide how to proceed.",
+        evidence:
+          (input.note ?? "").trim() ||
+          existing.reason ||
+          "The worker reported a human decision without a diagnostic.",
+      };
     // #1253: disposition audit stamp (human-decision BLOCKED).
     data.disposedAt = new Date();
     data.disposedEvidence = null;
@@ -2794,7 +2818,7 @@ export async function markPrFixItem(
           where: {
             id: existing.id,
             ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-            ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
+            ...stickySettlementStatusFilter,
           },
           data: refusalData,
         });
@@ -2895,7 +2919,7 @@ export async function markPrFixItem(
         id: existing.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
         ...(settlesAttempt ? { postDispatchEvidenceKeys: { equals: [] } } : {}),
-        ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
+        ...stickySettlementStatusFilter,
       };
       const { count } = await tx.prFixQueueItem.updateMany({ where: settleWhere, data });
       if (count !== 1) return null;
@@ -2977,7 +3001,7 @@ export async function markPrFixItem(
           id: fresh.id,
           ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
           postDispatchEvidenceKeys: { equals: freshCacheKeys },
-          ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
+          ...stickySettlementStatusFilter,
         },
         data: { ...data, postDispatchEvidenceKeys: [] },
       });
@@ -3027,7 +3051,7 @@ export async function markPrFixItem(
         where: {
           id: existing.id,
           ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-          ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
+          ...stickySettlementStatusFilter,
         },
         data: { ...data, postDispatchEvidenceKeys: [] },
       });
@@ -3088,7 +3112,7 @@ export async function markPrFixItem(
       where: {
         id: existing.id,
         ...(expectedGeneration !== undefined ? { generation: expectedGeneration } : {}),
-        ...(pinToQueuedForStickySettlement ? { status: "QUEUED" } : {}),
+        ...stickySettlementStatusFilter,
       },
       data: forceData,
     });
@@ -3396,6 +3420,77 @@ export function agentAlreadyHanded(
     const parsed = parseAgentHandoutToken(entry);
     return parsed !== null && parsed.agentName === agentName && parsed.generation === generation;
   });
+}
+
+/**
+ * Release the reporting agent's hand-out records from a settled pr-fix item
+ * (#1340). When a report settles the attempt (a `blocked` report that marks
+ * the row BLOCKED or PARKED), the attempt is over: the per-agent hand-out,
+ * ack, and receipt entries for the settled generation must not survive, or
+ * the live receipt would keep pinning the settled item as if it were still
+ * dispatched. Drops every entry for (agentName, generation) from
+ * `agentHandouts`, `handoutAcks`, and `handoutReceipts`; if the filtered
+ * `agentHandouts` ends up empty, the dispatch stamps are cleared too,
+ * mirroring the capacity-exhausted last-hand-out branch. The settlement
+ * write has already committed — this release is best-effort: a failure
+ * here only logs, it never undoes or fails the settlement.
+ */
+export async function releaseAgentHandout(
+  client: PrFixQueueClient,
+  row: {
+    id: string;
+    generation: number;
+    agentHandouts?: unknown;
+    handoutAcks?: unknown;
+    handoutReceipts?: unknown;
+  },
+  agentName: string | undefined,
+  generation: number,
+): Promise<void> {
+  const agent = agentName?.trim();
+  if (!agent) return;
+  try {
+    const receipts: string[] = Array.isArray(row.handoutReceipts) ? row.handoutReceipts : [];
+    const handouts: string[] = Array.isArray(row.agentHandouts) ? row.agentHandouts : [];
+    const acks: string[] = Array.isArray(row.handoutAcks) ? row.handoutAcks : [];
+    const isOwnReceipt = (entry: unknown): boolean => {
+      const parsed = parseHandoutReceipt(entry);
+      return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
+    };
+    const isOwnToken = (entry: unknown): boolean => {
+      const parsed = parseAgentHandoutToken(entry);
+      return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
+    };
+    const remainingReceipts = receipts.filter((entry) => !isOwnReceipt(entry));
+    const remainingHandouts = handouts.filter((entry) => !isOwnToken(entry));
+    const remainingAcks = acks.filter((entry) => !isOwnToken(entry));
+    // Nothing for this agent at this generation (or a malformed row) — no
+    // write.
+    if (
+      remainingReceipts.length === receipts.length &&
+      remainingHandouts.length === handouts.length &&
+      remainingAcks.length === acks.length
+    ) {
+      return;
+    }
+    await client.prFixQueueItem.updateMany({
+      where: { id: row.id, generation },
+      data: {
+        handoutReceipts: remainingReceipts,
+        agentHandouts: remainingHandouts,
+        handoutAcks: remainingAcks,
+        ...(remainingHandouts.length === 0
+          ? {
+              dispatchedGeneration: null,
+              dispatchedAt: null,
+              attemptEvidenceWatermark: null,
+            }
+          : {}),
+      },
+    });
+  } catch (error) {
+    console.error(`pr-fix-queue handout release failed for ${row.id}:`, error);
+  }
 }
 
 export function toAgentQueuePrFixItem(item: any) {
@@ -3965,6 +4060,16 @@ export async function resolvePrFixFromAgentReport(
         attemptGeneration: attempt?.generation ?? null,
       };
     }
+    // #1340: the attempt is over — release the reporting agent's hand-out
+    // records at the settled generation so a stale receipt does not keep
+    // pinning the settled item. Best-effort: the settlement already committed,
+    // so a failure here only logs and never fails the report.
+    await releaseAgentHandout(
+      client as PrFixQueueClient,
+      markResult.item,
+      (input.agentName ?? undefined)?.trim(),
+      existing.generation,
+    );
     return {
       matched: true,
       action: isHumanDecision ? "blocked" : "parked",

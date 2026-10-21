@@ -15,7 +15,13 @@
 | `invalid_wait` | External wait without a verifiable dependency (#1250) | `PARKED` | `NORMAL` | Diagnostic parked comment; fail closed, operator requeue required |
 | external wait | Worker is waiting on a prerequisite outside Dispatch | `WAITING_EXTERNAL` | Existing lane | No human escalation or attempt charge; retry after cooldown |
 
-The structured outcome is stored on `PrFixQueueItem` and `PrFixHistory`; human decisions may also include `decisionDetail`. A `tasks/report` request may provide `blockReason` and `decision` (`question`, `options`, `evidence`). A bare `outcome: "blocked"` without `blockReason` means `no_progress`, not `human_decision`. An `outcome` supplied on a brand-new `NORMAL`-lane enqueue is advisory and only takes effect if/when the item parks (a fresh item starts `QUEUED`).
+The structured outcome is stored on `PrFixQueueItem` and `PrFixHistory`; human decisions may also include `decisionDetail`. A `tasks/report` request may provide `blockReason` and `decision` (`question`, `options`, `evidence`). A bare `outcome: "blocked"` without `blockReason` means `no_progress`, not `human_decision`. An `outcome` supplied on a brand-new `NORMAL`-lane enqueue is advisory and only takes effect if/when the item parks (a fresh item starts `QUEUED`). A `BLOCKED` settlement always carries a `decisionDetail`: when the report or mark supplies no structured `decision`, Dispatch synthesizes one from the diagnostic (a question plus the note/reason as evidence) so the needs-human surface never renders empty (#1340).
+
+## Needs-human settlement and escalation (#1340)
+
+A worker run that ends needing a human decision (for example a Courier run terminalizing `NeedsHuman`) parks first via its bare `blocked` report and then marks the item `BLOCKED`. The sticky pin therefore relaxes in exactly one direction: a non-operator `BLOCKED` mark may **escalate** a same-generation `PARKED` row to `BLOCKED`/`human_decision` (needs-human label and marker included). `PARKED` marks stay `QUEUED`-only, a recorded `BLOCKED` stays sticky against every other worker mark, and de-escalation (`BLOCKED` → `PARKED`/`QUEUED`) remains operator-only via `allowStickyReclassify`. Operator requeue and fresh-evidence/fresh-generation exits still release `BLOCKED` two-way exactly as before.
+
+When a worker's `blocked` report settles the attempt (to `BLOCKED` or `PARKED`), the attempt's hand-out records for the **reporting agent** at the settled generation are released: the agent's `agentHandouts`, `handoutAcks`, and `handoutReceipts` entries are dropped so a consumed receipt never pins the settled item. Other agents' live hand-outs at the generation survive; the dispatch stamps (`dispatchedGeneration`, `dispatchedAt`, `attemptEvidenceWatermark`) clear only when the release removes the last live hand-out, mirroring the #1256 capacity-release rule. The release is best-effort after the settlement commit.
 
 ## Budgets and recovery
 

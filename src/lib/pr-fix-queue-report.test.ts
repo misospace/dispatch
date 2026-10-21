@@ -712,4 +712,112 @@ describe("resolvePrFixFromAgentReport", () => {
     // The merge-state probe was skipped — a hard block never reaches GitHub.
     expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
   });
+
+  // #1340: settling the attempt ends the reporting agent's hand-out. The
+  // per-agent hand-out/ack/receipt entries for the settled generation are
+  // released so a live receipt does not keep pinning the settled item —
+  // while another agent's hand-out at the same generation survives (the
+  // item stays dispatched to it).
+  it("releases the reporting agent's hand-out records when a blocked report settles the attempt (#1340)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      agentHandouts: ["fixer@1", "other@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+      attemptEvidenceWatermark: "watermark-1",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("parked");
+    expect(result.itemId).toBe("item-42");
+    expect(result.attemptGeneration).toBe(1);
+    // Two writes: the PARKED settlement, then the hand-out release.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(2);
+    const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(releaseCall?.where).toEqual({ id: "item-42", generation: 1 });
+    // fixer's entries are gone; other@1's hand-out survives, so the
+    // dispatch stamps stay.
+    expect(releaseCall?.data).toEqual({
+      handoutReceipts: [],
+      agentHandouts: ["other@1"],
+      handoutAcks: [],
+    });
+  });
+
+  it("clears the dispatch stamps when a blocked report releases the last live hand-out (#1340)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      agentHandouts: ["fixer@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+      attemptEvidenceWatermark: "watermark-1",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      summary: "repeated no-progress runs",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("parked");
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(2);
+    const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(releaseCall?.where).toEqual({ id: "item-42", generation: 1 });
+    // No hand-out left — the item is no longer dispatched.
+    expect(releaseCall?.data).toEqual({
+      handoutReceipts: [],
+      agentHandouts: [],
+      handoutAcks: [],
+      dispatchedGeneration: null,
+      dispatchedAt: null,
+      attemptEvidenceWatermark: null,
+    });
+  });
+
+  // #1340: a human_decision blocked report without a structured decision
+  // payload still records one — the settlement write carries a synthesized
+  // question and evidence so the needs-human surface has something to act on.
+  it("records a synthesized decision context when a human_decision blocked report carries no decision payload (#1340)", async () => {
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FIXTURE_ITEM });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      blockReason: "human_decision",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("blocked");
+    expect(result.itemId).toBe("item-42");
+    expect(result.attemptGeneration).toBe(1);
+    // FIXTURE_ITEM carries no hand-out records, so the release is a no-op
+    // and the only write is the BLOCKED settlement.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    const settleCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(settleCall?.data?.status).toBe("BLOCKED");
+    expect(settleCall?.data?.lane).toBe("NEEDS_HUMAN");
+    expect(typeof settleCall?.data?.decisionDetail?.question).toBe("string");
+    expect(settleCall?.data?.decisionDetail?.question?.trim().length).toBeGreaterThan(0);
+    expect(settleCall?.data?.decisionDetail?.evidence).toBe("the spec is ambiguous about retry semantics");
+  });
 });
