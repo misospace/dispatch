@@ -53,7 +53,7 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
 
 import { removeIssueLabel } from "@/lib/github";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
-import { sweepStaleWork, type StaleWorkClient } from "./stale-work";
+import { activeStateFamilies, sweepStaleWork, type StaleWorkClient } from "./stale-work";
 
 const removeIssueLabelMock = removeIssueLabel as ReturnType<typeof vi.fn>;
 
@@ -1424,5 +1424,112 @@ describe("sweepStaleWork — parked blocked claims (#1316)", () => {
     expect(report.claimRetained).toBe(0);
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
     expect(leases).toHaveLength(0);
+  });
+});
+
+// The sweeper's candidate clause / mark CAS (`reclaim`) and the live-sibling
+// lookup (`live`) are built from the SAME `activeStateFamilies` definitions,
+// so their mutual exclusion is structural. This grid pins the SEMANTICS:
+// every non-pending active row matches exactly one arm of its own family —
+// the sweep reclaims it, or it is live and shields the claim — under the
+// fake's SQL three-valued logic (a NULL timestamp never compares true).
+describe("activeStateFamilies reclaim/live complement (#1316)", () => {
+  const cutoff = minutesAgo(5);
+  const beforeCutoff = new Date(cutoff.getTime() - 60_000);
+  const afterCutoff = new Date(cutoff.getTime() + 60_000);
+  const families = activeStateFamilies(cutoff);
+  const heartbeat = families.find((family) => family.name === "heartbeat-gated")!;
+  const blocked = families.find((family) => family.name === "blocked-park")!;
+
+  function matches(row: Record<string, unknown>, clauses: { reclaim: unknown; live: unknown }) {
+    return {
+      reclaim: matchesWhere(row, clauses.reclaim),
+      live: matchesWhere(row, clauses.live),
+    };
+  }
+
+  function describeRow(row: {
+    state: string;
+    lastHeartbeatAt: Date;
+    leaseExpiresAt: Date | null;
+  }) {
+    return `state=${row.state} hb=${row.lastHeartbeatAt.toISOString()} exp=${
+      row.leaseExpiresAt?.toISOString() ?? "NULL"
+    }`;
+  }
+
+  it("every non-pending active row is either reclaimable or live, never both", () => {
+    for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
+      for (const lastHeartbeatAt of [beforeCutoff, cutoff, afterCutoff]) {
+        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, null]) {
+          const row = { state, staleClaimReleasePending: false, lastHeartbeatAt, leaseExpiresAt };
+          const own = state === "BLOCKED" ? blocked : heartbeat;
+          const other = state === "BLOCKED" ? heartbeat : blocked;
+
+          const { reclaim, live } = matches(row, own);
+          expect(reclaim !== live, describeRow(row)).toBe(true);
+          // The other family never matches a row of this family, either way.
+          expect(matches(row, other), describeRow(row)).toEqual({ reclaim: false, live: false });
+        }
+      }
+    }
+  });
+
+  it("the blocked family parks until its deadline and reclaims a NULL deadline", () => {
+    const silent = { state: "BLOCKED", staleClaimReleasePending: false, lastHeartbeatAt: afterCutoff };
+
+    // Parked (deadline in the future): live despite silence — the #1316 fix.
+    expect(matches({ ...silent, leaseExpiresAt: afterCutoff }, blocked)).toEqual({
+      reclaim: false,
+      live: true,
+    });
+    // Park elapsed: reclaimable.
+    expect(matches({ ...silent, leaseExpiresAt: beforeCutoff }, blocked)).toEqual({
+      reclaim: true,
+      live: false,
+    });
+    // No deadline, no park: reclaimable regardless of heartbeat, and it must
+    // NOT shield a claim as a live sibling (`gte` is UNKNOWN on NULL).
+    expect(matches({ ...silent, leaseExpiresAt: null }, blocked)).toEqual({
+      reclaim: true,
+      live: false,
+    });
+  });
+
+  it("the heartbeat-gated family stays live on a fresh heartbeat with a NULL expiry", () => {
+    const active = { state: "IN_PROGRESS", staleClaimReleasePending: false };
+
+    // SQL 3VL: `NULL < cutoff` is UNKNOWN, so this row is NOT a reclaim
+    // candidate; the live arm's explicit NULL clause keeps it alive.
+    expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: null }, heartbeat)).toEqual({
+      reclaim: false,
+      live: true,
+    });
+    // Silence or an elapsed expiry is reclaimable.
+    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: afterCutoff }, heartbeat)).toEqual({
+      reclaim: true,
+      live: false,
+    });
+    expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: beforeCutoff }, heartbeat)).toEqual({
+      reclaim: true,
+      live: false,
+    });
+  });
+
+  it("a pending-release active row is never a reclaim candidate for any family", () => {
+    // `staleClaimReleasePending: true` on a non-STALE row is the inconsistent
+    // retry-marker state the sweep never produces: every family's reclaim arm
+    // excludes it, so only the dedicated `state: "STALE"` retry arm can pick
+    // a release back up.
+    for (const family of families) {
+      for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
+        expect(
+          matchesWhere(
+            { state, staleClaimReleasePending: true, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: beforeCutoff },
+            family.reclaim,
+          ),
+        ).toBe(false);
+      }
+    }
   });
 });
