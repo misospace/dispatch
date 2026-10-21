@@ -90,10 +90,15 @@ Semantics that never change:
   `409 disposition_conflict`. A replayed `register` returns the persisted
   registration with `replayed: true` and writes nothing — no timestamp refresh,
   no run-reference overwrite, no second audit row.
-- **Atomicity.** The operations that assert a new fact about an attempt commit
-  their evidence together in one transaction: `register` (registration +
-  lifecycle event + audit row) and `disposition` (terminal CAS + AgentWork
-  settlement + history + lifecycle event + audit row). A write that fails
+- **Atomicity.** The operations that write lease state commit their local
+  effects together in one transaction: `register` (registration + lifecycle
+  event + audit row), `renew` (lease CAS + the matching `AgentWork` liveness
+  write + history — since #1300 that write is load-bearing for the stale-work
+  sweeper, so a crash between the CAS and the row write must not leave a
+  renewed lease whose row still carries the old lapsed expiry, #1315; a failed
+  write rolls the whole renewal back and never reports success) and
+  `disposition` (terminal CAS + AgentWork settlement + history + lifecycle
+  event + audit row). A write that fails
   mid-way rolls the whole fact back, so the retry re-enters the full path
   instead of hitting a replay that reports success for evidence which never
   landed. This matters because the issue mutation guard has no resume branch
