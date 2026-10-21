@@ -387,11 +387,12 @@ To enable OIDC authentication:
 ## Local Development
 
 Noninteractive bootstrap (recommended): [mise](https://mise.jdx.dev) reads `.mise/config.toml` and
-`.mise/mise.lock`, which pin the supported Node version with locked checksums, and `mise run
-bootstrap` is idempotent — it installs the pinned toolchain, runs `npm ci`, and generates the
-Prisma client. It requires no `DATABASE_URL`, runs no migrations, installs no Git hooks, mutates
-no global config, and does not run tests or formatting. The bootstrap needs `mise` on `PATH` and
-a non-root shell; anything else it needs is declared in `.mise/`.
+`.mise/mise.lock` — the config pins the supported Node range and the lockfile pins the exact
+version and download checksums, with `locked = true` so installs never deviate from or implicitly
+rewrite the lock. `mise run bootstrap` is idempotent — it installs the pinned toolchain, runs
+`npm ci`, and generates the Prisma client. It requires no `DATABASE_URL`, needs no sudo, runs no
+migrations, installs no Git hooks, mutates no global config, and does not run tests or formatting.
+The bootstrap needs `mise` on `PATH`; anything else it needs is declared in `.mise/`.
 
 ```bash
 mise run bootstrap   # pinned Node + npm ci + Prisma client generation (repeatable)
@@ -402,7 +403,7 @@ mise run test        # vitest suite
 Without mise, the equivalent manual steps are:
 
 ```bash
-# Install dependencies (Node >= 24; see .mise/config.toml for the exact pinned version)
+# Install dependencies (Node >= 24; exact pinned version in .mise/mise.lock)
 npm install
 
 # Generate Prisma client

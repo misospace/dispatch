@@ -1,5 +1,12 @@
 min_version = "2026.10.13"
 
+[settings]
+# Fail closed against the lockfile: installs must match a locked platform
+# entry with its pinned checksum, and mise never rewrites .mise/mise.lock
+# implicitly (an un-reviewed lock change breaks the byte-identical approval
+# check used by the Courier bootstrap contract).
+locked = true
+
 [tools]
 node = "24"
 
