@@ -13,6 +13,7 @@ import {
   type ResolveAlreadyDoneResult,
 } from "@/lib/report-close";
 import { asRepoFilePath } from "@/lib/groomer/close-grounding";
+import { parseExecutionMetadata } from "@/lib/execution-metadata";
 import { PLAN_LIMITS } from "@/lib/groomer/plan";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
@@ -76,6 +77,11 @@ export interface TaskReportBody {
   // contract fails closed to PARKED/`invalid_wait` rather than a cooldown
   // wait. Part of the report's payload identity (idempotency hash).
   externalWait?: Record<string, unknown>;
+  // #1183: optional worker-supplied execution metadata (worker product,
+  // model, effective reasoning effort, runtime/config revision, cohort
+  // label). Validated fail-closed by parseExecutionMetadata; the parsed bag
+  // participates in the idempotency payload hash like the other fields.
+  executionMetadata?: Record<string, string>;
 }
 
 function deriveStatus(outcome: ValidOutcome): string {
@@ -380,6 +386,23 @@ export async function POST(
     externalWait = raw.externalWait as Record<string, unknown>;
   }
 
+  // #1183: optional worker-supplied execution metadata. Validated fail-closed
+  // here, but the validation is STRUCTURAL ONLY (recognized keys only, values
+  // trimmed non-empty single-line printable ASCII of at most 128 chars) — it
+  // is NOT a content filter: a credential short enough to fit the shape would
+  // pass. Workers must not send secrets and Dispatch does not scan content.
+  // What the shape does guarantee: no multiline prompts or stack traces in
+  // the AgentRun column, and a bounded size. An absent or null bag is valid
+  // and empty; an empty object is not (the worker supplied the field, so it
+  // must carry something). The parsed bag participates in the idempotency
+  // payload hash like the other report fields.
+  const parsedExecutionMetadata = parseExecutionMetadata(raw.executionMetadata);
+  if (!parsedExecutionMetadata.ok) {
+    return errorResponse(parsedExecutionMetadata.error, 400);
+  }
+  const executionMetadata =
+    Object.keys(parsedExecutionMetadata.value).length > 0 ? parsedExecutionMetadata.value : undefined;
+
   // #1121/#1143: evidence is meaningful for an already_addressed settlement and
   // for an already_done close — it is trimmed, bounded, and recorded in the
   // settlement/close history. On any other outcome it is ignored (never hashed,
@@ -554,6 +577,9 @@ export async function POST(
     startedAt: resolveReportedStartedAt(raw.startedAt, now),
     prFixItem,
     capacity: typeof raw.capacity === "string" ? raw.capacity.trim() : undefined,
+    // #1183: validated execution metadata; undefined (absent/empty) leaves
+    // the AgentRun column untouched, so existing workers change nothing.
+    executionMetadata,
   };
 
   try {
@@ -575,6 +601,9 @@ export async function POST(
       errorMessage: report.error,
       touchedIssueUrls,
       issueId,
+      // #1183: persisted only when the worker supplied a non-empty validated
+      // bag; absent stays null (additive, backward compatible).
+      ...(executionMetadata ? { executionMetadata } : {}),
     };
 
     let run: { id: string };

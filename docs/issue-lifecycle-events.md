@@ -19,7 +19,9 @@ timestamps cannot drift between routes.
 Non-goals for now: a board UI over the timeline, and worker attempt
 telemetry/cohorts (downstream #1183/#1184 build on the read contract below).
 The read contract, the authoritative merge linkage, and the bounded backfill
-landed with #1203.
+landed with #1203. The attempt chain built on that contract (execution
+attempts and PR-fix rounds linked into one delivery chain) is documented in
+[docs/work-attempt-chain.md](./work-attempt-chain.md).
 
 ## Taxonomy
 

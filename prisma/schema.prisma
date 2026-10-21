@@ -305,6 +305,9 @@ model PrFixQueueItem {
   // FIRST is part of the index key order because it is part of the ORDER BY;
   // the trailing `id` matches the deterministic tiebreak.
   @@index([status, triggerEvaluatedAt(sort: Asc, nulls: First), id])
+  // #1183: the attempt-chain read fetches the queue items for one work
+  // item's exact (repo, issue) coordinates.
+  @@index([repo, issue])
 }
 
 model PrFixHistory {
@@ -386,6 +389,17 @@ model AgentRun {
   // a follow-up cleanup. Renderers that treat non-https entries as broken
   // links should be aware of this when deciding how to handle them.
   touchedIssueUrls String[]
+  // #1183: optional worker-supplied execution metadata (worker product,
+  // model, effective reasoning effort, runtime/config revision, experiment/
+  // cohort label). Bounded and validated at the API write boundaries (the
+  // tasks/report route, via src/lib/execution-metadata.ts): recognized keys
+  // only, trimmed printable-ASCII strings of at most 128 characters on a
+  // single line. This is STRUCTURAL validation only, not a content filter —
+  // a credential short enough to fit the shape would pass; workers must not
+  // send secrets and Dispatch does not scan content. The shape keeps
+  // multiline prompts and stack traces out and bounds size. Values are
+  // preserved (trimmed), never inferred; absent stays null.
+  executionMetadata Json?
   createdAt        DateTime  @default(now())
   issueId          String?
   issue            Issue?    @relation(fields: [issueId], references: [id])
@@ -399,6 +413,8 @@ model AgentRun {
   @@index([runType])
   @@index([status])
   @@index([createdAt])
+  // #1183: the attempt-chain read resolves an issue's run evidence by issueId.
+  @@index([issueId])
 }
 
 enum EscalatedOutcome {

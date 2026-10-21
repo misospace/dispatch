@@ -2482,3 +2482,142 @@ describe("POST /api/agents/[agentName]/tasks/report — lifecycle evidence (#120
     expect(warn).toHaveBeenCalled();
   });
 });
+
+describe("POST /api/agents/[agentName]/tasks/report — executionMetadata (#1183)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    // Later describes' mockReset() strips the hoisted default implementations
+    // (see the already_done suite); re-establish them so a keyed report's
+    // claim/create/update path behaves like the fresh-file default.
+    mockAgentRun.create.mockReset().mockResolvedValue({ id: "run-1" });
+    mockDedupe.create.mockReset().mockResolvedValue({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "em-key-1",
+      payloadHash: "hash",
+      agentRunId: null,
+      prFixResolution: null,
+    });
+    mockDedupe.findUnique.mockReset().mockResolvedValue(null);
+    mockDedupe.update.mockReset().mockResolvedValue({});
+    prFixResolveMock.mockReset().mockResolvedValue({
+      matched: false,
+      action: "none",
+      itemId: null,
+      reason: "no matching pr-fix queue item",
+    });
+    getLiveIssueLabelsMock.mockReset();
+  });
+
+  const bag = {
+    worker: "courier",
+    model: "gpt-5.5",
+    reasoningEffort: "high",
+    runtimeRevision: "abc123",
+    cohortLabel: "exp-42",
+  };
+
+  it("(a) a legacy report without executionMetadata stores no executionMetadata on the AgentRun", async () => {
+    const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+
+    expect(res.status).toBe(200);
+    // Absent stays null in the column: the route only writes the key when a
+    // non-empty validated bag was supplied.
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.executionMetadata).toBeUndefined();
+  });
+
+  it("(b) a report with a valid bag stores it on the AgentRun row", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      executionMetadata: bag,
+    });
+
+    expect(res.status).toBe(200);
+    const call = mockAgentRun.create.mock.calls[0][0].data;
+    expect(call.executionMetadata).toEqual(bag);
+  });
+
+  it("(c) an identical keyed retry with the bag replays as a duplicate, no second AgentRun", async () => {
+    const body = {
+      taskType: "implement",
+      outcome: "pr_opened",
+      idempotencyKey: "em-key-1",
+      executionMetadata: bag,
+    };
+    const first = await postRequest(body);
+    expect(first.status).toBe(200);
+    const payloadHash = mockDedupe.create.mock.calls[0][0].data.payloadHash;
+
+    // The retry hits the committed claim from the first report: same hash
+    // (the bag participates in the payload hash) → duplicate branch.
+    mockDedupe.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+        code: "P2002",
+        clientVersion: "test",
+      }),
+    );
+    mockDedupe.findUnique.mockResolvedValueOnce({
+      id: "claim-1",
+      agentName: "test-agent",
+      idempotencyKey: "em-key-1",
+      payloadHash,
+      agentRunId: "run-1",
+      prFixResolution: null,
+    });
+
+    const retry = await postRequest(body);
+
+    expect(retry.status).toBe(200);
+    const retryBody = await retry.json();
+    expect(retryBody.duplicate).toBe(true);
+    expect(retryBody.agentRunId).toBe("run-1");
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("(d) an empty object bag is rejected with 400", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      executionMetadata: {},
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/at least one/);
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+  });
+
+  it("(e) an unknown key is rejected with 400", async () => {
+    const res = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      executionMetadata: { worker: "courier", prompt: "leak" },
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/prompt is not a recognized key/);
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+  });
+
+  it("(f) oversized or newline-containing values are rejected with 400", async () => {
+    const oversized = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      executionMetadata: { worker: "x".repeat(129) },
+    });
+    expect(oversized.status).toBe(400);
+    expect((await oversized.json()).error).toMatch(/at most 128/);
+
+    const newline = await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      executionMetadata: { worker: "line1\nline2" },
+    });
+    expect(newline.status).toBe(400);
+
+    expect(mockAgentRun.create).not.toHaveBeenCalled();
+  });
+});
