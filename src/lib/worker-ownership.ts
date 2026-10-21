@@ -618,8 +618,11 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
       // parked row a few minutes later and deletes the very lease the park
       // was recorded on (#1316). A `blocked` disposition WITHOUT `retryAfter`
       // has no deadline to park until: the deliberate choice is NO park — the
-      // row keeps its current expiry and stays reclaimable by the normal
-      // stale path, exactly like a plain blocked checkpoint.
+      // row's `leaseExpiresAt` is CLEARED so the settlement invents no
+      // park-shaped hold of its own. The sweep's `BLOCKED` family reclaims a
+      // NULL-deadline row immediately (`leaseExpiresAt IS NULL`) and its
+      // `live` arm is UNKNOWN on NULL, so the row can neither escape the
+      // normal stale path nor shield the claim its park sits on.
       const work = await findCurrentClaimWork(tx, input.agentName, input.issueId);
       if (work) {
         const terminalState = DISPOSITION_AGENT_WORK_STATE[input.disposition];
@@ -630,7 +633,7 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
             ...(input.disposition === "blocked"
               ? {
                   blockerReason: input.note ?? work.blockerReason,
-                  ...(input.retryAfter ? { leaseExpiresAt: input.retryAfter } : {}),
+                  leaseExpiresAt: input.retryAfter ? input.retryAfter : null,
                 }
               : {}),
           },

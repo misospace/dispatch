@@ -1225,12 +1225,14 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     expect(controlReport.examined).toBe(1);
   });
 
-  it("leaves a blocked disposition without retryAfter on the normal stale path (#1316)", async () => {
+  it("clears the settled row's park deadline when a blocked disposition has no retryAfter (#1316)", async () => {
     // The settled decision: no `retryAfter` means no deadline to park until —
-    // the settlement must NOT invent a park; the row stays reclaimable exactly
-    // like a plain blocked checkpoint.
-    const expiryBefore = inMin(-10);
-    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-15), leaseExpiresAt: expiryBefore });
+    // no deadline parks nothing. The settlement must NOT leave the (still
+    // future) execution expiry in place to masquerade as a park: it clears
+    // the row's `leaseExpiresAt`, so the park-gated sweep family reclaims the
+    // row through its NULL-deadline arm and the row can never ride a
+    // park-shaped hold it had no deadline for.
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-15), leaseExpiresAt: inMin(5) });
 
     const res = await post(
       baseBody({ operation: "disposition", disposition: "blocked", note: "stuck on a decision" }),
@@ -1240,16 +1242,27 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     expect(db.agentWork.state).toBe("BLOCKED");
 
     expect(db.agentWorkUpdates).toHaveLength(1);
-    expect(db.agentWorkUpdates[0].data.state).toBe("BLOCKED");
-    // Nothing parked the row: its expiry is untouched…
-    expect(db.agentWorkUpdates[0].data.leaseExpiresAt).toBeUndefined();
-    expect(db.agentWork.leaseExpiresAt.getTime()).toBe(expiryBefore.getTime());
+    const [update] = db.agentWorkUpdates;
+    expect(update.data.state).toBe("BLOCKED");
+    // The NO-park write clears the row's deadline outright.
+    expect(update.data.leaseExpiresAt).toBeNull();
+    expect(db.agentWork.leaseExpiresAt).toBeNull();
 
-    // …and the same sweeper still reclaims it.
+    // Forensic controls against the REAL clause: the settled row (worker
+    // silent, NULL deadline) IS selected by the sweeper…
     const settledRow = db.agentWork;
-    const { client } = makeSweepClient(() => settledRow);
+    const { client, capturedClauses } = makeSweepClient(() => settledRow);
     const report = await sweepStaleWork(client);
     expect(report.examined).toBe(1);
+    const [clause] = capturedClauses;
+    const agedSettledRow = { ...settledRow, lastHeartbeatAt: inMin(-11) };
+    expect(matchesWhere(agedSettledRow, clause)).toBe(true);
+    // …while the pre-fix write shape (same aged row, the still-future
+    // execution expiry left in place) is NOT selected: a dead park-shaped
+    // hold would have shielded the row instead of returning it to the
+    // normal stale path.
+    const preFixRow = { ...agedSettledRow, leaseExpiresAt: inMin(5) };
+    expect(matchesWhere(preFixRow, clause)).toBe(false);
   });
 
   it("clears a stale external wait when the disposition is not blocked (#1251 review)", async () => {

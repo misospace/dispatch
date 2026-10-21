@@ -62,8 +62,9 @@ export interface ActiveStateFamilyPredicates {
  *   moving its `leaseExpiresAt` to the park deadline (`retryAfter`). So it is
  *   reclaimable only once the park deadline elapsed OR when it never had one
  *   (`leaseExpiresAt IS NULL` — no deadline means no park, reclaimable even
- *   with a fresh heartbeat; every row start/checkpoint/sweep write always
- *   carries a real expiry). Reclaiming on the heartbeat instead would destroy
+ *   with a fresh heartbeat; a `blocked` disposition without `retryAfter`
+ *   writes exactly that NULL in `dispositionOwnership` — no park instead of a
+ *   park-shaped hold it had no deadline for). Reclaiming on the heartbeat instead would destroy
  *   the parked claim while the park is still running, deleting the lease the
  *   `blocked` disposition was recorded on. Live is the 3VL complement of
  *   `IS NULL OR lt`: `NOT IS NULL AND notLt`, which collapses to the bare
