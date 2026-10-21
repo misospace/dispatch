@@ -1071,6 +1071,83 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     expect(db.lease.waitReason).toBe("infra cooldown");
   });
 
+  it("parks the settled AgentWork row's lease expiry at the retryAfter deadline (#1316)", async () => {
+    // The row carries the short execution expiry written by start/checkpoint.
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-6), leaseExpiresAt: inMin(-1) });
+    const retryAfter = new Date(Date.now() + 2 * 3600_000);
+
+    const res = await post(
+      baseBody({
+        operation: "disposition",
+        disposition: "blocked",
+        note: "waiting on infra",
+        retryAfter: retryAfter.toISOString(),
+      }),
+    );
+    expect(res.status).toBe(200);
+
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    const [update] = db.agentWorkUpdates;
+    expect(update.where.id).toBe("work-1");
+    expect(update.data.state).toBe("BLOCKED");
+    // The park deadline written onto the lease is also written onto the row:
+    // the stale-work sweep gates BLOCKED reclamation on that expiry, so the
+    // parked claim cannot be reclaimed before the park expires (#1316).
+    expect(update.data.leaseExpiresAt).toBeInstanceOf(Date);
+    expect((update.data.leaseExpiresAt as Date).getTime()).toBe(retryAfter.getTime());
+    expect(db.agentWork.state).toBe("BLOCKED");
+    expect(db.agentWork.leaseExpiresAt.getTime()).toBe(retryAfter.getTime());
+
+    // The sweeper leaves the parked row alone.
+    const settledRow = db.agentWork;
+    const { client, capturedClauses } = makeSweepClient(() => settledRow);
+    const report = await sweepStaleWork(client);
+    expect(report.examined).toBe(0);
+    expect(report.released).toBe(0);
+
+    // Forensic controls against the REAL clause, evaluated at the moment the
+    // bug used to fire (~5 minutes after the disposition, worker silent):
+    // the fixed row is still NOT selected…
+    const [clause] = capturedClauses;
+    const agedParkedRow = { ...settledRow, lastHeartbeatAt: inMin(-11) };
+    expect(matchesWhere(agedParkedRow, clause)).toBe(false);
+    // …while the pre-fix write shape (same aged row, old execution expiry
+    // left in place) is selected and would have had its parked claim
+    // destroyed.
+    const agedPreFixRow = { ...agedParkedRow, leaseExpiresAt: inMin(-6) };
+    expect(matchesWhere(agedPreFixRow, clause)).toBe(true);
+    const control = makeSweepClient(() => agedPreFixRow);
+    const controlReport = await sweepStaleWork(control.client);
+    expect(controlReport.examined).toBe(1);
+  });
+
+  it("leaves a blocked disposition without retryAfter on the normal stale path (#1316)", async () => {
+    // The settled decision: no `retryAfter` means no deadline to park until —
+    // the settlement must NOT invent a park; the row stays reclaimable exactly
+    // like a plain blocked checkpoint.
+    const expiryBefore = inMin(-10);
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-15), leaseExpiresAt: expiryBefore });
+
+    const res = await post(
+      baseBody({ operation: "disposition", disposition: "blocked", note: "stuck on a decision" }),
+    );
+    expect(res.status).toBe(200);
+    expect(db.lease.retryAfter).toBeNull();
+    expect(db.agentWork.state).toBe("BLOCKED");
+
+    expect(db.agentWorkUpdates).toHaveLength(1);
+    expect(db.agentWorkUpdates[0].data.state).toBe("BLOCKED");
+    // Nothing parked the row: its expiry is untouched…
+    expect(db.agentWorkUpdates[0].data.leaseExpiresAt).toBeUndefined();
+    expect(db.agentWork.leaseExpiresAt.getTime()).toBe(expiryBefore.getTime());
+
+    // …and the same sweeper still reclaims it.
+    const settledRow = db.agentWork;
+    const { client } = makeSweepClient(() => settledRow);
+    const report = await sweepStaleWork(client);
+    expect(report.examined).toBe(1);
+  });
+
   it("clears a stale external wait when the disposition is not blocked (#1251 review)", async () => {
     // An earlier renew parked an external wait; a terminal completed
     // disposition must drop it so the gone owner is not EXTERNAL_WAIT.

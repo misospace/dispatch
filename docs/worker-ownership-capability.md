@@ -15,7 +15,21 @@ label cleanup, requeue, or credential rotation happens through this capability
 |---|---|---|
 | `register` | `runRef?` (≤500 chars) | Records durable ownership on the lease (server `registeredAt` + worker-reported `registrationOccurredAt`), one deduplicated `ownership_registered` lifecycle event, one audit row. |
 | `renew` | `runRef?`, `externalWait?` (`{reason, retryAfter}` or `null` to clear) | Extends the single ownership TTL (`expiredAt = now + DISPATCH_OWNERSHIP_RENEW_TTL_MS`), increments `renewCount`, records observed + occurred renewal times, heartbeats the **current claim's** active `AgentWork` row and refreshes that row's `leaseExpiresAt` to the renewed ownership expiry — so the stale-work sweep (which reclaims on `leaseExpiresAt` as well as on the heartbeat) cannot reclaim a renewed long-running worker. Progress is **not** required. |
-| `disposition` | `disposition` ∈ `completed`/`released`/`blocked`/`handed_off`, `note?`, `successorRef?`, `retryAfter?`/`waitReason?` | Durable terminal record on the lease (`disposition*` columns), settles the **current claim's** active `AgentWork` row (DONE/RELEASED/BLOCKED) — never an arbitrary active sibling (see *Current claim's work* below), records an `ownership_dispositioned` lifecycle event and audit row. |
+| `disposition` | `disposition` ∈ `completed`/`released`/`blocked`/`handed_off`, `note?`, `successorRef?`, `retryAfter?`/`waitReason?` | Durable terminal record on the lease (`disposition*` columns), settles the **current claim's** active `AgentWork` row (DONE/RELEASED/BLOCKED) — never an arbitrary active sibling (see *Current claim's work* below), records an `ownership_dispositioned` lifecycle event and audit row. A `blocked` disposition **with `retryAfter`** also moves the settled row's `leaseExpiresAt` to the park deadline — the same `retryAfter` written on the lease — so the stale-work sweep cannot reclaim the parked claim before the park expires (#1316). A `blocked` disposition **without `retryAfter`** has no deadline to park until: the deliberate choice is NO park — the row keeps its current expiry and stays reclaimable by the normal stale path. Terminal dispositions (`completed`/`released`/`handed_off`) settle to non-active states and are unaffected. |
+
+**Stale-work sweep and blocked parks (#1316).** The sweep gates the two
+active families differently. `CLAIMED`/`IN_PROGRESS` rows are
+**heartbeat-gated** (reclaimable when `lastHeartbeatAt` OR `leaseExpiresAt`
+fell past the cutoff — silence of an executing worker is the failure the
+sweep catches). `BLOCKED` rows are **park-gated**: a blocked worker is
+silent by design, so a `BLOCKED` row is reclaimable only when
+`leaseExpiresAt < cutoff` (the park deadline elapsed) or
+`leaseExpiresAt IS NULL` (no deadline, no park — normal stale path). The
+live-sibling lookup is the exact per-state complement, so a parked row
+protects the lease its park was recorded on. After the deadline passes, the
+parked row follows the normal reclaim path: marked `STALE`, its lease is
+deleted through the epoch-fenced delete, and the claim is released for
+re-dispatch.
 
 **Stale-work sweep and claim incarnations.** The sweep releases the claim of a
 stale `AgentWork` row only when no live sibling row for the same (agent, issue)

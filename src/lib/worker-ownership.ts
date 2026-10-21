@@ -578,6 +578,19 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
       // current IN_PROGRESS row must not absorb a `completed`/`released`
       // disposition while the current attempt stays active. History is
       // written by the same call; the lease row itself is retained as evidence.
+      //
+      // A `blocked` disposition WITH `retryAfter` parks the claim as an
+      // external wait, and the parked row's park deadline is its
+      // `leaseExpiresAt`: the stale-work sweep treats `BLOCKED` as an active
+      // state, and a parked worker is silent BY DESIGN, so the park deadline —
+      // not the heartbeat — is what keeps the row out of the reclaim
+      // (see `stale-work.ts`). Without this refresh the row keeps the short
+      // execution expiry written by start/checkpoint, the sweep reclaims the
+      // parked row a few minutes later and deletes the very lease the park
+      // was recorded on (#1316). A `blocked` disposition WITHOUT `retryAfter`
+      // has no deadline to park until: the deliberate choice is NO park — the
+      // row keeps its current expiry and stays reclaimable by the normal
+      // stale path, exactly like a plain blocked checkpoint.
       const work = await findCurrentClaimWork(tx, input.agentName, input.issueId);
       if (work) {
         const terminalState = DISPOSITION_AGENT_WORK_STATE[input.disposition];
@@ -585,7 +598,12 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
           where: { id: work.id },
           data: {
             state: terminalState,
-            ...(input.disposition === "blocked" ? { blockerReason: input.note ?? work.blockerReason } : {}),
+            ...(input.disposition === "blocked"
+              ? {
+                  blockerReason: input.note ?? work.blockerReason,
+                  ...(input.retryAfter ? { leaseExpiresAt: input.retryAfter } : {}),
+                }
+              : {}),
           },
         });
         await tx.agentWorkHistory.create({
