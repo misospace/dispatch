@@ -7,9 +7,11 @@
  * counted the caller is rejected until the window expires.
  *
  * Route handlers should call `enforceRateLimit` at the top of their mutating
- * handlers, right after auth, keyed by the authenticated actor:
+ * handlers, right after auth, keyed by the credential-derived throttle
+ * identity — never by `auth.actor` or a caller-supplied agent name, which
+ * can be rotated to open fresh windows (#1322):
  *
- *   const limited = enforceRateLimit(`issues/move:${auth.actor}`, RATE_LIMIT);
+ *   const limited = enforceRateLimit(`issues/move:${auth.throttleKey}`, RATE_LIMIT);
  *   if (limited) return limited;
  *
  * Expired windows are pruned lazily on write (no timers), so the map stays

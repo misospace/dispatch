@@ -22,7 +22,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`lane:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`lane:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

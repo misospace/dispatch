@@ -26,22 +26,26 @@
 // 4. **Serialization.** Lease-mutating operations run under the per-issue
 //    `IssueMutationGuard` anchor (#1259) so a renewal cannot interleave with a
 //    claim or a fenced capacity release on the same issue.
-// 5. **Atomicity.** The two operations that assert a *new fact* about an
-//    attempt — `register` (registration + lifecycle event + audit row) and
+// 5. **Atomicity.** Every operation that writes lease state commits its local
+//    effects in ONE `prisma.$transaction`, all through that transaction's
+//    client: `register` (registration + lifecycle event + audit row), `renew`
+//    (lease CAS + matching `AgentWork` liveness write + history, #1315) and
 //    `disposition` (terminal CAS + AgentWork settlement + history + lifecycle
-//    event + audit row) — commit in ONE `prisma.$transaction`, the lifecycle
-//    event through that transaction's client. That guard anchor has no resume
-//    branch and is deleted on throw, so a CAS committed without its evidence
-//    would be unreachable on retry: the replay branch would report success for
-//    a disposition whose work was never settled and whose required lifecycle
-//    event does not exist. `renew` is deliberately NOT in this class — it
-//    extends a TTL that a retry can safely re-extend and heartbeats a
-//    matching `AgentWork` as best-effort evidence whose absence it reports
-//    truthfully (`agentWorkHeartbeated: false`), so there is nothing for it
-//    to lie about. That heartbeat also carries the renewed expiry onto the
-//    AgentWork row: the stale-work sweeper reclaims on `leaseExpiresAt` too,
-//    so a renewal that moved only the heartbeat would still lose a renewed
-//    long-running worker to the sweeper (#1251).
+//    event + audit row). For `register`/`disposition` the reason is the guard
+//    anchor: it has no resume branch and is deleted on throw, so a CAS
+//    committed without its evidence would be unreachable on retry — the replay
+//    branch would report success for a disposition whose work was never
+//    settled and whose required lifecycle event does not exist. For `renew`
+//    the reason is the sweeper: since #1300 the `AgentWork` liveness write is
+//    load-bearing, not best-effort evidence — `sweepStaleWork` reclaims on
+//    `leaseExpiresAt` as well as on `lastHeartbeatAt`, so a crash between a
+//    committed lease CAS and the row write left the AgentWork row on its old
+//    lapsed 5-minute expiry and the sweep reclaimed the renewed worker and
+//    deleted its lease. `agentWorkHeartbeated: false` stays truthful in this
+//    class too: it reports the ABSENCE of a matching active row (nothing to
+//    write, nothing rolled back), never a lost write — a failed write rolls
+//    the whole renewal back and the route reports 500, it never answers
+//    success.
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
@@ -254,21 +258,28 @@ export function findCurrentClaimWork<T extends { agentWork: { findFirst: (args: 
  *
  * The row refreshed is the CURRENT claim's work (`findCurrentClaimWork`), so
  * the row a renewal is about cannot be a sibling the renewal left behind.
+ *
+ * Runs on the CALLER's transaction client (#1315): the renewal's lease CAS and
+ * this write are one local fact, so a crash cannot leave a renewed lease whose
+ * AgentWork row still carries the old lapsed expiry the sweeper reclaims on.
+ * Returning `false` means no active row matched — nothing was written, not
+ * that a write was lost.
  */
 async function heartbeatMatchingAgentWork(
+  client: Prisma.TransactionClient,
   input: OwnershipOpInput,
   action: string,
   summary: string | null | undefined,
   now: Date,
   expiresAt: Date,
 ): Promise<boolean> {
-  const work = await findCurrentClaimWork(prisma, input.agentName, input.issueId);
+  const work = await findCurrentClaimWork(client, input.agentName, input.issueId);
   if (!work) return false;
-  await prisma.agentWork.update({
+  await client.agentWork.update({
     where: { id: work.id },
     data: { lastHeartbeatAt: now, leaseExpiresAt: expiresAt },
   });
-  await prisma.agentWorkHistory.create({
+  await client.agentWorkHistory.create({
     data: { workId: work.id, action, summary: summary ?? undefined },
   });
   return true;
@@ -423,6 +434,19 @@ export interface RenewOwnershipSuccess {
  * all (`no_active_claim` — the claim was released or pruned), a mismatched
  * token (`stale_claim_token` — a superseded incarnation), and any lease that
  * already carries a terminal disposition (`disposed`).
+ *
+ * Atomicity (#1315): the fenced lease CAS and the matching `AgentWork`
+ * liveness write (heartbeat + renewed expiry + history) commit in ONE
+ * `prisma.$transaction` through the transaction's client. The write is
+ * load-bearing since #1300 — the stale-work sweeper reclaims on
+ * `leaseExpiresAt` too — so a crash between the two used to leave the lease
+ * renewed while the AgentWork row kept its old lapsed 5-minute expiry, and
+ * the sweep then reclaimed the worker and deleted the lease. A failure rolls
+ * the whole renewal back and the route reports 500: a rolled-back renewal
+ * never reports success. A replay just re-extends the TTL (idempotent by
+ * nature), so unlike register/disposition there is no replay branch to
+ * corrupt — the CAS stays the transaction's FIRST statement, so the
+ * lost-race early return commits an empty transaction.
  */
 export async function renewOwnership(input: RenewOwnershipInput): Promise<{ ok: true; value: RenewOwnershipSuccess } | OwnershipOpFailure> {
   const now = input.now ?? new Date();
@@ -435,47 +459,52 @@ export async function renewOwnership(input: RenewOwnershipInput): Promise<{ ok: 
     if (lease.disposition) return fail("disposed");
 
     const expiresAt = new Date(now.getTime() + ownershipRenewTtlMs());
-    // Compare-and-set against the exact token and a still-undisposed row: a
-    // disposition landing concurrently makes this renewal a no-op, never a
-    // resurrection of terminal ownership.
-    const updated = await prisma.lease.updateMany({
-      where: { id: lease.id, claimToken: input.claimToken, disposition: null },
-      data: {
-        expiredAt: expiresAt,
-        renewedAt: now,
-        lastRenewalObservedAt: now,
-        lastRenewalOccurredAt: occurred,
-        renewCount: { increment: 1 },
-        ...(input.runRef ? { runRef: input.runRef } : {}),
-        ...externalWaitData(input.externalWait),
-      },
-    });
-    if (updated.count === 0) return fail("stale_claim_token", "Claim changed concurrently; re-read active work and retry");
+    return prisma.$transaction(async (tx): Promise<{ ok: true; value: RenewOwnershipSuccess } | OwnershipOpFailure> => {
+      // Compare-and-set against the exact token and a still-undisposed row: a
+      // disposition landing concurrently makes this renewal a no-op, never a
+      // resurrection of terminal ownership. Keep it first: the early return
+      // below commits whatever ran before it, which must be nothing.
+      const updated = await tx.lease.updateMany({
+        where: { id: lease.id, claimToken: input.claimToken, disposition: null },
+        data: {
+          expiredAt: expiresAt,
+          renewedAt: now,
+          lastRenewalObservedAt: now,
+          lastRenewalOccurredAt: occurred,
+          renewCount: { increment: 1 },
+          ...(input.runRef ? { runRef: input.runRef } : {}),
+          ...externalWaitData(input.externalWait),
+        },
+      });
+      if (updated.count === 0) return fail("stale_claim_token", "Claim changed concurrently; re-read active work and retry");
 
-    const row = await prisma.lease.findUnique({ where: { id: lease.id } });
-    // The same clock and the same expiry the lease was written with: the
-    // matching active AgentWork row is refreshed to the renewed ownership
-    // expiry, so the stale-work sweeper cannot reclaim a worker that is
-    // still renewing (#1251).
-    const agentWorkHeartbeated = await heartbeatMatchingAgentWork(
-      input,
-      "ownership_renewed",
-      input.externalWait && typeof input.externalWait === "object" ? `external wait: ${input.externalWait.reason}` : null,
-      now,
-      expiresAt,
-    );
-
-    return {
-      ok: true as const,
-      value: {
-        leaseId: lease.id,
+      const row = await tx.lease.findUnique({ where: { id: lease.id } });
+      // The same clock and the same expiry the lease was written with: the
+      // matching active AgentWork row is refreshed to the renewed ownership
+      // expiry, so the stale-work sweeper cannot reclaim a worker that is
+      // still renewing (#1251). On THIS transaction's client, so the sweeper
+      // can never observe the lease renewed and the row not (#1315).
+      const agentWorkHeartbeated = await heartbeatMatchingAgentWork(
+        tx,
+        input,
+        "ownership_renewed",
+        input.externalWait && typeof input.externalWait === "object" ? `external wait: ${input.externalWait.reason}` : null,
+        now,
         expiresAt,
-        renewCount: row?.renewCount ?? 1,
-        lastRenewalObservedAt: now,
-        lastRenewalOccurredAt: occurred,
-        agentWorkHeartbeated,
-      },
-    };
+      );
+
+      return {
+        ok: true as const,
+        value: {
+          leaseId: lease.id,
+          expiresAt,
+          renewCount: row?.renewCount ?? 1,
+          lastRenewalObservedAt: now,
+          lastRenewalOccurredAt: occurred,
+          agentWorkHeartbeated,
+        },
+      };
+    });
   });
 }
 

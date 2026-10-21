@@ -36,7 +36,7 @@ const { mocks, db, applyData } = vi.hoisted(() => {
       guardBusy: false,
       // One-shot write-failure injection: the named delegate throws the first
       // time it is reached after being armed, so the retry runs clean.
-      failAt: null as null | "agentWork.update" | "lifecycle" | "audit",
+      failAt: null as null | "agentWork.update" | "agentWorkHistory.create" | "lifecycle" | "audit",
     },
     db: {
       issue: null as any,
@@ -229,6 +229,7 @@ vi.mock("@/lib/prisma", () => {
       },
       agentWorkHistory: {
         create: async ({ data }: any) => {
+          maybeFail("agentWorkHistory.create");
           pushRow("agentWorkHistory.create", db.agentWorkHistory, data);
           return data;
         },
@@ -792,6 +793,109 @@ describe("POST /api/agent-work/ownership — renew", () => {
     const got = new Date(body.lastRenewalOccurredAt).getTime();
     expect(got).toBeGreaterThan(before - 5000);
     expect(got).toBeLessThanOrEqual(before + 5000);
+  });
+});
+
+describe("POST /api/agent-work/ownership — renew atomicity (#1315)", () => {
+  // The renewal's fenced lease CAS and the matching AgentWork liveness write
+  // are ONE local fact (#1315): the sweeper reclaims on `leaseExpiresAt` too,
+  // so a crash between the two used to leave a renewed lease whose AgentWork
+  // row still carried the old lapsed expiry — reclaimable, renewal lost. A
+  // rolled-back renewal must never report success.
+  let consoleError: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleError.mockRestore();
+  });
+
+  const assertRenewRolledBack = (seededExpiry: Date, seededHeartbeat: Date, seededRowExpiry: Date) => {
+    // Lease: no renewal committed.
+    expect(db.lease.renewCount).toBe(0);
+    expect(db.lease.renewedAt).toBeNull();
+    expect(db.lease.lastRenewalObservedAt).toBeNull();
+    expect(db.lease.lastRenewalOccurredAt).toBeNull();
+    expect(db.lease.expiredAt.getTime()).toBe(seededExpiry.getTime());
+    // AgentWork: no liveness write survived either.
+    expect(db.agentWorkUpdates).toHaveLength(0);
+    expect(db.agentWorkHistory).toHaveLength(0);
+    expect(db.agentWork.lastHeartbeatAt.getTime()).toBe(seededHeartbeat.getTime());
+    expect(db.agentWork.leaseExpiresAt.getTime()).toBe(seededRowExpiry.getTime());
+    // A rolled-back renewal answered nothing but the 500 (the injector's
+    // ambient out-of-transaction audit row is not an ownership write).
+    expect(db.audit.filter((a) => a.action.startsWith("ownership_"))).toHaveLength(0);
+  };
+
+  it("commits the lease CAS and the AgentWork liveness write through one transaction client", async () => {
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
+
+    const res = await post(baseBody({ operation: "renew" }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).agentWorkHeartbeated).toBe(true);
+    expect(db.txCount).toBe(1);
+    // Lease CAS, AgentWork heartbeat and its history all went out on the
+    // transaction client — nothing escaped to the ambient root client.
+    expect(db.writes.map((w) => w.op)).toEqual([
+      "lease.updateMany",
+      "agentWork.update",
+      "agentWorkHistory.create",
+    ]);
+    expect(db.writes.filter((w) => w.client === "prisma")).toEqual([]);
+  });
+
+  it("rolls the lease CAS back when the AgentWork liveness write fails, and converges on retry", async () => {
+    db.agentWork = makeAgentWork({ lastHeartbeatAt: inMin(-12), leaseExpiresAt: inMin(-10) });
+    const seededExpiry = db.lease.expiredAt;
+    const seededHeartbeat = db.agentWork.lastHeartbeatAt;
+    const seededRowExpiry = db.agentWork.leaseExpiresAt;
+    mocks.failAt = "agentWork.update";
+
+    const failed = await post(baseBody({ operation: "renew" }));
+    expect(failed.status).toBe(500);
+    expect(db.txCount).toBe(1);
+    assertRenewRolledBack(seededExpiry, seededHeartbeat, seededRowExpiry);
+
+    // Renewals are idempotent by nature: the retry re-extends normally and
+    // keeps the worker alive for the sweeper.
+    const retry = await post(baseBody({ operation: "renew" }));
+    expect(retry.status).toBe(200);
+    const body = await retry.json();
+    expect(body.renewCount).toBe(1);
+    expect(body.agentWorkHeartbeated).toBe(true);
+    expect(db.lease.renewCount).toBe(1);
+    expect(db.agentWork.leaseExpiresAt.getTime()).toBe(db.lease.expiredAt.getTime());
+  });
+
+  it("rolls the heartbeat back as well when the history write fails after it", async () => {
+    db.agentWork = makeAgentWork();
+    const seededExpiry = db.lease.expiredAt;
+    const seededHeartbeat = db.agentWork.lastHeartbeatAt;
+    const seededRowExpiry = db.agentWork.leaseExpiresAt;
+    mocks.failAt = "agentWorkHistory.create";
+
+    const failed = await post(baseBody({ operation: "renew" }));
+    expect(failed.status).toBe(500);
+    expect(db.txCount).toBe(1);
+    // The heartbeat HAD been written inside the transaction; the missing
+    // history row rolls it back together with the lease CAS.
+    assertRenewRolledBack(seededExpiry, seededHeartbeat, seededRowExpiry);
+  });
+
+  it("keeps the lost-race CAS first: a compare-and-set miss commits nothing and reports 409", async () => {
+    db.agentWork = makeAgentWork();
+    db.updateManyCount = 0;
+
+    const res = await post(baseBody({ operation: "renew" }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("stale_claim_token");
+    // The CAS is the transaction's first statement, so the early return
+    // committed an empty transaction: no heartbeat, no history.
+    expect(db.writes).toEqual([]);
+    expect(db.agentWorkUpdates).toHaveLength(0);
+    expect(db.agentWorkHistory).toHaveLength(0);
   });
 });
 

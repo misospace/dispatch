@@ -16,7 +16,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`groomer/run:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`groomer/run:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   let body: Record<string, unknown> = {};

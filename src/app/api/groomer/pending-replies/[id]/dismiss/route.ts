@@ -16,7 +16,7 @@ export async function POST(
   if (!auth.authorized) return authErrorResponse(auth);
   const forbidden = rejectAgentCaller(auth, "Dismissing a groomer reply");
   if (forbidden) return forbidden;
-  const limited = enforceRateLimit(`groomer-reply-dismiss:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`groomer-reply-dismiss:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

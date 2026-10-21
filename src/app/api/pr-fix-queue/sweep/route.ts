@@ -23,7 +23,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`pr-fix-sweep:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`pr-fix-sweep:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   const lock = await acquireLock("pr-fix-handout-sweep");

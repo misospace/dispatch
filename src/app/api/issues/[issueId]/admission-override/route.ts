@@ -64,7 +64,7 @@ export async function POST(request: Request, context: { params: Promise<{ issueI
   const forbidden = rejectAgentCaller(auth);
   if (forbidden) return forbidden;
 
-  const limited = enforceRateLimit(`admission-override:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`admission-override:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {
@@ -179,7 +179,7 @@ export async function DELETE(request: Request, context: { params: Promise<{ issu
   const forbidden = rejectAgentCaller(auth);
   if (forbidden) return forbidden;
 
-  const limited = enforceRateLimit(`admission-override:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`admission-override:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

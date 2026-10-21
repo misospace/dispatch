@@ -25,7 +25,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`pr-health-refresh:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`pr-health-refresh:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

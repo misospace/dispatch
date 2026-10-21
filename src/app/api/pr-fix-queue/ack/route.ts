@@ -47,7 +47,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const limited = enforceRateLimit(`pr-fix-ack:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`pr-fix-ack:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   let body: unknown;

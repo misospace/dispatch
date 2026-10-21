@@ -39,7 +39,7 @@ const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 describe("GET /api/issues/actions/agents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", throttleKey: "disabled:test-agent", tier: "maintainer" });
     mocks.parseAgentList.mockReturnValue(["worker", "reviewer"]);
     mocks.findMany.mockResolvedValue([
       { labels: ["status/backlog", "agent/handler", "type/feature"] },
