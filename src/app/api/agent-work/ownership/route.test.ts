@@ -1276,6 +1276,29 @@ describe("POST /api/agent-work/ownership — disposition", () => {
     expect(db.lease.waitReason).toBeNull();
   });
 
+  it("clears a stale external wait when the disposition is blocked without retryAfter (#1316 review)", async () => {
+    // The disposition is the latest statement of the owner's intent: a
+    // blocked settlement with NO deadline overrides the wait marker an
+    // earlier renew's externalWait left on the lease. Keeping it would put
+    // the read model in EXTERNAL_WAIT against the recorded no-park
+    // settlement, and the sweep's fenced delete would erase the marker
+    // immediately after reclaiming the cleared row — the erasure class the
+    // cleanup skip (#1334) prevents while the marker is legitimately running.
+    db.lease = { ...db.lease, retryAfter: new Date(Date.now() + 3600_000), waitReason: "dep" };
+    db.agentWork = makeAgentWork({ leaseExpiresAt: inMin(5) });
+
+    const res = await post(
+      baseBody({ operation: "disposition", disposition: "blocked", note: "stuck on a decision" }),
+    );
+    expect(res.status).toBe(200);
+    expect(db.lease.disposition).toBe("blocked");
+    expect(db.lease.retryAfter).toBeNull();
+    expect(db.lease.waitReason).toBeNull();
+    // The row settles to the same no-park shape: no deadline at all.
+    expect(db.agentWork.state).toBe("BLOCKED");
+    expect(db.agentWork.leaseExpiresAt).toBeNull();
+  });
+
   it("rejects a past retryAfter with 400", async () => {
     const res = await post(
       baseBody({

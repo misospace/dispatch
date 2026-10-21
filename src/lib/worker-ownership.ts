@@ -571,11 +571,17 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
     // route rejects retryAfter on other kinds with 400; here, a terminal
     // non-blocked disposition additionally CLEARS any wait marker recorded by
     // an earlier renew, so a gone owner is never parked as EXTERNAL_WAIT in
-    // the read model (which would shadow the terminal evidence).
+    // the read model (which would shadow the terminal evidence). A `blocked`
+    // disposition WITHOUT `retryAfter` clears the marker for the same
+    // coherence reason: the disposition is the latest statement of the
+    // owner's intent — no wait deadline — and a stale future marker left by
+    // an earlier renew would contradict the recorded no-park settlement and
+    // put the read model in EXTERNAL_WAIT (a wait marker this settlement's
+    // row write no longer protects, #1316 review).
     const waitPatch = input.disposition === "blocked"
       ? (input.retryAfter
           ? { retryAfter: input.retryAfter, waitReason: input.waitReason ?? input.note ?? null }
-          : {})
+          : { retryAfter: null, waitReason: null })
       : { retryAfter: null, waitReason: null };
 
     // Everything from the terminal compare-and-set onward is one local fact
