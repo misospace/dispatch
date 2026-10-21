@@ -30,7 +30,7 @@ const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 describe("GET /api/automation/events", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", tier: "maintainer" });
+    mockAuthorizeRequest.mockResolvedValue({ authorized: true, type: "disabled", actor: "test-agent", throttleKey: "disabled:test-agent", tier: "maintainer" });
   });
 
   it("returns 401 when not authenticated", async () => {

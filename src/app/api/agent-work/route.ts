@@ -150,7 +150,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`agent-work:${auth.actor}`, { limit: 30, windowMs: 10_000 });
+  const limited = enforceRateLimit(`agent-work:${auth.throttleKey}`, { limit: 30, windowMs: 10_000 });
   if (limited) return limited;
 
   try {

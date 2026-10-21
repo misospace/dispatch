@@ -28,7 +28,7 @@ export async function POST(request: Request) {
   }
   const auditActor = getAuthorizedActor(auth, request);
 
-  const limited = enforceRateLimit(`route:issues/unassign:${auditActor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`route:issues/unassign:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   try {

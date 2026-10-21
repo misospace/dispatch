@@ -20,8 +20,11 @@ async function recordWorkerScopeDenial(
       auth.authorized && auth.type === "bearer" && auth.agentName
         ? auth.agentName
         : "unbound-worker";
+    // Throttle on the credential-derived identity (#1322), not the row actor,
+    // so every bucket key for this stream follows the same rule as routes.
+    const throttleKey = auth.authorized ? auth.throttleKey : "unknown";
     const { checkRateLimit } = await import("./rate-limit");
-    if (!checkRateLimit(`worker_scope_denied:${actor}`, { limit: 10, windowMs: 60_000 }).allowed) {
+    if (!checkRateLimit(`worker_scope_denied:${throttleKey}`, { limit: 10, windowMs: 60_000 }).allowed) {
       return;
     }
     const { prisma } = await import("./prisma");

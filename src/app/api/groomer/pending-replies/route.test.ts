@@ -30,7 +30,7 @@ function request(url = "http://localhost/api/groomer/pending-replies") {
 describe("GET /api/groomer/pending-replies", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "basic", actor: "operator" });
+    mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "basic", actor: "operator", throttleKey: "basic:operator" });
     mocks.enforceRateLimit.mockReturnValue(null);
     mocks.findMany.mockResolvedValue([{ id: "reply-1", commentBody: "Proposed reply", trustContext: {} }]);
   });
@@ -49,7 +49,7 @@ describe("GET /api/groomer/pending-replies", () => {
     const response = await GET(request());
 
     expect(response).toBe(limited);
-    expect(mocks.enforceRateLimit).toHaveBeenCalledWith("groomer-reply-list:operator", { limit: 30, windowMs: 10_000 });
+    expect(mocks.enforceRateLimit).toHaveBeenCalledWith("groomer-reply-list:basic:operator", { limit: 30, windowMs: 10_000 });
     expect(mocks.findMany).not.toHaveBeenCalled();
   });
 

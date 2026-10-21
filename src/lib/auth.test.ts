@@ -16,7 +16,7 @@ import {
   authorizeGroomerRequest,
 } from "./auth";
 import { enforceWorkerAgentScope, enforceWorkerBound } from "./worker-identity";
-import { resetRateLimits, type RateLimitOptions, type RateLimitResult } from "./rate-limit";
+import { enforceRateLimit, resetRateLimits, type RateLimitOptions, type RateLimitResult } from "./rate-limit";
 
 const { mocks } = vi.hoisted(() => ({
   mocks: {
@@ -378,6 +378,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "disabled",
       actor: "operator",
+      throttleKey: "disabled:operator",
       tier: "maintainer",
     });
   });
@@ -394,6 +395,7 @@ describe("authorizeRequest (route helper)", () => {
       type: "basic",
       username: "operator",
       actor: "operator",
+      throttleKey: "basic:operator",
       tier: "maintainer",
     });
   });
@@ -410,6 +412,9 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "bearer",
       actor: "worker-1",
+      // The actor is header-derived for attribution, but the throttle key is
+      // credential-derived and must not contain or depend on x-agent-name.
+      throttleKey: expect.stringMatching(/^maintainer-cred:[0-9a-f]{32}$/),
       tier: "maintainer",
     });
   });
@@ -422,6 +427,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "oidc",
       actor: "operator@example.com",
+      throttleKey: "oidc:operator@example.com",
       tier: "maintainer",
     });
   });
@@ -436,6 +442,7 @@ describe("authorizeRequest (route helper)", () => {
       authorized: true,
       type: "bearer",
       actor: "agent",
+      throttleKey: expect.stringMatching(/^maintainer-cred:[0-9a-f]{32}$/),
       tier: "maintainer",
     });
     expect(mocks.auth).not.toHaveBeenCalled();
@@ -1016,25 +1023,25 @@ describe("enforceWorkerAgentScope (#1129)", () => {
   it("allows maintainer, oidc, basic and disabled callers for any agent", async () => {
     await expect(
       enforceWorkerAgentScope(
-        { authorized: true, type: "oidc", actor: "operator", tier: "maintainer" },
+        { authorized: true, type: "oidc", actor: "operator", throttleKey: "oidc:operator", tier: "maintainer" },
         "any-agent",
       ),
     ).resolves.toBeNull();
     await expect(
       enforceWorkerAgentScope(
-        { authorized: true, type: "basic", username: "operator", actor: "operator", tier: "maintainer" },
+        { authorized: true, type: "basic", username: "operator", actor: "operator", throttleKey: "basic:operator", tier: "maintainer" },
         "any-agent",
       ),
     ).resolves.toBeNull();
     await expect(
       enforceWorkerAgentScope(
-        { authorized: true, type: "disabled", actor: "operator", tier: "maintainer" },
+        { authorized: true, type: "disabled", actor: "operator", throttleKey: "disabled:operator", tier: "maintainer" },
         "any-agent",
       ),
     ).resolves.toBeNull();
     await expect(
       enforceWorkerAgentScope(
-        { authorized: true, type: "bearer", actor: "operator", tier: "maintainer" },
+        { authorized: true, type: "bearer", actor: "operator", throttleKey: "maintainer-cred:test", tier: "maintainer" },
         "any-agent",
       ),
     ).resolves.toBeNull();
@@ -1043,7 +1050,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
   it("allows a bound worker acting for its own agent", async () => {
     await expect(
       enforceWorkerAgentScope(
-        { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+        { authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" },
         "alpha",
       ),
     ).resolves.toBeNull();
@@ -1051,7 +1058,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
 
   it("denies a bound worker acting for another agent with a 403 and no token leak", async () => {
     const res = await enforceWorkerAgentScope(
-      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      { authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" },
       "bravo",
     );
     expect(res?.status).toBe(403);
@@ -1062,7 +1069,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
 
   it("writes a best-effort worker_scope_denied audit row on denial", async () => {
     await enforceWorkerAgentScope(
-      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      { authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" },
       "bravo",
     );
     expect(mocks.auditCreate).toHaveBeenCalledTimes(1);
@@ -1076,7 +1083,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
   it("a failing scope-denial audit write never changes the 403 decision", async () => {
     mocks.auditCreate.mockRejectedValueOnce(new Error("db down"));
     const res = await enforceWorkerAgentScope(
-      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      { authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" },
       "bravo",
     );
     expect(res?.status).toBe(403);
@@ -1087,7 +1094,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
       throw new Error("limiter down");
     });
     const res = await enforceWorkerAgentScope(
-      { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+      { authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" },
       "bravo",
     );
     expect(res?.status).toBe(403);
@@ -1098,7 +1105,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
     try {
       for (let i = 0; i < 14; i += 1) {
         await enforceWorkerAgentScope(
-          { authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" },
+          { authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" },
           "bravo",
         );
       }
@@ -1110,7 +1117,7 @@ describe("enforceWorkerAgentScope (#1129)", () => {
 
   it("denies an unbound legacy worker token with a 403 naming the migration env var", async () => {
     const res = await enforceWorkerAgentScope(
-      { authorized: true, type: "bearer", actor: "agent", tier: "worker" },
+      { authorized: true, type: "bearer", actor: "agent", throttleKey: "worker-cred:test", tier: "worker" },
       "alpha",
     );
     expect(res?.status).toBe(403);
@@ -1120,12 +1127,115 @@ describe("enforceWorkerAgentScope (#1129)", () => {
 
   it("enforceWorkerBound passes bound workers and maintainers, denies unbound workers", async () => {
     await expect(
-      enforceWorkerBound({ authorized: true, type: "bearer", actor: "alpha", tier: "worker", agentName: "alpha" }),
+      enforceWorkerBound({ authorized: true, type: "bearer", actor: "alpha", throttleKey: "agent:alpha", tier: "worker", agentName: "alpha" }),
     ).resolves.toBeNull();
     await expect(
-      enforceWorkerBound({ authorized: true, type: "bearer", actor: "operator", tier: "maintainer" }),
+      enforceWorkerBound({ authorized: true, type: "bearer", actor: "operator", throttleKey: "maintainer-cred:test", tier: "maintainer" }),
     ).resolves.toBeNull();
-    const res = await enforceWorkerBound({ authorized: true, type: "bearer", actor: "agent", tier: "worker" });
+    const res = await enforceWorkerBound({ authorized: true, type: "bearer", actor: "agent", throttleKey: "worker-cred:test", tier: "worker" });
     expect(res?.status).toBe(403);
+  });
+});
+
+describe("throttle identity is credential-derived (#1322)", () => {
+  const MAINTAINER_TOKEN = "maintainer-token-1322";
+  const LEGACY_TOKEN = "legacy-worker-token-1322";
+
+  function bearerRequest(pathname: string, token: string, agentHeader?: string) {
+    return new Request(`http://localhost${pathname}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(agentHeader ? { "x-agent-name": agentHeader } : {}),
+      },
+    });
+  }
+
+  beforeEach(() => {
+    clearAll();
+    resetAuthCaches();
+    resetRateLimits();
+    mocks.auditCreate.mockReset();
+  });
+  afterEach(() => {
+    clearAll();
+    resetRateLimits();
+  });
+
+  it("keeps one throttle key across rotated x-agent-name headers for the maintainer token", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = MAINTAINER_TOKEN;
+
+    const first = await authorizeRequest(bearerRequest("/api/issues/status", MAINTAINER_TOKEN, "rot-a"));
+    const second = await authorizeRequest(bearerRequest("/api/issues/status", MAINTAINER_TOKEN, "rot-b"));
+    if (!first.authorized || !second.authorized) throw new Error("expected authorization");
+
+    // Audit attribution still follows the header for readability...
+    expect(first.actor).toBe("rot-a");
+    expect(second.actor).toBe("rot-b");
+    // ...but the throttle identity is credential-derived and header-immune.
+    expect(first.throttleKey).toBe(second.throttleKey);
+    expect(first.throttleKey).toMatch(/^maintainer-cred:[0-9a-f]{32}$/);
+    expect(first.throttleKey).not.toContain(MAINTAINER_TOKEN);
+  });
+
+  it("exhausts one window across x-agent-name rotations — rotating the header opens no fresh window", async () => {
+    process.env.DISPATCH_AGENT_TOKEN = MAINTAINER_TOKEN;
+
+    const limit = { limit: 3, windowMs: 60_000 };
+    const allowed: boolean[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const auth = await authorizeRequest(bearerRequest("/api/issues/status", MAINTAINER_TOKEN, `rot-${i}`));
+      if (!auth.authorized) throw new Error("expected authorization");
+      allowed.push(enforceRateLimit(`status:${auth.throttleKey}`, limit) === null);
+    }
+    expect(allowed).toEqual([true, true, true, false, false, false]);
+  });
+
+  it("keeps bound worker windows per agent and immune to header rotation", async () => {
+    process.env.DISPATCH_WORKER_TOKENS = "alpha:tok-alpha,bravo:tok-bravo";
+
+    for (const header of ["spoof-1", "spoof-2"]) {
+      const alpha = await authorizeRequest(bearerRequest("/api/issues/status", "tok-alpha", header));
+      if (!alpha.authorized) throw new Error("expected authorization");
+      expect(alpha.throttleKey).toBe("agent:alpha");
+    }
+    const bravo = await authorizeRequest(bearerRequest("/api/issues/status", "tok-bravo", "alpha"));
+    if (!bravo.authorized) throw new Error("expected authorization");
+    expect(bravo.throttleKey).toBe("agent:bravo");
+
+    const limit = { limit: 2, windowMs: 60_000 };
+    expect(enforceRateLimit("status:agent:alpha", limit)).toBeNull();
+    expect(enforceRateLimit("status:agent:alpha", limit)).toBeNull();
+    expect(enforceRateLimit("status:agent:alpha", limit)?.status).toBe(429);
+    // Exhausting alpha's bucket must not touch bravo's per-agent window.
+    expect(enforceRateLimit("status:agent:bravo", limit)).toBeNull();
+  });
+
+  it("gives the legacy unbound worker token a stable bucket, distinct from the maintainer bucket", async () => {
+    process.env.DISPATCH_WORKER_TOKEN = LEGACY_TOKEN;
+    process.env.DISPATCH_AGENT_TOKEN = MAINTAINER_TOKEN;
+
+    const unbound = await authorizeRequest(bearerRequest("/api/issues/status", LEGACY_TOKEN, "worker-x"));
+    const unboundAgain = await authorizeRequest(bearerRequest("/api/issues/status", LEGACY_TOKEN, "worker-y"));
+    const maintainer = await authorizeRequest(bearerRequest("/api/issues/status", MAINTAINER_TOKEN));
+    if (!unbound.authorized || !unboundAgain.authorized || !maintainer.authorized) {
+      throw new Error("expected authorization");
+    }
+
+    expect(unbound.throttleKey).toBe(unboundAgain.throttleKey);
+    expect(unbound.throttleKey).toMatch(/^worker-cred:[0-9a-f]{32}$/);
+    expect(unbound.throttleKey).not.toContain(LEGACY_TOKEN);
+    expect(unbound.throttleKey).not.toBe(maintainer.throttleKey);
+  });
+
+  it("caps tier-denial audits per credential even when the unbound worker rotates x-agent-name", async () => {
+    process.env.DISPATCH_WORKER_TOKEN = LEGACY_TOKEN;
+
+    for (let i = 0; i < 14; i += 1) {
+      await authorizeRequest(bearerRequest(`/api/issues/${i}/lane`, LEGACY_TOKEN, `rot-${i}`));
+    }
+    // One overall per-credential ceiling: the rotation cannot fan out into
+    // fresh per-actor buckets (pre-#1322 this wrote 14 rows).
+    expect(mocks.auditCreate).toHaveBeenCalledTimes(10);
   });
 });

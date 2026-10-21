@@ -250,7 +250,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`reconcile:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`reconcile:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   let lock: AcquiredLock | LockConflict | undefined;

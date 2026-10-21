@@ -34,7 +34,7 @@ export async function POST(request: Request) {
     return authErrorResponse(auth);
   }
 
-  const limited = enforceRateLimit(`sync-scheduled:${auth.actor}`, RATE_LIMIT);
+  const limited = enforceRateLimit(`sync-scheduled:${auth.throttleKey}`, RATE_LIMIT);
   if (limited) return limited;
 
   let body: unknown;

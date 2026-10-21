@@ -135,7 +135,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ is
   const rejected = rejectAgentCaller(auth, "Lifecycle backfill");
   if (rejected) return rejected;
 
-  const limited = enforceRateLimit(`lifecycle-backfill:${auth.actor}`, BACKFILL_RATE_LIMIT);
+  const limited = enforceRateLimit(`lifecycle-backfill:${auth.throttleKey}`, BACKFILL_RATE_LIMIT);
   if (limited) return limited;
 
   try {
