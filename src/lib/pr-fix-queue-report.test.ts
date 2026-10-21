@@ -745,7 +745,16 @@ describe("resolvePrFixFromAgentReport", () => {
     // Two writes: the PARKED settlement, then the hand-out release.
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(2);
     const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
-    expect(releaseCall?.where).toEqual({ id: "item-42", generation: 1 });
+    // The release CAS-pins the arrays it just read (the fixture's, since the
+    // mock re-reads the same row) so a concurrent hand-out/sweep cannot
+    // clobber the release.
+    expect(releaseCall?.where).toEqual({
+      id: "item-42",
+      generation: 1,
+      handoutReceipts: { equals: ["hnd_aabbccddeeff@fixer@1"] },
+      agentHandouts: { equals: ["fixer@1", "other@1"] },
+      handoutAcks: { equals: ["fixer@1"] },
+    });
     // fixer's entries are gone; other@1's hand-out survives, so the
     // dispatch stamps stay.
     expect(releaseCall?.data).toEqual({
@@ -779,7 +788,15 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(result.action).toBe("parked");
     expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(2);
     const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
-    expect(releaseCall?.where).toEqual({ id: "item-42", generation: 1 });
+    // The release CAS-pins the arrays it just read, the way it does in
+    // every case (mock re-reads the same row).
+    expect(releaseCall?.where).toEqual({
+      id: "item-42",
+      generation: 1,
+      handoutReceipts: { equals: ["hnd_aabbccddeeff@fixer@1"] },
+      agentHandouts: { equals: ["fixer@1"] },
+      handoutAcks: { equals: ["fixer@1"] },
+    });
     // No hand-out left — the item is no longer dispatched.
     expect(releaseCall?.data).toEqual({
       handoutReceipts: [],
@@ -819,5 +836,82 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(typeof settleCall?.data?.decisionDetail?.question).toBe("string");
     expect(settleCall?.data?.decisionDetail?.question?.trim().length).toBeGreaterThan(0);
     expect(settleCall?.data?.decisionDetail?.evidence).toBe("the spec is ambiguous about retry semantics");
+  });
+
+  // #1340 follow-up: a blocked report against an ALREADY-settled row is an
+  // idempotent skip, but the reporting agent's hand-out records must not
+  // linger on the terminal row — the release runs even though the
+  // settlement itself does nothing.
+  it("releases the reporting agent's stale hand-out when a blocked report skips an already-BLOCKED item (#1340)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      status: "BLOCKED",
+      agentHandouts: ["fixer@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+      attemptEvidenceWatermark: "watermark-1",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      blockReason: "human_decision",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toBe("pr-fix item already BLOCKED");
+    expect(result.attemptGeneration).toBe(1);
+    // Exactly one write: the CAS hand-out release. No settlement write —
+    // the row is already terminal, and no history row, no GitHub probe.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(releaseCall?.where).toEqual({
+      id: "item-42",
+      generation: 1,
+      handoutReceipts: { equals: ["hnd_aabbccddeeff@fixer@1"] },
+      agentHandouts: { equals: ["fixer@1"] },
+      handoutAcks: { equals: ["fixer@1"] },
+    });
+    expect(releaseCall?.data).toEqual({
+      handoutReceipts: [],
+      agentHandouts: [],
+      handoutAcks: [],
+      dispatchedGeneration: null,
+      dispatchedAt: null,
+      attemptEvidenceWatermark: null,
+    });
+    expect(prisma.prFixHistory.create).not.toHaveBeenCalled();
+    expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
+  });
+
+  it("performs zero writes when a blocked report skips an already-FIXED item with no hand-out records (#1340)", async () => {
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FIXTURE_ITEM,
+      status: "FIXED",
+    });
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      blockReason: "human_decision",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.matched).toBe(true);
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toBe("pr-fix item already FIXED");
+    // No hand-out records to release, so the idempotent skip is a pure no-op.
+    expect(prisma.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(prisma.prFixHistory.create).not.toHaveBeenCalled();
+    expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
   });
 });

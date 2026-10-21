@@ -5057,6 +5057,52 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(synthetic.evidence).toBe("the spec is ambiguous about retry semantics");
     });
 
+    // #1340 + #1253: the escalation also lands when the parked row carries
+    // fresh post-dispatch evidence. The sticky PARKED row never re-arms on
+    // new evidence (#1218), but the record sits on its post-dispatch cache;
+    // the BLOCKED settlement must absorb it (keys-pinned write clears the
+    // cache) instead of being blocked by it or reopening the row.
+    it("a worker BLOCKED mark escalates a PARKED row with fresh post-dispatch evidence and clears it (#1340, #1253)", async () => {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 324, lane: "NORMAL", reason: "r", feedback: "f1",
+        evidenceKey: "review:1", headSha: "H1",
+      });
+      const parked = await markPrFixItem(client, {
+        repo: "org/repo", pr: 324, status: "PARKED", outcome: "no_progress", expectedGeneration: 1,
+      });
+      expect(mutatedItem(parked).status).toBe("PARKED");
+
+      // A fresh automated review lands after the park (a new evidence key),
+      // and sits on the row's post-dispatch cache (#1253 "fresh evidence
+      // while parked").
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 324, lane: "NORMAL", reason: "r", feedback: "f2",
+        evidenceKey: "review:2", headSha: "H2",
+      });
+      client.items[0].postDispatchEvidenceKeys = ["review:2@H2"];
+      expect(client.items[0].status).toBe("PARKED");
+      expect(client.items[0].generation).toBe(1);
+      surfacingMocks.surfacePrFixParked.mockClear();
+      surfacingMocks.surfacePrFixBlocked.mockClear();
+      surfacingMocks.surfacePrFixUnblocked.mockClear();
+
+      const escalation = await markPrFixItem(client, {
+        repo: "org/repo", pr: 324, status: "BLOCKED", note: "the spec is ambiguous about retry semantics", expectedGeneration: 1,
+      });
+
+      expect(escalation.mutated).toBe(true);
+      expect(client.items[0].status).toBe("BLOCKED");
+      expect(client.items[0].lane).toBe("NEEDS_HUMAN");
+      expect(client.items[0].outcome).toBe("human_decision");
+      // The settlement absorbed the fresh-evidence cache rather than
+      // reopening the row or leaving the entries behind.
+      expect(client.items[0].postDispatchEvidenceKeys).toEqual([]);
+      expect(client.items[0].generation).toBe(1);
+      expect(surfacingMocks.surfacePrFixBlocked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+      expect(surfacingMocks.surfacePrFixUnblocked).not.toHaveBeenCalled();
+    });
+
     // #1340: the relaxation is BLOCKED-only — a recorded STALE settlement
     // (a closed PR is gone, no human decision pending) stays sticky against
     // worker BLOCKED marks exactly like a recorded BLOCKED.
