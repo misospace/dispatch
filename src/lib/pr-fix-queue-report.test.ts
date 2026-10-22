@@ -729,7 +729,13 @@ describe("resolvePrFixFromAgentReport", () => {
       attemptEvidenceWatermark: "watermark-1",
     };
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
-    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+    // Stateful write: the release re-reads the row AFTER the settlement
+    // landed, so the mock must show the settled status (the unfenced
+    // fallback only releases non-QUEUED rows).
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
+      Object.assign(row, data);
+      return { count: 1 };
+    });
 
     const result = await resolvePrFixFromAgentReport(baseInput({
       outcome: "blocked",
@@ -775,7 +781,12 @@ describe("resolvePrFixFromAgentReport", () => {
       attemptEvidenceWatermark: "watermark-1",
     };
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
-    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+    // Stateful write: the release re-reads the row AFTER the settlement
+    // landed (the unfenced fallback only releases non-QUEUED rows).
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
+      Object.assign(row, data);
+      return { count: 1 };
+    });
 
     const result = await resolvePrFixFromAgentReport(baseInput({
       outcome: "blocked",
@@ -889,6 +900,120 @@ describe("resolvePrFixFromAgentReport", () => {
     });
     expect(prisma.prFixHistory.create).not.toHaveBeenCalled();
     expect(fetchPullRequestMergeStateMock).not.toHaveBeenCalled();
+  });
+
+  // #1340 review: when the report echoes the issued receipt token, the release
+  // is authorized by the EXACT issuance (#1256 rule): only that receipt is
+  // dropped, another agent's live hand-out at the generation survives, and the
+  // dispatch stamps stay while any hand-out is still live.
+  it("releases the exact issuance when a blocked report echoes the issued handoutToken (#1340 review)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      agentHandouts: ["fixer@1", "other@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1", "hnd_112233445566@other@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+      attemptEvidenceWatermark: "watermark-1",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
+      Object.assign(row, data);
+      return { count: 1 };
+    });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: { itemId: "item-42", generation: 1, handoutToken: "hnd_aabbccddeeff" },
+    }));
+
+    expect(result.action).toBe("parked");
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(2);
+    const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(releaseCall?.where).toEqual({
+      id: "item-42",
+      generation: 1,
+      handoutReceipts: { equals: ["hnd_aabbccddeeff@fixer@1", "hnd_112233445566@other@1"] },
+      agentHandouts: { equals: ["fixer@1", "other@1"] },
+      handoutAcks: { equals: ["fixer@1"] },
+    });
+    // Only fixer's issued receipt is dropped; other@1's live hand-out keeps
+    // the dispatch stamps.
+    expect(releaseCall?.data).toEqual({
+      handoutReceipts: ["hnd_112233445566@other@1"],
+      agentHandouts: ["other@1"],
+      handoutAcks: [],
+    });
+  });
+
+  // #1340 review: a report still carrying the token of a PREVIOUS hand-out of
+  // the same agent at the same generation (rotated after a reclaim/re-release)
+  // authorizes no release — the live rotated receipt and hand-out survive.
+  // The settlement itself stays authorized by the (id, generation) attempt
+  // descriptor plus the agent-bound report route.
+  it("a stale handoutToken on a blocked report cannot release the rotated live hand-out (#1340 review)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      agentHandouts: ["fixer@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_111111111111111a@fixer@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+      attemptEvidenceWatermark: "watermark-1",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
+      Object.assign(row, data);
+      return { count: 1 };
+    });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: { itemId: "item-42", generation: 1, handoutToken: "hnd_000000000000000a" },
+    }));
+
+    expect(result.action).toBe("parked");
+    // Exactly one write: the PARKED settlement. The release refuses with zero
+    // mutation because the presented receipt is not the live issuance.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    expect(row.agentHandouts).toEqual(["fixer@1"]);
+    expect(row.handoutReceipts).toEqual(["hnd_111111111111111a@fixer@1"]);
+  });
+
+  // #1340 review: the no-token migration-window fallback releases only settled
+  // rows. When the settlement itself lost its pinned write, the row is still
+  // QUEUED — an unfenced release must not clear a live hand-out there.
+  it("skips the unfenced release when a no-token blocked report loses its settlement on a QUEUED row (#1340 review)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      agentHandouts: ["fixer@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    // The settlement's pinned write loses its race: nothing landed.
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      summary: "repeated no-progress runs",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.action).toBe("skipped");
+    // No release-shaped write (one pinning the hand-out arrays) was attempted:
+    // the row never left QUEUED, so the unfenced fallback refuses it.
+    const writes = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.map((c: any) => c[0]);
+    expect(writes.every((w: any) => w.data?.agentHandouts === undefined)).toBe(true);
+    expect(row.agentHandouts).toEqual(["fixer@1"]);
+    expect(row.handoutReceipts).toEqual(["hnd_aabbccddeeff@fixer@1"]);
   });
 
   it("performs zero writes when a blocked report skips an already-FIXED item with no hand-out records (#1340)", async () => {

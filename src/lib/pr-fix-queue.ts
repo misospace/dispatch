@@ -3444,6 +3444,20 @@ export function agentAlreadyHanded(
  * row — they only gate dispatch while the item is QUEUED at that
  * generation, and the next generation change clears them.
  *
+ * Fencing (#1340 review, mirroring #1256): when the report echoes the issued
+ * `handoutToken`, the release is authorized ONLY by the exact live receipt —
+ * (agent, generation, token) must all match. A rotated/reclaimed/released
+ * token has no authority over the current issuance, so a stale same-agent
+ * report can never remove a newer live hand-out; a mismatch releases nothing.
+ * A report without a token (Courier's `blocked` reports do not echo one yet —
+ * tracked as a courier-side follow-up) falls back to (agent, generation)
+ * matching, authorized by the identity-bound report route, but ONLY against a
+ * settled (non-QUEUED) row: on a still-QUEUED row the report's settlement did
+ * not land, and an unfenced release could clobber a re-issued live hand-out —
+ * exactly what the token fence exists to prevent. On a settled row the
+ * entries are inert (they gate dispatch only while QUEUED), so removing the
+ * reporting agent's own entries there is the intended cleanup.
+ *
  * Best-effort throughout: the settlement (or the skip decision) is already
  * made, so a failure here only logs and never fails the report.
  */
@@ -3452,9 +3466,11 @@ export async function releaseAgentHandout(
   itemId: string,
   agentName: string | undefined,
   generation: number,
+  handoutToken?: string | null,
 ): Promise<void> {
   const agent = agentName?.trim();
   if (!agent) return;
+  const token = handoutToken?.trim();
   try {
     for (let pass = 0; pass < 2; pass++) {
       const fresh = await client.prFixQueueItem.findUnique({ where: { id: itemId } });
@@ -3462,15 +3478,27 @@ export async function releaseAgentHandout(
       const receipts: string[] = Array.isArray(fresh.handoutReceipts) ? fresh.handoutReceipts : [];
       const handouts: string[] = Array.isArray(fresh.agentHandouts) ? fresh.agentHandouts : [];
       const acks: string[] = Array.isArray(fresh.handoutAcks) ? fresh.handoutAcks : [];
-      const isOwnReceipt = (entry: unknown): boolean => {
-        const parsed = parseHandoutReceipt(entry);
-        return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
-      };
       const isOwnToken = (entry: unknown): boolean => {
         const parsed = parseAgentHandoutToken(entry);
         return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
       };
-      const remainingReceipts = receipts.filter((entry) => !isOwnReceipt(entry));
+      let remainingReceipts: string[];
+      if (token) {
+        // Exact-issuance fence: the presented receipt must be this agent's
+        // live receipt at this generation (#1256 rule). An unknown, rotated,
+        // or already-released token authorizes nothing.
+        const owned = findHandoutReceipt(receipts, { agentName: agent, generation, token });
+        if (!owned) return;
+        remainingReceipts = receipts.filter((entry) => entry !== owned);
+      } else {
+        // Migration-window fallback (see the doc comment above): only a
+        // settled row may be released unfenced.
+        if (fresh.status === "QUEUED") return;
+        remainingReceipts = receipts.filter((entry) => {
+          const parsed = parseHandoutReceipt(entry);
+          return !(parsed !== null && parsed.agentName === agent && parsed.generation === generation);
+        });
+      }
       const remainingHandouts = handouts.filter((entry) => !isOwnToken(entry));
       const remainingAcks = acks.filter((entry) => !isOwnToken(entry));
       // Nothing for this agent at this generation (or a malformed row) — no
@@ -3883,6 +3911,7 @@ export async function resolvePrFixFromAgentReport(
         existing.id,
         input.agentName?.trim(),
         attempt.generation,
+        attempt.handoutToken,
       );
     }
     return {
@@ -4090,6 +4119,7 @@ export async function resolvePrFixFromAgentReport(
         existing.id,
         (input.agentName ?? undefined)?.trim(),
         attempt?.generation ?? existing.generation,
+        attempt?.handoutToken,
       );
       return {
         matched: true,
@@ -4108,6 +4138,7 @@ export async function resolvePrFixFromAgentReport(
       existing.id,
       (input.agentName ?? undefined)?.trim(),
       attempt?.generation ?? existing.generation,
+      attempt?.handoutToken,
     );
     return {
       matched: true,
