@@ -226,16 +226,27 @@ export async function sweepStaleWork(
   });
 
   // #1254: defer rows whose issue has a pending reconciler release intent.
-  // Fetched BEFORE the candidate take so deferred rows cannot occupy the
-  // batch window and starve reclaimable work behind them.
-  const pendingIntentIssueIds = new Set(
-    (
-      await client.ownershipReleaseIntent.findMany({
-        where: { phase: "pending" },
-        take: 500,
-        select: { issueId: true },
-      })
-    ).map((row: any) => row.issueId),
+  // Review round 4: the lookup is scoped to the CANDIDATE issue ids instead
+  // of a capped global pending read. A cap silently under-defers once pending
+  // intents exceed the window — a deferred candidate would then be released
+  // by the sweep alongside its live intent (two writers, one claim). Scoping
+  // by id is both exact and bounded: the id list is at most `batchSize`.
+  const candidateIssueIds = Array.from(
+    new Set(
+      candidates
+        .map((work: any) => work.issueId as string | null)
+        .filter((id: string | null): id is string => Boolean(id)),
+    ),
+  );
+  const pendingIntentIssueIds = new Set<string>(
+    candidateIssueIds.length === 0
+      ? []
+      : (
+          await client.ownershipReleaseIntent.findMany({
+            where: { phase: "pending", issueId: { in: candidateIssueIds } },
+            select: { issueId: true },
+          })
+        ).map((row: any) => row.issueId),
   );
 
   const releasableCandidates = candidates.filter(

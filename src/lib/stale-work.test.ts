@@ -106,6 +106,8 @@ const CLAUSE_KEYS = new Set([
   "claimToken",
   "expiredAt",
   "lastRenewalObservedAt",
+  // #1254: the pending-release-intent deferral lookup.
+  "phase",
 ]);
 
 /** Scalar equality honoring Prisma's by-value comparison for `Date`s. */
@@ -206,6 +208,12 @@ function makeSweepClient(options: {
   dieBeforeFinalize?: boolean;
   /** Lease rows visible to the epoch snapshot and the fenced delete. */
   leases?: LeaseRow[];
+  /**
+   * #1254: `OwnershipReleaseIntent` rows visible to the pending-intent
+   * deferral lookup. Evaluated through the real clause, so a lookup that is
+   * capped or unscoped mis-defers here exactly as it would in the database.
+   */
+  pendingIntents?: Array<{ issueId: string; phase: string }>;
   /**
    * Runs INSIDE the sweep's decision window — after the claim-epoch snapshot
    * and the live-sibling lookup, before the fenced lease delete. This is the
@@ -321,11 +329,19 @@ function makeSweepClient(options: {
     issueLifecycleEvent,
   };
 
+  // #1254: the sweep defers to pending reconciler release intents. Evaluated
+  // faithfully through the production clause (with `take`/`select` honored),
+  // so a capped or unscoped lookup mis-defers here exactly as in the database.
+  const intentRows = options.pendingIntents ?? [];
+  const ownershipReleaseIntentFindMany = vi.fn(async ({ where, take, select }: any) => {
+    let matched = intentRows.filter((row) => matchesWhere(row as unknown as Record<string, unknown>, where));
+    if (typeof take === "number") matched = matched.slice(0, take);
+    return select ? matched.map((row) => ({ issueId: row.issueId })) : matched.map((row) => ({ ...row }));
+  });
+
   const client = {
     agentWork: { findMany: agentWorkFindMany },
-    // #1254: the sweep defers to pending reconciler release intents; the fake
-    // always answers none.
-    ownershipReleaseIntent: { findMany: vi.fn(async () => []) },
+    ownershipReleaseIntent: { findMany: ownershipReleaseIntentFindMany },
     issue,
     issueLifecycleEvent,
     lease: tx.lease,
@@ -339,7 +355,7 @@ function makeSweepClient(options: {
     $transaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
   } as unknown as StaleWorkClient;
 
-  return { client, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases };
+  return { client, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases, ownershipReleaseIntentFindMany };
 }
 
 function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
@@ -1245,10 +1261,10 @@ describe("sweepStaleWork — leasesReleased accounting (#1317)", () => {
 describe("sweepStaleWork — defers to pending reconciler release intents (#1254)", () => {
   it("skips a candidate whose issue has a pending release intent: no lease delete, no label release", async () => {
     const work = makeWork();
-    const { client, auditRows, leaseDeleteMany } = makeSweepClient({ candidates: [work] });
-    (client.ownershipReleaseIntent.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { issueId: work.issueId, phase: "pending" },
-    ]);
+    const { client, auditRows, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      pendingIntents: [{ issueId: "issue-1", phase: "pending" }],
+    });
 
     const report = await sweepStaleWork(client as unknown as StaleWorkClient);
 
@@ -1266,5 +1282,55 @@ describe("sweepStaleWork — defers to pending reconciler release intents (#1254
 
     expect(report.released).toBe(1);
     expect(leaseDeleteMany).toHaveBeenCalled();
+  });
+
+  it("ignores settled intents: only pending ones defer the sweep", async () => {
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      leases: [makeLease()],
+      pendingIntents: [{ issueId: "issue-1", phase: "settled" }],
+    });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.released).toBe(1);
+    expect(leaseDeleteMany).toHaveBeenCalled();
+  });
+
+  it("review round 4: defers a candidate whose intent sits behind 500+ unrelated pending intents", async () => {
+    // The regression: a capped global pending-intent read drops intents beyond
+    // the window and the sweep releases a claim whose reconciler intent is
+    // still live (two writers, one claim). The candidate's intent is seeded
+    // LAST among 600 unrelated ones, so any read capped below that misses it.
+    const work = makeWork();
+    const noise = Array.from({ length: 600 }, (_, i) => ({
+      issueId: `issue-noise-${i}`,
+      phase: "pending",
+    }));
+    const { client, leaseDeleteMany, ownershipReleaseIntentFindMany } = makeSweepClient({
+      candidates: [work],
+      leases: [makeLease()],
+      pendingIntents: [...noise, { issueId: "issue-1", phase: "pending" }],
+    });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.skipped).toBe(1);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabel).not.toHaveBeenCalled();
+    // And the lookup is scoped to the candidate ids, not a capped global scan.
+    const query = ownershipReleaseIntentFindMany.mock.calls[0]?.[0] as any;
+    expect(query.where.issueId).toEqual({ in: ["issue-1"] });
+    expect(query.take).toBeUndefined();
+  });
+
+  it("issues no intent query at all when no candidate is issue-scoped", async () => {
+    const work = makeWork({ issueId: null as unknown as string });
+    const { client, ownershipReleaseIntentFindMany } = makeSweepClient({ candidates: [work] });
+
+    await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(ownershipReleaseIntentFindMany).not.toHaveBeenCalled();
   });
 });

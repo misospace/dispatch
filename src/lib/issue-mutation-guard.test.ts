@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { withIssueMutationGuard } from "./issue-mutation-guard";
+import { GUARD_HEARTBEAT_MS, withIssueMutationGuard } from "./issue-mutation-guard";
 
 vi.mock("@/lib/prisma", () => ({ prisma: {
   issueMutationGuard: { create: vi.fn(), findUnique: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn() },
@@ -220,6 +220,43 @@ describe("issue mutation guard", () => {
       withIssueMutationGuard({ issueId: "issue-1", operation: "claim", agentName: "beta", override: true }, callback),
     ).resolves.toMatchObject({ status: "completed", value: "force claimed" });
     expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it("stamps the guard while a live holder runs, and stops on release (#1254 round 4)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+      vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
+      vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+      let resume!: () => void;
+      let started!: () => void;
+      const entered = new Promise<void>((resolve) => { started = resolve; });
+      const pause = new Promise<void>((resolve) => { resume = resolve; });
+      const run = withIssueMutationGuard(request, async () => {
+        started();
+        await pause;
+        return { complete: true, value: "done" };
+      });
+      await entered;
+      await vi.advanceTimersByTimeAsync(GUARD_HEARTBEAT_MS * 2 + 1);
+      // The stamp is CAS'd to this owner's executing guard and only ever
+      // refreshes `updatedAt`: it keeps the age fence honest (a stamped guard
+      // is never old enough for an override) without touching fence state.
+      expect(prisma.issueMutationGuard.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { issueId: "issue-1", ownerToken: "existing", executing: true },
+          data: { updatedAt: expect.any(Date) },
+        }),
+      );
+      const stampsWhileRunning = vi.mocked(prisma.issueMutationGuard.updateMany).mock.calls.length;
+      resume();
+      await run;
+      // After release the heartbeat is stopped: no further stamps ever land.
+      await vi.advanceTimersByTimeAsync(GUARD_HEARTBEAT_MS * 3);
+      expect(vi.mocked(prisma.issueMutationGuard.updateMany).mock.calls.length).toBe(stampsWhileRunning);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reopens a thrown callback but keeps the owner barrier", async () => {

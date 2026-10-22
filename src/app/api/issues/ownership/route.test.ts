@@ -70,11 +70,12 @@ const { db, applyListArgs } = vi.hoisted(() => {
 
   return {
     db: {
-      issues: [] as any[],
-      leases: [] as any[],
-      agentWorks: [] as any[],
-      prFixes: [] as any[],
-    },
+    issues: [] as any[],
+    leases: [] as any[],
+    agentWorks: [] as any[],
+    prFixes: [] as any[],
+    guards: [] as any[],
+  },
     applyListArgs,
   };
 });
@@ -85,7 +86,7 @@ vi.mock("@/lib/prisma", () => ({
     // ladder candidates.
     ownershipReleaseIntent: { findMany: async () => [] },
     ownershipReconcileCandidate: { findMany: async () => [] },
-    issueMutationGuard: { findMany: async () => [] },
+    issueMutationGuard: { findMany: async () => db.guards.filter((g) => g.executing) },
     issue: {
       // list route: { where: { repository: { enabled }, state }, orderBy, take }
       findMany: async (args?: any) =>
@@ -259,6 +260,7 @@ function reset() {
   db.leases = [];
   db.agentWorks = [];
   db.prFixes = [];
+  db.guards = [];
 }
 
 describe("GET /api/issues/ownership — auth", () => {
@@ -288,6 +290,45 @@ describe("GET /api/issues/ownership — auth", () => {
     expect(res.status).toBe(403);
     const body = await res.json();
     expect(body.error).toContain("maintainer");
+  });
+});
+
+describe("GET /api/issues/ownership — executing-guard surface (#1254 round 4)", () => {
+  beforeEach(() => {
+    reset();
+  });
+
+  it("surfaces guard updatedAt (the heartbeat silence signal), never the owner token", async () => {
+    const createdAt = new Date(Date.now() - 20 * 60_000);
+    // Created 20 min ago but stamped 30 s ago: the operator reads SILENCE,
+    // not elapsed age — this guard belongs to a live (slow) holder and is NOT
+    // override-eligible. The payload must carry both timestamps to show that.
+    const updatedAt = new Date(Date.now() - 30_000);
+    db.guards = [
+      {
+        issueId: "issue-1",
+        operation: "reconcile-release",
+        agentName: "alpha",
+        ownerToken: "secret-owner-token",
+        executing: true,
+        createdAt,
+        updatedAt,
+      },
+    ];
+
+    const res = await get("http://localhost/api/issues/ownership?state=");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.reconciliation.executingGuards).toEqual([
+      {
+        issueId: "issue-1",
+        operation: "reconcile-release",
+        agentName: "alpha",
+        ownerTokenPresent: true,
+        createdAt: createdAt.toISOString(),
+        updatedAt: updatedAt.toISOString(),
+      },
+    ]);
   });
 });
 

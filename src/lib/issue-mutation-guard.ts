@@ -20,16 +20,28 @@ export interface IssueMutationRequest {
 }
 
 /**
- * #1254 review: minimum age before an operator override may clear an
- * `executing` guard. Every guard holder is request-scoped (claim route) or
- * scheduler-pass-scoped (reconcile/stale-release) with bounded remote/DB
- * timeouts, so it cannot legitimately hold a guard across this window — an
- * executing guard older than it is a crashed holder, and stealing a younger
- * one would race a live writer through the §8.7 serialization boundary.
- * The guard itself is still NEVER time-expired: this bounds only the
- * deliberate operator override, never an automatic steal.
+ * #1254 review (round 4): while the callback runs, the holder stamps its
+ * guard every interval, so `updatedAt` on an `executing` guard is a LIVE
+ * liveness signal, not just the creation time. A live process that is merely
+ * SLOW keeps stamping (the interval runs independently of the callback);
+ * only a dead process goes silent. This is what turns "older than the fence"
+ * into evidence of a crash instead of an assumption.
  */
-export const GUARD_OVERRIDE_MIN_AGE_MS = 5 * 60_000;
+export const GUARD_HEARTBEAT_MS = 60_000;
+
+/**
+ * #1254 review: minimum silence (guard `updatedAt` age while still
+ * `executing`) before an operator override may clear the guard. Two enforced
+ * premises make silence mean "crashed holder":
+ * 1. `GUARD_HEARTBEAT_MS` — every live holder stamps the guard every minute
+ *    (a stamping holder is never old enough to be overridden);
+ * 2. #1347 — every remote call a holder can make is hard-bounded
+ *    (`AbortSignal.timeout` per attempt + capped backoff in `fetchWithRetry`),
+ *    so no healthy operation waits on a stalled socket past the fence.
+ * The guard itself is still NEVER time-expired: this bounds only the
+ * deliberate, maintainer-only operator override, never an automatic steal.
+ */
+export const GUARD_OVERRIDE_MIN_AGE_MS = 5 * GUARD_HEARTBEAT_MS;
 
 export interface IssueMutationContext { resuming: boolean }
 export type IssueMutationResult<T> =
@@ -67,14 +79,14 @@ export async function withIssueMutationGuard<T>(
     // guard. Deliberately narrower than resuming: it does not run the stale
     // writer's callback, it discards it.
     //
-    // #1254 review: the delete is age-fenced on `updatedAt` (the guard's last
-    // state transition, so a resumed guard restarts the clock). A holder is
-    // always request- or pass-scoped with bounded timeouts, so an executing
-    // guard younger than `GUARD_OVERRIDE_MIN_AGE_MS` may still belong to a
-    // LIVE writer — the override refuses it (retryable busy) instead of
-    // stealing the §8.7 serialization anchor out from under it. Only a guard
-    // older than any legitimate hold can be a crashed holder, and the CAS on
-    // ownerToken+executing still loses cleanly if the writer finished first.
+    // #1254 review: the delete is age-fenced on `updatedAt`, which a live
+    // holder stamps every `GUARD_HEARTBEAT_MS` (see the heartbeat below) —
+    // so the fence measures SILENCE, not elapsed work. An executing guard
+    // with a fresh stamp belongs to a LIVE writer (retryable busy); only one
+    // silent past `GUARD_OVERRIDE_MIN_AGE_MS` — longer than any heartbeat
+    // interval and any bounded remote call (#1347) — can be a crashed
+    // holder. The CAS on ownerToken+executing still loses cleanly if the
+    // writer finished or re-acquired first.
     if (request.override === true && guard.executing) {
       const overrideCutoff = new Date(Date.now() - GUARD_OVERRIDE_MIN_AGE_MS);
       const removed = await prisma.issueMutationGuard.deleteMany({
@@ -127,6 +139,29 @@ export async function withIssueMutationGuard<T>(
   }
   if (!guard) return { status: "busy", ownerToken, operation: request.operation };
 
+  // #1254 review round 4: liveness heartbeat. While this holder runs, stamp
+  // the guard every `GUARD_HEARTBEAT_MS` so an `executing` row's `updatedAt`
+  // means "the owning process was alive then". The interval runs alongside
+  // the callback (a slow-but-alive holder keeps stamping; a dead process
+  // goes silent), it is CAS-scoped to this owner's executing guard, and it
+  // is best-effort: a missed stamp only makes the row look older, it can
+  // never corrupt the fence. `unref` so a pending tick never pins the loop.
+  const heartbeat = setInterval(() => {
+    try {
+      void Promise.resolve(
+        prisma.issueMutationGuard.updateMany({
+          where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
+          data: { updatedAt: new Date() },
+        }),
+      ).catch(() => undefined);
+    } catch {
+      // Best-effort liveness stamp (test fakes may not return promises).
+    }
+  }, GUARD_HEARTBEAT_MS);
+  if (typeof (heartbeat as { unref?: () => void }).unref === "function") {
+    (heartbeat as { unref: () => void }).unref();
+  }
+
   try {
     const result = await callback(undefined, { resuming });
     if (result.complete) {
@@ -146,5 +181,7 @@ export async function withIssueMutationGuard<T>(
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });
     }
     throw error;
+  } finally {
+    clearInterval(heartbeat);
   }
 }

@@ -321,13 +321,18 @@ export async function GET(request: Request) {
         lastReasons: candidate.lastReasons,
       })),
       // Every in-flight guard, live or crashed — the operator distinguishes by
-      // age; a maintainer force-claim is the override that clears a crashed one.
+      // SILENCE: a live holder stamps `updatedAt` every GUARD_HEARTBEAT_MS
+      // (#1254 round 4), so a fresh stamp means "still running" regardless of
+      // how long the operation has been going, and only silence past
+      // GUARD_OVERRIDE_MIN_AGE_MS evidences a crash. A maintainer force-claim
+      // is the override that clears a crashed one.
       executingGuards: stuckGuards.map((guard) => ({
         issueId: guard.issueId,
         operation: guard.operation,
         agentName: guard.agentName,
         ownerTokenPresent: guard.ownerToken !== "",
         createdAt: guard.createdAt,
+        updatedAt: guard.updatedAt,
       })),
     },
   });

@@ -467,10 +467,13 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > with a retryable 409 while an intent is pending — the maintainer force-claim (which may also take over a guard left
 > `executing` by a crashed process via the guard `override` — the deliberate
 > operator decision the fail-closed posture defers to; the override is
-> age-fenced on the guard's `updatedAt` (`GUARD_OVERRIDE_MIN_AGE_MS`): every
-> holder is request- or pass-scoped with bounded timeouts, so only a guard
-> older than any legitimate hold can be a crashed holder, and a young
-> executing guard keeps the override fail-closed instead of racing a live
+> silence-fenced on the guard's `updatedAt` (`GUARD_OVERRIDE_MIN_AGE_MS`): a
+> live holder stamps its guard every `GUARD_HEARTBEAT_MS` while it runs, and
+> every remote call it can make is hard-bounded (#1347: per-attempt
+> `AbortSignal.timeout`, default 30s via `DISPATCH_GITHUB_TIMEOUT_MS`, plus a
+> capped retry backoff in `fetchWithRetry`), so silence past the fence means
+> the holder process is gone — a young or freshly stamped executing guard
+> keeps the override fail-closed instead of racing a live
 > writer through the anchor), the owner/operator
 > unclaim and the operator agent-work release, and the direct `assign_agent`
 > path (which takes the same anchor as operation `assign`) instead supersede
