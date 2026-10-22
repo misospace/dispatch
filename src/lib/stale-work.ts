@@ -38,11 +38,14 @@ function notLt(field: string, cutoff: Date): WhereClause {
  * at/after the cutoff.
  *
  * `notLt` cannot express it: `notLt` is TRUE on a NULL column, while this arm
- * must be UNKNOWN (never TRUE) there — a NULL deadline means NO park, and
- * such a row must never shield a claim. So the NULL polarity is spelled out
- * explicitly here instead of being implied by the comparison, and the
- * blocked-park family's live arm is derived from THIS builder. The two
- * builders are the two polarities of the same rule, side by side.
+ * must never be TRUE there — a NULL deadline means NO park, and such a row
+ * must not shield a claim. The bare `{ gte }` comparison already excludes
+ * NULL rows (SQL's `NULL >= cutoff` is UNKNOWN, never TRUE), so this builder
+ * spells the `IS NOT NULL` conjunct out instead of leaning on that side
+ * effect: the NULL polarity of the rule lives in the builder, not in a
+ * comparison's behaviour. The blocked-park family's live arm is derived from
+ * THIS builder; the two builders are the two polarities of the same rule,
+ * side by side.
  */
 function notNullNotLt(field: string, cutoff: Date): WhereClause {
   return { AND: [{ [field]: { not: null } }, { [field]: { gte: cutoff } }] };
@@ -68,6 +71,25 @@ function notNullNotLt(field: string, cutoff: Date): WhereClause {
 function parkRunning(lease: { retryAfter?: Date | null } | null | undefined, now: Date): boolean {
   const retryAfter = lease?.retryAfter ?? null;
   return retryAfter !== null && retryAfter.getTime() > now.getTime();
+}
+
+/**
+ * The (agent, issue) claims that are PARKED — a running wait marker on the
+ * lease (`retryAfter` in the future).
+ *
+ * One query for the whole instance: `retryAfter > now` is exactly "a park
+ * that is still running" (a NULL marker is not a park — `retryAfter > now`
+ * is UNKNOWN for NULL, never TRUE).
+ */
+async function findParkedClaims(
+  client: StaleWorkClient,
+  now: Date,
+): Promise<Array<{ agentName: string; issueId: string }>> {
+  const leases = await client.lease.findMany({
+    where: { retryAfter: { gt: now } },
+    select: { agentName: true, issueId: true },
+  });
+  return leases.map((lease) => ({ agentName: lease.agentName, issueId: lease.issueId }));
 }
 
 /**
@@ -111,10 +133,9 @@ export interface ActiveStateFamilyPredicates {
  *   the parked claim while the park is still running, deleting the lease the
  *   `blocked` disposition was recorded on. Live is the 3VL complement of
  *   `IS NULL OR lt` — `NOT IS NULL AND notLt` — derived through the sibling
- *   builder `notNullNotLt`: the bare `{ gte }` arm alone would be TRUE on a
- *   NULL expiry, so the explicit `IS NOT NULL` conjunct is what makes a
- *   NULL-deadline BLOCKED sibling UNKNOWN (never TRUE) and therefore unable to
- *   keep a claim alive forever.
+ *   builder `notNullNotLt`, which spells the `IS NOT NULL` conjunct out: a
+ *   NULL-deadline BLOCKED sibling is therefore FALSE (never TRUE) for the
+ *   live arm and can never keep a claim alive forever.
  *
  * Both arms of both families share the pending boundary
  * `staleClaimReleasePending: false`. A row that still owes a claim release
@@ -238,6 +259,7 @@ export interface StaleWorkClient {
   };
   issue: IssueClaimClient["issue"];
   lease: {
+    findMany: (args: any) => Promise<any[]>;
     findFirst: StaleWorkTransactionClient["lease"]["findFirst"];
     deleteMany: StaleWorkTransactionClient["lease"]["deleteMany"];
   };
@@ -358,13 +380,27 @@ export async function sweepStaleWork(
 ): Promise<StaleWorkReport> {
   const now = new Date();
   const cutoff = new Date(now.getTime() - maxAgeMs);
+
+  // A PARKED claim is not reclaim work at all (#1334): a running wait marker
+  // on the lease says the owner defers until that deadline. Parked claims are
+  // excluded from the candidate query UP FRONT, because the query orders by
+  // the oldest heartbeat first and a parked row's heartbeat is old BY
+  // DEFINITION — without this, parked claims would fill the candidate batch
+  // on every sweep and starve the genuinely stale rows behind them. The
+  // in-transaction park check stays authoritative: a park that starts after
+  // this read is caught there.
+  const parkedClaims = await findParkedClaims(client, now);
+  const reclaimClause = {
+    OR: [
+      ...activeStateFamilies(cutoff).map((family) => family.reclaim),
+      { state: "STALE", staleClaimReleasePending: true },
+    ],
+  };
   const candidates = await client.agentWork.findMany({
-    where: {
-      OR: [
-        ...activeStateFamilies(cutoff).map((family) => family.reclaim),
-        { state: "STALE", staleClaimReleasePending: true },
-      ],
-    },
+    where:
+      parkedClaims.length > 0
+        ? { AND: [reclaimClause, { NOT: { OR: parkedClaims } }] }
+        : reclaimClause,
     orderBy: { lastHeartbeatAt: "asc" },
     take: batchSize,
     include: {
@@ -496,12 +532,13 @@ export async function sweepStaleWork(
               expiredAt: epoch.expiredAt,
               lastRenewalObservedAt: epoch.lastRenewalObservedAt,
               // #1334: a RUNNING park is not evidence of abandonment, so the
-              // delete must not consume the lease the park was recorded on —
-              // not even when the park started inside the sweep's decision
-              // window (the epoch fence already covers renewals, which move
-              // the epoch fields; a park does not have to). A lease with no
-              // wait marker (`retryAfter IS NULL`) or an elapsed one is
-              // reclaimable as before.
+              // delete must not consume the lease the park was recorded on.
+              // Defence in depth: every writer of the marker takes the same
+              // per-issue fence the sweep holds, so the lease cannot change
+              // inside the decision window — but the sweep must not depend on
+              // that to keep a park alive. A lease with no wait marker
+              // (`retryAfter IS NULL`) or an elapsed one is reclaimable as
+              // before.
               OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
             },
           });
@@ -513,7 +550,10 @@ export async function sweepStaleWork(
         // a successful delete — means the claim epoch moved.
         const remaining = await tx.lease.findFirst({
           where: { agentName: work.agentName, issueId: work.issueId },
-          select: { claimToken: true, retryAfter: true },
+          // The full epoch snapshot, so the row this returns is the shape the
+          // type declares — the recheck answers "is the claim still there?"
+          // and "is it parked?".
+          select: { claimToken: true, expiredAt: true, lastRenewalObservedAt: true, retryAfter: true },
         });
         if (remaining && parkRunning(remaining, now)) {
           // A park is running on the claim now — it started inside the sweep's

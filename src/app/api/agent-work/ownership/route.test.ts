@@ -432,7 +432,12 @@ function makeSweepClient(getRow: () => Record<string, unknown> | null) {
       update: vi.fn(async () => ({})),
       findUnique: vi.fn(async () => ({ labels: [] })),
     },
-    lease: { deleteMany: vi.fn(async () => ({ count: 0 })) },
+    lease: {
+      deleteMany: vi.fn(async () => ({ count: 0 })),
+      // The parked-claim pre-filter: no lease in this fake carries a running
+      // wait marker, so nothing is parked.
+      findMany: vi.fn(async () => []),
+    },
     agentWorkHistory: { create: vi.fn(async () => ({})) },
     auditLog: { create: vi.fn(async () => ({})) },
     $transaction: vi.fn(async () => false),

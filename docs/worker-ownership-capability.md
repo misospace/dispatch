@@ -52,12 +52,18 @@ deadline covers a `blocked` disposition (it parks the settled row), but a
 renewal's `externalWait` parks the **lease** only — the row keeps its ordinary
 execution expiry — so the sweep reads the wait marker off the lease:
 
-- A candidate whose claim carries a **running** marker (`retryAfter` in the
-  future) is **skipped**: no `STALE` mark, no lease delete, no claim release.
-  The silence of a parked worker is not evidence of abandonment, and the park
-  deadline — not the heartbeat — decides when the work becomes reclaimable.
-  Once the deadline passes the marker is spent and the row follows the normal
-  reclaim path (marked `STALE`, lease deleted, claim released).
+- Parked claims are **excluded from the sweep's candidate query**: they are
+  not reclaim work at all. The exclusion matters because the query orders by
+  the oldest heartbeat first and a parked row's heartbeat is old by
+  definition — without it, parked claims would fill the candidate batch on
+  every sweep and starve the genuinely stale rows behind them.
+- Inside the decision transaction a candidate whose claim carries a **running**
+  marker (`retryAfter` in the future) is **skipped**: no `STALE` mark, no lease
+  delete, no claim release. The silence of a parked worker is not evidence of
+  abandonment, and the park deadline — not the heartbeat — decides when the
+  work becomes reclaimable. Once the deadline passes the marker is spent and
+  the row follows the normal reclaim path (marked `STALE`, lease deleted,
+  claim released).
 - The sweep's epoch-fenced lease delete excludes a running park
   (`retryAfter IS NULL OR retryAfter <= now`), so a park that starts inside
   the sweep's decision window cannot have its lease consumed either. Such a
