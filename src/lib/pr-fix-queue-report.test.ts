@@ -984,6 +984,49 @@ describe("resolvePrFixFromAgentReport", () => {
     expect(row.handoutReceipts).toEqual(["hnd_111111111111111a@fixer@1"]);
   });
 
+  // #1340 review: the token fence also guards the already-settled skip path —
+  // the release runs with zero settlement writes and still keeps its exact
+  // (agent, generation, token) authorization there.
+  it("releases the exact issuance on an already-settled skip when the report echoes the live handoutToken (#1340 review)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      status: "BLOCKED",
+      agentHandouts: ["fixer@1", "other@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1", "hnd_112233445566@other@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+      attemptEvidenceWatermark: "watermark-1",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      blockReason: "human_decision",
+      summary: "the spec is ambiguous about retry semantics",
+      agentName: "fixer",
+      attempt: { itemId: "item-42", generation: 1, handoutToken: "hnd_aabbccddeeff" },
+    }));
+
+    expect(result.action).toBe("skipped");
+    // Exactly one write: the fenced release. No settlement write.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
+    const releaseCall = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(releaseCall?.where).toEqual({
+      id: "item-42",
+      generation: 1,
+      handoutReceipts: { equals: ["hnd_aabbccddeeff@fixer@1", "hnd_112233445566@other@1"] },
+      agentHandouts: { equals: ["fixer@1", "other@1"] },
+      handoutAcks: { equals: ["fixer@1"] },
+    });
+    expect(releaseCall?.data).toEqual({
+      handoutReceipts: ["hnd_112233445566@other@1"],
+      agentHandouts: ["other@1"],
+      handoutAcks: [],
+    });
+  });
+
   // #1340 review: the no-token migration-window fallback releases only settled
   // rows. When the settlement itself lost its pinned write, the row is still
   // QUEUED — an unfenced release must not clear a live hand-out there.
