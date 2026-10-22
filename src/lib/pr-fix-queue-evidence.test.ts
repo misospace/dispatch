@@ -53,11 +53,11 @@ function matches(row: any, where: any): boolean {
     if (cond !== null && typeof cond === "object" && !(cond instanceof Date) && !Array.isArray(cond)) {
       const ops = cond as Record<string, unknown>;
       for (const [op, operand] of Object.entries(ops)) {
-          if (op === "equals") {
-            if (!sameValue(value, operand)) return false;
-          } else if (op === "in") {
-            if (!Array.isArray(operand) || !(operand as unknown[]).some((o) => sameValue(value, o))) return false;
-          } else if (op === "has") {
+        if (op === "equals") {
+          if (!sameValue(value, operand)) return false;
+        } else if (op === "in") {
+          if (!Array.isArray(operand) || !(operand as unknown[]).some((o) => sameValue(value, o))) return false;
+        } else if (op === "has") {
           if (!(Array.isArray(value) && value.includes(operand))) return false;
         } else if (op === "not") {
           if (sameValue(value, operand)) return false;
