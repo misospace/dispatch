@@ -1,0 +1,29 @@
+min_version = "2026.10.13"
+
+[settings]
+# Fail closed against the lockfile: installs must match a locked platform
+# entry with its pinned checksum, and mise never rewrites .mise/mise.lock
+# implicitly (an un-reviewed lock change breaks the byte-identical approval
+# check used by the Courier bootstrap contract).
+locked = true
+
+[tools]
+node = "24"
+
+[tasks.bootstrap]
+description = "Idempotent dev bootstrap: npm ci + Prisma client generation (no DATABASE_URL, no migrations, no git hooks, no tests, no formatting)"
+run = [
+  "npm ci --include=dev",
+  "npx prisma generate",
+]
+
+[tasks.check]
+description = "CI-equivalent static checks: lint + typecheck (mirrors .github/workflows/ci.yaml)"
+run = [
+  "npm run lint",
+  "npm run typecheck",
+]
+
+[tasks.test]
+description = "Test suite: npm run test (vitest)"
+run = "npm run test"
