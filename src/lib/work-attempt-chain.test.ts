@@ -426,6 +426,138 @@ describe("buildWorkItemDeliveryChain", () => {
     );
   });
 
+  it("merges a fact's evidence across its observations instead of trusting the representative row", () => {
+    // A backfilled reconstruction of the claim and a live observation of the
+    // same claim are one fact. The backfilled row sorts FIRST (source
+    // "api:claim" < "webhook"), so a representative-only read would report
+    // the fact as backfilled even though a source recorded it live.
+    const backfilled = event({
+      kind: "claim",
+      source: "api:claim",
+      agentName: "alpha",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+      metadata: { backfilled: true },
+    });
+    const live = event({
+      kind: "claim",
+      source: "webhook",
+      agentName: "alpha",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+    });
+    const merged = chain({ events: [backfilled, live] });
+    expect(merged.attempts).toHaveLength(1);
+    expect(merged.attempts[0].claimedAt.provenance).toBe("observed");
+    // The fact was recorded live, so the id is the same one it had before
+    // the backfilled observation arrived.
+    expect(merged.attempts[0].attemptId).toBe(execId(live));
+
+    // A claim that ONLY a backfill observed stays backfilled.
+    const onlyBackfilled = chain({ events: [backfilled] });
+    expect(onlyBackfilled.attempts[0].claimedAt.provenance).toBe("backfilled");
+  });
+
+  it("keeps an attested failure outcome when a duplicate observation carries no outcome", () => {
+    const failure = event({
+      kind: "attempt_failed",
+      source: "webhook",
+      agentName: "alpha",
+      occurredAt: "2026-10-01T11:00:00.000Z",
+      metadata: { outcome: "failed" },
+    });
+    const before = chain({
+      events: [event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" }), failure],
+    });
+    expect(before.attempts[0].outcome).toBe("failed");
+
+    // The same failure observed by another writer, without the outcome
+    // metadata: the attested outcome survives. This duplicate sorts FIRST
+    // ("agent-report" < "webhook"), so a representative-only read would
+    // report the attempt as unclassified.
+    const withoutOutcome = event({
+      kind: "attempt_failed",
+      source: "agent-report",
+      actor: "system",
+      agentName: "alpha",
+      occurredAt: "2026-10-01T11:00:00.000Z",
+    });
+    const after = chain({
+      events: [
+        event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" }),
+        failure,
+        withoutOutcome,
+      ],
+    });
+    expect(after.attempts).toHaveLength(1);
+    expect(after.attempts[0].outcome).toBe("failed");
+    expect(after.attempts[0].attemptId).toBe(before.attempts[0].attemptId);
+  });
+
+  it("attributes the outcome to the claim's own agent when another agent closes at the same instant", () => {
+    const result = chain({
+      events: [
+        event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" }),
+        // A cross-agent closing that sorts FIRST (source "agent-report" <
+        // "zz-agent-report") — it must not mask the claim's own report.
+        event({
+          kind: "completed",
+          source: "agent-report",
+          actor: "beta",
+          agentName: "beta",
+          occurredAt: "2026-10-01T11:00:00.000Z",
+        }),
+        event({
+          kind: "completed",
+          source: "zz-agent-report",
+          actor: "alpha",
+          agentName: "alpha",
+          occurredAt: "2026-10-01T11:00:00.000Z",
+        }),
+      ],
+    });
+
+    expect(result.attempts).toHaveLength(1);
+    expect(result.attempts[0].outcome).toBe("success");
+    expect(result.attempts[0].reportedAt).toBe("2026-10-01T11:00:00.000Z");
+    expect(result.notes).not.toContain(
+      "closing report from a different agent ignored for outcome attribution",
+    );
+  });
+
+  it("never lets a closing observation that PRECEDES the claim close the attempt", () => {
+    const result = chain({
+      events: [
+        // Same instant as the claim, but sorted first ("attempt_failed" <
+        // "claim"): it belongs to an earlier attempt, not to this one.
+        event({
+          kind: "attempt_failed",
+          source: "agent-report",
+          agentName: "alpha",
+          occurredAt: "2026-10-01T12:00:00.000Z",
+          metadata: { outcome: "failed" },
+        }),
+        event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T12:00:00.000Z" }),
+        event({
+          kind: "completed",
+          source: "agent-report",
+          agentName: "beta",
+          occurredAt: "2026-10-01T12:00:00.000Z",
+        }),
+      ],
+    });
+
+    expect(result.attempts).toHaveLength(1);
+    // The only closing evidence AFTER the claim is another agent's report:
+    // it closes the window but never decides the outcome.
+    expect(result.attempts[0].outcome).toBe("unclassified");
+    expect(result.notes).toContain(
+      "closing report from a different agent ignored for outcome attribution",
+    );
+  });
+
   it("keeps execution attempt ids stable when a backfilled EARLIER claim arrives", () => {
     const originalClaim = event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" });
     const closing = event({

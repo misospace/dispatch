@@ -35,7 +35,9 @@ Everything hangs off identity that survives retries and replays:
   hex characters of a sha256 over the claim event's **canonical dedupe
   identity** — the exact key the projection's dedupe uses: `kind`,
   `fromStatus`, `toStatus`, `occurredAtMs`, `agentName` (joined with a
-  NUL separator). `source` and `actor` are deliberately NOT part of the
+  NUL separator; a `pr_merged` observation adds its resolved PR number as a
+  sixth element, and only a `claim` anchors an attempt). `source` and
+  `actor` are deliberately NOT part of the
   identity: the same transition observed by two writers (the documented
   api-vs-webhook double-record) is ONE fact, and either writer may be the
   only one recorded so far. The id is therefore content-derived, not
@@ -67,7 +69,7 @@ Each `attempts.attempts[]` entry carries:
 | `attemptId` | Stable id as above. |
 | `kind` | `"execution"` or `"fix-round"`. |
 | `agentName` | From the claim / closing event or the matched run; `null` when unknown. Fix rounds are `null` — the PR-fix history stream carries no agent attribution. |
-| `claimedAt` | `{ at, provenance }` from the claim event (`observed`, or `backfilled` when the row says so). Null means unknown — **never** inferred from the issue's creation time or from run timestamps. |
+| `claimedAt` | `{ at, provenance }` from the claim event: `observed` when at least one observation of the claim was recorded live, `backfilled` when every observation of it is a backfill (see "Dedupe guarantees"). Null means unknown — **never** inferred from the issue's creation time or from run timestamps. |
 | `startedAt` / `endedAt` | Only from `AgentRun` intervals (`startedAt` / `finishedAt`) when a run's interval lies within/overlaps the attempt window; null otherwise. Claim/admission time and actual execution time are different facts and stay distinct: `claimedAt` is admission, these are execution. |
 | `reportedAt` | `occurredAt` of the closing lifecycle event (`attempt_failed` / `completed` / `claim_released`) that ends the attempt; null when open. |
 | `outcome` | See below. Every attempt is preserved with its outcome. |
@@ -99,7 +101,7 @@ never sum the per-attempt values.
 |---|---|
 | Closed by a `completed` event **from the claim's agent** | `success` |
 | `attempt_failed` with `metadata.outcome` `"failed"` / `"blocked"` **from the claim's agent** | the same word |
-| Closing `completed` / `attempt_failed` from a DIFFERENT agent than the claim | the window still closes (`reportedAt` is set), but the outcome stays `unclassified` — the closing report is ignored for outcome attribution ("closing report from a different agent ignored for outcome attribution" note) |
+| Closing `completed` / `attempt_failed` from a DIFFERENT agent than the claim | the window still closes (`reportedAt` is set), but the outcome stays `unclassified` — the closing report is ignored for outcome attribution ("closing report from a different agent ignored for outcome attribution" note). When the claim's OWN agent also closed at that same instant, its report is the one used |
 | Claim closed by a newer claim with no intervening release | `superseded` — the previous attempt is preserved, not deleted |
 | Fix round with a newer generation on the same item | `superseded` |
 | Fix round, item status `FIXED` / `BLOCKED` / `PARKED` | `success` / `blocked` / `abandoned` |
@@ -134,6 +136,21 @@ claim.
   `source`/`actor` — collapses into the existing attempt and leaves its id
   unchanged. Only a claim that differs in a field of the identity (kind,
   status transition, occurrence time, or agent) is a new attempt.
+- **A fact's evidence is the union of its observations.** Which row happens
+  to represent a collapsed duplicate never decides an attempt's content:
+  - `claimedAt.provenance` is `observed` when AT LEAST ONE observation of
+    the claim was recorded live, and `backfilled` only when EVERY
+    observation of it is a backfill (a backfill is a reconstruction from
+    existing evidence, so a fact that also has a live observation was
+    observed). More evidence never weakens the claim.
+  - A failure's outcome (`failed` / `blocked`) is the first non-null
+    `metadata.outcome` across the fact's observations; a duplicate that
+    carries no outcome never erases an attested one. Conflicting
+    attestations inside one fact resolve deterministically by content
+    order.
+  - When several closing events land at the SAME instant, the closing event
+    from the CLAIM's own agent wins, so a cross-agent report at that
+    instant cannot mask the claim's own outcome.
 
 ## Unparseable input is skipped, never guessed
 

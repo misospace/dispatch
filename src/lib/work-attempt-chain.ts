@@ -216,6 +216,32 @@ function executionAttemptId(claim: { identityKey: string }): string {
 }
 
 /**
+ * ONE logical fact, merged across every observation of it.
+ *
+ * The dedupe collapses duplicate observations of the same transition into a
+ * single fact. The fact's EVIDENCE is the union of what its observations
+ * say — not whatever the representative row happens to carry (#1183 review):
+ * a late duplicate must never flip an attempt's provenance or outcome.
+ *
+ * - `observed`: at least one observation was recorded live (not a backfill).
+ *   A backfill is a reconstruction from existing evidence, so a fact that
+ *   ALSO has a live observation was observed; only a fact whose EVERY
+ *   observation is a backfill is `backfilled`. More evidence never weakens
+ *   the claim, so a late duplicate can only refine it.
+ * - `outcome`: the first non-null `metadata.outcome` across the fact's
+ *   observations (deterministic: the observations are visited in the same
+ *   content order the dedupe sorts by). A duplicate that carries no outcome
+ *   never erases an attested one.
+ */
+interface DedupeFact {
+  row: LifecycleEventRecord;
+  occurredAtMs: number;
+  identityKey: string;
+  observed: boolean;
+  outcome: string | null;
+}
+
+/**
  * The timeline's exact-duplicate collapse, applied to the same rows: the
  * same transition observed twice (the documented api-vs-webhook pair) is one
  * fact and must not inflate the attempt count. `source` is deliberately not
@@ -225,7 +251,7 @@ function executionAttemptId(claim: { identityKey: string }): string {
 function dedupeEvents(
   events: readonly LifecycleEventRecord[],
   addNote: (note: string) => void,
-): Array<{ row: LifecycleEventRecord; occurredAtMs: number; identityKey: string }> {
+): DedupeFact[] {
   const ordered = [...events].sort((a, b) =>
     contentKey([
       a.kind,
@@ -254,8 +280,8 @@ function dedupeEvents(
       : 1,
   );
 
-  const deduped: Array<{ row: LifecycleEventRecord; occurredAtMs: number; identityKey: string }> = [];
-  const seen = new Set<string>();
+  const facts: DedupeFact[] = [];
+  const byIdentity = new Map<string, DedupeFact>();
   let collapsed = false;
   for (const row of ordered) {
     const occurredAtMs = toMillis(row.occurredAt);
@@ -264,21 +290,35 @@ function dedupeEvents(
       continue;
     }
     const key = observationIdentityKey(row, occurredAtMs);
-    if (seen.has(key)) {
+    const reported = (row.metadata ?? {}).outcome;
+    const existing = byIdentity.get(key);
+    if (existing) {
       collapsed = true;
+      // Merge the duplicate's evidence into the fact it observes.
+      if (!isBackfilled(row.metadata)) existing.observed = true;
+      if (existing.outcome === null && typeof reported === "string") {
+        existing.outcome = reported;
+      }
       continue;
     }
-    seen.add(key);
-    deduped.push({ row, occurredAtMs, identityKey: key });
+    const fact: DedupeFact = {
+      row,
+      occurredAtMs,
+      identityKey: key,
+      observed: !isBackfilled(row.metadata),
+      outcome: typeof reported === "string" ? reported : null,
+    };
+    byIdentity.set(key, fact);
+    facts.push(fact);
   }
   if (collapsed) addNote("duplicate observation collapsed");
 
-  deduped.sort(
+  facts.sort(
     (a, b) =>
       a.occurredAtMs - b.occurredAtMs ||
       (a.row.kind < b.row.kind ? -1 : a.row.kind > b.row.kind ? 1 : 0),
   );
-  return deduped;
+  return facts;
 }
 
 /** Union length of closed intervals: overlapping intervals are counted once,
@@ -437,7 +477,27 @@ export function buildWorkItemDeliveryChain(
         break;
       }
     }
-    const closing = closeIndex !== null ? events[closeIndex] : null;
+    let closing = closeIndex !== null ? events[closeIndex] : null;
+    if (closing !== null && !supersededByClaim) {
+      // Among closing events at the SAME instant, the claim's own agent wins:
+      // a cross-agent report must not mask the claim's own outcome just
+      // because it sorts first (#1183 review). Only events AFTER the claim
+      // are candidates — a closing observation that precedes the claim
+      // belongs to an earlier attempt.
+      const claimAgent = claim.row.agentName;
+      const closingAtMs = closing.occurredAtMs;
+      if (claimAgent !== null) {
+        for (let i = eventIndex + 1; i < events.length; i += 1) {
+          const candidate = events[i];
+          if (candidate.occurredAtMs > closingAtMs) break;
+          if (candidate.occurredAtMs !== closingAtMs) continue;
+          if (!CLOSING_KINDS.has(candidate.row.kind)) continue;
+          if (candidate.row.agentName !== claimAgent) continue;
+          closing = candidate;
+          break;
+        }
+      }
+    }
     const windowEnd = closing !== null ? closing.occurredAtMs : Number.POSITIVE_INFINITY;
     if (supersededByClaim) {
       addNote("attempt closed by a newer claim without a release");
@@ -492,7 +552,10 @@ export function buildWorkItemDeliveryChain(
       } else if (closing.row.kind === "completed") {
         outcome = "success";
       } else {
-        const reported = (closing.row.metadata ?? {}).outcome;
+        // The outcome is the fact's merged evidence, not the representative
+        // row's metadata: a duplicate observation that carries no outcome
+        // never erases an attested one.
+        const reported = closing.outcome;
         if (reported === "failed") outcome = "failed";
         else if (reported === "blocked") outcome = "blocked";
       }
@@ -528,7 +591,10 @@ export function buildWorkItemDeliveryChain(
         agentName,
         claimedAt: {
           at: toIso(windowStart),
-          provenance: isBackfilled(claim.row.metadata) ? "backfilled" : "observed",
+          // Fact-level provenance: observed when at least one observation of
+          // the claim was recorded live, backfilled only when every
+          // observation is a backfill.
+          provenance: claim.observed ? "observed" : "backfilled",
         },
         startedAt: startedAtMs !== null ? toIso(startedAtMs) : null,
         endedAt: endedAtMs !== null ? toIso(endedAtMs) : null,
