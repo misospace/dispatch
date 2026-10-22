@@ -25,10 +25,49 @@ function lt(field: string, cutoff: Date): WhereClause {
  * The SQL three-valued complement of `lt(field, cutoff)` over a NULLABLE
  * column: TRUE exactly when the `lt` comparison is NOT TRUE — the column IS
  * NULL, or its value is at/after the cutoff. This is the one place the
- * NULL-polarity rule is spelled; both families derive their live arms from it.
+ * NULL-polarity rule is spelled; the heartbeat-gated family's live arm is
+ * derived from it.
  */
 function notLt(field: string, cutoff: Date): WhereClause {
   return { OR: [{ [field]: null }, { [field]: { gte: cutoff } }] };
+}
+
+/**
+ * The SQL three-valued complement of the "IS NULL OR lt" reclaim shape over a
+ * NULLABLE column: TRUE exactly when the column IS NOT NULL AND its value is
+ * at/after the cutoff.
+ *
+ * `notLt` cannot express it: `notLt` is TRUE on a NULL column, while this arm
+ * must be UNKNOWN (never TRUE) there — a NULL deadline means NO park, and
+ * such a row must never shield a claim. So the NULL polarity is spelled out
+ * explicitly here instead of being implied by the comparison, and the
+ * blocked-park family's live arm is derived from THIS builder. The two
+ * builders are the two polarities of the same rule, side by side.
+ */
+function notNullNotLt(field: string, cutoff: Date): WhereClause {
+  return { AND: [{ [field]: { not: null } }, { [field]: { gte: cutoff } }] };
+}
+
+/**
+ * Is the claim's wait marker still RUNNING?
+ *
+ * A lease's `retryAfter` parks the claim until that deadline (#1316/#1334).
+ * While the deadline is still in the future the park is running: the owner
+ * recorded that it defers until then, so the silence of a parked worker is
+ * NOT evidence of abandonment. The sweep must not reclaim such a row, delete
+ * the lease the park was recorded on, or release the claim — the park
+ * deadline decides when the work is reclaimable, not the heartbeat. Once the
+ * deadline has passed the marker is spent and the normal reclaim path
+ * applies.
+ *
+ * Both writers of the marker get this: a `blocked` ownership disposition
+ * (which parks the settled row as well) and a renewal's `externalWait` (which
+ * parks the lease only — the sweep reads the marker off the lease, so the
+ * protection is uniform in the wait marker itself).
+ */
+function parkRunning(lease: { retryAfter?: Date | null } | null | undefined, now: Date): boolean {
+  const retryAfter = lease?.retryAfter ?? null;
+  return retryAfter !== null && retryAfter.getTime() > now.getTime();
 }
 
 /**
@@ -71,9 +110,11 @@ export interface ActiveStateFamilyPredicates {
  *   park-shaped hold it had no deadline for). Reclaiming on the heartbeat instead would destroy
  *   the parked claim while the park is still running, deleting the lease the
  *   `blocked` disposition was recorded on. Live is the 3VL complement of
- *   `IS NULL OR lt`: `NOT IS NULL AND notLt`, which collapses to the bare
- *   `{ gte }` arm — UNKNOWN (never TRUE) on a NULL expiry, so a NULL-deadline
- *   BLOCKED sibling never keeps a claim alive forever.
+ *   `IS NULL OR lt` — `NOT IS NULL AND notLt` — derived through the sibling
+ *   builder `notNullNotLt`: the bare `{ gte }` arm alone would be TRUE on a
+ *   NULL expiry, so the explicit `IS NOT NULL` conjunct is what makes a
+ *   NULL-deadline BLOCKED sibling UNKNOWN (never TRUE) and therefore unable to
+ *   keep a claim alive forever.
  *
  * Both arms of both families share the pending boundary
  * `staleClaimReleasePending: false`. A row that still owes a claim release
@@ -115,7 +156,7 @@ export function activeStateFamilies(cutoff: Date): ActiveStateFamilyPredicates[]
       live: {
         state: "BLOCKED",
         staleClaimReleasePending: false,
-        leaseExpiresAt: { gte: cutoff },
+        ...notNullNotLt("leaseExpiresAt", cutoff),
       },
     },
   ];
@@ -130,6 +171,13 @@ export interface StaleWorkReport {
    * Such a row is counted here only — never as `released`, never as `skipped`.
    */
   claimRetained: number;
+  /**
+   * Rows the sweep did not reclaim this run. Two reasons: the per-issue
+   * fence was held by another claim-path writer, or the claim is PARKED — a
+   * running wait marker (`retryAfter` in the future, #1316/#1334) says the
+   * owner defers until that deadline, so the row is left alone and reclaimed
+   * through the normal path once the park elapses.
+   */
   skipped: number;
   /**
    * Lease rows the sweep actually deleted through its claim-epoch CAS-fenced
@@ -157,11 +205,17 @@ export interface StaleWorkReport {
  * existence recheck instead — no delete is attempted at all when the snapshot
  * saw no row. A terminal `disposition` write changes NONE of these fields, so
  * a worker cleanly disposing its claim never makes the sweep back off.
+ *
+ * `retryAfter` is NOT a fence field: it is read to decide whether the claim
+ * is PARKED (a running wait marker, #1316/#1334) and is deliberately not
+ * compared for equality — the delete's own condition excludes a running park
+ * instead.
  */
 interface ClaimEpochSnapshot {
   claimToken: string | null;
   expiredAt: Date;
   lastRenewalObservedAt: Date | null;
+  retryAfter: Date | null;
 }
 
 interface StaleWorkTransactionClient {
@@ -287,6 +341,15 @@ async function findLiveSiblingWork(
  *    claim, lease and label are reported retained, never released. This is
  *    the belt to the fence's braces — it also covers any future writer that
  *    forgets the mutation guard.
+ *
+ * A third rule sits in front of both: a PARKED claim is not stale work at
+ * all. A running wait marker on the lease (`retryAfter` in the future,
+ * #1316/#1334) says the owner defers until that deadline, so the sweep skips
+ * the row — no STALE mark, no lease delete, no claim release — and the normal
+ * reclaim path applies once the deadline elapses. The marker is written by
+ * both a `blocked` ownership disposition and a renewal's `externalWait`, and
+ * the sweep reads it off the lease, so the protection is uniform in the wait
+ * marker itself.
  */
 export async function sweepStaleWork(
   client: StaleWorkClient = prisma as unknown as StaleWorkClient,
@@ -337,6 +400,14 @@ export async function sweepStaleWork(
     // commits first makes the conditional update miss; a heartbeat after
     // this point sees a terminal STALE row and cannot revive it midway.
     const outcome = await client.$transaction(async (tx): Promise<StaleWorkOutcome> => {
+      // The row's shape BEFORE this transaction writes anything: the restore
+      // in the park branch below puts it back exactly as the sweep found it.
+      const before = {
+        state: work.state,
+        leaseExpiresAt: work.leaseExpiresAt,
+        staleClaimReleasePending: work.staleClaimReleasePending,
+      };
+
       // Claim-epoch snapshot, taken BEFORE the sibling lookup: every write the
       // fenced delete below can no longer match is a write that committed
       // inside the decision window (snapshot → delete), i.e. exactly the
@@ -344,9 +415,21 @@ export async function sweepStaleWork(
       const epoch = work.issueId
         ? await tx.lease.findFirst({
             where: { agentName: work.agentName, issueId: work.issueId },
-            select: { claimToken: true, expiredAt: true, lastRenewalObservedAt: true },
+            select: { claimToken: true, expiredAt: true, lastRenewalObservedAt: true, retryAfter: true },
           })
         : null;
+
+      // A RUNNING wait marker parks the claim until its deadline (#1316/#1334).
+      // The owner recorded that it defers until then, so its silence is not
+      // evidence of abandonment: the sweep leaves the row alone — no STALE
+      // mark, no lease delete, no claim release — and the normal reclaim path
+      // applies once the deadline elapses (the marker is spent by then, so the
+      // row is reclaimed for good). This is the half of the park protection
+      // the row-level park deadline cannot cover: a renewal's `externalWait`
+      // parks the LEASE only, so the marker has to be read off the lease.
+      if (parkRunning(epoch, now)) {
+        return { marked: false, retained: false };
+      }
 
       // Claim-incarnation guard. A live sibling row for the same (agent,
       // issue) still owns the claim, so this row's reclaim must not release
@@ -412,6 +495,14 @@ export async function sweepStaleWork(
               claimToken: epoch.claimToken,
               expiredAt: epoch.expiredAt,
               lastRenewalObservedAt: epoch.lastRenewalObservedAt,
+              // #1334: a RUNNING park is not evidence of abandonment, so the
+              // delete must not consume the lease the park was recorded on —
+              // not even when the park started inside the sweep's decision
+              // window (the epoch fence already covers renewals, which move
+              // the epoch fields; a park does not have to). A lease with no
+              // wait marker (`retryAfter IS NULL`) or an elapsed one is
+              // reclaimable as before.
+              OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
             },
           });
           if ((deleted?.count ?? 0) !== 1) epochMoved = true;
@@ -422,8 +513,29 @@ export async function sweepStaleWork(
         // a successful delete — means the claim epoch moved.
         const remaining = await tx.lease.findFirst({
           where: { agentName: work.agentName, issueId: work.issueId },
-          select: { claimToken: true },
+          select: { claimToken: true, retryAfter: true },
         });
+        if (remaining && parkRunning(remaining, now)) {
+          // A park is running on the claim now — it started inside the sweep's
+          // decision window (or the snapshot read it too early). The claim is
+          // parked, so this row must NOT be left reclaimed: the mark above
+          // would retire the parked owner's row while its park still runs, and
+          // the row would never be reclaimed again (the release it owed is
+          // dropped) — the claim would leak. Restore the row to the shape the
+          // sweep found it in and leave the claim alone; the park deadline,
+          // not the sweep, decides when the work is reclaimable. A restore
+          // that matched nothing leaves the row STALE with its release owed,
+          // which the retry arm picks up once the park has elapsed.
+          await tx.agentWork.updateMany({
+            where: { id: work.id, state: "STALE" },
+            data: {
+              state: before.state,
+              leaseExpiresAt: before.leaseExpiresAt,
+              staleClaimReleasePending: before.staleClaimReleasePending,
+            },
+          });
+          return { marked: false, retained: false };
+        }
         if (remaining) epochMoved = true;
         if (epochMoved) {
           // A renewal, re-claim or fresh claim won the window. Back off — the
