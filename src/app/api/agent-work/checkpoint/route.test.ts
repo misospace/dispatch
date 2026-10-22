@@ -35,7 +35,7 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha", "bound-checkpoint-agent": "test-agent" }));
 
 import { POST as handleCheckpoint } from "./route";
 
@@ -45,13 +45,13 @@ beforeEach(() => {
   resetRateLimits();
 });
 
-function makeCheckpointRequest(payload: Record<string, unknown>) {
+function makeCheckpointRequest(payload: Record<string, unknown>, token = "test-token") {
   return handleCheckpoint(
     new Request("http://localhost/api/agent-work/checkpoint", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: "Bearer test-token",
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(payload),
     })
@@ -375,6 +375,25 @@ describe("POST /api/agent-work/checkpoint — rate limit", () => {
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
     // The rejected request performed no work mutation.
     expect(mockAgentWork.update).toHaveBeenCalledTimes(30);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await makeCheckpointRequest({ agentName: "test-agent", checkpoint: "CHANGES_MADE" });
+      expect(res.status).toBe(200);
+    }
+    const throttled = await makeCheckpointRequest({ agentName: "test-agent", checkpoint: "CHANGES_MADE" });
+    expect(throttled.status).toBe(429);
+
+    // A different credential checkpointing the same agent's work still
+    // succeeds: the window is keyed on the credential-derived throttleKey,
+    // never a shared or body-supplied agent-name bucket.
+    const res = await makeCheckpointRequest(
+      { agentName: "test-agent", checkpoint: "CHANGES_MADE" },
+      "bound-checkpoint-agent",
+    );
+    expect(res.status).toBe(200);
+    expect(mockAgentWork.update).toHaveBeenCalledTimes(31);
   });
 });
 

@@ -98,4 +98,20 @@ describe("POST /api/agent-work/sweep — rate limit", () => {
     expect(mocks.acquireLock).toHaveBeenCalledTimes(6);
     expect(mocks.sweepStaleWork).toHaveBeenCalledTimes(6);
   });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    for (let i = 0; i < 6; i++) {
+      const res = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+      expect(res.status).toBe(200);
+    }
+    const throttled = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+    expect(throttled.status).toBe(429);
+
+    // A different credential (different auth.throttleKey) still sweeps: the
+    // window is keyed on the credential-derived identity, not shared globally.
+    mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "bearer", actor: "scheduler", throttleKey: "test-cred-2" });
+    const res = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+    expect(res.status).toBe(200);
+    expect(mocks.acquireLock).toHaveBeenCalledTimes(7);
+  });
 });

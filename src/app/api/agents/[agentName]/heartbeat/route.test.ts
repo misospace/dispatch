@@ -4,7 +4,7 @@ import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha", "bound-heartbeat-agent": "my-agent" }));
 
 const { mocks, mockAgentRun } = vi.hoisted(() => ({
   mockAgentRun: {
@@ -431,6 +431,32 @@ describe("POST /api/agents/[agentName]/heartbeat — rate limit", () => {
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
     // The rejected request recorded no AgentRun and ran no sync phases.
     expect(mockAgentRun.create).toHaveBeenCalledTimes(30);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await POST(makeRequest("my-agent"), {
+        params: Promise.resolve({ agentName: "my-agent" }),
+      });
+      expect(res.status).toBe(200);
+    }
+    const throttled = await POST(makeRequest("my-agent"), {
+      params: Promise.resolve({ agentName: "my-agent" }),
+    });
+    expect(throttled.status).toBe(429);
+
+    // A different credential heartbeating for the same agent name still
+    // succeeds: the window is keyed on the credential-derived throttleKey,
+    // never a shared or caller-supplied agent-name bucket.
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/my-agent/heartbeat", {
+        method: "POST",
+        token: "bound-heartbeat-agent",
+        body: {},
+      }) as unknown as Parameters<typeof POST>[0],
+      { params: Promise.resolve({ agentName: "my-agent" }) },
+    );
+    expect(res.status).toBe(200);
   });
 });
 

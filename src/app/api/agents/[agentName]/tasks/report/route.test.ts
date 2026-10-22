@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha", "bound-report-agent": "test-agent" }));
 
 const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, prismaMock, getLiveIssueLabelsMock } = vi.hoisted(() => {
   const mockAgentRun = {
@@ -2510,5 +2510,27 @@ describe("POST /api/agents/[agentName]/tasks/report — rate limit", () => {
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
     // The rejected request recorded no AgentRun.
     expect(mockAgentRun.create).toHaveBeenCalledTimes(30);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+      expect(res.status).toBe(200);
+    }
+    const throttled = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+    expect(throttled.status).toBe(429);
+
+    // A different credential reporting for the same agent name still succeeds:
+    // the window is keyed on the credential-derived throttleKey, never a
+    // shared or caller-supplied agent-name bucket.
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+        method: "POST",
+        token: "bound-report-agent",
+        body: { taskType: "implement", outcome: "pr_opened" },
+      }),
+      { params: Promise.resolve({ agentName: "test-agent" }) },
+    );
+    expect(res.status).toBe(200);
   });
 });
