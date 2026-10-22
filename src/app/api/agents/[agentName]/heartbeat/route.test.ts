@@ -434,13 +434,16 @@ describe("POST /api/agents/[agentName]/heartbeat — rate limit", () => {
   });
 
   it("keeps an independent window for a second credential (#1322)", async () => {
+    // The primary requests carry the same x-agent-name the second credential
+    // is bound to, so a limiter regressing to the self-reported actor (or a
+    // shared bucket) collapses both credentials into one window and 429s here.
     for (let i = 0; i < 30; i++) {
-      const res = await POST(makeRequest("my-agent"), {
+      const res = await POST(makeRequest("my-agent", true, { "x-agent-name": "my-agent" }), {
         params: Promise.resolve({ agentName: "my-agent" }),
       });
       expect(res.status).toBe(200);
     }
-    const throttled = await POST(makeRequest("my-agent"), {
+    const throttled = await POST(makeRequest("my-agent", true, { "x-agent-name": "my-agent" }), {
       params: Promise.resolve({ agentName: "my-agent" }),
     });
     expect(throttled.status).toBe(429);

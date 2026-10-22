@@ -2513,11 +2513,23 @@ describe("POST /api/agents/[agentName]/tasks/report — rate limit", () => {
   });
 
   it("keeps an independent window for a second credential (#1322)", async () => {
+    // Primary requests carry the same x-agent-name the second credential is
+    // bound to, so a limiter regressing to the self-reported actor (or a
+    // shared bucket) collapses both credentials into one window and 429s here.
+    const primary = () =>
+      POST(
+        authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+          method: "POST",
+          body: { taskType: "implement", outcome: "pr_opened" },
+          headers: { "x-agent-name": "test-agent" },
+        }),
+        { params: Promise.resolve({ agentName: "test-agent" }) },
+      );
     for (let i = 0; i < 30; i++) {
-      const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+      const res = await primary();
       expect(res.status).toBe(200);
     }
-    const throttled = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+    const throttled = await primary();
     expect(throttled.status).toBe(429);
 
     // A different credential reporting for the same agent name still succeeds:

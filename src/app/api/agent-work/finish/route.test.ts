@@ -45,13 +45,18 @@ beforeEach(() => {
   resetRateLimits();
 });
 
-function makeFinishRequest(payload: Record<string, unknown>, token = "test-token") {
+function makeFinishRequest(
+  payload: Record<string, unknown>,
+  token = "test-token",
+  extraHeaders: Record<string, string> = {},
+) {
   return handleFinish(
     new Request("http://localhost/api/agent-work/finish", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
+        ...extraHeaders,
       },
       body: JSON.stringify(payload),
     })
@@ -339,11 +344,22 @@ describe("POST /api/agent-work/finish — rate limit", () => {
   });
 
   it("keeps an independent window for a second credential (#1322)", async () => {
+    // Primary requests carry the same x-agent-name the second credential is
+    // bound to, so a limiter regressing to the self-reported actor (or a
+    // shared bucket) collapses both credentials into one window and 429s here.
     for (let i = 0; i < 30; i++) {
-      const res = await makeFinishRequest({ agentName: "test-agent", state: "DONE" });
+      const res = await makeFinishRequest(
+        { agentName: "test-agent", state: "DONE" },
+        "test-token",
+        { "x-agent-name": "test-agent" },
+      );
       expect(res.status).toBe(200);
     }
-    const throttled = await makeFinishRequest({ agentName: "test-agent", state: "DONE" });
+    const throttled = await makeFinishRequest(
+      { agentName: "test-agent", state: "DONE" },
+      "test-token",
+      { "x-agent-name": "test-agent" },
+    );
     expect(throttled.status).toBe(429);
 
     // A different credential finishing the same agent's work still succeeds:
