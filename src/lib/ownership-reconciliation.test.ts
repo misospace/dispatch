@@ -636,6 +636,32 @@ describe("ownership reconciliation (#1254)", () => {
       expect(report.errors.join("|")).toContain("external wait");
     });
 
+    it("a forge read failure before Phase B withholds without consuming the retry budget", async () => {
+      // Withholds are not forge failures: attempts must not bump, or a long
+      // outage/hold would park the pending intent and wedge the barrier.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: "tok-g",
+        phase: "pending",
+        attempts: 0,
+        parkedAt: null,
+      });
+      forgeShared.labels.clear(); // getLiveIssueLabels now throws
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      const intent = fixture.tables.ownershipReleaseIntent[0];
+      expect(intent.phase).toBe("pending");
+      expect(intent.parkedAt ?? null).toBeNull();
+      expect(intent.attempts).toBe(0);
+      expect(report.errors.join("|")).toContain("forge read failed before Phase B");
+    });
+
     it("a hold landing after the intent committed withholds the replayed Phase B", async () => {
       // The pre-B re-check runs inside driveReleaseIntent, so the pending
       // intent stays pending (barrier holds, operator sees the error).
