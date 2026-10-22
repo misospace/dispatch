@@ -277,9 +277,14 @@ export async function finishAgentWork(client: AgentWorkClient, input: FinishAgen
   const state = input.state as AgentWorkState;
 
   return client.$transaction(async (tx) => {
-    const existing = await tx.agentWork.findFirst({
-      where: { agentName: input.agentName, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-    });
+    // #1316 review: select through the shared current-claim-work rule
+    // (freshest lastHeartbeatAt, then createdAt, then id) instead of an
+    // unordered pick. A `blocked` disposition parks its row as an external
+    // wait that survives `startAgentWork` (which releases only
+    // CLAIMED/IN_PROGRESS rows), so an unordered findFirst could terminalize
+    // another issue's parked row while the attempt actually being finished
+    // stays active — the same hazard #1328 closed for checkpoints.
+    const existing = await findCurrentClaimWork(tx, input.agentName);
 
     if (!existing) {
       return null;
@@ -315,16 +320,33 @@ export async function getActiveWorkByAgent(client: AgentWorkClient, agentName: s
   });
 }
 
+/**
+ * Legacy simplified reclaim (transaction-only, no claim release). The live
+ * sweeper is `sweepStaleWork` (`stale-work.ts`); this predicate mirrors its
+ * per-state gate (#1316): `CLAIMED`/`IN_PROGRESS` rows are heartbeat-gated,
+ * while a `BLOCKED` row is gated on its park deadline only — reclaimable
+ * once `leaseExpiresAt` elapsed or when it never had one (NULL) — so a
+ * parked blocked claim is never destroyed here either.
+ */
+function reclaimGateClauses(cutoff: Date) {
+  return [
+    {
+      state: { in: ["CLAIMED", "IN_PROGRESS"] },
+      OR: [{ lastHeartbeatAt: { lt: cutoff } }, { leaseExpiresAt: { lt: cutoff } }],
+    },
+    {
+      state: "BLOCKED",
+      OR: [{ leaseExpiresAt: { lt: cutoff } }, { leaseExpiresAt: null }],
+    },
+  ];
+}
+
 export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number) {
   const cutoff = new Date(Date.now() - maxAgeMs);
   return client.$transaction(async (tx) => {
     const stale = await tx.agentWork.findMany({
       where: {
-        state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
-        OR: [
-          { lastHeartbeatAt: { lt: cutoff } },
-          { leaseExpiresAt: { lt: cutoff } },
-        ],
+        OR: reclaimGateClauses(cutoff),
       },
     });
 
@@ -332,11 +354,7 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
       const updated = await tx.agentWork.updateMany({
         where: {
           id: work.id,
-          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
-          OR: [
-            { lastHeartbeatAt: { lt: cutoff } },
-            { leaseExpiresAt: { lt: cutoff } },
-          ],
+          OR: reclaimGateClauses(cutoff),
         },
         data: { state: "STALE", leaseExpiresAt: new Date() },
       });
@@ -355,6 +373,15 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * matching active Lease. This covers the crash/oom-kill scenario where an
  * agent leaves a CLAIMED/IN_PROGRESS AgentWork behind with no live lease.
  *
+ * A lease carrying a still-running park (`retryAfter` in the future) protects
+ * its agent here even after the ownership TTL elapsed: an `externalWait`
+ * renewal parks the claim on the wait deadline while the row it heartbeats
+ * stays CLAIMED/IN_PROGRESS, so deleting that row would erase a running park
+ * through the claim path — exactly what the stale-work sweep's parked-claim
+ * exclusion holds off (#1316, #1334). SQL 3VL: a NULL `retryAfter` matches
+ * neither future arm. Once the park deadline passes the marker is spent and
+ * the row follows the normal cleanup, as after the sweep.
+ *
  * History entries are automatically cascaded via onDelete: Cascade.
  * An AuditLog entry is created for traceability.
  *
@@ -365,9 +392,13 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   issueId: string,
   repoFullName: string,
 ): Promise<number> {
-  // Active lease agent names for this issue (non-expired)
+  // Active lease agent names for this issue: non-expired, or a running park.
+  const now = new Date();
   const activeLeases = await prisma.lease.findMany({
-    where: { issueId, expiredAt: { gt: new Date() } },
+    where: {
+      issueId,
+      OR: [{ expiredAt: { gt: now } }, { retryAfter: { gt: now } }],
+    },
     select: { agentName: true },
   });
 

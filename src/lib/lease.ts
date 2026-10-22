@@ -199,11 +199,29 @@ export async function releaseLease(leaseId: string): Promise<any | null> {
 
 /**
  * Release all expired leases for a given issue. Returns count of released leases.
+ *
+ * A lease carrying a `retryAfter` still in the future is a RUNNING park (#1316):
+ * the wait deadline was recorded on purpose, so this abandoned-lease cleanup
+ * must not destroy the park's claim receipt and `EXTERNAL_WAIT` evidence
+ * (#1334) while the park is still running. The marker is written by both a
+ * `blocked` ownership disposition and a renewal's `externalWait`, and both get
+ * the same protection. The lease follows the normal cleanup once `retryAfter`
+ * itself elapses; the stale-work sweep additionally deletes it through the
+ * fenced delete when the parked row's own park deadline expires. Deliberately,
+ * the claim-epoch fence fields (`claimToken`/`expiredAt`, #1317) are never
+ * moved here: the skip is evaluated per call, not parked forward.
  */
 export async function releaseExpiredLeases(issueId: string): Promise<number> {
   const now = new Date();
   const expired = await prisma.lease.findMany({
-    where: { issueId, expiredAt: { lte: now } },
+    where: {
+      issueId,
+      expiredAt: { lte: now },
+      // Skip a park that is still running: `retryAfter IS NULL` (no wait
+      // marker — SQL 3VL: a NULL `retryAfter` makes `retryAfter <= now`
+      // UNKNOWN, never TRUE) or a `retryAfter` already in the past.
+      OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
+    },
     select: { id: true },
   });
   if (expired.length === 0) return 0;
