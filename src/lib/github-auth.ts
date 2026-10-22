@@ -327,7 +327,10 @@ export async function fetchWithRetry(
     } catch (error) {
       // A composed signal aborts with `TimeoutError` only when OUR bound
       // fired; any other reason is the caller's cancellation — never retried.
-      const timedOut = error instanceof Error && error.name === "TimeoutError";
+      // (The `!init.signal?.aborted` guard keeps even a caller abort reason
+      // *named* TimeoutError from being mistaken for our bound.)
+      const timedOut =
+        error instanceof Error && error.name === "TimeoutError" && !init.signal?.aborted;
       if (timedOut && timeoutIsRetryable && attempt < maxAttempts) {
         await sleep(Math.min(GITHUB_RETRY_MAX_DELAY_MS, 1000 * 2 ** (attempt - 1)));
         continue;

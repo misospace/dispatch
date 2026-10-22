@@ -329,16 +329,19 @@ export async function GET(request: Request) {
       // force-claim may clear it. A NON-eligible guard that the operator
       // still believes stuck is a live-but-wedged holder: the recovery is
       // restarting its process, not stealing the anchor.
-      executingGuards: stuckGuards.map((guard) => ({
-        issueId: guard.issueId,
-        operation: guard.operation,
-        agentName: guard.agentName,
-        ownerTokenPresent: guard.ownerToken !== "",
-        createdAt: guard.createdAt,
-        updatedAt: guard.updatedAt,
-        silentMs: Date.now() - guard.updatedAt.getTime(),
-        overrideEligible: Date.now() - guard.updatedAt.getTime() >= GUARD_OVERRIDE_MIN_AGE_MS,
-      })),
+      executingGuards: stuckGuards.map((guard) => {
+        const silentMs = Date.now() - guard.updatedAt.getTime();
+        return {
+          issueId: guard.issueId,
+          operation: guard.operation,
+          agentName: guard.agentName,
+          ownerTokenPresent: guard.ownerToken !== "",
+          createdAt: guard.createdAt,
+          updatedAt: guard.updatedAt,
+          silentMs,
+          overrideEligible: silentMs >= GUARD_OVERRIDE_MIN_AGE_MS,
+        };
+      }),
     },
   });
 }
