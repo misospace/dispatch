@@ -54,6 +54,17 @@ decide-and-release window on two levels (#1251 review):
     fence. A terminal `disposition` changes none of the fence fields, so a
     cleanly-disposed claim never makes the sweep back off forever.
 
+The sweep's epoch-fenced lease delete also skips a lease that carries a future
+`retryAfter` — a live blocked park (a `blocked` disposition, or a renewal's
+external wait). That marker is the park's evidence and the `EXTERNAL_WAIT`
+read-model signal, so a STALE-marked row can never erase a parked lease: the
+claim is retained (reported as `claimRetained`, audited as
+`stale_agentwork_claim_retained`, labels unchanged, no `claim_released` event),
+and the release stays owed — the retry marker is left up, so a later sweep
+completes the release once the park deadline has elapsed. The deferral is a
+state, not an event: it is audited when the row is reclaimed, and the
+repetitions are counted in the sweep report only.
+
 **Current claim's work.** Several active `AgentWork` rows can coexist for one
 (agent, issue) — `startAgentWork` releases the `CLAIMED`/`IN_PROGRESS` ones, so
 an older `BLOCKED` row survives. The row that *is* the current claim's work is

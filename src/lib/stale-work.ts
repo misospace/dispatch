@@ -50,13 +50,27 @@ interface ClaimEpochSnapshot {
   lastRenewalObservedAt: Date | null;
 }
 
+/**
+ * What the sweep reads from a lease row.
+ *
+ * `retryAfter` is the park marker (#1343): a lease carrying a future
+ * `retryAfter` is inside a live blocked park (a `blocked` disposition or a
+ * renewal's external wait), that marker IS the park's evidence and the
+ * EXTERNAL_WAIT read-model signal (`src/lib/ownership-state.ts`), and it is
+ * what tells a parked lease apart from a claim epoch that moved. Both reads
+ * project the same four fields, so the row shape the sweep sees is one type.
+ */
+interface LeaseRowSnapshot extends ClaimEpochSnapshot {
+  retryAfter: Date | null;
+}
+
 interface StaleWorkTransactionClient {
   agentWork: {
     findFirst: (args: any) => Promise<any>;
     updateMany: (args: any) => Promise<{ count: number }>;
   };
   lease: {
-    findFirst: (args: any) => Promise<ClaimEpochSnapshot | null>;
+    findFirst: (args: any) => Promise<LeaseRowSnapshot | null>;
     deleteMany: (args: any) => Promise<{ count: number }>;
   };
   agentWorkHistory: {
@@ -91,12 +105,21 @@ export interface StaleWorkClient {
  *   snapshot read and its fenced delete (a renewal, a re-claim or a fresh
  *   claim committed inside the decision window), so the sweep backs off and
  *   leaves the lease, the label and the claim untouched.
+ * - `parked_lease` — the lease carries a future `retryAfter`: it is inside a
+ *   live blocked park, and the park marker is the park's evidence (#1343).
+ *   The sweep backs off the same way, and the release stays OWED.
  */
 interface StaleWorkOutcome {
   marked: boolean;
   retained: boolean;
-  retention?: "live_sibling" | "claim_epoch_moved";
+  retention?: "live_sibling" | "claim_epoch_moved" | "parked_lease";
   liveSiblingId?: string | null;
+  /**
+   * The park deadline that kept a parked lease alive (#1343): the lease's
+   * future `retryAfter` at the moment the sweep backed off. Recorded so the
+   * retention audit can name the park it deferred to.
+   */
+  parkRetryAfter?: Date | null;
   /**
    * Lease rows the fenced delete removed in this marked transaction
    * (#1317 accounting). Reported into `StaleWorkReport.leasesReleased`
@@ -147,6 +170,26 @@ async function findLiveSiblingWork(
 }
 
 /**
+ * The reason recorded in the retention audit row — why the sweep reclaimed the
+ * row but did NOT release its claim.
+ *
+ * Each retention names the evidence the sweep deferred to, so an operator can
+ * tell a sibling that still owns the claim apart from a claim epoch that moved
+ * inside the decision window (#1343) and from a lease parked on a live blocked
+ * park (whose `retryAfter` deadline is named).
+ */
+function describeRetention(outcome: StaleWorkOutcome): string {
+  if (outcome.retention === "claim_epoch_moved") {
+    return "the claim epoch moved (renewal, re-claim or fresh claim committed inside the sweep's decision window)";
+  }
+  if (outcome.retention === "parked_lease") {
+    const deadline = outcome.parkRetryAfter ? outcome.parkRetryAfter.toISOString() : "unknown";
+    return `the lease is inside a live blocked park (retryAfter=${deadline}): the park's evidence is retained until the park deadline elapses`;
+  }
+  return `live AgentWork ${outcome.liveSiblingId} still owns the claim`;
+}
+
+/**
  * Reclaim expired AgentWork rows. A row is first moved to STALE with a
  * retryable marker in the database, then its GitHub claim is released. If the
  * process dies between those steps, the next sweep retries the marked row.
@@ -176,6 +219,12 @@ async function findLiveSiblingWork(
  *    claim, lease and label are reported retained, never released. This is
  *    the belt to the fence's braces — it also covers any future writer that
  *    forgets the mutation guard.
+ *
+ * The epoch-fenced delete additionally refuses a lease inside a live blocked
+ * park (a future `retryAfter`, #1343): that marker IS the park's evidence and
+ * the EXTERNAL_WAIT read-model signal, so a stale row must never erase it. A
+ * parked lease is retained, and the release stays owed until the park deadline
+ * elapses.
  */
 export async function sweepStaleWork(
   client: StaleWorkClient = prisma as unknown as StaleWorkClient,
@@ -229,6 +278,10 @@ export async function sweepStaleWork(
   // For issue-scoped claims the whole pipeline runs inside the per-issue
   // mutation fence held by the caller.
   const reclaimStaleRow = async (work: any): Promise<void> => {
+    // The row's state as the candidate query found it, read BEFORE the mark
+    // below moves it to STALE: a row that was already reclaimed is a repeat
+    // visit, not a fresh reclaim (#1343).
+    const alreadyReclaimed = work.state === "STALE";
     // Claim the stale transition before external I/O. A heartbeat that
     // commits first makes the conditional update miss; a heartbeat after
     // this point sees a terminal STALE row and cannot revive it midway.
@@ -240,7 +293,12 @@ export async function sweepStaleWork(
       const epoch = work.issueId
         ? await tx.lease.findFirst({
             where: { agentName: work.agentName, issueId: work.issueId },
-            select: { claimToken: true, expiredAt: true, lastRenewalObservedAt: true },
+            select: {
+              claimToken: true,
+              expiredAt: true,
+              lastRenewalObservedAt: true,
+              retryAfter: true,
+            },
           })
         : null;
 
@@ -312,34 +370,73 @@ export async function sweepStaleWork(
               claimToken: epoch.claimToken,
               expiredAt: epoch.expiredAt,
               lastRenewalObservedAt: epoch.lastRenewalObservedAt,
+              // #1343: never delete a lease inside a live blocked park. The
+              // park marker (`retryAfter`) IS the park's evidence and the
+              // EXTERNAL_WAIT read-model signal, so erasing the row would
+              // erase a live park. The predicate is evaluated by the DATABASE
+              // at delete time, so it also protects a park that lands inside
+              // the sweep's decide-and-release window.
+              OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
             },
           });
           if ((deleted?.count ?? 0) !== 1) epochMoved = true;
           else leasesDeleted = deleted.count;
         }
         // A lease on the pair at the end of the window that the sweep did not
-        // consume — a fresh claim that raced in during the window, or behind
-        // a successful delete — means the claim epoch moved.
+        // consume — a fresh claim that raced in during the window, a parked
+        // lease the guard refused to delete, or a row behind a successful
+        // delete — means the claim epoch moved, or the lease is parked.
         const remaining = await tx.lease.findFirst({
           where: { agentName: work.agentName, issueId: work.issueId },
-          select: { claimToken: true },
+          select: {
+            claimToken: true,
+            expiredAt: true,
+            lastRenewalObservedAt: true,
+            retryAfter: true,
+          },
         });
         if (remaining) epochMoved = true;
+        // #1343: a lease carrying a future `retryAfter` is inside a live
+        // blocked park. Its evidence must survive the sweep, so the retention
+        // keeps the lease, the label and the claim — and the release stays
+        // OWED (the retry marker is left up), so a later sweep — after the
+        // park deadline elapses — completes it through the normal path.
+        //
+        // The park is read from BOTH ends of the window: the snapshot (the
+        // park was live when the sweep decided) and the recheck (the park
+        // landed inside the window, or is still live on the row that survived
+        // the delete). Reading the snapshot too keeps the deferral a park
+        // deferral even when the parked lease is deleted by an unguarded
+        // writer between the delete and the recheck: the release stays owed
+        // and the next sweep re-decides against the current state, so the
+        // claim is released then instead of being stranded.
+        const parkLive = (lease: LeaseRowSnapshot | null | undefined): boolean =>
+          lease?.retryAfter != null && lease.retryAfter.getTime() > now.getTime();
+        const parked = parkLive(epoch) || parkLive(remaining);
         if (epochMoved) {
-          // A renewal, re-claim or fresh claim won the window. Back off — the
-          // row stays reclaimed, but the lease, the label and the claim are
-          // left alone, and the retry marker goes down so the next sweep does
-          // not chase it. The next sweep re-decides against CURRENT state:
-          // the fresh claim is then visible to the sibling lookup as well.
+          // A renewal, re-claim, fresh claim or a live park won the window.
+          // Back off — the row stays reclaimed, but the lease, the label and
+          // the claim are left alone. An epoch move clears the retry marker
+          // (the next sweep re-decides against CURRENT state: the fresh claim
+          // is then visible to the sibling lookup as well); a park keeps it
+          // up, because the release of a parked claim is still owed.
           const reverted = await tx.agentWork.updateMany({
             where: { id: work.id, state: "STALE" },
-            data: { leaseExpiresAt: now, staleClaimReleasePending: false },
+            data: parked
+              ? { leaseExpiresAt: now }
+              : { leaseExpiresAt: now, staleClaimReleasePending: false },
           });
           if (reverted.count !== 1) return { marked: false, retained: false };
           // In the pathological case where the CAS delete consumed a row AND
           // a recheck still found one, the consumed deletion is still real —
           // report it honestly even though this row is retained.
-          return { marked: true, retained: true, retention: "claim_epoch_moved", leasesDeleted };
+          return {
+            marked: true,
+            retained: true,
+            retention: parked ? "parked_lease" : "claim_epoch_moved",
+            parkRetryAfter: parked ? remaining?.retryAfter ?? epoch?.retryAfter ?? null : null,
+            leasesDeleted,
+          };
         }
       }
       return { marked: true, retained: false, liveSiblingId: null, leasesDeleted };
@@ -353,22 +450,31 @@ export async function sweepStaleWork(
 
     if (outcome.retained) {
       // The row was reclaimed, but the claim it could have released is live:
-      // a sibling row still owns it, or the claim epoch moved under the
-      // sweep. Recorded as a retention, not a release: the labels are
-      // unchanged because nothing was released.
+      // a sibling row still owns it, the claim epoch moved under the sweep,
+      // or the lease is parked on a live blocked park. Recorded as a
+      // retention, not a release: the labels are unchanged because nothing
+      // was released.
       report.claimRetained++;
       const issueRef = [work.issueId, work.issue?.number != null ? `#${work.issue.number}` : null]
         .filter((part): part is string => Boolean(part))
         .join(" ");
-      const reason =
-        outcome.retention === "claim_epoch_moved"
-          ? "the claim epoch moved (renewal, re-claim or fresh claim committed inside the sweep's decision window)"
-          : `live AgentWork ${outcome.liveSiblingId} still owns the claim`;
+      const reason = describeRetention(outcome);
+      // A park deferral is a STATE, not an event: the row stays reclaimed and
+      // the park deadline is unchanged, so every later sweep defers it again.
+      // Auditing each repetition would pile up one audit row per sweep for
+      // the whole park (up to the 7-day park cap), so the deferral is audited
+      // when the sweep reclaims the row, and a row that was already reclaimed
+      // (a repeat deferral, or the retry of a crashed sweep) is counted in
+      // the report only.
+      const repeatedParkDeferral = outcome.retention === "parked_lease" && alreadyReclaimed;
       // The retention decision is already committed and the row is no longer
-      // a sweep candidate, so a failure here must NOT escape: it would leave
-      // the mutation guard demoted with nothing left to resume it (resume is
-      // only reachable from a candidate), freezing every claim-path write on
-      // the issue. Surface the audit failure in the report instead.
+      // a sweep candidate — except for a park deferral, which keeps the
+      // release owed and stays a candidate — so a failure here must NOT
+      // escape: it would leave the mutation guard demoted with nothing left
+      // to resume it (resume is only reachable from a candidate), freezing
+      // every claim-path write on the issue. Surface the audit failure in the
+      // report instead.
+      if (repeatedParkDeferral) return;
       try {
         await client.auditLog.create({
           data: {
