@@ -477,12 +477,16 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > a pending intent (audited) via `supersedeOwnershipReleaseIntent`;
 > `assign_owner` does not touch agent labels and never cancels a pending
 > release. Guards left `executing` by a hard crash surface on the ownership
-> inspect read view; only an operator clears them. Phase A re-derives the
-> CAS-unpinnable facts at commit time, under the anchor and before any CAS
-> write: a fresh live-label read fails closed on forge errors, and a
-> maintainer hold (`status/blocked` + reason), review ownership (open linked
-> PR or open PR-fix queue row), or a future lease `retryAfter` withholds the
-> intent (issue #1254 "re-check … at commit time"). Phase A CAS-fences on
+> inspect read view; only an operator clears them. The CAS-unpinnable facts
+> are re-derived at commit time, under the anchor: a fresh live-label read
+> fails closed on forge errors, and a maintainer hold (`status/blocked` +
+> reason), review ownership (open linked PR or open PR-fix queue row), or a
+> future lease `retryAfter` withholds the release (issue #1254 "re-check …
+> at commit time"). Phase A runs it before the intent-commit transaction
+> (nothing commits when withheld); `driveReleaseIntent` repeats it directly
+> before every Phase B delete, so a hold that lands while an intent is
+> pending withholds the replay too (the intent stays pending; exempt
+> operator paths supersede it). Phase A CAS-fences on
 > the full claim epoch — `{claimToken, expiredAt, lastRenewalObservedAt,
 > disposition}` plus the observed `AgentWork` heartbeat (§8.6) — with the
 > heartbeat CAS sequenced before the token-retiring lease CAS so a failed

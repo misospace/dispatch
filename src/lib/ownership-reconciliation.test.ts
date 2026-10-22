@@ -636,6 +636,31 @@ describe("ownership reconciliation (#1254)", () => {
       expect(report.errors.join("|")).toContain("external wait");
     });
 
+    it("a hold landing after the intent committed withholds the replayed Phase B", async () => {
+      // The pre-B re-check runs inside driveReleaseIntent, so the pending
+      // intent stays pending (barrier holds, operator sees the error).
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReleaseIntent.push({
+        id: "intent-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        agentLabel: "agent/alpha",
+        attemptToken: "tok-g",
+        phase: "pending",
+        attempts: 0,
+        parkedAt: null,
+      });
+      // Maintainer blocked the issue after Phase A committed.
+      forgeShared.setLabels(REPO, 42, ["status/blocked", "agent/alpha"]);
+      fixture.tables.issue[0].blockedReason = "human hold";
+      const report = await runReconcile(fixture, now, "enforce");
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(1);
+      expect(report.errors.join("|")).toContain("maintainer hold");
+    });
+
     it("dead ladder rows with reclaim history survive cleanup (loaded reclaimCount)", async () => {
       const now = new Date();
       const fixture = buildFixture(now);

@@ -474,6 +474,39 @@ async function driveReleaseIntent(
           return { complete: true, value: { kind: "error", error: "settle skipped: issue row missing" } };
         }
 
+        // #1254 acceptance ("re-check … at commit time") extended to the
+        // replay entry: the same hold/review/external-wait re-check runs
+        // directly before the remote delete. A maintainer hold or review
+        // ownership that landed while the intent was pending (after its
+        // Phase A commit) withholds Phase B and the intent stays pending
+        // (fail closed, retried next pass; the exempt operator paths
+        // supersede it).
+        let replayLiveLabels: string[];
+        try {
+          replayLiveLabels = await forge.getLiveIssueLabels(issue.repository.fullName, issue.number);
+        } catch (error) {
+          return {
+            complete: true,
+            value: {
+              kind: "skipped",
+              error: `forge read failed before Phase B: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          };
+        }
+        const withheld = await releaseWithheldAtCommitTime(
+          client,
+          {
+            issue: { id: issue.id, number: issue.number, repository: issue.repository },
+            agentLabel: intent.agentLabel,
+            hasLeaseEpoch: intent.attemptToken != null,
+          },
+          replayLiveLabels,
+          now,
+        );
+        if (withheld) {
+          return { complete: true, value: { kind: "skipped", error: `release withheld before Phase B: ${withheld}` } };
+        }
+
         // Phase B — the ONLY remote mutation of a release. Targeted delete of
         // exactly the label the intent names. The forge adapter already
         // swallows 404s, so ANY error here is a real failure: fail closed and
@@ -760,6 +793,36 @@ async function commitReleaseIntent(
     { issueId: input.issue.id, operation: "reconcile-release", agentName: input.agentName },
     async (): Promise<{ complete: boolean; value: PhaseAResult }> => {
       try {
+        // #1254 acceptance: commit-time re-check (fail closed on a forge read
+        // failure for BOTH paths — an unverifiable live label set can never
+        // authorize a release). It runs inside the same anchor window and
+        // BEFORE the transaction (a network read must not hold the DB
+        // transaction open, and a withheld release commits nothing, not even
+        // a retired token). The other writers of this label set serialize on
+        // the same anchor, so facts it checks cannot move mid-window.
+        let liveLabels: string[];
+        try {
+          liveLabels = await forge.getLiveIssueLabels(
+            input.issue.repository.fullName,
+            input.issue.number,
+          );
+        } catch (error) {
+          return {
+            complete: true,
+            value: {
+              kind: "skipped",
+              error: `forge read failed during Phase A commit-time re-check: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          };
+        }
+        const withheld = await releaseWithheldAtCommitTime(
+          client,
+          { issue: input.issue, agentLabel: input.agentLabel, hasLeaseEpoch: input.epoch !== null },
+          liveLabels,
+          now,
+        );
+        if (withheld) return { complete: true, value: { kind: "skipped", error: `release withheld: ${withheld}` } };
+
         const result = await client.$transaction(async (tx): Promise<PhaseAResult> => {
           const existing = await tx.ownershipReleaseIntent.findUnique({
             where: { issueId_agentLabel: { issueId: input.issue.id, agentLabel: input.agentLabel } },
@@ -769,30 +832,6 @@ async function commitReleaseIntent(
           // ladder run re-derives from current evidence).
           if (existing && existing.phase === "superseded") return { kind: "skipped" };
           if (existing && existing.phase === "pending") return { kind: "replay" };
-
-          // #1254 acceptance: commit-time re-check (fail closed on a forge
-          // read failure for BOTH paths — an unverifiable live label set can
-          // never authorize a release). Runs before any CAS write so a
-          // withheld release commits nothing, not even a retired token.
-          let liveLabels: string[];
-          try {
-            liveLabels = await forge.getLiveIssueLabels(
-              input.issue.repository.fullName,
-              input.issue.number,
-            );
-          } catch (error) {
-            return {
-              kind: "skipped",
-              error: `forge read failed during Phase A commit-time re-check: ${error instanceof Error ? error.message : String(error)}`,
-            };
-          }
-          const withheld = await releaseWithheldAtCommitTime(
-            tx,
-            { issue: input.issue, agentLabel: input.agentLabel, hasLeaseEpoch: input.epoch !== null },
-            liveLabels,
-            now,
-          );
-          if (withheld) return { kind: "skipped", error: `release withheld: ${withheld}` };
 
           if (input.epoch) {
             // CAS the ownership row on the exact claim epoch — the snapshot of
@@ -996,6 +1035,9 @@ export async function replayPendingOwnershipReleases(
         result.errors.push(`${issue.repository.fullName}#${issue.number}: ${outcome.error}`);
       } else {
         result.skipped++;
+        // A withheld replay carries its reason (hold/review/external-wait);
+        // surface it instead of silently skipping.
+        if (outcome.error) result.errors.push(`${issue.repository.fullName}#${issue.number}: ${outcome.error}`);
       }
     } catch (error) {
       result.errors.push(
