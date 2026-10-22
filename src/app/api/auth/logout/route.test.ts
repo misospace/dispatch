@@ -80,4 +80,34 @@ describe("POST /api/auth/logout — rate limit", () => {
     const res = await POST(makeLogoutRequest({ "x-forwarded-for": "203.0.113.7" }));
     expect(res.status).toBe(429);
   });
+
+  it("uses the rightmost (trusted) x-forwarded-for entry, so rotating the forged leftmost value does not reset the window", async () => {
+    for (let i = 0; i < 10; i++) {
+      const res = await POST(
+        makeLogoutRequest({ "x-forwarded-for": `forged-${i}, 203.0.113.5` })
+      );
+      expect(res.status).toBe(200);
+    }
+
+    // Same trusted peer IP despite a fresh forged leftmost entry: still limited.
+    const res = await POST(
+      makeLogoutRequest({ "x-forwarded-for": "forged-final, 203.0.113.5" })
+    );
+    expect(res.status).toBe(429);
+    expect(mocks.signOut).toHaveBeenCalledTimes(10);
+  });
+
+  it("falls back to x-real-ip when x-forwarded-for is absent", async () => {
+    for (let i = 0; i < 10; i++) {
+      const res = await POST(makeLogoutRequest({ "x-real-ip": "192.0.2.44" }));
+      expect(res.status).toBe(200);
+    }
+
+    const limited = await POST(makeLogoutRequest({ "x-real-ip": "192.0.2.44" }));
+    expect(limited.status).toBe(429);
+
+    // No headers at all uses the separate "unknown" bucket.
+    const unknown = await POST(makeLogoutRequest());
+    expect(unknown.status).toBe(200);
+  });
 });
