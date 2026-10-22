@@ -451,10 +451,13 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
       agentWork: { 
         findMany: vi.fn().mockImplementation(({ where }: any) => {
           let result: any[] = [];
-          // Return data based on what's been mocked — simulate notIn filtering
+          // Return data based on what's been mocked — simulate state + notIn filtering
           const mockData = (mockPrisma.agentWork as any)._mockData;
           if (mockData) {
             result = [...mockData];
+            if (where?.state?.in) {
+              result = result.filter((w: any) => where.state.in.includes(w.state));
+            }
             if (where?.agentName?.notIn) {
               result = result.filter((w: any) => !where.agentName.notIn.includes(w.agentName));
             }
@@ -505,6 +508,21 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
         notes: expect.stringContaining("Deleted 1 stale AgentWork record"),
       }),
     });
+  });
+
+  it("never releases a BLOCKED row through the claim-path cleanup (#1316, #1334)", async () => {
+    // A parked claim's settled row is BLOCKED and its parked AgentWork row has
+    // no matching active Lease once the ownership TTL elapses; the claim path
+    // must leave it to the park-gated sweep, not delete it here.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "parked-1", state: "BLOCKED", agentName: "parked-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
   });
 
   it("does not release work whose agent has an active lease", async () => {

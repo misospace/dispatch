@@ -829,3 +829,136 @@ describe("POST /api/issues/claim — lifecycle evidence (#1202)", () => {
     });
   });
 });
+
+describe("POST /api/issues/claim — parked claims (#1316, #1334)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseCreate.mockResolvedValue({ id: "l-new", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseUpdate.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.agentWorkFindMany.mockResolvedValue([]);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  /**
+   * Behavioral stand-in for the two lease queries the claim path runs against
+   * one parked row: `findActiveLeasesForIssue` (`expiredAt > now` — a park
+   * whose ownership TTL elapsed is not "active") and `releaseExpiredLeases`
+   * (`expiredAt <= now` AND the wait marker gone, SQL 3VL: a future
+   * `retryAfter` matches neither OR arm). The parked row is only ever returned
+   * to a query that actually selects it, so the assertions below cannot pass
+   * by accident.
+   */
+  function leaseQueriesSee(parked: Record<string, any>) {
+    mocks.leaseFindMany.mockImplementation(({ where }: any) => {
+      const matches = (row: Record<string, any>) => {
+        if (where.issueId !== undefined && row.issueId !== where.issueId) return false;
+        if (where.expiredAt?.gt !== undefined) return row.expiredAt.getTime() > where.expiredAt.gt.getTime();
+        if (where.expiredAt?.lte !== undefined) {
+          if (row.expiredAt.getTime() > where.expiredAt.lte.getTime()) return false;
+          return where.OR.some((arm: any) =>
+            arm.retryAfter === null
+              ? row.retryAfter === null
+              : arm.retryAfter?.lte !== undefined && row.retryAfter !== null && row.retryAfter.getTime() <= arm.retryAfter.lte.getTime(),
+          );
+        }
+        return true;
+      };
+      return Promise.resolve(matches(parked) ? [parked] : []);
+    });
+  }
+
+  it("does not erase another agent's running park through expired-lease cleanup when claiming the issue (#1334)", async () => {
+    // The #1334 hazard end to end at the route: agent `other-agent` parked a
+    // blocked claim (wait deadline in the future, ownership TTL elapsed), and
+    // `test-agent` now claims the same issue. The pre-claim cleanup used to
+    // delete any expired lease — destroying the park receipt — while the
+    // parked BLOCKED AgentWork row survived until its own deadline.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    // The park's lease row is never deleted, by any cleanup call the route makes.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The claim is its own row (the park row is keyed to another agent and is
+    // never mutated by a different agent's claim).
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1);
+    expect((mocks.leaseCreate.mock.calls[0] as any)[0].data.agentName).toBe("test-agent");
+  });
+
+  it("a running park with a live ownership TTL 409s a normal claim outright (#1334)", async () => {
+    // Before the TTL elapses the park is simply an active lease: no cleanup
+    // runs, no write happens, and the claim is refused without force.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 10 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+  });
+
+  it("the parked owner's own re-claim releases the park by design (documented resume path)", async () => {
+    // A claim-path write is a fresh assertion of ACTIVE ownership (#1251):
+    // the owner re-claiming its parked issue ends the wait deliberately, so
+    // the renewal clears the marker instead of inheriting it. This is the
+    // release path the capability doc names ("until it expires naturally or
+    // the same agent re-claims") — not evidence loss.
+    const parked = {
+      id: "lease-parked",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      disposition: "blocked",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    mocks.leaseFindUnique.mockResolvedValue(parked);
+    mocks.leaseFindMany.mockResolvedValue([]);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    expect(mocks.leaseUpdate).toHaveBeenCalledTimes(1);
+    const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+    expect(updateData.retryAfter).toBeNull();
+    expect(updateData.waitReason).toBeNull();
+  });
+});
