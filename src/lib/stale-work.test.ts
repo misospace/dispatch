@@ -1284,12 +1284,12 @@ describe("sweepStaleWork — defers to pending reconciler release intents (#1254
     expect(leaseDeleteMany).toHaveBeenCalled();
   });
 
-  it("ignores settled intents: only pending ones defer the sweep", async () => {
+  it("ignores superseded intents: only pending ones defer the sweep", async () => {
     const work = makeWork();
     const { client, leaseDeleteMany } = makeSweepClient({
       candidates: [work],
       leases: [makeLease()],
-      pendingIntents: [{ issueId: "issue-1", phase: "settled" }],
+      pendingIntents: [{ issueId: "issue-1", phase: "superseded" }],
     });
 
     const report = await sweepStaleWork(client as unknown as StaleWorkClient);

@@ -298,12 +298,13 @@ describe("GET /api/issues/ownership — executing-guard surface (#1254 round 4)"
     reset();
   });
 
-  it("surfaces guard updatedAt (the heartbeat silence signal), never the owner token", async () => {
+  it("surfaces guard updatedAt/silence (the heartbeat signal), never the owner token", async () => {
     const createdAt = new Date(Date.now() - 20 * 60_000);
     // Created 20 min ago but stamped 30 s ago: the operator reads SILENCE,
-    // not elapsed age — this guard belongs to a live (slow) holder and is NOT
-    // override-eligible. The payload must carry both timestamps to show that.
+    // not elapsed age — this holder is alive (slow) and NOT override-
+    // eligible. A second guard silent past the fence IS.
     const updatedAt = new Date(Date.now() - 30_000);
+    const deadStamp = new Date(Date.now() - 10 * 60_000);
     db.guards = [
       {
         issueId: "issue-1",
@@ -314,21 +315,38 @@ describe("GET /api/issues/ownership — executing-guard surface (#1254 round 4)"
         createdAt,
         updatedAt,
       },
+      {
+        issueId: "issue-2",
+        operation: "claim",
+        agentName: "beta",
+        ownerToken: "other-token",
+        executing: true,
+        createdAt: deadStamp,
+        updatedAt: deadStamp,
+      },
     ];
 
     const res = await get("http://localhost/api/issues/ownership?state=");
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.reconciliation.executingGuards).toEqual([
-      {
-        issueId: "issue-1",
-        operation: "reconcile-release",
-        agentName: "alpha",
-        ownerTokenPresent: true,
-        createdAt: createdAt.toISOString(),
-        updatedAt: updatedAt.toISOString(),
-      },
-    ]);
+    const guards = body.reconciliation.executingGuards;
+    expect(guards).toHaveLength(2);
+    expect(guards[0]).toMatchObject({
+      issueId: "issue-1",
+      operation: "reconcile-release",
+      agentName: "alpha",
+      ownerTokenPresent: true,
+      createdAt: createdAt.toISOString(),
+      updatedAt: updatedAt.toISOString(),
+      overrideEligible: false,
+    });
+    expect(guards[0].silentMs).toBeGreaterThanOrEqual(29_000);
+    expect(guards[1].overrideEligible).toBe(true);
+    expect(body.reconciliation.guardHeartbeatMs).toBeGreaterThan(0);
+    expect(body.reconciliation.guardOverrideMinAgeMs).toBeGreaterThanOrEqual(body.reconciliation.guardHeartbeatMs);
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("secret-owner-token");
+    expect(serialized).not.toContain("other-token");
   });
 });
 

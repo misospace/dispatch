@@ -471,9 +471,15 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > live holder stamps its guard every `GUARD_HEARTBEAT_MS` while it runs, and
 > every remote call it can make is hard-bounded (#1347: per-attempt
 > `AbortSignal.timeout`, default 30s via `DISPATCH_GITHUB_TIMEOUT_MS`, plus a
-> capped retry backoff in `fetchWithRetry`), so silence past the fence means
-> the holder process is gone — a young or freshly stamped executing guard
-> keeps the override fail-closed instead of racing a live
+> capped retry backoff in `fetchWithRetry`), so silence past the fence
+> evidences a holder that cannot prove liveness — dead, event-loop-blocked,
+> or DB-starved. The converse is the accepted cost: a holder that is alive
+> and stamping is never override-eligible, however wedged its operation is,
+> and the issue stays pinned until that process restarts (the inspect
+> surface's `overrideEligible` says which situation the operator is looking
+> at); a silent-but-live holder that resumes after an override loses on the
+> ownerToken CAS. A young or freshly stamped executing guard keeps the
+> override fail-closed instead of racing a live
 > writer through the anchor), the owner/operator
 > unclaim and the operator agent-work release, and the direct `assign_agent`
 > path (which takes the same anchor as operation `assign`) instead supersede

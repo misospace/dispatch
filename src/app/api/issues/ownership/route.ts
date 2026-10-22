@@ -20,6 +20,7 @@ import {
   reconcileRecheckIntervalMs,
   reconcileMaxForgeRetries,
 } from "@/lib/ownership-reconciliation";
+import { GUARD_HEARTBEAT_MS, GUARD_OVERRIDE_MIN_AGE_MS } from "@/lib/issue-mutation-guard";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -300,6 +301,8 @@ export async function GET(request: Request) {
       maxReclaims: reconcileMaxReclaims(),
       recheckIntervalMs: reconcileRecheckIntervalMs(),
       maxForgeRetries: reconcileMaxForgeRetries(),
+      guardHeartbeatMs: GUARD_HEARTBEAT_MS,
+      guardOverrideMinAgeMs: GUARD_OVERRIDE_MIN_AGE_MS,
       pendingIntents: releaseIntents.map((intent) => ({
         id: intent.id,
         issueId: intent.issueId,
@@ -320,12 +323,12 @@ export async function GET(request: Request) {
         lastReclaimAt: candidate.lastReclaimAt,
         lastReasons: candidate.lastReasons,
       })),
-      // Every in-flight guard, live or crashed — the operator distinguishes by
-      // SILENCE: a live holder stamps `updatedAt` every GUARD_HEARTBEAT_MS
-      // (#1254 round 4), so a fresh stamp means "still running" regardless of
-      // how long the operation has been going, and only silence past
-      // GUARD_OVERRIDE_MIN_AGE_MS evidences a crash. A maintainer force-claim
-      // is the override that clears a crashed one.
+      // Every in-flight guard, live or crashed — the operator reads SILENCE:
+      // a live holder stamps `updatedAt` every GUARD_HEARTBEAT_MS (#1254
+      // round 4), so `overrideEligible` says precisely whether a maintainer
+      // force-claim may clear it. A NON-eligible guard that the operator
+      // still believes stuck is a live-but-wedged holder: the recovery is
+      // restarting its process, not stealing the anchor.
       executingGuards: stuckGuards.map((guard) => ({
         issueId: guard.issueId,
         operation: guard.operation,
@@ -333,6 +336,8 @@ export async function GET(request: Request) {
         ownerTokenPresent: guard.ownerToken !== "",
         createdAt: guard.createdAt,
         updatedAt: guard.updatedAt,
+        silentMs: Date.now() - guard.updatedAt.getTime(),
+        overrideEligible: Date.now() - guard.updatedAt.getTime() >= GUARD_OVERRIDE_MIN_AGE_MS,
       })),
     },
   });

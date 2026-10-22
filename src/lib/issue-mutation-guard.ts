@@ -8,13 +8,13 @@ export interface IssueMutationRequest {
   claimToken?: string;
   /**
    * #1254: maintainer-only deliberate override (the claim route's force=true
-   * path). Takes over a guard left `executing` by a crashed process — the
-   * operator decision the fail-closed posture defers to. Never used by
-   * automation: a normal conflicting writer still gets `busy`.
-   * Bounded by `GUARD_OVERRIDE_MIN_AGE_MS`: nothing here can prove a holder
-   * crashed instantly, so the override refuses a guard young enough to still
-   * belong to a live writer and only clears one older than any request-scoped
-   * holder could have held it.
+   * path). Takes over a guard whose holder has gone SILENT past
+   * `GUARD_OVERRIDE_MIN_AGE_MS` — a crashed (or wedged-loop, or
+   * DB-starved) process is the operator decision the fail-closed posture
+   * defers to. Never used by automation: a normal conflicting writer still
+   * gets `busy`. A holder that is alive and stamping is NEVER override-
+   * eligible, however slow it is — recovering such a holder means restarting
+   * its process, not stealing the anchor.
    */
   override?: boolean;
 }
@@ -23,23 +23,30 @@ export interface IssueMutationRequest {
  * #1254 review (round 4): while the callback runs, the holder stamps its
  * guard every interval, so `updatedAt` on an `executing` guard is a LIVE
  * liveness signal, not just the creation time. A live process that is merely
- * SLOW keeps stamping (the interval runs independently of the callback);
- * only a dead process goes silent. This is what turns "older than the fence"
- * into evidence of a crash instead of an assumption.
+ * SLOW keeps stamping (the interval runs independently of the callback, and
+ * the stamp uses the holder's clock — single-replica assumption inherited
+ * from the scheduler, like every other window here); silence means the
+ * holder could not prove liveness: dead, event-loop-blocked, or unable to
+ * reach the database.
  */
 export const GUARD_HEARTBEAT_MS = 60_000;
 
 /**
  * #1254 review: minimum silence (guard `updatedAt` age while still
  * `executing`) before an operator override may clear the guard. Two enforced
- * premises make silence mean "crashed holder":
- * 1. `GUARD_HEARTBEAT_MS` — every live holder stamps the guard every minute
- *    (a stamping holder is never old enough to be overridden);
+ * premises make SILENCE evidence the holder cannot prove liveness
+ * (crashed, loop-blocked, or DB-starved — all safe to override, see below):
+ * 1. `GUARD_HEARTBEAT_MS` — every reachable live holder stamps the guard
+ *    every minute (a stamping holder is never old enough to be overridden);
  * 2. #1347 — every remote call a holder can make is hard-bounded
  *    (`AbortSignal.timeout` per attempt + capped backoff in `fetchWithRetry`),
- *    so no healthy operation waits on a stalled socket past the fence.
- * The guard itself is still NEVER time-expired: this bounds only the
- * deliberate, maintainer-only operator override, never an automatic steal.
+ *    so no reachable healthy operation waits on a stalled socket past the
+ *    fence.
+ * A silent-but-actually-live holder that resumes after an override loses
+ * cleanly on the ownerToken CAS — the accepted cost of the deliberate
+ * override, unchanged. The guard itself is NEVER time-expired: this bounds
+ * only the deliberate, maintainer-only operator override, never an
+ * automatic steal.
  */
 export const GUARD_OVERRIDE_MIN_AGE_MS = 5 * GUARD_HEARTBEAT_MS;
 
@@ -142,10 +149,13 @@ export async function withIssueMutationGuard<T>(
   // #1254 review round 4: liveness heartbeat. While this holder runs, stamp
   // the guard every `GUARD_HEARTBEAT_MS` so an `executing` row's `updatedAt`
   // means "the owning process was alive then". The interval runs alongside
-  // the callback (a slow-but-alive holder keeps stamping; a dead process
-  // goes silent), it is CAS-scoped to this owner's executing guard, and it
-  // is best-effort: a missed stamp only makes the row look older, it can
-  // never corrupt the fence. `unref` so a pending tick never pins the loop.
+  // the callback (a slow-but-alive holder keeps stamping; a dead process,
+  // a blocked event loop, or a holder that cannot reach the DB goes
+  // silent), it is CAS-scoped to this owner's executing guard, and it is
+  // best-effort: a missed stamp only makes a still-live row look older —
+  // the residual override race it opens is the same ownerToken-CAS-losing
+  // cost the deliberate override already accepts. `unref` so a pending tick
+  // never pins the loop.
   const heartbeat = setInterval(() => {
     try {
       void Promise.resolve(

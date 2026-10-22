@@ -236,6 +236,13 @@ export interface FetchWithRetryOptions {
   maxAttempts?: number;
   /** Injectable sleep for tests (default: real setTimeout). */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Retry a request that hit the #1347 timeout bound. Default: GET/HEAD
+   * only. Set true for requests the caller KNOWS are read-idempotent even
+   * though they ride POST (e.g. the GraphQL search) — never for mutating
+   * writes, whose timeout outcome is ambiguous.
+   */
+  retryOnTimeout?: boolean;
 }
 
 /**
@@ -266,18 +273,35 @@ function retryDelayMs(response: Response, attempt: number): number {
 }
 
 /**
+ * Compose the per-attempt request signal: the caller's cancellation (if
+ * any) AND the hard timeout, never one instead of the other (#1347 — the
+ * bound must hold for every request, including ones with a caller signal).
+ * `AbortSignal.any` propagates the FIRST abort, so the rejection reason
+ * still distinguishes `TimeoutError` (our bound) from the caller's abort
+ * reason, keeping the retry decision below honest.
+ */
+function attemptSignal(callerSignal: AbortSignal | null | undefined): AbortSignal {
+  const timeout = AbortSignal.timeout(githubFetchTimeoutMs());
+  return callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout;
+}
+
+/**
  * fetch() with retry-with-backoff for transient GitHub failures.
  *
  * Retries 429 and 5xx responses up to `maxAttempts` times with exponential
  * backoff, honoring `Retry-After` / `x-ratelimit-reset` on 429 (capped at
  * `GITHUB_RETRY_MAX_DELAY_MS` per sleep, #1347). Non-retryable responses
  * (e.g. 404) are returned immediately so callers keep their existing error
- * handling. Every attempt carries a fresh `AbortSignal.timeout` bound
- * (#1347): a stalled request rejects instead of hanging the caller. A
- * timeout is retried only for idempotent reads (GET/HEAD) — a timed-out
- * write may already have applied server-side, so it re-throws fail-closed
- * and the caller's own fenced protocol decides the retry. A caller-supplied
- * `init.signal` is kept verbatim (cancellation stays the caller's).
+ * handling. Every attempt carries a fresh timeout bound (#1347): a stalled
+ * request rejects instead of hanging the caller. The bound stays armed
+ * through BODY consumption too — a slow large response (e.g. a CI job log)
+ * aborts mid-read at the caller, which is the point: the wait is bounded
+ * even when the server is slow. A timeout is retried only for idempotent
+ * reads (GET/HEAD, or POSTs the caller declares read-idempotent via
+ * `retryOnTimeout`) — a timed-out write may already have applied
+ * server-side, so it re-throws fail-closed and the caller's own fenced
+ * protocol decides the retry. A caller-supplied `init.signal` is combined
+ * with the bound (cancellation stays the caller's; the bound still holds).
  */
 export async function fetchWithRetry(
   url: string,
@@ -288,7 +312,8 @@ export async function fetchWithRetry(
   const sleep =
     options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const method = (init.method ?? "GET").toUpperCase();
-  const timeoutIsRetryable = method === "GET" || method === "HEAD";
+  const timeoutIsRetryable =
+    options.retryOnTimeout ?? (method === "GET" || method === "HEAD");
 
   for (let attempt = 1; ; attempt++) {
     let response: Response;
@@ -297,13 +322,12 @@ export async function fetchWithRetry(
       // expire during the backoff sleeps between them.
       response = await fetch(url, {
         ...init,
-        signal: init.signal ?? AbortSignal.timeout(githubFetchTimeoutMs()),
+        signal: attemptSignal(init.signal),
       });
     } catch (error) {
-      // With a caller signal we cannot distinguish our timeout from the
-      // caller's cancellation — never retry it, only re-throw.
-      const timedOut =
-        !init.signal && error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+      // A composed signal aborts with `TimeoutError` only when OUR bound
+      // fired; any other reason is the caller's cancellation — never retried.
+      const timedOut = error instanceof Error && error.name === "TimeoutError";
       if (timedOut && timeoutIsRetryable && attempt < maxAttempts) {
         await sleep(Math.min(GITHUB_RETRY_MAX_DELAY_MS, 1000 * 2 ** (attempt - 1)));
         continue;

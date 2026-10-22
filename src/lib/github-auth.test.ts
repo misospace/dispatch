@@ -178,8 +178,8 @@ describe("fetchWithRetry bounded timeout (#1347)", () => {
     delete process.env.DISPATCH_GITHUB_TIMEOUT_MS;
   });
 
-  it("every attempt gets a fresh AbortSignal; the caller's own signal is kept verbatim", async () => {
-    const calls = vi.fn(async () => {
+  it("every attempt gets a fresh AbortSignal; a caller signal is combined, not dropped", async () => {
+    const calls = vi.fn(async (_url: string, _init?: RequestInit) => {
       if (calls.mock.calls.length === 1) return jsonResponse(503);
       return jsonResponse(200);
     });
@@ -187,15 +187,21 @@ describe("fetchWithRetry bounded timeout (#1347)", () => {
 
     await fetchWithRetry("https://api.github.com/x", {}, { sleep: fakeSleep });
 
-    const first = (calls.mock.calls[0][1] as RequestInit).signal;
-    const second = (calls.mock.calls[1][1] as RequestInit).signal;
+    const first = calls.mock.calls[0][1]?.signal;
+    const second = calls.mock.calls[1][1]?.signal;
     expect(first).toBeInstanceOf(AbortSignal);
     expect(second).toBeInstanceOf(AbortSignal);
     expect(second).not.toBe(first);
 
-    const callerSignal = new AbortController().signal;
-    await fetchWithRetry("https://api.github.com/x", { signal: callerSignal }, { sleep: fakeSleep });
-    expect((calls.mock.calls[2][1] as RequestInit).signal).toBe(callerSignal);
+    // #1347: a caller-supplied signal must NOT void the hard bound — the
+    // two are composed, and the composed signal is still an AbortSignal.
+    const controller = new AbortController();
+    await fetchWithRetry("https://api.github.com/x", { signal: controller.signal }, { sleep: fakeSleep });
+    const composed = calls.mock.calls[2][1]?.signal;
+    expect(composed).toBeInstanceOf(AbortSignal);
+    expect(composed).not.toBe(controller.signal);
+    controller.abort();
+    expect(composed?.aborted).toBe(true);
   });
 
   it("a stalled GET is retried and a late success still resolves", async () => {
@@ -235,6 +241,23 @@ describe("fetchWithRetry bounded timeout (#1347)", () => {
     ).rejects.toThrow(/timed out/);
     expect(calls).toHaveBeenCalledTimes(1);
     expect(fakeSleep).not.toHaveBeenCalled();
+  });
+
+  it("retryOnTimeout admits a caller-declared read-idempotent POST (GraphQL)", async () => {
+    const calls = vi.fn(async () => {
+      if (calls.mock.calls.length === 1) throw timeoutError();
+      return jsonResponse(200, {});
+    });
+    vi.stubGlobal("fetch", calls);
+
+    const res = await fetchWithRetry(
+      "https://api.github.com/graphql",
+      { method: "POST", body: "{}" },
+      { sleep: fakeSleep, retryOnTimeout: true },
+    );
+
+    expect(res.status).toBe(200);
+    expect(calls).toHaveBeenCalledTimes(2);
   });
 
   it("a caller-signal abort is surfaced once and never treated as our timeout", async () => {
