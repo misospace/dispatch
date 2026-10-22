@@ -373,6 +373,15 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * matching active Lease. This covers the crash/oom-kill scenario where an
  * agent leaves a CLAIMED/IN_PROGRESS AgentWork behind with no live lease.
  *
+ * A lease carrying a still-running park (`retryAfter` in the future) protects
+ * its agent here even after the ownership TTL elapsed: an `externalWait`
+ * renewal parks the claim on the wait deadline while the row it heartbeats
+ * stays CLAIMED/IN_PROGRESS, so deleting that row would erase a running park
+ * through the claim path — exactly what the stale-work sweep's parked-claim
+ * exclusion holds off (#1316, #1334). SQL 3VL: a NULL `retryAfter` matches
+ * neither future arm. Once the park deadline passes the marker is spent and
+ * the row follows the normal cleanup, as after the sweep.
+ *
  * History entries are automatically cascaded via onDelete: Cascade.
  * An AuditLog entry is created for traceability.
  *
@@ -383,9 +392,13 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   issueId: string,
   repoFullName: string,
 ): Promise<number> {
-  // Active lease agent names for this issue (non-expired)
+  // Active lease agent names for this issue: non-expired, or a running park.
+  const now = new Date();
   const activeLeases = await prisma.lease.findMany({
-    where: { issueId, expiredAt: { gt: new Date() } },
+    where: {
+      issueId,
+      OR: [{ expiredAt: { gt: now } }, { retryAfter: { gt: now } }],
+    },
     select: { agentName: true },
   });
 

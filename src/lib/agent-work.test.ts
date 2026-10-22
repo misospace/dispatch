@@ -525,6 +525,66 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
   });
 
+  /**
+   * SQL-3VL evaluation of the protecting-lease clause
+   * (`expiredAt > now OR retryAfter > now`): a running park protects its
+   * agent's active-shaped rows even after the ownership TTL lapsed; a NULL
+   * comparison column satisfies neither arm.
+   */
+  function matchesProtectingLeaseWhere(
+    lease: { expiredAt: Date; retryAfter: Date | null },
+    where: { issueId: string; OR: Array<Record<string, any>> },
+  ): boolean {
+    return where.OR.some((arm) => {
+      for (const [field, cond] of Object.entries(arm)) {
+        const value = (lease as any)[field] as Date | null;
+        if (value === null || value === undefined) return false;
+        if (cond?.gt !== undefined && !(value.getTime() > cond.gt.getTime())) return false;
+      }
+      return true;
+    });
+  }
+
+  function leaseQuerySeeLeases(leases: Array<{ agentName: string; expiredAt: Date; retryAfter: Date | null }>) {
+    mockPrisma.lease.findMany.mockImplementation(({ where }: any) =>
+      Promise.resolve(leases.filter((l) => matchesProtectingLeaseWhere(l, where))),
+    );
+  }
+
+  it("a running park (renewal externalWait) keeps the parked agent's IN_PROGRESS row alive through the cleanup (#1316, #1334)", async () => {
+    // The claim path used to key "active" on expiredAt alone, so a park
+    // longer than the renew TTL — the row still CLAIMED/IN_PROGRESS, the
+    // wait deadline still running — lost its row to deleteMany while the
+    // sweeper deliberately holds off. The park must decide here too.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    leaseQuerySeeLeases([
+      { agentName: "parked-agent", expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() + 30 * 60_000) },
+    ]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "parked-work-1", state: "IN_PROGRESS", agentName: "parked-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("an elapsed park no longer protects the agent's active-shaped row (marker spent, normal cleanup)", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    leaseQuerySeeLeases([
+      { agentName: "parked-agent", expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() - 60_000) },
+    ]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "parked-work-1", state: "IN_PROGRESS", agentName: "parked-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(1);
+    expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ["parked-work-1"] } },
+    });
+  });
+
   it("does not release work whose agent has an active lease", async () => {
     const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
     mockPrisma.lease.findMany.mockResolvedValue([{ agentName: "active-agent" }]);

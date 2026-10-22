@@ -46,6 +46,12 @@ renewals, #1317): the skip is evaluated per cleanup call, never parked forward,
 and the stale-work sweep remains the fenced reclaimer when the park deadline
 itself elapses. The protection is uniform in the wait marker: both writers —
 a `blocked` ownership disposition and a renewal's `externalWait` — get it.
+The same posture governs the claim path's stale-`AgentWork` cleanup
+(`findAndReleaseStaleAgentWorkForIssue`): a lease whose `retryAfter` is still
+in the future counts as active for that cleanup too, so a renewal park —
+whose heartbeated row stays `CLAIMED`/`IN_PROGRESS` — keeps its row through a
+claim attempt even after the ownership TTL lapses; once the deadline passes
+the marker is spent and the row follows the normal cleanup, as after the sweep.
 
 **A running park also holds the stale-work sweep off.** The row-level park
 deadline covers a `blocked` disposition (it parks the settled row), but a
