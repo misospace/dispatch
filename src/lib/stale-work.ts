@@ -35,9 +35,13 @@ function notLt(field: string, cutoff: Date): WhereClause {
  * One active-state family's predicates, defined ONCE as a reclaim/live pair so
  * the sweeper's candidate clause and the live-sibling lookup cannot drift:
  * `reclaim` is what the candidate query and the mark CAS match against, and
- * `live` is its exact SQL three-valued complement over the same state family
- * (a row is live exactly when the sweep would NOT reclaim it), used by
- * `findLiveSiblingWork`. Both queries consume the SAME objects built here.
+ * `live` is its SQL three-valued complement over the same state family and
+ * the same NON-PENDING boundary (a row is live exactly when the sweep would
+ * NOT reclaim it AND it does not owe a claim release), used by
+ * `findLiveSiblingWork`. Both queries consume the SAME objects built here,
+ * and BOTH arms carry `staleClaimReleasePending: false`: an active-shaped row
+ * still owed a release belongs to NEITHER arm — never a reclaim candidate,
+ * never a claim-shielding live sibling.
  */
 export interface ActiveStateFamilyPredicates {
   /** Family identity, for diagnostics and the complement property test. */
@@ -71,6 +75,15 @@ export interface ActiveStateFamilyPredicates {
  *   `{ gte }` arm — UNKNOWN (never TRUE) on a NULL expiry, so a NULL-deadline
  *   BLOCKED sibling never keeps a claim alive forever.
  *
+ * Both arms of both families share the pending boundary
+ * `staleClaimReleasePending: false`. A row that still owes a claim release
+ * belongs to neither arm: it is not a reclaim candidate (its release is
+ * already owed, the dedicated `state: "STALE"` retry arm picks it up), and it
+ * must not shield a claim as a live sibling either — shielding with it would
+ * withhold the very release the previous sweep decided on. The complement
+ * property therefore holds over NON-PENDING active rows, and a pending
+ * active-shaped row is inert for both queries.
+ *
  * Exported for the reclaim/live complement property test in
  * `stale-work.test.ts`, which evaluates both arms of every family against a
  * full truth grid so the coupling is pinned behaviorally, not just by
@@ -87,6 +100,7 @@ export function activeStateFamilies(cutoff: Date): ActiveStateFamilyPredicates[]
       },
       live: {
         state: { in: [...HEARTBEAT_GATED_STATES] },
+        staleClaimReleasePending: false,
         lastHeartbeatAt: { gte: cutoff },
         ...notLt("leaseExpiresAt", cutoff),
       },
@@ -100,6 +114,7 @@ export function activeStateFamilies(cutoff: Date): ActiveStateFamilyPredicates[]
       },
       live: {
         state: "BLOCKED",
+        staleClaimReleasePending: false,
         leaseExpiresAt: { gte: cutoff },
       },
     },
@@ -212,7 +227,9 @@ interface StaleWorkOutcome {
  * the SAME family definitions the candidate query and the mark CAS consume for
  * their `reclaim` clauses. A sibling is live exactly when the sweeper's own
  * staleness test would NOT reclaim it for that state family, per state, in
- * SQL three-valued logic (see `activeStateFamilies` / `notLt` for how each
+ * SQL three-valued logic, and it does not owe a claim release (both arms
+ * carry `staleClaimReleasePending: false`, so a pending active-shaped row is
+ * never mistaken for a live shield — see `activeStateFamilies` / `notLt` for how each
  * family's live arm is derived as the 3VL complement of its reclaim arm and
  * why the NULL polarity differs per family). The structural coupling is the
  * point: one definition site, both consumers, so the two predicates cannot

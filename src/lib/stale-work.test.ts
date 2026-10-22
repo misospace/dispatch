@@ -664,6 +664,42 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
   });
 
+  it("does not treat a pending-release active-shaped sibling as live", async () => {
+    // A sibling still carrying the retry marker owes a claim release from an
+    // earlier sweep. Counting it as live would let it shield the claim while
+    // its own release is pending — the pending boundary must be structural
+    // in the live arms too, not just in the reclaim arms.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const pendingActiveShaped = makeWork({
+      id: "work-pending-active",
+      issue,
+      state: "IN_PROGRESS",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, pendingActiveShaped],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(leases).toHaveLength(0);
+  });
+
   it("needs BOTH arms of the live predicate: a fresh heartbeat alone is not live", async () => {
     // The sweeper reclaims a row when its heartbeat OR its expiry falls past
     // the cutoff, so "live" is the exact complement: BOTH must be fresh. A
@@ -1516,19 +1552,26 @@ describe("activeStateFamilies reclaim/live complement (#1316)", () => {
     });
   });
 
-  it("a pending-release active row is never a reclaim candidate for any family", () => {
+  it("a pending-release active row is neither a reclaim candidate nor live for any family", () => {
     // `staleClaimReleasePending: true` on a non-STALE row is the inconsistent
     // retry-marker state the sweep never produces: every family's reclaim arm
     // excludes it, so only the dedicated `state: "STALE"` retry arm can pick
-    // a release back up.
-    for (const family of families) {
-      for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
-        expect(
-          matchesWhere(
-            { state, staleClaimReleasePending: true, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: beforeCutoff },
-            family.reclaim,
-          ),
-        ).toBe(false);
+    // a release back up. The live arms exclude it too (both arms share the
+    // pending boundary): a pending active-shaped row must not shield a claim
+    // either — the release is already owed, and shielding would withhold it.
+    // The grid spans every timestamp shape so no freshness window leaks.
+    for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
+      for (const lastHeartbeatAt of [beforeCutoff, cutoff, afterCutoff]) {
+        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, null]) {
+          const row = { state, staleClaimReleasePending: true, lastHeartbeatAt, leaseExpiresAt };
+          // Inert for EVERY family, own or otherwise.
+          for (const family of families) {
+            expect(matches(row, family), `${family.name} ${describeRow(row)}`).toEqual({
+              reclaim: false,
+              live: false,
+            });
+          }
+        }
       }
     }
   });
