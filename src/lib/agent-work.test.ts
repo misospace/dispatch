@@ -153,6 +153,7 @@ describe("parseFinishAgentWorkInput", () => {
       agentName: "test-agent",
       state: "DONE",
       summary: null,
+      issueId: null,
     });
   });
 
@@ -162,6 +163,7 @@ describe("parseFinishAgentWorkInput", () => {
       agentName: "test-agent",
       state: "DONE",
       summary: null,
+      issueId: null,
     });
   });
 
@@ -171,6 +173,7 @@ describe("parseFinishAgentWorkInput", () => {
       agentName: "test-agent",
       state: "BLOCKED",
       summary: null,
+      issueId: null,
     });
   });
 
@@ -215,6 +218,7 @@ describe("parseFinishAgentWorkInput", () => {
       agentName: "test-agent",
       state: "IN_PROGRESS",
       summary: null,
+      issueId: null,
     });
   });
 
@@ -226,6 +230,19 @@ describe("parseFinishAgentWorkInput", () => {
   it("returns error when agentName is empty string", () => {
     const result = parseFinishAgentWorkInput({ agentName: "", state: "DONE" });
     expect(result).toEqual({ error: "Missing required field: agentName (string)" });
+  });
+
+  it("passes through an optional issueId", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: "DONE", issueId: "issue-A" });
+    expect(result).toEqual(expect.objectContaining({ agentName: "test-agent", state: "DONE", issueId: "issue-A" }));
+  });
+  it("treats a non-string issueId as absent", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: "DONE", issueId: 42 });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
+  });
+  it("treats an empty-string issueId as absent", () => {
+    const result = parseFinishAgentWorkInput({ agentName: "test-agent", state: "DONE", issueId: "  " });
+    expect(result).toEqual(expect.objectContaining({ issueId: null }));
   });
 });
 
@@ -350,6 +367,138 @@ describe("finishAgentWork", () => {
     const result = await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
     expect(result).toBeNull();
   });
+
+  // #1331 regression: selection must go through the shared current-claim-work
+  // rule (freshest lastHeartbeatAt, then createdAt, then id) instead of an
+  // unordered findFirst, so an older active sibling (e.g. a surviving BLOCKED
+  // row) can never be settled while the current attempt stays active.
+  it("selects the active row through the shared current-claim-work ordering rule", async () => {
+    const tx = createMockTransaction();
+    tx.agentWork.findFirst.mockResolvedValue({ id: "work-1", state: "IN_PROGRESS" });
+
+    await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
+
+    expect(tx.agentWork.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          agentName: "agent-1",
+          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+        }),
+        orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
+      })
+    );
+  });
+
+  it("scopes selection to the finish's issue when the request identifies one", async () => {
+    const tx = createMockTransaction();
+    tx.agentWork.findFirst.mockResolvedValue({ id: "work-1", state: "IN_PROGRESS" });
+
+    await finishAgentWork(tx, { agentName: "agent-1", state: "DONE", issueId: "issue-A" });
+
+    expect(tx.agentWork.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ agentName: "agent-1", issueId: "issue-A" }),
+        orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
+      })
+    );
+  });
+
+  it("does not scope selection by issue when the request identifies none", async () => {
+    const tx = createMockTransaction();
+    tx.agentWork.findFirst.mockResolvedValue({ id: "work-1", state: "IN_PROGRESS" });
+
+    await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
+
+    const call = tx.agentWork.findFirst.mock.calls[0][0];
+    expect(call.where).not.toHaveProperty("issueId");
+  });
+
+  it("settles the current attempt and leaves an older active sibling untouched", async () => {
+    // The older BLOCKED sibling is FIRST in the pool: an unordered findFirst
+    // lands on it, the shared ordering rule lands on the current row.
+    const older = {
+      id: "work-old",
+      agentName: "agent-1",
+      issueId: "issue-A",
+      state: "BLOCKED",
+      lastHeartbeatAt: new Date("2026-01-01T00:00:00.000Z"),
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    };
+    const current = {
+      id: "work-current",
+      agentName: "agent-1",
+      issueId: "issue-A",
+      state: "IN_PROGRESS",
+      summary: "",
+      lastHeartbeatAt: new Date("2026-01-02T00:00:00.000Z"),
+      createdAt: new Date("2026-01-02T00:00:00.000Z"),
+    };
+    // A terminal row carries the FRESHEST heartbeat: the finish must skip it
+    // (only CLAIMED/IN_PROGRESS/BLOCKED rows are active work) and settle the
+    // current attempt instead.
+    const alreadyDone = {
+      id: "work-done",
+      agentName: "agent-1",
+      issueId: "issue-A",
+      state: "DONE",
+      summary: "earlier attempt",
+      lastHeartbeatAt: new Date("2026-01-03T00:00:00.000Z"),
+      createdAt: new Date("2026-01-03T00:00:00.000Z"),
+    };
+    const tx = createRowBackedTransaction([older, current, alreadyDone]);
+
+    await finishAgentWork(tx, { agentName: "agent-1", state: "DONE", issueId: "issue-A", summary: "final" });
+
+    expect(current.state).toBe("DONE");
+    expect(current.summary).toBe("final");
+    expect(older.state).toBe("BLOCKED");
+    expect(alreadyDone.summary).toBe("earlier attempt");
+  });
+
+  it("never settles another issue's active row", async () => {
+    // The other issue's row is FIRST in the pool and carries the fresher
+    // heartbeat, so only the issue scoping keeps it out of the finish.
+    const otherIssue = {
+      id: "work-b",
+      agentName: "agent-1",
+      issueId: "issue-B",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date("2026-01-02T00:00:00.000Z"),
+      createdAt: new Date("2026-01-02T00:00:00.000Z"),
+    };
+    const identified = {
+      id: "work-a",
+      agentName: "agent-1",
+      issueId: "issue-A",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date("2026-01-01T00:00:00.000Z"),
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    };
+    const tx = createRowBackedTransaction([otherIssue, identified]);
+
+    await finishAgentWork(tx, { agentName: "agent-1", state: "DONE", issueId: "issue-A" });
+
+    expect(identified.state).toBe("DONE");
+    expect(otherIssue.state).toBe("IN_PROGRESS");
+  });
+
+  it("does not fall back to another issue's row when the identified issue has none", async () => {
+    const otherIssue = {
+      id: "work-b",
+      agentName: "agent-1",
+      issueId: "issue-B",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: new Date("2026-01-02T00:00:00.000Z"),
+      createdAt: new Date("2026-01-02T00:00:00.000Z"),
+    };
+    const tx = createRowBackedTransaction([otherIssue]);
+
+    const result = await finishAgentWork(tx, { agentName: "agent-1", state: "DONE", issueId: "issue-A" });
+
+    expect(result).toBeNull();
+    expect(otherIssue.state).toBe("IN_PROGRESS");
+    expect(tx.agentWork.update).not.toHaveBeenCalled();
+  });
 });
 
 describe("releaseStaleWork", () => {
@@ -381,6 +530,85 @@ function createMockTransaction() {
     create: vi.fn().mockResolvedValue({ id: "work-1", state: "CLAIMED", checkpoint: "CLAIMED" }),
     update: vi.fn().mockResolvedValue({ id: "work-1" }),
     updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+  };
+  const agentWorkHistory = {
+    create: vi.fn().mockResolvedValue({ id: "hist-1" }),
+  };
+  return {
+    agentWork,
+    agentWorkHistory,
+    $transaction: (fn: (tx: any) => Promise<any>) => fn({ agentWork, agentWorkHistory }),
+  };
+}
+
+// Sorts rows exactly like `orderBy` does in the database: the keys apply IN
+// ORDER; `Date`s compare by instant, strings lexically. A key or direction
+// this helper does not implement throws, so a selection rule change in
+// production cannot silently read as "pool order won".
+function compareRows(orderBy: unknown) {
+  const specs = (Array.isArray(orderBy) ? orderBy : [orderBy]) as Array<Record<string, "asc" | "desc">>;
+  return (a: any, b: any) => {
+    for (const spec of specs) {
+      for (const [key, direction] of Object.entries(spec)) {
+        if (direction !== "desc" && direction !== "asc") {
+          throw new Error(`test fake: unsupported orderBy direction ${String(direction)}`);
+        }
+        const left = a[key];
+        const right = b[key];
+        if (left === undefined || right === undefined) {
+          throw new Error(`test fake: orderBy on missing field ${key}`);
+        }
+        let cmp = 0;
+        if (left instanceof Date || right instanceof Date) {
+          if (!(left instanceof Date) || !(right instanceof Date)) {
+            throw new Error(`test fake: mixed Date/plain comparison on ${key}`);
+          }
+          cmp = left.getTime() - right.getTime();
+        } else if (typeof left === "number" && typeof right === "number") {
+          cmp = left - right;
+        } else {
+          cmp = String(left) < String(right) ? -1 : String(left) > String(right) ? 1 : 0;
+        }
+        if (cmp !== 0) return direction === "desc" ? -cmp : cmp;
+      }
+    }
+    return 0;
+  };
+}
+
+/**
+ * A transaction client over a real row pool: `agentWork.findFirst` honors
+ * `where.agentName`, `where.issueId` and `where.state.in`, and honors the
+ * `orderBy` array, so a selection that ignores either cannot pass by
+ * accident — an unordered pick and the shared freshest-active pick disagree
+ * here and the test observes which row was actually settled.
+ */
+function createRowBackedTransaction(rows: any[]) {
+  const agentWork = {
+    findUnique: vi.fn(),
+    findFirst: vi.fn(async ({ where, orderBy }: any) => {
+      if (where.state !== undefined && !Array.isArray(where.state?.in)) {
+        throw new Error(`test fake: unsupported where.state shape ${JSON.stringify(where.state)}`);
+      }
+      const matches = rows.filter(
+        (row) =>
+          row.agentName === where.agentName &&
+          (where.issueId === undefined || row.issueId === where.issueId) &&
+          (!where.state?.in || where.state.in.includes(row.state)),
+      );
+      if (matches.length === 0) return null;
+      if (orderBy) matches.sort(compareRows(orderBy));
+      return matches[0];
+    }),
+    findMany: vi.fn().mockResolvedValue([]),
+    create: vi.fn(),
+    update: vi.fn(async ({ where, data }: any) => {
+      const row = rows.find((candidate) => candidate.id === where.id);
+      if (!row) throw new Error(`test fake: no AgentWork row with id ${where.id}`);
+      Object.assign(row, data);
+      return row;
+    }),
+    updateMany: vi.fn().mockResolvedValue({ count: 0 }),
   };
   const agentWorkHistory = {
     create: vi.fn().mockResolvedValue({ id: "hist-1" }),

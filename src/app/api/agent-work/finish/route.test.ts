@@ -151,6 +151,22 @@ describe("POST /api/agent-work/finish", () => {
     expect(body.error).toBe("No active work found for agent");
   });
 
+  // #1331: a finish that identifies an issue must say which issue it looked
+  // for — the agent's other issues' work is never settled as a fallback.
+  it("returns 404 naming the identified issue when that issue has no active work", async () => {
+    mockAgentWork.findFirst.mockResolvedValue(null);
+
+    const res = await makeFinishRequest({
+      agentName: "test-agent",
+      state: "DONE",
+      issueId: "GH_issue_abc123",
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe("No active work found for agent (issueId: GH_issue_abc123)");
+    expect(mockAgentWork.update).not.toHaveBeenCalled();
+  });
+
   it("returns 400 when body is null", async () => {
     const res = await handleFinish(
       new Request("http://localhost/api/agent-work/finish", {

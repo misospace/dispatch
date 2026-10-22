@@ -80,6 +80,8 @@ export interface CheckpointAgentWorkInput {
  * @body agentName (string, required) - Worker identifier matching the active work record
  * @body state (string, required) - One of the valid state values listed above
  * @body summary (string, optional) - Final summary of what was accomplished or why blocked
+ * @body issueId (string, optional) - GitHub issue ID the finish belongs to; scopes
+ *                                   selection to that issue's active rows (#1331)
  *
  * Response 200: Updated work object with final state set and lease expired
  * Response 400: { error: string } with details about which field failed validation
@@ -91,6 +93,17 @@ export interface FinishAgentWorkInput {
   agentName: string;
   state: string;
   summary?: string | null;
+  /**
+   * Optional GitHub issue ID identifying the finish's issue (#1331).
+   * When present, selection is scoped to this issue's active rows so a
+   * finish can never settle another issue's active work.
+   *
+   * Workers that know their issue should send it: without it the finish
+   * settles the agent's FRESHEST active row, and a renewal on another issue
+   * can reorder that pick — only the issue-scoped pick names the intended
+   * attempt for certain.
+   */
+  issueId?: string | null;
 }
 
 /**
@@ -168,6 +181,7 @@ export function parseFinishAgentWorkInput(body: unknown): FinishAgentWorkInput |
     agentName: input.agentName.trim(),
     state: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
+    issueId: typeof input.issueId === "string" && nonEmpty(input.issueId.trim()) ? input.issueId.trim() : null,
   };
 }
 
@@ -277,9 +291,13 @@ export async function finishAgentWork(client: AgentWorkClient, input: FinishAgen
   const state = input.state as AgentWorkState;
 
   return client.$transaction(async (tx) => {
-    const existing = await tx.agentWork.findFirst({
-      where: { agentName: input.agentName, state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] } },
-    });
+    // #1331: select the current claim's work through the shared deterministic
+    // rule (freshest lastHeartbeatAt, then createdAt, then id), scoped to the
+    // finish's issue when the request identifies one. An unordered findFirst
+    // could land on an older active sibling (e.g. a surviving BLOCKED row) and
+    // settle it while the current attempt stays active; without issueId
+    // scoping it could settle a different issue's active row entirely.
+    const existing = await findCurrentClaimWork(tx, input.agentName, input.issueId ?? undefined);
 
     if (!existing) {
       return null;
