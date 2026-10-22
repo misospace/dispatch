@@ -35,4 +35,8 @@ describe("trustedClientIp", () => {
   it("falls back to the literal unknown bucket when no proxy header is present", () => {
     expect(trustedClientIp(headers({}))).toBe("unknown");
   });
+
+  it("falls back to unknown when every x-forwarded-for entry is blank and x-real-ip is absent", () => {
+    expect(trustedClientIp(headers({ "x-forwarded-for": " , " }))).toBe("unknown");
+  });
 });
