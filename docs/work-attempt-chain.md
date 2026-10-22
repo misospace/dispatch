@@ -32,15 +32,20 @@ Everything hangs off identity that survives retries and replays:
 - **Work item** = `repoFullName` + `issueNumber` (GitHub remains the source
   of truth; Dispatch's database is a cache).
 - **Execution attempts** = `exec-<hash12>`, where `hash12` is the first 12
-  hex characters of a sha256 over a stable join of the claim event's
-  identity fields (`kind`, `actor`, `source`, `agentName`, `occurredAtMs`,
-  `fromStatus`, `toStatus`) after the projection's dedupe. The id is
-  content-derived, not positional: a backfilled claim that arrives EARLIER
-  than already-projected claims adds a new attempt without renaming any
-  existing one — ids are stable across newly arrived evidence. The join is
-  at least as discriminating as the dedupe key, so two claim rows that
-  survive dedupe can never share an attempt id. Every observed `claim`
-  event anchors one attempt.
+  hex characters of a sha256 over the claim event's **canonical dedupe
+  identity** — the exact key the projection's dedupe uses: `kind`,
+  `fromStatus`, `toStatus`, `occurredAtMs`, `agentName` (joined with a
+  NUL separator). `source` and `actor` are deliberately NOT part of the
+  identity: the same transition observed by two writers (the documented
+  api-vs-webhook double-record) is ONE fact, and either writer may be the
+  only one recorded so far. The id is therefore content-derived, not
+  positional, and stable in both directions: a backfilled claim that arrives
+  EARLIER than already-projected claims adds a new attempt without renaming
+  any existing one, and a later duplicate observation of an existing claim
+  (different `source`/`actor`, same fact) collapses into the existing
+  attempt without renaming it. The join is exactly as discriminating as the
+  dedupe key, so two claim rows that survive dedupe can never share an
+  attempt id. Every observed `claim` event anchors one attempt.
 - **Fix rounds** = `fix-<itemId>-g<generation>`, exactly one per generation
   `1..item.generation` on the PR-fix queue item (#1044's work identity). The
   id keys off the item id — unique even when two queue items share the same
@@ -123,6 +128,12 @@ claim.
   timeline's exact-duplicate collapse: the same transition observed by two
   writers (the documented `api:*` vs `webhook` pair) is one fact, with a
   "duplicate observation collapsed" note.
+- **A late duplicate observation cannot rename an attempt.** Because the
+  attempt id is derived from the fact's canonical dedupe identity and not
+  from the observing row, a duplicate that arrives later — with a different
+  `source`/`actor` — collapses into the existing attempt and leaves its id
+  unchanged. Only a claim that differs in a field of the identity (kind,
+  status transition, occurrence time, or agent) is a new attempt.
 
 ## Unparseable input is skipped, never guessed
 

@@ -11,9 +11,10 @@
  * rows for the item's PRs — so a reader sees one ordered chain:
  *
  * - `attempts` in oldest-first order: one `exec-<hash12>` per observed
- *   claim (a content-derived id over the claim event's identity fields —
- *   stable even when backfilled evidence arrives out of order), one
- *   `fix-<itemId>-g<generation>` per PR-fix generation.
+ *   claim (a content-derived id over the claim event's canonical dedupe
+ *   identity — stable even when backfilled evidence arrives out of order,
+ *   and stable even when a later duplicate observation of the same claim
+ *   arrives), one `fix-<itemId>-g<generation>` per PR-fix generation.
  * - `totalExecutionWallTimeMs`: the union of ALL execution-interval evidence
  *   across attempts and fix rounds, so overlapping intervals are never
  *   double-counted.
@@ -173,29 +174,45 @@ function contentKey(value: unknown): string {
 }
 
 /**
- * Content-derived execution-attempt identity (#1183 review): sha256 over a
- * stable join of the claim event's identity fields (kind, actor, source,
- * agentName, occurredAtMs, fromStatus, toStatus) AFTER the projection's
- * dedupe, first 12 hex chars. The status labels are in the join so the id is
- * at least as discriminating as the dedupe key itself: two claim rows that
- * survive dedupe can never share an attempt id. A positional `exec-<ordinal>`
- * would rename every attempt when a
- * backfilled EARLIER claim arrives — the ordinal shifts, the content id
- * does not. `node:crypto` createHash is used instead of an inline FNV-1a/
- * djb2 to keep a hand-rolled hash out of the identity path; the module
- * stays pure (deterministic, no I/O, no clock reads).
+ * The canonical identity of ONE logical lifecycle observation — the exact key
+ * the timeline's dedupe uses: `kind`, `fromStatus`, `toStatus`,
+ * `occurredAtMs`, `agentName` (plus the PR number for a merge).
+ *
+ * `source` and `actor` are deliberately NOT part of it (#1183 review): the
+ * same transition observed by two writers (the documented api-vs-webhook
+ * double-record) is one fact, and either writer may be the only one
+ * recorded so far. Identity must never depend on WHICH duplicate observation
+ * happens to represent the fact, or a later duplicate would rename an
+ * existing attempt.
  */
-function executionAttemptId(claim: { row: LifecycleEventRecord; occurredAtMs: number }): string {
-  const key = JSON.stringify([
-    claim.row.kind,
-    claim.row.actor,
-    claim.row.source,
-    claim.row.agentName,
-    claim.occurredAtMs,
-    claim.row.fromStatus,
-    claim.row.toStatus,
-  ]);
-  return `exec-${createHash("sha256").update(key).digest("hex").slice(0, 12)}`;
+function observationIdentityKey(row: LifecycleEventRecord, occurredAtMs: number): string {
+  return [
+    row.kind,
+    row.fromStatus ?? "",
+    row.toStatus ?? "",
+    occurredAtMs,
+    row.agentName ?? "",
+    row.kind === "pr_merged" ? (resolvePrNumber(row) ?? "") : "",
+  ].join("\u0000");
+}
+
+/**
+ * Content-derived execution-attempt identity (#1183 review): sha256 over the
+ * claim event's canonical dedupe identity, first 12 hex chars.
+ *
+ * The join is exactly the dedupe identity, so it is stable: a duplicate
+ * observation of the same claim (different `source`/`actor`, same fact) maps
+ * to the same attempt id and can never rename an existing attempt. It is
+ * also exactly as discriminating as the dedupe key — two claim rows that
+ * survive dedupe have different identities and therefore different ids. A
+ * positional `exec-<ordinal>` would rename every attempt when a backfilled
+ * EARLIER claim arrives — the ordinal shifts, the content id does not.
+ * `node:crypto` createHash is used instead of an inline FNV-1a/djb2 to keep
+ * a hand-rolled hash out of the identity path; the module stays pure
+ * (deterministic, no I/O, no clock reads).
+ */
+function executionAttemptId(claim: { identityKey: string }): string {
+  return `exec-${createHash("sha256").update(claim.identityKey).digest("hex").slice(0, 12)}`;
 }
 
 /**
@@ -208,7 +225,7 @@ function executionAttemptId(claim: { row: LifecycleEventRecord; occurredAtMs: nu
 function dedupeEvents(
   events: readonly LifecycleEventRecord[],
   addNote: (note: string) => void,
-): Array<{ row: LifecycleEventRecord; occurredAtMs: number }> {
+): Array<{ row: LifecycleEventRecord; occurredAtMs: number; identityKey: string }> {
   const ordered = [...events].sort((a, b) =>
     contentKey([
       a.kind,
@@ -237,7 +254,7 @@ function dedupeEvents(
       : 1,
   );
 
-  const deduped: Array<{ row: LifecycleEventRecord; occurredAtMs: number }> = [];
+  const deduped: Array<{ row: LifecycleEventRecord; occurredAtMs: number; identityKey: string }> = [];
   const seen = new Set<string>();
   let collapsed = false;
   for (const row of ordered) {
@@ -246,20 +263,13 @@ function dedupeEvents(
       addNote(`event ${row.kind} (${row.source}) skipped: unparseable occurredAt`);
       continue;
     }
-    const key = [
-      row.kind,
-      row.fromStatus ?? "",
-      row.toStatus ?? "",
-      occurredAtMs,
-      row.agentName ?? "",
-      row.kind === "pr_merged" ? (resolvePrNumber(row) ?? "") : "",
-    ].join("\u0000");
+    const key = observationIdentityKey(row, occurredAtMs);
     if (seen.has(key)) {
       collapsed = true;
       continue;
     }
     seen.add(key);
-    deduped.push({ row, occurredAtMs });
+    deduped.push({ row, occurredAtMs, identityKey: key });
   }
   if (collapsed) addNote("duplicate observation collapsed");
 

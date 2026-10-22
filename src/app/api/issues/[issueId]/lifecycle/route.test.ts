@@ -245,17 +245,17 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
     expect(body.attempts.workItem).toEqual({ repoFullName: "org/repo", issueNumber: 42 });
     expect(body.attemptsTruncated).toBe(false);
     // Content-derived execution id (#1183): sha256 over the claim event's
-    // identity fields [kind, actor, source, agentName, occurredAtMs,
-    // fromStatus, toStatus].
-    const claimKey = JSON.stringify([
+    // canonical dedupe identity [kind, fromStatus, toStatus, occurredAtMs,
+    // agentName]. `source`/`actor` are excluded on purpose — the same claim
+    // observed by two writers is one fact and keeps one id.
+    const claimKey = [
       "claim",
-      "agent/alpha",
-      "api:claim",
-      "agent/alpha",
-      Date.parse("2026-10-01T10:00:00.000Z"),
       "status/ready",
       "status/in-progress",
-    ]);
+      Date.parse("2026-10-01T10:00:00.000Z"),
+      "agent/alpha",
+      "",
+    ].join("\u0000");
     const execId = `exec-${createHash("sha256").update(claimKey).digest("hex").slice(0, 12)}`;
     expect(body.attempts.attempts.map((a: { attemptId: string }) => a.attemptId)).toEqual([
       execId,

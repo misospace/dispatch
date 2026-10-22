@@ -71,21 +71,22 @@ function chain(inputs: Partial<{ events: LifecycleEventRecord[]; runs: WorkAttem
 
 /**
  * Mirrors the documented execution-attempt identity scheme (#1183):
- * `exec-<first 12 hex of sha256 over [kind, actor, source, agentName,
- * occurredAtMs, fromStatus, toStatus]>` after dedupe. Pins the contract: if
- * the join changes, this — and the doc — must change with it.
+ * `exec-<first 12 hex of sha256 over the claim's canonical dedupe identity
+ * [kind, fromStatus, toStatus, occurredAtMs, agentName]>` after dedupe.
+ * `source`/`actor` are NOT part of the identity — the same claim observed by
+ * two writers is one fact and must keep one id. Pins the contract: if the
+ * join changes, this — and the doc — must change with it.
  */
 function execId(claim: LifecycleEventRecord): string {
   const ms = typeof claim.occurredAt === "string" ? Date.parse(claim.occurredAt) : claim.occurredAt.getTime();
-  const key = JSON.stringify([
+  const key = [
     claim.kind,
-    claim.actor,
-    claim.source,
-    claim.agentName,
+    claim.fromStatus ?? "",
+    claim.toStatus ?? "",
     ms,
-    claim.fromStatus,
-    claim.toStatus,
-  ]);
+    claim.agentName ?? "",
+    "",
+  ].join("\u0000");
   return `exec-${createHash("sha256").update(key).digest("hex").slice(0, 12)}`;
 }
 
@@ -350,6 +351,79 @@ describe("buildWorkItemDeliveryChain", () => {
     );
     expect(result.attempts).toHaveLength(3);
     expect(result.attempts.map((a) => a.prFix && a.prFix.itemId)).toEqual(["item-1", "item-2", "item-1"]);
+  });
+
+  it("keeps an attempt id stable when a later duplicate observation of the same claim arrives", () => {
+    // The claim was first observed by the webhook writer only.
+    const observed = event({
+      kind: "claim",
+      source: "webhook",
+      actor: "system",
+      agentName: "alpha",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+    });
+    const before = chain({ events: [observed] });
+    expect(before.attempts).toHaveLength(1);
+    const idBefore = before.attempts[0].attemptId;
+
+    // The SAME logical claim, later observed by the API writer: a different
+    // source AND actor, the same fact. It must collapse into the existing
+    // attempt and must not rename it.
+    const duplicate = event({
+      kind: "claim",
+      source: "api:claim",
+      actor: "agent/alpha",
+      agentName: "alpha",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+    });
+    const after = chain({ events: [observed, duplicate] });
+
+    expect(after.attempts).toHaveLength(1);
+    expect(after.attempts[0].attemptId).toBe(idBefore);
+    // The id is the fact's identity, not either observer's row: both rows
+    // hash to the same attempt.
+    expect(execId(duplicate)).toBe(execId(observed));
+    expect(after.notes).toContain("duplicate observation collapsed");
+  });
+
+  it("gives distinct claims distinct attempt ids even when only the observer differs", () => {
+    const first = event({
+      kind: "claim",
+      source: "webhook",
+      agentName: "alpha",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+    });
+    // A different agent claiming in the same instant is a different fact.
+    const other = event({
+      kind: "claim",
+      source: "api:claim",
+      agentName: "beta",
+      fromStatus: "status/ready",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+    });
+    // A different transition in the same instant is a different fact too.
+    const otherTransition = event({
+      kind: "claim",
+      source: "api:claim",
+      agentName: "alpha",
+      fromStatus: "status/backlog",
+      toStatus: "status/in-progress",
+      occurredAt: "2026-10-01T10:00:00.000Z",
+    });
+
+    const result = chain({ events: [first, other, otherTransition] });
+    expect(result.attempts).toHaveLength(3);
+    expect(new Set(result.attempts.map((a) => a.attemptId)).size).toBe(3);
+    expect([...result.attempts.map((a) => a.attemptId)].sort()).toEqual(
+      [execId(first), execId(other), execId(otherTransition)].sort(),
+    );
   });
 
   it("keeps execution attempt ids stable when a backfilled EARLIER claim arrives", () => {
