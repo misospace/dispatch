@@ -15,6 +15,9 @@ Dispatch is a self-hosted Next.js/TypeScript Kanban and work dispatch layer for 
 ## Key Commands
 
 ```bash
+mise run bootstrap   # Pinned Node + deps + Prisma client (idempotent; no DATABASE_URL, no migrations, no git hooks)
+mise run check       # Lint + typecheck (mirrors CI jobs)
+mise run test        # Vitest suite
 npm install          # Install dependencies (runs `prisma generate` via postinstall)
 npm run dev          # Start development server
 npm run build        # Production build
@@ -24,6 +27,11 @@ npm run db:generate  # Regenerate Prisma client (also runs on postinstall; re-ru
 npm run db:push      # Push schema (dev)
 npm run db:deploy    # Deploy migrations (prod)
 ```
+
+`.mise/config.toml` + `.mise/mise.lock` are the repository development-bootstrap contract
+(Courier #414): Node is the pinned runtime tool, `bootstrap`/`check`/`test` are the shared task
+names, and `check`/`test` delegate to the authoritative `npm run` commands. Do not add
+git-hook installation, migrations, DATABASE_URL requirements, or test execution to `bootstrap`.
 
 ## Important Conventions
 
