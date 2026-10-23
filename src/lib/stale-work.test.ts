@@ -914,6 +914,26 @@ describe("sweepStaleWork — retry arm refuses a claim that postdates the mark (
     expect(audit?.notes).toContain("newer claim incarnation landed after the row's stale mark (#1359)");
   });
 
+  it("retires the row: the next sweep does not pick a refused row up again", async () => {
+    const row = retryRow();
+    const lease = makeLease({ claimToken: "token-new-claim", createdAt: new Date() });
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+    });
+
+    await sweepStaleWork(client);
+    const second = await sweepStaleWork(client);
+
+    // The refusal retired the row (STALE, marker down): it matches no
+    // candidate arm any more — the newer incarnation's lease would otherwise
+    // be re-judged every sweep forever — and the lease stays untouched.
+    expect(second).toMatchObject({ examined: 0, released: 0, claimRetained: 0, skipped: 0 });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toEqual([lease]);
+  });
+
   it("completes the owed release when retry finds no lease", async () => {
     const row = retryRow();
     const { client, eventRows, leaseDeleteMany } = makeSweepClient({ candidates: [row], rows: [row], leases: [] });

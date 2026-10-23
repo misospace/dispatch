@@ -605,11 +605,17 @@ export async function sweepStaleWork(
         }
         if (remaining) epochMoved = true;
         if (epochMoved) {
-          // A renewal, re-claim or fresh claim won the window. Back off — the
-          // row stays reclaimed, but the lease, the label and the claim are
-          // left alone, and the retry marker goes down so the next sweep does
-          // not chase it. The next sweep re-decides against CURRENT state:
-          // the fresh claim is then visible to the sibling lookup as well.
+          // A renewal, re-claim or fresh claim won — inside the mark arm's
+          // decision window, or in the crash window after the mark that the
+          // retry arm just found (#1359). Back off — the row stays
+          // reclaimed, but the lease, the label and the claim are left
+          // alone, and the retry marker goes down so the sweep does not
+          // chase it. In the mark arm the newer incarnation belongs to a
+          // live worker: the next sweep re-decides against CURRENT state,
+          // where the fresh claim is visible to the sibling lookup. In the
+          // retry arm the refused lease postdates the mark and the row is
+          // already terminal: it matches no candidate arm again, and the
+          // bare claim behind it has no AgentWork row to re-decide about.
           const reverted = await tx.agentWork.updateMany({
             where: { id: work.id, state: "STALE" },
             data: { leaseExpiresAt: now, staleClaimReleasePending: false },
