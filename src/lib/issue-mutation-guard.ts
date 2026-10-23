@@ -351,7 +351,15 @@ export async function withIssueMutationGuard<T>(
     // the claim token — there is no partial remote effect to preserve, so a
     // failed ownership attempt must not leave an unrecoverable guard behind
     // (its resume branch does not exist by design). Same posture as "lease".
-    if ((request.operation === "lease" || request.operation === "ownership") && !resuming) {
+    //
+    // #1361: "unassign" joins them. It has no resume branch either (only an
+    // `unassign` attempt can take over an `unassign` guard, and the route
+    // never leaves one behind: it releases the guard on every handled path),
+    // so a failed attempt must not leave a demoted `executing: false` row
+    // behind — that row is invisible to the ownership inspect surface (which
+    // lists `executing` guards only) and would wedge EVERY writer on the
+    // issue, claims included, with no operator-visible way to clear it.
+    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

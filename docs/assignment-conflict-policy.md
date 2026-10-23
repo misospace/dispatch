@@ -129,6 +129,9 @@ The flag is accepted and logged in the audit trail for transparency and to suppo
 - Accepts `action: "unassign_agent"` or `action: "unassign_owner"`.
 - Removes **all** labels of the corresponding type using the shared module.
 - Returns an error if no labels of that type exist.
+- Holds the per-issue mutation anchor — the same anchor the claim and assign paths hold — for the whole mutation, and performs its remote label write inside a **fenced write** (#1361). The label set it writes is a snapshot taken under the anchor, and the write happens only while this holder still owns the anchor: a stolen anchor means no remote write at all, a failure audit row, and a retryable **409 Conflict**.
+- Returns **409 Conflict** while another writer holds the anchor (`Issue mutation is in progress; retry shortly`).
+- Rejects a body whose `repoFullName`/`issueNumber` do not match the anchored issue (**400**) — the write always targets the anchor's issue.
 
 ### `GET /api/agents/<name>/queue` (agent queue)
 
