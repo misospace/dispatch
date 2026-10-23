@@ -2338,10 +2338,15 @@ export async function hasInFlightRebaseHandout(
   return rows.some((row: { attemptType?: unknown; type?: unknown; agentHandouts?: unknown; dispatchedAt?: unknown }) => {
     if ((row.attemptType ?? row.type) !== "REBASE") return false;
     if (!Array.isArray(row.agentHandouts) || row.agentHandouts.length === 0) return false;
-    // Hand-outs without a stamped start should not exist (next-task stamps
-    // `dispatchedAt` before issuing the token); count them as live rather
-    // than fan out on an unprovable claim of death.
-    if (!row.dispatchedAt) return true;
+    // A hand-out with no stamped start is anomalous: next-task stamps
+    // `dispatchedAt` BEFORE pushing the hand-out record, and the only gap
+    // left is a stamp write that throws while the later push succeeds. Such
+    // a row is invisible to the reclaim sweep too (`dispatchedAt: { lt }`
+    // never matches NULL), so counting it live would re-open the
+    // forever-block door the timeout exists to close. Skip it instead: the
+    // worst case is the transient concurrency-2 window the lane already
+    // accepts best-effort, and the next dispatch re-stamps the row properly.
+    if (!row.dispatchedAt) return false;
     return new Date(row.dispatchedAt as string | number | Date).getTime() >= staleBefore;
   });
 }

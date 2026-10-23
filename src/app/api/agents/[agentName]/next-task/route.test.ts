@@ -312,11 +312,11 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     // QUEUED); `waiting` is the next DIRTY PR. Neither may be handed out:
     // `waiting` because the lane is busy, `live` because a second hand-out
     // would put two force-with-lease pushes on one branch.
-    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"] };
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"], dispatchedAt: new Date() };
     const waiting = { ...prFixRow(22), type: "REBASE" };
     mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
-      where?.type === "REBASE"
-        ? [live, waiting].filter((r) => r.status === where.status)
+      where?.OR
+        ? [live, waiting].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
         : [live, waiting].filter((r) => r.status === "QUEUED"));
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
       (where.id === waiting.id ? waiting : live));
@@ -332,11 +332,11 @@ describe("GET /api/agents/[agentName]/next-task", () => {
 
   it("dispatches ordinary fix work while a rebase hand-out is live (#1327)", async () => {
     // The concurrency-1 gate is REBASE-only: OTHER fix work is unaffected.
-    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"] };
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"], dispatchedAt: new Date() };
     const fix = prFixRow(23);
     mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
-      where?.type === "REBASE"
-        ? [live].filter((r) => r.status === where.status)
+      where?.OR
+        ? [live].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
         : [live, fix].filter((r) => r.status === "QUEUED"));
     mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
       (where.id === fix.id ? fix : live));
