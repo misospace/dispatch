@@ -1,9 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha", "bound-heartbeat-agent": "my-agent" }));
 
 const { mocks, mockAgentRun } = vi.hoisted(() => ({
   mockAgentRun: {
@@ -72,6 +73,12 @@ vi.mock("@/lib/heartbeat", async (importOriginal) => {
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 import * as heartbeatModule from "@/lib/heartbeat";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function makeRequest(
   agentName = "test-agent",
@@ -397,6 +404,62 @@ describe("POST /api/agents/[agentName]/heartbeat — error response", () => {
     expect(body.status).toBe("error");
     expect(body.errors.length).toBe(2);
     expect(mockAgentRun.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("POST /api/agents/[agentName]/heartbeat — rate limit", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 60s) without recording runs", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await POST(makeRequest("my-agent"), {
+        params: Promise.resolve({ agentName: "my-agent" }),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(makeRequest("my-agent"), {
+      params: Promise.resolve({ agentName: "my-agent" }),
+    });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request recorded no AgentRun and ran no sync phases.
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(30);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    // The primary requests carry the same x-agent-name the second credential
+    // is bound to, so a limiter regressing to the self-reported actor (or a
+    // shared bucket) collapses both credentials into one window and 429s here.
+    for (let i = 0; i < 30; i++) {
+      const res = await POST(makeRequest("my-agent", true, { "x-agent-name": "my-agent" }), {
+        params: Promise.resolve({ agentName: "my-agent" }),
+      });
+      expect(res.status).toBe(200);
+    }
+    const throttled = await POST(makeRequest("my-agent", true, { "x-agent-name": "my-agent" }), {
+      params: Promise.resolve({ agentName: "my-agent" }),
+    });
+    expect(throttled.status).toBe(429);
+
+    // A different credential heartbeating for the same agent name still
+    // succeeds: the window is keyed on the credential-derived throttleKey,
+    // never a shared or caller-supplied agent-name bucket.
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/my-agent/heartbeat", {
+        method: "POST",
+        token: "bound-heartbeat-agent",
+        body: {},
+      }) as unknown as Parameters<typeof POST>[0],
+      { params: Promise.resolve({ agentName: "my-agent" }) },
+    );
+    expect(res.status).toBe(200);
   });
 });
 

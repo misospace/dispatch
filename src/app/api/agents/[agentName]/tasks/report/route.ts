@@ -17,6 +17,12 @@ import { PLAN_LIMITS } from "@/lib/groomer/plan";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { recordLifecycleEventQuietly } from "@/lib/issue-lifecycle";
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// The worker contract records exactly one report per task cycle and cycles are
+// model-driven (minutes apart); a burst is a broken client, and report
+// resolution can trigger GitHub round-trips.
+const RATE_LIMIT = { limit: 30, windowMs: 60_000 } as const;
 
 const VALID_TASK_TYPES = ["implement", "followup-pr"] as const;
 type ValidTaskType = (typeof VALID_TASK_TYPES)[number];
@@ -258,6 +264,9 @@ export async function POST(
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`tasks-report:${auth.throttleKey}`, RATE_LIMIT);
+  if (limited) return limited;
 
   // A bound worker credential may only report for its own agent; an unbound
   // legacy worker token is refused on this identity-scoped route (#1129).

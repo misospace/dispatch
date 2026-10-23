@@ -53,7 +53,7 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
 
 import { removeIssueLabel } from "@/lib/github";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
-import { sweepStaleWork, type StaleWorkClient } from "./stale-work";
+import { activeStateFamilies, sweepStaleWork, type StaleWorkClient } from "./stale-work";
 
 const removeIssueLabelMock = removeIssueLabel as ReturnType<typeof vi.fn>;
 
@@ -94,6 +94,8 @@ interface WorkRow {
 /** The clause keys the sweeper's clauses are allowed to use. */
 const CLAUSE_KEYS = new Set([
   "OR",
+  "AND",
+  "NOT",
   "id",
   "agentName",
   "issueId",
@@ -106,8 +108,8 @@ const CLAUSE_KEYS = new Set([
   "claimToken",
   "expiredAt",
   "lastRenewalObservedAt",
-  // The lease's park marker (#1343): the fenced delete refuses to consume a
-  // lease inside a live blocked park.
+  // The external-wait marker (#1316/#1334): the park the sweep reads off the
+  // lease and the fenced delete excludes while it is still running.
   "retryAfter",
 ]);
 
@@ -126,6 +128,18 @@ function matchesWhere(row: Record<string, unknown>, where: unknown): boolean {
     if (key === "OR") {
       const clauses = cond as unknown[];
       if (!clauses.some((clause) => matchesWhere(row, clause))) return false;
+      continue;
+    }
+    if (key === "AND") {
+      const clauses = cond as unknown[];
+      if (!clauses.every((clause) => matchesWhere(row, clause))) return false;
+      continue;
+    }
+    if (key === "NOT") {
+      // The candidate query's parked-claim exclusion. The excluded pairs are
+      // exact (agent, issue) matches on non-null columns, so SQL's NOT is
+      // unambiguous here.
+      if (matchesWhere(row, cond)) return false;
       continue;
     }
     if (!CLAUSE_KEYS.has(key)) {
@@ -188,8 +202,9 @@ interface LeaseRow {
   expiredAt: Date;
   lastRenewalObservedAt: Date | null;
   /**
-   * The lease's park marker (#1343): a live "blocked park" recorded by a
-   * `blocked` ownership disposition. `null` = no park.
+   * The external-wait marker (#1316/#1334). A value in the future is a RUNNING
+   * park: the owner defers until then, so the sweep must leave the claim
+   * alone. `null` is "no park".
    */
   retryAfter: Date | null;
   createdAt: Date;
@@ -222,6 +237,13 @@ function makeSweepClient(options: {
    * renewal / re-claim / fresh claim that commits exactly there.
    */
   afterSiblingLookup?: () => void | Promise<void>;
+  /**
+   * Runs right after the sweep's parked-claim read: a park that lands
+   * between that read and the sweep's decision transaction. The candidate
+   * batch is already decided, so only the in-transaction park check can catch
+   * it.
+   */
+  afterParkFilter?: () => void;
 }) {
   const eventRows: Array<Record<string, any>> = [];
   const auditRows: Array<Record<string, any>> = [];
@@ -330,6 +352,16 @@ function makeSweepClient(options: {
     return projected;
   });
 
+  // The parked-claim read: the sweep asks which claims carry a running wait
+  // marker, before it picks its candidates.
+  const leaseFindMany = vi.fn(async ({ where }: any) => {
+    const matched = leases.filter((lease) => matchesWhere(lease as unknown as Record<string, unknown>, where));
+    // The park lands right after that read: the candidate batch is already
+    // decided, so only the in-transaction park check can catch this park.
+    if (options.afterParkFilter) options.afterParkFilter();
+    return matched;
+  });
+
   const leaseDeleteMany = vi.fn(async ({ where }: any) => {
     const doomed = leases.filter((lease) => matchesWhere(lease as unknown as Record<string, unknown>, where));
     for (const doomed_ of doomed) leases.splice(leases.indexOf(doomed_), 1);
@@ -338,7 +370,7 @@ function makeSweepClient(options: {
 
   const tx = {
     agentWork: { findFirst: agentWorkFindFirst, updateMany: agentWorkUpdateMany },
-    lease: { findFirst: leaseFindFirst, deleteMany: leaseDeleteMany },
+    lease: { findFirst: leaseFindFirst, findMany: leaseFindMany, deleteMany: leaseDeleteMany },
     agentWorkHistory: { create: vi.fn().mockResolvedValue({ id: "h-1" }) },
     issue,
     issueLifecycleEvent,
@@ -687,6 +719,42 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
   });
 
+  it("does not treat a pending-release active-shaped sibling as live", async () => {
+    // A sibling still carrying the retry marker owes a claim release from an
+    // earlier sweep. Counting it as live would let it shield the claim while
+    // its own release is pending — the pending boundary must be structural
+    // in the live arms too, not just in the reclaim arms.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const pendingActiveShaped = makeWork({
+      id: "work-pending-active",
+      issue,
+      state: "IN_PROGRESS",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: minutesAhead(30),
+    });
+
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, pendingActiveShaped],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(leases).toHaveLength(0);
+  });
+
   it("needs BOTH arms of the live predicate: a fresh heartbeat alone is not live", async () => {
     // The sweeper reclaims a row when its heartbeat OR its expiry falls past
     // the cutoff, so "live" is the exact complement: BOTH must be fresh. A
@@ -1017,7 +1085,8 @@ describe("sweepStaleWork — decide-and-release under the per-issue fence and cl
     expect(report.released).toBe(1);
     expect(report.claimRetained).toBe(0);
     // The delete is CAS-fenced on the exact epoch the snapshot read, and it
-    // refuses a lease inside a live blocked park (#1343).
+    // excludes a lease whose park is still running (#1334): no wait marker, or
+    // an elapsed one, is reclaimable.
     expect(leaseDeleteMany).toHaveBeenCalledWith({
       where: {
         agentName: "alpha",
@@ -1264,117 +1333,182 @@ describe("sweepStaleWork — leasesReleased accounting (#1317)", () => {
   });
 });
 
-// ─── #1343: a live blocked park is never erased by the stale sweep ──────────
+// ─── #1316: a parked blocked claim outlives the park ─────────────────────────
 //
-// A `blocked` ownership disposition records the park on the lease row as a
-// future `retryAfter`. That marker IS the park's evidence and the EXTERNAL_WAIT
-// read-model signal, so the sweep's epoch-fenced lease delete must skip a
-// lease carrying it: a STALE-marked row can never erase a parked lease. The
-// claim is retained instead, and the release stays OWED — a later sweep, once
-// the park deadline has elapsed, completes it through the normal path.
+// A `blocked` ownership disposition parks the claim as an external wait by
+// moving the settled row's `leaseExpiresAt` to the `retryAfter` deadline
+// (`worker-ownership.ts`). The parked worker is silent BY DESIGN, so the
+// BLOCKED family is reclaim-gated on the park deadline alone — heartbeat
+// silence must not reclaim a row whose park is still running, or the sweep
+// destroys the very lease the park was recorded on.
 
-describe("sweepStaleWork — a live blocked park survives the sweep (#1343)", () => {
-  const staleRow = (overrides: Partial<WorkRow> = {}) =>
-    makeWork({
-      id: "work-stale",
+describe("sweepStaleWork — parked blocked claims (#1316)", () => {
+  it("leaves a parked BLOCKED row out of the reclaim candidates despite heartbeat silence", async () => {
+    const parked = makeWork({
+      id: "work-parked",
+      state: "BLOCKED",
+      // The shape a blocked disposition actually leaves: the worker is gone,
+      // its last heartbeat keeps aging, and the row now carries the park
+      // deadline (retryAfter) as its lease expiry.
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAhead(40),
+    });
+    const lease = makeLease();
+    const { client, eventRows, leaseDeleteMany, leases, candidateClauses } = makeSweepClient({
+      candidates: [parked],
+      rows: [parked],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ examined: 0, released: 0, claimRetained: 0, skipped: 0 });
+    expect(parked.state).toBe("BLOCKED");
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toHaveLength(1);
+    expect(eventRows).toHaveLength(0);
+
+    // Forensic delta against the REAL clause: the identical row with the old
+    // (unrefreshed, now lapsed) expiry — the pre-disposition-fix shape a few
+    // minutes after the disposition — IS selected. The park deadline is the
+    // only thing keeping the row alive.
+    const [candidateClause] = candidateClauses;
+    const preFixShape = { ...parked, leaseExpiresAt: minutesAgo(10) } as unknown as Record<string, unknown>;
+    expect(matchesWhere(preFixShape, candidateClause)).toBe(true);
+  });
+
+  it("reclaims a silent BLOCKED row once its deadline elapsed (delta control for the park)", async () => {
+    // The ONLY difference from the parked row above is a lapsed deadline: the
+    // sweep still reclaims silent BLOCKED rows, so the parked row's survival
+    // is caused by the park itself, not by a broken clause.
+    const unparked = makeWork({
+      id: "work-unparked",
       state: "BLOCKED",
       lastHeartbeatAt: minutesAgo(30),
-      leaseExpiresAt: minutesAgo(25),
-      ...overrides,
+      leaseExpiresAt: minutesAgo(10),
     });
-
-  it("keeps a lease that is already parked at snapshot time", async () => {
-    const parkDeadline = minutesAhead(20);
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
-      retryAfter: parkDeadline,
-    });
-    const stale = staleRow();
-    const { client, eventRows, auditRows, leaseDeleteMany, leases } = makeSweepClient({
-      candidates: [stale],
-      rows: [stale],
+    const lease = makeLease();
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [unparked],
+      rows: [unparked],
       leases: [lease],
     });
 
     const report = await sweepStaleWork(client);
 
-    // The sweep tried its fenced delete and the park guard refused it.
+    expect(report.released).toBe(1);
+    expect(unparked.state).toBe("STALE");
+    expect(report.leasesReleased).toBe(1);
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
-    // The claim is retained, never released.
-    expect(report.claimRetained).toBe(1);
-    expect(report.released).toBe(0);
-    expect(report.leasesReleased).toBe(0);
-    expect(report.skipped).toBe(0);
-    // The park's evidence survives: the lease row and its marker are intact.
-    expect(leases).toHaveLength(1);
-    expect(leases[0].retryAfter?.getTime()).toBe(parkDeadline.getTime());
-    // The label survives, and no release is recorded.
-    expect(removeIssueLabelMock).not.toHaveBeenCalled();
-    expect(stale.issue.labels).toEqual(["agent/alpha", "status/in-progress"]);
-    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(0);
-    // The release stays OWED: the row is reclaimed (STALE) but still asks for
-    // its release, so it remains a sweep candidate.
-    expect(stale.state).toBe("STALE");
-    expect(stale.staleClaimReleasePending).toBe(true);
-    // The retention is audited as a retention, with unchanged labels.
-    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
-    expect(audit).toBeDefined();
-    expect(audit?.success).toBe(true);
-    expect(audit?.afterLabels).toEqual(audit?.beforeLabels);
-    expect(auditRows.find((row) => row.action === "stale_agentwork_released")).toBeUndefined();
+    expect(leases).toHaveLength(0);
   });
 
-  it("keeps a lease whose park lands inside the sweep's decision window", async () => {
-    // The park commits after the epoch snapshot and the sibling lookup, before
-    // the fenced delete: the delete predicate is evaluated at delete time, so
-    // it must refuse the row all the same.
-    const parkDeadline = minutesAhead(20);
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
+  it("reclaims the parked row once the park deadline has elapsed", async () => {
+    // Past `retryAfter` (+ the sweep's age window) the park is over: the row
+    // follows the normal reclaim path and releases the claim for re-dispatch.
+    const expiredPark = makeWork({
+      id: "work-park-expired",
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(10),
     });
-    const stale = staleRow();
-    const { client, eventRows, auditRows, leaseDeleteMany, leases } = makeSweepClient({
-      candidates: [stale],
-      rows: [stale],
+    const lease = makeLease();
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [expiredPark],
+      rows: [expiredPark],
       leases: [lease],
-      afterSiblingLookup: () => {
-        lease.retryAfter = parkDeadline;
-      },
     });
 
     const report = await sweepStaleWork(client);
 
+    expect(report.released).toBe(1);
+    expect(expiredPark.state).toBe("STALE");
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
-    expect(report.claimRetained).toBe(1);
-    expect(report.released).toBe(0);
-    expect(report.leasesReleased).toBe(0);
-    expect(leases).toHaveLength(1);
-    expect(leases[0].retryAfter?.getTime()).toBe(parkDeadline.getTime());
-    expect(removeIssueLabelMock).not.toHaveBeenCalled();
-    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(0);
-    // The park landed inside the window, so only the recheck can see it: the
-    // deferral is a PARK deferral — the release stays owed and the audit
-    // names the park, not a claim-epoch move.
-    expect(stale.staleClaimReleasePending).toBe(true);
-    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
-    expect(audit?.notes).toContain("live blocked park");
+    expect(leases).toHaveLength(0);
   });
 
-  it("negative control: a lease whose park deadline has elapsed is deleted and released normally", async () => {
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
-      retryAfter: minutesAgo(5),
+  it("reclaims a BLOCKED row with no park deadline (NULL expiry) even with a fresh heartbeat", async () => {
+    // No deadline means no park: the NULL arm keeps such rows on the normal
+    // stale path instead of letting them hold the claim forever.
+    const nullDeadline = makeWork({
+      id: "work-null-deadline",
+      state: "BLOCKED",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: null,
     });
-    const stale = staleRow();
+    const lease = makeLease();
     const { client, leases } = makeSweepClient({
+      candidates: [nullDeadline],
+      rows: [nullDeadline],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(nullDeadline.state).toBe("STALE");
+    expect(leases).toHaveLength(0);
+  });
+
+  it("a parked BLOCKED sibling keeps the claim of a reclaimed stale row", async () => {
+    // The parked park deadline — not a heartbeat — is what shields the claim:
+    // reclaiming the older row must not delete the lease the park sits on.
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "CLAIMED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const parked = makeWork({
+      id: "work-parked",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: minutesAgo(40),
+      leaseExpiresAt: minutesAhead(40),
+    });
+    const lease = makeLease();
+    const { client, auditRows, leaseDeleteMany, leases } = makeSweepClient({
       candidates: [stale],
-      rows: [stale],
+      rows: [stale, parked],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.claimRetained).toBe(1);
+    expect(report.released).toBe(0);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toHaveLength(1);
+    expect(parked.state).toBe("BLOCKED");
+    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
+    expect(audit?.notes).toContain("work-parked");
+  });
+
+  it("a NULL-expiry BLOCKED sibling is not live: no park, no shield", async () => {
+    // The exact complement of the reclaim arm: `leaseExpiresAt IS NULL` is
+    // reclaimable for BLOCKED rows, so it must NOT count as a live sibling
+    // (a silent NULL-expiry row would otherwise hold the claim forever).
+    const issue = makeWork().issue;
+    const stale = makeWork({
+      id: "work-stale",
+      issue,
+      state: "CLAIMED",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const nullDeadline = makeWork({
+      id: "work-null-deadline",
+      issue,
+      state: "BLOCKED",
+      lastHeartbeatAt: new Date(),
+      leaseExpiresAt: null,
+    });
+    const lease = makeLease();
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [stale],
+      rows: [stale, nullDeadline],
       leases: [lease],
     });
 
@@ -1382,139 +1516,360 @@ describe("sweepStaleWork — a live blocked park survives the sweep (#1343)", ()
 
     expect(report.released).toBe(1);
     expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(leases).toHaveLength(0);
+  });
+});
+
+// ─── #1334 review: a running wait marker parks the claim in the sweep too ───
+//
+// A `blocked` disposition parks the settled ROW (its `leaseExpiresAt` becomes
+// the park deadline), so the row-level park covers it. A renewal's
+// `externalWait` parks the LEASE only — the row keeps its execution expiry —
+// so the sweep has to read the wait marker off the lease: a running park means
+// the owner defers until the deadline, and the silence of a parked worker is
+// not evidence of abandonment. The protection is uniform in the wait marker,
+// so both writers get it.
+
+describe("sweepStaleWork — a running wait marker parks the claim (#1334 review)", () => {
+  it("leaves a claim parked by a renewal's external wait alone", async () => {
+    // The shape a renewal's `externalWait` leaves: the row is an ordinary
+    // executing row (heartbeat and execution expiry both lapsed — the worker
+    // is silent because it is waiting), and the LEASE carries the park.
+    const parked = makeWork({
+      id: "work-parked",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const lease = makeLease({ retryAfter: minutesAhead(40) });
+    const { client, eventRows, auditRows, candidateClauses, leaseFindFirst, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [parked],
+      rows: [parked],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    // The parked claim is not reclaim work at all: it never enters the
+    // candidate batch, so it cannot occupy it either.
+    expect(report).toMatchObject({
+      examined: 0,
+      released: 0,
+      claimRetained: 0,
+      skipped: 0,
+      leasesReleased: 0,
+    });
+    expect(parked.state).toBe("IN_PROGRESS");
+    expect(parked.staleClaimReleasePending).toBe(false);
+    expect(leaseFindFirst).not.toHaveBeenCalled();
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toHaveLength(1);
+    expect(eventRows).toHaveLength(0);
+    expect(auditRows).toHaveLength(0);
+
+    // Forensic delta against the REAL clause: the reclaim clause alone WOULD
+    // select this row (it is silent and its execution expiry lapsed) — the
+    // parked-claim exclusion is the only thing that keeps it out.
+    const [candidateClause] = candidateClauses;
+    const reclaimOnly = (candidateClause as { AND?: unknown[] }).AND?.[0] ?? candidateClause;
+    expect(matchesWhere(parked as unknown as Record<string, unknown>, reclaimOnly)).toBe(true);
+    expect(matchesWhere(parked as unknown as Record<string, unknown>, candidateClause)).toBe(false);
+  });
+
+  it("skips a claim whose park starts after the parked-claim read", async () => {
+    // The parked-claim read is a snapshot read outside the decision
+    // transaction: a park that lands right after it is invisible to that
+    // read, so the in-transaction check is the one that must catch it — the
+    // row is left alone, lease and claim intact.
+    const row = makeWork({
+      id: "work-park-after-filter",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const lease = makeLease();
+    const { client, leaseFindFirst, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+      afterParkFilter: () => {
+        lease.retryAfter = minutesAhead(40);
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({
+      examined: 1,
+      released: 0,
+      claimRetained: 0,
+      skipped: 1,
+      leasesReleased: 0,
+    });
+    expect(row.state).toBe("IN_PROGRESS");
+    expect(row.staleClaimReleasePending).toBe(false);
+    // The decision transaction DID run (the epoch snapshot was read) — the
+    // park was caught in there, not by the pre-filter.
+    expect(leaseFindFirst).toHaveBeenCalled();
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toHaveLength(1);
+  });
+
+  it("reclaims the row once the park deadline has elapsed (delta control for the park)", async () => {
+    // The ONLY difference from the parked row above is an ELAPSED marker: the
+    // sweep still reclaims silent rows, so the parked row's survival is caused
+    // by the park itself, not by a broken clause.
+    const elapsed = makeWork({
+      id: "work-park-elapsed",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const lease = makeLease({ retryAfter: minutesAgo(10) });
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [elapsed],
+      rows: [elapsed],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(elapsed.state).toBe("STALE");
     expect(report.leasesReleased).toBe(1);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
     expect(leases).toHaveLength(0);
   });
 
-  it("completes the deferred release once the park deadline has elapsed", async () => {
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
-      retryAfter: minutesAhead(20),
+  it("a park that starts inside the decision window keeps the lease and the row", async () => {
+    // The park lands between the claim-epoch snapshot and the fenced delete:
+    // the delete's own condition must not consume the lease, and the row must
+    // not be left reclaimed — a retired row would never be reclaimed again
+    // (the release it owed is dropped), so the claim would leak.
+    const row = makeWork({
+      id: "work-park-race",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
     });
-    const stale = staleRow();
+    const originalExpiry = row.leaseExpiresAt;
+    const lease = makeLease();
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+      afterSiblingLookup: () => {
+        lease.retryAfter = minutesAhead(40);
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({
+      released: 0,
+      claimRetained: 0,
+      skipped: 1,
+      leasesReleased: 0,
+    });
+    // The row is back to the shape the sweep found it in.
+    expect(row.state).toBe("IN_PROGRESS");
+    expect(row.staleClaimReleasePending).toBe(false);
+    expect(row.leaseExpiresAt).toBe(originalExpiry);
+    // The lease the park was recorded on survives.
+    expect(leases).toHaveLength(1);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("the restore keeps a STALE retry row's owed release", async () => {
+    // The other mark branch: a row already marked STALE with its claim
+    // release owed (the dedicated retry arm). The restore must put the owed
+    // release back — dropping it would retire the row without ever releasing
+    // the claim.
+    const row = makeWork({
+      id: "work-stale-retry",
+      state: "STALE",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+    const originalExpiry = row.leaseExpiresAt;
+    const lease = makeLease();
     const { client, leases } = makeSweepClient({
-      candidates: [stale],
-      rows: [stale],
+      candidates: [row],
+      rows: [row],
       leases: [lease],
+      afterSiblingLookup: () => {
+        lease.retryAfter = minutesAhead(40);
+      },
     });
 
-    const first = await sweepStaleWork(client);
+    const report = await sweepStaleWork(client);
 
-    expect(first.claimRetained).toBe(1);
-    expect(first.released).toBe(0);
-    // The retry marker stayed up, so the row is still a sweep candidate.
-    expect(stale.staleClaimReleasePending).toBe(true);
-
-    // The park deadline elapses: the marker is now in the past.
-    lease.retryAfter = minutesAgo(1);
-
-    const second = await sweepStaleWork(client);
-
-    expect(second.released).toBe(1);
-    expect(second.claimRetained).toBe(0);
-    expect(second.leasesReleased).toBe(1);
-    expect(leases).toHaveLength(0);
+    expect(report).toMatchObject({
+      released: 0,
+      claimRetained: 0,
+      skipped: 1,
+      leasesReleased: 0,
+    });
+    expect(row.state).toBe("STALE");
+    expect(row.staleClaimReleasePending).toBe(true);
+    expect(row.leaseExpiresAt).toBe(originalExpiry);
+    expect(leases).toHaveLength(1);
   });
 
-  it("audits the park retention by name, not as a claim-epoch move", async () => {
-    const parkDeadline = minutesAhead(20);
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
-      retryAfter: parkDeadline,
+  it("a parked claim does not occupy the candidate batch", async () => {
+    // The candidate query orders by the oldest heartbeat first, and a parked
+    // row's heartbeat is old by definition: without the pre-filter, parked
+    // claims would fill the batch window on every sweep and starve the
+    // genuinely stale rows behind them. Two DIFFERENT claims here — the park
+    // holds its own claim only.
+    const parked = makeWork({
+      id: "work-parked",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
     });
-    const stale = staleRow();
-    const { client, auditRows } = makeSweepClient({
-      candidates: [stale],
-      rows: [stale],
-      leases: [lease],
+    const stale = makeWork({
+      id: "work-stale",
+      agentName: "beta",
+      issueId: "issue-2",
+      state: "IN_PROGRESS",
+      lastHeartbeatAt: minutesAgo(20),
+      leaseExpiresAt: minutesAgo(15),
+      issue: { ...makeWork().issue, id: "issue-2", number: 43, labels: ["agent/beta"] },
+    });
+    const parkedLease = makeLease({ agentName: "alpha", issueId: "issue-1", retryAfter: minutesAhead(40) });
+    const staleLease = makeLease({ agentName: "beta", issueId: "issue-2" });
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [parked, stale],
+      rows: [parked, stale],
+      leases: [parkedLease, staleLease],
     });
 
-    await sweepStaleWork(client);
+    const report = await sweepStaleWork(client);
 
-    const audit = auditRows.find((row) => row.action === "stale_agentwork_claim_retained");
-    expect(audit).toBeDefined();
-    // The note names the park it deferred to…
-    expect(audit?.notes).toContain("live blocked park");
-    expect(audit?.notes).toContain(parkDeadline.toISOString());
-    // …and does not report an epoch move, which is a different retention.
-    expect(audit?.notes).not.toContain("claim epoch moved");
+    // The parked claim never enters the candidate batch, so it did not stop
+    // the stale row behind it from being reclaimed.
+    expect(report).toMatchObject({ examined: 1, released: 1, skipped: 0, leasesReleased: 1 });
+    expect(parked.state).toBe("IN_PROGRESS");
+    expect(stale.state).toBe("STALE");
+    // The parked claim's lease survives; the stale claim's lease is gone.
+    expect(leases).toEqual([parkedLease]);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The sweeper's candidate clause / mark CAS (`reclaim`) and the live-sibling
+// lookup (`live`) are built from the SAME `activeStateFamilies` definitions,
+// so their mutual exclusion is structural. This grid pins the SEMANTICS:
+// every non-pending active row matches exactly one arm of its own family —
+// the sweep reclaims it, or it is live and shields the claim — under the
+// fake's SQL three-valued logic (a NULL timestamp never compares true).
+describe("activeStateFamilies reclaim/live complement (#1316)", () => {
+  const cutoff = minutesAgo(5);
+  const beforeCutoff = new Date(cutoff.getTime() - 60_000);
+  const afterCutoff = new Date(cutoff.getTime() + 60_000);
+  const families = activeStateFamilies(cutoff);
+  const heartbeat = families.find((family) => family.name === "heartbeat-gated")!;
+  const blocked = families.find((family) => family.name === "blocked-park")!;
+
+  function matches(row: Record<string, unknown>, clauses: { reclaim: unknown; live: unknown }) {
+    return {
+      reclaim: matchesWhere(row, clauses.reclaim),
+      live: matchesWhere(row, clauses.live),
+    };
+  }
+
+  function describeRow(row: {
+    state: string;
+    lastHeartbeatAt: Date;
+    leaseExpiresAt: Date | null;
+  }) {
+    return `state=${row.state} hb=${row.lastHeartbeatAt.toISOString()} exp=${
+      row.leaseExpiresAt?.toISOString() ?? "NULL"
+    }`;
+  }
+
+  it("every non-pending active row is either reclaimable or live, never both", () => {
+    for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
+      for (const lastHeartbeatAt of [beforeCutoff, cutoff, afterCutoff]) {
+        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, null]) {
+          const row = { state, staleClaimReleasePending: false, lastHeartbeatAt, leaseExpiresAt };
+          const own = state === "BLOCKED" ? blocked : heartbeat;
+          const other = state === "BLOCKED" ? heartbeat : blocked;
+
+          const { reclaim, live } = matches(row, own);
+          expect(reclaim !== live, describeRow(row)).toBe(true);
+          // The other family never matches a row of this family, either way.
+          expect(matches(row, other), describeRow(row)).toEqual({ reclaim: false, live: false });
+        }
+      }
+    }
   });
 
-  it("defers the release when the parked lease is deleted by an unguarded writer mid-window", async () => {
-    // The guard refuses the delete, and an unguarded writer removes the
-    // parked lease between that refusal and the sweep's recheck. The park was
-    // live when the sweep decided, so the deferral is a PARK deferral: the
-    // release stays owed and the next sweep re-decides against the current
-    // state — which releases the claim, because by then no lease is left to
-    // protect. Reporting an epoch move here would clear the retry marker and
-    // strand the claim with no release path at all.
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
-      retryAfter: minutesAhead(20),
+  it("the blocked family parks until its deadline and reclaims a NULL deadline", () => {
+    const silent = { state: "BLOCKED", staleClaimReleasePending: false, lastHeartbeatAt: afterCutoff };
+
+    // Parked (deadline in the future): live despite silence — the #1316 fix.
+    expect(matches({ ...silent, leaseExpiresAt: afterCutoff }, blocked)).toEqual({
+      reclaim: false,
+      live: true,
     });
-    const stale = staleRow();
-    const { client, leases, leaseDeleteMany } = makeSweepClient({
-      candidates: [stale],
-      rows: [stale],
-      leases: [lease],
+    // Park elapsed: reclaimable.
+    expect(matches({ ...silent, leaseExpiresAt: beforeCutoff }, blocked)).toEqual({
+      reclaim: true,
+      live: false,
     });
-    leaseDeleteMany.mockImplementation(async () => {
-      // An unguarded writer deletes the lease between the refused delete and
-      // the recheck.
-      leases.splice(0, leases.length);
-      return { count: 0 };
+    // No deadline, no park: reclaimable regardless of heartbeat, and it must
+    // NOT shield a claim as a live sibling (`gte` is UNKNOWN on NULL).
+    expect(matches({ ...silent, leaseExpiresAt: null }, blocked)).toEqual({
+      reclaim: true,
+      live: false,
     });
-
-    const first = await sweepStaleWork(client);
-
-    expect(first.claimRetained).toBe(1);
-    expect(first.released).toBe(0);
-    // The release is still owed, so the row stays a sweep candidate.
-    expect(stale.staleClaimReleasePending).toBe(true);
-
-    const second = await sweepStaleWork(client);
-
-    // No lease is left to protect, so the claim is released after all.
-    expect(second.released).toBe(1);
-    expect(second.claimRetained).toBe(0);
-    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
   });
 
-  it("audits the park deferral once, not once per sweep", async () => {
-    // The deferral is a state, not an event: the row stays reclaimed and the
-    // park deadline does not move, so every sweep defers it again. Auditing
-    // each repetition would write one audit row per sweep for the whole
-    // park — the repetitions are counted in the report instead.
-    const lease = makeLease({
-      claimToken: "token-1",
-      expiredAt: minutesAgo(25),
-      lastRenewalObservedAt: null,
-      retryAfter: minutesAhead(20),
+  it("the heartbeat-gated family stays live on a fresh heartbeat with a NULL expiry", () => {
+    const active = { state: "IN_PROGRESS", staleClaimReleasePending: false };
+
+    // SQL 3VL: `NULL < cutoff` is UNKNOWN, so this row is NOT a reclaim
+    // candidate; the live arm's explicit NULL clause keeps it alive.
+    expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: null }, heartbeat)).toEqual({
+      reclaim: false,
+      live: true,
     });
-    const stale = staleRow();
-    const { client, auditRows } = makeSweepClient({
-      candidates: [stale],
-      rows: [stale],
-      leases: [lease],
+    // Silence or an elapsed expiry is reclaimable.
+    expect(matches({ ...active, lastHeartbeatAt: beforeCutoff, leaseExpiresAt: afterCutoff }, heartbeat)).toEqual({
+      reclaim: true,
+      live: false,
     });
+    expect(matches({ ...active, lastHeartbeatAt: afterCutoff, leaseExpiresAt: beforeCutoff }, heartbeat)).toEqual({
+      reclaim: true,
+      live: false,
+    });
+  });
 
-    const retentions = () =>
-      auditRows.filter((row) => row.action === "stale_agentwork_claim_retained");
-
-    await sweepStaleWork(client);
-    expect(retentions()).toHaveLength(1);
-
-    await sweepStaleWork(client);
-
-    // The second sweep defers again…
-    expect(stale.staleClaimReleasePending).toBe(true);
-    // …and writes no second audit row.
-    expect(retentions()).toHaveLength(1);
+  it("a pending-release active row is neither a reclaim candidate nor live for any family", () => {
+    // `staleClaimReleasePending: true` on a non-STALE row is the inconsistent
+    // retry-marker state the sweep never produces: every family's reclaim arm
+    // excludes it, so only the dedicated `state: "STALE"` retry arm can pick
+    // a release back up. The live arms exclude it too (both arms share the
+    // pending boundary): a pending active-shaped row must not shield a claim
+    // either — the release is already owed, and shielding would withhold it.
+    // The grid spans every timestamp shape so no freshness window leaks.
+    for (const state of ["CLAIMED", "IN_PROGRESS", "BLOCKED"]) {
+      for (const lastHeartbeatAt of [beforeCutoff, cutoff, afterCutoff]) {
+        for (const leaseExpiresAt of [beforeCutoff, cutoff, afterCutoff, null]) {
+          const row = { state, staleClaimReleasePending: true, lastHeartbeatAt, leaseExpiresAt };
+          // Inert for EVERY family, own or otherwise.
+          for (const family of families) {
+            expect(matches(row, family), `${family.name} ${describeRow(row)}`).toEqual({
+              reclaim: false,
+              live: false,
+            });
+          }
+        }
+      }
+    }
   });
 });
