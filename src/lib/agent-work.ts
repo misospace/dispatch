@@ -80,8 +80,9 @@ export interface CheckpointAgentWorkInput {
  * @body agentName (string, required) - Worker identifier matching the active work record
  * @body state (string, required) - One of the valid state values listed above
  * @body summary (string, optional) - Final summary of what was accomplished or why blocked
- * @body issueId (string, optional) - GitHub issue ID the finish belongs to; scopes
- *                                   selection to that issue's active rows (#1331)
+ * @body issueId (string, optional) - GitHub issue ID this finish belongs to
+ *                                   (POST /api/agent-work/finish); scopes selection
+ *                                   to that issue's active rows (#1331)
  *
  * Response 200: Updated work object with final state set and lease expired
  * Response 400: { error: string } with details about which field failed validation
