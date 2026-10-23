@@ -119,11 +119,15 @@ export interface InspectIssueOwnershipOptions {
 
 /**
  * Choose the ownership-relevant lease among a set of lease rows for an issue:
- * the freshest ACTIVE lease (`expiredAt > now`), ordered by `renewedAt` desc
- * (nulls last) with a `createdAt` desc tiebreak; when none is active, the most
- * recently created lease so a lapsed-but-disposed claim still surfaces.
+ * the freshest ACTIVE lease (`expiredAt > now`), ordered by the SAME activity
+ * key the bounded ownership scan uses (#1312) — last renewal falling back to
+ * the claim time (`renewedAt ?? createdAt`) desc, with `id` asc as the
+ * deterministic tiebreak — so the operator view and the scan never disagree
+ * about which lease is operative on an issue that carries several; when none
+ * is active, the most recently created lease so a lapsed-but-disposed claim
+ * still surfaces.
  */
-function selectLease<T extends { expiredAt: Date; renewedAt: Date | null; createdAt: Date }>(
+function selectLease<T extends { id: string; expiredAt: Date; renewedAt: Date | null; createdAt: Date }>(
   leases: T[],
   now: Date,
 ): T | null {
@@ -133,10 +137,10 @@ function selectLease<T extends { expiredAt: Date; renewedAt: Date | null; create
   const active = leases
     .filter((l) => l.expiredAt.getTime() > nowMs)
     .sort((a, b) => {
-      const aRen = a.renewedAt ? a.renewedAt.getTime() : -1;
-      const bRen = b.renewedAt ? b.renewedAt.getTime() : -1;
-      if (bRen !== aRen) return bRen - aRen;
-      return b.createdAt.getTime() - a.createdAt.getTime();
+      const aActivity = (a.renewedAt ?? a.createdAt).getTime();
+      const bActivity = (b.renewedAt ?? b.createdAt).getTime();
+      if (bActivity !== aActivity) return bActivity - aActivity;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
   if (active.length > 0) return active[0];
 

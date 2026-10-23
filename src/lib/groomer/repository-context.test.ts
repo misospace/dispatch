@@ -366,6 +366,67 @@ describe("buildRepositoryContext", () => {
     });
   });
 
+  describe("warning sanitization (dispatch#1297)", () => {
+    // Everything except \t, \n, printable ASCII, and above-C1 code points.
+    const CONTROL_FREE = /^[\x09\x0A\x20-\x7E\xA0-\uFFFF]*$/;
+
+    it("strips NUL and C0 controls from fetchRepo failure text, keeping newlines and tabs", async () => {
+      deps.fetchRepo.mockRejectedValue(
+        new Error("boom\u0000\u0001\u001BAt \u0002source\r\n\tframe"),
+      );
+      deps.searchCode.mockResolvedValue([]);
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toBe("Failed to fetch repo metadata: boomAt source\n\tframe");
+      for (const warning of result.warnings) expect(warning).toMatch(CONTROL_FREE);
+    });
+
+    it("strips control bytes from searchCode failure text", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockRejectedValue(
+        new Error("rate limited \u0000 on \u001B[31merrors\r"),
+      );
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.warnings.some((w) => w.includes("Code search failed"))).toBe(true);
+      for (const warning of result.warnings) {
+        expect(warning).toMatch(CONTROL_FREE);
+        expect(warning).not.toContain("\u0000");
+      }
+    });
+
+    it("strips control bytes from fetchFile failure text and GitHub-provided path", async () => {
+      deps.fetchRepo.mockResolvedValue({
+        fullName: "org/repo",
+        defaultBranch: "main",
+        description: null,
+      });
+      deps.searchCode.mockResolvedValue([{ path: "bad\u0000.ts", url: "1" }]);
+      deps.fetchFile.mockRejectedValue(new Error("not found\u0007"));
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.warnings).toContain("Failed to fetch bad.ts: not found");
+      for (const warning of result.warnings) expect(warning).toMatch(CONTROL_FREE);
+    });
+
+    it("sanitizes non-Error thrown values", async () => {
+      deps.fetchRepo.mockRejectedValue({ toString: () => "weird\u0000\u0007value" });
+      deps.searchCode.mockResolvedValue([]);
+
+      const result = await buildRepositoryContext(defaultInput, defaultConfig, deps);
+
+      expect(result.warnings).toEqual(["Failed to fetch repo metadata: weirdvalue"]);
+    });
+  });
+
   describe("duplicate paths", () => {
     it("does not fetch the same path twice across queries", async () => {
       deps.fetchRepo.mockResolvedValue({

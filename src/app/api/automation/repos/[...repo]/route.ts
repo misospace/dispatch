@@ -3,6 +3,12 @@ import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { jsonSafe } from "@/lib/json";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// DELETE cascades and hard-deletes tracked-repo state; this matches the shared
+// repos window #1307 gave POST /api/repos and POST /api/automation/repos
+// (10 per minute).
+const DELETE_RATE_LIMIT = { limit: 10, windowMs: 60_000 } as const;
 
 interface RouteContext {
   params: Promise<{ repo: string[] }>;
@@ -92,6 +98,8 @@ export async function DELETE(request: Request, context: RouteContext) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+  const limited = enforceRateLimit(`repos-delete:${auth.throttleKey}`, DELETE_RATE_LIMIT);
+  if (limited) return limited;
   const auditActor = getAuthorizedActor(auth, request);
 
   const { repo: pathRepo } = await context.params;

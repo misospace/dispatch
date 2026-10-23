@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN, authedRequest, makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 const mocks = vi.hoisted(() => ({
   authorizeRequest: vi.fn(),
@@ -33,7 +34,10 @@ import { POST } from "./route";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "bearer", actor: "scheduler" });
+  // The rate limiter keeps module-global state — reset it so the per-credential
+  // window never leaks between tests.
+  resetRateLimits();
+  mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "bearer", actor: "scheduler", throttleKey: "test-cred" });
   mocks.acquireLock.mockResolvedValue({ locked: true, runId: "run-1" });
   mocks.sweepStaleWork.mockResolvedValue({ examined: 1, released: 1, skipped: 0, errors: [] });
   mocks.releaseLock.mockResolvedValue(undefined);
@@ -76,5 +80,38 @@ describe("POST /api/agent-work/sweep", () => {
 
     expect(res.status).toBe(500);
     expect(mocks.releaseLock).toHaveBeenCalledWith("run-1");
+  });
+});
+
+describe("POST /api/agent-work/sweep — rate limit", () => {
+  it("returns 429 after exceeding the rate limit (6 per 60s) without acquiring the lock", async () => {
+    for (let i = 0; i < 6; i++) {
+      const res = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+      expect(res.status).toBe(200);
+    }
+
+    const res = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request never acquired the lock or swept.
+    expect(mocks.acquireLock).toHaveBeenCalledTimes(6);
+    expect(mocks.sweepStaleWork).toHaveBeenCalledTimes(6);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    for (let i = 0; i < 6; i++) {
+      const res = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+      expect(res.status).toBe(200);
+    }
+    const throttled = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+    expect(throttled.status).toBe(429);
+
+    // A different credential (different auth.throttleKey) still sweeps: the
+    // window is keyed on the credential-derived identity, not shared globally.
+    mocks.authorizeRequest.mockResolvedValue({ authorized: true, type: "bearer", actor: "scheduler", throttleKey: "test-cred-2" });
+    const res = await POST(authedRequest("http://localhost/api/agent-work/sweep", { method: "POST", token: TEST_AGENT_TOKEN }));
+    expect(res.status).toBe(200);
+    expect(mocks.acquireLock).toHaveBeenCalledTimes(7);
   });
 });

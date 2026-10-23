@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 const mockAgentWork = {
   findFirst: vi.fn(),
@@ -34,17 +35,28 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token", {}, { "bound-token": "alpha", "bound-finish-agent": "test-agent" }));
 
 import { POST as handleFinish } from "./route";
 
-function makeFinishRequest(payload: Record<string, unknown>) {
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
+
+function makeFinishRequest(
+  payload: Record<string, unknown>,
+  token = "test-token",
+  extraHeaders: Record<string, string> = {},
+) {
   return handleFinish(
     new Request("http://localhost/api/agent-work/finish", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: "Bearer test-token",
+        Authorization: `Bearer ${token}`,
+        ...extraHeaders,
       },
       body: JSON.stringify(payload),
     })
@@ -294,6 +306,68 @@ describe("POST /api/agent-work/finish", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.state).toBe("IN_PROGRESS");
+  });
+});
+
+describe("POST /api/agent-work/finish — rate limit", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRateLimits();
+    mockAgentWork.findFirst.mockResolvedValue({
+      id: "work-1",
+      agentName: "test-agent",
+      state: "IN_PROGRESS",
+      checkpoint: "CHANGES_MADE",
+    });
+    mockAgentWork.update.mockResolvedValue({
+      id: "work-1",
+      agentName: "test-agent",
+      state: "DONE",
+      checkpoint: "DONE",
+      summary: "All changes applied and tested",
+    });
+    mockAgentWorkHistory.create.mockResolvedValue({ id: "hist-1" });
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 10s) without mutating work", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await makeFinishRequest({ agentName: "test-agent", state: "DONE" });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await makeFinishRequest({ agentName: "test-agent", state: "DONE" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request performed no work mutation.
+    expect(mockAgentWork.update).toHaveBeenCalledTimes(30);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    // Primary requests carry the same x-agent-name the second credential is
+    // bound to, so a limiter regressing to the self-reported actor (or a
+    // shared bucket) collapses both credentials into one window and 429s here.
+    for (let i = 0; i < 30; i++) {
+      const res = await makeFinishRequest(
+        { agentName: "test-agent", state: "DONE" },
+        "test-token",
+        { "x-agent-name": "test-agent" },
+      );
+      expect(res.status).toBe(200);
+    }
+    const throttled = await makeFinishRequest(
+      { agentName: "test-agent", state: "DONE" },
+      "test-token",
+      { "x-agent-name": "test-agent" },
+    );
+    expect(throttled.status).toBe(429);
+
+    // A different credential finishing the same agent's work still succeeds:
+    // the window is keyed on the credential-derived throttleKey, never a
+    // shared or body-supplied agent-name bucket.
+    const res = await makeFinishRequest({ agentName: "test-agent", state: "DONE" }, "bound-finish-agent");
+    expect(res.status).toBe(200);
+    expect(mockAgentWork.update).toHaveBeenCalledTimes(31);
   });
 });
 
