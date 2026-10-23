@@ -295,9 +295,9 @@ export interface PrFixDecisionContext {
 }
 // ─── PR Fix Type Constants ───────────────────────────────────────────────────
 
-export type PrFixType = "MERGE_CONFLICT" | "CI_FAILURE" | "REVIEW_FEEDBACK" | "OTHER";
+export type PrFixType = "MERGE_CONFLICT" | "CI_FAILURE" | "REVIEW_FEEDBACK" | "OTHER" | "REBASE";
 
-export const VALID_PR_FIX_TYPES: PrFixType[] = ["MERGE_CONFLICT", "CI_FAILURE", "REVIEW_FEEDBACK", "OTHER"];
+export const VALID_PR_FIX_TYPES: PrFixType[] = ["MERGE_CONFLICT", "CI_FAILURE", "REVIEW_FEEDBACK", "OTHER", "REBASE"];
 
 export function isValidPrFixType(type: string): type is PrFixType {
   return VALID_PR_FIX_TYPES.includes(type as PrFixType);
@@ -309,15 +309,20 @@ export function normalizePrFixType(type?: string | null): PrFixType {
   if (normalized === "MERGE_CONFLICT" || normalized === "MERGECONFLICT") return "MERGE_CONFLICT";
   if (normalized === "CI_FAILURE" || normalized === "CIFAILURE") return "CI_FAILURE";
   if (normalized === "REVIEW_FEEDBACK" || normalized === "REVIEWFEEDBACK") return "REVIEW_FEEDBACK";
+  if (normalized === "REBASE") return "REBASE";
   return isValidPrFixType(normalized) ? normalized : "OTHER";
 }
 
 /**
  * Priority ordering for PR fix queue items.
  * Lower number = higher priority.
+ * REBASE shares the top slot with MERGE_CONFLICT: it is the mechanical,
+ * bounded recovery for a determinable conflict (#1327) and unblocks review
+ * convergence for the other lanes, so it outranks code work.
  */
 export const PR_FIX_TYPE_PRIORITY: Record<PrFixType, number> = {
   MERGE_CONFLICT: 0,
+  REBASE: 0,
   CI_FAILURE: 1,
   REVIEW_FEEDBACK: 2,
   OTHER: 3,

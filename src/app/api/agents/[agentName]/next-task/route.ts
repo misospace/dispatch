@@ -10,10 +10,13 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, newHandoutToken, normalizeQueueRepo } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, hasInFlightRebaseHandout, newHandoutToken, normalizeQueueRepo } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
+import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
+import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
+import type { PrFixType } from "@/types";
 
 /** A queued PR-fix item as the route consumes it (see toAgentQueuePrFixItem). */
 type PrFixCandidate = {
@@ -26,6 +29,8 @@ type PrFixCandidate = {
   generation: number;
   reason: string;
   feedback: string[];
+  /** The queued item's PrFixType (e.g. REBASE, #1327); absent on legacy lines. */
+  fixType?: PrFixType;
 };
 
 /**
@@ -96,6 +101,10 @@ async function confirmPrFixHandOut(
           dispatchedAt: new Date(),
           dispatchedGeneration: stampGeneration,
           postDispatchEvidenceKeys: [],
+          // #1327: stamp the lane THIS attempt is dispatched as. The row's
+          // `type` stays mutable across re-enqueues; the rebase terminal
+          // settlement and the concurrency gate key on this stamp.
+          attemptType: candidate.fixType ?? null,
         },
       });
       if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
@@ -361,6 +370,26 @@ export async function GET(
       // same); unrelated capacities dispatch it normally.
       if (skipPrForCapacity(candidate.repo, candidate.pr)) return null;
       if (agentAlreadyHanded(candidate, agentName)) return null;
+      // #1327: the mechanical rebase lane is concurrency 1, no fan-out. A
+      // REBASE candidate waits while another rebase hand-out is live
+      // somewhere (see hasInFlightRebaseHandout: bounded by the hand-out
+      // timeout, best-effort against concurrent polls). Non-rebase fix work
+      // is unaffected. Deferral is transient: the next poll retries it.
+      if (candidate.fixType === "REBASE") {
+        let rebaseBusy = false;
+        try {
+          rebaseBusy = await hasInFlightRebaseHandout(asPrFixQueueClient(prisma));
+        } catch (error) {
+          // Fail open on the gate check itself: a read failure must not 500
+          // the poll, and dispatching one rebase is safer than losing the
+          // lane's dispatch path to a transient error.
+          console.error(`next-task pr-fix rebase concurrency check failed for ${candidate.repo}#${candidate.pr}; dispatching without it:`, error);
+        }
+        if (rebaseBusy) {
+          console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
+          return null;
+        }
+      }
       const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded);
       if (!confirmed) return null;
 
@@ -400,7 +429,7 @@ export async function GET(
         issue: candidate.issue
           ? { repoFullName: candidate.repo, number: candidate.issue }
           : undefined,
-        prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken },
+        prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: candidate.fixType },
         reasons,
       });
     };
@@ -480,6 +509,16 @@ export async function GET(
         (health.followupReasons.length > 0 ? health.followupReasons : ["Linked PR needs follow-up"])
           .filter((reason): reason is string => Boolean(reason)),
       )];
+      // #1327: a conflicted linked PR enters the mechanical rebase lane
+      // instead of the ordinary code-fix lane — a code attempt cannot rebase
+      // a merge conflict away. The contract is the item's feedback, stored
+      // exactly as the PR-followup ingestion path stores it (one string in the
+      // feedback array).
+      const mergeState = (health.mergeState ?? "").trim();
+      const isConflicted =
+        CONFLICTING_STATUSES.has(mergeState.toLowerCase()) ||
+        health.followupReasons.some((reason) => reason === "merge_conflict");
+      const rebase = isConflicted ? rebaseWorkItem(mergeState || "dirty") : null;
       // Materialization is best-effort per candidate: a transient DB failure
       // must not 500 the poll (and with it the whole lane), so log and move on
       // to the next candidate.
@@ -494,8 +533,9 @@ export async function GET(
           pr,
           issue: followupItem.number,
           lane: queueLane,
-          reason: reasons[0],
-          feedback: reasons,
+          type: rebase ? "REBASE" : null,
+          reason: rebase ? rebase.reason : reasons[0],
+          feedback: rebase ? [rebase.feedback] : reasons,
           evidenceKey: `linked-health:${followupItem.number}:${health.checkedAt ?? "unknown"}`,
           url: health.url,
           title: `Follow up linked PR for ${repo}#${followupItem.number}`,
@@ -515,7 +555,9 @@ export async function GET(
       // next poll; this caller keeps to its own issue work.
       if (requestPrFixLane === null) continue;
       const linkedContext = {
-        reasons,
+        // #1327: a REBASE item's reasons ARE the contract wall — the health
+        // reasons are appended to it, never substituted for it.
+        reasons: rebase ? [...new Set([rebase.reason, rebase.feedback, ...reasons])] : reasons,
         issueTitle: followupItem.title,
         issueUrl: followupItem.url,
       };
@@ -530,6 +572,10 @@ export async function GET(
         reason: materialized.item.reason,
         feedback: materialized.item.feedback ?? [],
         agentHandouts: materialized.item.agentHandouts ?? [],
+        // The materialized row's own type (#1327): a conflicted linked PR
+        // enters the mechanical rebase lane (REBASE); every other linked-PR
+        // materialization stays the ordinary fix lane (OTHER).
+        fixType: materialized.item.type ?? "OTHER",
       };
       const task = await dispatchPrFixCandidate(candidate);
       if (task) {

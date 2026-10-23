@@ -297,6 +297,56 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(mocks.prFixUpdateMany.mock.calls.every(([args]) => args.where.id === b.id)).toBe(true);
   });
 
+  it("marks the dispatched PR-fix identity with the item's fixType (#1327)", async () => {
+    mocks.prFixFindMany.mockResolvedValue([{ ...prFixRow(13), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" }]);
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    expect(body.reasons[0]).toContain("Mechanical rebase");
+  });
+
+  it("defers REBASE hand-outs while any rebase hand-out is live (concurrency 1, #1327)", async () => {
+    // `live` is a REBASE already handed out (live hand-out record, still
+    // QUEUED); `waiting` is the next DIRTY PR. Neither may be handed out:
+    // `waiting` because the lane is busy, `live` because a second hand-out
+    // would put two force-with-lease pushes on one branch.
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"], dispatchedAt: new Date() };
+    const waiting = { ...prFixRow(22), type: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [live, waiting].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [live, waiting].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === waiting.id ? waiting : live));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    // Deferred, not dispatched: no hand-out stamp on either item.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(live.agentHandouts).toEqual(["other-agent@2"]);
+    expect(waiting.agentHandouts).toEqual([]);
+  });
+
+  it("dispatches ordinary fix work while a rebase hand-out is live (#1327)", async () => {
+    // The concurrency-1 gate is REBASE-only: OTHER fix work is unaffected.
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"], dispatchedAt: new Date() };
+    const fix = prFixRow(23);
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [live].filter((r: any) => r.type === "REBASE" || r.attemptType === "REBASE")
+        : [live, fix].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === fix.id ? fix : live));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(23);
+  });
+
   it("skips linked generation 1 before materialization or GitHub reads", async () => {
     mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 12), independentIssue(99)]);
     const body = await (await GET(request(exclusionUrl(["org/repo#12@1"])), {
@@ -2524,6 +2574,62 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     const body = await res.json();
     expect(body.type).toBe("followup-pr");
     expect(body.reasons).toEqual(["Linked PR needs follow-up"]);
+  });
+
+  it("dispatches a conflicted linked PR through the mechanical rebase lane (#1327)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "dirty",
+        linkedPrFollowupReasons: ["merge_conflict"],
+      }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(15);
+    // The dispatch identity names the rebase lane, not the ordinary fix lane.
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The materialized row is a REBASE item carrying the contract as its
+    // single feedback entry (the same shape the ingestion path writes).
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    const materialized = mocks.prFixCreate.mock.calls[0][0].data;
+    expect(materialized.type).toBe("REBASE");
+    expect(materialized.feedback).toHaveLength(1);
+    expect(materialized.reason).toContain("Mechanical rebase");
+    // The contract IS the instruction wall: it must reach the worker.
+    const contract = body.reasons.join("\n");
+    expect(contract).toContain("MECHANICALLY ONLY");
+    expect(contract).toContain("--force-with-lease");
+    expect(contract).toContain("human_decision");
+  });
+
+  it("materializes a linked PR without a merge conflict as an ordinary fix item (#1327)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "behind",
+        linkedPrFollowupReasons: ["merge_state_behind"],
+      }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("OTHER");
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    const materialized = mocks.prFixCreate.mock.calls[0][0].data;
+    expect(materialized.type).toBe("OTHER");
+    expect(materialized.feedback).toEqual(["merge_state_behind"]);
+    // No conflict, no contract: the health reasons stand unchanged.
+    expect(body.reasons).toEqual(["merge_state_behind"]);
   });
 
   it("normal issue still returns implement when no follow-up exists", async () => {
