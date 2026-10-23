@@ -430,7 +430,7 @@ async function driveReleaseIntent(
 
   const guarded = await guard(
     { issueId: intent.issueId, operation: "reconcile-release", agentName: intent.agentName },
-    async (_tx, { stillHoldsGuard }): Promise<{ complete: boolean; value: ReleaseOutcome }> => {
+    async (_tx, { runFencedRemoteWrite }): Promise<{ complete: boolean; value: ReleaseOutcome }> => {
       try {
         // #1254 acceptance ("re-check … at commit time") extended to the
         // replay entry: the same hold/review/external-wait re-check runs
@@ -515,12 +515,29 @@ async function driveReleaseIntent(
           return { complete: true, value: { kind: "error", error: "settle skipped: issue row missing" } };
         }
 
-        // #1254: anchor tripwire immediately before the ONLY remote write.
-        // The intent re-check above authorizes the delete; this re-check proves
-        // this holder still owns the guard it runs under, so a maintainer
-        // override that cleared a silent reconcile-release guard cannot be
-        // followed by a stale forge delete from the abandoned attempt.
-        if (!(await stillHoldsGuard())) {
+        // Phase B — the ONLY remote mutation of a release. Targeted delete of
+        // exactly the label the intent names, run inside the FENCED write.
+        // The intent re-check above authorizes the delete; the fenced write
+        // proves — ATOMICALLY with the write — that this holder still owns the
+        // guard it runs under: the guard row's lock is held across the delete,
+        // so a maintainer override that cleared a silent reconcile-release
+        // guard can neither slip between the check and the delete nor land
+        // while the delete is in flight. If the guard was already deleted or
+        // re-owned, the forge function is NEVER called (`guard-lost`).
+        //
+        // The forge adapter already swallows 404s, so ANY error here is a real
+        // failure: fail closed and leave the intent pending for the next pass
+        // (§10 "forge outage"). The error is caught INSIDE the fenced region
+        // so the region commits its lock refresh instead of unwinding.
+        const deleted = await runFencedRemoteWrite(async () => {
+          try {
+            await forge.removeIssueLabel(issue.repository.fullName, issue.number, intent.agentLabel);
+            return { ok: true as const };
+          } catch (error) {
+            return { ok: false as const, error: error instanceof Error ? error.message : String(error) };
+          }
+        });
+        if (deleted.status === "guard-lost") {
           // #1254: the guard-loss tripwire records a failure audit: the
           // release was skipped because the anchor moved on, and without the
           // audit row the skip is invisible to the operator. The intent is NOT
@@ -545,16 +562,8 @@ async function driveReleaseIntent(
             value: { kind: "skipped", error: "release skipped: mutation guard no longer held (superseded before Phase B)" },
           };
         }
-
-        // Phase B — the ONLY remote mutation of a release. Targeted delete of
-        // exactly the label the intent names. The forge adapter already
-        // swallows 404s, so ANY error here is a real failure: fail closed and
-        // leave the intent pending for the next pass (§10 "forge outage").
-        try {
-          await forge.removeIssueLabel(issue.repository.fullName, issue.number, intent.agentLabel);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          return { complete: true, value: { kind: "error", error: `forge delete failed: ${message}` } };
+        if (!deleted.value.ok) {
+          return { complete: true, value: { kind: "error", error: `forge delete failed: ${deleted.value.error}` } };
         }
 
         // Phase C — settle (Postgres only). The pending intent exists is the

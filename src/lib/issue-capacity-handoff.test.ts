@@ -1,7 +1,19 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
 const { githubMocks, claimGateMocks, claimMocks, guardState } = vi.hoisted(() => ({
-  guardState: { resuming: false, busy: false, lastComplete: undefined as boolean | undefined },
+  guardState: {
+    resuming: false,
+    busy: false,
+    lastComplete: undefined as boolean | undefined,
+    // #1254: the fenced remote write reports a stolen guard, so the forge
+    // function is NEVER called.
+    fenceGuardLost: false,
+    // The transaction client the fenced write hands to its callback.
+    tx: {
+      issue: { update: vi.fn(async () => ({})), findUnique: vi.fn(async () => null) },
+      issueLifecycleEvent: { create: vi.fn(async () => ({})), upsert: vi.fn(async () => ({})) },
+    } as Record<string, any>,
+  },
   githubMocks: { removeIssueLabel: vi.fn().mockResolvedValue(undefined) },
   claimGateMocks: { getLiveIssueLabels: vi.fn() },
   claimMocks: { releaseIssueClaim: vi.fn() },
@@ -11,9 +23,20 @@ vi.mock("./github", () => ({ removeIssueLabel: githubMocks.removeIssueLabel }));
 vi.mock("./claim-gate", () => ({ getLiveIssueLabels: claimGateMocks.getLiveIssueLabels }));
 vi.mock("./issue-claim", () => ({ releaseIssueClaim: claimMocks.releaseIssueClaim }));
 vi.mock("./issue-mutation-guard", () => ({
+  // The real budget function: the module derives the handoff's fenced
+  // region's transaction timeout from it at import time.
+  fencedWriteTimeoutMs: () => 195_000,
   withIssueMutationGuard: async (_request: unknown, callback: (...args: any[]) => Promise<{ complete: boolean; value: unknown }>) => {
     if (guardState.busy) return { status: "busy", ownerToken: "owner-1", operation: "capacity-release" };
-    const outcome = await callback(undefined, { resuming: guardState.resuming });
+    const outcome = await callback(undefined, {
+      resuming: guardState.resuming,
+      // #1254: the fenced remote write is ATOMIC with the guard check — a
+      // stolen guard means the forge function is NEVER called.
+      runFencedRemoteWrite: async (fn: any) => {
+        if (guardState.fenceGuardLost) return { status: "guard-lost" };
+        return { status: "written", value: await fn(guardState.tx) };
+      },
+    });
     guardState.lastComplete = outcome.complete;
     return { status: "completed", value: outcome.value };
   },
@@ -120,6 +143,7 @@ describe("recoverIssueCapacityHandoff", () => {
     guardState.resuming = false;
     guardState.busy = false;
     guardState.lastComplete = undefined;
+    guardState.fenceGuardLost = false;
     githubMocks.removeIssueLabel.mockResolvedValue(undefined);
     claimGateMocks.getLiveIssueLabels.mockResolvedValue(["agent/alpha", "status/in-progress"]);
     claimMocks.releaseIssueClaim.mockResolvedValue({ labels: ["status/ready"], status: "status/ready", statusNote: null });
@@ -165,6 +189,72 @@ describe("recoverIssueCapacityHandoff", () => {
     expect(client.lease.deleteMany).not.toHaveBeenCalled();
     expect(client.mirrors).toHaveLength(0);
     expect(client.audits.at(-1)).toMatchObject({ success: false });
+  });
+
+  it("skips the shared release when the guard is stolen inside the fenced write window (#1254 review)", async () => {
+    // The reviewer's hole: the capacity release wrote to GitHub with NO
+    // guard check at all, so a maintainer force-claim could steal the guard
+    // and the stale release could still land — stripping the new owner's
+    // agent label (and its status). The release now runs inside the FENCED
+    // write: a stolen guard means the forge function is NEVER called.
+    guardState.fenceGuardLost = true;
+    const client = makeClient();
+    const result = await call(client);
+
+    expect(result).toMatchObject({ ok: false, httpStatus: 500, code: "release_failed" });
+    expect((result as any).message).toContain("guard");
+    // No remote write at all: neither the shared release nor a targeted
+    // removal.
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(githubMocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The lease and the claim stay intact, and no settlement proof is
+    // written (the record is written AFTER the release, and the lease CAS
+    // after that).
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.settlements).toHaveLength(0);
+    expect(client.mirrors).toHaveLength(0);
+    // The skip is audited — it must not be silent.
+    expect(client.audits.at(-1)).toMatchObject({ action: "issue_capacity_handoff", success: false });
+    expect(client.audits.at(-1).errorMessage).toContain("guard");
+    // The guard is retained for the exact-token retry.
+    expect(guardState.lastComplete).toBe(false);
+  });
+
+  it("skips the targeted ownership cleanup when the guard is stolen inside the fenced write window (#1254 review)", async () => {
+    // The other release path: the ownership changed between the two live
+    // reads, so the handoff removes ONLY its own label. That removal is a
+    // remote ownership write too, and it must not land after a steal.
+    guardState.fenceGuardLost = true;
+    claimGateMocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/alpha", "status/in-progress"]).mockResolvedValueOnce(["agent/omega", "status/in-progress"]);
+    const client = makeClient();
+    const result = await call(client);
+
+    expect(result).toMatchObject({ ok: false, httpStatus: 500, code: "release_failed" });
+    expect((result as any).message).toContain("guard");
+    expect(githubMocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(client.lease.deleteMany).not.toHaveBeenCalled();
+    expect(client.settlements).toHaveLength(0);
+    expect(client.mirrors).toHaveLength(0);
+    expect(client.audits.at(-1)).toMatchObject({ success: false });
+    expect(guardState.lastComplete).toBe(false);
+  });
+
+  it("hands the release a client without $transaction, so it cannot nest inside the fenced region (#1254 review)", async () => {
+    // A real Prisma interactive-transaction client DOES expose
+    // `$transaction`; handing it to `releaseIssueClaim` would open a NESTED
+    // interactive transaction (a savepoint under Prisma's default 5s
+    // timeout) inside the fenced region, rolling the release's cache mirror
+    // and its `claim_released` evidence row back while the GitHub removal
+    // stands. The thin client carries no `$transaction`.
+    const client = makeClient();
+    await call(client);
+
+    expect(claimMocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    const passed = claimMocks.releaseIssueClaim.mock.calls[0][0] as any;
+    expect(passed.prisma).toBeDefined();
+    expect("$transaction" in passed.prisma).toBe(false);
+    expect(passed.prisma.issue).toBe(guardState.tx.issue);
   });
 
   it("resumes exact-token cleanup after prior label removal without changing resting status", async () => {

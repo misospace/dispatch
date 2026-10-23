@@ -23,15 +23,21 @@ const { guard } = vi.hoisted(() => {
   // #1254: the per-holder anchor re-check. Tests flip `value` to false to make
   // the sweep's pre-write re-check report that the guard was superseded.
   const checks = { value: true };
+  // #1254: the transaction client the fenced remote write hands to the
+  // callback — the fake guard passes it through so the guarded local writes
+  // join the same (fake) transaction.
+  const tx: { current: any } = { current: undefined };
   return {
     guard: {
       held,
       attempts,
       checks,
+      tx,
       reset: () => {
         held.clear();
         attempts.length = 0;
         checks.value = true;
+        tx.current = undefined;
       },
     },
   };
@@ -47,7 +53,16 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
     guard.held.set(request.issueId, { operation: request.operation, agentName: request.agentName });
     guard.attempts.push({ ...request, status: "acquired" });
     try {
-      const result = await callback(undefined, { resuming: false, stillHoldsGuard: async () => guard.checks.value });
+      const result = await callback(undefined, {
+        resuming: false,
+        stillHoldsGuard: async () => guard.checks.value,
+        // #1254: the fenced remote write is ATOMIC with the guard check — a
+        // stolen guard means the forge function is NEVER called.
+        runFencedRemoteWrite: async (fn: any) => {
+          if (!guard.checks.value) return { status: "guard-lost" };
+          return { status: "written", value: await fn(guard.tx.current) };
+        },
+      });
       if (result.complete) return { status: "completed", value: result.value };
       return { status: "retained", ownerToken: "self", value: result.value };
     } finally {
@@ -373,6 +388,16 @@ function makeSweepClient(options: {
     agentWorkHistory: { create: vi.fn().mockResolvedValue({ id: "h-1" }) },
     issue,
     issueLifecycleEvent,
+    // #1254: a REAL Prisma interactive-transaction client DOES expose
+    // `$transaction` (Prisma only denies `$connect`/`$disconnect`/`$on`/
+    // `$use`/`$extends`). The fake mirrors production here, so a callee that
+    // opens a NESTED interactive transaction inside the fenced region — which
+    // in production would savepoint the release's evidence row under
+    // Prisma's default 5s timeout — fails the test loudly instead of
+    // silently taking the non-transactional branch.
+    $transaction: vi.fn(async () => {
+      throw new Error("nested $transaction inside the fenced region");
+    }),
   };
 
   // #1254: the sweep defers to pending reconciler release intents. Evaluated
@@ -385,10 +410,19 @@ function makeSweepClient(options: {
     return select ? matched.map((row) => ({ issueId: row.issueId })) : matched.map((row) => ({ ...row }));
   });
 
+  // #1254: the pool client and the interactive transaction's client are
+  // DISTINCT surfaces in production, so the fake keeps them distinct: a test
+  // can then tell whether the release's local writes joined the fenced
+  // transaction or went around it through the pool client.
+  const clientIssue = {
+    update: vi.fn(async () => null),
+    findUnique: vi.fn(async () => null),
+  };
+
   const client = {
     agentWork: { findMany: agentWorkFindMany },
     ownershipReleaseIntent: { findMany: ownershipReleaseIntentFindMany },
-    issue,
+    issue: clientIssue,
     issueLifecycleEvent,
     lease: tx.lease,
     agentWorkHistory: tx.agentWorkHistory,
@@ -401,7 +435,12 @@ function makeSweepClient(options: {
     $transaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
   } as unknown as StaleWorkClient;
 
-  return { client, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases, ownershipReleaseIntentFindMany };
+  // #1254: the fenced remote write hands its transaction client to the
+  // callback, so the release's own local writes join the same fake
+  // transaction instead of opening one of their own.
+  guard.tx.current = tx;
+
+  return { client, tx, clientIssue, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases, ownershipReleaseIntentFindMany };
 }
 
 function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
@@ -514,6 +553,35 @@ describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
     expect(report.claimRetained).toBe(0);
     expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
     expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+  });
+
+  it("runs the release's local writes inside the fenced transaction — never a nested one (#1254 review)", async () => {
+    // The release hands `releaseIssueClaim` a client. If that client exposed
+    // `$transaction` (a real Prisma interactive-transaction client DOES),
+    // the release would open a NESTED interactive transaction inside the
+    // fenced region — a savepoint under Prisma's default 5s timeout — and
+    // the release's cache mirror and its `claim_released` evidence row could
+    // roll back while the GitHub removal stands. The thin client the release
+    // receives has no `$transaction`, so the local writes join the fenced
+    // transaction instead.
+    const work = makeWork();
+    const { client, tx, clientIssue, eventRows } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    // The cache mirror and the evidence row went through the FENCED
+    // transaction's client...
+    expect(tx.issue.update).toHaveBeenCalled();
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(1);
+    // ...and NOT through the pool client, and no callee opened a nested
+    // interactive transaction (the fake's `$transaction` throws if it does).
+    expect(clientIssue.update).not.toHaveBeenCalled();
+    expect(tx.$transaction).not.toHaveBeenCalled();
   });
 });
 

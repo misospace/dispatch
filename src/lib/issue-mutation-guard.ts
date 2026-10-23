@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { githubCallBudgetMs } from "@/lib/github-auth";
 
 export interface IssueMutationRequest {
   issueId: string;
@@ -50,19 +51,101 @@ export const GUARD_HEARTBEAT_MS = 60_000;
  */
 export const GUARD_OVERRIDE_MIN_AGE_MS = 5 * GUARD_HEARTBEAT_MS;
 
+/** Slack for the region's own local writes on top of the forge call's bound. */
+const FENCED_WRITE_SLACK_MS = 15_000;
+
+/**
+ * The transaction budget of a fenced remote write (#1254 review).
+ *
+ * A fenced region holds the guard row's EXCLUSIVE row lock across the forge
+ * call, so the transaction must NOT expire while that call is in flight: a
+ * mid-flight abort would release the lock with the remote effect still
+ * in flight and reopen exactly the hole the fence closes.
+ *
+ * The budget is the worst case of ONE mutating forge call
+ * (`githubCallBudgetMs()` — the attempt chain, the capped retry backoff and a
+ * cold App installation-token fetch, every term bounded by #1347) plus slack
+ * for the local writes a region carries alongside its forge call.
+ *
+ * It is deliberately SHORTER than the override's silence window
+ * (`GUARD_OVERRIDE_MIN_AGE_MS`): the fence re-stamps the guard row, and a
+ * region that ran longer than the silence window would leave the row looking
+ * stale the moment it committed (the heartbeat's own stamp waits behind the
+ * row lock), so an operator override could steal the guard right after the
+ * region's writes landed. One mutating forge call per region keeps the
+ * region inside that window.
+ */
+export function fencedWriteTimeoutMs(): number {
+  return githubCallBudgetMs() + FENCED_WRITE_SLACK_MS;
+}
+
+
+/**
+ * The outcome of a fenced remote write: either the remote write happened
+ * (while the guard row's lock was held) or the guard was lost before the
+ * write could start — in which case the forge function was NEVER called.
+ */
+export type FencedRemoteWriteResult<T> =
+  | { status: "written"; value: T }
+  | { status: "guard-lost" };
+
+export interface FencedRemoteWriteOptions {
+  /**
+   * The region's transaction budget, in milliseconds. The default
+   * (`fencedWriteTimeoutMs()`) covers ONE mutating forge call — the region
+   * invariant every fenced write follows. A region that carries MORE than one
+   * mutating forge call (the capacity handoff's shared release: the
+   * ownership removal plus the resting-status transition) MUST raise it to
+   * the worst case of the calls it holds: a mid-region abort would release
+   * the guard row's lock with a remote effect still in flight.
+   */
+  timeoutMs?: number;
+}
+
 export interface IssueMutationContext {
   resuming: boolean;
   /**
-   * #1254: re-check, before a remote ownership write, that THIS holder still
-   * owns the guard. The override path can delete this holder's `executing`
-   * guard between acquisition and the remote call (a maintainer force-claim
-   * stealing a silent guard); this lets a callback detect that it no longer
-   * holds the anchor and back off before mutating GitHub. The residual window
-   * between this read and the remote call is the same accepted
-   * ownerToken-CAS-losing posture the deliberate override already takes — the
-   * override's CAS is the load-bearing fence, this is the pre-write tripwire.
+   * #1254: re-check that THIS holder still owns the guard. Use it for LOCAL
+   * (non-forge) decisions only — a read-then-act check cannot fence a remote
+   * write, because the guard can be taken between the read and the call (the
+   * override's `DELETE` is a separate statement). Every remote OWNERSHIP
+   * write goes through `runFencedRemoteWrite` instead, which makes the check
+   * and the write one atomic step.
    */
   stillHoldsGuard: () => Promise<boolean>;
+  /**
+   * #1254: run a remote ownership write ATOMICALLY with the guard check.
+   *
+   * The implementation takes the guard row's exclusive lock (an `UPDATE`
+   * inside a transaction, held until the transaction ends) and performs the
+   * forge write INSIDE that lock. The override's steal (`DELETE` on the same
+   * row) is therefore serialized with the write:
+   *
+   * - the override wins first → the guard row is gone or re-owned → the
+   *   holder's `UPDATE` matches no row → `fn` is NEVER called → no forge
+   *   write lands after the steal;
+   * - the holder wins first → the override's `DELETE` blocks on the row lock
+   *   until the holder commits, then re-evaluates its silence predicate
+   *   (`updatedAt <= cutoff`) against the row the holder's `UPDATE` just
+   *   re-stamped → the predicate is false → the row is skipped → the override
+   *   reports `busy` and does NOT steal.
+   *
+   * So a steal can never commit between the check and the write THIS REGION
+   * covers: there is no gap, because the check and the write share one
+   * transaction. (What the fence does NOT make atomic is a SET of writes:
+   * a region carries one mutating forge call, so a callback that needs two
+   * writes runs two regions — and a steal between them leaves the first one
+   * applied.)
+   *
+   * The region MUST carry exactly ONE mutating forge call by default (see
+   * `fencedWriteTimeoutMs`) and MUST NOT start another interactive
+   * transaction of its own — the callback receives the transaction client so
+   * local writes join the fenced transaction instead of nesting.
+   */
+  runFencedRemoteWrite: <T>(
+    fn: (tx: Prisma.TransactionClient) => Promise<T>,
+    options?: FencedRemoteWriteOptions,
+  ) => Promise<FencedRemoteWriteResult<T>>;
 }
 export type IssueMutationResult<T> =
   | { status: "busy"; ownerToken: string; operation: string }
@@ -107,6 +190,22 @@ export async function withIssueMutationGuard<T>(
     // interval and any bounded remote call (#1347) — can be a crashed
     // holder. The CAS on ownerToken+executing still loses cleanly if the
     // writer finished or re-acquired first.
+    //
+    // #1254 review (the fenced remote write): the steal predicate now also
+    // excludes a guard whose holder is INSIDE a fenced remote write. The
+    // holder's fenced transaction holds the guard row's exclusive lock for
+    // the whole forge call, so this `DELETE` blocks on that lock; when the
+    // holder commits, the `DELETE` re-evaluates its predicate against the
+    // re-stamped row (the fenced `UPDATE` refreshes `updatedAt`) — the
+    // silence predicate `updatedAt <= cutoff` is false, the row is skipped,
+    // `removed.count !== 1`, and the override reports `busy` WITHOUT
+    // stealing. The operator's force-claim therefore WAITS for the in-flight
+    // fenced write (bounded by the region's own transaction budget,
+    // `fencedWriteTimeoutMs`) and is then told the issue is busy; it never
+    // waits unboundedly, because that budget is what bounds the lock hold.
+    // If the override's `DELETE` wins the race instead, the holder's fenced
+    // `UPDATE` matches no row and the forge write is never issued
+    // (`runFencedRemoteWrite` → `guard-lost`).
     if (request.override === true && guard.executing) {
       const overrideCutoff = new Date(Date.now() - GUARD_OVERRIDE_MIN_AGE_MS);
       const removed = await prisma.issueMutationGuard.deleteMany({
@@ -190,11 +289,55 @@ export async function withIssueMutationGuard<T>(
       resuming,
       // #1254: re-read the anchor and compare it against the token this holder
       // captured on acquisition. A deleted-or-re-owned guard means the
-      // override won; the holder no longer holds the fence and must not commit
-      // remote ownership writes.
+      // override won. This is a LOCAL decision only (a read-then-act check
+      // cannot fence a remote write) — remote ownership writes go through
+      // `runFencedRemoteWrite` below.
       stillHoldsGuard: async () => {
         const current = await prisma.issueMutationGuard.findUnique({ where: { issueId: request.issueId } });
         return current?.ownerToken === guard.ownerToken && current.executing === true;
+      },
+      // #1254 review: the ATOMIC fenced remote write. The `UPDATE` inside the
+      // transaction takes the guard row's exclusive row lock (held until the
+      // transaction ends) and refreshes the liveness stamp (`updatedAt`); the
+      // forge write then runs INSIDE that lock. The override's steal
+      // (`DELETE` on the same row) is serialized with it, so a steal can
+      // never commit between the check and the write:
+      // - override first → the row is gone/re-owned → `updateMany` matches no
+      //   row → `fn` is NEVER called → `guard-lost`, no remote write;
+      // - holder first → the override's `DELETE` blocks on the row lock and
+      //   then fails its silence predicate (the `UPDATE` re-stamped
+      //   `updatedAt`) → the override reports `busy` and does not steal.
+      runFencedRemoteWrite: async <T>(
+        fn: (tx: Prisma.TransactionClient) => Promise<T>,
+        options?: FencedRemoteWriteOptions,
+      ): Promise<FencedRemoteWriteResult<T>> => {
+        const outcome = await prisma.$transaction(async (tx) => {
+          const held = await tx.issueMutationGuard.updateMany({
+            where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
+            // The liveness stamp is set EXPLICITLY rather than left to the
+            // column's `@updatedAt` handling: the override's steal predicate
+            // is `updatedAt <= cutoff` (SILENCE), so the re-stamp that keeps a
+            // guard inside a fenced write un-stealable must not depend on the
+            // engine refreshing an `@updatedAt` column inside this update.
+            data: { executing: true, updatedAt: new Date() },
+          });
+          // The guard was deleted or re-owned between acquisition and this
+          // write: the anchor moved on, so NO remote write may happen.
+          if (held.count !== 1) return null;
+          const value = await fn(tx);
+          return { value };
+        }, {
+          // The budget must dominate the worst case of the mutating forge
+          // call(s) the region holds, or the transaction could abort with a
+          // remote effect still in flight (which would release the row lock
+          // and reopen the hole). `maxWait` keeps pool waiters failing fast
+          // instead of queueing behind the held connection.
+          timeout: options?.timeoutMs ?? fencedWriteTimeoutMs(),
+          maxWait: 5_000,
+        });
+        return outcome === null
+          ? { status: "guard-lost" }
+          : { status: "written", value: outcome.value };
       },
     });
     if (result.complete) {

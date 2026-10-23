@@ -81,7 +81,7 @@ export async function POST(request: Request) {
       // not touch agent labels and must not cancel a pending release), then
       // the explicit assignment's own idempotent label write converges the
       // state. Busy means another claim-path writer holds the issue: 409.
-      const guarded = await withIssueMutationGuard({ issueId, operation: "assign" }, async (_tx, { stillHoldsGuard }): Promise<{ complete: boolean; value: Response }> => {
+      const guarded = await withIssueMutationGuard({ issueId, operation: "assign" }, async (_tx, { runFencedRemoteWrite }): Promise<{ complete: boolean; value: Response }> => {
       // Fetch current issue to get existing labels and state
       const issue = await prisma.issue.findUnique({ where: { id: issueId } });
       if (!issue) {
@@ -146,15 +146,11 @@ export async function POST(request: Request) {
       // Build new label set using the shared module
       const newLabels = buildNewLabels(currentLabels, payload.action, payload.value);
 
-      // #1254: re-check the anchor before the remote label write. A maintainer
-      // force-claim can take this holder's guard between acquisition and the
-      // write; a superseded assignment must not commit a remote label mutation
-      // the holder no longer owns. assign_owner is not affected by the
-      // agent-label override and needs no check.
-      if (payload.action === "assign_agent" && !(await stillHoldsGuard())) {
-        // #1254: the guard-loss tripwire records a failure audit — the
-        // skipped assignment must be visible, not silent. Best-effort: a
-        // failing audit write must not mask the 409.
+      // #1254: the guard-loss path records a failure audit — the skipped
+      // assignment must be visible, not silent — and answers with the route's
+      // busy/conflict shape. Best-effort: a failing audit write must not mask
+      // the 409.
+      const guardLost = async (): Promise<{ complete: boolean; value: Response }> => {
         try {
           await prisma.auditLog.create({
             data: {
@@ -173,10 +169,28 @@ export async function POST(request: Request) {
           // Audit log failure should not mask the real error
         }
         return { complete: true, value: errorResponse("Assignment was superseded by an operator override", 409) };
-      }
+      };
 
-      // Update GitHub labels atomically via updateIssueLabels (replaces all)
-      await updateIssueLabels(repoFullName, issueNumber, newLabels);
+      // #1254: the remote label write runs inside the FENCED write for EVERY
+      // action, not only `assign_agent`. `updateIssueLabels` is a FULL-label-
+      // set PUT (it replaces ALL labels), so the set it writes is a snapshot
+      // taken before the write: a stale snapshot strips every label another
+      // writer added in the meantime — including the `agent/*` label a
+      // maintainer force-claim owns. The fence makes the guard check and the
+      // write ONE step (the guard row's lock is held across the write), so
+      // when the guard is already gone or re-owned the forge function is
+      // NEVER called and the route answers with its busy/conflict shape.
+      // (This says nothing about GitHub's own lack of a label CAS: the fence
+      // closes the "the guard was stolen under me" hole, not the "another
+      // writer changed the labels concurrently" one.)
+      const written = await runFencedRemoteWrite(async () => {
+        // Update GitHub labels atomically via updateIssueLabels (replaces all)
+        await updateIssueLabels(repoFullName, issueNumber, newLabels);
+        return true;
+      });
+      if (written.status === "guard-lost") {
+        return await guardLost();
+      }
 
       // Update local cache
       await prisma.issue.update({

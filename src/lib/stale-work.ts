@@ -253,6 +253,28 @@ interface StaleWorkTransactionClient {
   };
 }
 
+/**
+ * A THIN `IssueClaimClient` over the fenced transaction client.
+ *
+ * `releaseIssueClaim` opens its own interactive transaction whenever the
+ * client it is handed exposes `$transaction` — and a real Prisma interactive
+ * transaction client DOES expose it (Prisma only denies `$connect`,
+ * `$disconnect`, `$on`, `$use` and `$extends`). Inside the fenced region that
+ * would open a NESTED interactive transaction (a savepoint) with Prisma's
+ * default 5s timeout: the release's cache mirror and its `claim_released`
+ * evidence row could roll back to the savepoint while the GitHub removal
+ * stands. The thin client is therefore built EXPLICITLY from the transaction
+ * client, WITHOUT `$transaction`, so the release's local writes join the
+ * fenced transaction instead of nesting inside it.
+ */
+function fencedClaimClient(tx: unknown): IssueClaimClient {
+  const source = tx as {
+    issue: IssueClaimClient["issue"];
+    issueLifecycleEvent?: IssueClaimClient["issueLifecycleEvent"];
+  };
+  return { issue: source.issue, issueLifecycleEvent: source.issueLifecycleEvent };
+}
+
 export interface StaleWorkClient {
   agentWork: {
     findMany: (args: any) => Promise<any[]>;
@@ -478,7 +500,20 @@ export async function sweepStaleWork(
   // lease (fenced on its epoch), release the GitHub claim, finalize the row.
   // For issue-scoped claims the whole pipeline runs inside the per-issue
   // mutation fence held by the caller.
-  const reclaimStaleRow = async (work: any, guardCheck?: () => Promise<boolean>): Promise<void> => {
+  //
+  // `guard` carries the two anchor capabilities of that fence: the LOCAL
+  // re-check (`stillHoldsGuard`, used for the in-transaction decision below)
+  // and the ATOMIC fenced write (`runFencedRemoteWrite`, used for the remote
+  // label release, which must not be able to land after the guard was stolen).
+  const reclaimStaleRow = async (
+    work: any,
+    guard?: {
+      stillHoldsGuard: () => Promise<boolean>;
+      runFencedRemoteWrite: <T>(
+        fn: (tx: any) => Promise<T>,
+      ) => Promise<{ status: "written"; value: T } | { status: "guard-lost" }>;
+    },
+  ): Promise<void> => {
     // Claim the stale transition before external I/O. A heartbeat that
     // commits first makes the conditional update miss; a heartbeat after
     // this point sees a terminal STALE row and cannot revive it midway.
@@ -570,7 +605,7 @@ export async function sweepStaleWork(
        // entry written by the mark in place: the history is the sweep's own
        // observation log, not claim state, and deleting a row the transition
        // genuinely reached would hide a real decision from the audit trail.
-       if (guardCheck && !(await guardCheck())) {
+       if (guard && !(await guard.stillHoldsGuard())) {
         await tx.agentWork.updateMany({
           where: { id: work.id, state: "STALE" },
           data: {
@@ -744,16 +779,56 @@ export async function sweepStaleWork(
     }
 
     if (work.issue) {
-      // #1254: second tripwire. The mark committed above, so an override that
-      // lands between that commit and this remote write must still not strip
-      // the label a forced claimant now owns. The row keeps its pending-release
+      // #1254: second tripwire — now an ATOMIC fenced write. The mark
+      // committed above, so an override that lands between that commit and
+      // this remote write must still not strip the label a forced claimant now
+      // owns. The fenced write makes the anchor check and the remote label
+      // release ONE step (the guard row's lock is held across the release),
+      // so the release can neither slip past a steal nor land after one: if
+      // the guard was already taken, the forge function is NEVER called and
+      // the sweep skips the release. The row keeps its pending-release
       // marker, so the next sweep (or the force-claim's own receipt) converges.
       // Known shape (pre-existing crash-matrix, narrowed here): if the override
       // re-claimed for the SAME agent without a fresh AgentWork row, the retry
       // snapshots that lease as the epoch and would release it — the same
       // window a crash between mark and release already had; the epoch CAS
       // against a renewed clock, not this tripwire, is the standing fence.
-      if (guardCheck && !(await guardCheck())) {
+      //
+      // The release is attributed to the sweep, not to the abandoned agent:
+      // nobody chose to let this claim go, and a claim-to-merge read must be
+      // able to tell a recovered stall apart from a worker's own unclaim
+      // (#1202).
+      const releaseWith = (claimClient: IssueClaimClient) =>
+        releaseIssueClaim({
+          // The release's own local writes (the cache mirror and the
+          // `claim_released` event) join the fenced transaction, so they
+          // cannot open an interactive transaction of their own inside it.
+          // `preserveStatus` keeps the region at exactly ONE mutating forge
+          // call (the agent-label removal), so the region's transaction
+          // budget always covers the call it holds.
+          prisma: claimClient,
+          issue: work.issue,
+          repoFullName: work.issue.repository.fullName,
+          issueNumber: work.issue.number,
+          agentName: work.agentName,
+          options: {
+            allowMissingAgent: true,
+            preserveStatus: true,
+            source: "stale-recovery",
+            actor: "system",
+            // This AgentWork row is this claim epoch, and it is stable across a
+            // retry of the same sweep (the retry re-marks the same STALE row).
+            // Keying the release on it means the release and the
+            // already-released repair a retry has to take are one
+            // `claim_released`, not two. A reclaimed issue gets a new row and
+            // therefore a new key, so a genuine second release still counts.
+            releaseKey: lifecycleDedupeKey("agent-work", work.id),
+          },
+        });
+      const released = guard
+        ? await guard.runFencedRemoteWrite(async (tx) => releaseWith(fencedClaimClient(tx)))
+        : { status: "written" as const, value: await releaseWith(client as unknown as IssueClaimClient) };
+      if (released.status === "guard-lost") {
         // #1254: the second tripwire leaves a failure audit too — the remote
         // release was skipped because the anchor moved on, and the skip must
         // be visible. Best-effort: a failing audit is reported, never thrown,
@@ -782,30 +857,6 @@ export async function sweepStaleWork(
         report.skipped++;
         return;
       }
-      // The release is attributed to the sweep, not to the abandoned agent:
-      // nobody chose to let this claim go, and a claim-to-merge read must be
-      // able to tell a recovered stall apart from a worker's own unclaim
-      // (#1202).
-      await releaseIssueClaim({
-        prisma: client,
-        issue: work.issue,
-        repoFullName: work.issue.repository.fullName,
-        issueNumber: work.issue.number,
-        agentName: work.agentName,
-        options: {
-          allowMissingAgent: true,
-          preserveStatus: true,
-          source: "stale-recovery",
-          actor: "system",
-          // This AgentWork row is this claim epoch, and it is stable across a
-          // retry of the same sweep (the retry re-marks the same STALE row).
-          // Keying the release on it means the release and the
-          // already-released repair a retry has to take are one
-          // `claim_released`, not two. A reclaimed issue gets a new row and
-          // therefore a new key, so a genuine second release still counts.
-          releaseKey: lifecycleDedupeKey("agent-work", work.id),
-        },
-      });
     }
 
     const finalized = await client.$transaction(async (tx) => {
@@ -863,7 +914,7 @@ export async function sweepStaleWork(
         // window that completed far enough to owe one.
         const guarded = await withIssueMutationGuard(
           { issueId: work.issueId, operation: "stale-release", agentName: work.agentName },
-          async (_tx, context) => ({ complete: true, value: await reclaimStaleRow(work, context.stillHoldsGuard) }),
+          async (_tx, context) => ({ complete: true, value: await reclaimStaleRow(work, context) }),
         );
         if (guarded.status === "busy") report.skipped++;
       } else {

@@ -1,7 +1,19 @@
-const { guardState } = vi.hoisted(() => ({ guardState: { resuming: false, stillHolds: true } }));
+const { guardState } = vi.hoisted(() => ({
+  guardState: { resuming: false, stillHolds: true, fencedGuardLost: false },
+}));
 vi.mock("@/lib/issue-mutation-guard", () => ({
   withIssueMutationGuard: async (_request: unknown, callback: any) => {
-    const result = await callback(undefined, { resuming: guardState.resuming, stillHoldsGuard: async () => guardState.stillHolds });
+    const result = await callback(undefined, {
+      resuming: guardState.resuming,
+      stillHoldsGuard: async () => guardState.stillHolds,
+      // #1254: the fenced remote write is ATOMIC with the guard check — a
+      // stolen guard means the forge function is NEVER called. `fencedGuardLost`
+      // models the steal landing between the local re-check and the write.
+      runFencedRemoteWrite: async (fn: any) => {
+        if (guardState.fencedGuardLost || !guardState.stillHolds) return { status: "guard-lost" };
+        return { status: "written", value: await fn(undefined) };
+      },
+    });
     return { status: result.complete ? "completed" : "retained", value: result.value };
   },
 }));
@@ -94,6 +106,7 @@ import { POST } from "./route";
 beforeEach(() => {
   guardState.resuming = false;
   guardState.stillHolds = true;
+  guardState.fencedGuardLost = false;
   resetRateLimits();
 });
 
@@ -1058,6 +1071,29 @@ describe("POST /api/issues/claim — §8.7 override pre-write re-check (#1254)",
     expect(res.status).toBe(200);
     expect(mocks.addIssueLabel).toHaveBeenCalled();
     expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not land the remote add when the guard is stolen inside the fenced write window (#1254 review)", async () => {
+    // The reviewer's hole: the read-only pre-write tripwire could pass, the
+    // maintainer force-claim could then steal the guard, and the stale
+    // callback could still commit its remote ownership write. The fenced
+    // write makes the check and the write ONE step: the guard is stolen
+    // before the write starts, so the forge function is NEVER called.
+    guardState.fencedGuardLost = true;
+    mocks.leaseCreate.mockResolvedValue({ id: "lease-1", claimToken: "tok-1", renewedAt: null });
+
+    const res = await POST(makeRequest({ force: true }));
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("superseded");
+    // No remote ownership write at all — not the label add, not a removal.
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The receipt this attempt minted is fenced-deleted so the override's
+    // claim can own the issue.
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1", renewedAt: null } });
+    // The skip is audited — it must not be silent.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
   });
 });
 

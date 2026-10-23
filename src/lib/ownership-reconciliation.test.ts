@@ -307,7 +307,13 @@ function makeFakeGuard() {
     held.set(request.issueId, { operation: request.operation, agentName: request.agentName });
     attempts.push({ ...request, status: "acquired" });
     try {
-      const result = await callback(undefined, { resuming: false, stillHoldsGuard: async () => true });
+      const result = await callback(undefined, {
+        resuming: false,
+        stillHoldsGuard: async () => true,
+        // #1254: the fenced remote write is ATOMIC with the guard check — the
+        // guard is held here, so the forge write runs.
+        runFencedRemoteWrite: async (fn: any) => ({ status: "written", value: await fn(undefined) }),
+      });
       return result;
     } finally {
       held.delete(request.issueId);
@@ -1666,7 +1672,13 @@ describe("ownership reconciliation (#1254)", () => {
       const superseded = async (request: any, callback: any) => {
         if (request.operation === "reconcile-release") {
           return baseGuard(request, (tx: any) =>
-            callback(tx, { resuming: false, stillHoldsGuard: async () => false }),
+            callback(tx, {
+            resuming: false,
+            stillHoldsGuard: async () => false,
+            // #1254: the fenced write reports the lost guard, so the forge
+            // delete is NEVER issued by the abandoned attempt.
+            runFencedRemoteWrite: async () => ({ status: "guard-lost" }),
+          }),
           );
         }
         return baseGuard(request, callback);

@@ -81,7 +81,7 @@ export async function POST(request: Request) {
     // Maintainer force-claims may take over a guard left `executing` by a
     // crashed process — the deliberate operator decision the fail-closed
     // guard posture defers to (#1254). Automation never overrides.
-    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming, stillHoldsGuard }) => {
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming, runFencedRemoteWrite }) => {
     let remoteStarted = false;
     const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
@@ -271,23 +271,37 @@ export async function POST(request: Request) {
     // Check for agent conflict — if another agent is assigned, require force-claim
     if (analysis.hasAgentConflict) {
       if (force === true) {
-        // #1254: re-check the anchor before the remote removals. A maintainer
-        // force-claim can take this holder's guard before the remote writes;
-        // if so, do not start a remote mutation the holder no longer owns.
-        if (!(await stillHoldsGuard())) {
-          return superseded();
-        }
+        // #1254: the remote removals run inside FENCED writes: the guard
+        // check and the forge write share one transaction that holds the
+        // guard row's lock, so a maintainer force-claim can neither take this
+        // holder's guard between the check and the write nor land its own
+        // claim while these removals are in flight. If the guard is already
+        // gone/re-owned, `runFencedRemoteWrite` reports `guard-lost` and the
+        // forge function was NEVER called — do not start a remote mutation
+        // this holder no longer owns. ONE removal per fenced region (a region
+        // carries exactly one mutating forge call, so the region's
+        // transaction budget always covers the call it holds). The removal
+        // SET is therefore NOT atomic: a steal that lands between two
+        // removals leaves the earlier ones applied — the guard loss is
+        // detected on the next region's fence, and the override's own claim
+        // converges the label state.
+        remoteStarted = true;
         // Force claim: remove ALL stale agent labels first.
         // buildNewLabels below drops every conflicting agent label from the
         // cache, so GitHub must lose all of them too — leaving extras behind
         // is the same GitHub/cache divergence class #1037 fights.
-        remoteStarted = true;
         for (const staleAgentLabel of analysis.existingAgents) {
-          try {
-            await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
-          } catch (e) {
-            console.error(`Failed to remove stale agent label ${staleAgentLabel} during force claim:`, e);
-            // Non-fatal: continue with force claim even if label removal fails
+          const removal = await runFencedRemoteWrite(async () => {
+            try {
+              await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
+            } catch (e) {
+              console.error(`Failed to remove stale agent label ${staleAgentLabel} during force claim:`, e);
+              // Non-fatal: continue with force claim even if label removal fails
+            }
+            return true;
+          });
+          if (removal.status === "guard-lost") {
+            return superseded();
           }
         }
       } else {
@@ -315,27 +329,41 @@ export async function POST(request: Request) {
         mutationGuardHeld: true,
       });
 
-      // #1254: re-check the anchor before the remote add. A maintainer
-      // force-claim can delete this holder's guard between the claim-intent
-      // (lease) commit and the label write; the override already retired our
-      // receipt, so committing the add here would race it. Back off: delete
-      // the lease we minted ourselves and 409 — the add is idempotent, so the
-      // override's own claim lands the label. A receipt we did NOT mint (a
-      // plain renewal of a live attempt's row) is left intact.
-      if (!(await stillHoldsGuard())) {
+      // #1254: the remote add runs inside the FENCED write. A maintainer
+      // force-claim can take this holder's guard between the claim-intent
+      // (lease) commit and the label write; the fenced write makes the guard
+      // check and the label add ONE atomic step (the guard row's lock is held
+      // across the add), so the add can never land after the guard was
+      // stolen. When the guard is already gone/re-owned, the forge function
+      // is never called: back off, delete the lease we minted ourselves and
+      // 409 — the add is idempotent, so the override's own claim lands the
+      // label. A receipt we did NOT mint (a plain renewal of a live attempt's
+      // row) is left intact.
+      remoteStarted = true;
+      const added = await runFencedRemoteWrite(async () => {
+        // The add is idempotent: a fresh claim lands it once; a resumed claim
+        // replays it, repairing a crash that died between the lease (intent)
+        // commit and the remote add without creating a second owner.
+        await addIssueLabel(repoFullName, issueNumber, agentLabel);
+        return true;
+      });
+      if (added.status === "guard-lost") {
         return superseded(lease);
       }
-
-      remoteStarted = true;
-      // The add is idempotent: a fresh claim lands it once; a resumed claim
-      // replays it, repairing a crash that died between the lease (intent)
-      // commit and the remote add without creating a second owner.
-      await addIssueLabel(repoFullName, issueNumber, agentLabel);
 
       // Remove ALL existing status labels (not just the first) before adding
       // status/in-progress — keeps GitHub and the Prisma cache from
       // diverging when an issue carries more than one status label.
       // Base is the live GitHub label set (authoritative — #1037).
+      //
+      // #1254: this status transition is deliberately OUTSIDE the fenced
+      // write. Status labels are disjoint from `agent/*` (the fence protects
+      // OWNERSHIP writes), and the fenced add above already proved — under
+      // the guard row's lock — that this holder owns the claim at that
+      // moment. The override's silence fence (5 minutes without a stamp)
+      // cannot elapse across it either: the fenced add re-stamped the guard
+      // row, and this holder's heartbeat keeps stamping it every
+      // `GUARD_HEARTBEAT_MS` while the transition runs.
       if (!resuming || !liveLabels.includes(IN_PROGRESS_STATUS)) {
         await transitionIssueStatus(repoFullName, issueNumber, liveLabels, IN_PROGRESS_STATUS);
       }

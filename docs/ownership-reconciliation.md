@@ -505,15 +505,84 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > when another writer already released the claim. The stale-work sweep defers
 > to pending intents (the reconciler owns that release). The §8.5 status
 > selection is computed against a fresh live label read (#1037). The override's
-> CAS is the load-bearing fence; each guarded callback's pre-write re-check is
-> the tripwire. Every guarded callback (claim, direct `assign_agent`, and the
-> stale-work sweep) re-reads the anchor immediately before a remote ownership
-> write: if the guard no longer belongs to that holder — deleted, or re-owned
-> by a concurrent maintainer force-claim — the callback backs off before the
-> write (fenced-deleting any lease it minted) instead of racing the override.
-> The residual window between that read and the remote call is the same
-> ownerToken-CAS-losing cost the override itself accepts; the re-check only
-> closes the case where the override's delete has already committed.
+> CAS is the load-bearing fence, and the guarded remote ownership write is now
+> **atomic with the guard check** — it is not a read-then-act tripwire.
+> Every guarded callback (claim, the direct assignment route — `assign_agent`
+> AND `assign_owner`, whose label write is a full-set PUT — the reconciler's
+> Phase B delete, the stale-work sweep, and the capacity handoff's release)
+> performs its remote ownership write inside a **fenced write**
+> (`IssueMutationContext.runFencedRemoteWrite`,
+> `src/lib/issue-mutation-guard.ts`): the fenced write opens a transaction,
+> takes the guard row's **exclusive row lock** with a CAS-scoped `UPDATE`
+> (which also re-stamps the liveness stamp) and holds that lock **across the
+> forge call**. A steal therefore cannot commit between the check and the
+> write: the two are one step.
+> - the override wins first (it deleted the guard, or a different
+>   `ownerToken` owns it) → the fenced `UPDATE` matches no row → the forge
+>   function is **never called** → the callback backs off (fenced-deleting any
+>   lease it minted) and answers the same busy/conflict shape it used for the
+>   old tripwire;
+> - the holder wins first → the override's `DELETE` **blocks** on the row lock
+>   until the fenced write commits, then re-evaluates its silence predicate
+>   (`updatedAt <= cutoff`) against the row the fenced `UPDATE` just re-stamped
+>   → the predicate is false → the row is skipped → the override reports
+>   `busy` and does **not** steal. The operator's force-claim therefore waits
+>   for the in-flight fenced write — bounded by that region's own transaction
+>   budget — and is then told the issue is busy; it never waits unboundedly,
+>   because that budget is what bounds the lock hold.
+>
+> **The budget.** A region's transaction budget must dominate the worst case
+> of the mutating forge call(s) it holds: a mid-flight abort would release
+> the row lock with the remote effect still in flight, which reopens the hole
+> the fence closes. `githubCallBudgetMs()` (`src/lib/github-auth.ts`) is the
+> worst case of ONE mutating forge call — the attempt chain (3 attempts × the
+> per-attempt timeout), the capped retry backoff between attempts
+> (2 × `GITHUB_RETRY_MAX_DELAY_MS`), and one cold App installation-token
+> fetch — every term bounded by `DISPATCH_GITHUB_TIMEOUT_MS` (default 30s).
+> At the default configuration that is 180s, and the region's transaction
+> budget is `fencedWriteTimeoutMs()` = `githubCallBudgetMs()` + 15s of slack
+> = 195s. The budget is also deliberately shorter than the override's silence
+> window (`GUARD_OVERRIDE_MIN_AGE_MS`, 5 min): the fence re-stamps the guard
+> row, and a region that ran longer than the silence window would leave the
+> row looking stale the moment it committed (the heartbeat's own stamp waits
+> behind the row lock), so an override could steal the guard right after the
+> region's writes landed. Every region therefore carries **one** mutating
+> forge call — except the capacity handoff's release, which carries the
+> shared release (the ownership removal plus the resting-status transition:
+> up to three chained calls) and therefore raises its own budget to match.
+>
+> **What the fence proves, precisely.** The steal cannot COMMIT between the
+> fence and the write it covers: the steal's `DELETE` blocks on the guard
+> row's lock and then fails its silence predicate against the re-stamped row.
+> Two boundaries remain, by design:
+> - the claim route's forced stale-label cleanup runs **one removal per
+>   fenced region** (a region carries one mutating forge call), so the
+>   removal SET is **not atomic**: a steal that lands between two removals
+>   leaves the earlier ones applied. The next region's fence detects the
+>   loss and the callback backs off; the override's own claim converges the
+>   label state;
+> - the claim's **status transition is deliberately outside the fence** —
+>   status labels are disjoint from `agent/*`, and the fenced ownership
+>   write in front of it already proved, under the row lock, that this
+>   holder owns the claim at that moment.
+>
+> **The pool/lock tradeoff.** The fence deliberately holds ONE pooled
+> connection AND the guard row's lock for the duration of ONE hard-bounded
+> forge call. The hold is bounded by `fencedWriteTimeoutMs()` (195s at the
+> default configuration), so a GitHub outage can hold connections for that
+> budget — `maxWait: 5_000` keeps the other pool waiters failing fast
+> instead of queueing behind it. The guard heartbeat's stamp on the same row
+> waits behind that lock, so a long region also delays the holder's own
+> liveness stamp; the budget is what keeps that delay inside the silence
+> window.
+>
+> The residual window between the old read and the remote call — the
+> ownerToken-CAS-losing cost the override itself accepts — is therefore
+> **gone** for every write the fence covers: the only way the override can
+> win is to delete the guard first, and then the fenced write finds no row
+> to lock and issues no remote write.
+> The re-read (`stillHoldsGuard`) survives for LOCAL decisions only (a
+> Postgres-only decision that needs no forge fence).
 > Mode semantics: `off` (default) starts no new release but still **replays**
 > intents already committed before the mode change — otherwise a pending
 > intent would hold the issue's claim path forever with no self-healing path;
@@ -529,7 +598,13 @@ no such claim; §8.7 defines the actual cross-system boundary.
 
 Because the remote write cannot be fenced, the design fences **admission** in
 Postgres and lets that barrier serialize the remote write against every other
-automation writer of the same label. The invariant:
+automation writer of the same label. The anchor's row lock additionally makes
+each guarded ownership write **atomic with its admission check** (see the
+§8.7 implementation note above): the forge call happens while the anchor row's
+lock is held, so no ownership steal can commit between "the guard is mine" and
+"the label changed" (status writes are the documented exception — they are
+disjoint from `agent/*` and deliberately sit outside the fence). The
+invariant:
 
 > **Every reconciler-initiated `agent/*` label delete, and every claim-path
 > `agent/*` label add, is backed by a Postgres intent committed under one

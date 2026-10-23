@@ -231,6 +231,39 @@ export function githubFetchTimeoutMs(): number {
  */
 export const GITHUB_RETRY_MAX_DELAY_MS = 30_000;
 
+/**
+ * #1254: the default attempt count of `fetchWithRetry` (total attempts,
+ * including the first). MUTATING calls get the same count: a write retries
+ * on 429/5xx like a read; only a TIMEOUT is not retried for a write (its
+ * outcome is ambiguous). The fenced region's transaction budget is derived
+ * from this number (`githubCallBudgetMs`), so the two must not drift.
+ */
+export const GITHUB_FETCH_MAX_ATTEMPTS = 3;
+
+/**
+ * #1254: the worst-case duration of ONE mutating forge call — the bound the
+ * fenced region's transaction budget is derived from.
+ *
+ * A mutating call is `fetchWithRetry` with the default attempt count, and
+ * every attempt carries the #1347 per-attempt timeout, with the retry sleeps
+ * capped at `GITHUB_RETRY_MAX_DELAY_MS`. The bound therefore is:
+ *
+ *   attempts × per-attempt timeout + (attempts − 1) × capped backoff
+ *
+ * plus one per-attempt timeout for a COLD App installation-token fetch (the
+ * token POST bypasses `fetchWithRetry` but carries the same timeout bound).
+ * The token is cached, so this last term is paid at most once per region.
+ *
+ * At the default configuration (30s timeout, 30s backoff cap, 3 attempts)
+ * that is 3 × 30s + 2 × 30s + 30s = 180s.
+ */
+export function githubCallBudgetMs(): number {
+  const attempts = GITHUB_FETCH_MAX_ATTEMPTS;
+  const attemptChainMs =
+    attempts * githubFetchTimeoutMs() + (attempts - 1) * GITHUB_RETRY_MAX_DELAY_MS;
+  return attemptChainMs + githubFetchTimeoutMs();
+}
+
 export interface FetchWithRetryOptions {
   /** Total attempts including the first (default 3). */
   maxAttempts?: number;
@@ -308,7 +341,7 @@ export async function fetchWithRetry(
   init: RequestInit,
   options: FetchWithRetryOptions = {},
 ): Promise<Response> {
-  const maxAttempts = options.maxAttempts ?? 3;
+  const maxAttempts = options.maxAttempts ?? GITHUB_FETCH_MAX_ATTEMPTS;
   const sleep =
     options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const method = (init.method ?? "GET").toUpperCase();
