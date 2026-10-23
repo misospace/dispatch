@@ -333,9 +333,23 @@ function makeSweepClient(options: {
   // row here exactly as it would in the database.
   const leases = options.leases ?? [];
 
-  const leaseFindFirst = vi.fn(async ({ where }: any) => {
+  /**
+   * The lease read, projected onto the columns the caller asked for.
+   *
+   * The projection is honoured because Prisma honours it too: a read that
+   * asks for `retryAfter` and does not get it must look exactly like a read
+   * that never asked for it. A fake that always returned the whole row would
+   * let a production read that forgot the park marker pass its tests.
+   */
+  const leaseFindFirst = vi.fn(async ({ where, select }: any) => {
     const matched = leases.find((lease) => matchesWhere(lease as unknown as Record<string, unknown>, where));
-    return matched ? { ...matched } : null;
+    if (!matched) return null;
+    if (!select) return { ...matched };
+    const projected: Record<string, unknown> = {};
+    for (const [key, wanted] of Object.entries(select as Record<string, unknown>)) {
+      if (wanted) projected[key] = (matched as unknown as Record<string, unknown>)[key];
+    }
+    return projected;
   });
 
   // The parked-claim read: the sweep asks which claims carry a running wait
