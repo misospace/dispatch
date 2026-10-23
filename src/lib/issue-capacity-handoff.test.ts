@@ -8,6 +8,9 @@ const { githubMocks, claimGateMocks, claimMocks, guardState } = vi.hoisted(() =>
     // #1254: the fenced remote write reports a stolen guard, so the forge
     // function is NEVER called.
     fenceGuardLost: false,
+    // #1254 review: the options the fenced write was handed (the derived
+    // region budget).
+    fencedOptions: null as Record<string, any> | null,
     // The transaction client the fenced write hands to its callback.
     tx: {
       issue: { update: vi.fn(async () => ({})), findUnique: vi.fn(async () => null) },
@@ -29,16 +32,20 @@ vi.mock("./issue-claim", async (importOriginal) => {
   return { ...actual, releaseIssueClaim: claimMocks.releaseIssueClaim };
 });
 vi.mock("./issue-mutation-guard", () => ({
-  // The real budget function: the module derives the handoff's fenced
-  // region's transaction timeout from it at import time.
+  // The default single-call fence budget, kept real-shaped for the module.
   fencedWriteTimeoutMs: () => 195_000,
+  // #1367 review: the derived-budget helper keeps the REAL helper's
+  // arithmetic (n × per-call budget + slack) on a fake per-call figure of
+  // 45s — the same shape the unclaim route's suite uses.
+  fencedWriteTimeoutForCalls: (calls: number) => Math.max(1, Math.ceil(calls)) * 45_000 + 15_000,
   withIssueMutationGuard: async (_request: unknown, callback: (...args: any[]) => Promise<{ complete: boolean; value: unknown }>) => {
     if (guardState.busy) return { status: "busy", ownerToken: "owner-1", operation: "capacity-release" };
     const outcome = await callback(undefined, {
       resuming: guardState.resuming,
       // #1254: the fenced remote write is ATOMIC with the guard check — a
       // stolen guard means the forge function is NEVER called.
-      runFencedRemoteWrite: async (fn: any) => {
+      runFencedRemoteWrite: async (fn: any, options?: any) => {
+        guardState.fencedOptions = options ?? null;
         if (guardState.fenceGuardLost) return { status: "guard-lost" };
         return { status: "written", value: await fn(guardState.tx) };
       },
@@ -150,6 +157,7 @@ describe("recoverIssueCapacityHandoff", () => {
     guardState.busy = false;
     guardState.lastComplete = undefined;
     guardState.fenceGuardLost = false;
+    guardState.fencedOptions = null;
     githubMocks.removeIssueLabel.mockResolvedValue(undefined);
     claimGateMocks.getLiveIssueLabels.mockResolvedValue(["agent/alpha", "status/in-progress"]);
     claimMocks.releaseIssueClaim.mockResolvedValue({ labels: ["status/ready"], status: "status/ready", statusNote: null });
@@ -261,6 +269,59 @@ describe("recoverIssueCapacityHandoff", () => {
     expect(passed.prisma).toBeDefined();
     expect("$transaction" in passed.prisma).toBe(false);
     expect(passed.prisma.issue).toBe(guardState.tx.issue);
+  });
+
+  it("derives the fenced-release budget from the release's observed label set (#1367 review)", async () => {
+    // The default live shape (agent/alpha + status/in-progress) derives
+    // 4 calls (1 agent removal + 1 status removal + the target add + the
+    // in-review read) → 4 × 45s + 15s slack = 195s in this suite's fake
+    // arithmetic. A regression to a fixed multiplier fails this pin.
+    const client = makeClient();
+    await call(client);
+
+    expect(claimMocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 195_000 });
+  });
+
+  it("derives a strictly larger budget for a duplicated-status label set (#1367 review)", async () => {
+    // Six observed status/*.labels chain six removals (one each) inside the
+    // release, so the derived bound must grow with the DATA — a fixed
+    // multiplier could not (the previous `fencedWriteTimeoutMs() * 3`).
+    const sixStatusLabels = [
+      "agent/alpha",
+      "status/in-progress",
+      "status/in-review",
+      "status/ready",
+      "status/backlog",
+      "status/needs-review",
+      "status/in-progress",
+    ];
+    claimGateMocks.getLiveIssueLabels.mockResolvedValue(sixStatusLabels);
+    const client = makeClient();
+    await call(client);
+
+    // 9 calls (1 agent + 6 status removals + target add + in-review read)
+    // → 9 × 45s + 15s slack = 420s in this suite's fake arithmetic.
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 420_000 });
+    expect((guardState.fencedOptions as any).timeoutMs).toBeGreaterThan(195_000);
+    // The budget derived from the label set the release RECEIVES: the
+    // release's own issue labels are exactly the second live read.
+    const passed = claimMocks.releaseIssueClaim.mock.calls[0][0] as any;
+    expect(passed.issue.labels).toEqual(sixStatusLabels);
+  });
+
+  it("targeted own-label removal region carries one mutating call, so it uses the default fence budget", async () => {
+    // The ownership changed between the two live reads: only the targeted
+    // removal runs — a single mutating forge call, so the region's budget
+    // stays the default single-call one (no raised options handed to the
+    // fence).
+    claimGateMocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/alpha", "status/in-progress"]).mockResolvedValueOnce(["agent/omega", "status/in-progress"]);
+    const client = makeClient();
+    const result = await call(client);
+    expect(result).toMatchObject({ ok: true, status: "status/in-progress" });
+    expect(claimMocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(githubMocks.removeIssueLabel).toHaveBeenCalledTimes(1);
+    expect(guardState.fencedOptions).toBeNull();
   });
 
   it("resumes exact-token cleanup after prior label removal without changing resting status", async () => {

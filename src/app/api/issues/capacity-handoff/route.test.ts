@@ -1,7 +1,10 @@
 vi.mock("@/lib/issue-mutation-guard", () => ({
-  // The capacity-handoff module derives its fenced-region transaction budget
-  // from this at import time.
+  // The capacity-handoff module derives its shared-release region's
+  // transaction budget per release from the observed label set (#1367
+  // review): the fake keeps the real helper's arithmetic (n × per-call
+  // budget + slack) on a 45s per-call figure.
   fencedWriteTimeoutMs: () => 195_000,
+  fencedWriteTimeoutForCalls: (calls: number) => Math.max(1, Math.ceil(calls)) * 45_000 + 15_000,
   withIssueMutationGuard: async (_request: unknown, callback: any) => {
     const result = await callback(undefined, {
       resuming: false,

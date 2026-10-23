@@ -566,11 +566,9 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > ran, so a steal blocked on the row lock re-evaluates its silence predicate
 > against that fresh row and reports `busy` instead of taking the anchor. The
 > budget therefore only has to dominate the region's forge calls; it does not
-> have to fit inside the silence window. Regions that carry more than one
-> mutating forge call — the capacity handoff's release and the unclaim
-> route's release, each carrying the shared release (the ownership removal
-> plus a chained resting-status transition) — derive or raise their own
-> budget to match. The unclaim route's call count is
+> have to fit inside the silence window. Regions that carry more — or a
+> data-dependent number — of mutating forge calls derive their budget from
+> the calls they actually hold. The unclaim route's release is
 > **data-dependent** (a label set with duplicated `status/*` labels chains one
 > removal each), so its budget is **derived from the issue's observed label
 > set** — `releaseIssueClaimWorstCaseCalls`
@@ -579,8 +577,11 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > (`src/lib/issue-mutation-guard.ts`, `githubCallBudgetMs()` per call +
 > slack) — rather than a fixed
 > multiplier, so no duplicate-label shape can outrun the region
-> (#1367 review). The capacity handoff's region still carries a fixed raised
-> budget, with the same residual documented for a follow-up.
+> (#1367 review). The capacity handoff's shared-release region derives its
+> budget the same way, from the release's own label set (its second live
+> read); its other region — the targeted own-label removal after an
+> ownership change — carries exactly one mutating forge call and uses the
+> default single-call budget.
 >
 > **What the fence proves, precisely.** The steal cannot COMMIT between the
 > fence and the write it covers: the steal's `DELETE` blocks on the guard
@@ -604,10 +605,9 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > connection AND the guard row's lock for the duration of the region's
 > hard-bounded forge call(s). The hold is bounded by the region's own
 > transaction budget — `fencedWriteTimeoutMs()` (195s at the default
-> configuration) for a region that carries one mutating forge call, and the
-> region's own raised budget when it carries several: the unclaim route
-> derives its budget from the issue's observed label set (above), while the
-> capacity handoff raises it by a fixed multiplier —
+> configuration) for a single-call region (e.g. the capacity handoff's
+> targeted own-label removal), and the region's derived label-set budget for
+> the shared-release regions (the unclaim route and the capacity handoff) —
 > so a GitHub outage can hold connections for that budget:
 > `maxWait: 5_000` keeps
 > the other pool waiters failing fast instead of queueing behind it. The

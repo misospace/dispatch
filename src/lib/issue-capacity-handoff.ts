@@ -15,7 +15,7 @@
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { removeIssueLabel } from "./github";
 import { getLiveIssueLabels } from "./claim-gate";
-import { releaseIssueClaim, fencedClaimClient } from "./issue-claim";
+import { releaseIssueClaim, fencedClaimClient, releaseIssueClaimWorstCaseCalls } from "./issue-claim";
 import { recordCapacityHandoff, capacityCooldownMs, type CapacityHandoffClient } from "./capacity-handoff";
 import {
   lookupIssueHandoffSettlement,
@@ -24,7 +24,7 @@ import {
 } from "./issue-handoff-settlement";
 import {
   withIssueMutationGuard,
-  fencedWriteTimeoutMs,
+  fencedWriteTimeoutForCalls,
   type FencedRemoteWriteOptions,
   type FencedRemoteWriteResult,
 } from "./issue-mutation-guard";
@@ -36,21 +36,6 @@ type FencedRemoteWrite = <T>(
   fn: (tx: any) => Promise<T>,
   options?: FencedRemoteWriteOptions,
 ) => Promise<FencedRemoteWriteResult<T>>;
-
-/**
- * The fenced release's transaction budget.
- *
- * The shared release carries the ownership removal AND — when the issue sits
- * in `status/in-progress` — the resting-status transition (remove the old
- * status label, then add the target): up to THREE chained mutating forge
- * calls. The region's transaction budget must dominate all of them: a
- * mid-region abort would release the guard row's lock with a remote effect
- * still in flight, which is exactly the hole the fence closes. Regions that
- * carry a single mutating forge call use the default `fencedWriteTimeoutMs()`;
- * a region that carries several (this one, the unclaim route's) raises its
- * own budget to match.
- */
-const CAPACITY_RELEASE_FENCED_TIMEOUT_MS = fencedWriteTimeoutMs() * 3;
 
 // `fencedClaimClient` lives in `./issue-claim` next to the release it feeds
 // (shared with the unclaim route, #1367); imported above.
@@ -477,14 +462,16 @@ async function recoverIssueCapacityHandoffUnlocked(
     // flight. When the guard is already gone/re-owned the forge function is
     // NEVER called: no label is written, the lease and the claim stay
     // intact, and the module's failure shape names the guard loss.
+    // The targeted removal carries exactly ONE mutating forge call, so this
+    // region uses the default single-call fence budget.
     let removal: FencedRemoteWriteResult<boolean>;
     try {
+      // Targeted, idempotent: only our own label. Never a status write —
+      // the new owner's transition stands.
       removal = await fencedWrite(async () => {
-        // Targeted, idempotent: only our own label. Never a status write —
-        // the new owner's transition stands.
         await removeIssueLabel(repoFullName, issueNumber, agentLabel);
         return true;
-      }, { timeoutMs: CAPACITY_RELEASE_FENCED_TIMEOUT_MS });
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       await writeFailureAudit(client, input, liveLabels, `Could not remove claim label: ${message}`);
@@ -527,6 +514,17 @@ async function recoverIssueCapacityHandoffUnlocked(
     // the guard is already gone/re-owned the forge function is NEVER called:
     // no label is written, the lease and the claim stay intact, and the
     // module's failure shape names the guard loss.
+    //
+    // The release's remote call count is DATA-DEPENDENT — the ownership
+    // removal plus a chained `transitionIssueStatus`, which removes EVERY
+    // observed `status/*` label one call each (duplicated status labels are a
+    // documented data-quality edge case, #1037) — so the region derives its
+    // budget from the label set the release actually receives (the second
+    // live read) rather than a fixed multiplier:
+    // `fencedWriteTimeoutForCalls(releaseIssueClaimWorstCaseCalls(releaseLabels))`.
+    // An over-bound is cheaper than a bound a new duplicated-status shape can
+    // outrun (#1367 review). Supporting local writes (mirror, lifecycle row)
+    // are database work inside this same budget.
     const released = await fencedWrite(async (tx) => releaseIssueClaim({
       // The release's own local writes (the cache mirror and the
       // `claim_released` evidence row) join the fenced transaction through a
@@ -537,7 +535,9 @@ async function recoverIssueCapacityHandoffUnlocked(
       repoFullName,
       issueNumber,
       agentName,
-    }), { timeoutMs: CAPACITY_RELEASE_FENCED_TIMEOUT_MS });
+    }), {
+      timeoutMs: fencedWriteTimeoutForCalls(releaseIssueClaimWorstCaseCalls(releaseLabels)),
+    });
     if (released.status === "guard-lost") {
       await writeFailureAudit(
         client,
