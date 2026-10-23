@@ -591,6 +591,28 @@ describe("POST /api/issues/unassign — #1366 live label set", () => {
     });
   });
 
+  it("derives the owner-unassign label set from live labels, not the cached row", async () => {
+    // Cache and live disagree on the whole set: the PUT must follow the live
+    // labels minus the owner labels, preserving the live-only label too.
+    mocks.getLiveIssueLabels.mockResolvedValueOnce([
+      "status/in-progress",
+      "owner/alice",
+      "type/bug",
+    ]);
+
+    const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["status/in-progress", "type/bug"],
+    );
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/in-progress", "type/bug"] }),
+    });
+  });
+
   it("answers 400 without any write when the agent label is gone live but still cached", async () => {
     // The assignment was already removed on GitHub: the cache still shows the
     // agent label, but the live read is the source of truth for the decision.
