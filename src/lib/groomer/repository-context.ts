@@ -6,6 +6,15 @@ import type { PinnedRead } from "./close-grounding";
 import { fetchRepositoryMetadata as defaultFetchRepo } from "@/lib/github";
 import { searchRepositoryCode as defaultSearchCode } from "@/lib/github";
 import { fetchRepositoryFileText as defaultFetchFile } from "@/lib/github";
+import { sanitizeModelText } from "./sanitize";
+
+function errorMessage(err: unknown): string {
+  // GitHub-authored failure text is foreign input that flows into
+  // GroomingRun.contextWarnings (String[]); strip NUL and the other C0
+  // controls except \n/\t before it reaches Postgres, matching the
+  // #1130/#1157/#1164/#1214 source-sanitization sources (dispatch#1297).
+  return sanitizeModelText(err instanceof Error ? err.message : String(err));
+}
 
 export interface RepositoryContextInput {
   repoFullName: string;
@@ -135,7 +144,7 @@ export async function buildRepositoryContext(
   try {
     metadata = await deps.fetchRepo(input.repoFullName);
   } catch (err) {
-    warnings.push(`Failed to fetch repo metadata: ${err instanceof Error ? err.message : String(err)}`);
+    warnings.push(`Failed to fetch repo metadata: ${errorMessage(err)}`);
   }
 
   if (metadata) {
@@ -175,7 +184,7 @@ export async function buildRepositoryContext(
     try {
       results = await deps.searchCode(input.repoFullName, query, config.maxFiles);
     } catch (err) {
-      warnings.push(`Code search failed for "${query}": ${err instanceof Error ? err.message : String(err)}`);
+      warnings.push(`Code search failed for "${query}": ${errorMessage(err)}`);
       continue;
     }
 
@@ -194,7 +203,7 @@ export async function buildRepositoryContext(
       try {
         content = await deps.fetchFile(input.repoFullName, result.path, input.ref ?? metadata?.defaultBranch);
       } catch (err) {
-        warnings.push(`Failed to fetch ${result.path}: ${err instanceof Error ? err.message : String(err)}`);
+        warnings.push(`Failed to fetch ${sanitizeModelText(result.path)}: ${errorMessage(err)}`);
         continue;
       }
 

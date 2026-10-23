@@ -25,6 +25,7 @@ const { mocks } = vi.hoisted(() => ({
     getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
     agentWorkFindMany: vi.fn().mockResolvedValue([]),
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
+    agentWorkDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     transaction: vi.fn((arg: any) => {
       if (typeof arg === "function") {
         return Promise.resolve(
@@ -73,6 +74,7 @@ vi.mock("@/lib/prisma", () => ({
     agentWork: {
       findMany: mocks.agentWorkFindMany,
       update: mocks.agentWorkUpdate,
+      deleteMany: mocks.agentWorkDeleteMany,
     },
     $transaction: mocks.transaction,
   },
@@ -921,5 +923,180 @@ describe("POST /api/issues/claim — §8.7 pending release intent (#1254)", () =
     // The pending intent was superseded (force exemption), not raced.
     expect(mocks.intentUpdateMany).toHaveBeenCalled();
     expect(mocks.supersedeAuditCreate).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/claim — parked claims (#1316, #1334)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseCreate.mockResolvedValue({ id: "l-new", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseUpdate.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.agentWorkFindMany.mockResolvedValue([]);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate, deleteMany: mocks.agentWorkDeleteMany },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+        auditLog: { create: mocks.createAuditLog },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  /**
+   * Behavioral stand-in (SQL 3VL) for the three lease queries the claim path
+   * runs against one parked row: `findActiveLeasesForIssue` (`expiredAt > now`
+   * — a park whose ownership TTL elapsed is not "active"), `releaseExpiredLeases`
+   * (`expiredAt <= now` AND the wait marker gone — a future `retryAfter`
+   * matches neither OR arm), and `findAndReleaseStaleAgentWorkForIssue`'s
+   * protecting-lease read (`expiredAt > now OR retryAfter > now` — a running
+   * park protects its agent's active-shaped rows, mirroring the sweep's
+   * parked-claim exclusion). A NULL comparison column never satisfies a
+   * bound arm. The parked row is only ever returned to a query that actually
+   * selects it, so the assertions below cannot pass by accident.
+   */
+  function leaseQueriesSee(parked: Record<string, any>) {
+    mocks.leaseFindMany.mockImplementation(({ where }: any) => {
+      const cmp = (value: Date | null | undefined, cond: any): boolean => {
+        if (value === null || value === undefined) return false;
+        if (cond.gt !== undefined) return value.getTime() > cond.gt.getTime();
+        if (cond.lte !== undefined) return value.getTime() <= cond.lte.getTime();
+        return false;
+      };
+      const matchesArm = (row: Record<string, any>, arm: Record<string, any>) =>
+        Object.entries(arm).every(([field, cond]) =>
+          // The marker-gone arm of the cleanup clause is a literal-NULL test.
+          cond === null ? row[field] === null || row[field] === undefined : cmp(row[field], cond),
+        );
+      const matches = (row: Record<string, any>) => {
+        if (where.issueId !== undefined && row.issueId !== where.issueId) return false;
+        if (where.expiredAt !== undefined && !cmp(row.expiredAt, where.expiredAt)) return false;
+        if (where.OR !== undefined) return where.OR.some((arm: any) => matchesArm(row, arm));
+        return true;
+      };
+      return Promise.resolve(matches(parked) ? [parked] : []);
+    });
+  }
+
+  it("does not erase another agent's running park through expired-lease cleanup when claiming the issue (#1334)", async () => {
+    // The #1334 hazard end to end at the route: agent `other-agent` parked a
+    // blocked claim (wait deadline in the future, ownership TTL elapsed), and
+    // `test-agent` now claims the same issue. The pre-claim cleanup used to
+    // delete any expired lease — destroying the park receipt — while the
+    // parked BLOCKED AgentWork row survived until its own deadline.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    // The park's lease row is never deleted, by any cleanup call the route makes.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The claim is its own row (the park row is keyed to another agent and is
+    // never mutated by a different agent's claim).
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1);
+    expect((mocks.leaseCreate.mock.calls[0] as any)[0].data.agentName).toBe("test-agent");
+  });
+
+  it("does not delete a renewal-parked agent's active-shaped AgentWork row during the claim-path cleanup (#1316, #1334)", async () => {
+    // An `externalWait` renewal parks the LEASE but leaves the heartbeated
+    // AgentWork row CLAIMED/IN_PROGRESS. Once the ownership TTL lapses while
+    // the wait deadline is still running — the steady state of any park
+    // longer than the renew TTL — a claim on the issue must not delete that
+    // row: the running park protects its agent, exactly as it does the
+    // stale-work sweep.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+    const parkedWork = [{ id: "work-parked", state: "IN_PROGRESS", agentName: "other-agent" }];
+    mocks.agentWorkFindMany.mockImplementation(({ where }: any) => {
+      let rows = [...parkedWork];
+      if (where?.state?.in) rows = rows.filter((w) => where.state.in.includes(w.state));
+      if (where?.agentName?.notIn) rows = rows.filter((w) => !where.agentName.notIn.includes(w.agentName));
+      return Promise.resolve(rows);
+    });
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    // The parked agent's row survived the cleanup: nothing was deleted, and
+    // the cleanup's audit row was never written.
+    expect(mocks.agentWorkDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog.mock.calls.filter((call: any) => (call[0] as any).data.action === "stale_agentwork_cleanup")).toHaveLength(0);
+  });
+
+  it("a running park with a live ownership TTL 409s a normal claim outright (#1334)", async () => {
+    // Before the TTL elapses the park is simply an active lease: no cleanup
+    // runs, no write happens, and the claim is refused without force.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 10 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+  });
+
+  it("the parked owner's own re-claim releases the park by design (documented resume path)", async () => {
+    // A claim-path write is a fresh assertion of ACTIVE ownership (#1251):
+    // the owner re-claiming its parked issue ends the wait deliberately, so
+    // the renewal clears the marker instead of inheriting it. This is the
+    // release path the capability doc names ("until it expires naturally or
+    // the same agent re-claims") — not evidence loss.
+    const parked = {
+      id: "lease-parked",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      disposition: "blocked",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    mocks.leaseFindUnique.mockResolvedValue(parked);
+    mocks.leaseFindMany.mockResolvedValue([]);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    expect(mocks.leaseUpdate).toHaveBeenCalledTimes(1);
+    const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+    expect(updateData.retryAfter).toBeNull();
+    expect(updateData.waitReason).toBeNull();
   });
 });

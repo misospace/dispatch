@@ -5,6 +5,11 @@ import { prisma } from "@/lib/prisma";
 import { acquireLock, releaseLock } from "@/lib/sync-lock";
 import { sweepStaleWork, DEFAULT_STALE_WORK_MAX_AGE_MS, DEFAULT_STALE_WORK_BATCH_SIZE } from "@/lib/stale-work";
 import { reconcileOwnership } from "@/lib/ownership-reconciliation";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// Operator-triggered sweep; the stale-work lock prevents overlap but not
+// repetition, so this matches pr-fix-queue/sweep (6 per minute).
+const RATE_LIMIT = { limit: 6, windowMs: 60_000 } as const;
 
 const MAX_AGE_MS = DEFAULT_STALE_WORK_MAX_AGE_MS;
 const BATCH_SIZE = DEFAULT_STALE_WORK_BATCH_SIZE;
@@ -15,6 +20,9 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`agent-work-sweep:${auth.throttleKey}`, RATE_LIMIT);
+  if (limited) return limited;
 
   const lock = await acquireLock("stale-work");
   if (!lock.locked) {

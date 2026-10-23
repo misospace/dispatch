@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { getToken } from "next-auth/jwt";
 import { isAuthorizedBearerToken, safeEqual } from "@/lib/dispatch-env";
+import { trustedClientIp } from "@/lib/client-ip";
 import { enforceRateLimit, resetRateLimitKey } from "@/lib/rate-limit";
 
 type AuthMode = "basic" | "oidc" | "disabled" | undefined;
@@ -166,29 +167,10 @@ function isBasicAuthorized(authHeader: string | null): boolean {
  */
 const BASIC_AUTH_RATE_LIMIT = { limit: 5, windowMs: 60_000 };
 
-/**
- * Extract the source IP for rate limiting. Prefer the rightmost entry of
- * `X-Forwarded-For` because Envoy Gateway appends the observed peer address
- * to the right of the chain rather than replacing the header. The leftmost
- * entry is whatever the client sent, so an attacker rotating it would evade
- * the per-IP bucket — taking the last hop discards the attacker-controlled
- * portion. Fall back to `X-Real-IP` (which Envoy also sets to the peer
- * address) when the chain is absent, and finally to the literal string
- * `"unknown"`. The unknown bucket is only reachable when no proxy header
- * arrives at all (e.g. in-cluster or port-forward in dev); under a gateway
- * the request always has one of the two headers set, so it is a coarse but
- * safe last resort rather than an attacker-controllable bypass.
- */
-function clientIp(request: NextRequest): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const last = forwarded.split(",").pop()?.trim();
-    if (last) return last;
-  }
-  const realIp = request.headers.get("x-real-ip")?.trim();
-  if (realIp) return realIp;
-  return "unknown";
-}
+// Trusted source-IP derivation for the Basic-auth limiter lives in
+// `@/lib/client-ip` (shared with the unauthenticated logout limiter):
+// rightmost `X-Forwarded-For` entry first, then `X-Real-IP`, then
+// `"unknown"`. See that module for why the leftmost entry is untrusted.
 
 /**
  * True when the request carries a syntactically valid Basic credential pair
@@ -311,7 +293,7 @@ export async function middleware(request: NextRequest) {
   // (DISPATCH_AGENT_TOKEN, DISPATCH_MAINTAINER_TOKEN, DISPATCH_WORKER_TOKEN);
   // enforcing the tier itself is the route handler's job.
   if (isBasicAuthorized(authHeader)) {
-    resetRateLimitKey(`basic-auth:${clientIp(request)}`);
+    resetRateLimitKey(`basic-auth:${trustedClientIp(request.headers)}`);
     const response = NextResponse.next();
     await applySecurityHeaders(request, response);
     return response;
@@ -328,7 +310,7 @@ export async function middleware(request: NextRequest) {
   // header, a malformed header, or a Bearer-only call does not burn a
   // failure against the source IP.
   if (isBasicAttempt(authHeader)) {
-    const ip = clientIp(request);
+    const ip = trustedClientIp(request.headers);
     const lockedResponse = enforceRateLimit(`basic-auth:${ip}`, BASIC_AUTH_RATE_LIMIT);
     if (lockedResponse) {
       await applySecurityHeaders(request, lockedResponse);

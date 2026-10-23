@@ -395,6 +395,32 @@ describe("releaseLease", () => {
   });
 });
 
+/**
+ * SQL three-valued evaluation of the `releaseExpiredLeases` cleanup clause
+ * against one lease row, so the park-skip guard is behavioral rather than a
+ * where-shape snapshot. The clause selects leases whose `expiredAt` has
+ * elapsed AND whose wait marker is gone: `retryAfter IS NULL` (unknown-safe:
+ * the NULL arm is literal null equality) or `retryAfter` already elapsed (a
+ * NULL column makes the `lte` comparison UNKNOWN, never a match).
+ */
+function matchesReleaseExpiredWhere(
+  lease: Record<string, unknown>,
+  where: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> },
+): boolean {
+  const expiredAt = lease.expiredAt as Date;
+  const retryAfter = (lease.retryAfter ?? null) as Date | null;
+  if (expiredAt.getTime() > where.expiredAt.lte.getTime()) return false;
+  for (const arm of where.OR) {
+    if (arm.retryAfter === null) {
+      if (retryAfter === null) return true;
+      continue;
+    }
+    const armLte = (arm.retryAfter as { lte: Date }).lte;
+    if (retryAfter !== null && retryAfter.getTime() <= armLte.getTime()) return true;
+  }
+  return false;
+}
+
 describe("releaseExpiredLeases", () => {
   it("deletes all expired leases for an issue and returns count", async () => {
     mocks.leaseFindMany.mockImplementation(() => Promise.resolve([{ id: "l-1" }, { id: "l-2" }]));
@@ -415,6 +441,70 @@ describe("releaseExpiredLeases", () => {
 
     expect(result).toBe(0);
     expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not select a lease whose retryAfter park is still running, so cleanup cannot erase the park evidence (#1316, #1334)", async () => {
+    let capturedWhere: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseFindMany.mockImplementation(async (args: any) => {
+      capturedWhere = args.where;
+      return [];
+    });
+
+    const result = await releaseExpiredLeases("i-1");
+
+    expect(result).toBe(0);
+    expect(capturedWhere).toBeDefined();
+
+    // A still-running park — expired ownership TTL, wait deadline in the
+    // future — is NOT selected: the block park (or a renewal's externalWait)
+    // owns its receipt until the deadline elapses.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() + 3600_000) }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
+    // The expired lease this cleanup exists for is still selected…
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: null }),
+        capturedWhere!,
+      ),
+    ).toBe(true);
+    // …and the lease-existence gate stays intact: a non-expired lease is
+    // never selected by the cleanup, park or no park.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() + 5 * 60_000), retryAfter: null }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
+  });
+
+  it("selects an expired lease once its retryAfter has elapsed (park over)", async () => {
+    let capturedWhere: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseFindMany.mockImplementation(async (args: any) => {
+      capturedWhere = args.where;
+      return [];
+    });
+
+    await releaseExpiredLeases("i-1");
+
+    expect(capturedWhere).toBeDefined();
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() - 60_000) }),
+        capturedWhere!,
+      ),
+    ).toBe(true);
+    // The boundary is inclusive per `lte`: a retryAfter exactly at the
+    // cleanup's `now` is no longer a park.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: capturedWhere!.expiredAt.lte }),
+        capturedWhere!,
+      ),
+    ).toBe(true);
   });
 });
 
