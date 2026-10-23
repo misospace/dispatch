@@ -2291,15 +2291,29 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
 /**
  * #1327: the mechanical rebase lane is concurrency 1 with no fan-out — the
  * issue scopes the lane to a bounded local worker, not a fleet. Hand-out is
- * gated on this check: a REBASE candidate waits while ANY QUEUED REBASE item
- * — including the candidate itself — carries a live hand-out record. The
- * self case matters: re-handing an already-live REBASE to a second worker
- * would put two `--force-with-lease` pushes on one branch.
+ * gated on this check: a REBASE candidate waits while ANY QUEUED row whose
+ * DISPATCHED lane (`attemptType`, falling back to `type` for rows stamped
+ * before the column existed) is REBASE carries a live hand-out record —
+ * including the candidate itself. The self case matters: re-handing an
+ * already-live REBASE to a second worker would put two `--force-with-lease`
+ * pushes on one branch.
  *
- * "Live" means the item is still QUEUED with a non-empty `agentHandouts`
- * list: settlement clears the records, and the generic reclaim sweep clears
- * hand-outs that were never acknowledged, so a crashed worker blocks rebase
- * dispatches only until its hand-out is reclaimed.
+ * "Live" means a non-empty `agentHandouts` list within the lane's hand-out
+ * timeout (`PR_FIX_HANDOUT_TIMEOUT_MS`, same bound the reclaim sweep uses),
+ * anchored on `dispatchedAt` — the attempt's start, stamped at hand-out.
+ * `updatedAt` is deliberately NOT the anchor: re-observation enqueues refresh
+ * it, which would keep a dead hand-out blocking the lane forever. The timeout
+ * is what keeps the gate from inheriting the queue's oldest stranding mode:
+ * an ACKNOWLEDGED hand-out is deliberately never reclaimed (#1211 — a live
+ * worker owns its generation), so an acked-then-crashed rebase would
+ * otherwise block EVERY rebase dispatch forever. A legitimately long rebase
+ * past the timeout may transiently share the lane — accepted best-effort
+ * semantics.
+ *
+ * Keying on `attemptType` (not the row's mutable `type`) matters: enqueue
+ * overwrites `type` on every re-observation, so a mid-attempt flip must
+ * neither free the lane from a live rebase (REBASE -> other) nor let an
+ * in-flight ordinary fix attempt block it (other -> REBASE).
  *
  * Best-effort by construction: there is no global lock, so two concurrent
  * polls can each pass this check before either stamps its hand-out. That
@@ -2307,14 +2321,24 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
  * are generation-fenced, and the failed-report settlement is terminal for
  * REBASE, so a doubled hand-out cannot turn into a retry loop.
  */
-export async function hasInFlightRebaseHandout(client: PrFixQueueClient): Promise<boolean> {
+export async function hasInFlightRebaseHandout(
+  client: PrFixQueueClient,
+  options: { now?: Date } = {},
+): Promise<boolean> {
+  const now = (options.now ?? new Date()).getTime();
+  const staleBefore = now - prFixHandoutTimeoutMs();
   const rows = await client.prFixQueueItem.findMany({
-    where: { type: "REBASE", status: "QUEUED" },
+    where: { status: "QUEUED", OR: [{ type: "REBASE" }, { attemptType: "REBASE" }] },
   });
-  return rows.some(
-    (row: { agentHandouts?: unknown }) =>
-      Array.isArray(row.agentHandouts) && row.agentHandouts.length > 0,
-  );
+  return rows.some((row: { attemptType?: unknown; type?: unknown; agentHandouts?: unknown; dispatchedAt?: unknown }) => {
+    if ((row.attemptType ?? row.type) !== "REBASE") return false;
+    if (!Array.isArray(row.agentHandouts) || row.agentHandouts.length === 0) return false;
+    // Hand-outs without a stamped start should not exist (next-task stamps
+    // `dispatchedAt` before issuing the token); count them as live rather
+    // than fan out on an unprovable claim of death.
+    if (!row.dispatchedAt) return true;
+    return new Date(row.dispatchedAt as string | number | Date).getTime() >= staleBefore;
+  });
 }
 
 /**
@@ -4051,10 +4075,15 @@ export async function resolvePrFixFromAgentReport(
       // A failed REBASE never reopens a fresh attempt (the generic
       // PR_FIX_MAX_ATTEMPTS ladder is for code-fix generations; retrying a
       // rebase on the same head is exactly the cheap-retry churn this lane
-      // exists to remove). A new DIRTY episode is a new head, and the #940
-      // head-movement reopen lifts the park the same way it lifts a
-      // cap-parked fix item.
-      const rebaseTerminal = normalizePrFixType(fresh.type) === "REBASE";
+      // exists to remove). The bound keys on `attemptType` — the lane the
+      // attempt was DISPATCHED as — because enqueue overwrites the row's
+      // `type` on every re-observation, mid-attempt included: a lane flip
+      // during a live attempt must neither smuggle a rebase report back onto
+      // the ladder nor terminal-park an ordinary fix attempt. A new DIRTY
+      // episode is fresh evidence at a new head, which reactivates the park
+      // through the #1253 recovery path (cooldown-gated), not the #940
+      // FIXED-tombstone net.
+      const rebaseTerminal = normalizePrFixType(fresh.attemptType ?? fresh.type) === "REBASE";
       const capped = rebaseTerminal || (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
       const data: Record<string, unknown> = capped
         ? {
@@ -4076,6 +4105,9 @@ export async function resolvePrFixFromAgentReport(
             ...freshAttemptGeneration(),
             fixAttempts: { increment: 1 },
             attemptHeadSha: fresh.headSha ?? fresh.attemptHeadSha ?? null,
+            // The fresh attempt's dispatched lane is stamped at its own
+            // hand-out (#1327); the consumed attempt's stamp must not leak.
+            attemptType: null,
             outcome: null,
             decisionDetail: null,
             postDispatchEvidenceKeys: [],

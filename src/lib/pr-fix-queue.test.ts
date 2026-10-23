@@ -4677,6 +4677,66 @@ describe("PR-fix outcome separation (#1218)", () => {
     }
   });
 
+  it("terminal-parks a failed REBASE attempt even when the row type flipped mid-attempt (#1327)", async () => {
+    // The bound keys on the DISPATCHED lane (attemptType), not the row's
+    // mutable type: mid-attempt evidence must not smuggle a failed rebase
+    // back onto the reopen ladder for a second rebase on the same head.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 307, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k307", headSha: "H1",
+      });
+      client.items[0].attemptType = "REBASE";
+      client.items[0].type = "REVIEW_FEEDBACK";
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 307,
+        outcome: "failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("parked");
+      expect(client.items[0].status).toBe("PARKED");
+      expect(client.items[0].generation).toBe(1);
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("does not terminal-park an ordinary attempt whose row flipped into the rebase lane mid-run (#1327)", async () => {
+    // A code-fix attempt (attemptType CI_FAILURE) that observed the PR go
+    // dirty mid-run keeps the generic ladder; the rebase bound attaches to
+    // rebase DISPATCHES only.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 308, lane: "NORMAL", type: "CI_FAILURE", reason: "r", feedback: "f", evidenceKey: "k308", headSha: "H1",
+      });
+      client.items[0].attemptType = "CI_FAILURE";
+      client.items[0].type = "REBASE";
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 308,
+        outcome: "failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("requeued");
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].generation).toBe(2);
+      // The consumed attempt's lane stamp does not leak into the fresh one.
+      expect(client.items[0].attemptType).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
   it("marks BLOCKED + NEEDS_HUMAN and surfaces the decision on a human_decision blocked report", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 302, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k302",
@@ -5343,20 +5403,64 @@ describe("hasInFlightRebaseHandout (#1327)", () => {
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 401, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k401" });
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
 
-    // A live hand-out (agent record while still QUEUED) gates the lane.
+    // A live hand-out (agent record, still QUEUED, within the hand-out
+    // timeout) gates the lane.
     client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].dispatchedAt = new Date();
     expect(await hasInFlightRebaseHandout(client)).toBe(true);
 
     // A live hand-out on a non-REBASE item must not gate the rebase lane.
     client.items[0].agentHandouts = [];
     await enqueuePrFixItem(client, { repo: "org/repo", pr: 402, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k402" });
     client.items[1].agentHandouts = ["worker-b@1"];
+    client.items[1].dispatchedAt = new Date();
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
 
     // A settled REBASE (no longer QUEUED) does not gate, even with stale
     // records: settlement/reclaim clearing is what frees the lane.
     client.items[0].agentHandouts = ["worker-a@1"];
     client.items[0].status = "PARKED";
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+
+  it("ages an unclaimed hand-out out of the lane bound (no whole-lane deadlock)", async () => {
+    // An ACKNOWLEDGED dead hand-out is never reclaimed (#1211). The rebase
+    // lane's concurrency gate must still release once the hand-out passes
+    // the lane's hand-out timeout, or one crashed worker would block every
+    // REBASE dispatch forever.
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 403, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k403" });
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].handoutAcks = ["worker-a@1"];
+    client.items[0].dispatchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    client.items[0].updatedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+
+    // No persisted start evidence at all: counted live (fail closed).
+    client.items[0].dispatchedAt = null;
+    client.items[0].updatedAt = null;
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+  });
+
+  it("keys the lane on the DISPATCHED type, not the mutable row type", async () => {
+    const client = makeClient();
+    // A REBASE attempt whose row flipped to another lane mid-attempt still
+    // occupies the lane.
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 404, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k404" });
+    client.items[0].type = "REVIEW_FEEDBACK";
+    client.items[0].attemptType = "REBASE";
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].dispatchedAt = new Date();
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+    client.items[0].agentHandouts = [];
+
+    // An ordinary fix attempt whose row flipped INTO REBASE mid-attempt is
+    // not the rebase lane and must not block it.
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 405, lane: "NORMAL", type: "CI_FAILURE", reason: "r", feedback: "f", evidenceKey: "k405" });
+    client.items[1].attemptType = "CI_FAILURE";
+    client.items[1].type = "REBASE";
+    client.items[1].agentHandouts = ["worker-b@1"];
+    client.items[1].dispatchedAt = new Date();
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
   });
 });

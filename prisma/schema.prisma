@@ -197,6 +197,12 @@ model PrFixQueueItem {
   // captured when the attempt becomes dispatchable. The FIXED guard compares
   // the PR head against this baseline, not the mutable enqueue-time headSha.
   attemptHeadSha           String?
+  // The PR-fix lane this attempt was handed out as (#1327): stamped with the
+  // first hand-out of each generation. The row's `type` is mutable — every
+  // re-enqueue overwrites it, mid-attempt included — so the terminal rebase
+  // bound and the rebase concurrency gate key on the lane the attempt was
+  // actually dispatched as, not the current type.
+  attemptType              String?
   // Dispatchable fix attempts since creation or the last operator requeue
   // (#1103): 1 on creation, +1 per fresh attempt. PR_FIX_MAX_ATTEMPTS bounds
   // this, not evidence keys — one review can carry many comment keys.
