@@ -668,6 +668,12 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
             if (where?.agentName?.notIn) {
               result = result.filter((w: any) => !where.agentName.notIn.includes(w.agentName));
             }
+            if (where?.staleClaimReleasePending === false) {
+              // Prisma equality over a non-nullable Boolean (schema default
+              // false): fixture rows without the field stand for database
+              // rows whose marker is false, a true marker never matches.
+              result = result.filter((w: any) => (w.staleClaimReleasePending ?? false) === false);
+            }
           }
           return Promise.resolve(result);
         }),
@@ -700,11 +706,12 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     (mockPrisma.agentWork as any)._mockData = [
       { id: "stale-1", state: "IN_PROGRESS", agentName: "crashed-agent" },
     ];
+    mockPrisma.agentWork.deleteMany.mockResolvedValue({ count: 1 });
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
     expect(result).toBe(1);
     expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ["stale-1"] } },
+      where: { id: "stale-1", state: { in: ["CLAIMED", "IN_PROGRESS"] }, staleClaimReleasePending: false },
     });
     expect(mockPrisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -784,11 +791,12 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     (mockPrisma.agentWork as any)._mockData = [
       { id: "parked-work-1", state: "IN_PROGRESS", agentName: "parked-agent" },
     ];
+    mockPrisma.agentWork.deleteMany.mockResolvedValue({ count: 1 });
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
     expect(result).toBe(1);
     expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ["parked-work-1"] } },
+      where: { id: "parked-work-1", state: { in: ["CLAIMED", "IN_PROGRESS"] }, staleClaimReleasePending: false },
     });
   });
 
@@ -801,5 +809,67 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
 
     const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
     expect(result).toBe(0);
+  });
+
+  it("never deletes a row still owed a claim release (#1350)", async () => {
+    // The sweep's pending-release boundary (`activeStateFamilies` canon): a
+    // row the sweep marked still owes its claim release. A marked STALE row is
+    // excluded by the state filter; an active-shaped row carrying the marker
+    // is excluded by the boundary conjunct itself. Either way the release is
+    // retired by the sweep's retry arm, never dropped here.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "owed-stale-1", state: "STALE", agentName: "crashed-agent", staleClaimReleasePending: true },
+      { id: "owed-active-1", state: "IN_PROGRESS", agentName: "crashed-agent-2", staleClaimReleasePending: true },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("the fenced delete refuses a row that became owed a release after the scan (#1350)", async () => {
+    // The delete re-checks the SAME boundary conjuncts the scan matched on
+    // (the sweep's CAS practice). A writer outside the per-issue mutation
+    // guard — e.g. the self-heal agent-work routes — can land between the
+    // scan and the delete; here the concurrent write pins the pending marker
+    // mid-flight, so the fence must consume nothing and no audit row may
+    // claim a deletion that did not happen.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "raced-1", state: "IN_PROGRESS", agentName: "returned-agent", staleClaimReleasePending: false },
+    ];
+
+    let firstDelete = false;
+    mockPrisma.agentWork.deleteMany.mockImplementation(({ where }: any) => {
+      const rows = (mockPrisma.agentWork as any)._mockData as any[];
+      if (!firstDelete) {
+        firstDelete = true;
+        // The concurrent write lands after the scan returned the row.
+        rows[0].staleClaimReleasePending = true;
+      }
+      // Evaluate the fenced where against the row's CURRENT shape (SQL 3VL
+      // stand-in): a where carrying the pending boundary must not match a
+      // row whose marker is now true.
+      const row = rows.find((r: any) => r.id === where.id);
+      const matches =
+        row &&
+        (!where.state?.in || where.state.in.includes(row.state)) &&
+        (where.staleClaimReleasePending !== false || row.staleClaimReleasePending === false);
+      if (matches) {
+        rows.splice(rows.indexOf(row), 1);
+        return Promise.resolve({ count: 1 });
+      }
+      return Promise.resolve({ count: 0 });
+    });
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+    const row = ((mockPrisma.agentWork as any)._mockData as any[])[0];
+    expect(row.id).toBe("raced-1");
   });
 });
