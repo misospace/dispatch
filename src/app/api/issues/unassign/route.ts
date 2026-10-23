@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
+import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { buildUnassignedLabels, getAgentLabels, getOwnerLabels } from "@/lib/assignment-conflicts";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -134,7 +135,53 @@ export async function POST(request: Request) {
             };
           }
 
+          // The cached row is the audit baseline until the live read lands.
           currentLabels = issue.labels;
+
+          // #1366: `updateIssueLabels` is a FULL-label-set PUT, so the set it
+          // writes must be derived from the labels GitHub CURRENTLY has, not
+          // the Prisma cache — a label added on GitHub since the last sync
+          // would be silently stripped by the snapshot (the same rule
+          // issue-claim.ts states and the sibling assign route (#1037) obeys).
+          // The read happens INSIDE the anchor, so the snapshot the fenced PUT
+          // applies is the one taken while this holder owns the issue. Fail
+          // closed when GitHub is unreachable: no remote write, no cache
+          // write, a failure audit row, and a 503 — the route could not have
+          // succeeded without GitHub anyway (the PUT needs it), so the live
+          // read costs no availability.
+          let liveLabels: string[];
+          try {
+            liveLabels = await getLiveIssueLabels(repoFullName, issueNumber);
+          } catch (error) {
+            const liveReadMessage = error instanceof Error ? error.message : "Unknown error";
+
+            // Failed audit entry, consistent with the assign route's live-read
+            // failure shape. Best-effort: a failing audit write must not mask
+            // the 503.
+            try {
+              await prisma.auditLog.create({
+                data: {
+                  actor: auditActor,
+                  action: payload.action,
+                  repoFullName,
+                  issueNumber,
+                  issueId: payload.issueId,
+                  beforeLabels: currentLabels,
+                  afterLabels: [],
+                  success: false,
+                  errorMessage: `Could not verify live GitHub labels: ${liveReadMessage}`,
+                },
+              });
+            } catch {
+              // Audit log failure should not mask the real error
+            }
+
+            return {
+              complete: true,
+              value: errorResponse(`Could not verify live GitHub labels: ${liveReadMessage}`, 503),
+            };
+          }
+          currentLabels = liveLabels;
 
           // Use shared conflict resolution module for both removal detection and label update
           const labelsToRemove = payload.action === "unassign_agent"

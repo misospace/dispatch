@@ -19,6 +19,9 @@ const { mocks, guardState } = vi.hoisted(() => ({
     updateIssue: vi.fn().mockResolvedValue(undefined),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
     updateIssueLabels: vi.fn().mockResolvedValue(undefined),
+    // #1366: the label set the unassign PUTs is derived from the LIVE GitHub
+    // labels (via the shared claim-gate read), not the cached row.
+    getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
   },
 }));
 
@@ -36,6 +39,13 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
+}));
+
+// #1366: the unassign derives its full-set PUT from the live GitHub labels;
+// the sibling assign route reads the same capability and fails closed (503)
+// when it is unreachable.
+vi.mock("@/lib/claim-gate", () => ({
+  getLiveIssueLabels: mocks.getLiveIssueLabels,
 }));
 
 // #1361: the unassign path serializes on the per-issue mutation anchor; the
@@ -206,6 +216,9 @@ describe("POST /api/issues/unassign — unassign_agent", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.updateIssueLabels.mockResolvedValue(undefined);
+    // #1366: live GitHub labels match the cache in the baseline suites; the
+    // divergence cases below override this per test.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/backlog", "agent/worker"]);
   });
 
   it("removes agent label and preserves other labels", async () => {
@@ -231,6 +244,7 @@ describe("POST /api/issues/unassign — unassign_agent", () => {
       repository: { fullName: "org/repo" },
       labels: ["agent/dup1", "agent/dup2", "priority/p1"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/dup1", "agent/dup2", "priority/p1"]);
 
     const res = await postRequest();
     expect(res.status).toBe(200);
@@ -247,6 +261,7 @@ describe("POST /api/issues/unassign — unassign_agent", () => {
       repository: { fullName: "org/repo" },
       labels: ["agent/worker", "owner/alice"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/worker", "owner/alice"]);
 
     const res = await postRequest();
     expect(res.status).toBe(200);
@@ -262,6 +277,7 @@ describe("POST /api/issues/unassign — unassign_agent", () => {
       repository: { fullName: "org/repo" },
       labels: ["status/backlog", "owner/alice"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "owner/alice"]);
 
     const res = await postRequest();
     expect(res.status).toBe(400);
@@ -291,6 +307,9 @@ describe("POST /api/issues/unassign — unassign_owner", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.updateIssueLabels.mockResolvedValue(undefined);
+    // #1366: live GitHub labels match the cache in the baseline suites; the
+    // divergence cases below override this per test.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/in-progress", "owner/alice"]);
   });
 
   it("removes owner label and preserves other labels", async () => {
@@ -315,6 +334,7 @@ describe("POST /api/issues/unassign — unassign_owner", () => {
       repository: { fullName: "org/repo" },
       labels: ["agent/worker", "owner/alice"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["agent/worker", "owner/alice"]);
 
     const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
     expect(res.status).toBe(200);
@@ -330,6 +350,7 @@ describe("POST /api/issues/unassign — unassign_owner", () => {
       repository: { fullName: "org/repo" },
       labels: ["status/backlog", "agent/worker"],
     });
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "agent/worker"]);
 
     const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
     expect(res.status).toBe(400);
@@ -349,6 +370,7 @@ describe("POST /api/issues/unassign — error handling", () => {
     });
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/backlog", "agent/worker"]);
   });
 
   it("writes AuditLog with success=false when GitHub mutation fails", async () => {
@@ -383,6 +405,9 @@ describe("POST /api/issues/unassign — #1361 mutation anchor", () => {
     mocks.updateIssue.mockResolvedValue(undefined);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
     mocks.updateIssueLabels.mockResolvedValue(undefined);
+    // #1366: live GitHub labels match the cache in the baseline suites; the
+    // divergence cases below override this per test.
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/backlog", "agent/worker"]);
   });
 
   it("writes the remote label set under the anchor and mirrors the cache and the audit", async () => {
@@ -495,6 +520,9 @@ describe("POST /api/issues/unassign — #1361 mutation anchor", () => {
     const body = await res.json();
     expect(body.error).toBe("issueId does not match repoFullName/issueNumber; expected org/repo#42");
 
+    // The identity check runs BEFORE the forge: a mismatched body must not
+    // even reach GitHub (#1366 live read included).
+    expect(mocks.getLiveIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).not.toHaveBeenCalled();
     expect(mocks.createAuditLog).not.toHaveBeenCalled();
@@ -509,5 +537,145 @@ describe("POST /api/issues/unassign — #1361 mutation anchor", () => {
     expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).not.toHaveBeenCalled();
     expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/unassign — #1366 live label set", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findIssue.mockResolvedValue({
+      id: "issue-1",
+      number: 42,
+      repository: { fullName: "org/repo" },
+      labels: ["status/backlog", "agent/worker"],
+    });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.updateIssueLabels.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/backlog", "agent/worker"]);
+  });
+
+  it("derives the written label set from the live GitHub labels, not the cached row", async () => {
+    // A label was added on GitHub since the last sync: it exists live but not
+    // in the cache. A full-set PUT derived from the cache would strip it.
+    mocks.getLiveIssueLabels.mockResolvedValueOnce([
+      "status/backlog",
+      "agent/worker",
+      "priority/p1",
+    ]);
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.labels).toEqual(["status/backlog", "priority/p1"]);
+
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["status/backlog", "priority/p1"],
+    );
+
+    // The cache mirrors the LIVE-derived set, and the audit's beforeLabels are
+    // the live snapshot the PUT was derived from.
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/backlog", "priority/p1"] }),
+    });
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "unassign_agent",
+        beforeLabels: ["status/backlog", "agent/worker", "priority/p1"],
+        afterLabels: ["status/backlog", "priority/p1"],
+        success: true,
+      }),
+    });
+  });
+
+  it("derives the owner-unassign label set from live labels, not the cached row", async () => {
+    // Cache and live disagree on the whole set: the PUT must follow the live
+    // labels minus the owner labels, preserving the live-only label too.
+    mocks.getLiveIssueLabels.mockResolvedValueOnce([
+      "status/in-progress",
+      "owner/alice",
+      "type/bug",
+    ]);
+
+    const res = await postRequest(makePayload({ action: "unassign_owner" as const }));
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssueLabels).toHaveBeenCalledWith(
+      "org/repo",
+      42,
+      ["status/in-progress", "type/bug"],
+    );
+    expect(mocks.updateIssue).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: expect.objectContaining({ labels: ["status/in-progress", "type/bug"] }),
+    });
+  });
+
+  it("answers 400 without any write when the agent label is gone live but still cached", async () => {
+    // The assignment was already removed on GitHub: the cache still shows the
+    // agent label, but the live read is the source of truth for the decision.
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog"]);
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/No agent label found/);
+
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("fails closed with 503 when live GitHub labels cannot be verified", async () => {
+    mocks.getLiveIssueLabels.mockRejectedValueOnce(new Error("github 500"));
+
+    const res = await postRequest();
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toBe("Could not verify live GitHub labels: github 500");
+
+    // Fail closed: no remote write, no cache write — same shape as the assign
+    // route's live-read failure.
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+
+    // The failed attempt is audited, with the cached row as the beforeLabels
+    // baseline (the live snapshot never landed).
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "unassign_agent",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        beforeLabels: ["status/backlog", "agent/worker"],
+        afterLabels: [],
+        success: false,
+        errorMessage: "Could not verify live GitHub labels: github 500",
+      }),
+    });
+  });
+
+  it("takes the live label read inside the anchor, after the issue read", async () => {
+    // The snapshot the fenced PUT applies must be taken WHILE the anchor is
+    // held: the live read happens between anchor acquisition and the write.
+    mocks.findIssue.mockImplementation(async () => {
+      guardState.events.push("issue-read");
+      return {
+        id: "issue-1",
+        number: 42,
+        repository: { fullName: "org/repo" },
+        labels: ["status/backlog", "agent/worker"],
+      };
+    });
+    mocks.getLiveIssueLabels.mockImplementation(async () => {
+      guardState.events.push("live-labels-read");
+      return ["status/backlog", "agent/worker"];
+    });
+
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    expect(guardState.events).toEqual(["anchor-entered", "issue-read", "live-labels-read"]);
   });
 });

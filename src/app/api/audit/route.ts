@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { parseListLimit } from "@/lib/query-limit";
 
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -9,7 +10,7 @@ export async function GET(request: Request) {
     return authErrorResponse(auth);
   }
   const { searchParams } = new URL(request.url);
-  const limit = parseInt(searchParams.get("limit") || "50");
+  const limit = parseListLimit(searchParams.get("limit"));
   const repo = searchParams.get("repo");
 
   try {

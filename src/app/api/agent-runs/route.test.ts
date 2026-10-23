@@ -74,6 +74,28 @@ describe("GET /api/agent-runs", () => {
     expect(call.take).toBe(10);
   });
 
+  it("clamps an oversized limit at 200", async () => {
+    await GET(getRequest("http://localhost/api/agent-runs?limit=999999999"));
+
+    const call = mocks.agentRunFindMany.mock.calls[0][0];
+    expect(call.take).toBe(200);
+  });
+
+  it("falls back to the default on a non-numeric limit instead of erroring", async () => {
+    const res = await GET(getRequest("http://localhost/api/agent-runs?limit=abc"));
+
+    expect(res.status).toBe(200);
+    const call = mocks.agentRunFindMany.mock.calls[0][0];
+    expect(call.take).toBe(50);
+  });
+
+  it("falls back to the default on a negative limit", async () => {
+    await GET(getRequest("http://localhost/api/agent-runs?limit=-5"));
+
+    const call = mocks.agentRunFindMany.mock.calls[0][0];
+    expect(call.take).toBe(50);
+  });
+
   it("orders by createdAt descending", async () => {
     await GET(getRequest("http://localhost/api/agent-runs"));
 

@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { listGroomingRuns } from "@/lib/groomer/history";
 import { jsonSafe } from "@/lib/json";
+import { parseListLimit } from "@/lib/query-limit";
 
 export async function GET(request: Request) {
   const auth = await authorizeRequest(request);
@@ -20,7 +21,7 @@ export async function GET(request: Request) {
       model: searchParams.get("model") ?? undefined,
       issueNumber: issueNumber ? parseInt(issueNumber, 10) : undefined,
       dryRun: dryRun === null ? undefined : dryRun === "true",
-      take: parseInt(searchParams.get("limit") || "50", 10),
+      take: parseListLimit(searchParams.get("limit")),
     });
     return NextResponse.json(jsonSafe(runs));
   } catch (error) {

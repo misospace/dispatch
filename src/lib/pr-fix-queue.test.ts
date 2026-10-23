@@ -862,6 +862,51 @@ describe("reconcileStalePrFixItems", () => {
     expect(result.checked).toBe(0);
     expect(result.markedStale).toBe(0);
   });
+
+  // #1372: callers pass each map key through a repo-map of cached repo casing
+  // ("Org/Repo" from repository.fullName / repoFullNames), while the queue
+  // folds repo to lowercase on every write (#1145). A findMany on the raw
+  // casing matched no row and silently skipped the reap — the same bug class
+  // #1370 fixed in the ownership reads and #1357 in the inspect read.
+  it("reaps stale items for an uppercase-cased repo by querying the folded identity (#1372)", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, {
+      repo: "misospace/miso-chat",
+      pr: 590,
+      reason: "AI review failed",
+      feedback: "feedback",
+      evidenceKey: "k1",
+    });
+    const UPPER = "Misospace/Miso-Chat";
+
+    const queriedRepos: string[] = [];
+    const baseFindMany = client.prFixQueueItem.findMany;
+    client.prFixQueueItem.findMany = async (args: any) => {
+      if (args?.where?.repo !== undefined) queriedRepos.push(args.where.repo);
+      return baseFindMany(args);
+    };
+
+    const result = await reconcileStalePrFixItems(
+      client,
+      new Map([[UPPER, new Set([590])]]),
+      new Map([[UPPER, new Map([[590, "merged" as const]])]]),
+    );
+
+    // The query must receive the folded value, never the raw cached casing.
+    expect(queriedRepos.length).toBeGreaterThan(0);
+    expect(queriedRepos).not.toContain(UPPER);
+    expect(queriedRepos).toEqual(queriedRepos.map((r) => r.trim().toLowerCase()));
+
+    // The folded read finds the row → it is reaped despite the casing mismatch.
+    expect(result.checked).toBe(1);
+    expect(result.markedStale).toBe(1);
+    expect(result.errored).toBe(0);
+    expect(client.items[0].status).toBe("STALE");
+    // The state lookup stays keyed by the caller's raw key, so the history
+    // note keeps the true upstream state rather than the "merged" fallback.
+    // history[0] is the enqueue row; the mark row is last.
+    expect(client.history[client.history.length - 1].note).toContain("state=merged");
+  });
 });
 
 describe("pr-fix surfacing integration", () => {

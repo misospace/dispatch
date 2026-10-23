@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { isValidEscalatedOutcome, VALID_ESCALATED_OUTCOMES } from "@/types";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { parseListLimit } from "@/lib/query-limit";
 
 // Generous per-actor rate limit — agents report runs frequently, so this is
 // the loosest of the API limits and only backstops runaway loops.
@@ -20,7 +21,7 @@ export async function GET(request: Request) {
     return authErrorResponse(auth);
   }
   const { searchParams } = new URL(request.url);
-  const limit = parseInt(searchParams.get("limit") || "50");
+  const limit = parseListLimit(searchParams.get("limit"));
 
   try {
     const runs = await prisma.agentRun.findMany({
