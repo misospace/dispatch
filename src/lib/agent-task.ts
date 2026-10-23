@@ -1,3 +1,5 @@
+import type { PrFixType } from "@/types";
+
 export interface IssueRef {
   id?: string;
   repoFullName: string;
@@ -44,7 +46,7 @@ export interface PrFixItemIdentity {
    * The task's `reasons` carry the full contract; this field lets callers
    * branch without parsing prose.
    */
-  fixType?: string;
+  fixType?: PrFixType;
 }
 
 export interface IdleTask {

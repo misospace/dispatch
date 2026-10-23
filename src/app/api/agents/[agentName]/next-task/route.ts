@@ -16,6 +16,7 @@ import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
+import type { PrFixType } from "@/types";
 
 /** A queued PR-fix item as the route consumes it (see toAgentQueuePrFixItem). */
 type PrFixCandidate = {
@@ -29,7 +30,7 @@ type PrFixCandidate = {
   reason: string;
   feedback: string[];
   /** The queued item's PrFixType (e.g. REBASE, #1327); absent on legacy lines. */
-  fixType?: string;
+  fixType?: PrFixType;
 };
 
 /**
