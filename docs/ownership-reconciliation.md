@@ -485,7 +485,14 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > path (which takes the same anchor as operation `assign`) instead supersede
 > a pending intent (audited) via `supersedeOwnershipReleaseIntent`;
 > `assign_owner` does not touch agent labels and never cancels a pending
-> release. Guards left `executing` by a hard crash surface on the ownership
+> release. The unassign route (#1361) takes the same anchor as operation
+> `unassign` and writes its full label set inside a fenced write, so an
+> unassign can neither interleave a maintainer force-claim's `agent/*` add nor
+> leave GitHub and the cache disagreeing about it (an unassign that runs
+> AFTER a force-claim still removes the claim's label — that is what
+> unassigning an agent means); it has no resume branch (it releases the
+> anchor on every handled path), so a failed attempt deletes its guard row
+> instead of leaving a demoted one behind. Guards left `executing` by a hard crash surface on the ownership
 > inspect read view; only an operator clears them. The CAS-unpinnable facts
 > are re-derived at commit time, under the anchor: a fresh live-label read
 > fails closed on forge errors, and a maintainer hold (`status/blocked` +
@@ -508,7 +515,9 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > CAS is the load-bearing fence, and the guarded remote ownership write is now
 > **atomic with the guard check** — it is not a read-then-act tripwire.
 > Every guarded callback (claim, the direct assignment route — `assign_agent`
-> AND `assign_owner`, whose label write is a full-set PUT — the reconciler's
+> AND `assign_owner`, whose label write is a full-set PUT — the unassign route
+> (#1361, whose label write is a full-set PUT too — the direct assignment's
+> twin in the other direction — the reconciler's
 > Phase B delete, the stale-work sweep, and the capacity handoff's release)
 > performs its remote ownership write inside a **fenced write**
 > (`IssueMutationContext.runFencedRemoteWrite`,
