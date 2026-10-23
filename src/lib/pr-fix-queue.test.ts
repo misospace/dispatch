@@ -239,6 +239,10 @@ function makeClient(): PrFixQueueClient & {
         if (where?.repo) result = result.filter((i) => i.repo === where.repo);
         if (where?.pr?.in) result = result.filter((i) => where.pr.in.includes(i.pr));
         if (where?.type) result = result.filter((i) => i.type === where.type);
+        // Mirror a top-level `OR` of plain equality conditions (the #1327
+        // rebase-lane gate query) so the SQL predicate is exercised, not
+        // just the helper's JS post-filter.
+        if (where?.OR) result = result.filter((i) => where.OR.some((cond: any) => Object.entries(cond).every(([key, value]) => i[key] === value)));
         if (where?.status) {
           result = Array.isArray(where.status.in)
             ? result.filter((i) => where.status.in.includes(i.status))
@@ -5436,10 +5440,12 @@ describe("hasInFlightRebaseHandout (#1327)", () => {
     client.items[0].updatedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
 
-    // No persisted start evidence at all: counted live (fail closed).
+    // No stamped start at all (the anomalous throw-between-writes shape):
+    // NOT counted live — the reclaim sweep can never clear such a row
+    // either, so gating on it would block the lane forever.
     client.items[0].dispatchedAt = null;
     client.items[0].updatedAt = null;
-    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
   });
 
   it("keys the lane on the DISPATCHED type, not the mutable row type", async () => {
