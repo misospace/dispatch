@@ -826,6 +826,34 @@ describe("ownership reconciliation (#1254)", () => {
       expect(report.errors.join("|")).toContain("review ownership");
     });
 
+    it("an open PR-fix queue row that lands before Phase A withholds even under uppercase repo casing (#1370)", async () => {
+      // The queue folds repo to lowercase on every write (#1145), while the
+      // issue cache can carry GitHub's canonical casing ("Octocat/..."). A
+      // commit-time re-check that queries with the raw casing matches no row
+      // and releases a review-owned claim — the exact bug #1357 fixed in the
+      // inspect read.
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const MIXED = "Octocat/Hello-World";
+      fixture.tables.issue[0].repository.fullName = MIXED;
+      forgeShared.labels.clear();
+      forgeShared.setLabels(MIXED, 42, ["status/in-progress", "agent/alpha"]);
+      fixture.tables.ownershipReconcileCandidate.push(matureCandidate(now));
+      const report = await runWithMutateOnAcquire(fixture, now, () => {
+        fixture.tables.prFixQueueItem.push({
+          id: "qfix-1",
+          repo: REPO, // canonical folded identity
+          status: "QUEUED",
+          issue: 42,
+          pr: 77,
+        });
+      });
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+      expect(report.errors.join("|")).toContain("review ownership (open PR-fix queue row)");
+    });
+
     it("an external wait (retryAfter) committed before Phase A withholds the release", async () => {
       const now = new Date();
       const fixture = buildFixture(now);
@@ -1706,4 +1734,42 @@ describe("ownership reconciliation (#1254)", () => {
       expect(guardLost[0].success).toBe(false);
       expect(guardLost[0].errorMessage).toContain("mutation guard no longer held");
     });
+
+  describe("repo casing fold in the ladder-scan pr-fix read (#1370)", () => {
+    // Same rule as #1357 for inspect: PrFixQueueItem.repo is the folded
+    // identity (#1145), so the bounded ladder scan must fold the cached
+    // `repository.fullName` before querying — otherwise an open queue row is
+    // invisible and review ownership is silently under-reported.
+    it("queries the queue with the folded repo identity and retains the review-owned claim", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const MIXED = "Octocat/Hello-World";
+      fixture.tables.issue[0].repository.fullName = MIXED;
+      forgeShared.labels.clear();
+      forgeShared.setLabels(MIXED, 42, ["status/in-progress", "agent/alpha"]);
+      fixture.tables.prFixQueueItem.push({
+        id: "qfix-1",
+        repo: REPO, // canonical folded identity
+        status: "QUEUED",
+        issue: 42,
+        pr: 77,
+      });
+      const queueRepos: string[] = [];
+      const baseFindFirst = fixture.client.prFixQueueItem.findFirst;
+      fixture.client.prFixQueueItem.findFirst = async (args: any) => {
+        queueRepos.push(args?.where?.repo);
+        return baseFindFirst(args);
+      };
+
+      const report = await runReconcile(fixture, now, "enforce");
+
+      expect(queueRepos.length).toBeGreaterThan(0);
+      // The query must receive the folded value, never the raw cached casing.
+      expect(queueRepos).toEqual(queueRepos.map((r) => r.trim().toLowerCase()));
+      expect(queueRepos).not.toContain(MIXED);
+      // The folded read finds the open queue row → REVIEW_OWNED → no release.
+      expect(report.released).toBe(0);
+      expect(forgeShared.removeCalls).toHaveLength(0);
+    });
+  });
 });
