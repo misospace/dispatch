@@ -1,6 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
-import { resetRateLimits } from "@/lib/rate-limit";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
@@ -9,7 +8,6 @@ vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock());
 const { mocks } = vi.hoisted(() => ({
   mocks: {
     repositoryFindMany: vi.fn().mockResolvedValue([]),
-    createTrackedRepo: vi.fn(),
   },
 }));
 
@@ -19,20 +17,7 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 
-// The POST handler creates the tracked repo through createTrackedRepo, which
-// wraps the real writes in a prisma transaction.
-vi.mock("@/lib/tracked-repos", () => ({
-  createTrackedRepo: mocks.createTrackedRepo,
-  auditTrackedRepoCreateFailure: vi.fn().mockResolvedValue(undefined),
-}));
-
-import { GET, POST } from "./route";
-
-// The rate limiter keeps module-global state — reset it so the per-actor
-// window never leaks between tests.
-beforeEach(() => {
-  resetRateLimits();
-});
+import { GET } from "./route";
 
 describe("GET /api/repos", () => {
   const authed = () => authedRequest("http://localhost/api/repos");
@@ -88,34 +73,9 @@ describe("GET /api/repos", () => {
     const body = await res.json();
     expect(body.error).toBe("Failed to fetch repositories");
   });
-});
 
-describe("POST /api/repos", () => {
-  const authed = () =>
-    authedRequest("http://localhost/api/repos", {
-      method: "POST",
-      body: { fullName: "org/repo" },
-    });
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.createTrackedRepo.mockResolvedValue({
-      automationRepo: { id: "ar-1", fullName: "org/repo" },
-      repository: { id: "r1", fullName: "org/repo", enabled: true },
-    });
-  });
-
-  it("returns 429 after exceeding the rate limit (10 per 60s)", async () => {
-    for (let i = 0; i < 10; i++) {
-      const res = await POST(authed());
-      expect(res.status).toBe(201);
-    }
-
-    const res = await POST(authed());
-    expect(res.status).toBe(429);
-    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
-    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
-    // The 11th request is rejected before the tracked repo is created.
-    expect(mocks.createTrackedRepo).toHaveBeenCalledTimes(10);
+  it("no longer exposes a POST write path (deprecated endpoint removed, #1310)", async () => {
+    const route = (await import("./route")) as Record<string, unknown>;
+    expect(route.POST).toBeUndefined();
   });
 });

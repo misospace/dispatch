@@ -8,9 +8,9 @@ import { auditTrackedRepoCreateFailure, createTrackedRepo } from "@/lib/tracked-
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
-// 10 requests / 60s — the SAME budget as the deprecated POST /api/repos
-// alias (same `repos:${actor}` key, same limit), so both tracked-repo-create
-// paths share one budget instead of doubling it.
+// 10 requests / 60s — tracked-repo creation is a DB-only write, so this
+// ceiling is generous but still caps runaway callers. The deprecated
+// POST /api/repos alias was removed (#1310); this is the only create path.
 const RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 export async function GET(request: Request) {
