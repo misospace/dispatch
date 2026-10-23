@@ -157,6 +157,14 @@ describe("createFollowupPrTask", () => {
     expect(task.prFixItem?.generation).toBe(3);
   });
 
+  it("forwards the queue item's fixType on the PR-fix identity (#1327)", () => {
+    const task = createFollowupPrTask({
+      ...baseInput,
+      prFixItem: { id: "cuid-1", generation: 3, fixType: "REBASE" },
+    });
+    expect(task.prFixItem?.fixType).toBe("REBASE");
+  });
+
   it("omits PR-fix identity when not provided", () => {
     const task = createFollowupPrTask(baseInput);
     expect(task.prFixItem).toBeUndefined();

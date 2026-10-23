@@ -297,6 +297,16 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(mocks.prFixUpdateMany.mock.calls.every(([args]) => args.where.id === b.id)).toBe(true);
   });
 
+  it("marks the dispatched PR-fix identity with the item's fixType (#1327)", async () => {
+    mocks.prFixFindMany.mockResolvedValue([{ ...prFixRow(13), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" }]);
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    expect(body.reasons[0]).toContain("Mechanical rebase");
+  });
+
   it("skips linked generation 1 before materialization or GitHub reads", async () => {
     mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 12), independentIssue(99)]);
     const body = await (await GET(request(exclusionUrl(["org/repo#12@1"])), {
