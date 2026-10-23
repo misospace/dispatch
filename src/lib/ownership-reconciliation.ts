@@ -44,6 +44,7 @@ import { prisma } from "@/lib/prisma";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
 import { removeIssueLabel } from "@/lib/github";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
+import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
 import { transitionIssueStatus } from "@/lib/issue-status";
 import {
   lifecycleDedupeKey,
@@ -771,7 +772,11 @@ async function releaseWithheldAtCommitTime(
   // Review ownership: open linked PR or open PR-fix queue row.
   const openPrFix = await tx.prFixQueueItem.findFirst({
     where: {
-      repo: input.issue.repository.fullName,
+      // The queue stores the folded repo identity (#1145), so this lookup must
+      // fold too (#1370) — the raw cached casing ("Org/Repo") matches no row
+      // and a review-owned issue could be released while the queue still owns
+      // the PR.
+      repo: normalizeQueueRepo(input.issue.repository.fullName),
       status: { in: [...OPEN_PR_FIX_STATES] },
       OR: [
         { issue: input.issue.number },
@@ -1344,7 +1349,9 @@ export async function reconcileOwnership(
       });
       const openPrFix = await client.prFixQueueItem.findFirst({
         where: {
-          repo: repoFullName,
+          // Fold to the queue's canonical repo identity (#1145, #1370): the
+          // raw cached casing would under-report review ownership silently.
+          repo: normalizeQueueRepo(repoFullName),
           status: { in: [...OPEN_PR_FIX_STATES] },
           OR: [
             { issue: issue.number },
