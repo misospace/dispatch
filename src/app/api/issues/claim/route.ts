@@ -220,14 +220,18 @@ export async function POST(request: Request) {
     // #1254: the shared supersede tripwire for the pre-write re-checks. When a
     // maintainer force-claim has taken this holder's guard away, the callback
     // must not commit remote ownership writes: it CAS-deletes any lease it
-    // committed (fenced on the claim token it minted, so it can never touch a
-    // newer attempt's receipt), records a failure audit, and 409s. No GitHub
-    // label is written — the override's own claim converges the state.
-    const superseded = async (leaseRow?: { id: string; claimToken?: string | null }): Promise<Response> => {
+    // committed and records a failure audit, then 409s. No GitHub label is
+    // written — the override's own claim converges the state.
+    // The cleanup CAS is { id, claimToken, renewedAt } against the exact row
+    // THIS commit produced: renewals deliberately KEEP the claim token
+    // (#1256), so a same-agent winner's renewal would echo the token — but
+    // every later renewal stamps a new `renewedAt`, which this fence catches.
+    // A miss means the receipt moved into someone else's hands and stays.
+    const superseded = async (leaseRow?: { id: string; claimToken?: string | null; renewedAt?: Date | null }): Promise<Response> => {
       if (leaseRow?.id) {
         try {
           await prisma.lease.deleteMany({
-            where: { id: leaseRow.id, claimToken: leaseRow.claimToken ?? null },
+            where: { id: leaseRow.id, claimToken: leaseRow.claimToken ?? null, renewedAt: leaseRow.renewedAt ?? null },
           });
         } catch {
           // Best-effort: a failed cleanup must not mask the 409.

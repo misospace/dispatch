@@ -955,14 +955,35 @@ describe("POST /api/issues/claim — §8.7 override pre-write re-check (#1254)",
 
   it("does not commit a superseded non-force claim before the remote add (check b)", async () => {
     guardState.stillHolds = false;
-    mocks.leaseCreate.mockResolvedValue({ id: "lease-1", claimToken: "tok-1" });
+    // The real create path leaves `renewedAt` null; the fence must carry it
+    // explicitly (null-safe) rather than drop it from the CAS.
+    mocks.leaseCreate.mockResolvedValue({ id: "lease-1", claimToken: "tok-1", renewedAt: null });
     const res = await POST(makeRequest());
     expect(res.status).toBe(409);
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
     // The minted receipt is fenced-deleted so the override's claim can own it.
-    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1" } });
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1", renewedAt: null } });
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
+  });
+
+  it("fences the superseded-receipt cleanup on renewedAt, not just the echoed token (same-agent renewal)", async () => {
+    // Renewals deliberately KEEP the claim token (#1256): if a same-agent
+    // force-claim renews the very row this holder committed, {id, claimToken}
+    // alone would match the winner's fresh receipt. The cleanup CAS must pin
+    // the renewedAt stamp this commit wrote — the winner's later renewal
+    // changes it and the delete misses.
+    guardState.stillHolds = false;
+    const existing = { id: "lease-1", agentName: "test-agent", issueId: "issue-1", claimToken: "tok-1", renewedAt: new Date("2026-10-22T00:00:00.000Z"), checkpoint: "issue_claimed" };
+    const ourRenewal = { ...existing, renewedAt: new Date("2026-10-23T01:00:00.000Z") };
+    mocks.leaseFindUnique.mockResolvedValue(existing);
+    mocks.leaseUpdate.mockResolvedValue(ourRenewal);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({
+      where: { id: "lease-1", claimToken: "tok-1", renewedAt: ourRenewal.renewedAt },
+    });
   });
 
   it("does not start a superseded force claim before the remote removals (check a)", async () => {

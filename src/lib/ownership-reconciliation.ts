@@ -1081,11 +1081,18 @@ export async function replayPendingOwnershipReleases(
  * a terminal disposition or an expired clock, and stale active AgentWork rows.
  * Label-only legacy claims (no Dispatch evidence at all) are never candidates
  * — they stay UNKNOWN for the operator (§5 tier 6).
+ *
+ * `readOnly` (audit mode) makes the scan pure: the dead-ladder housekeeping
+ * delete is skipped, because audit mode promises no persisted
+ * `OwnershipReconcileCandidate` mutation at all. The dead rows are harmless
+ * there — they only make the bounded ladder source slightly less fresh, which
+ * is exactly the trade `audit` accepts in exchange for touching nothing.
  */
 async function selectCandidates(
   client: OwnershipReconcileClient,
   graceCutoff: Date,
   batchSize: number,
+  readOnly = false,
 ): Promise<any[]> {
   // `reclaimCount` must be loaded: the dead-row cleanup below keeps rows with
   // churn history, and a select that drops it makes real Prisma rows look
@@ -1139,7 +1146,7 @@ async function selectCandidates(
       return !issue || !issue.labels.some((label: string) => label.startsWith(AGENT_PREFIX));
     })
     .map((row: any) => row.issueId);
-  if (deadLadderIds.length > 0) {
+  if (!readOnly && deadLadderIds.length > 0) {
     await client.ownershipReconcileCandidate.deleteMany({ where: { issueId: { in: deadLadderIds } } });
   }
 
@@ -1257,7 +1264,7 @@ export async function reconcileOwnership(
   //    the off-mode early-return).
   let candidates: any[];
   try {
-    candidates = await selectCandidates(client, graceCutoff, batchSize);
+    candidates = await selectCandidates(client, graceCutoff, batchSize, mode === "audit");
   } catch (error) {
     report.errors.push(`candidate selection failed: ${error instanceof Error ? error.message : String(error)}`);
     return report;

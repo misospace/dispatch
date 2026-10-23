@@ -558,8 +558,12 @@ export async function sweepStaleWork(
       // lease and then run the post-transaction release, which would strip the
       // agent label the new claim owns. Restore the row to the shape the sweep
       // found it in and back off — the force-claim's own receipt converges the
-      // state, and `marked: false` short-circuits the release below.
-      if (guardCheck && !(await guardCheck())) {
+       // state, and `marked: false` short-circuits the release below. Like the
+       // park restore below, the restore leaves the `stale` AgentWorkHistory
+       // entry written by the mark in place: the history is the sweep's own
+       // observation log, not claim state, and deleting a row the transition
+       // genuinely reached would hide a real decision from the audit trail.
+       if (guardCheck && !(await guardCheck())) {
         await tx.agentWork.updateMany({
           where: { id: work.id, state: "STALE" },
           data: {
@@ -708,6 +712,11 @@ export async function sweepStaleWork(
       // lands between that commit and this remote write must still not strip
       // the label a forced claimant now owns. The row keeps its pending-release
       // marker, so the next sweep (or the force-claim's own receipt) converges.
+      // Known shape (pre-existing crash-matrix, narrowed here): if the override
+      // re-claimed for the SAME agent without a fresh AgentWork row, the retry
+      // snapshots that lease as the epoch and would release it — the same
+      // window a crash between mark and release already had; the epoch CAS
+      // against a renewed clock, not this tripwire, is the standing fence.
       if (guardCheck && !(await guardCheck())) {
         report.skipped++;
         return;

@@ -495,7 +495,33 @@ describe("ownership reconciliation (#1254)", () => {
       expect(actions).toContain("ownership_reconcile_candidate");
     });
 
+    it("the selection scan's dead-ladder cleanup does not delete in audit mode", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const writes = spyCandidateWrites(fixture.client);
+      // A candidate row for an issue Dispatch no longer sees as claimed (the
+      // issue row is gone from the fixture's open-issue scan): enforce would
+      // housekeeping-delete it, audit must leave it untouched.
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-dead",
+        issueId: "issue-gone",
+        agentName: "alpha",
+        staleCount: 1,
+        firstStaleAt: minutesAgo(now, 30),
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 0,
+        lastReclaimAt: null,
+      });
+
+      const report = await runReconcile(fixture, now, "audit");
+
+      expect(report.released).toBe(0);
+      expect(writes.deleteMany).not.toHaveBeenCalled();
+      expect(fixture.tables.ownershipReconcileCandidate.some((r: any) => r.id === "cand-dead")).toBe(true);
+    });
+
     it("no stored row: the ladder is simulated in memory only (first observation)", async () => {
+
       const now = new Date();
       const fixture = buildFixture(now);
       const writes = spyCandidateWrites(fixture.client);
