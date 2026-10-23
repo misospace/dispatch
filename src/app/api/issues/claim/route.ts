@@ -278,9 +278,10 @@ export async function POST(request: Request) {
         // claim while these removals are in flight. If the guard is already
         // gone/re-owned, `runFencedRemoteWrite` reports `guard-lost` and the
         // forge function was NEVER called — do not start a remote mutation
-        // this holder no longer owns. ONE removal per fenced region (a region
-        // carries exactly one mutating forge call, so the region's
-        // transaction budget always covers the call it holds). The removal
+        // this holder no longer owns. ONE removal per fenced region (each of
+        // this route's regions carries exactly one mutating forge call, so
+        // the region's transaction budget always covers the call it holds).
+        // The removal
         // SET is therefore NOT atomic: a steal that lands between two
         // removals leaves the earlier ones applied — the guard loss is
         // detected on the next region's fence, and the override's own claim

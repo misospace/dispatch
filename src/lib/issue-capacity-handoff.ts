@@ -45,9 +45,10 @@ type FencedRemoteWrite = <T>(
  * status label, then add the target): up to THREE chained mutating forge
  * calls. The region's transaction budget must dominate all of them: a
  * mid-region abort would release the guard row's lock with a remote effect
- * still in flight, which is exactly the hole the fence closes. Every other
- * fenced region carries ONE mutating forge call and uses the default
- * `fencedWriteTimeoutMs()`.
+ * still in flight, which is exactly the hole the fence closes. Regions that
+ * carry a single mutating forge call use the default `fencedWriteTimeoutMs()`;
+ * a region that carries several (this one, the unclaim route's) raises its
+ * own budget to match.
  */
 const CAPACITY_RELEASE_FENCED_TIMEOUT_MS = fencedWriteTimeoutMs() * 3;
 

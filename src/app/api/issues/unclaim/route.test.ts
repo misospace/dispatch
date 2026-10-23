@@ -19,6 +19,9 @@ const { guardState, mocks } = vi.hoisted(() => ({
     foreignKey: false,
     request: null as unknown,
     events: [] as string[],
+    // The options the route handed to the fenced remote write — the region's
+    // transaction budget.
+    fencedOptions: null as unknown,
     // #1367: the transaction client the fenced write hands to its callback —
     // what `fencedClaimClient` must reshape into the release's `prisma` arg.
     fencedTx: { issue: { id: "tx-issue" }, issueLifecycleEvent: undefined },
@@ -74,7 +77,10 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
       context: {
         resuming: boolean;
         stillHoldsGuard: () => Promise<boolean>;
-        runFencedRemoteWrite: <T>(fn: (tx: unknown) => Promise<T>) => Promise<{ status: string; value?: T }>;
+        runFencedRemoteWrite: <T>(
+          fn: (tx: unknown) => Promise<T>,
+          options?: { timeoutMs?: number },
+        ) => Promise<{ status: string; value?: T }>;
       },
     ) => Promise<{ complete: boolean; value: unknown }>,
   ) => {
@@ -95,7 +101,8 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
         stillHoldsGuard: async () => guardState.stillHolds,
         // #1367: the fenced remote write is ATOMIC with the guard check — a
         // stolen guard means the forge function is NEVER called.
-        runFencedRemoteWrite: async <T,>(fn: (tx: unknown) => Promise<T>) => {
+        runFencedRemoteWrite: async <T,>(fn: (tx: unknown) => Promise<T>, options?: { timeoutMs?: number }) => {
+          guardState.fencedOptions = options ?? null;
           if (!guardState.stillHolds) return { status: "guard-lost" };
           guardState.events.push("fenced-entered");
           return { status: "written", value: await fn(guardState.fencedTx) };
@@ -119,6 +126,7 @@ beforeEach(() => {
   guardState.foreignKey = false;
   guardState.request = null;
   guardState.events = [];
+  guardState.fencedOptions = null;
   resetRateLimits();
 });
 
@@ -269,6 +277,22 @@ describe("POST /api/issues/unclaim — happy path (#1367)", () => {
       actor: "worker",
       reason: "explicit unclaim by worker",
     });
+  });
+
+  it("gives the fenced region the RAISED budget that dominates the release's forge calls", async () => {
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+
+    // The unclaim region carries the shared release: the ownership removal
+    // (the `agent/*` label) plus, when the resting-status policy applies, a
+    // chained status transition that removes EVERY existing `status/*` label
+    // — three mutating forge calls in the normal shape. The region's
+    // transaction budget must therefore be RAISED to the worst case of the
+    // calls it holds (`fencedWriteTimeoutMs() * 5` — 60s in this suite's
+    // fake): a mid-region abort would release the guard row's lock with a
+    // remote effect still in flight, which is exactly the hole the fence
+    // closes.
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 300_000 });
   });
 
   it("hands the release a thin client with no $transaction so its local writes join the fenced transaction", async () => {

@@ -25,14 +25,25 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
  * documented data-quality edge case that is real, #1037). The normal shape is
  * three mutating forge calls (agent removal, old-status removal, target add);
  * duplicated status labels can chain more removals, so the *5 budget covers
- * the normal three plus headroom for that edge. An even more degenerate label
- * set remains a residual, accepted bound inherited from the capacity
- * handoff's region shape (a follow-up will visit
+ * the normal three plus headroom for that edge. The call count is
+ * DATA-DEPENDENT, so the budget is not a hard bound: a label set with more
+ * than ~5 chained `status/*` removals (6+ calls) can outrun the budget and
+ * abort the region mid-flight — the same residual the capacity handoff's
+ * region shape carries (a follow-up will visit
  * `CAPACITY_RELEASE_FENCED_TIMEOUT_MS`). The region's transaction budget must
  * dominate its forge calls: a mid-region abort would release the guard row's
  * lock with a remote effect still in flight, which is exactly the hole the
- * fence closes. Every other fenced region carries ONE mutating forge call and
- * uses the default `fencedWriteTimeoutMs()`.
+ * fence closes. Regions that carry a single mutating forge call use the
+ * default `fencedWriteTimeoutMs()`.
+ *
+ * The raised budget does NOT make the guard look stealable: a region that
+ * runs longer than the override's silence window (`GUARD_OVERRIDE_MIN_AGE_MS`,
+ * 5 min) re-stamps the guard row inside its own transaction, right before the
+ * commit (see `runFencedRemoteWrite`), so the committed row is FRESH however
+ * long the region ran. A maintainer force-claim waiting on the anchor is then
+ * told the issue is busy instead of taking the anchor away while this
+ * callback is still running. The budget therefore only has to dominate the
+ * region's forge calls — it does not have to fit inside the silence window.
  */
 const UNCLAIM_FENCED_TIMEOUT_MS = fencedWriteTimeoutMs() * 5;
 
