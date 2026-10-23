@@ -2294,6 +2294,35 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
 }
 
 /**
+ * #1327: the mechanical rebase lane is concurrency 1 with no fan-out — the
+ * issue scopes the lane to a bounded local worker, not a fleet. Hand-out is
+ * gated on this check: a REBASE candidate waits while ANY QUEUED REBASE item
+ * — including the candidate itself — carries a live hand-out record. The
+ * self case matters: re-handing an already-live REBASE to a second worker
+ * would put two `--force-with-lease` pushes on one branch.
+ *
+ * "Live" means the item is still QUEUED with a non-empty `agentHandouts`
+ * list: settlement clears the records, and the generic reclaim sweep clears
+ * hand-outs that were never acknowledged, so a crashed worker blocks rebase
+ * dispatches only until its hand-out is reclaimed.
+ *
+ * Best-effort by construction: there is no global lock, so two concurrent
+ * polls can each pass this check before either stamps its hand-out. That
+ * residual window is accepted — items are singletons per (repo, PR), reports
+ * are generation-fenced, and the failed-report settlement is terminal for
+ * REBASE, so a doubled hand-out cannot turn into a retry loop.
+ */
+export async function hasInFlightRebaseHandout(client: PrFixQueueClient): Promise<boolean> {
+  const rows = await client.prFixQueueItem.findMany({
+    where: { type: "REBASE", status: "QUEUED" },
+  });
+  return rows.some(
+    (row: { agentHandouts?: unknown }) =>
+      Array.isArray(row.agentHandouts) && row.agentHandouts.length > 0,
+  );
+}
+
+/**
  * Verify that the PR head SHA at fix-time differs from the per-attempt
  * baseline head. Returns one of:
  *
@@ -4183,13 +4212,21 @@ export async function resolvePrFixFromAgentReport(
     // transition. The status+generation pins still reject concurrent
     // settles at the same generation (neither BLOCKED nor FIXED bumps).
     const maxFailedRedecisions = 3;
-    let settled: { row: any; capped: boolean } | null = null;
+    let settled: { row: any; capped: boolean; rebaseTerminal: boolean } | null = null;
     for (let pass = 0; pass < maxFailedRedecisions && !settled; pass++) {
       const fresh = await client.prFixQueueItem.findUnique({ where: { id: existing.id } });
       if (!fresh) break;
       if (fresh.status !== "QUEUED") break;
       if (expectedGeneration !== undefined && fresh.generation !== expectedGeneration) break;
-      const capped = (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
+      // #1327: the mechanical rebase lane is ONE attempt per DIRTY episode.
+      // A failed REBASE never reopens a fresh attempt (the generic
+      // PR_FIX_MAX_ATTEMPTS ladder is for code-fix generations; retrying a
+      // rebase on the same head is exactly the cheap-retry churn this lane
+      // exists to remove). A new DIRTY episode is a new head, and the #940
+      // head-movement reopen lifts the park the same way it lifts a
+      // cap-parked fix item.
+      const rebaseTerminal = normalizePrFixType(fresh.type) === "REBASE";
+      const capped = rebaseTerminal || (fresh.fixAttempts ?? 1) >= maxPrFixAttempts();
       const data: Record<string, unknown> = capped
         ? {
             status: "PARKED",
@@ -4245,7 +4282,9 @@ export async function resolvePrFixFromAgentReport(
             note: [
               input.summary ?? null,
               capped
-                ? `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), parked instead of re-queuing (#1133).`
+                ? rebaseTerminal
+                  ? "Agent reported failed; the mechanical rebase lane gets one attempt per DIRTY episode (#1327) — parked instead of re-queuing."
+                  : `Agent reported failed; bounded at ${fresh.fixAttempts ?? 1} fix attempts (PR_FIX_MAX_ATTEMPTS=${maxPrFixAttempts()}), parked instead of re-queuing (#1133).`
                 : `Agent reported failed; reopened as a fresh attempt so the consumed generation cannot strand the queue (#1133).`,
             ]
               .filter(Boolean)
@@ -4254,7 +4293,7 @@ export async function resolvePrFixFromAgentReport(
         });
         return freshRow;
       });
-      if (row) settled = { row, capped };
+      if (row) settled = { row, capped, rebaseTerminal };
     }
     if (!settled) {
       // The row is gone, its generation moved (the attempt was re-issued),
@@ -4286,7 +4325,9 @@ export async function resolvePrFixFromAgentReport(
       action: settled.capped ? "parked" : "requeued",
       itemId: existing.id ?? null,
       reason: settled.capped
-        ? "agent reported failed; past the fix-attempt cap, parked"
+        ? settled.rebaseTerminal
+          ? "agent reported failed; the rebase lane is one attempt per DIRTY episode, parked"
+          : "agent reported failed; past the fix-attempt cap, parked"
         : "agent reported failed; reopened as a fresh attempt at the next generation",
       attemptGeneration: attempt?.generation ?? null,
     };

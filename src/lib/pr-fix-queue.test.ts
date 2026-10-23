@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -242,6 +242,7 @@ function makeClient(): PrFixQueueClient & {
         let result = items.slice();
         if (where?.repo) result = result.filter((i) => i.repo === where.repo);
         if (where?.pr?.in) result = result.filter((i) => where.pr.in.includes(i.pr));
+        if (where?.type) result = result.filter((i) => i.type === where.type);
         if (where?.status) {
           result = Array.isArray(where.status.in)
             ? result.filter((i) => where.status.in.includes(i.status))
@@ -4661,6 +4662,70 @@ describe("PR-fix outcome separation (#1218)", () => {
     }
   });
 
+  it("parks a failed REBASE report instead of reopening a retry (#1327)", async () => {
+    // The generic cap must NOT be what parks it: with a generous cap, the
+    // rebase lane still settles terminally — one attempt per DIRTY episode.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 305, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k305", headSha: "H1",
+      });
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 305,
+        outcome: "failed",
+        summary: "semantic conflict, not mechanical",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("parked");
+      const row = client.items[0];
+      expect(row.status).toBe("PARKED");
+      expect(row.lane).toBe("NORMAL");
+      expect(row.outcome).toBe("no_progress");
+      // No fresh attempt: same generation, no attempt-budget spend.
+      expect(row.generation).toBe(1);
+      expect(row.fixAttempts).toBe(1);
+      expect(surfacingMocks.surfacePrFixParked).toHaveBeenCalledTimes(1);
+      expect(surfacingMocks.surfacePrFixBlocked).not.toHaveBeenCalled();
+      const note = client.history.at(-1)?.note ?? "";
+      expect(note).toContain("#1327");
+      expect(note).not.toContain("PR_FIX_MAX_ATTEMPTS");
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
+  it("still reopens a failed legacy conflict report below the cap (#1327)", async () => {
+    // Only REBASE is terminal per episode; the legacy MERGE_CONFLICT code-fix
+    // lane keeps the generic PR_FIX_MAX_ATTEMPTS ladder.
+    const prev = process.env.PR_FIX_MAX_ATTEMPTS;
+    process.env.PR_FIX_MAX_ATTEMPTS = "5";
+    try {
+      await enqueuePrFixItem(client, {
+        repo: "org/repo", pr: 306, lane: "NORMAL", type: "MERGE_CONFLICT", reason: "r", feedback: "f", evidenceKey: "k306", headSha: "H1",
+      });
+      const result = await resolvePrFixFromAgentReport({
+        client: client as PrFixQueueClient,
+        repoFullName: "org/repo",
+        pullRequestNumber: 306,
+        outcome: "failed",
+        attempt: { itemId: client.items[0].id, generation: 1 },
+      });
+
+      expect(result.action).toBe("requeued");
+      expect(client.items[0].status).toBe("QUEUED");
+      expect(client.items[0].generation).toBe(2);
+      expect(surfacingMocks.surfacePrFixParked).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.PR_FIX_MAX_ATTEMPTS;
+      else process.env.PR_FIX_MAX_ATTEMPTS = prev;
+    }
+  });
+
   it("marks BLOCKED + NEEDS_HUMAN and surfaces the decision on a human_decision blocked report", async () => {
     await enqueuePrFixItem(client, {
       repo: "org/repo", pr: 302, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k302",
@@ -5424,5 +5489,29 @@ describe("PR-fix outcome separation (#1218)", () => {
       expect(client.items[0].outcome).toBe("human_decision");
       expect(client.history.length).toBe(historyBefore);
     });
+  });
+});
+
+describe("hasInFlightRebaseHandout (#1327)", () => {
+  it("flags QUEUED REBASE rows with live hand-out records only", async () => {
+    const client = makeClient();
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 401, lane: "NORMAL", type: "REBASE", reason: "r", feedback: "f", evidenceKey: "k401" });
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+
+    // A live hand-out (agent record while still QUEUED) gates the lane.
+    client.items[0].agentHandouts = ["worker-a@1"];
+    expect(await hasInFlightRebaseHandout(client)).toBe(true);
+
+    // A live hand-out on a non-REBASE item must not gate the rebase lane.
+    client.items[0].agentHandouts = [];
+    await enqueuePrFixItem(client, { repo: "org/repo", pr: 402, lane: "NORMAL", reason: "r", feedback: "f", evidenceKey: "k402" });
+    client.items[1].agentHandouts = ["worker-b@1"];
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
+
+    // A settled REBASE (no longer QUEUED) does not gate, even with stale
+    // records: settlement/reclaim clearing is what frees the lane.
+    client.items[0].agentHandouts = ["worker-a@1"];
+    client.items[0].status = "PARKED";
+    expect(await hasInFlightRebaseHandout(client)).toBe(false);
   });
 });

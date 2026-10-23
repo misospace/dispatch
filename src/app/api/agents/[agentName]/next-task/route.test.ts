@@ -307,6 +307,46 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.reasons[0]).toContain("Mechanical rebase");
   });
 
+  it("defers REBASE hand-outs while any rebase hand-out is live (concurrency 1, #1327)", async () => {
+    // `live` is a REBASE already handed out (live hand-out record, still
+    // QUEUED); `waiting` is the next DIRTY PR. Neither may be handed out:
+    // `waiting` because the lane is busy, `live` because a second hand-out
+    // would put two force-with-lease pushes on one branch.
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"] };
+    const waiting = { ...prFixRow(22), type: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.type === "REBASE"
+        ? [live, waiting].filter((r) => r.status === where.status)
+        : [live, waiting].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === waiting.id ? waiting : live));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    // Deferred, not dispatched: no hand-out stamp on either item.
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+    expect(live.agentHandouts).toEqual(["other-agent@2"]);
+    expect(waiting.agentHandouts).toEqual([]);
+  });
+
+  it("dispatches ordinary fix work while a rebase hand-out is live (#1327)", async () => {
+    // The concurrency-1 gate is REBASE-only: OTHER fix work is unaffected.
+    const live = { ...prFixRow(21, 2), type: "REBASE", agentHandouts: ["other-agent@2"] };
+    const fix = prFixRow(23);
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.type === "REBASE"
+        ? [live].filter((r) => r.status === where.status)
+        : [live, fix].filter((r) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === fix.id ? fix : live));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(23);
+  });
+
   it("skips linked generation 1 before materialization or GitHub reads", async () => {
     mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 12), independentIssue(99)]);
     const body = await (await GET(request(exclusionUrl(["org/repo#12@1"])), {
