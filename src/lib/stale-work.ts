@@ -303,6 +303,13 @@ interface StaleWorkOutcome {
    * once the transaction commits.
    */
   leasesDeleted?: number;
+  /**
+   * #1254: the sweep lost the per-issue mutation guard before the lease
+   * delete — the mark was restored and the release was abandoned. The
+   * transaction client has no `auditLog`, so the flag carries the decision
+   * out of the transaction and the failure audit is written after it.
+   */
+  guardLost?: boolean;
 }
 
 /**
@@ -572,7 +579,7 @@ export async function sweepStaleWork(
             staleClaimReleasePending: before.staleClaimReleasePending,
           },
         });
-        return { marked: false, retained: false };
+        return { marked: false, retained: false, guardLost: true };
       }
 
       // Releasing the lease in the same transaction as the stale marker
@@ -660,6 +667,35 @@ export async function sweepStaleWork(
       return { marked: true, retained: false, liveSiblingId: null, leasesDeleted };
     });
 
+    // #1254: the guard-loss tripwire leaves a failure audit. The sweep
+    // abandoned a release because an operator override took the per-issue
+    // anchor away; without the audit row the skip is invisible. It is written
+    // AFTER the transaction (the transaction client has no `auditLog`) and it
+    // is best-effort: a failing audit must not strand the sweep.
+    if (outcome?.guardLost) {
+      try {
+        await client.auditLog.create({
+          data: {
+            actor: "system",
+            action: "stale_agentwork_release_superseded",
+            repoFullName: work.issue?.repository?.fullName ?? "",
+            issueNumber: work.issue?.number ?? undefined,
+            issueId: work.issueId ?? undefined,
+            beforeLabels: work.issue?.labels ?? [],
+            afterLabels: work.issue?.labels ?? [],
+            success: false,
+            errorMessage:
+              "stale sweep skipped the release: the mutation guard was taken by an operator override before the lease delete",
+          },
+        });
+      } catch (error) {
+        report.errors.push({
+          workId: work.id,
+          error: `guard-loss audit failed (the release was skipped): ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
+
     if (!outcome?.marked) {
       report.skipped++;
       return;
@@ -718,6 +754,31 @@ export async function sweepStaleWork(
       // window a crash between mark and release already had; the epoch CAS
       // against a renewed clock, not this tripwire, is the standing fence.
       if (guardCheck && !(await guardCheck())) {
+        // #1254: the second tripwire leaves a failure audit too — the remote
+        // release was skipped because the anchor moved on, and the skip must
+        // be visible. Best-effort: a failing audit is reported, never thrown,
+        // so the sweep is not stranded by it.
+        try {
+          await client.auditLog.create({
+            data: {
+              actor: "system",
+              action: "stale_agentwork_release_superseded",
+              repoFullName: work.issue?.repository?.fullName ?? "",
+              issueNumber: work.issue?.number ?? undefined,
+              issueId: work.issueId ?? undefined,
+              beforeLabels: work.issue?.labels ?? [],
+              afterLabels: work.issue?.labels ?? [],
+              success: false,
+              errorMessage:
+                "stale sweep skipped the remote label release: the mutation guard was taken by an operator override",
+            },
+          });
+        } catch (error) {
+          report.errors.push({
+            workId: work.id,
+            error: `guard-loss audit failed (the remote release was skipped): ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
         report.skipped++;
         return;
       }

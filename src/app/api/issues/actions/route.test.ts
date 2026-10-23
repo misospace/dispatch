@@ -377,16 +377,27 @@ describe("POST /api/issues/actions — assign_agent", () => {
     expect(body.labels).not.toContain("agent/old");
   });
 
-  it("does not commit a superseded assign_agent before the remote label write (#1254)", async () => {
+  it("does not commit a superseded assign_agent before the remote label write and audits the guard loss (#1254)", async () => {
     guardState.stillHolds = false;
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "type/feature"]);
     const res = await postRequest(makePayload());
     expect(res.status).toBe(409);
     expect((await res.json()).error).toContain("superseded");
-    // No remote label write, no local cache write, no audit: the holder lost the guard.
+    // No remote label write, no local cache write: the holder lost the guard.
     expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
     expect(mocks.updateIssue).not.toHaveBeenCalled();
-    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+    // #1254: the guard loss is audited — the skipped assignment must be
+    // visible, not silent.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "assign_agent",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        success: false,
+        errorMessage: "Assignment was superseded by an operator override before the remote label write",
+      }),
+    });
   });
 
   it("commits a normal assign_agent when the guard is still held (control)", async () => {

@@ -152,6 +152,26 @@ export async function POST(request: Request) {
       // the holder no longer owns. assign_owner is not affected by the
       // agent-label override and needs no check.
       if (payload.action === "assign_agent" && !(await stillHoldsGuard())) {
+        // #1254: the guard-loss tripwire records a failure audit — the
+        // skipped assignment must be visible, not silent. Best-effort: a
+        // failing audit write must not mask the 409.
+        try {
+          await prisma.auditLog.create({
+            data: {
+              actor: auditActor,
+              action: payload.action,
+              repoFullName,
+              issueNumber,
+              issueId,
+              beforeLabels: currentLabels,
+              afterLabels: [],
+              success: false,
+              errorMessage: "Assignment was superseded by an operator override before the remote label write",
+            },
+          });
+        } catch {
+          // Audit log failure should not mask the real error
+        }
         return { complete: true, value: errorResponse("Assignment was superseded by an operator override", 409) };
       }
 

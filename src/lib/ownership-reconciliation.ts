@@ -521,6 +521,25 @@ async function driveReleaseIntent(
         // override that cleared a silent reconcile-release guard cannot be
         // followed by a stale forge delete from the abandoned attempt.
         if (!(await stillHoldsGuard())) {
+          // #1254: the guard-loss tripwire records a failure audit: the
+          // release was skipped because the anchor moved on, and without the
+          // audit row the skip is invisible to the operator. The intent is NOT
+          // settled here — it stays pending unless the overriding force-claim
+          // superseded it (the claim route supersedes the intent under the
+          // anchor, and that is what usually lifts the claim barrier). The
+          // attempt counter was already bumped above, so a guard loss DOES
+          // consume one of the bounded attempts; the park path is the
+          // operator-visible escalation for a repeatedly stolen anchor.
+          try {
+            await auditReconcileEvent(client, {
+              action: "ownership_reconcile_guard_lost",
+              issueId: intent.issueId,
+              success: false,
+              errorMessage: "release skipped: mutation guard no longer held (superseded before Phase B)",
+            });
+          } catch {
+            // Annotation only; the skip outcome must not change.
+          }
           return {
             complete: true,
             value: { kind: "skipped", error: "release skipped: mutation guard no longer held (superseded before Phase B)" },
@@ -1424,15 +1443,45 @@ export async function reconcileOwnership(
 
       const lastReclaimAt = effectiveRow.lastReclaimAt ?? null;
       const reclaimCount = effectiveRow.reclaimCount ?? 0;
+
+      // #1254: audit mode annotates EVERY abandoned candidate exactly once
+      // per pass, so an abandoned candidate is never silently dropped from
+      // the audit trail. On a fresh audit-only deployment no stored row ever
+      // exists (audit mode never writes one), so without this annotation the
+      // operator sees nothing at all and the "would release" annotation below
+      // is unreachable.
+      const annotateAbandonedCandidate = async (ladderCount: number, wouldRelease: string): Promise<void> => {
+        try {
+          await auditReconcileEvent(client, {
+            action: "ownership_reconcile_candidate",
+            issue,
+            beforeLabels: issue.labels,
+            afterLabels: issue.labels,
+            notes: `state=ABANDONED_CANDIDATE reasons=[${assessment.reasonCodes.join(",")}] verified=${assessment.verified} ladder=${ladderCount}/2 wouldRelease=${wouldRelease}`,
+          });
+        } catch {
+          // Annotation only; a failing audit must not break the pass.
+        }
+      };
+
       if (
         lastReclaimAt !== null &&
         now.getTime() - lastReclaimAt.getTime() < cooldownMs
       ) {
+        // The reclaim cooldown holds this candidate back for now. In audit
+        // mode it is still surfaced: the ladder count is the STORED one — this
+        // pass did not advance it.
+        if (mode === "audit") {
+          await annotateAbandonedCandidate(effectiveRow.staleCount ?? 0, "no (reclaim cooldown)");
+        }
         report.retained++;
         continue;
       }
       if (reclaimCount >= maxReclaims) {
         report.held++;
+        if (mode === "audit") {
+          await annotateAbandonedCandidate(effectiveRow.staleCount ?? 0, "no (parked at the reclaim limit)");
+        }
         try {
           await auditReconcileEvent(client, {
             action: "ownership_reconcile_parked",
@@ -1452,16 +1501,21 @@ export async function reconcileOwnership(
       if (lastObserved === null) {
         staleCount = 1;
       } else if (now.getTime() - lastObserved < recheckMs) {
+        // Second observation inside the re-check interval: the ladder cannot
+        // advance this pass, but the candidate is still annotated — an
+        // abandoned candidate is never silently dropped from the audit trail.
+        if (mode === "audit") await annotateAbandonedCandidate(staleCount, "no (confirmation pending)");
         report.retained++;
         continue;
       } else {
         staleCount += 1;
       }
 
-      // Audit mode is read-only for candidate state: the in-memory
-      // `staleCount` still drives the report counters and the "would
-      // release" annotation below, but the stored row never advances —
-      // each audit pass re-derives the ladder from stored state.
+      // Audit mode never advances the stored row, so the ladder can only
+      // MATURE in audit mode when a stored candidate row already exists (e.g.
+      // written by an earlier enforce pass): on a fresh instance the ladder
+      // stays at the first observation and the annotation below reports
+      // `wouldRelease=no (confirmation pending)`.
       if (mode !== "audit") {
         await client.ownershipReconcileCandidate.update({
           where: { issueId: issue.id },
@@ -1473,6 +1527,10 @@ export async function reconcileOwnership(
             lastReasons: assessment.reasonCodes.join(","),
           },
         });
+      }
+
+      if (mode === "audit") {
+        await annotateAbandonedCandidate(staleCount, staleCount >= 2 ? "yes" : "no (confirmation pending)");
       }
 
       if (staleCount < 2) {

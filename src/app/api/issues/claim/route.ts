@@ -219,16 +219,24 @@ export async function POST(request: Request) {
 
     // #1254: the shared supersede tripwire for the pre-write re-checks. When a
     // maintainer force-claim has taken this holder's guard away, the callback
-    // must not commit remote ownership writes: it CAS-deletes any lease it
-    // committed and records a failure audit, then 409s. No GitHub label is
-    // written — the override's own claim converges the state.
-    // The cleanup CAS is { id, claimToken, renewedAt } against the exact row
-    // THIS commit produced: renewals deliberately KEEP the claim token
-    // (#1256), so a same-agent winner's renewal would echo the token — but
-    // every later renewal stamps a new `renewedAt`, which this fence catches.
-    // A miss means the receipt moved into someone else's hands and stays.
-    const superseded = async (leaseRow?: { id: string; claimToken?: string | null; renewedAt?: Date | null }): Promise<Response> => {
-      if (leaseRow?.id) {
+    // must not commit remote ownership writes: it deletes the lease receipt it
+    // MINTED, records a failure audit, then 409s. No GitHub label is written
+    // — the override's own claim converges the state.
+    // Mint-based rule: the row is deleted ONLY when THIS attempt minted the
+    // receipt (`upsertLease` reports `mintedToken`). A plain renewal merely
+    // echoed a live attempt's own token, so its row belongs to that attempt
+    // and must survive. The `{id, claimToken, renewedAt}` CAS stays as a
+    // second fence, but it alone was NOT sufficient: renewals deliberately
+    // KEEP the claim token (#1256) and the losing attempt's own renewal
+    // re-stamps `renewedAt` AFTER the winner's renewal, so the fence could
+    // still match a live attempt's row and delete it.
+    const superseded = async (receipt?: {
+      lease?: { id: string; claimToken?: string | null; renewedAt?: Date | null };
+      mintedToken?: boolean;
+    }): Promise<Response> => {
+      const leaseRow = receipt?.lease;
+      const mintedToken = receipt?.mintedToken === true;
+      if (leaseRow?.id && mintedToken) {
         try {
           await prisma.lease.deleteMany({
             where: { id: leaseRow.id, claimToken: leaseRow.claimToken ?? null, renewedAt: leaseRow.renewedAt ?? null },
@@ -248,7 +256,10 @@ export async function POST(request: Request) {
             beforeLabels: liveLabels,
             afterLabels: [],
             success: false,
-            errorMessage: "Claim was superseded by an operator override before the remote label write",
+            errorMessage:
+              leaseRow?.id && !mintedToken
+                ? "Claim was superseded by an operator override before the remote label write; the lease receipt belongs to a live attempt and was left intact"
+                : "Claim was superseded by an operator override before the remote label write",
           },
         });
       } catch {
@@ -307,11 +318,12 @@ export async function POST(request: Request) {
       // #1254: re-check the anchor before the remote add. A maintainer
       // force-claim can delete this holder's guard between the claim-intent
       // (lease) commit and the label write; the override already retired our
-      // receipt, so committing the add here would race it. Back off: CAS-delete
-      // the lease we just minted and 409 — the add is idempotent, so the
-      // override's own claim lands the label.
+      // receipt, so committing the add here would race it. Back off: delete
+      // the lease we minted ourselves and 409 — the add is idempotent, so the
+      // override's own claim lands the label. A receipt we did NOT mint (a
+      // plain renewal of a live attempt's row) is left intact.
       if (!(await stillHoldsGuard())) {
-        return superseded(lease.lease);
+        return superseded(lease);
       }
 
       remoteStarted = true;

@@ -963,26 +963,79 @@ describe("POST /api/issues/claim — §8.7 override pre-write re-check (#1254)",
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
     // The minted receipt is fenced-deleted so the override's claim can own it.
+    // #1254: this attempt MINTED the receipt (the create path), so the
+    // cleanup may delete it — the mint gate only spares renewed receipts.
     expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1", renewedAt: null } });
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
   });
 
-  it("fences the superseded-receipt cleanup on renewedAt, not just the echoed token (same-agent renewal)", async () => {
-    // Renewals deliberately KEEP the claim token (#1256): if a same-agent
-    // force-claim renews the very row this holder committed, {id, claimToken}
-    // alone would match the winner's fresh receipt. The cleanup CAS must pin
-    // the renewedAt stamp this commit wrote — the winner's later renewal
-    // changes it and the delete misses.
+  it("deletes a renewed receipt when the renewal itself minted the token (#1254)", async () => {
+    // The mirror of the regression above: a renewal that minted a FRESH token
+    // (the reconciler's Phase A retired the fence, so the row carried no
+    // token) owns the receipt it just wrote — the mint gate must let the
+    // cleanup delete it, and the `{id, claimToken, renewedAt}` CAS still
+    // pins the exact row this commit produced.
     guardState.stillHolds = false;
-    const existing = { id: "lease-1", agentName: "test-agent", issueId: "issue-1", claimToken: "tok-1", renewedAt: new Date("2026-10-22T00:00:00.000Z"), checkpoint: "issue_claimed" };
-    const ourRenewal = { ...existing, renewedAt: new Date("2026-10-23T01:00:00.000Z") };
-    mocks.leaseFindUnique.mockResolvedValue(existing);
+    const retired = {
+      id: "lease-1",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      claimToken: null,
+      disposition: null,
+      renewedAt: new Date("2026-10-22T00:00:00.000Z"),
+      checkpoint: "issue_claimed",
+    };
+    const ourRenewal = { ...retired, claimToken: "claim_minted", renewedAt: new Date("2026-10-23T01:00:00.000Z") };
+    mocks.leaseFindUnique.mockResolvedValue(retired);
     mocks.leaseUpdate.mockResolvedValue(ourRenewal);
+
     const res = await POST(makeRequest());
+
     expect(res.status).toBe(409);
     expect(mocks.addIssueLabel).not.toHaveBeenCalled();
     expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({
-      where: { id: "lease-1", claimToken: "tok-1", renewedAt: ourRenewal.renewedAt },
+      where: { id: "lease-1", claimToken: "claim_minted", renewedAt: ourRenewal.renewedAt },
+    });
+  });
+
+  it("does not delete a live attempt's lease receipt when the claim only RENEWED it (#1254)", async () => {
+    // #1254 regression: this claim only renewed a pre-existing lease row
+    // (same agent, the row already carries a claim token), so it did NOT
+    // mint the receipt — the row belongs to the live attempt. The old
+    // `{id, claimToken, renewedAt}` fence was not enough: renewals
+    // deliberately KEEP the claim token (#1256) and the loser's own renewal
+    // re-stamps `renewedAt` AFTER the winner's renewal, so the CAS could
+    // still match and delete the live attempt's row. The cleanup is now
+    // gated on the mint, so the row survives.
+    guardState.stillHolds = false;
+    const existing = {
+      id: "lease-1",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      claimToken: "tok-live",
+      disposition: null,
+      renewedAt: new Date("2026-10-22T00:00:00.000Z"),
+      checkpoint: "issue_claimed",
+    };
+    const ourRenewal = { ...existing, renewedAt: new Date("2026-10-23T01:00:00.000Z") };
+    mocks.leaseFindUnique.mockResolvedValue(existing);
+    mocks.leaseUpdate.mockResolvedValue(ourRenewal);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    // No remote write at all.
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The live attempt's receipt is left intact.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The failure audit says so.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: false,
+        errorMessage: expect.stringContaining("belongs to a live attempt"),
+      }),
     });
   });
 

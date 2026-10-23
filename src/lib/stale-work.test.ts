@@ -435,7 +435,7 @@ beforeEach(() => {
 describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
   it("does not release a claim when the sweep's guard was superseded before the lease delete", async () => {
     const work = makeWork();
-    const { client, leaseDeleteMany } = makeSweepClient({
+    const { client, leaseDeleteMany, auditRows } = makeSweepClient({
       candidates: [work],
       rows: [work],
       leases: [makeLease()],
@@ -455,6 +455,14 @@ describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
     // The row was restored to the shape the sweep found it in.
     expect(work.state).toBe("CLAIMED");
     expect(work.staleClaimReleasePending).toBe(false);
+    // #1254: the guard loss is audited — a skipped release must be visible.
+    const superseded = auditRows.filter((row: any) => row.action === "stale_agentwork_release_superseded");
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].success).toBe(false);
+    expect(superseded[0].actor).toBe("system");
+    expect(superseded[0].issueNumber).toBe(42);
+    expect(superseded[0].issueId).toBe("issue-1");
+    expect(superseded[0].errorMessage).toContain("before the lease delete");
   });
 
   it("does not strip the label when the guard is lost after the mark commits, before the remote release", async () => {
@@ -464,7 +472,7 @@ describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
     // its pending-release marker so the next sweep (or the force-claim's own
     // receipt) converges.
     const work = makeWork();
-    const { client, leaseDeleteMany } = makeSweepClient({
+    const { client, leaseDeleteMany, auditRows } = makeSweepClient({
       candidates: [work],
       rows: [work],
       leases: [makeLease()],
@@ -483,6 +491,12 @@ describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
     // The mark stays (with its pending-release marker) for the retry arm.
     expect(work.state).toBe("STALE");
     expect(work.staleClaimReleasePending).toBe(true);
+    // #1254: the guard loss is audited — a skipped remote release must be
+    // visible, not silent.
+    const superseded = auditRows.filter((row: any) => row.action === "stale_agentwork_release_superseded");
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].success).toBe(false);
+    expect(superseded[0].errorMessage).toContain("skipped the remote label release");
   });
 
   it("releases the claim normally when the sweep still holds the guard (control)", async () => {

@@ -536,6 +536,70 @@ describe("ownership reconciliation (#1254)", () => {
       // First (simulated) observation only: no "would release" annotation.
       const actions = fixture.tables.auditLog.map((r) => r.action);
       expect(actions).not.toContain("ownership_reconcile_release_withheld");
+      // The abandoned candidate is still surfaced: audit mode annotates every
+      // abandoned candidate once per pass, ladder state or not.
+      const annotations = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+      expect(annotations).toHaveLength(1);
+      expect(annotations[0].notes).toContain("state=ABANDONED_CANDIDATE");
+      expect(annotations[0].notes).toContain("wouldRelease=no (confirmation pending)");
+      expect(forgeShared.removeCalls).toHaveLength(0);
+    });
+
+    it("an abandoned candidate with no stored row: one annotation, zero writes anywhere else", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const writes = spyCandidateWrites(fixture.client);
+      const leaseBefore = { ...fixture.tables.lease[0] };
+      const workBefore = { ...fixture.tables.agentWork[0] };
+
+      const report = await runReconcile(fixture, now, "audit");
+
+      // No candidate writes at all.
+      expect(writes.deleteMany).not.toHaveBeenCalled();
+      expect(writes.update).not.toHaveBeenCalled();
+      expect(writes.upsert).not.toHaveBeenCalled();
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(0);
+      // No forge write, no lease/agentWork mutation.
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.lease[0]).toEqual(leaseBefore);
+      expect(fixture.tables.agentWork[0]).toEqual(workBefore);
+      // Exactly one candidate annotation for the abandoned candidate.
+      const annotations = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+      expect(annotations).toHaveLength(1);
+      expect(annotations[0].notes).toContain("state=ABANDONED_CANDIDATE");
+      expect(annotations[0].notes).toContain("ladder=1/2");
+      expect(annotations[0].notes).toContain("wouldRelease=no (confirmation pending)");
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+    });
+
+    it("a candidate inside the reclaim cooldown is still annotated (never silently dropped)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const writes = spyCandidateWrites(fixture.client);
+      // Reclaimed recently: the cooldown holds the candidate back before the
+      // ladder runs. In audit mode the candidate must still be surfaced.
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 1,
+        firstStaleAt: minutesAgo(now, 30),
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 1,
+        lastReclaimAt: minutesAgo(now, 1),
+      });
+
+      const report = await runReconcile(fixture, now, "audit");
+
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+      expect(writes.deleteMany).not.toHaveBeenCalled();
+      expect(writes.update).not.toHaveBeenCalled();
+      expect(writes.upsert).not.toHaveBeenCalled();
+      const annotations = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+      expect(annotations).toHaveLength(1);
+      expect(annotations[0].notes).toContain("wouldRelease=no (reclaim cooldown)");
       expect(forgeShared.removeCalls).toHaveLength(0);
     });
 
@@ -559,6 +623,12 @@ describe("ownership reconciliation (#1254)", () => {
       expect(fixture.tables.ownershipReconcileCandidate[0].lastObservedAt.getTime()).toBe(minutesAgo(now, 10).getTime());
       const actions = fixture.tables.auditLog.map((r) => r.action);
       expect(actions).toContain("ownership_reconcile_release_withheld");
+      // The abandoned candidate is annotated too, and the ladder HAS matured.
+      const annotations = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+      expect(annotations).toHaveLength(1);
+      expect(annotations[0].notes).toContain("state=ABANDONED_CANDIDATE");
+      expect(annotations[0].notes).toContain("ladder=2/2");
+      expect(annotations[0].notes).toContain("wouldRelease=yes");
       expect(forgeShared.removeCalls).toHaveLength(0);
       expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
     });
@@ -1618,5 +1688,10 @@ describe("ownership reconciliation (#1254)", () => {
       expect(fixture.tables.agentWork[0].state).not.toBe("RELEASED");
       expect(report.released).toBe(0);
       expect(report.errors.some((e: string) => e.includes("guard no longer held"))).toBe(true);
+      // #1254: the guard-loss tripwire records a failure audit.
+      const guardLost = fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_guard_lost");
+      expect(guardLost).toHaveLength(1);
+      expect(guardLost[0].success).toBe(false);
+      expect(guardLost[0].errorMessage).toContain("mutation guard no longer held");
     });
 });
