@@ -50,7 +50,20 @@ export const GUARD_HEARTBEAT_MS = 60_000;
  */
 export const GUARD_OVERRIDE_MIN_AGE_MS = 5 * GUARD_HEARTBEAT_MS;
 
-export interface IssueMutationContext { resuming: boolean }
+export interface IssueMutationContext {
+  resuming: boolean;
+  /**
+   * #1254: re-check, before a remote ownership write, that THIS holder still
+   * owns the guard. The override path can delete this holder's `executing`
+   * guard between acquisition and the remote call (a maintainer force-claim
+   * stealing a silent guard); this lets a callback detect that it no longer
+   * holds the anchor and back off before mutating GitHub. The residual window
+   * between this read and the remote call is the same accepted
+   * ownerToken-CAS-losing posture the deliberate override already takes — the
+   * override's CAS is the load-bearing fence, this is the pre-write tripwire.
+   */
+  stillHoldsGuard: () => Promise<boolean>;
+}
 export type IssueMutationResult<T> =
   | { status: "busy"; ownerToken: string; operation: string }
   | { status: "completed"; value: T }
@@ -173,7 +186,17 @@ export async function withIssueMutationGuard<T>(
   }
 
   try {
-    const result = await callback(undefined, { resuming });
+    const result = await callback(undefined, {
+      resuming,
+      // #1254: re-read the anchor and compare it against the token this holder
+      // captured on acquisition. A deleted-or-re-owned guard means the
+      // override won; the holder no longer holds the fence and must not commit
+      // remote ownership writes.
+      stillHoldsGuard: async () => {
+        const current = await prisma.issueMutationGuard.findUnique({ where: { issueId: request.issueId } });
+        return current?.ownerToken === guard.ownerToken && current.executing === true;
+      },
+    });
     if (result.complete) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
       return { status: "completed", value: result.value };

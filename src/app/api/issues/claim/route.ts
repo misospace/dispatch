@@ -81,7 +81,7 @@ export async function POST(request: Request) {
     // Maintainer force-claims may take over a guard left `executing` by a
     // crashed process — the deliberate operator decision the fail-closed
     // guard posture defers to (#1254). Automation never overrides.
-    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming }) => {
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming, stillHoldsGuard }) => {
     let remoteStarted = false;
     const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
@@ -217,9 +217,51 @@ export async function POST(request: Request) {
     // carrying agent/<this agent> is ours to take, not a conflict to 409 on.
     const analysis = analyzeAssignmentConflict(liveLabels, `${AGENT_PREFIX}${agentName}`);
 
+    // #1254: the shared supersede tripwire for the pre-write re-checks. When a
+    // maintainer force-claim has taken this holder's guard away, the callback
+    // must not commit remote ownership writes: it CAS-deletes any lease it
+    // committed (fenced on the claim token it minted, so it can never touch a
+    // newer attempt's receipt), records a failure audit, and 409s. No GitHub
+    // label is written — the override's own claim converges the state.
+    const superseded = async (leaseRow?: { id: string; claimToken?: string | null }): Promise<Response> => {
+      if (leaseRow?.id) {
+        try {
+          await prisma.lease.deleteMany({
+            where: { id: leaseRow.id, claimToken: leaseRow.claimToken ?? null },
+          });
+        } catch {
+          // Best-effort: a failed cleanup must not mask the 409.
+        }
+      }
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor,
+            action: "claim_issue",
+            repoFullName,
+            issueNumber,
+            issueId: issueId as string,
+            beforeLabels: liveLabels,
+            afterLabels: [],
+            success: false,
+            errorMessage: "Claim was superseded by an operator override before the remote label write",
+          },
+        });
+      } catch {
+        // A failing audit write must not mask the 409.
+      }
+      return errorResponse("Claim was superseded by an operator override before the remote label write", 409);
+    };
+
     // Check for agent conflict — if another agent is assigned, require force-claim
     if (analysis.hasAgentConflict) {
       if (force === true) {
+        // #1254: re-check the anchor before the remote removals. A maintainer
+        // force-claim can take this holder's guard before the remote writes;
+        // if so, do not start a remote mutation the holder no longer owns.
+        if (!(await stillHoldsGuard())) {
+          return superseded();
+        }
         // Force claim: remove ALL stale agent labels first.
         // buildNewLabels below drops every conflicting agent label from the
         // cache, so GitHub must lose all of them too — leaving extras behind
@@ -257,6 +299,16 @@ export async function POST(request: Request) {
         checkpoint: "issue_claimed",
         mutationGuardHeld: true,
       });
+
+      // #1254: re-check the anchor before the remote add. A maintainer
+      // force-claim can delete this holder's guard between the claim-intent
+      // (lease) commit and the label write; the override already retired our
+      // receipt, so committing the add here would race it. Back off: CAS-delete
+      // the lease we just minted and 409 — the add is idempotent, so the
+      // override's own claim lands the label.
+      if (!(await stillHoldsGuard())) {
+        return superseded(lease.lease);
+      }
 
       remoteStarted = true;
       // The add is idempotent: a fresh claim lands it once; a resumed claim

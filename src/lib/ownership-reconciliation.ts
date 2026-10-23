@@ -9,7 +9,8 @@
 //
 // 1. **Default-off.** `DISPATCH_OWNERSHIP_RECONCILE_MODE` is `off` unless the
 //    operator opts into `audit` (annotate only — no forge writes, no release
-//    mutations) or `enforce` (release confirmed-abandoned claims through the
+//    mutations, persisted candidate state read-only) or `enforce` (release
+//    confirmed-abandoned claims through the
 //    §8.7 protocol). Missing telemetry is never abandonment: a release only
 //    follows the §8.2 confirmation ladder (sustained stale observations) or
 //    positive terminal-disposition evidence, and a bounded reclaim counter
@@ -429,7 +430,7 @@ async function driveReleaseIntent(
 
   const guarded = await guard(
     { issueId: intent.issueId, operation: "reconcile-release", agentName: intent.agentName },
-    async (): Promise<{ complete: boolean; value: ReleaseOutcome }> => {
+    async (_tx, { stillHoldsGuard }): Promise<{ complete: boolean; value: ReleaseOutcome }> => {
       try {
         // #1254 acceptance ("re-check … at commit time") extended to the
         // replay entry: the same hold/review/external-wait re-check runs
@@ -512,6 +513,18 @@ async function driveReleaseIntent(
 
         if (!issue) {
           return { complete: true, value: { kind: "error", error: "settle skipped: issue row missing" } };
+        }
+
+        // #1254: anchor tripwire immediately before the ONLY remote write.
+        // The intent re-check above authorizes the delete; this re-check proves
+        // this holder still owns the guard it runs under, so a maintainer
+        // override that cleared a silent reconcile-release guard cannot be
+        // followed by a stale forge delete from the abandoned attempt.
+        if (!(await stillHoldsGuard())) {
+          return {
+            complete: true,
+            value: { kind: "skipped", error: "release skipped: mutation guard no longer held (superseded before Phase B)" },
+          };
         }
 
         // Phase B — the ONLY remote mutation of a release. Targeted delete of
@@ -1201,9 +1214,11 @@ function resolveDeps(deps?: Partial<OwnershipReconcileDeps>): ResolvedDeps {
 
 /**
  * One bounded reconciliation pass (§8.1): replay pending intents, then examine
- * candidates through the §8.2 confirmation ladder. `audit` mode annotates and
- * records observations but never releases; `enforce` releases through the
- * §8.7 two-sided protocol. `off` does nothing.
+ * candidates through the §8.2 confirmation ladder. `audit` mode annotates
+ * only — persisted candidate state is read-only (the ladder re-derives from
+ * stored state each pass, or a simulated fresh row when none exists) and it
+ * never releases; `enforce` releases through the §8.7 two-sided protocol.
+ * `off` does nothing.
  */
 export async function reconcileOwnership(
   deps?: Partial<OwnershipReconcileDeps>,
@@ -1323,10 +1338,15 @@ export async function reconcileOwnership(
 
       if (assessment.state !== "ABANDONED_CANDIDATE") {
         // Renewal observed mid-ladder (§8.4): candidacy is aborted, never
-        // carried forward as a stale blip.
-        const deleted = await client.ownershipReconcileCandidate.deleteMany({
-          where: { issueId: issue.id },
-        });
+        // carried forward as a stale blip. Audit mode is read-only for
+        // candidate state: the stored row (if any) survives untouched and
+        // the annotation below is the only output of this branch.
+        const deleted =
+          mode === "audit"
+            ? { count: 0 }
+            : await client.ownershipReconcileCandidate.deleteMany({
+                where: { issueId: issue.id },
+              });
         report.retained++;
         if (mode === "audit" || deleted.count > 0) {
           try {
@@ -1346,33 +1366,52 @@ export async function reconcileOwnership(
 
       // ── ABANDONED_CANDIDATE: the confirmation ladder (§8.2) ──
       const owner = assessment.ownerAgent ?? labelOwner;
-      const candidateRow = await client.ownershipReconcileCandidate.upsert({
-        where: { issueId: issue.id },
-        create: {
-          issueId: issue.id,
-          agentName: owner ?? "unknown",
-          staleCount: 0,
-        },
-        update: {},
-      });
+      // Audit mode performs zero candidate writes: the ladder re-derives
+      // from the stored row, or from a simulated fresh row when none exists.
+      // The stored row never advances in audit, so each audit pass starts
+      // from the same stored state — intended, not a bug.
+      const candidateRow =
+        mode === "audit"
+          ? (await client.ownershipReconcileCandidate.findUnique({
+              where: { issueId: issue.id },
+            }) ?? {
+                agentName: owner ?? "unknown",
+                staleCount: 0,
+                firstStaleAt: null,
+                lastObservedAt: null,
+                reclaimCount: 0,
+                lastReclaimAt: null,
+              })
+          : await client.ownershipReconcileCandidate.upsert({
+              where: { issueId: issue.id },
+              create: {
+                issueId: issue.id,
+                agentName: owner ?? "unknown",
+                staleCount: 0,
+              },
+              update: {},
+            });
 
       // A different owner inherited the previous owner observations: the
       // ladder observations and the reclaim counter are per-claim, so a new
       // owner restarts the full confirmation ladder (§8.2 — two independent
-      // observations of THIS claim, not of the previous one).
+      // observations of THIS claim, not of the previous one). Audit mode
+      // applies the reset to the in-memory row only (no candidate write).
       let effectiveRow = candidateRow;
       if (owner != null && candidateRow.agentName !== owner) {
-        await client.ownershipReconcileCandidate.update({
-          where: { issueId: issue.id },
-          data: {
-            agentName: owner,
-            staleCount: 0,
-            firstStaleAt: null,
-            lastObservedAt: null,
-            reclaimCount: 0,
-            lastReclaimAt: null,
-          },
-        });
+        if (mode !== "audit") {
+          await client.ownershipReconcileCandidate.update({
+            where: { issueId: issue.id },
+            data: {
+              agentName: owner,
+              staleCount: 0,
+              firstStaleAt: null,
+              lastObservedAt: null,
+              reclaimCount: 0,
+              lastReclaimAt: null,
+            },
+          });
+        }
         effectiveRow = { ...candidateRow, agentName: owner, staleCount: 0, firstStaleAt: null, lastObservedAt: null, reclaimCount: 0, lastReclaimAt: null };
       }
 
@@ -1412,16 +1451,22 @@ export async function reconcileOwnership(
         staleCount += 1;
       }
 
-      await client.ownershipReconcileCandidate.update({
-        where: { issueId: issue.id },
-        data: {
-          agentName: assessment.ownerAgent ?? labelOwner ?? "unknown",
-          staleCount,
-          firstStaleAt: effectiveRow.firstStaleAt ?? now,
-          lastObservedAt: now,
-          lastReasons: assessment.reasonCodes.join(","),
-        },
-      });
+      // Audit mode is read-only for candidate state: the in-memory
+      // `staleCount` still drives the report counters and the "would
+      // release" annotation below, but the stored row never advances —
+      // each audit pass re-derives the ladder from stored state.
+      if (mode !== "audit") {
+        await client.ownershipReconcileCandidate.update({
+          where: { issueId: issue.id },
+          data: {
+            agentName: assessment.ownerAgent ?? labelOwner ?? "unknown",
+            staleCount,
+            firstStaleAt: effectiveRow.firstStaleAt ?? now,
+            lastObservedAt: now,
+            lastReasons: assessment.reasonCodes.join(","),
+          },
+        });
+      }
 
       if (staleCount < 2) {
         report.retained++;

@@ -504,11 +504,23 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > token-less intent), and clears the intent without a second lifecycle event
 > when another writer already released the claim. The stale-work sweep defers
 > to pending intents (the reconciler owns that release). The §8.5 status
-> selection is computed against a fresh live label read (#1037).
+> selection is computed against a fresh live label read (#1037). The override's
+> CAS is the load-bearing fence; each guarded callback's pre-write re-check is
+> the tripwire. Every guarded callback (claim, direct `assign_agent`, and the
+> stale-work sweep) re-reads the anchor immediately before a remote ownership
+> write: if the guard no longer belongs to that holder — deleted, or re-owned
+> by a concurrent maintainer force-claim — the callback backs off before the
+> write (fenced-deleting any lease it minted) instead of racing the override.
+> The residual window between that read and the remote call is the same
+> ownerToken-CAS-losing cost the override itself accepts; the re-check only
+> closes the case where the override's delete has already committed.
 > Mode semantics: `off` (default) starts no new release but still **replays**
 > intents already committed before the mode change — otherwise a pending
 > intent would hold the issue's claim path forever with no self-healing path;
-> `audit` performs no mutations at all, not even replay; `enforce` runs the
+> `audit` performs no mutations at all — it is read-only for persisted
+> `OwnershipReconcileCandidate` state (each pass re-derives the ladder from
+> stored state, or a simulated fresh row when none exists), writes only
+> AuditLog annotations, and does not even replay intents; `enforce` runs the
 > full protocol. A claim with zero Dispatch-side evidence still derives
 > `UNKNOWN` (#1251) and is never released — the intent-only Phase A (null
 > attempt token) is reachable only for claims whose ladder decision rested on

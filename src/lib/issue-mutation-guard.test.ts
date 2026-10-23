@@ -259,13 +259,57 @@ describe("issue mutation guard", () => {
     }
   });
 
-  it("reopens a thrown callback but keeps the owner barrier", async () => {
-    vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
-    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
-    vi.mocked(prisma.issueMutationGuard.updateMany as any).mockResolvedValue({ count: 1 });
-    const error = new Error("failure");
-    await expect(withIssueMutationGuard(request, async () => { throw error; })).rejects.toBe(error);
-    expect(prisma.issueMutationGuard.updateMany).toHaveBeenCalledWith({ where: { issueId: "issue-1", ownerToken: "existing", executing: true }, data: { executing: false } });
-    expect(prisma.issueMutationGuard.deleteMany).not.toHaveBeenCalled();
-  });
+   it("reopens a thrown callback but keeps the owner barrier", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
+     vi.mocked(prisma.issueMutationGuard.updateMany as any).mockResolvedValue({ count: 1 });
+     const error = new Error("failure");
+     await expect(withIssueMutationGuard(request, async () => { throw error; })).rejects.toBe(error);
+     expect(prisma.issueMutationGuard.updateMany).toHaveBeenCalledWith({ where: { issueId: "issue-1", ownerToken: "existing", executing: true }, data: { executing: false } });
+     expect(prisma.issueMutationGuard.deleteMany).not.toHaveBeenCalled();
+   });
+
+   it("stillHoldsGuard reports true while this holder still owns the anchor (#1254)", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+     // Acquisition read, then the callback's re-check read: both still ours.
+     vi.mocked(prisma.issueMutationGuard.findUnique)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never);
+     const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+       complete: true,
+       value: await context.stillHoldsGuard(),
+     }));
+     expect(result).toMatchObject({ status: "completed", value: true });
+   });
+
+   it("stillHoldsGuard reports false once an override re-owns the anchor (#1254)", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+     // Acquisition read is ours; the callback's re-check read returns a guard
+     // a different ownerToken now holds — a maintainer force-claim took it.
+     vi.mocked(prisma.issueMutationGuard.findUnique)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never)
+       .mockResolvedValueOnce(row({ ownerToken: "override-owner", executing: true }) as never);
+     const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+       complete: true,
+       value: await context.stillHoldsGuard(),
+     }));
+     expect(result).toMatchObject({ status: "completed", value: false });
+   });
+
+   it("stillHoldsGuard reports false when the anchor row has been deleted (#1254)", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+     // Acquisition read is ours; the re-check read finds no row (deleted, and
+     // the override's own create has not committed yet).
+     vi.mocked(prisma.issueMutationGuard.findUnique)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never)
+       .mockResolvedValueOnce(null as never);
+     const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+       complete: true,
+       value: await context.stillHoldsGuard(),
+     }));
+     expect(result).toMatchObject({ status: "completed", value: false });
+   });
 });

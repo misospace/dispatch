@@ -2,7 +2,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 // vi.hoisted() runs at the very top of the file, before vi.mock() hoisting.
-const { mocks } = vi.hoisted(() => ({
+const { mocks, guardState } = vi.hoisted(() => ({
+  guardState: { stillHolds: true },
   mocks: {
     findIssue: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
@@ -39,9 +40,12 @@ vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabel
 vi.mock("@/lib/issue-mutation-guard", () => ({
   // #1254: the assign path serializes on the per-issue anchor; the fake
   // always grants the lock.
-  withIssueMutationGuard: async (_req: unknown, cb: () => Promise<{ complete: boolean; value: unknown }>) => ({
+  withIssueMutationGuard: async (
+    _req: unknown,
+    cb: (tx: unknown, context: { resuming: boolean; stillHoldsGuard: () => Promise<boolean> }) => Promise<{ complete: boolean; value: unknown }>,
+  ) => ({
     status: "completed",
-    value: (await cb()).value,
+    value: (await cb(undefined, { resuming: false, stillHoldsGuard: async () => guardState.stillHolds })).value,
   }),
 }));
 
@@ -55,6 +59,7 @@ import { POST } from "./route";
 
 // Reset process-global per-actor rate-limit windows per test (see claim suite).
 beforeEach(() => {
+  guardState.stillHolds = true;
   resetRateLimits();
 });
 
@@ -370,6 +375,26 @@ describe("POST /api/issues/actions — assign_agent", () => {
     expect(body.labels).toContain("priority/p1");
     expect(body.labels).toContain("type/bug");
     expect(body.labels).not.toContain("agent/old");
+  });
+
+  it("does not commit a superseded assign_agent before the remote label write (#1254)", async () => {
+    guardState.stillHolds = false;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "type/feature"]);
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("superseded");
+    // No remote label write, no local cache write, no audit: the holder lost the guard.
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("commits a normal assign_agent when the guard is still held (control)", async () => {
+    guardState.stillHolds = true;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "type/feature"]);
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssueLabels).toHaveBeenCalled();
   });
 });
 

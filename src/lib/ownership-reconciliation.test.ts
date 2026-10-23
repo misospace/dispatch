@@ -196,7 +196,13 @@ function makeFakePrisma() {
       if (where.id !== undefined) return rows().find((r) => r.id === where.id);
       const key = Object.keys(where)[0];
       if (!key) throw new Error(`fake ${name}.findUnique: unsupported selector`);
-      return rows().find((r) => matchesWhere(r, where[key]));
+      const cond = where[key];
+      if (cond !== null && typeof cond === "object") {
+        // Compound unique selector, e.g. agentName_issueId: { agentName, issueId }
+        return rows().find((r) => matchesWhere(r, cond));
+      }
+      // Scalar unique field, e.g. { issueId } on ownershipReconcileCandidate.
+      return rows().find((r) => matchesScalar(r[key], cond));
     };
     return {
       findMany: async (args: any = {}) => {
@@ -301,7 +307,7 @@ function makeFakeGuard() {
     held.set(request.issueId, { operation: request.operation, agentName: request.agentName });
     attempts.push({ ...request, status: "acquired" });
     try {
-      const result = await callback(undefined, { resuming: false });
+      const result = await callback(undefined, { resuming: false, stillHoldsGuard: async () => true });
       return result;
     } finally {
       held.delete(request.issueId);
@@ -431,6 +437,104 @@ describe("ownership reconciliation (#1254)", () => {
       expect(report.retained).toBeGreaterThanOrEqual(1);
       const actions = fixture.tables.auditLog.map((r) => r.action);
       expect(actions).toContain("ownership_reconcile_release_withheld");
+    });
+  });
+
+  describe("audit mode is read-only for candidate state", () => {
+    // The fake is table-based; "not called" is asserted through call-counting
+    // wrappers around the candidate model's write methods.
+    function spyCandidateWrites(client: any) {
+      const model = client.ownershipReconcileCandidate;
+      const writes = {
+        deleteMany: vi.fn((args: any) => model.deleteMany(args)),
+        update: vi.fn((args: any) => model.update(args)),
+        upsert: vi.fn((args: any) => model.upsert(args)),
+      };
+      model.deleteMany = writes.deleteMany;
+      model.update = writes.update;
+      model.upsert = writes.upsert;
+      return writes;
+    }
+
+    function preseededMatureCandidate(now: Date) {
+      return {
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 1,
+        firstStaleAt: minutesAgo(now, 30),
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 0,
+        lastReclaimAt: null,
+      };
+    }
+
+    it("a renewal mid-ladder: no candidate deleteMany/update/upsert, annotation still emitted", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const writes = spyCandidateWrites(fixture.client);
+      const preseeded = preseededMatureCandidate(now);
+      fixture.tables.ownershipReconcileCandidate.push(preseeded);
+      // The worker renews between observations: fresh evidence → non-abandoned state.
+      fixture.tables.lease[0].renewedAt = now;
+      fixture.tables.lease[0].lastRenewalObservedAt = now;
+      fixture.tables.lease[0].expiredAt = new Date(now.getTime() + 40 * MIN);
+      fixture.tables.agentWork[0].lastHeartbeatAt = now;
+
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+      expect(writes.deleteMany).not.toHaveBeenCalled();
+      expect(writes.update).not.toHaveBeenCalled();
+      expect(writes.upsert).not.toHaveBeenCalled();
+      // The stored row survives untouched.
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(1);
+      expect(fixture.tables.ownershipReconcileCandidate[0]).toBe(preseeded);
+      const actions = fixture.tables.auditLog.map((r) => r.action);
+      expect(actions).toContain("ownership_reconcile_candidate");
+    });
+
+    it("no stored row: the ladder is simulated in memory only (first observation)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const writes = spyCandidateWrites(fixture.client);
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+      expect(writes.deleteMany).not.toHaveBeenCalled();
+      expect(writes.update).not.toHaveBeenCalled();
+      expect(writes.upsert).not.toHaveBeenCalled();
+      expect(fixture.tables.ownershipReconcileCandidate).toHaveLength(0);
+      // First (simulated) observation only: no "would release" annotation.
+      const actions = fixture.tables.auditLog.map((r) => r.action);
+      expect(actions).not.toContain("ownership_reconcile_release_withheld");
+      expect(forgeShared.removeCalls).toHaveLength(0);
+    });
+
+    it("a mature stored row past the re-check interval: 'would release' annotation, zero candidate writes", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const writes = spyCandidateWrites(fixture.client);
+      const preseeded = preseededMatureCandidate(now);
+      fixture.tables.ownershipReconcileCandidate.push(preseeded);
+
+      const report = await runReconcile(fixture, now, "audit");
+      expect(report.examined).toBe(1);
+      expect(report.retained).toBe(1);
+      expect(report.released).toBe(0);
+      expect(writes.deleteMany).not.toHaveBeenCalled();
+      expect(writes.update).not.toHaveBeenCalled();
+      expect(writes.upsert).not.toHaveBeenCalled();
+      // The stored row never advances: each audit pass re-derives from it.
+      expect(fixture.tables.ownershipReconcileCandidate[0]).toBe(preseeded);
+      expect(fixture.tables.ownershipReconcileCandidate[0].staleCount).toBe(1);
+      expect(fixture.tables.ownershipReconcileCandidate[0].lastObservedAt.getTime()).toBe(minutesAgo(now, 10).getTime());
+      const actions = fixture.tables.auditLog.map((r) => r.action);
+      expect(actions).toContain("ownership_reconcile_release_withheld");
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
     });
   });
 
@@ -1444,5 +1548,49 @@ describe("ownership reconciliation (#1254)", () => {
       // No NEW candidate work happens in off mode.
       expect(report.examined).toBe(0);
       expect(report.released).toBe(1);
+    });
+
+    it("Phase B is skipped when the reconcile-release guard was superseded before the remote delete (#1254 tripwire)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      // Mature observation: enforce would run Phase A → B → C in this pass.
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 1,
+        firstStaleAt: minutesAgo(now, 30),
+        lastObservedAt: minutesAgo(now, 10),
+        reclaimCount: 0,
+        lastReclaimAt: null,
+      });
+      // Instrumented guard: the callback runs, but its anchor re-check reports
+      // that a maintainer override already cleared this reconcile-release guard.
+      const baseGuard = fixture.guard.fake;
+      const superseded = async (request: any, callback: any) => {
+        if (request.operation === "reconcile-release") {
+          return baseGuard(request, (tx: any) =>
+            callback(tx, { resuming: false, stillHoldsGuard: async () => false }),
+          );
+        }
+        return baseGuard(request, callback);
+      };
+      vi.stubEnv("DISPATCH_OWNERSHIP_RECONCILE_MODE", "enforce");
+      const { reconcileOwnership } = await import("@/lib/ownership-reconciliation");
+      const report = await reconcileOwnership(
+        { prisma: fixture.client, forge: forgeShared, guard: superseded },
+        now,
+      );
+
+      // The abandoned attempt issues ZERO remote deletes...
+      expect(forgeShared.removeCalls).toHaveLength(0);
+      // ...and the committed intent stays pending (the override's own claim,
+      // or the next pass, settles or supersedes it).
+      const intent = fixture.tables.ownershipReleaseIntent.find((r: any) => r.issueId === ISSUE_ID);
+      expect(intent?.phase).toBe("pending");
+      // Nothing settled: the claim's AgentWork row is untouched.
+      expect(fixture.tables.agentWork[0].state).not.toBe("RELEASED");
+      expect(report.released).toBe(0);
+      expect(report.errors.some((e: string) => e.includes("guard no longer held"))).toBe(true);
     });
 });

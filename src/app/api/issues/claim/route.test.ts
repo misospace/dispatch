@@ -1,7 +1,7 @@
-const { guardState } = vi.hoisted(() => ({ guardState: { resuming: false } }));
+const { guardState } = vi.hoisted(() => ({ guardState: { resuming: false, stillHolds: true } }));
 vi.mock("@/lib/issue-mutation-guard", () => ({
   withIssueMutationGuard: async (_request: unknown, callback: any) => {
-    const result = await callback(undefined, { resuming: guardState.resuming });
+    const result = await callback(undefined, { resuming: guardState.resuming, stillHoldsGuard: async () => guardState.stillHolds });
     return { status: result.complete ? "completed" : "retained", value: result.value };
   },
 }));
@@ -93,6 +93,7 @@ import { POST } from "./route";
 // as move/webhook suites).
 beforeEach(() => {
   guardState.resuming = false;
+  guardState.stillHolds = true;
   resetRateLimits();
 });
 
@@ -923,6 +924,66 @@ describe("POST /api/issues/claim — §8.7 pending release intent (#1254)", () =
     // The pending intent was superseded (force exemption), not raced.
     expect(mocks.intentUpdateMany).toHaveBeenCalled();
     expect(mocks.supersedeAuditCreate).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/claim — §8.7 override pre-write re-check (#1254)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    // clearAllMocks does not reset prior tests' implementations; pin the lease
+    // read so upsertLease takes the create path and honors the per-test lease.
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 1 });
+    mocks.intentFindFirst.mockResolvedValue(null);
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  it("does not commit a superseded non-force claim before the remote add (check b)", async () => {
+    guardState.stillHolds = false;
+    mocks.leaseCreate.mockResolvedValue({ id: "lease-1", claimToken: "tok-1" });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The minted receipt is fenced-deleted so the override's claim can own it.
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1" } });
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
+  });
+
+  it("does not start a superseded force claim before the remote removals (check a)", async () => {
+    guardState.stillHolds = false;
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other"] });
+    mocks.getLiveIssueLabels.mockResolvedValue(["agent/other"]);
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(409);
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    // No lease was minted before the re-check, so there is nothing to fence-delete.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
+  });
+
+  it("commits a normal claim when the guard is still held (control)", async () => {
+    // stillHolds stays true (reset in the module-level beforeEach): the claim lands.
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.addIssueLabel).toHaveBeenCalled();
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
   });
 });
 

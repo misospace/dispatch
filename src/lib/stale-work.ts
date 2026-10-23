@@ -471,7 +471,7 @@ export async function sweepStaleWork(
   // lease (fenced on its epoch), release the GitHub claim, finalize the row.
   // For issue-scoped claims the whole pipeline runs inside the per-issue
   // mutation fence held by the caller.
-  const reclaimStaleRow = async (work: any): Promise<void> => {
+  const reclaimStaleRow = async (work: any, guardCheck?: () => Promise<boolean>): Promise<void> => {
     // Claim the stale transition before external I/O. A heartbeat that
     // commits first makes the conditional update miss; a heartbeat after
     // this point sees a terminal STALE row and cannot revive it midway.
@@ -550,6 +550,25 @@ export async function sweepStaleWork(
         // The claim stays with the live sibling: no lease delete, no
         // release, so the `agent/<name>` label survives untouched.
         return { marked: true, retained: true, retention: "live_sibling", liveSiblingId: liveSibling.id };
+      }
+
+      // #1254: re-check the anchor before the sweep commits the release. A
+      // maintainer force-claim can take this holder's guard between the mark
+      // and the lease delete; a superseded stale-release must not delete the
+      // lease and then run the post-transaction release, which would strip the
+      // agent label the new claim owns. Restore the row to the shape the sweep
+      // found it in and back off — the force-claim's own receipt converges the
+      // state, and `marked: false` short-circuits the release below.
+      if (guardCheck && !(await guardCheck())) {
+        await tx.agentWork.updateMany({
+          where: { id: work.id, state: "STALE" },
+          data: {
+            state: before.state,
+            leaseExpiresAt: before.leaseExpiresAt,
+            staleClaimReleasePending: before.staleClaimReleasePending,
+          },
+        });
+        return { marked: false, retained: false };
       }
 
       // Releasing the lease in the same transaction as the stale marker
@@ -685,6 +704,14 @@ export async function sweepStaleWork(
     }
 
     if (work.issue) {
+      // #1254: second tripwire. The mark committed above, so an override that
+      // lands between that commit and this remote write must still not strip
+      // the label a forced claimant now owns. The row keeps its pending-release
+      // marker, so the next sweep (or the force-claim's own receipt) converges.
+      if (guardCheck && !(await guardCheck())) {
+        report.skipped++;
+        return;
+      }
       // The release is attributed to the sweep, not to the abandoned agent:
       // nobody chose to let this claim go, and a claim-to-merge read must be
       // able to tell a recovered stall apart from a worker's own unclaim
@@ -766,7 +793,7 @@ export async function sweepStaleWork(
         // window that completed far enough to owe one.
         const guarded = await withIssueMutationGuard(
           { issueId: work.issueId, operation: "stale-release", agentName: work.agentName },
-          async () => ({ complete: true, value: await reclaimStaleRow(work) }),
+          async (_tx, context) => ({ complete: true, value: await reclaimStaleRow(work, context.stillHoldsGuard) }),
         );
         if (guarded.status === "busy") report.skipped++;
       } else {

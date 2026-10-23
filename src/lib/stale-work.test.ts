@@ -20,13 +20,18 @@ vi.mock("@/lib/prisma", () => ({ prisma: {} }));
 const { guard } = vi.hoisted(() => {
   const held = new Map<string, { operation: string; agentName?: string }>();
   const attempts: Array<{ issueId: string; operation: string; agentName?: string; status: string }> = [];
+  // #1254: the per-holder anchor re-check. Tests flip `value` to false to make
+  // the sweep's pre-write re-check report that the guard was superseded.
+  const checks = { value: true };
   return {
     guard: {
       held,
       attempts,
+      checks,
       reset: () => {
         held.clear();
         attempts.length = 0;
+        checks.value = true;
       },
     },
   };
@@ -42,7 +47,7 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
     guard.held.set(request.issueId, { operation: request.operation, agentName: request.agentName });
     guard.attempts.push({ ...request, status: "acquired" });
     try {
-      const result = await callback(undefined, { resuming: false });
+      const result = await callback(undefined, { resuming: false, stillHoldsGuard: async () => guard.checks.value });
       if (result.complete) return { status: "completed", value: result.value };
       return { status: "retained", ownerToken: "self", value: result.value };
     } finally {
@@ -425,6 +430,77 @@ beforeEach(() => {
   vi.clearAllMocks();
   guard.reset();
   removeIssueLabelMock.mockResolvedValue(undefined);
+});
+
+describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
+  it("does not release a claim when the sweep's guard was superseded before the lease delete", async () => {
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+
+    // A maintainer force-claim takes the sweep's guard right before the sweep's
+    // lease delete: the re-check must stop the release in its tracks.
+    guard.checks.value = false;
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(0);
+    expect(report.claimRetained).toBe(0);
+    expect(report.skipped).toBe(1);
+    // No lease delete, no label removal: the override's claim owns the issue.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    // The row was restored to the shape the sweep found it in.
+    expect(work.state).toBe("CLAIMED");
+    expect(work.staleClaimReleasePending).toBe(false);
+  });
+
+  it("does not strip the label when the guard is lost after the mark commits, before the remote release", async () => {
+    // The second tripwire: the mark + lease delete committed while the sweep
+    // still owned the guard; a force-claim lands before the remote
+    // releaseIssueClaim. The remote label write must not run — the row keeps
+    // its pending-release marker so the next sweep (or the force-claim's own
+    // receipt) converges.
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+    const originalDeleteMany = leaseDeleteMany.getMockImplementation();
+    leaseDeleteMany.mockImplementation(((...args: unknown[]) => {
+      guard.checks.value = false; // the override wins right after the delete
+      return (originalDeleteMany as (...a: unknown[]) => unknown)(...args);
+    }) as typeof leaseDeleteMany);
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    // The mark stays (with its pending-release marker) for the retry arm.
+    expect(work.state).toBe("STALE");
+    expect(work.staleClaimReleasePending).toBe(true);
+  });
+
+  it("releases the claim normally when the sweep still holds the guard (control)", async () => {
+
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+  });
 });
 
 describe("sweepStaleWork — one claim_released per claim epoch (#1202 review)", () => {
