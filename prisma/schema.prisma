@@ -158,6 +158,11 @@ enum PrFixType {
   CI_FAILURE
   REVIEW_FEEDBACK
   OTHER
+  // Mechanical rebase lane (#1327): a DIRTY PR is handed a bounded rebase
+  // attempt instead of a code-fix generation. The Postgres enum is the write
+  // path's contract — a value it lacks cannot be persisted at all — so it
+  // must move together with `PrFixType` in src/types/index.ts.
+  REBASE
 }
 
 model PrFixQueueItem {
