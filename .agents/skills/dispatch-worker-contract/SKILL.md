@@ -81,6 +81,8 @@ The `next-task` endpoint returns one of three task types:
 
 A `followup-pr` task names the queued item's lane in `prFixItem.fixType`. The task's `reasons` carry the full contract for the item; `fixType` is the branch key that lets a worker pick the lane without parsing prose.
 
+For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#1327): `next-task` hands out at most one live rebase at a time across all PRs (concurrency 1, no fan-out; deferred candidates are retried next poll), and a `failed` or give-up `blocked` report on a `REBASE` item settles as a terminal `PARKED` — it is never re-dispatched as a fresh attempt the way other fix types are under `PR_FIX_MAX_ATTEMPTS`. A new dirty episode (a new head) re-opens the item.
+
 | `fixType` | Contract |
 |-----------|----------|
 | `REBASE` | Mechanical rebase lane (#1327). Rebase the PR branch onto its base and reconcile conflicts **mechanically only**: lockfiles, version strings, import order, doc indexes, adjacent non-overlapping hunks, and comment-only overlaps where one side is a strict subset. Never edit the same logic on both sides, never merge, never open a PR. Push with `--force-with-lease`, then run the repo's bounded typecheck — an unfixable error in a file this PR touches means the rebase was not mechanical. On **any** semantic conflict, report `outcome: "blocked"` with `blockReason: "human_decision"`, the conflicting files, and why the conflict is not mechanical; do not resolve it yourself. One attempt per dirty episode: do not retry. |
