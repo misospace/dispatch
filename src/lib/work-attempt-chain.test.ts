@@ -55,8 +55,10 @@ function prFixItem(
     fixAttempts: overrides.fixAttempts ?? 1,
     status: overrides.status ?? "QUEUED",
     outcome: overrides.outcome ?? null,
+    type: overrides.type ?? "REVIEW_FEEDBACK",
     queuedAt: overrides.queuedAt ?? "2026-10-01T12:00:00.000Z",
     history: overrides.history ?? [],
+    historyTruncated: overrides.historyTruncated ?? false,
     ...overrides,
   };
 }
@@ -124,8 +126,22 @@ describe("buildWorkItemDeliveryChain", () => {
           status: "FIXED",
           queuedAt: "2026-10-01T12:00:00.000Z",
           history: [
-            { at: "2026-10-01T12:00:00.000Z", action: "enqueue", status: "QUEUED", outcome: null },
-            { at: "2026-10-01T13:00:00.000Z", action: "mark", status: "FIXED", outcome: null },
+            {
+              id: "h-1",
+              at: "2026-10-01T12:00:00.000Z",
+              action: "enqueue",
+              status: "QUEUED",
+              outcome: null,
+              evidenceKey: "review:octocat/hello-world#7",
+            },
+            {
+              id: "h-2",
+              at: "2026-10-01T13:00:00.000Z",
+              action: "mark",
+              status: "FIXED",
+              outcome: null,
+              evidenceKey: null,
+            },
           ],
         }),
       ],
@@ -140,7 +156,7 @@ describe("buildWorkItemDeliveryChain", () => {
     expect(result.attempts[0].kind).toBe("execution");
     expect(result.attempts[0].prFix).toBeNull();
     expect(result.attempts[1].kind).toBe("fix-round");
-    expect(result.attempts[1].prFix).toEqual({ itemId: "item-1", repo: "octocat/hello-world", pr: 7 });
+    expect(result.attempts[1].prFix).toEqual({ itemId: "item-1", repo: "octocat/hello-world", pr: 7, type: "REVIEW_FEEDBACK" });
     expect(result.attempts[2].outcome).toBe("success");
   });
 
@@ -853,7 +869,7 @@ describe("buildWorkItemDeliveryChain", () => {
         prFixItem({
           id: "item-1",
           pr: 7,
-          history: [{ at: "nope", action: "enqueue", status: null, outcome: null }],
+          history: [{ id: "h-bad", at: "nope", action: "enqueue", status: null, outcome: null, evidenceKey: null }],
         }),
       ],
     });
@@ -903,5 +919,210 @@ describe("buildWorkItemDeliveryChain", () => {
     });
 
     expect(reversed).toEqual(forward);
+  });
+
+  describe("pr-fix evidence events (#1183 acceptance)", () => {
+    function historyEntry(
+      overrides: Partial<{
+        id: string;
+        at: Date | string;
+        action: string;
+        status: string | null;
+        outcome: string | null;
+        evidenceKey: string | null;
+      }> & { id: string; at: Date | string; action: string },
+    ) {
+      return {
+        id: overrides.id,
+        at: overrides.at,
+        action: overrides.action,
+        status: overrides.status ?? null,
+        outcome: overrides.outcome ?? null,
+        evidenceKey: overrides.evidenceKey ?? null,
+      };
+    }
+
+    it("keeps enqueue, ack, reclaim, requeue, handoff, reactivation, external-wait, settlement distinct", () => {
+      const result = chain({
+        prFixItems: [
+          prFixItem({
+            id: "item-1",
+            pr: 7,
+            generation: 2,
+            status: "FIXED",
+            history: [
+              historyEntry({ id: "h-enq", at: "2026-10-01T09:00:00.000Z", action: "enqueue" }),
+              historyEntry({ id: "h-ack", at: "2026-10-01T09:10:00.000Z", action: "ack" }),
+              historyEntry({ id: "h-rec", at: "2026-10-01T09:20:00.000Z", action: "reclaim" }),
+              historyEntry({ id: "h-req", at: "2026-10-01T09:30:00.000Z", action: "requeue" }),
+              historyEntry({ id: "h-cap", at: "2026-10-01T09:40:00.000Z", action: "capacity_handoff" }),
+              historyEntry({
+                id: "h-ext",
+                at: "2026-10-01T09:50:00.000Z",
+                action: "mark",
+                status: "WAITING_EXTERNAL",
+              }),
+              historyEntry({ id: "h-reopen", at: "2026-10-01T10:00:00.000Z", action: "mark", status: "QUEUED" }),
+              historyEntry({ id: "h-fixed", at: "2026-10-01T10:10:00.000Z", action: "mark", status: "FIXED" }),
+              historyEntry({ id: "h-future", at: "2026-10-01T10:20:00.000Z", action: "quantum_leap" }),
+            ],
+          }),
+        ],
+      });
+
+      expect(result.prFixEvents.map((e) => [e.eventId, e.eventClass])).toEqual([
+        ["h-enq", "enqueue"],
+        ["h-ack", "ack"],
+        ["h-rec", "reclaim"],
+        ["h-req", "requeue"],
+        ["h-cap", "capacity-handoff"],
+        ["h-ext", "external-wait"],
+        ["h-reopen", "reactivation"],
+        ["h-fixed", "settlement"],
+        ["h-future", "other"],
+      ]);
+      // Fix rounds stay one-per-generation; the history is NOT folded into
+      // them, but neither does it fabricate extra rounds.
+      expect(result.attempts.map((a) => a.attemptId)).toEqual([fixId("item-1", 1), fixId("item-1", 2)]);
+    });
+
+    it("classifies review / CI-failure / conflict triggers from the evidence kind", () => {
+      const result = chain({
+        prFixItems: [
+          prFixItem({
+            id: "item-1",
+            pr: 7,
+            generation: 3,
+            history: [
+              historyEntry({
+                id: "h-review",
+                at: "2026-10-01T09:00:00.000Z",
+                action: "enqueue",
+                evidenceKey: "review_comment:octocat/hello-world#7:123",
+              }),
+              historyEntry({
+                id: "h-ci",
+                at: "2026-10-01T09:10:00.000Z",
+                action: "enqueue",
+                evidenceKey: "check_run:octocat/hello-world#7:456",
+              }),
+              historyEntry({
+                id: "h-conflict",
+                at: "2026-10-01T09:20:00.000Z",
+                action: "enqueue",
+                evidenceKey: "merge_conflict:octocat/hello-world#7",
+              }),
+              historyEntry({
+                id: "h-state",
+                at: "2026-10-01T09:30:00.000Z",
+                action: "enqueue",
+                evidenceKey: "merge_state:octocat/hello-world#7",
+              }),
+              historyEntry({
+                id: "h-future",
+                at: "2026-10-01T09:40:00.000Z",
+                action: "enqueue",
+                evidenceKey: "telepathy:octocat/hello-world#7",
+              }),
+            ],
+          }),
+        ],
+      });
+
+      expect(result.prFixEvents.map((e) => [e.eventId, e.evidenceKind, e.evidenceTrigger])).toEqual([
+        ["h-review", "review_comment", "review"],
+        ["h-ci", "check_run", "ci-failure"],
+        ["h-conflict", "merge_conflict", "conflict"],
+        ["h-state", "merge_state", "merge-state"],
+        ["h-future", "telepathy", "unknown"],
+      ]);
+      // Rows without an evidence key report null, never an inherited guess.
+      const bare = chain({ prFixItems: [prFixItem({ id: "i", pr: 8, history: [historyEntry({ id: "h", at: "2026-10-01T09:00:00.000Z", action: "ack" })] })] });
+      expect(bare.prFixEvents[0].evidenceKind).toBeNull();
+      expect(bare.prFixEvents[0].evidenceTrigger).toBeNull();
+    });
+
+    it("collapses exact replays of one row id and notes conflicting duplicates", () => {
+      const row = historyEntry({ id: "h-enq", at: "2026-10-01T09:00:00.000Z", action: "enqueue" });
+      const replayed = chain({
+        prFixItems: [prFixItem({ id: "item-1", pr: 7, history: [row, { ...row }] })],
+      });
+      expect(replayed.prFixEvents).toHaveLength(1);
+      expect(replayed.notes).not.toContain("pr-fix history row h-enq has conflicting content; kept first");
+
+      const conflicting = chain({
+        prFixItems: [
+          prFixItem({
+            id: "item-1",
+            pr: 7,
+            history: [row, { ...row, action: "mark", status: "FIXED" }],
+          }),
+        ],
+      });
+      expect(conflicting.prFixEvents).toHaveLength(1);
+      expect(conflicting.notes).toContain("pr-fix history row h-enq has conflicting content; kept first");
+
+      // Two distinct rows at the same instant stay two distinct events.
+      const siblings = chain({
+        prFixItems: [
+          prFixItem({
+            id: "item-1",
+            pr: 7,
+            history: [
+              row,
+              historyEntry({ id: "h-ack", at: "2026-10-01T09:00:00.000Z", action: "ack" }),
+            ],
+          }),
+        ],
+      });
+      // Same instant: deterministic tie-break on (item, row id), not arrival.
+      expect(siblings.prFixEvents.map((e) => e.eventId)).toEqual(["h-ack", "h-enq"]);
+    });
+
+    it("is chronological and order-invariant across items and rows", () => {
+      const items = [
+        prFixItem({
+          id: "item-2",
+          pr: 8,
+          history: [
+            historyEntry({ id: "h-c", at: "2026-10-01T11:00:00.000Z", action: "ack" }),
+            historyEntry({ id: "h-a", at: "2026-10-01T09:00:00.000Z", action: "enqueue" }),
+          ],
+        }),
+        prFixItem({
+          id: "item-1",
+          pr: 7,
+          history: [historyEntry({ id: "h-b", at: "2026-10-01T10:00:00.000Z", action: "requeue" })],
+        }),
+      ];
+      const forward = chain({ prFixItems: items });
+      const reversed = chain({
+        prFixItems: items.map((item) => ({ ...item, history: [...item.history].reverse() })).reverse(),
+      });
+      expect(reversed.prFixEvents).toEqual(forward.prFixEvents);
+      expect(forward.prFixEvents.map((e) => e.eventId)).toEqual(["h-a", "h-b", "h-c"]);
+    });
+
+    it("flags bounded-read truncation and skips unparseable stamps", () => {
+      const result = chain({
+        prFixItems: [
+          prFixItem({
+            id: "item-1",
+            pr: 7,
+            historyTruncated: true,
+            history: [
+              historyEntry({ id: "h-1", at: "2026-10-01T09:00:00.000Z", action: "enqueue" }),
+              historyEntry({ id: "h-bad", at: "nope", action: "ack" }),
+            ],
+          }),
+        ],
+      });
+      expect(result.prFixEventsTruncated).toBe(true);
+      expect(result.prFixEvents.map((e) => e.eventId)).toEqual(["h-1"]);
+      expect(result.notes).toContain("pr-fix item octocat/hello-world#7 history truncated by the bounded read");
+      const clean = chain({ prFixItems: [prFixItem({ id: "item-1", pr: 7 })] });
+      expect(clean.prFixEvents).toEqual([]);
+      expect(clean.prFixEventsTruncated).toBe(false);
+    });
   });
 });

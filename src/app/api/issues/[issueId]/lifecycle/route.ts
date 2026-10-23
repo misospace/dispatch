@@ -28,6 +28,7 @@ const MAX_EVENTS = 500;
  * `attemptsTruncated` rather than silently dropped.
  */
 const MAX_ATTEMPT_RUNS = 500;
+const MAX_ATTEMPT_HISTORY = 100;
 
 function toEventRecord(row: {
   kind: string;
@@ -138,7 +139,7 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
         // Queue writes fold repo through normalizeQueueRepo (#1145);
         // Repository.fullName keeps caller casing, so reads must fold too.
         where: { repo: normalizeQueueRepo(issue.repository.fullName), issue: issue.number },
-        include: { history: { orderBy: { at: "asc" }, take: 100 } },
+        include: { history: { orderBy: { at: "asc" }, take: MAX_ATTEMPT_HISTORY + 1 } },
       }),
     ]);
     const attemptsTruncated = runRows.length > MAX_ATTEMPT_RUNS;
@@ -165,12 +166,16 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
       fixAttempts: row.fixAttempts,
       status: row.status,
       outcome: row.outcome,
+      type: row.type,
       queuedAt: row.queuedAt,
-      history: row.history.map((entry) => ({
+      historyTruncated: row.history.length > MAX_ATTEMPT_HISTORY,
+      history: row.history.slice(0, MAX_ATTEMPT_HISTORY).map((entry) => ({
+        id: entry.id,
         at: entry.at,
         action: entry.action,
         status: entry.status,
         outcome: entry.outcome,
+        evidenceKey: entry.evidenceKey,
       })),
     }));
 

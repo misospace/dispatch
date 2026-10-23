@@ -59,10 +59,14 @@ export interface WorkAttemptRunRecord {
 }
 
 export interface WorkAttemptHistoryRecord {
+  /** Persisted `PrFixHistory` row id — the event's identity in the chain. */
+  id: string;
   at: Date | string;
   action: string;
   status: string | null;
   outcome: string | null;
+  /** Enqueue rows carry the triggering evidence key (`<kind>:<repo>#<pr>...`). */
+  evidenceKey: string | null;
 }
 
 export interface WorkAttemptPrFixItemRecord {
@@ -74,8 +78,12 @@ export interface WorkAttemptPrFixItemRecord {
   fixAttempts: number;
   status: string;
   outcome: string | null;
+  /** `PrFixQueueItem.type` (MERGE_CONFLICT / CI_FAILURE / REVIEW_FEEDBACK / OTHER). */
+  type: string;
   queuedAt: Date | string;
   history: readonly WorkAttemptHistoryRecord[];
+  /** True when the bounded read cut this item's history off (#1183). */
+  historyTruncated: boolean;
 }
 
 export type WorkItemAttemptKind = "execution" | "fix-round";
@@ -121,9 +129,59 @@ export interface WorkItemAttempt {
   wallTimeMs: number | null;
   // The PR-fix queue item behind a fix-round attempt (#1183 review): the
   // attemptId keys off the item id — unique even when two items share the
-  // same repo#pr — so this field carries the coordinates. null for
-  // execution attempts.
-  prFix: { itemId: string; repo: string; pr: number } | null;
+  // same repo#pr — so this field carries the coordinates. `type` is the
+  // item's CURRENT queue type (mutable across rounds); per-round triggering
+  // evidence is distinct in `prFixEvents`. null for execution attempts.
+  prFix: { itemId: string; repo: string; pr: number; type: string } | null;
+}
+
+/**
+ * Closed classification of one `PrFixHistory` row (#1183 acceptance): enqueue,
+ * review-request/CI-failure/conflict triggers (via the evidence kind), acks,
+ * reclaims, requeues, and settlements stay DISTINCT — the chain never folds
+ * the history stream into the round's single outcome. Derived only from the
+ * row's persisted `action`/`status`; an unrecognized action stays `other`
+ * rather than being guessed.
+ */
+export type WorkItemPrFixEventClass =
+  | "enqueue"
+  | "ack"
+  | "reclaim"
+  | "requeue"
+  | "capacity-handoff"
+  | "reactivation"
+  | "external-wait"
+  | "settlement"
+  | "other";
+
+/**
+ * What triggered a fix round, from the evidence kind its enqueue row carried.
+ * `merge-state` is ambiguous (a merge-state observation can back either a
+ * conflict or a generic update) and is never folded into `conflict`.
+ */
+export type WorkItemPrFixEvidenceTrigger =
+  | "review"
+  | "ci-failure"
+  | "conflict"
+  | "comment"
+  | "merge-state"
+  | "unknown";
+
+export interface WorkItemPrFixEvent {
+  /** The persisted `PrFixHistory` row id; replays of the same row are one event. */
+  eventId: string;
+  itemId: string;
+  repo: string;
+  pr: number;
+  at: string;
+  /** Raw persisted action, verbatim — the class never replaces the source fact. */
+  action: string;
+  eventClass: WorkItemPrFixEventClass;
+  status: string | null;
+  outcome: string | null;
+  /** Raw evidence-kind prefix of `evidenceKey` (null when the row carried none). */
+  evidenceKind: string | null;
+  evidenceTrigger: WorkItemPrFixEvidenceTrigger | null;
 }
 
 export interface WorkItemDeliveryChain {
@@ -131,6 +189,15 @@ export interface WorkItemDeliveryChain {
   units: "milliseconds";
   workItem: { repoFullName: string; issueNumber: number };
   attempts: WorkItemAttempt[];
+  /**
+   * Per-item PR-fix evidence stream (#1183 acceptance): every retained
+   * `PrFixHistory` row as a classified, distinct event. Generation
+   * attribution is NOT guessed — history rows carry no generation — so the
+   * events stay item-level and chronologically ordered.
+   */
+  prFixEvents: WorkItemPrFixEvent[];
+  /** True when any item's history exceeded the bounded read. */
+  prFixEventsTruncated: boolean;
   totalExecutionWallTimeMs: number | null;
   notes: string[];
 }
@@ -378,6 +445,63 @@ function executionMetadataFromRuns(
 }
 
 const CLOSING_KINDS = new Set(["attempt_failed", "completed", "claim_released"]);
+
+/**
+ * Classify a `PrFixHistory` row from its persisted fields ONLY. `mark`
+ * splits by the status it stamped: a QUEUED mark is an internal reopen /
+ * reactivation (cooldown, post-dispatch evidence, failure-report reopen), a
+ * WAITING_EXTERNAL mark records an external wait, anything else settles the
+ * item. Unknown actions stay `other` — never guessed.
+ */
+function classifyPrFixEventClass(row: WorkAttemptHistoryRecord): WorkItemPrFixEventClass {
+  switch (row.action) {
+    case "enqueue":
+      return "enqueue";
+    case "ack":
+      return "ack";
+    case "reclaim":
+      return "reclaim";
+    case "requeue":
+      return "requeue";
+    case "capacity_handoff":
+      return "capacity-handoff";
+    case "mark":
+      if (row.status === "QUEUED") return "reactivation";
+      if (row.status === "WAITING_EXTERNAL") return "external-wait";
+      return "settlement";
+    default:
+      return "other";
+  }
+}
+
+const EVIDENCE_TRIGGER_BY_KIND = new Map<string, WorkItemPrFixEvidenceTrigger>([
+  ["review", "review"],
+  ["review_comment", "review"],
+  ["check_run", "ci-failure"],
+  ["merge_conflict", "conflict"],
+  ["comment", "comment"],
+  ["merge_state", "merge-state"],
+  ["unknown", "unknown"],
+]);
+
+/**
+ * The triggering evidence class of a history row: the prefix of its
+ * `evidenceKey` (`"<kind>:<repo>#<pr>[:<sourceId>]"`). Only enqueue rows
+ * carry an evidence key; every other row reports null rather than inheriting
+ * the item's (mutable) current type. An unrecognized kind is `unknown` with
+ * its raw prefix preserved in `evidenceKind`.
+ */
+function prFixEvidenceTrigger(evidenceKey: string | null): {
+  evidenceKind: string | null;
+  evidenceTrigger: WorkItemPrFixEvidenceTrigger | null;
+} {
+  if (evidenceKey === null || evidenceKey === "") return { evidenceKind: null, evidenceTrigger: null };
+  const kind = evidenceKey.slice(0, evidenceKey.indexOf(":") === -1 ? evidenceKey.length : evidenceKey.indexOf(":"));
+  return {
+    evidenceKind: kind,
+    evidenceTrigger: EVIDENCE_TRIGGER_BY_KIND.get(kind) ?? "unknown",
+  };
+}
 
 /**
  * Build the delivery chain for one work item. Inputs are plain data — a
@@ -689,7 +813,7 @@ export function buildWorkItemDeliveryChain(
           executionMetadata: emptyExecutionMetadata(),
           artifacts: { agentRunIds: [], pullRequestNumbers: [] },
           wallTimeMs: null,
-          prFix: { itemId: item.id, repo: item.repo, pr: item.pr },
+          prFix: { itemId: item.id, repo: item.repo, pr: item.pr, type: item.type },
         },
         // The round's oldest evidence — its first history entry, else the
         // queue time — orders it against the execution attempts.
@@ -699,6 +823,70 @@ export function buildWorkItemDeliveryChain(
       });
     }
   }
+
+  // PR-fix evidence events (#1183 acceptance): the history stream is exposed
+  // as its own classified, chronologically ordered evidence — never folded
+  // into the fix round's single outcome. Rows are persisted facts with their
+  // own ids, so no lifecycle-style dedupe is needed for genuine facts; only
+  // exact replays of the SAME row id (a bounded read returning a duplicate,
+  // or a fixture re-listing one) collapse, keyed by id and content. History
+  // rows carry no generation attribution, so events are deliberately NOT
+  // attached to a generation's attempt — item coordinates plus time keep
+  // them placeable without guessing.
+  const prFixEvents: WorkItemPrFixEvent[] = [];
+  const seenHistoryIds = new Map<string, string>();
+  let prFixEventsTruncated = false;
+  const sortedHistoryItems = [...inputs.prFixItems].sort((a, b) =>
+    contentKey([a.repo, a.pr, a.id]) < contentKey([b.repo, b.pr, b.id]) ? -1 : 1,
+  );
+  for (const item of sortedHistoryItems) {
+    if (item.historyTruncated) {
+      prFixEventsTruncated = true;
+      addNote(`pr-fix item ${item.repo}#${item.pr} history truncated by the bounded read`);
+    }
+    const historyRows = [...item.history].sort((a, b) =>
+      contentKey([a.id, toMillis(a.at), a.action, a.status, a.outcome, a.evidenceKey]) <
+      contentKey([b.id, toMillis(b.at), b.action, b.status, b.outcome, b.evidenceKey])
+        ? -1
+        : 1,
+    );
+    for (const entry of historyRows) {
+      const atMs = toMillis(entry.at);
+      if (atMs === null) continue; // already noted by the round pass above
+      const contentKeyForReplay = contentKey([entry.id, atMs, entry.action, entry.status, entry.outcome, entry.evidenceKey]);
+      const seenKey = seenHistoryIds.get(entry.id);
+      if (seenKey !== undefined) {
+        // Same persisted row seen twice (or conflicting duplicates of one id):
+        // one event, first-in-content-order — matching the run-dedupe rule.
+        if (seenKey !== contentKeyForReplay) {
+          addNote(`pr-fix history row ${entry.id} has conflicting content; kept first`);
+        }
+        continue;
+      }
+      seenHistoryIds.set(entry.id, contentKeyForReplay);
+      const { evidenceKind, evidenceTrigger } = prFixEvidenceTrigger(entry.evidenceKey);
+      prFixEvents.push({
+        eventId: entry.id,
+        itemId: item.id,
+        repo: item.repo,
+        pr: item.pr,
+        at: toIso(atMs),
+        action: entry.action,
+        eventClass: classifyPrFixEventClass(entry),
+        status: entry.status,
+        outcome: entry.outcome,
+        evidenceKind,
+        evidenceTrigger,
+      });
+    }
+  }
+  // Chronological, deterministic: at (then item coordinates, then row id) so
+  // the order never depends on row arrival.
+  prFixEvents.sort(
+    (a, b) =>
+      Date.parse(a.at) - Date.parse(b.at) ||
+      (contentKey([a.itemId, a.eventId]) < contentKey([b.itemId, b.eventId]) ? -1 : 1),
+  );
 
   // Oldest-first: by anchor time, execution attempts before fix rounds at an
   // equal instant, then execution ordinal / fix generation, then arrival
@@ -718,6 +906,8 @@ export function buildWorkItemDeliveryChain(
     units: "milliseconds",
     workItem: { repoFullName: workItem.repoFullName, issueNumber: workItem.issueNumber },
     attempts: ordered.map(({ attempt }) => attempt),
+    prFixEvents,
+    prFixEventsTruncated,
     totalExecutionWallTimeMs,
     notes,
   };

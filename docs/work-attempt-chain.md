@@ -19,11 +19,12 @@ work item:
 - the `PrFixQueueItem` rows matching the item's exact (repo, issue)
   coordinates — the filter is bounded to the linked PRs (one row per PR),
   each with its history capped at the OLDEST 100 entries per item (asc
-  order).
+  order; the read takes one extra row to detect truncation).
 
 The response carries the chain as an **additive top-level `attempts` key**
-plus an `attemptsTruncated` flag when the run read hit its cap. No existing
-response field changes shape.
+plus an `attemptsTruncated` flag when the run read hit its cap and a
+`prFixEventsTruncated` flag when any item's history read hit its cap. No
+existing response field changes shape.
 
 ## Stable identity
 
@@ -53,8 +54,12 @@ Everything hangs off identity that survives retries and replays:
   id keys off the item id — unique even when two queue items share the same
   repo#pr. `fixAttempts` is a worker-execution count (#1103), not a work
   identity, and never fabricates extra rounds. Each fix-round attempt
-  carries `prFix: { itemId, repo, pr }` identifying the queue item and the
-  PR the round was about; execution attempts carry `prFix: null`.
+  carries `prFix: { itemId, repo, pr, type }` identifying the queue item,
+  the PR the round was about, and the item's CURRENT queue type
+  (`MERGE_CONFLICT` / `CI_FAILURE` / `REVIEW_FEEDBACK` / `OTHER` — mutable
+  across rounds, so it is item context, not per-round truth; per-round
+  triggering evidence is distinct in `prFixEvents`). Execution attempts
+  carry `prFix: null`.
 - **Artifacts** = the `AgentRun` ids whose intervals overlap the attempt
   window **and whose agent identity does not contradict the claim's** (see
   "Run attribution is agent-aware"), plus the PR numbers of `pr_merged`
@@ -78,7 +83,7 @@ Each `attempts.attempts[]` entry carries:
 | `classification` | `"active-execution"` ONLY when an attributable run interval overlaps the attempt window; `"waiting-review"` when a `claim_released` deliberately retained `status/in-review`; `"unclassified"` otherwise. Conservative by design: queued, waiting-CI, and merge-adjacent states stay unclassified unless explicit evidence says otherwise. |
 | `executionMetadata` | `{ workerProduct, model, reasoningEffort, runtimeRevision, cohortLabel }` normalized from the matched runs' stored execution metadata (keys `worker`, `model`, `reasoningEffort`, `runtimeRevision`, `cohortLabel`). Unknown/missing stays null and is never inferred from timestamps or deployment data. Multiple matched runs union first-non-null-per-field in run order. |
 | `artifacts` | `agentRunIds` + `pullRequestNumbers` as above. |
-| `prFix` | `{ itemId, repo, pr }` for fix-round attempts (the PR-fix queue item the round belongs to), `null` for execution attempts. |
+| `prFix` | `{ itemId, repo, pr, type }` for fix-round attempts (the PR-fix queue item the round belongs to and its current queue type), `null` for execution attempts. |
 | `wallTimeMs` | The **union** (not the sum) of the attempt's overlapping run intervals; null with no run evidence. |
 
 Top level: `totalExecutionWallTimeMs` unions ALL execution-interval evidence
@@ -154,7 +159,9 @@ known agent's runs never flow into an open attempt).
 - **Repeated webhook/sync events collapse.** The projection reuses the
   timeline's exact-duplicate collapse: the same transition observed by two
   writers (the documented `api:*` vs `webhook` pair) is one fact, with a
-  "duplicate observation collapsed" note.
+  "duplicate observation collapsed" note. PR-fix history rows are persisted
+  facts with their own ids: `prFixEvents` keys on the row id, so an exact
+  replay of one row is one event and never inflates the evidence stream.
 - **A late duplicate observation cannot rename an attempt.** Because the
   attempt id is derived from the fact's canonical dedupe identity and not
   from the observing row, a duplicate that arrives later — with a different
@@ -208,6 +215,31 @@ stays null and the idempotency payload hash is unchanged for existing
 workers, since the canonical hashing omits explicitly-undefined fields. The
 migration (`20261021180000_add_agent_run_execution_metadata`) is additive:
 one nullable JSONB column on `AgentRun`, no backfill.
+
+## PR-fix evidence events stay distinct
+
+The fix round answers *which generation of fix work*; it deliberately does
+NOT absorb the queue item's history. The `PrFixHistory` stream is delivered
+alongside the attempts as `attempts.prFixEvents` — one classified event per
+retained history row — so enqueue, review-triggered, CI-failure, conflict,
+ack, reclaim, requeue, capacity-handoff, reactivation, external-wait, and
+settlement evidence remain **distinct facts** (#1183 acceptance), never
+folded into the round's single outcome.
+
+| Field | Meaning |
+|---|---|
+| `eventId` | The persisted `PrFixHistory` row id — the event's identity. Exact replays of one row produce one event; conflicting duplicates of one id keep the first in content order with a note. |
+| `itemId` / `repo` / `pr` | The queue item the row belongs to. |
+| `at` | The row's timestamp, ISO. Rows whose `at` does not parse are skipped with a note. |
+| `action` | The raw persisted action, verbatim — classification never replaces the source fact. |
+| `eventClass` | Closed classification from the row's own fields: `enqueue`, `ack`, `reclaim`, `requeue`, `capacity-handoff` (`capacity_handoff`); `mark` splits by the status it stamped — `reactivation` (QUEUED: cooldown, post-dispatch-evidence reopen, failure-report reopen), `external-wait` (WAITING_EXTERNAL), `settlement` (anything else). An unrecognized action stays `other` — never guessed. |
+| `status` / `outcome` | The row's stamped status/outcome, verbatim (nullable). |
+| `evidenceKind` / `evidenceTrigger` | Only enqueue rows carry an `evidenceKey` (`"<kind>:<repo>#<pr>[:<sourceId>]"`): `evidenceKind` is the raw prefix and `evidenceTrigger` maps it to a closed set — `review` (`review`/`review_comment`), `ci-failure` (`check_run`), `conflict` (`merge_conflict`), `comment`, `merge-state`, `unknown`. `merge_state` is ambiguous and never folded into `conflict`. Every other row reports `null` — it never inherits the item's mutable current `type` as a guess. |
+
+Events are chronological, with a deterministic tie-break on
+`(itemId, eventId)`, and are **not** attributed to a generation: history rows
+carry no generation field, so guessing which round an event fed would be
+fabrication. Item coordinates plus time place each event against the rounds.
 
 ## Worked example
 
@@ -270,6 +302,8 @@ result. The chain then reads, for that issue:
       }
     ],
     "totalExecutionWallTimeMs": 3300000,
+    "prFixEvents": [],
+    "prFixEventsTruncated": false,
     "notes": []
   },
   "attemptsTruncated": false

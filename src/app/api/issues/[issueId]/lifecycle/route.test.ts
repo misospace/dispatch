@@ -233,9 +233,10 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
         fixAttempts: 1,
         status: "FIXED",
         outcome: null,
+        type: "CI_FAILURE",
         queuedAt: new Date("2026-10-01T12:00:00Z"),
         history: [
-          { at: new Date("2026-10-01T12:10:00Z"), action: "ack", status: null, outcome: null },
+          { id: "h-ack", at: new Date("2026-10-01T12:10:00Z"), action: "ack", status: null, outcome: null, evidenceKey: null },
         ],
       },
     ]);
@@ -269,7 +270,25 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
       prFix: null,
     });
     expect(body.attempts.attempts[1].outcome).toBe("success");
-    expect(body.attempts.attempts[1].prFix).toEqual({ itemId: "item-1", repo: "org/repo", pr: 7 });
+    expect(body.attempts.attempts[1].prFix).toEqual({ itemId: "item-1", repo: "org/repo", pr: 7, type: "CI_FAILURE" });
+    // #1183: the history stream rides as its own classified evidence, distinct
+    // from the round outcome.
+    expect(body.attempts.prFixEvents).toEqual([
+      {
+        eventId: "h-ack",
+        itemId: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        at: "2026-10-01T12:10:00.000Z",
+        action: "ack",
+        eventClass: "ack",
+        status: null,
+        outcome: null,
+        evidenceKind: null,
+        evidenceTrigger: null,
+      },
+    ]);
+    expect(body.attempts.prFixEventsTruncated).toBe(false);
     expect(body.attempts.totalExecutionWallTimeMs).toBe(3300000);
   });
 
@@ -305,6 +324,43 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
     const body = await (await get()).json();
     expect(body.attemptsTruncated).toBe(true);
     expect(body.attempts.attempts).toEqual([]);
+  });
+
+  it("flags pr-fix history truncation from the bounded per-item read (#1183)", async () => {
+    // The read takes MAX_ATTEMPT_HISTORY + 1 rows per item; 101 rows mean the
+    // 101st is cut, the flag flips, and only the 100 oldest become events.
+    mocks.prFixItemFindMany.mockResolvedValue([
+      {
+        id: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        issue: 42,
+        generation: 1,
+        fixAttempts: 1,
+        status: "QUEUED",
+        outcome: null,
+        type: "CI_FAILURE",
+        queuedAt: new Date("2026-10-01T12:00:00Z"),
+        history: Array.from({ length: 101 }, (_, i) => ({
+          id: `h-${i}`,
+          at: new Date(Date.UTC(2026, 9, 1, 0, 0, i)),
+          action: "mark",
+          status: "QUEUED",
+          outcome: null,
+          evidenceKey: null,
+        })),
+      },
+    ]);
+
+    const body = await (await get()).json();
+    expect(body.attempts.prFixEvents).toHaveLength(100);
+    expect(body.attempts.prFixEvents[99].eventId).toBe("h-99");
+    expect(body.attempts.prFixEventsTruncated).toBe(true);
+    expect(mocks.prFixItemFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: { history: { orderBy: { at: "asc" }, take: 101 } },
+      }),
+    );
   });
 });
 
