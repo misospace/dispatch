@@ -569,8 +569,18 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > have to fit inside the silence window. Regions that carry more than one
 > mutating forge call — the capacity handoff's release and the unclaim
 > route's release, each carrying the shared release (the ownership removal
-> plus the resting-status transition: up to three chained calls) — raise
-> their own budget to match.
+> plus a chained resting-status transition) — derive or raise their own
+> budget to match. The unclaim route's call count is
+> **data-dependent** (a label set with duplicated `status/*` labels chains one
+> removal each), so its budget is **derived from the issue's observed label
+> set** — `releaseIssueClaimWorstCaseCalls`
+> (`src/lib/issue-claim.ts`) scaled by
+> `fencedWriteTimeoutForCalls`
+> (`src/lib/issue-mutation-guard.ts`, `githubCallBudgetMs()` per call +
+> slack) — rather than a fixed
+> multiplier, so no duplicate-label shape can outrun the region
+> (#1367 review). The capacity handoff's region still carries a fixed raised
+> budget, with the same residual documented for a follow-up.
 >
 > **What the fence proves, precisely.** The steal cannot COMMIT between the
 > fence and the write it covers: the steal's `DELETE` blocks on the guard
@@ -594,10 +604,12 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > connection AND the guard row's lock for the duration of the region's
 > hard-bounded forge call(s). The hold is bounded by the region's own
 > transaction budget — `fencedWriteTimeoutMs()` (195s at the default
-> configuration) for a region that carries one mutating forge call, and that
-> budget raised to match its call count for a region that carries several
-> (the capacity handoff's and the unclaim route's shared release) — so a
-> GitHub outage can hold connections for that budget: `maxWait: 5_000` keeps
+> configuration) for a region that carries one mutating forge call, and the
+> region's own raised budget when it carries several: the unclaim route
+> derives its budget from the issue's observed label set (above), while the
+> capacity handoff raises it by a fixed multiplier —
+> so a GitHub outage can hold connections for that budget:
+> `maxWait: 5_000` keeps
 > the other pool waiters failing fast instead of queueing behind it. The
 > guard heartbeat's stamp on the same row would wait behind that lock, so it
 > now SKIPS its ticks while a region is in flight: a blocked stamp would hold

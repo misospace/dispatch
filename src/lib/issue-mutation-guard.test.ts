@@ -7,6 +7,7 @@ import {
 import {
   GUARD_HEARTBEAT_MS,
   GUARD_OVERRIDE_MIN_AGE_MS,
+  fencedWriteTimeoutForCalls,
   fencedWriteTimeoutMs,
   withIssueMutationGuard,
 } from "./issue-mutation-guard";
@@ -706,5 +707,30 @@ describe("issue mutation guard — fenced remote write (#1254 review)", () => {
     expect(options.timeout).toBe(fencedWriteTimeoutMs());
     // Pool waiters fail fast instead of queueing behind the held connection.
     expect(options.maxWait).toBe(5_000);
+  });
+});
+
+describe("fencedWriteTimeoutForCalls (#1367 review)", () => {
+  it("scales the per-call budget by the derived call count", () => {
+    expect(fencedWriteTimeoutForCalls(1)).toBe(fencedWriteTimeoutMs());
+    expect(fencedWriteTimeoutForCalls(3)).toBe(
+      githubCallBudgetMs() * 3 + (fencedWriteTimeoutMs() - githubCallBudgetMs()),
+    );
+    expect(fencedWriteTimeoutForCalls(9)).toBeGreaterThan(fencedWriteTimeoutForCalls(3));
+  });
+
+  it("never answers below the single-call budget", () => {
+    expect(fencedWriteTimeoutForCalls(0)).toBe(fencedWriteTimeoutForCalls(1));
+    expect(fencedWriteTimeoutForCalls(0.5)).toBe(fencedWriteTimeoutForCalls(1));
+    expect(fencedWriteTimeoutForCalls(-2)).toBe(fencedWriteTimeoutForCalls(1));
+  });
+
+  it("dominates the call sequence it was derived for", () => {
+    // The review's counterexample: six duplicated status labels chain six
+    // removals + the add on top of the agent removal; the budget derived for
+    // that count must exceed the call chain itself (the helper charges the
+    // per-call bound, cold-token term included, plus slack).
+    const calls = 9;
+    expect(fencedWriteTimeoutForCalls(calls)).toBeGreaterThan(githubCallBudgetMs() * calls);
   });
 });

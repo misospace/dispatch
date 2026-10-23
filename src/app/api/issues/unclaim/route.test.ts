@@ -70,6 +70,12 @@ vi.mock("@/lib/issue-claim", async (importOriginal) => {
 // anchor.
 vi.mock("@/lib/issue-mutation-guard", () => ({
   fencedWriteTimeoutMs: () => 60_000,
+  // The route derives its region budget from `githubCallBudgetMs()` × the
+  // derived call count + slack; the fake per-call budget here is the fake
+  // `fencedWriteTimeoutMs()`'s 60s minus the 15s slack, so the fake keeps the
+  // real helper's arithmetic (n × per-call budget + slack).
+  fencedWriteTimeoutForCalls: (calls: number) =>
+    Math.max(1, Math.ceil(calls)) * 45_000 + 15_000,
   withIssueMutationGuard: async (
     req: unknown,
     cb: (
@@ -279,20 +285,45 @@ describe("POST /api/issues/unclaim — happy path (#1367)", () => {
     });
   });
 
-  it("gives the fenced region the RAISED budget that dominates the release's forge calls", async () => {
+  it("gives the fenced region the budget DERIVED from the observed label set", async () => {
     const res = await postRequest();
     expect(res.status).toBe(200);
 
     // The unclaim region carries the shared release: the ownership removal
     // (the `agent/*` label) plus, when the resting-status policy applies, a
-    // chained status transition that removes EVERY existing `status/*` label
-    // — three mutating forge calls in the normal shape. The region's
-    // transaction budget must therefore be RAISED to the worst case of the
-    // calls it holds (`fencedWriteTimeoutMs() * 5` — 60s in this suite's
-    // fake): a mid-region abort would release the guard row's lock with a
-    // remote effect still in flight, which is exactly the hole the fence
-    // closes.
-    expect(guardState.fencedOptions).toEqual({ timeoutMs: 300_000 });
+    // chained status transition that removes EVERY existing `status/*` label.
+    // The count is DATA-DEPENDENT, so the route derives the budget from the
+    // observed labels (`releaseIssueClaimWorstCaseCalls` — 1 agent removal +
+    // 1 status here → 4 calls: +1 add +1 PR read) instead of a fixed
+    // multiplier: a mid-region abort would release the guard row's lock with
+    // a remote effect still in flight, which is exactly the hole the fence
+    // closes. In this suite's fake: 4 calls × 45s + 15s slack = 195s.
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 195_000 });
+  });
+
+  it("grows the derived budget with the observed status labels so a duplicated-label chain cannot outrun the region", async () => {
+    // The review's counterexample shape: six duplicated `status/*` labels
+    // (a real data-quality edge, #1037) chain six removals + the add on top
+    // of the agent removal — a call sequence a fixed multiplier cannot bound.
+    // The derived budget must rise with the observed labels and dominate the
+    // sequence: 9 calls (1 agent + 6 removals + 1 add + 1 PR read) × 45s +
+    // 15s slack = 420s in this suite's fake.
+    installReleaseLabels([
+      "agent/worker",
+      "status/in-progress",
+      "status/ready",
+      "status/blocked",
+      "status/in-review",
+      "status/queued",
+      "status/hold",
+    ]);
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 420_000 });
+
+    // And it is strictly larger than the normal-shape budget: derived from
+    // the labels, not a constant.
+    expect((guardState.fencedOptions as { timeoutMs: number }).timeoutMs).toBeGreaterThan(195_000);
   });
 
   it("hands the release a thin client with no $transaction so its local writes join the fenced transaction", async () => {

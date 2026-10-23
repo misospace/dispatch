@@ -91,6 +91,39 @@ export function fencedClaimClient(tx: unknown): IssueClaimClient {
 }
 
 /**
+ * The worst-case number of bounded remote calls `releaseIssueClaim` can make
+ * for an issue whose cached label set is `labels` (#1367 review).
+ *
+ * The call count is DATA-DEPENDENT, so a region that wraps this release needs
+ * a budget DERIVED from the observed labels rather than a fixed multiplier: a
+ * fixed one can be outrun by the duplicated-`status/*`-labels data-quality
+ * edge case (#1037) — `transitionIssueStatus` removes EVERY existing
+ * `status/*` label, one call each. The bound is deliberately branch-blind and
+ * over-counts: exactly ONE branch of the release's resting-status policy runs
+ * per attempt, but the bound charges every observed status label as a
+ * potential removal, plus the target add and the in-review PR-state read,
+ * regardless of which branch fires:
+ *
+ *   1 for the `agent/*` removal (every live path makes it)
+ *   + S for the observed `status/*` labels (each a potential removal)
+ *   + 1 for the transition's target add
+ *   + 1 for the in-review branch's linked-PR state read
+ *
+ * S here is the count of the LABELS THE CALLER PASSES. Callers inside a
+ * fenced region must pass the label set the release receives (the route's
+ * in-anchor re-read; the capacity handoff's live labels), not an older cache
+ * row — the bound must cover the calls the region will actually issue. The
+ * worst-case bound covering the WIDEST policy usage (no `preserveStatus`) is
+ * valid for narrower usages too; callers that change the release's policy or
+ * its call shape must revisit this helper — it is co-located above
+ * `releaseIssueClaim` so the two are edited together.
+ */
+export function releaseIssueClaimWorstCaseCalls(labels: string[]): number {
+  const statusLabelCount = labels.filter((label) => label.startsWith("status/")).length;
+  return 1 + statusLabelCount + 1 + 1;
+}
+
+/**
  * Release an issue's agent claim and mirror the result in the local cache.
  *
  * The operator unclaim route and stale-work recovery use this same mutation

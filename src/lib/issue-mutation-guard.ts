@@ -90,6 +90,28 @@ export function fencedWriteTimeoutMs(): number {
   return githubCallBudgetMs() + FENCED_WRITE_SLACK_MS;
 }
 
+/**
+ * The transaction budget of a fenced region whose worst-case forge-call
+ * COUNT is known (#1367 review): it does not have to fit inside the override's
+ * silence window (the commit-time re-stamp keeps the committed row fresh,
+ * however long the region ran), but it must DOMINATE every mutating forge
+ * call the region carries — a mid-region abort would release the row lock
+ * with a remote effect still in flight.
+ *
+ * The bound is `githubCallBudgetMs()` per call. It deliberately over-counts:
+ * the per-call figure includes the cold App installation-token fetch that is
+ * in truth paid at most once per region, and callers derive the count from
+ * the observed label set rather than from the exact branch the release will
+ * take, so an over-bound stays valid as the release's own branches move. A
+ * bound that only just covers a branch's arithmetic would be the next thing
+ * a counterexample outgrows. The bound is still bounded itself: a region's
+ * label set is finite, so the derived count is finite (a force-claim's
+ * override `DELETE` waiting behind the row lock is bounded by the region's
+ * own budget, never unbounded).
+ */
+export function fencedWriteTimeoutForCalls(calls: number): number {
+  return githubCallBudgetMs() * Math.max(1, Math.ceil(calls)) + FENCED_WRITE_SLACK_MS;
+}
 
 /**
  * The outcome of a fenced remote write: either the remote write happened
@@ -235,7 +257,9 @@ export async function withIssueMutationGuard<T>(
     // `removed.count !== 1`, and the override reports `busy` WITHOUT
     // stealing. The operator's force-claim therefore WAITS for the in-flight
     // fenced write (bounded by the region's own transaction budget,
-    // `fencedWriteTimeoutMs`) and is then told the issue is busy; it never
+    // `fencedWriteTimeoutMs` for a single-call region, or the region's own
+    // raised or label-derived budget for a several-call region) and is then
+    // told the issue is busy; it never
     // waits unboundedly, because that budget is what bounds the lock hold.
     // If the override's `DELETE` wins the race instead, the holder's fenced
     // `UPDATE` matches no row and the forge write is never issued

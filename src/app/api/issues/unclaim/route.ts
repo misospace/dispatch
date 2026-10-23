@@ -8,33 +8,32 @@ import {
   releaseLeaseByAgentAndIssue,
   releaseAgentWorkByAgentAndIssue,
 } from "@/lib/lease";
-import { releaseIssueClaim, fencedClaimClient } from "@/lib/issue-claim";
+import { releaseIssueClaim, fencedClaimClient, releaseIssueClaimWorstCaseCalls } from "@/lib/issue-claim";
 import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { enforceRateLimit } from "@/lib/rate-limit";
-import { withIssueMutationGuard, fencedWriteTimeoutMs } from "@/lib/issue-mutation-guard";
+import { withIssueMutationGuard, fencedWriteTimeoutForCalls } from "@/lib/issue-mutation-guard";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
 
 /**
- * The fenced release's transaction budget.
+ * The fenced release's transaction budget — DERIVED from the observed labels.
  *
  * The unclaim region carries the shared claim release: the ownership removal
  * (the `agent/*` label) plus, when the resting-status policy applies, a
  * chained `transitionIssueStatus` call — which removes EVERY existing
  * `status/*` label before adding the target (duplicated status labels are a
- * documented data-quality edge case that is real, #1037). The normal shape is
- * three mutating forge calls (agent removal, old-status removal, target add);
- * duplicated status labels can chain more removals, so the *5 budget covers
- * the normal three plus headroom for that edge. The call count is
- * DATA-DEPENDENT, so the budget is not a hard bound: a label set with more
- * than ~5 chained `status/*` removals (6+ calls) can outrun the budget and
- * abort the region mid-flight — the same residual the capacity handoff's
- * region shape carries (a follow-up will visit
- * `CAPACITY_RELEASE_FENCED_TIMEOUT_MS`). The region's transaction budget must
- * dominate its forge calls: a mid-region abort would release the guard row's
- * lock with a remote effect still in flight, which is exactly the hole the
- * fence closes. Regions that carry a single mutating forge call use the
- * default `fencedWriteTimeoutMs()`.
+ * documented data-quality edge case that is real, #1037). The call count is
+ * therefore DATA-DEPENDENT, and a fixed multiplier cannot bound it: the
+ * release review found six duplicated status labels chaining enough
+ * sequential mutating calls to outrun the previous fixed raise. The region's
+ * budget is now computed per release with
+ * `releaseIssueClaimWorstCaseCalls(issue.labels)` — 1 agent removal + every
+ * observed `status/*` label as a potential removal + the target add + the
+ * in-review PR read — scaled by `fencedWriteTimeoutForCalls`, so the budget
+ * dominates every call sequence the release can issue FOR THIS LABEL SET.
+ * An over-bound (the per-call figure includes the once-per-region cold
+ * App-token fetch, and the count is branch-blind) is cheaper than a bound a
+ * new counterexample can outgrow.
  *
  * The raised budget does NOT make the guard look stealable: a region that
  * runs longer than the override's silence window (`GUARD_OVERRIDE_MIN_AGE_MS`,
@@ -45,7 +44,6 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
  * callback is still running. The budget therefore only has to dominate the
  * region's forge calls — it does not have to fit inside the silence window.
  */
-const UNCLAIM_FENCED_TIMEOUT_MS = fencedWriteTimeoutMs() * 5;
 
 /**
  * #1361: the anchor's guard row REFERENCES the issue, so acquiring the anchor
@@ -212,14 +210,16 @@ export async function POST(request: Request) {
                 options: { actor },
               }),
             {
-              // The region carries the shared release's worst case: the
-              // ownership removal plus a chained resting-status transition
-              // that removes EVERY existing `status/*` label — the normal
-              // three mutating forge calls plus headroom for the
-              // duplicate-status edge (see UNCLAIM_FENCED_TIMEOUT_MS). The
-              // budget must cover the calls: a mid-region abort would release
-              // the guard row's lock with a remote effect still in flight.
-              timeoutMs: UNCLAIM_FENCED_TIMEOUT_MS,
+              // The budget is DERIVED from the observed label set and
+              // dominates the release's data-dependent call sequence — the
+              // ownership removal plus every `status/*` label a chained
+              // resting-status transition can remove, the target add, and the
+              // in-review PR read (see the module comment). The budget must
+              // cover the calls: a mid-region abort would release the guard
+              // row's lock with a remote effect still in flight.
+              timeoutMs: fencedWriteTimeoutForCalls(
+                releaseIssueClaimWorstCaseCalls(issue.labels),
+              ),
             },
           );
 
