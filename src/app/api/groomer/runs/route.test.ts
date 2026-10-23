@@ -89,6 +89,43 @@ describe("GET /api/groomer/runs", () => {
     );
   });
 
+  it("defaults take to 50 when limit is absent", async () => {
+    await GET(request());
+
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ take: 50 }),
+    );
+  });
+
+  it("clamps an oversized limit at 200", async () => {
+    await GET(request("/api/groomer/runs?limit=999999999"));
+
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ take: 200 }),
+    );
+  });
+
+  it("falls back to the default on a non-numeric limit instead of erroring", async () => {
+    const res = await GET(request("/api/groomer/runs?limit=abc"));
+
+    expect(res.status).toBe(200);
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ take: 50 }),
+    );
+  });
+
+  it("falls back to the default on a negative limit", async () => {
+    await GET(request("/api/groomer/runs?limit=-5"));
+
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ take: 50 }),
+    );
+  });
+
   it("returns runs on success", async () => {
     mocks.listGroomingRuns.mockResolvedValue([
       {
