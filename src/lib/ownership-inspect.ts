@@ -15,6 +15,7 @@
 
 import { prisma } from "./prisma";
 import { getLiveIssueLabels } from "./claim-gate";
+import { normalizeQueueRepo } from "./pr-fix-queue";
 import { CURRENT_CLAIM_WORK_ORDER_BY } from "./worker-ownership";
 import {
   deriveOwnershipState,
@@ -211,7 +212,10 @@ export async function inspectIssueOwnership(
   }
   const openPrFixRow = await prisma.prFixQueueItem.findFirst({
     where: {
-      repo: repoFullName,
+      // The queue stores the folded repo identity (#1145), so this lookup must
+      // fold too (#1357) — the raw cached casing ("Org/Repo") matches no row
+      // and the open-PR-fix evidence would vanish without an error.
+      repo: normalizeQueueRepo(repoFullName),
       status: { in: OPEN_PR_FIX_STATES },
       OR: prFixOrConditions,
     },
