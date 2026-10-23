@@ -14,6 +14,13 @@ import {
   ownershipActiveWindowMs,
   ownershipLongRunGraceMs,
 } from "@/lib/worker-ownership";
+import {
+  ownershipReconcileMode,
+  reconcileMaxReclaims,
+  reconcileRecheckIntervalMs,
+  reconcileMaxForgeRetries,
+} from "@/lib/ownership-reconciliation";
+import { GUARD_HEARTBEAT_MS, GUARD_OVERRIDE_MIN_AGE_MS } from "@/lib/issue-mutation-guard";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -261,6 +268,19 @@ export async function GET(request: Request) {
     evidence: r.evidence,
   }));
 
+  // #1254 reconciliation read surface (§9 inspect-first): the pending release
+  // intents (the §8.7 barrier state) and the confirmation-ladder candidates,
+  // so an operator can see what the reconciler observed without introducing
+  // another queue system. Tokens are never surfaced — only their presence.
+  const [releaseIntents, ladderCandidates, stuckGuards] = await Promise.all([
+    prisma.ownershipReleaseIntent.findMany({ where: { phase: "pending" }, orderBy: { createdAt: "desc" }, take: 50 }),
+    prisma.ownershipReconcileCandidate.findMany({ orderBy: { updatedAt: "desc" }, take: 50 }),
+    // #1254: guards left `executing` by a crashed process are fail-closed and
+    // only an operator can clear them (a maintainer force-claim overrides) —
+    // surface them so "stuck" is observable rather than silent.
+    prisma.issueMutationGuard.findMany({ where: { executing: true }, orderBy: { createdAt: "desc" }, take: 50 }),
+  ]);
+
   return NextResponse.json({
     items,
     counts,
@@ -275,6 +295,53 @@ export async function GET(request: Request) {
     windows: {
       activeMs: ownershipActiveWindowMs(),
       longRunGraceMs: ownershipLongRunGraceMs(),
+    },
+    reconciliation: {
+      mode: ownershipReconcileMode(),
+      maxReclaims: reconcileMaxReclaims(),
+      recheckIntervalMs: reconcileRecheckIntervalMs(),
+      maxForgeRetries: reconcileMaxForgeRetries(),
+      guardHeartbeatMs: GUARD_HEARTBEAT_MS,
+      guardOverrideMinAgeMs: GUARD_OVERRIDE_MIN_AGE_MS,
+      pendingIntents: releaseIntents.map((intent) => ({
+        id: intent.id,
+        issueId: intent.issueId,
+        agentLabel: intent.agentLabel,
+        attemptTokenPresent: intent.attemptToken !== null,
+        phase: intent.phase,
+        attempts: intent.attempts,
+        parkedAt: intent.parkedAt,
+        createdAt: intent.createdAt,
+      })),
+      candidates: ladderCandidates.map((candidate) => ({
+        issueId: candidate.issueId,
+        agentName: candidate.agentName,
+        staleCount: candidate.staleCount,
+        firstStaleAt: candidate.firstStaleAt,
+        lastObservedAt: candidate.lastObservedAt,
+        reclaimCount: candidate.reclaimCount,
+        lastReclaimAt: candidate.lastReclaimAt,
+        lastReasons: candidate.lastReasons,
+      })),
+      // Every in-flight guard, live or crashed — the operator reads SILENCE:
+      // a live holder stamps `updatedAt` every GUARD_HEARTBEAT_MS (#1254
+      // round 4), so `overrideEligible` says precisely whether a maintainer
+      // force-claim may clear it. A NON-eligible guard that the operator
+      // still believes stuck is a live-but-wedged holder: the recovery is
+      // restarting its process, not stealing the anchor.
+      executingGuards: stuckGuards.map((guard) => {
+        const silentMs = Date.now() - guard.updatedAt.getTime();
+        return {
+          issueId: guard.issueId,
+          operation: guard.operation,
+          agentName: guard.agentName,
+          ownerTokenPresent: guard.ownerToken !== "",
+          createdAt: guard.createdAt,
+          updatedAt: guard.updatedAt,
+          silentMs,
+          overrideEligible: silentMs >= GUARD_OVERRIDE_MIN_AGE_MS,
+        };
+      }),
     },
   });
 }

@@ -355,12 +355,18 @@ export async function fetchPullRequestClosingIssues(
   const [owner, repo] = repoFullName.split("/");
   const first = Math.max(1, Math.min(limits?.maxResults ?? DEFAULT_MAX_CLOSING_ISSUES, 50));
   const ref = `${repoFullName}#${prNumber}`;
-  // A GraphQL query is a read; it is POSTed but idempotent, so retrying is safe.
-  const response = await fetchWithRetry(`${GITHUB_API}/graphql`, {
-    method: "POST",
-    headers: { ...(await getHeadersAsync()), "Content-Type": "application/json" },
-    body: JSON.stringify({ query: CLOSING_ISSUES_QUERY, variables: { owner, repo, number: prNumber, first } }),
-  });
+  // A GraphQL query is a read; it is POSTed but idempotent, so retrying is
+  // safe — declared explicitly (#1347: the default timeout-retry heuristic
+  // trusts only GET/HEAD).
+  const response = await fetchWithRetry(
+    `${GITHUB_API}/graphql`,
+    {
+      method: "POST",
+      headers: { ...(await getHeadersAsync()), "Content-Type": "application/json" },
+      body: JSON.stringify({ query: CLOSING_ISSUES_QUERY, variables: { owner, repo, number: prNumber, first } }),
+    },
+    { retryOnTimeout: true },
+  );
   if (!response.ok) {
     throw new Error(`GitHub GraphQL error for ${ref} closing references: ${response.status}`);
   }

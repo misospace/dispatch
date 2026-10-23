@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { updateIssueLabels } from "@/lib/github";
 import { analyzeAssignmentConflict, buildNewLabels } from "@/lib/assignment-conflicts";
 import { getLiveIssueLabels } from "@/lib/claim-gate";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
+import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 import { AGENT_PREFIX, OWNER_PREFIX } from "@/types";
 import { authorizeRequest, getAuthorizedActor, authErrorResponse } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
@@ -72,15 +74,23 @@ export async function POST(request: Request) {
     }
 
     try {
+      // §8.7: the assign path is an intent-free writer, but when it coincides
+      // with a pending reconciler release intent it must serialize on the
+      // per-issue anchor rather than race the Phase-B delete — under the lock
+      // a pending intent is superseded (assign_agent only; assign_owner does
+      // not touch agent labels and must not cancel a pending release), then
+      // the explicit assignment's own idempotent label write converges the
+      // state. Busy means another claim-path writer holds the issue: 409.
+      const guarded = await withIssueMutationGuard({ issueId, operation: "assign" }, async (_tx, { runFencedRemoteWrite }): Promise<{ complete: boolean; value: Response }> => {
       // Fetch current issue to get existing labels and state
       const issue = await prisma.issue.findUnique({ where: { id: issueId } });
       if (!issue) {
-        return errorResponse(`Issue not found: ${issueId}`, 404);
+        return { complete: true, value: errorResponse(`Issue not found: ${issueId}`, 404) };
       }
 
       // Policy §1: agents may only claim open issues
       if (issue.state !== "open") {
-        return errorResponse(`Cannot assign to closed issue (state: ${issue.state})`, 400);
+        return { complete: true, value: errorResponse(`Cannot assign to closed issue (state: ${issue.state})`, 400) };
       }
 
       // #1037: the assignment decision must be made against the labels
@@ -112,10 +122,23 @@ export async function POST(request: Request) {
           // Audit log failure should not mask the real error
         }
 
-        return errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503);
+        return { complete: true, value: errorResponse(`Could not verify live GitHub labels: ${errorMessage}`, 503) };
       }
 
       const currentLabels = liveLabels;
+
+      // §8.7 exemption: a direct operator/pipeline agent assignment supersedes
+      // a pending reconciler release intent (audited) rather than racing its
+      // Phase-B delete — the explicit human/pipeline choice converges the
+      // label state, the abandoned reconciler's intent does not. assign_owner
+      // does not touch agent labels and must not cancel a pending release.
+      if (payload.action === "assign_agent") {
+        await supersedeOwnershipReleaseIntent({
+          issueId,
+          actor: auditActor,
+          reason: "direct assign_agent assignment",
+        });
+      }
 
       // Analyze conflicts using the shared conflict resolution module
       const analysis = analyzeAssignmentConflict(currentLabels);
@@ -123,8 +146,51 @@ export async function POST(request: Request) {
       // Build new label set using the shared module
       const newLabels = buildNewLabels(currentLabels, payload.action, payload.value);
 
-      // Update GitHub labels atomically via updateIssueLabels (replaces all)
-      await updateIssueLabels(repoFullName, issueNumber, newLabels);
+      // #1254: the guard-loss path records a failure audit — the skipped
+      // assignment must be visible, not silent — and answers with the route's
+      // busy/conflict shape. Best-effort: a failing audit write must not mask
+      // the 409.
+      const guardLost = async (): Promise<{ complete: boolean; value: Response }> => {
+        try {
+          await prisma.auditLog.create({
+            data: {
+              actor: auditActor,
+              action: payload.action,
+              repoFullName,
+              issueNumber,
+              issueId,
+              beforeLabels: currentLabels,
+              afterLabels: [],
+              success: false,
+              errorMessage: "Assignment was superseded by an operator override before the remote label write",
+            },
+          });
+        } catch {
+          // Audit log failure should not mask the real error
+        }
+        return { complete: true, value: errorResponse("Assignment was superseded by an operator override", 409) };
+      };
+
+      // #1254: the remote label write runs inside the FENCED write for EVERY
+      // action, not only `assign_agent`. `updateIssueLabels` is a FULL-label-
+      // set PUT (it replaces ALL labels), so the set it writes is a snapshot
+      // taken before the write: a stale snapshot strips every label another
+      // writer added in the meantime — including the `agent/*` label a
+      // maintainer force-claim owns. The fence makes the guard check and the
+      // write ONE step (the guard row's lock is held across the write), so
+      // when the guard is already gone or re-owned the forge function is
+      // NEVER called and the route answers with its busy/conflict shape.
+      // (This says nothing about GitHub's own lack of a label CAS: the fence
+      // closes the "the guard was stolen under me" hole, not the "another
+      // writer changed the labels concurrently" one.)
+      const written = await runFencedRemoteWrite(async () => {
+        // Update GitHub labels atomically via updateIssueLabels (replaces all)
+        await updateIssueLabels(repoFullName, issueNumber, newLabels);
+        return true;
+      });
+      if (written.status === "guard-lost") {
+        return await guardLost();
+      }
 
       // Update local cache
       await prisma.issue.update({
@@ -164,7 +230,13 @@ export async function POST(request: Request) {
         },
       });
 
-      return NextResponse.json({ success: true, labels: newLabels });
+      return { complete: true, value: NextResponse.json({ success: true, labels: newLabels }) };
+      });
+
+      if (guarded.status === "busy") {
+        return errorResponse("Issue mutation is in progress; retry shortly", 409);
+      }
+      return guarded.value;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
 

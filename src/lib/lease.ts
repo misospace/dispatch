@@ -42,6 +42,14 @@ export function calculateLeaseExpiry(ttlMs: number = DEFAULT_LEASE_TTL_MS): Date
  * If an active (non-expired) lease exists for the same agent+issue, it is
  * renewed (expiredAt pushed forward, renewedAt set). Otherwise a new lease
  * is created.
+ *
+ * `mintedToken` reports whether THIS call created the receipt's claim token:
+ * `true` when the row was created, when a disposed row was reactivated (the
+ * token is rotated) and when a token-less row got a fresh token; `false` when
+ * the call merely renewed a row and echoed its existing token, and `false` on
+ * the P2002 create race (the winner minted the row, not this call). A caller
+ * that may destroy the receipt (the claim route's supersede cleanup) must
+ * only do so when it minted the token itself.
  */
 export async function upsertLease(params: {
   agentName: string;
@@ -52,7 +60,7 @@ export async function upsertLease(params: {
   ttlMs?: number;
   /** Internal: the claim route already holds the issue mutation guard. */
   mutationGuardHeld?: boolean;
-}): Promise<{ created: boolean; lease: any }> {
+}): Promise<{ created: boolean; lease: any; mintedToken: boolean }> {
   if (!params.mutationGuardHeld) {
     const result = await withIssueMutationGuard({ issueId: params.issueId, operation: "lease", agentName: params.agentName }, async () => ({
       complete: true, value: await upsertLease({ ...params, mutationGuardHeld: true }),
@@ -94,7 +102,24 @@ export async function upsertLease(params: {
     // SAME attempt (a live worker's own row): it keeps its claim token and
     // its registration + renewal evidence untouched, because a heartbeating
     // worker must not lose its receipt or have its liveness erased.
+    //
+    // #1254: a NULL-token row is never a live attempt's receipt. The
+    // reconciler's Phase A retires the fence by setting `claimToken = null`
+    // while leaving `disposition = null`, so a claim that supersedes a
+    // pending release intent lands on exactly this shape — renewing it must
+    // mint a fresh attempt token, or the new claim would echo a null token
+    // and every later fence (capacity-handoff, worker ownership) would be
+    // inert. A live heartbeating worker on such a row (a pre-#1256 legacy
+    // row, or one whose Phase A retired fence it never renewed) only gains a
+    // token it did not have, so this mints the token WITHOUT clearing the
+    // row's liveness provenance.
     const reactivating = Boolean(existing.disposition);
+    // The token is minted on exactly two renewals: a disposed row's
+    // reactivation (rotated) and a token-less row (Phase A retired the
+    // fence). Every other renewal keeps the row's own token — the attempt
+    // receipt of a live attempt, which this call did NOT mint.
+    const mintingToken =
+      reactivating || existing.claimToken === null || existing.claimToken === undefined;
     const lease = await prisma.lease.update({
       where: { id: existing.id },
       data: {
@@ -121,10 +146,12 @@ export async function upsertLease(params: {
               lastRenewalObservedAt: null,
               lastRenewalOccurredAt: null,
             }
-          : {}),
+          : existing.claimToken === null || existing.claimToken === undefined
+            ? { claimToken: newClaimToken() }
+            : {}),
       },
     });
-    return { created: false, lease };
+    return { created: false, lease, mintedToken: mintingToken };
   }
 
   // Create new lease (checkpoint is required in the schema).
@@ -151,7 +178,7 @@ export async function upsertLease(params: {
         claimToken: newClaimToken(),
       },
     });
-    return { created: true, lease };
+    return { created: true, lease, mintedToken: true };
   } catch (err) {
     if (
       err instanceof Prisma.PrismaClientKnownRequestError &&
@@ -160,7 +187,8 @@ export async function upsertLease(params: {
       const winner = await prisma.lease.findUnique({
         where: { agentName_issueId: { agentName: params.agentName, issueId: params.issueId } },
       });
-      if (winner) return { created: false, lease: winner };
+      // The winner minted the row (and its token) — this call did not.
+      if (winner) return { created: false, lease: winner, mintedToken: false };
     }
     throw err;
   }

@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { withIssueMutationGuard } from "./issue-mutation-guard";
+import {
+  GITHUB_RETRY_MAX_DELAY_MS,
+  githubCallBudgetMs,
+  githubFetchTimeoutMs,
+} from "@/lib/github-auth";
+import { GUARD_HEARTBEAT_MS, fencedWriteTimeoutMs, withIssueMutationGuard } from "./issue-mutation-guard";
 
 vi.mock("@/lib/prisma", () => ({ prisma: {
   issueMutationGuard: { create: vi.fn(), findUnique: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn() },
@@ -183,13 +188,276 @@ describe("issue mutation guard", () => {
     expect(prisma.issueMutationGuard.updateMany).not.toHaveBeenCalled();
   });
 
-  it("reopens a thrown callback but keeps the owner barrier", async () => {
+  it("override refuses an executing guard too young to prove a crash (#1254 review)", async () => {
+    // A live request-scoped writer (claim route, reconciler pass) can hold
+    // its guard for seconds — stealing a YOUNG executing guard would race it
+    // through the §8.7 anchor. The age fence keeps the override fail-closed
+    // until no legitimate holder could still be running.
+    vi.mocked(prisma.issueMutationGuard.create).mockRejectedValue({ code: "P2002" } as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(
+      row({ operation: "reconcile-release", agentName: "alpha", executing: true, updatedAt: new Date() }) as never,
+    );
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockImplementation(
+      async ({ where }: any) => ({ count: where.updatedAt.lte >= new Date() ? 1 : 0 }),
+    );
+    const callback = vi.fn();
+    expect(
+      await withIssueMutationGuard({ issueId: "issue-1", operation: "claim", agentName: "beta", override: true }, callback),
+    ).toMatchObject({ status: "busy" });
+    expect(callback).not.toHaveBeenCalled();
+    expect(prisma.issueMutationGuard.deleteMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ updatedAt: { lte: expect.any(Date) } }) }),
+    );
+  });
+
+  it("override clears an executing guard older than any bounded live hold", async () => {
+    vi.mocked(prisma.issueMutationGuard.create)
+      .mockRejectedValueOnce({ code: "P2002" } as never)
+      .mockResolvedValueOnce({} as never);
+    vi.mocked(prisma.issueMutationGuard.findUnique)
+      .mockResolvedValueOnce(row({ operation: "reconcile-release", agentName: "alpha", executing: true, updatedAt: new Date(Date.now() - 10 * 60_000) }) as never)
+      .mockResolvedValueOnce(row({ ownerToken: "fresh", executing: true }) as never);
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any)
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 });
+    const callback = vi.fn(async () => ({ complete: true, value: "force claimed" }));
+    await expect(
+      withIssueMutationGuard({ issueId: "issue-1", operation: "claim", agentName: "beta", override: true }, callback),
+    ).resolves.toMatchObject({ status: "completed", value: "force claimed" });
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it("stamps the guard while a live holder runs, and stops on release (#1254 round 4)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+      vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
+      vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+      let resume!: () => void;
+      let started!: () => void;
+      const entered = new Promise<void>((resolve) => { started = resolve; });
+      const pause = new Promise<void>((resolve) => { resume = resolve; });
+      const run = withIssueMutationGuard(request, async () => {
+        started();
+        await pause;
+        return { complete: true, value: "done" };
+      });
+      await entered;
+      await vi.advanceTimersByTimeAsync(GUARD_HEARTBEAT_MS * 2 + 1);
+      // The stamp is CAS'd to this owner's executing guard and only ever
+      // refreshes `updatedAt`: it keeps the age fence honest (a stamped guard
+      // is never old enough for an override) without touching fence state.
+      expect(prisma.issueMutationGuard.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { issueId: "issue-1", ownerToken: "existing", executing: true },
+          data: { updatedAt: expect.any(Date) },
+        }),
+      );
+      const stampsWhileRunning = vi.mocked(prisma.issueMutationGuard.updateMany).mock.calls.length;
+      resume();
+      await run;
+      // After release the heartbeat is stopped: no further stamps ever land.
+      await vi.advanceTimersByTimeAsync(GUARD_HEARTBEAT_MS * 3);
+      expect(vi.mocked(prisma.issueMutationGuard.updateMany).mock.calls.length).toBe(stampsWhileRunning);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+   it("reopens a thrown callback but keeps the owner barrier", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
+     vi.mocked(prisma.issueMutationGuard.updateMany as any).mockResolvedValue({ count: 1 });
+     const error = new Error("failure");
+     await expect(withIssueMutationGuard(request, async () => { throw error; })).rejects.toBe(error);
+     expect(prisma.issueMutationGuard.updateMany).toHaveBeenCalledWith({ where: { issueId: "issue-1", ownerToken: "existing", executing: true }, data: { executing: false } });
+     expect(prisma.issueMutationGuard.deleteMany).not.toHaveBeenCalled();
+   });
+
+   it("stillHoldsGuard reports true while this holder still owns the anchor (#1254)", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+     // Acquisition read, then the callback's re-check read: both still ours.
+     vi.mocked(prisma.issueMutationGuard.findUnique)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never);
+     const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+       complete: true,
+       value: await context.stillHoldsGuard(),
+     }));
+     expect(result).toMatchObject({ status: "completed", value: true });
+   });
+
+   it("stillHoldsGuard reports false once an override re-owns the anchor (#1254)", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+     // Acquisition read is ours; the callback's re-check read returns a guard
+     // a different ownerToken now holds — a maintainer force-claim took it.
+     vi.mocked(prisma.issueMutationGuard.findUnique)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never)
+       .mockResolvedValueOnce(row({ ownerToken: "override-owner", executing: true }) as never);
+     const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+       complete: true,
+       value: await context.stillHoldsGuard(),
+     }));
+     expect(result).toMatchObject({ status: "completed", value: false });
+   });
+
+   it("stillHoldsGuard reports false when the anchor row has been deleted (#1254)", async () => {
+     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
+     vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+     // Acquisition read is ours; the re-check read finds no row (deleted, and
+     // the override's own create has not committed yet).
+     vi.mocked(prisma.issueMutationGuard.findUnique)
+       .mockResolvedValueOnce(row({ ownerToken: "existing", executing: true }) as never)
+       .mockResolvedValueOnce(null as never);
+     const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+       complete: true,
+       value: await context.stillHoldsGuard(),
+     }));
+     expect(result).toMatchObject({ status: "completed", value: false });
+   });
+});
+
+// ─── The fenced remote write (#1254 review) ──────────────────────────────────
+//
+// The read-only tripwire could still let a stale callback land its remote
+// ownership write AFTER a maintainer force-claim stole the guard: the check
+// was not atomic with the mutation. The fenced write closes that hole — the
+// guard row's lock is held ACROSS the forge call, so the check and the write
+// are one step and a steal can never commit between them.
+
+describe("issue mutation guard — fenced remote write (#1254 review)", () => {
+  let prisma: Awaited<typeof import("@/lib/prisma")>["prisma"];
+  const events: string[] = [];
+  let guardRows: { count: number };
+  const guardUpdateMany = vi.fn(async () => {
+    events.push("guard:update");
+    return { count: guardRows.count };
+  });
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    events.length = 0;
+    guardRows = { count: 1 };
+    prisma = (await import("@/lib/prisma")).prisma;
     vi.mocked(prisma.issueMutationGuard.create).mockResolvedValue({} as never);
     vi.mocked(prisma.issueMutationGuard.findUnique).mockResolvedValue(row({ executing: true }) as never);
-    vi.mocked(prisma.issueMutationGuard.updateMany as any).mockResolvedValue({ count: 1 });
-    const error = new Error("failure");
-    await expect(withIssueMutationGuard(request, async () => { throw error; })).rejects.toBe(error);
-    expect(prisma.issueMutationGuard.updateMany).toHaveBeenCalledWith({ where: { issueId: "issue-1", ownerToken: "existing", executing: true }, data: { executing: false } });
-    expect(prisma.issueMutationGuard.deleteMany).not.toHaveBeenCalled();
+    vi.mocked(prisma.issueMutationGuard.deleteMany as any).mockResolvedValue({ count: 1 });
+    // The fake transaction records that the callback ran INSIDE it, so the
+    // test can prove the forge call happens under the row lock.
+    vi.mocked(prisma.$transaction as any).mockImplementation(async (fn: any) => {
+      events.push("tx:begin");
+      const tx = { issueMutationGuard: { updateMany: guardUpdateMany } };
+      try {
+        const result = await fn(tx);
+        events.push("tx:end");
+        return result;
+      } catch (error) {
+        events.push("tx:end");
+        throw error;
+      }
+    });
+  });
+
+  it("does NOT call the forge function when the guard was deleted or re-owned before the write", async () => {
+    // The override won: the guard row is gone (or a different ownerToken holds
+    // it), so the fenced `UPDATE` matches no row and the forge function must
+    // never run — no remote write can land after the steal.
+    guardRows.count = 0;
+    const forge = vi.fn(async () => "written");
+
+    const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+      complete: true,
+      value: await context.runFencedRemoteWrite(forge),
+    }));
+
+    expect(result).toMatchObject({ status: "completed", value: { status: "guard-lost" } });
+    expect(forge).not.toHaveBeenCalled();
+  });
+
+  it("calls the forge function and returns its value while the guard is held", async () => {
+    const forge = vi.fn(async () => "written");
+
+    const result = await withIssueMutationGuard(request, async (_tx, context) => ({
+      complete: true,
+      value: await context.runFencedRemoteWrite(forge),
+    }));
+
+    expect(result).toMatchObject({ status: "completed", value: { status: "written", value: "written" } });
+    expect(forge).toHaveBeenCalledOnce();
+  });
+
+  it("issues the forge call inside the $transaction callback", async () => {
+    const forge = vi.fn(async () => {
+      events.push("forge");
+      return "written";
+    });
+
+    await withIssueMutationGuard(request, async (_tx, context) => ({
+      complete: true,
+      value: await context.runFencedRemoteWrite(forge),
+    }));
+
+    // What this proves: the forge call is issued from INSIDE the
+    // `$transaction` callback, so it runs while the transaction — and with it
+    // the guard row's lock — is open. It does NOT by itself prove the lock
+    // is held: that is the database's guarantee for an `UPDATE` inside a
+    // transaction, exercised against a real PostgreSQL in
+    // `issue-mutation-guard.integration.test.ts`.
+    expect(events).toEqual(["tx:begin", "guard:update", "forge", "tx:end"]);
+  });
+
+  it("re-stamps the guard and bounds the transaction by the forge call budget", async () => {
+    await withIssueMutationGuard(request, async (_tx, context) => ({
+      complete: true,
+      value: await context.runFencedRemoteWrite(async () => "written"),
+    }));
+
+    // The fenced `UPDATE` is CAS-scoped to THIS holder and refreshes the
+    // liveness stamp, so the override's silence predicate cannot match a
+    // guard that is inside a fenced write.
+    expect(guardUpdateMany).toHaveBeenCalledWith({
+      where: { issueId: "issue-1", ownerToken: "existing", executing: true },
+      data: { executing: true, updatedAt: expect.any(Date) },
+    });
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      timeout: fencedWriteTimeoutMs(),
+      maxWait: 5_000,
+    });
+  });
+
+  it("budgets the fenced transaction above the worst case of the mutating call it wraps", async () => {
+    await withIssueMutationGuard(request, async (_tx, context) => ({
+      complete: true,
+      value: await context.runFencedRemoteWrite(async () => "written"),
+    }));
+
+    // ADEQUACY, not equality: the region's transaction budget must DOMINATE
+    // the worst case of the ONE mutating forge call it holds. A budget below
+    // that would let the transaction abort with the remote effect still in
+    // flight — releasing the guard row's lock while the write lands, which
+    // is exactly the hole the fence closes.
+    //
+    // The worst case is derived here from the primitives, independently of
+    // the production formula: the attempt chain (3 attempts × the per-attempt
+    // timeout), the capped retry backoff between attempts, and one cold App
+    // installation-token fetch.
+    const attempts = 3;
+    const worstCaseOneCallMs =
+      attempts * githubFetchTimeoutMs() +
+      (attempts - 1) * GITHUB_RETRY_MAX_DELAY_MS +
+      githubFetchTimeoutMs();
+
+    expect(worstCaseOneCallMs).toBe(githubCallBudgetMs());
+    expect(fencedWriteTimeoutMs()).toBeGreaterThanOrEqual(worstCaseOneCallMs);
+
+    // The region hands that budget to `$transaction` — a mid-flight abort is
+    // the failure mode this budget exists to prevent.
+    const [, options] = vi.mocked(prisma.$transaction as any).mock.calls[0] as [any, any];
+    expect(options.timeout).toBeGreaterThanOrEqual(worstCaseOneCallMs);
+    expect(options.timeout).toBe(fencedWriteTimeoutMs());
+    // Pool waiters fail fast instead of queueing behind the held connection.
+    expect(options.maxWait).toBe(5_000);
   });
 });

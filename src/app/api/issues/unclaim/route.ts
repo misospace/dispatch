@@ -9,6 +9,7 @@ import {
   releaseAgentWorkByAgentAndIssue,
 } from "@/lib/lease";
 import { releaseIssueClaim } from "@/lib/issue-claim";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -97,6 +98,15 @@ export async function POST(request: Request) {
     }
 
     try {
+      // §8.7 exemption: the owning agent's / an operator's explicit unclaim
+      // supersedes a pending reconciler release intent (audited) instead of
+      // racing it, then releases through the normal path.
+      await supersedeOwnershipReleaseIntent({
+        issueId: issueId as string,
+        actor,
+        reason: `explicit unclaim by ${actor}`,
+      });
+
       // The shared core keeps operator and scheduled claim release behaviour
       // consistent while allowing stale retries to be idempotent. It also
       // records the release's lifecycle event, attributed to the audited actor

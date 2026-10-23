@@ -15,14 +15,63 @@
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { removeIssueLabel } from "./github";
 import { getLiveIssueLabels } from "./claim-gate";
-import { releaseIssueClaim } from "./issue-claim";
+import { releaseIssueClaim, type IssueClaimClient } from "./issue-claim";
 import { recordCapacityHandoff, capacityCooldownMs, type CapacityHandoffClient } from "./capacity-handoff";
 import {
   lookupIssueHandoffSettlement,
   recordIssueHandoffSettlement,
   ISSUE_HANDOFF_SETTLEMENT_RETENTION_MS,
 } from "./issue-handoff-settlement";
-import { withIssueMutationGuard } from "./issue-mutation-guard";
+import {
+  withIssueMutationGuard,
+  fencedWriteTimeoutMs,
+  type FencedRemoteWriteOptions,
+  type FencedRemoteWriteResult,
+} from "./issue-mutation-guard";
+
+/**
+ * The fenced-write capability the per-issue guard hands to its callback.
+ */
+type FencedRemoteWrite = <T>(
+  fn: (tx: any) => Promise<T>,
+  options?: FencedRemoteWriteOptions,
+) => Promise<FencedRemoteWriteResult<T>>;
+
+/**
+ * The fenced release's transaction budget.
+ *
+ * The shared release carries the ownership removal AND — when the issue sits
+ * in `status/in-progress` — the resting-status transition (remove the old
+ * status label, then add the target): up to THREE chained mutating forge
+ * calls. The region's transaction budget must dominate all of them: a
+ * mid-region abort would release the guard row's lock with a remote effect
+ * still in flight, which is exactly the hole the fence closes. Every other
+ * fenced region carries ONE mutating forge call and uses the default
+ * `fencedWriteTimeoutMs()`.
+ */
+const CAPACITY_RELEASE_FENCED_TIMEOUT_MS = fencedWriteTimeoutMs() * 3;
+
+/**
+ * A THIN `IssueClaimClient` over the fenced transaction client.
+ *
+ * `releaseIssueClaim` opens its own interactive transaction whenever the
+ * client it is handed exposes `$transaction` — and a real Prisma interactive
+ * transaction client DOES expose it (Prisma only denies `$connect`,
+ * `$disconnect`, `$on`, `$use` and `$extends`). Inside the fenced region that
+ * would open a NESTED interactive transaction (a savepoint) with Prisma's
+ * default 5s timeout: the release's cache mirror and its `claim_released`
+ * evidence row could roll back to the savepoint while the GitHub removal
+ * stands. The thin client is therefore built EXPLICITLY from the transaction
+ * client, WITHOUT `$transaction`, so the release's local writes join the
+ * fenced transaction instead of nesting inside it.
+ */
+function fencedClaimClient(tx: unknown): IssueClaimClient {
+  const source = tx as {
+    issue: IssueClaimClient["issue"];
+    issueLifecycleEvent?: IssueClaimClient["issueLifecycleEvent"];
+  };
+  return { issue: source.issue, issueLifecycleEvent: source.issueLifecycleEvent };
+}
 
 export interface IssueCapacityHandoffClient extends CapacityHandoffClient {
   issue: {
@@ -118,8 +167,13 @@ export async function recoverIssueCapacityHandoff(
     operation: "capacity-release",
     agentName: input.agentName,
     claimToken: input.claimToken,
-  }, async (_tx, { resuming }) => {
-    const value = await recoverIssueCapacityHandoffUnlocked(input, resuming);
+  }, async (_tx, { resuming, runFencedRemoteWrite }) => {
+    // #1254: the fenced-write capability travels INTO the release path: the
+    // remote ownership writes below run inside the guard's row lock, so a
+    // maintainer force-claim can neither take this holder's guard between
+    // the check and the write nor land its own claim while the write is in
+    // flight.
+    const value = await recoverIssueCapacityHandoffUnlocked(input, resuming, runFencedRemoteWrite);
     return { complete: !(value.ok === false && (value.code === "release_failed" || value.code === "github_unavailable" || value.code === "settlement_unavailable")), value };
   });
   if (guarded.status === "busy") {
@@ -248,6 +302,7 @@ async function replayIssueHandoffSettlement(
 async function recoverIssueCapacityHandoffUnlocked(
   input: IssueCapacityHandoffInput,
   resuming: boolean,
+  fencedWrite: FencedRemoteWrite,
 ): Promise<IssueCapacityHandoffResult> {
   const { client, issueId, repoFullName, issueNumber, agentName, claimToken, capacity } = input;
   const now = input.now ?? new Date();
@@ -432,14 +487,41 @@ async function recoverIssueCapacityHandoffUnlocked(
   let statusNote: string | null;
   if (ownershipChangedPostCas) {
     const newOwner = getAgentFromLabels(releaseLabels);
+    // #1254: the targeted removal of OUR OWN label is a remote ownership
+    // write, so it runs inside the FENCED write: the guard check and the
+    // forge write share one transaction that holds the guard row's lock, so a
+    // maintainer force-claim can neither take this holder's guard between the
+    // check and the write nor land its own claim while the removal is in
+    // flight. When the guard is already gone/re-owned the forge function is
+    // NEVER called: no label is written, the lease and the claim stay
+    // intact, and the module's failure shape names the guard loss.
+    let removal: FencedRemoteWriteResult<boolean>;
     try {
-      // Targeted, idempotent: only our own label. Never a status write —
-      // the new owner's transition stands.
-      await removeIssueLabel(repoFullName, issueNumber, agentLabel);
+      removal = await fencedWrite(async () => {
+        // Targeted, idempotent: only our own label. Never a status write —
+        // the new owner's transition stands.
+        await removeIssueLabel(repoFullName, issueNumber, agentLabel);
+        return true;
+      }, { timeoutMs: CAPACITY_RELEASE_FENCED_TIMEOUT_MS });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       await writeFailureAudit(client, input, liveLabels, `Could not remove claim label: ${message}`);
       return { ok: false, httpStatus: 500, code: "release_failed", message: `Could not remove claim label; lease and release guard retained: ${message}` };
+    }
+    if (removal.status === "guard-lost") {
+      await writeFailureAudit(
+        client,
+        input,
+        liveLabels,
+        "Capacity handoff skipped the remote label removal: the mutation guard was taken by an operator override before the remote write",
+      );
+      return {
+        ok: false,
+        httpStatus: 500,
+        code: "release_failed",
+        message:
+          "Could not remove claim label; the mutation guard was taken by an operator override before the remote write — lease and release guard retained",
+      };
     }
     labels = releaseLabels.filter((l: string) => l !== agentLabel);
     status = labels.find((l: string) => l.startsWith("status/")) ?? null;
@@ -455,16 +537,43 @@ async function recoverIssueCapacityHandoffUnlocked(
       console.error(`capacity handoff: cache mirror failed for ${repoFullName}#${issueNumber}:`, error);
     }
   } else try {
-    const released = await releaseIssueClaim({
-      prisma: client,
+    // #1254: the shared release is a remote ownership write, so it runs
+    // inside the FENCED write: the guard check and the forge write share one
+    // transaction that holds the guard row's lock, so a maintainer
+    // force-claim can neither take this holder's guard between the check and
+    // the write nor land its own claim while the release is in flight. When
+    // the guard is already gone/re-owned the forge function is NEVER called:
+    // no label is written, the lease and the claim stay intact, and the
+    // module's failure shape names the guard loss.
+    const released = await fencedWrite(async (tx) => releaseIssueClaim({
+      // The release's own local writes (the cache mirror and the
+      // `claim_released` evidence row) join the fenced transaction through a
+      // THIN client, so the release cannot open a nested interactive
+      // transaction inside the region.
+      prisma: fencedClaimClient(tx),
       issue: { ...issue, labels: releaseLabels },
       repoFullName,
       issueNumber,
       agentName,
-    });
-    labels = released.labels;
-    status = released.status;
-    statusNote = released.statusNote;
+    }), { timeoutMs: CAPACITY_RELEASE_FENCED_TIMEOUT_MS });
+    if (released.status === "guard-lost") {
+      await writeFailureAudit(
+        client,
+        input,
+        liveLabels,
+        "Capacity handoff skipped the remote claim release: the mutation guard was taken by an operator override before the remote write",
+      );
+      return {
+        ok: false,
+        httpStatus: 500,
+        code: "release_failed",
+        message:
+          "Claim label release skipped; the mutation guard was taken by an operator override before the remote write — lease and release guard retained",
+      };
+    }
+    labels = released.value.labels;
+    status = released.value.status;
+    statusNote = released.value.statusNote;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     await writeFailureAudit(client, input, liveLabels, `Claim label release failed; lease retained: ${message}`);

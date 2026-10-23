@@ -80,6 +80,11 @@ vi.mock("@/lib/agent-work", () => ({
   releaseStaleWork: vi.fn(async () => []),
 }));
 
+vi.mock("@/lib/ownership-reconciliation", () => ({
+  // #1254: operator release supersedes pending reconciler intents; the fake
+  // records nothing.
+  supersedeOwnershipReleaseIntent: vi.fn(async () => false),
+}));
 vi.mock("@/lib/lease", () => ({
   releaseLeaseByAgentAndIssue: vi.fn(async () => 1),
   releaseAllLeasesByAgent: vi.fn(async () => 1),

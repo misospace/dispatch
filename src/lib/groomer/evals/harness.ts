@@ -292,7 +292,7 @@ export async function runCandidate(
     // labels-step writes.labels.
     addLabel: async () => {},
     findActiveLeases: async () => [],
-    upsertLease: async () => ({ created: true, lease: { id: "lease-1" } }),
+    upsertLease: async () => ({ created: true, lease: { id: "lease-1" }, mintedToken: true }),
     releaseLease: async () => ({ id: "lease-1" }),
     fetchCollaboratorPermission: async () => ({ status: "ok", permission: "write" }),
     prisma: prisma as unknown as GroomerDeps["prisma"],

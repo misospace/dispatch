@@ -13,6 +13,7 @@ import { transitionIssueStatus } from "@/lib/issue-status";
 import { recordClaimEvent } from "@/lib/issue-lifecycle";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 
 const IN_PROGRESS_STATUS = "status/in-progress";
 const RATE_LIMIT = { limit: 30, windowMs: 10_000 };
@@ -77,7 +78,10 @@ export async function POST(request: Request) {
       return errorResponse("Force claim requires a maintainer token", 403);
     }
 
-    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string }, async (_tx, { resuming }) => {
+    // Maintainer force-claims may take over a guard left `executing` by a
+    // crashed process — the deliberate operator decision the fail-closed
+    // guard posture defers to (#1254). Automation never overrides.
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming, runFencedRemoteWrite }) => {
     let remoteStarted = false;
     const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
@@ -113,6 +117,31 @@ export async function POST(request: Request) {
     // Refuse closed issues (cached state is fine for this check)
     if (issue.state === "closed") {
       return errorResponse("Cannot claim a closed issue", 400);
+    }
+
+    // §8.7 Claim side: a pending reconciler release intent holds ANY claim on
+    // this issue with a retryable 409 until the Phase C settle lifts the
+    // barrier — a claim that slips in behind an in-flight release could have
+    // its fresh label deleted by the release's Phase B. The maintainer
+    // force-claim is the one deliberate exemption: under the anchor it
+    // supersedes the intent (audited) rather than racing it, and its own
+    // idempotent label writes converge the state (docs/ownership-reconciliation.md).
+    const pendingReleaseIntent = await prisma.ownershipReleaseIntent.findFirst({
+      where: { issueId: issueId as string, phase: "pending" },
+    });
+    if (pendingReleaseIntent) {
+      if (force === true) {
+        await supersedeOwnershipReleaseIntent({
+          issueId: issueId as string,
+          actor,
+          reason: "maintainer force-claim superseded the pending reconciler release intent",
+        });
+      } else {
+        return errorResponse(
+          "Ownership release is pending on this issue; retry shortly",
+          409,
+        );
+      }
     }
 
     // #1037: the claim decision must be made against the labels GitHub
@@ -188,20 +217,91 @@ export async function POST(request: Request) {
     // carrying agent/<this agent> is ours to take, not a conflict to 409 on.
     const analysis = analyzeAssignmentConflict(liveLabels, `${AGENT_PREFIX}${agentName}`);
 
+    // #1254: the shared supersede tripwire for the pre-write re-checks. When a
+    // maintainer force-claim has taken this holder's guard away, the callback
+    // must not commit remote ownership writes: it deletes the lease receipt it
+    // MINTED, records a failure audit, then 409s. No GitHub label is written
+    // — the override's own claim converges the state.
+    // Mint-based rule: the row is deleted ONLY when THIS attempt minted the
+    // receipt (`upsertLease` reports `mintedToken`). A plain renewal merely
+    // echoed a live attempt's own token, so its row belongs to that attempt
+    // and must survive. The `{id, claimToken, renewedAt}` CAS stays as a
+    // second fence, but it alone was NOT sufficient: renewals deliberately
+    // KEEP the claim token (#1256) and the losing attempt's own renewal
+    // re-stamps `renewedAt` AFTER the winner's renewal, so the fence could
+    // still match a live attempt's row and delete it.
+    const superseded = async (receipt?: {
+      lease?: { id: string; claimToken?: string | null; renewedAt?: Date | null };
+      mintedToken?: boolean;
+    }): Promise<Response> => {
+      const leaseRow = receipt?.lease;
+      const mintedToken = receipt?.mintedToken === true;
+      if (leaseRow?.id && mintedToken) {
+        try {
+          await prisma.lease.deleteMany({
+            where: { id: leaseRow.id, claimToken: leaseRow.claimToken ?? null, renewedAt: leaseRow.renewedAt ?? null },
+          });
+        } catch {
+          // Best-effort: a failed cleanup must not mask the 409.
+        }
+      }
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor,
+            action: "claim_issue",
+            repoFullName,
+            issueNumber,
+            issueId: issueId as string,
+            beforeLabels: liveLabels,
+            afterLabels: [],
+            success: false,
+            errorMessage:
+              leaseRow?.id && !mintedToken
+                ? "Claim was superseded by an operator override before the remote label write; the lease receipt belongs to a live attempt and was left intact"
+                : "Claim was superseded by an operator override before the remote label write",
+          },
+        });
+      } catch {
+        // A failing audit write must not mask the 409.
+      }
+      return errorResponse("Claim was superseded by an operator override before the remote label write", 409);
+    };
+
     // Check for agent conflict — if another agent is assigned, require force-claim
     if (analysis.hasAgentConflict) {
       if (force === true) {
+        // #1254: the remote removals run inside FENCED writes: the guard
+        // check and the forge write share one transaction that holds the
+        // guard row's lock, so a maintainer force-claim can neither take this
+        // holder's guard between the check and the write nor land its own
+        // claim while these removals are in flight. If the guard is already
+        // gone/re-owned, `runFencedRemoteWrite` reports `guard-lost` and the
+        // forge function was NEVER called — do not start a remote mutation
+        // this holder no longer owns. ONE removal per fenced region (a region
+        // carries exactly one mutating forge call, so the region's
+        // transaction budget always covers the call it holds). The removal
+        // SET is therefore NOT atomic: a steal that lands between two
+        // removals leaves the earlier ones applied — the guard loss is
+        // detected on the next region's fence, and the override's own claim
+        // converges the label state.
+        remoteStarted = true;
         // Force claim: remove ALL stale agent labels first.
         // buildNewLabels below drops every conflicting agent label from the
         // cache, so GitHub must lose all of them too — leaving extras behind
         // is the same GitHub/cache divergence class #1037 fights.
-        remoteStarted = true;
         for (const staleAgentLabel of analysis.existingAgents) {
-          try {
-            await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
-          } catch (e) {
-            console.error(`Failed to remove stale agent label ${staleAgentLabel} during force claim:`, e);
-            // Non-fatal: continue with force claim even if label removal fails
+          const removal = await runFencedRemoteWrite(async () => {
+            try {
+              await removeIssueLabel(repoFullName, issueNumber, staleAgentLabel);
+            } catch (e) {
+              console.error(`Failed to remove stale agent label ${staleAgentLabel} during force claim:`, e);
+              // Non-fatal: continue with force claim even if label removal fails
+            }
+            return true;
+          });
+          if (removal.status === "guard-lost") {
+            return superseded();
           }
         }
       } else {
@@ -216,15 +316,54 @@ export async function POST(request: Request) {
     const updatedLabels = [...labelsWithAgent.filter((l) => !l.startsWith("status/")), IN_PROGRESS_STATUS];
 
     try {
+      // §8.7 Claim side, step 2: commit the claim intent — the lease row
+      // carrying the fresh attempt token — BEFORE the remote label add, in
+      // this same anchor window. The previous ordering wrote the lease after
+      // GitHub, which left no persisted claim intent a crash could replay.
+      // The lease is now the claim-side intent; the retry path replays the
+      // idempotent add below (crash-matrix "claim side" row).
+      const lease = await upsertLease({
+        agentName: agentName as string,
+        issueId: issueId as string,
+        checkpoint: "issue_claimed",
+        mutationGuardHeld: true,
+      });
+
+      // #1254: the remote add runs inside the FENCED write. A maintainer
+      // force-claim can take this holder's guard between the claim-intent
+      // (lease) commit and the label write; the fenced write makes the guard
+      // check and the label add ONE atomic step (the guard row's lock is held
+      // across the add), so the add can never land after the guard was
+      // stolen. When the guard is already gone/re-owned, the forge function
+      // is never called: back off, delete the lease we minted ourselves and
+      // 409 — the add is idempotent, so the override's own claim lands the
+      // label. A receipt we did NOT mint (a plain renewal of a live attempt's
+      // row) is left intact.
       remoteStarted = true;
-      // A resumed claim already landed remotely. Repair only the local mirror,
-      // lifecycle event and lease; do not repeat GitHub label mutations.
-      if (!resuming) await addIssueLabel(repoFullName, issueNumber, agentLabel);
+      const added = await runFencedRemoteWrite(async () => {
+        // The add is idempotent: a fresh claim lands it once; a resumed claim
+        // replays it, repairing a crash that died between the lease (intent)
+        // commit and the remote add without creating a second owner.
+        await addIssueLabel(repoFullName, issueNumber, agentLabel);
+        return true;
+      });
+      if (added.status === "guard-lost") {
+        return superseded(lease);
+      }
 
       // Remove ALL existing status labels (not just the first) before adding
       // status/in-progress — keeps GitHub and the Prisma cache from
       // diverging when an issue carries more than one status label.
       // Base is the live GitHub label set (authoritative — #1037).
+      //
+      // #1254: this status transition is deliberately OUTSIDE the fenced
+      // write. Status labels are disjoint from `agent/*` (the fence protects
+      // OWNERSHIP writes), and the fenced add above already proved — under
+      // the guard row's lock — that this holder owns the claim at that
+      // moment. The override's silence fence (5 minutes without a stamp)
+      // cannot elapse across it either: the fenced add re-stamped the guard
+      // row, and this holder's heartbeat keeps stamping it every
+      // `GUARD_HEARTBEAT_MS` while the transition runs.
       if (!resuming || !liveLabels.includes(IN_PROGRESS_STATUS)) {
         await transitionIssueStatus(repoFullName, issueNumber, liveLabels, IN_PROGRESS_STATUS);
       }
@@ -262,15 +401,10 @@ export async function POST(request: Request) {
         });
       });
 
-      // Create or renew a lease for this agent (issue #166).
+      // Create or renew a lease for this agent (issue #166) — done above, as
+      // the §8.7 claim intent committed before the remote add.
       // #1256: the lease carries the opaque claim token that fences a later
       // capacity-handoff release to THIS exact claim; echo it to the worker.
-      const lease = await upsertLease({
-        agentName: agentName as string,
-        issueId: issueId as string,
-        checkpoint: "issue_claimed",
-        mutationGuardHeld: true,
-      });
 
       // Write audit log with conflict analysis details
       const auditNotesParts: string[] = [];

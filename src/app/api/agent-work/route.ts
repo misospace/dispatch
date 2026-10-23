@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identity";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
@@ -188,6 +189,11 @@ async function releaseAgentWork(body: Record<string, unknown>) {
         if (!existing) {
           return errorResponse("Work item not found", 404);
         }
+        // #1254: an operator release supersedes a pending reconciler release
+        // intent (audited) instead of racing its Phase-B delete.
+        if (existing.issueId) {
+          await supersedeOwnershipReleaseIntent({ issueId: existing.issueId, actor: "operator", reason: "operator agent-work release" });
+        }
         if (existing.state === "DONE" || existing.state === "RELEASED") {
           return errorResponse("Work is already completed or released", 400);
         }
@@ -223,6 +229,8 @@ async function releaseAgentWork(body: Record<string, unknown>) {
           return errorResponse("Lease not found", 404);
         }
 
+        // #1254: operator release supersedes a pending reconciler intent.
+        await supersedeOwnershipReleaseIntent({ issueId: lease.issueId, actor: "operator", reason: "operator lease release" });
         await prisma.lease.delete({ where: { id: leaseId } });
 
         await prisma.auditLog.create({
@@ -266,6 +274,8 @@ async function releaseAgentWork(body: Record<string, unknown>) {
     let issueNumber: number | null = null;
 
     if (issueId) {
+      // #1254: operator release supersedes a pending reconciler intent.
+      await supersedeOwnershipReleaseIntent({ issueId, actor: "operator", reason: "operator agent-work release" });
       // Release by agentName + issueId
       const [leasesReleased, workReleased] = await Promise.all([
         releaseLeaseByAgentAndIssue(agentName, issueId),

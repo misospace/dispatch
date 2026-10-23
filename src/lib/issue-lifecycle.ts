@@ -67,6 +67,8 @@ export const LIFECYCLE_SOURCES = [
   "api:groom",
   /** Scheduled stale-AgentWork sweep releasing an abandoned claim. */
   "stale-recovery",
+  /** The #1254 ownership reconciler releasing a confirmed-abandoned claim. */
+  "ownership-reconcile",
   /** The hosted groomer applying a grooming plan. */
   "hosted-groomer",
   /** POST /api/issues/reconcile reacting to PR state. */
