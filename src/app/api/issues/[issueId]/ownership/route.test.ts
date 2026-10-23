@@ -186,4 +186,89 @@ describe("GET /api/issues/[issueId]/ownership — derivation", () => {
     expect(res.status).toBe(404);
     expect((await res.json()).error).toBe("Issue not found");
   });
+
+  // #1312 — the per-issue lease selection must use the SAME activity key as
+  // the bounded ownership scan (`renewedAt ?? createdAt` desc, `id` asc
+  // tiebreak), or the scan and this view disagree about which lease on a
+  // multi-lease issue is operative.
+  it("reports the most recently ACTIVE lease, not the most recently renewed one", async () => {
+    db.issue = makeIssue({ labels: ["agent/bob", "status/in-progress"] });
+    mocks.getLiveIssueLabels.mockResolvedValue(["agent/bob", "status/in-progress"]);
+    db.leases = [
+      // alice: claimed 2h ago, last renewed 30m ago (active).
+      makeLease({
+        id: "lease-alice",
+        agentName: "alice",
+        createdAt: inMin(-120),
+        renewedAt: inMin(-30),
+        expiredAt: inMin(20),
+        lastRenewalObservedAt: inMin(-30),
+        lastRenewalOccurredAt: inMin(-30),
+      }),
+      // bob: claimed 5m ago, never renewed (active). Its activity (the claim
+      // time) is more recent than alice's last renewal, so the scan ranks it
+      // first and this view must report it as the operative lease.
+      makeLease({
+        id: "lease-bob",
+        agentName: "bob",
+        createdAt: inMin(-5),
+        renewedAt: null,
+        registeredAt: inMin(-5),
+        renewCount: 0,
+        lastRenewalObservedAt: null,
+        lastRenewalOccurredAt: null,
+        expiredAt: inMin(30),
+      }),
+    ];
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.evidence.lease?.agentName).toBe("bob");
+    expect(body.assessment.ownerAgent).toBe("bob");
+    expect(body.assessment.state).toBe("CLAIMED_ACTIVE");
+    expect(body.assessment.reasonCodes).not.toContain("lease_owner_mismatch");
+  });
+
+  it("breaks equal lease activity by id ascending, matching the scan's tie-break", async () => {
+    db.issue = makeIssue({ labels: ["agent/carol", "status/in-progress"] });
+    mocks.getLiveIssueLabels.mockResolvedValue(["agent/carol", "status/in-progress"]);
+    db.leases = [
+      // dave: renewed 10m ago (created 90m ago) — activity 10m ago. The ids
+      // are cuid-shaped (lower-case alphanumeric) so the tie-break exercises
+      // the same id space whose JS-vs-database ordering equivalence the scan
+      // relies on.
+      makeLease({
+        id: "clz0tiebreak0dave",
+        agentName: "dave",
+        createdAt: inMin(-90),
+        renewedAt: inMin(-10),
+        expiredAt: inMin(20),
+        lastRenewalObservedAt: inMin(-10),
+        lastRenewalOccurredAt: inMin(-10),
+      }),
+      // carol: claimed 10m ago, never renewed — activity 10m ago (equal).
+      // The lower id wins, as it does in the scan's `id ASC` tie-break.
+      makeLease({
+        id: "cla0tiebreak0carol",
+        agentName: "carol",
+        createdAt: inMin(-10),
+        renewedAt: null,
+        registeredAt: inMin(-10),
+        renewCount: 0,
+        lastRenewalObservedAt: null,
+        lastRenewalOccurredAt: null,
+        expiredAt: inMin(30),
+      }),
+    ];
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.evidence.lease?.agentName).toBe("carol");
+    expect(body.assessment.ownerAgent).toBe("carol");
+    expect(body.assessment.state).toBe("CLAIMED_ACTIVE");
+  });
 });
