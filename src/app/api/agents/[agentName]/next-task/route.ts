@@ -26,6 +26,8 @@ type PrFixCandidate = {
   generation: number;
   reason: string;
   feedback: string[];
+  /** The queued item's PrFixType (e.g. REBASE, #1327); absent on legacy lines. */
+  fixType?: string;
 };
 
 /**
@@ -400,7 +402,7 @@ export async function GET(
         issue: candidate.issue
           ? { repoFullName: candidate.repo, number: candidate.issue }
           : undefined,
-        prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken },
+        prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: candidate.fixType },
         reasons,
       });
     };
@@ -530,6 +532,9 @@ export async function GET(
         reason: materialized.item.reason,
         feedback: materialized.item.feedback ?? [],
         agentHandouts: materialized.item.agentHandouts ?? [],
+        // Linked-health materializations are type OTHER (createLinkedPrFixItem
+        // hardcodes it) — conflict routing happens in the sync path (#1327).
+        fixType: "OTHER",
       };
       const task = await dispatchPrFixCandidate(candidate);
       if (task) {

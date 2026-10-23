@@ -260,7 +260,10 @@ overdue signal can rise without an automated sweeper to drain it — see A7.
 
 Outcomes: `human_decision, no_progress, infra_failure, security_failure`
 (`src/types/index.ts:266`). Types: `MERGE_CONFLICT, CI_FAILURE,
-REVIEW_FEEDBACK, OTHER`. The distinction is load-bearing: **BLOCKED** is a
+REVIEW_FEEDBACK, OTHER, REBASE` — `REBASE` is the mechanical rebase lane
+(#1327): one bounded-attempt rebase task per DIRTY episode instead of a fix
+generation, bailed to a human decision on any semantic conflict. The
+distinction is load-bearing: **BLOCKED** is a
 genuine human decision (carries `needs-human`); **PARKED** is bounded exhaustion
 or an operational failure and must not be presented as a decision
 (`src/lib/pr-fix-surfacing.ts:175-230`). `WAITING_EXTERNAL` cooldown defaults to

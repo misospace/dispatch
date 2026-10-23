@@ -524,15 +524,20 @@ const INGEST_DESCRIPTORS: Record<PrFollowupEvent["eventType"], IngestDescriptor>
       !isActionableEvidenceVersion("merge_state", { mergeStateStatus: event.mergeStateStatus }),
     filterTerminalPr: true,
     sourceId: (event) => event.mergeStateStatus ?? "",
-    workItem: (event) => ({
-      lane: "NORMAL",
-      // dirty/conflicting merge states are conflicts; everything else is OTHER
-      type: CONFLICTING_STATUSES.has((event.mergeStateStatus ?? "").toLowerCase())
-        ? "MERGE_CONFLICT"
-        : "OTHER",
-      reason: `Merge state change: ${event.mergeStateStatus}`,
-      feedback: `PR merge state is now ${event.mergeStateStatus}`,
-    }),
+    workItem: (event) => {
+      // dirty/conflicting merge states go through the mechanical rebase lane
+      // (#1327) — code-fix attempts cannot resolve a merge conflict they
+      // cannot rebase away. Everything else stays ordinary fix work.
+      if (CONFLICTING_STATUSES.has((event.mergeStateStatus ?? "").toLowerCase())) {
+        return rebaseWorkItem(event.mergeStateStatus ?? "dirty");
+      }
+      return {
+        lane: "NORMAL",
+        type: "OTHER",
+        reason: `Merge state change: ${event.mergeStateStatus}`,
+        feedback: `PR merge state is now ${event.mergeStateStatus}`,
+      };
+    },
   },
 };
 
@@ -956,9 +961,41 @@ export async function ingestMergeStateEvent(
 // ─── Merge Conflict Detection ───────────────────────────────────────────────
 
 /**
+ * Worker-facing contract for the mechanical rebase lane (#1327). Both
+ * conflict call-sites (merge_state dirty and mergeable=CONFLICTING) share it:
+ * the item's reasons ARE the instruction wall, since a rebase hand-off is a
+ * followup-pr task and the queue carries no separate instruction channel.
+ */
+export function rebaseWorkItem(stateLabel: string): IngestWorkItem {
+  return {
+    lane: "NORMAL",
+    type: "REBASE",
+    reason: `Mechanical rebase: PR ${stateLabel} against base (#1327)`,
+    feedback: [
+      `Mechanical rebase required: this PR is ${stateLabel} against its base branch (#1327).`,
+      "Rebase the PR branch onto the base and resolve conflicts MECHANICALLY ONLY:",
+      "lockfiles, version strings, import order, doc indexes, adjacent",
+      "non-overlapping hunks, and comment-only overlaps where one side is a",
+      "strict subset. Never edit the same logic on both sides; never merge;",
+      "never open a new PR. Push with --force-with-lease, then run the repo's",
+      "bounded typecheck; an unfixable error in a file this PR touches says the",
+      "rebase is not mechanical. On ANY semantic conflict, report outcome",
+      '"blocked" with blockReason "human_decision", the conflicting files, and',
+      "why the conflict is not mechanical — do NOT resolve it yourself. One",
+      "attempt per DIRTY episode; do not retry.",
+    ].join("\n"),
+  };
+}
+
+/**
  * Detect and enqueue merge conflict items for PRs with mergeable=CONFLICTING.
  * This is the primary function for surfacing merge conflicts as PR review-fix items.
- * 
+ *
+ * Since #1327 the item is type REBASE (mechanical rebase lane), not
+ * MERGE_CONFLICT: the fix loop's code attempts cannot rebase, so a DIRTY PR
+ * cycling fixed generations was pure quota burn. The `MERGE_CONFLICT` type
+ * remains valid for legacy rows.
+ *
  * Returns the evidence key if a new item was enqueued, null if skipped (not conflicting,
  * not eligible, or already queued).
  */
@@ -999,10 +1036,7 @@ export async function ingestMergeConflict(
   await enqueuePrFixItem(client, {
     repo: opts.repoFullName,
     pr: opts.prNumber,
-    lane: "NORMAL",
-    type: "MERGE_CONFLICT",
-    reason: `Merge conflict detected: PR is CONFLICTING`,
-    feedback: `PR has merge conflicts and needs rebase. Use \`git rebase\` to resolve, not patch.`,
+    ...rebaseWorkItem(`CONFLICTING`),
     evidenceKey,
     issue: opts.linkedIssue,
     branch: opts.branch,
@@ -1050,8 +1084,12 @@ export async function clearResolvedConflictItems(
 
   if (!existing) return false;
 
-  // Only clear if it's a merge conflict item and still queued
-  if (existing.type !== "MERGE_CONFLICT" || existing.status !== "QUEUED") return false;
+  // Only clear if it is a conflicts item and still queued. New items are
+  // type REBASE (#1327); MERGE_CONFLICT covers legacy rows the fix loop may
+  // still hold. A REBASE row clearing here is the lane's success path when
+  // GitHub's merge-state recomputes lag the pushed rebase.
+  if (existing.type !== "REBASE" && existing.type !== "MERGE_CONFLICT") return false;
+  if (existing.status !== "QUEUED") return false;
 
   // #1276 review: settle nothing before the ledger says the condition cleared.
   // The `merge_conflict:<repo>#<pr>` row is otherwise left at its last

@@ -37,6 +37,14 @@ export interface PrFixItemIdentity {
    * unaffected.
    */
   handoutToken?: string;
+  /**
+   * The queue item's PrFixType (#1327). A REBASE item names the mechanical
+   * rebase lane: rebase onto the base, reconcile conflicts mechanically,
+   * push --force-with-lease, and bail to a human on any semantic conflict.
+   * The task's `reasons` carry the full contract; this field lets callers
+   * branch without parsing prose.
+   */
+  fixType?: string;
 }
 
 export interface IdleTask {
