@@ -4,6 +4,11 @@ import { prisma, asAgentWorkClient } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { parseFinishAgentWorkInput, finishAgentWork } from "@/lib/agent-work";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// One finish per task cycle; matches the sibling agent-work/start window
+// (30 per 10s).
+const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
 
 /**
  * POST /api/agent-work/finish
@@ -57,6 +62,9 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`agent-work-finish:${auth.throttleKey}`, RATE_LIMIT);
+  if (limited) return limited;
 
   try {
     const body = await request.json();

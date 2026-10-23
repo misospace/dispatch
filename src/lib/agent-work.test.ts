@@ -410,6 +410,12 @@ describe("finishAgentWork", () => {
     await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
 
     const call = tx.agentWork.findFirst.mock.calls[0][0];
+    // Exactly the agent + active-state filter: no issue scoping, and no
+    // unexpected key smuggled into the query (#1316 review).
+    expect(call.where).toEqual({
+      agentName: "agent-1",
+      state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+    });
     expect(call.where).not.toHaveProperty("issueId");
   });
 
@@ -510,12 +516,25 @@ describe("releaseStaleWork", () => {
     const result = await releaseStaleWork(tx, 5 * 60 * 1000); // 5 minute threshold
 
     expect(result).toHaveLength(1);
+    // Per-state gate (#1316): heartbeat-gated CLAIMED/IN_PROGRESS rows, and
+    // BLOCKED rows gated on the park deadline only — a parked BLOCKED row
+    // (future expiry) is never selected or terminalized here.
+    const perStateGate = [
+      {
+        state: { in: ["CLAIMED", "IN_PROGRESS"] },
+        OR: [{ lastHeartbeatAt: { lt: expect.any(Date) } }, { leaseExpiresAt: { lt: expect.any(Date) } }],
+      },
+      {
+        state: "BLOCKED",
+        OR: [{ leaseExpiresAt: { lt: expect.any(Date) } }, { leaseExpiresAt: null }],
+      },
+    ];
+    expect(tx.agentWork.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { OR: perStateGate } }),
+    );
     expect(tx.agentWork.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({
-          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
-          OR: expect.any(Array),
-        }),
+        where: expect.objectContaining({ OR: perStateGate }),
         data: expect.objectContaining({ state: "STALE" }),
       }),
     );
@@ -629,10 +648,13 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
       agentWork: { 
         findMany: vi.fn().mockImplementation(({ where }: any) => {
           let result: any[] = [];
-          // Return data based on what's been mocked — simulate notIn filtering
+          // Return data based on what's been mocked — simulate state + notIn filtering
           const mockData = (mockPrisma.agentWork as any)._mockData;
           if (mockData) {
             result = [...mockData];
+            if (where?.state?.in) {
+              result = result.filter((w: any) => where.state.in.includes(w.state));
+            }
             if (where?.agentName?.notIn) {
               result = result.filter((w: any) => !where.agentName.notIn.includes(w.agentName));
             }
@@ -682,6 +704,81 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
         success: true,
         notes: expect.stringContaining("Deleted 1 stale AgentWork record"),
       }),
+    });
+  });
+
+  it("never releases a BLOCKED row through the claim-path cleanup (#1316, #1334)", async () => {
+    // A parked claim's settled row is BLOCKED and its parked AgentWork row has
+    // no matching active Lease once the ownership TTL elapses; the claim path
+    // must leave it to the park-gated sweep, not delete it here.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "parked-1", state: "BLOCKED", agentName: "parked-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
+  });
+
+  /**
+   * SQL-3VL evaluation of the protecting-lease clause
+   * (`expiredAt > now OR retryAfter > now`): a running park protects its
+   * agent's active-shaped rows even after the ownership TTL lapsed; a NULL
+   * comparison column satisfies neither arm.
+   */
+  function matchesProtectingLeaseWhere(
+    lease: { expiredAt: Date; retryAfter: Date | null },
+    where: { issueId: string; OR: Array<Record<string, any>> },
+  ): boolean {
+    return where.OR.some((arm) => {
+      for (const [field, cond] of Object.entries(arm)) {
+        const value = (lease as any)[field] as Date | null;
+        if (value === null || value === undefined) return false;
+        if (cond?.gt !== undefined && !(value.getTime() > cond.gt.getTime())) return false;
+      }
+      return true;
+    });
+  }
+
+  function leaseQuerySeeLeases(leases: Array<{ agentName: string; expiredAt: Date; retryAfter: Date | null }>) {
+    mockPrisma.lease.findMany.mockImplementation(({ where }: any) =>
+      Promise.resolve(leases.filter((l) => matchesProtectingLeaseWhere(l, where))),
+    );
+  }
+
+  it("a running park (renewal externalWait) keeps the parked agent's IN_PROGRESS row alive through the cleanup (#1316, #1334)", async () => {
+    // The claim path used to key "active" on expiredAt alone, so a park
+    // longer than the renew TTL — the row still CLAIMED/IN_PROGRESS, the
+    // wait deadline still running — lost its row to deleteMany while the
+    // sweeper deliberately holds off. The park must decide here too.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    leaseQuerySeeLeases([
+      { agentName: "parked-agent", expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() + 30 * 60_000) },
+    ]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "parked-work-1", state: "IN_PROGRESS", agentName: "parked-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.agentWork.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("an elapsed park no longer protects the agent's active-shaped row (marker spent, normal cleanup)", async () => {
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    leaseQuerySeeLeases([
+      { agentName: "parked-agent", expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() - 60_000) },
+    ]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "parked-work-1", state: "IN_PROGRESS", agentName: "parked-agent" },
+    ];
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(1);
+    expect(mockPrisma.agentWork.deleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ["parked-work-1"] } },
     });
   });
 
