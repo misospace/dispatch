@@ -163,6 +163,44 @@ describe("POST /api/agent-work/finish", () => {
     expect(body.error).toBe("No active work found for agent");
   });
 
+  // #1331: a finish that identifies an issue must say which issue it looked
+  // for — the agent's other issues' work is never settled as a fallback.
+  it("returns 404 naming the identified issue when that issue has no active work", async () => {
+    mockAgentWork.findFirst.mockResolvedValue(null);
+
+    const res = await makeFinishRequest({
+      agentName: "test-agent",
+      state: "DONE",
+      issueId: "GH_issue_abc123",
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe("No active work found for agent (issueId: GH_issue_abc123)");
+    expect(mockAgentWork.update).not.toHaveBeenCalled();
+  });
+
+  // #1331: the parsed issueId must reach the selection query — a route that
+  // stopped forwarding it would silently degrade a scoped finish to an
+  // unscoped one (the agent's freshest active row) while every other test
+  // still passes.
+  it("scopes the selection query to the identified issue", async () => {
+    const res = await makeFinishRequest({
+      agentName: "test-agent",
+      state: "DONE",
+      issueId: "GH_issue_abc123",
+    });
+    expect(res.status).toBe(200);
+    expect(mockAgentWork.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          agentName: "test-agent",
+          issueId: "GH_issue_abc123",
+          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+        },
+      })
+    );
+  });
+
   it("returns 400 when body is null", async () => {
     const res = await handleFinish(
       new Request("http://localhost/api/agent-work/finish", {

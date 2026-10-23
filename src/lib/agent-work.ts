@@ -80,17 +80,34 @@ export interface CheckpointAgentWorkInput {
  * @body agentName (string, required) - Worker identifier matching the active work record
  * @body state (string, required) - One of the valid state values listed above
  * @body summary (string, optional) - Final summary of what was accomplished or why blocked
+ * @body issueId (string, optional) - GitHub issue ID this finish belongs to
+ *                                   (POST /api/agent-work/finish); scopes selection
+ *                                   to that issue's active rows (#1331)
  *
  * Response 200: Updated work object with final state set and lease expired
  * Response 400: { error: string } with details about which field failed validation
  * Response 401: { error: "Unauthorized" } when bearer token is missing/invalid
  * Response 404: { error: "No active work found for agent" } when agent has no active work
- *               (also cleans up orphaned leases automatically)
+ *               (also cleans up orphaned leases automatically). When the request
+ *               identified an issue, the message names it —
+ *               { error: "No active work found for agent (issueId: …)" } — and the
+ *               agent's other issues' work is never settled as a fallback.
  */
 export interface FinishAgentWorkInput {
   agentName: string;
   state: string;
   summary?: string | null;
+  /**
+   * Optional GitHub issue ID identifying the finish's issue (#1331).
+   * When present, selection is scoped to this issue's active rows so a
+   * finish can never settle another issue's active work.
+   *
+   * Workers that know their issue should send it: without it the finish
+   * settles the agent's FRESHEST active row, and a renewal on another issue
+   * can reorder that pick — only the issue-scoped pick names the intended
+   * attempt for certain.
+   */
+  issueId?: string | null;
 }
 
 /**
@@ -168,6 +185,7 @@ export function parseFinishAgentWorkInput(body: unknown): FinishAgentWorkInput |
     agentName: input.agentName.trim(),
     state: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
+    issueId: typeof input.issueId === "string" && nonEmpty(input.issueId.trim()) ? input.issueId.trim() : null,
   };
 }
 
@@ -277,14 +295,17 @@ export async function finishAgentWork(client: AgentWorkClient, input: FinishAgen
   const state = input.state as AgentWorkState;
 
   return client.$transaction(async (tx) => {
-    // #1316 review: select through the shared current-claim-work rule
-    // (freshest lastHeartbeatAt, then createdAt, then id) instead of an
-    // unordered pick. A `blocked` disposition parks its row as an external
-    // wait that survives `startAgentWork` (which releases only
+    // #1316 review / #1331: select the current claim's work through the
+    // shared deterministic rule (freshest lastHeartbeatAt, then createdAt,
+    // then id) instead of an unordered pick, scoped to the finish's issue when
+    // the request identifies one. A `blocked` disposition parks its row as an
+    // external wait that survives `startAgentWork` (which releases only
     // CLAIMED/IN_PROGRESS rows), so an unordered findFirst could terminalize
     // another issue's parked row while the attempt actually being finished
-    // stays active — the same hazard #1328 closed for checkpoints.
-    const existing = await findCurrentClaimWork(tx, input.agentName);
+    // stays active — the same hazard #1328 closed for checkpoints. Without
+    // issueId scoping the pick could also settle a different issue's active
+    // row entirely.
+    const existing = await findCurrentClaimWork(tx, input.agentName, input.issueId ?? undefined);
 
     if (!existing) {
       return null;
