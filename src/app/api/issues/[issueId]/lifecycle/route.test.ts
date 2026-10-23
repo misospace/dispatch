@@ -358,7 +358,7 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
     expect(body.attempts.prFixEventsTruncated).toBe(true);
     expect(mocks.prFixItemFindMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        include: { history: { orderBy: { at: "asc" }, take: 101 } },
+        include: { history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: 101 } },
       }),
     );
   });

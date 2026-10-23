@@ -139,7 +139,9 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
         // Queue writes fold repo through normalizeQueueRepo (#1145);
         // Repository.fullName keeps caller casing, so reads must fold too.
         where: { repo: normalizeQueueRepo(issue.repository.fullName), issue: issue.number },
-        include: { history: { orderBy: { at: "asc" }, take: MAX_ATTEMPT_HISTORY + 1 } },
+        // Secondary `id` key: with >100 rows tied on `at` at the cap boundary,
+        // a lone `at` order would leave WHICH row survives DB-nondeterministic.
+        include: { history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: MAX_ATTEMPT_HISTORY + 1 } },
       }),
     ]);
     const attemptsTruncated = runRows.length > MAX_ATTEMPT_RUNS;
