@@ -88,7 +88,10 @@ export interface CheckpointAgentWorkInput {
  * Response 400: { error: string } with details about which field failed validation
  * Response 401: { error: "Unauthorized" } when bearer token is missing/invalid
  * Response 404: { error: "No active work found for agent" } when agent has no active work
- *               (also cleans up orphaned leases automatically)
+ *               (also cleans up orphaned leases automatically). When the request
+ *               identified an issue, the message names it —
+ *               { error: "No active work found for agent (issueId: …)" } — and the
+ *               agent's other issues' work is never settled as a fallback.
  */
 export interface FinishAgentWorkInput {
   agentName: string;

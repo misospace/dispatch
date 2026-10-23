@@ -378,15 +378,14 @@ describe("finishAgentWork", () => {
 
     await finishAgentWork(tx, { agentName: "agent-1", state: "DONE" });
 
-    expect(tx.agentWork.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          agentName: "agent-1",
-          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
-        }),
-        orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
-      })
-    );
+    const call = tx.agentWork.findFirst.mock.calls[0][0];
+    // Identity, not just structural equality: the selection must go through
+    // the shared constant, so an inline copy of it cannot pass by accident.
+    expect(call.orderBy).toBe(CURRENT_CLAIM_WORK_ORDER_BY);
+    expect(call.where).toEqual({
+      agentName: "agent-1",
+      state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+    });
   });
 
   it("scopes selection to the finish's issue when the request identifies one", async () => {
@@ -395,12 +394,15 @@ describe("finishAgentWork", () => {
 
     await finishAgentWork(tx, { agentName: "agent-1", state: "DONE", issueId: "issue-A" });
 
-    expect(tx.agentWork.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ agentName: "agent-1", issueId: "issue-A" }),
-        orderBy: CURRENT_CLAIM_WORK_ORDER_BY,
-      })
-    );
+    const call = tx.agentWork.findFirst.mock.calls[0][0];
+    expect(call.orderBy).toBe(CURRENT_CLAIM_WORK_ORDER_BY);
+    // Exactly the agent + issue + active-state filter: no stray filter key
+    // (e.g. a `runId` null filter) can slip into the scoped query unnoticed.
+    expect(call.where).toEqual({
+      agentName: "agent-1",
+      issueId: "issue-A",
+      state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+    });
   });
 
   it("does not scope selection by issue when the request identifies none", async () => {
@@ -608,6 +610,14 @@ function createRowBackedTransaction(rows: any[]) {
     findFirst: vi.fn(async ({ where, orderBy }: any) => {
       if (where.state !== undefined && !Array.isArray(where.state?.in)) {
         throw new Error(`test fake: unsupported where.state shape ${JSON.stringify(where.state)}`);
+      }
+      // Only the modeled filter keys are honored: a key this fake does not
+      // model would be silently ignored, so a selection that filters on
+      // something else could pass by accident.
+      for (const key of Object.keys(where)) {
+        if (!["agentName", "issueId", "state"].includes(key)) {
+          throw new Error(`test fake: unsupported where key ${key}`);
+        }
       }
       const matches = rows.filter(
         (row) =>

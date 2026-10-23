@@ -179,6 +179,28 @@ describe("POST /api/agent-work/finish", () => {
     expect(mockAgentWork.update).not.toHaveBeenCalled();
   });
 
+  // #1331: the parsed issueId must reach the selection query — a route that
+  // stopped forwarding it would silently degrade a scoped finish to an
+  // unscoped one (the agent's freshest active row) while every other test
+  // still passes.
+  it("scopes the selection query to the identified issue", async () => {
+    const res = await makeFinishRequest({
+      agentName: "test-agent",
+      state: "DONE",
+      issueId: "GH_issue_abc123",
+    });
+    expect(res.status).toBe(200);
+    expect(mockAgentWork.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          agentName: "test-agent",
+          issueId: "GH_issue_abc123",
+          state: { in: ["CLAIMED", "IN_PROGRESS", "BLOCKED"] },
+        },
+      })
+    );
+  });
+
   it("returns 400 when body is null", async () => {
     const res = await handleFinish(
       new Request("http://localhost/api/agent-work/finish", {
