@@ -10,6 +10,7 @@
 
 import { EnqueuePrFixInput, enqueuePrFixItem, normalizeQueueRepo, recordPrFixEvidenceBaseline, PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { CONFLICTING_STATUSES, FAILURE_CONCLUSIONS } from "@/lib/linked-pr-health";
+import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { extractFailureMarker, extractFailureWorkflow, isScanFailure } from "@/lib/ci-failure-ingestion";
 import { getConfiguredLanes, getEscalationLane } from "@/lib/lane-config";
 import { PARKED_COMMENT_MARKER } from "@/lib/pr-fix-surfacing";
@@ -21,6 +22,12 @@ import {
   type EvidenceVersionFields,
   type PrFixEvidenceKind,
 } from "@/lib/pr-fix-evidence";
+
+// The mechanical rebase contract lives in its own module (#1327) so the
+// linked-PR health materialization writes the same instruction wall. It is
+// re-exported here so every existing importer of the ingestion module keeps
+// working unchanged.
+export { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -959,33 +966,6 @@ export async function ingestMergeStateEvent(
 
 
 // ─── Merge Conflict Detection ───────────────────────────────────────────────
-
-/**
- * Worker-facing contract for the mechanical rebase lane (#1327). Both
- * conflict call-sites (merge_state dirty and mergeable=CONFLICTING) share it:
- * the item's reasons ARE the instruction wall, since a rebase hand-off is a
- * followup-pr task and the queue carries no separate instruction channel.
- */
-export function rebaseWorkItem(stateLabel: string): IngestWorkItem {
-  return {
-    lane: "NORMAL",
-    type: "REBASE",
-    reason: `Mechanical rebase: PR ${stateLabel} against base (#1327)`,
-    feedback: [
-      `Mechanical rebase required: this PR is ${stateLabel} against its base branch (#1327).`,
-      "Rebase the PR branch onto the base and resolve conflicts MECHANICALLY ONLY:",
-      "lockfiles, version strings, import order, doc indexes, adjacent",
-      "non-overlapping hunks, and comment-only overlaps where one side is a",
-      "strict subset. Never edit the same logic on both sides; never merge;",
-      "never open a new PR. Push with --force-with-lease, then run the repo's",
-      "bounded typecheck; an unfixable error in a file this PR touches says the",
-      "rebase is not mechanical. On ANY semantic conflict, report outcome",
-      '"blocked" with blockReason "human_decision", the conflicting files, and',
-      "why the conflict is not mechanical — do NOT resolve it yourself. One",
-      "attempt per DIRTY episode; do not retry.",
-    ].join("\n"),
-  };
-}
 
 /**
  * Detect and enqueue merge conflict items for PRs with mergeable=CONFLICTING.
