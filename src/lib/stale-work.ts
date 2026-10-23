@@ -230,7 +230,10 @@ export interface StaleWorkReport {
  * `retryAfter` is NOT a fence field: it is read to decide whether the claim
  * is PARKED (a running wait marker, #1316/#1334) and is deliberately not
  * compared for equality — the delete's own condition excludes a running park
- * instead.
+ * instead. The retry arm does not take a fresh epoch snapshot: a lease present
+ * at retry time postdates the stale mark, which committed only after consuming
+ * the marked lease and rechecking the pair empty (#1359). It must be refused,
+ * not mistaken for the incarnation whose release is owed.
  */
 interface ClaimEpochSnapshot {
   claimToken: string | null;
@@ -286,6 +289,7 @@ interface StaleWorkOutcome {
   marked: boolean;
   retained: boolean;
   retention?: "live_sibling" | "claim_epoch_moved";
+  staleRetryRefusal?: boolean;
   liveSiblingId?: string | null;
   /**
    * Lease rows the fenced delete removed in this marked transaction
@@ -354,15 +358,21 @@ async function findLiveSiblingWork(
  *    `executing` by a crashed process is never taken over automatically: it
  *    stays fail-closed (like a crashed claim guard) pending operator
  *    intervention.
- * 2. **Claim-epoch fence.** The lease delete is a compare-and-delete against
- *    a snapshot of `{claimToken, expiredAt, lastRenewalObservedAt}` taken
- *    BEFORE the sibling lookup, re-checked after the delete for any lease left
- *    on the pair. If any renew, re-claim or fresh claim commits between the
- *    snapshot and the delete, the fence no longer matches (or a new row shows
- *    up) and the sweep backs off: the row is still reclaimed (STALE) but the
- *    claim, lease and label are reported retained, never released. This is
- *    the belt to the fence's braces — it also covers any future writer that
- *    forgets the mutation guard.
+ * 2. **Claim-epoch fence.** The mark-arm lease delete is a compare-and-delete
+ *    against a snapshot of `{claimToken, expiredAt, lastRenewalObservedAt}`
+ *    taken BEFORE the sibling lookup, rechecked after the delete for any
+ *    lease left on the pair. If any renew, re-claim or fresh claim commits
+ *    between the snapshot and the delete, the fence no longer matches (or a
+ *    new row shows up) and the sweep backs off: the row is still reclaimed
+ *    (STALE) but the claim, lease and label are reported retained, never
+ *    released. This is the belt to the fence's braces — it also covers any
+ *    future writer that forgets the mutation guard.
+ * 3. **No retry re-snapshot (#1359).** The mark commits a pending release only
+ *    after consuming the marked lease incarnation and rechecking that no lease
+ *    remains. A lease found by a later retry therefore postdates the mark, even
+ *    if it belongs to the same agent; the retry refuses to delete it or release
+ *    its label. The lease stays untouched and the pending row is retired as a
+ *    claim-epoch retention.
  *
  * A third rule sits in front of both: a PARKED claim is not stale work at
  * all. A running wait marker on the lease (`retryAfter` in the future,
@@ -444,6 +454,14 @@ export async function sweepStaleWork(
         staleClaimReleasePending: work.staleClaimReleasePending,
       };
 
+      // Which arm this decision belongs to, captured BEFORE either CAS runs:
+      // the retry update below requires exactly `state: "STALE"` plus the
+      // pending marker, the mark update an active-shaped non-pending row —
+      // disjoint predicates, so this pre-write snapshot decides the arm. The
+      // mark CAS flips the row to STALE as a SIDE EFFECT, so the arm must
+      // never be re-derived from the row state after it (#1359).
+      const retryArm = work.state === "STALE";
+
       // Claim-epoch snapshot, taken BEFORE the sibling lookup: every write the
       // fenced delete below can no longer match is a write that committed
       // inside the decision window (snapshot → delete), i.e. exactly the
@@ -524,26 +542,35 @@ export async function sweepStaleWork(
       if (work.issueId) {
         let epochMoved = false;
         if (epoch) {
-          const deleted = await tx.lease.deleteMany({
-            where: {
-              agentName: work.agentName,
-              issueId: work.issueId,
-              claimToken: epoch.claimToken,
-              expiredAt: epoch.expiredAt,
-              lastRenewalObservedAt: epoch.lastRenewalObservedAt,
-              // #1334: a RUNNING park is not evidence of abandonment, so the
-              // delete must not consume the lease the park was recorded on.
-              // Defence in depth: every writer of the marker takes the same
-              // per-issue fence the sweep holds, so the lease cannot change
-              // inside the decision window — but the sweep must not depend on
-              // that to keep a park alive. A lease with no wait marker
-              // (`retryAfter IS NULL`) or an elapsed one is reclaimable as
-              // before.
-              OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
-            },
-          });
-          if ((deleted?.count ?? 0) !== 1) epochMoved = true;
-          else leasesDeleted = deleted.count;
+          if (retryArm) {
+            // #1359: the mark committed pending only after its CAS consumed the
+            // marked lease incarnation and its recheck found the pair empty.
+            // A lease read now is a newer claim incarnation (including a
+            // same-agent re-claim in the crash window), so retry must not
+            // consume it or release its agent label.
+            epochMoved = true;
+          } else {
+            const deleted = await tx.lease.deleteMany({
+              where: {
+                agentName: work.agentName,
+                issueId: work.issueId,
+                claimToken: epoch.claimToken,
+                expiredAt: epoch.expiredAt,
+                lastRenewalObservedAt: epoch.lastRenewalObservedAt,
+                // #1334: a RUNNING park is not evidence of abandonment, so the
+                // delete must not consume the lease the park was recorded on.
+                // Defence in depth: every writer of the marker takes the same
+                // per-issue fence the sweep holds, so the lease cannot change
+                // inside the decision window — but the sweep must not depend on
+                // that to keep a park alive. A lease with no wait marker
+                // (`retryAfter IS NULL`) or an elapsed one is reclaimable as
+                // before.
+                OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
+              },
+            });
+            if ((deleted?.count ?? 0) !== 1) epochMoved = true;
+            else leasesDeleted = deleted.count;
+          }
         }
         // A lease on the pair at the end of the window that the sweep did not
         // consume — a fresh claim that raced in during the window, or behind
@@ -591,7 +618,13 @@ export async function sweepStaleWork(
           // In the pathological case where the CAS delete consumed a row AND
           // a recheck still found one, the consumed deletion is still real —
           // report it honestly even though this row is retained.
-          return { marked: true, retained: true, retention: "claim_epoch_moved", leasesDeleted };
+          return {
+            marked: true,
+            retained: true,
+            retention: "claim_epoch_moved",
+            staleRetryRefusal: retryArm,
+            leasesDeleted,
+          };
         }
       }
       return { marked: true, retained: false, liveSiblingId: null, leasesDeleted };
@@ -614,7 +647,9 @@ export async function sweepStaleWork(
         .join(" ");
       const reason =
         outcome.retention === "claim_epoch_moved"
-          ? "the claim epoch moved (renewal, re-claim or fresh claim committed inside the sweep's decision window)"
+          ? outcome.staleRetryRefusal
+            ? "a newer claim incarnation landed after the row's stale mark (#1359)"
+            : "the claim epoch moved (renewal, re-claim or fresh claim committed inside the sweep's decision window)"
           : `live AgentWork ${outcome.liveSiblingId} still owns the claim`;
       // The retention decision is already committed and the row is no longer
       // a sweep candidate, so a failure here must NOT escape: it would leave

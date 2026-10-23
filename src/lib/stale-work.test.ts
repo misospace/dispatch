@@ -883,6 +883,71 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
   });
 });
 
+describe("sweepStaleWork — retry arm refuses a claim that postdates the mark (#1359)", () => {
+  const retryRow = () =>
+    makeWork({
+      state: "STALE",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+
+  it("retains a same-agent lease created after the mark without releasing its label", async () => {
+    const row = retryRow();
+    const lease = makeLease({ claimToken: "token-new-claim", createdAt: new Date() });
+    const { client, eventRows, auditRows, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ released: 0, claimRetained: 1, leasesReleased: 0, skipped: 0 });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toEqual([lease]);
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(eventRows.filter((event) => event.kind === "claim_released")).toHaveLength(0);
+    expect(row).toMatchObject({ state: "STALE", staleClaimReleasePending: false });
+    const audit = auditRows.find((entry) => entry.action === "stale_agentwork_claim_retained");
+    expect(audit).toBeDefined();
+    expect(audit?.notes).toContain("newer claim incarnation landed after the row's stale mark (#1359)");
+  });
+
+  it("completes the owed release when retry finds no lease", async () => {
+    const row = retryRow();
+    const { client, eventRows, leaseDeleteMany } = makeSweepClient({ candidates: [row], rows: [row], leases: [] });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ released: 1, claimRetained: 0, skipped: 0, leasesReleased: 0 });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+    expect(eventRows.filter((event) => event.kind === "claim_released")).toHaveLength(1);
+    expect(row.staleClaimReleasePending).toBe(false);
+  });
+
+  it("skips a retry row when a park appears after the parked-claim filter", async () => {
+    const row = retryRow();
+    const lease = makeLease();
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+      afterParkFilter: () => {
+        lease.retryAfter = minutesAhead(40);
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ released: 0, claimRetained: 0, skipped: 1 });
+    expect(row).toMatchObject({ state: "STALE", staleClaimReleasePending: true });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toEqual([lease]);
+  });
+});
+
 // ─── Fence + claim-epoch protection (#1251 review, TOCTOU blocker) ───────────
 //
 // The live-sibling lookup alone is a check, not a fence: a renewal or fresh
