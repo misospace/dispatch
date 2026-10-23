@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
     if (repoFullName) {
       repos = repos.filter((r) => r.fullName === repoFullName);
       if (repos.length === 0) {
-        return errorResponse(`Repo ${repoFullName} is not tracked. Track it first via /api/repos or the UI.`, 404);
+        return errorResponse(`Repo ${repoFullName} is not tracked. Track it first via /api/automation/repos or the UI.`, 404);
       }
     }
 

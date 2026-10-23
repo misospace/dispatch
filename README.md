@@ -484,9 +484,6 @@ Move issue between status columns. Body: `{ issueId, repoFullName, issueNumber, 
 ### GET /api/repos
 List configured repositories for the board/issue-sync view (`Repository` rows). This is not the tracked repository management API.
 
-### POST /api/repos
-Deprecated compatibility endpoint for adding a tracked repository. Prefer `POST /api/automation/repos`; this endpoint delegates to the same behavior and returns deprecation headers.
-
 ### GET /api/automation/repos
 Canonical tracked repository list for automation. Returns `AutomationRepo` rows with workflow/release summary fields used by `/automation`.
 
