@@ -21,7 +21,13 @@ const { githubMocks, claimGateMocks, claimMocks, guardState } = vi.hoisted(() =>
 
 vi.mock("./github", () => ({ removeIssueLabel: githubMocks.removeIssueLabel }));
 vi.mock("./claim-gate", () => ({ getLiveIssueLabels: claimGateMocks.getLiveIssueLabels }));
-vi.mock("./issue-claim", () => ({ releaseIssueClaim: claimMocks.releaseIssueClaim }));
+// #1367: `fencedClaimClient` moved into `./issue-claim` next to the release
+// it feeds. The mock keeps the real thin client (it is a pure reshape) and
+// stubs only the release itself.
+vi.mock("./issue-claim", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./issue-claim")>();
+  return { ...actual, releaseIssueClaim: claimMocks.releaseIssueClaim };
+});
 vi.mock("./issue-mutation-guard", () => ({
   // The real budget function: the module derives the handoff's fenced
   // region's transaction timeout from it at import time.

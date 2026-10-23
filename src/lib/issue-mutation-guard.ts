@@ -359,7 +359,15 @@ export async function withIssueMutationGuard<T>(
     // behind — that row is invisible to the ownership inspect surface (which
     // lists `executing` guards only) and would wedge EVERY writer on the
     // issue, claims included, with no operator-visible way to clear it.
-    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign") && !resuming) {
+    //
+    // #1367: same posture for "unclaim" — it also has no resume branch (only
+    // an `unclaim` attempt could take over an `unclaim` guard), and its route
+    // releases the anchor on every handled path (the callback catches its own
+    // failures), so a failed attempt deletes its guard row instead of leaving
+    // a demoted `executing: false` row that no one can resume — invisible to
+    // the ownership inspect surface (which lists `executing` guards only) and
+    // wedging every writer on the issue.
+    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign" || request.operation === "unclaim") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

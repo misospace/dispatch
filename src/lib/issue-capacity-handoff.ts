@@ -15,7 +15,7 @@
 import { AGENT_PREFIX, getAgentFromLabels } from "@/types";
 import { removeIssueLabel } from "./github";
 import { getLiveIssueLabels } from "./claim-gate";
-import { releaseIssueClaim, type IssueClaimClient } from "./issue-claim";
+import { releaseIssueClaim, fencedClaimClient } from "./issue-claim";
 import { recordCapacityHandoff, capacityCooldownMs, type CapacityHandoffClient } from "./capacity-handoff";
 import {
   lookupIssueHandoffSettlement,
@@ -51,27 +51,8 @@ type FencedRemoteWrite = <T>(
  */
 const CAPACITY_RELEASE_FENCED_TIMEOUT_MS = fencedWriteTimeoutMs() * 3;
 
-/**
- * A THIN `IssueClaimClient` over the fenced transaction client.
- *
- * `releaseIssueClaim` opens its own interactive transaction whenever the
- * client it is handed exposes `$transaction` — and a real Prisma interactive
- * transaction client DOES expose it (Prisma only denies `$connect`,
- * `$disconnect`, `$on`, `$use` and `$extends`). Inside the fenced region that
- * would open a NESTED interactive transaction (a savepoint) with Prisma's
- * default 5s timeout: the release's cache mirror and its `claim_released`
- * evidence row could roll back to the savepoint while the GitHub removal
- * stands. The thin client is therefore built EXPLICITLY from the transaction
- * client, WITHOUT `$transaction`, so the release's local writes join the
- * fenced transaction instead of nesting inside it.
- */
-function fencedClaimClient(tx: unknown): IssueClaimClient {
-  const source = tx as {
-    issue: IssueClaimClient["issue"];
-    issueLifecycleEvent?: IssueClaimClient["issueLifecycleEvent"];
-  };
-  return { issue: source.issue, issueLifecycleEvent: source.issueLifecycleEvent };
-}
+// `fencedClaimClient` lives in `./issue-claim` next to the release it feeds
+// (shared with the unclaim route, #1367); imported above.
 
 export interface IssueCapacityHandoffClient extends CapacityHandoffClient {
   issue: {

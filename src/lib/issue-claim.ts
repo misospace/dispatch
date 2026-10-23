@@ -64,6 +64,33 @@ export interface IssueClaimClient {
 }
 
 /**
+ * A THIN `IssueClaimClient` over the fenced transaction client.
+ *
+ * `releaseIssueClaim` opens its own interactive transaction whenever the
+ * client it is handed exposes `$transaction` — and a real Prisma interactive
+ * transaction client DOES expose it (Prisma only denies `$connect`,
+ * `$disconnect`, `$on`, `$use` and `$extends`). Inside the fenced region that
+ * would open a NESTED interactive transaction (a savepoint) with Prisma's
+ * default 5s timeout: the release's cache mirror and its `claim_released`
+ * evidence row could roll back to the savepoint while the GitHub removal
+ * stands. The thin client is therefore built EXPLICITLY from the transaction
+ * client, WITHOUT `$transaction`, so the release's local writes join the
+ * fenced transaction instead of nesting inside it.
+ *
+ * Shared with the release's fenced callers (#1254/#1361/#1367): the capacity
+ * handoff, the unclaim route, and the stale-work sweep all hand the release
+ * this helper's client, so the release's local writes join each caller's
+ * fenced transaction instead of nesting inside it.
+ */
+export function fencedClaimClient(tx: unknown): IssueClaimClient {
+  const source = tx as {
+    issue: IssueClaimClient["issue"];
+    issueLifecycleEvent?: IssueClaimClient["issueLifecycleEvent"];
+  };
+  return { issue: source.issue, issueLifecycleEvent: source.issueLifecycleEvent };
+}
+
+/**
  * Release an issue's agent claim and mirror the result in the local cache.
  *
  * The operator unclaim route and stale-work recovery use this same mutation

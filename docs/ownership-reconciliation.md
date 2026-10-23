@@ -517,7 +517,9 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > Every guarded callback (claim, the direct assignment route — `assign_agent`
 > AND `assign_owner`, whose label write is a full-set PUT — the unassign route
 > (#1361, whose label write is a full-set PUT too — the direct assignment's
-> twin in the other direction — the reconciler's
+> twin in the other direction), the unclaim route (#1367, whose remote release
+> removes the `agent/*` label and may chain a resting-status transition, and
+> whose entire mutation now runs under the anchor) — the reconciler's
 > Phase B delete, the stale-work sweep, and the capacity handoff's release)
 > performs its remote ownership write inside a **fenced write**
 > (`IssueMutationContext.runFencedRemoteWrite`,
