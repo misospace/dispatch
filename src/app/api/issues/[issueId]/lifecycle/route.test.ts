@@ -273,6 +273,23 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
     expect(body.attempts.totalExecutionWallTimeMs).toBe(3300000);
   });
 
+  it("folds the cached repo casing into the pr-fix read (#1183 review)", async () => {
+    // Queue writes always fold repo lowercase (#1145); Repository.fullName
+    // keeps caller casing, so a mixed-case cache row must still find its
+    // normalized queue items instead of silently reading none.
+    mocks.issueFindUnique.mockResolvedValue(
+      issue({ repository: { fullName: "Org/Repo" } }),
+    );
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    expect(mocks.prFixItemFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { repo: "org/repo", issue: 42 },
+      }),
+    );
+  });
+
   it("flags attemptsTruncated when the bounded run read hits its cap", async () => {
     const many = Array.from({ length: 501 }, (_, i) => ({
       id: `run-${i}`,

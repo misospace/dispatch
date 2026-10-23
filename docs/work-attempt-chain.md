@@ -56,9 +56,11 @@ Everything hangs off identity that survives retries and replays:
   carries `prFix: { itemId, repo, pr }` identifying the queue item and the
   PR the round was about; execution attempts carry `prFix: null`.
 - **Artifacts** = the `AgentRun` ids whose intervals overlap the attempt
-  window, plus the PR numbers of `pr_merged` lifecycle events whose
-  occurrence falls in that window. Merge evidence stays lifecycle-owned: it
-  is never derived from a run record or a worker report.
+  window **and whose agent identity does not contradict the claim's** (see
+  "Run attribution is agent-aware"), plus the PR numbers of `pr_merged`
+  lifecycle events whose occurrence falls in that window. Merge evidence
+  stays lifecycle-owned: it is never derived from a run record or a worker
+  report.
 
 ## Contract fields
 
@@ -70,10 +72,10 @@ Each `attempts.attempts[]` entry carries:
 | `kind` | `"execution"` or `"fix-round"`. |
 | `agentName` | From the claim / closing event or the matched run; `null` when unknown. Fix rounds are `null` — the PR-fix history stream carries no agent attribution. |
 | `claimedAt` | `{ at, provenance }` from the claim event: `observed` when at least one observation of the claim was recorded live, `backfilled` when every observation of it is a backfill (see "Dedupe guarantees"). Null means unknown — **never** inferred from the issue's creation time or from run timestamps. |
-| `startedAt` / `endedAt` | Only from `AgentRun` intervals (`startedAt` / `finishedAt`) when a run's interval lies within/overlaps the attempt window; null otherwise. Claim/admission time and actual execution time are different facts and stay distinct: `claimedAt` is admission, these are execution. |
+| `startedAt` / `endedAt` | Only from `AgentRun` intervals (`startedAt` / `finishedAt`) when a run's interval lies within/overlaps the attempt window **and is attributable to the attempt** (see "Run attribution is agent-aware"); null otherwise. Claim/admission time and actual execution time are different facts and stay distinct: `claimedAt` is admission, these are execution. |
 | `reportedAt` | `occurredAt` of the closing lifecycle event (`attempt_failed` / `completed` / `claim_released`) that ends the attempt; null when open. |
 | `outcome` | See below. Every attempt is preserved with its outcome. |
-| `classification` | `"active-execution"` ONLY when a run interval overlaps the attempt window; `"waiting-review"` when a `claim_released` deliberately retained `status/in-review`; `"unclassified"` otherwise. Conservative by design: queued, waiting-CI, and merge-adjacent states stay unclassified unless explicit evidence says otherwise. |
+| `classification` | `"active-execution"` ONLY when an attributable run interval overlaps the attempt window; `"waiting-review"` when a `claim_released` deliberately retained `status/in-review`; `"unclassified"` otherwise. Conservative by design: queued, waiting-CI, and merge-adjacent states stay unclassified unless explicit evidence says otherwise. |
 | `executionMetadata` | `{ workerProduct, model, reasoningEffort, runtimeRevision, cohortLabel }` normalized from the matched runs' stored execution metadata (keys `worker`, `model`, `reasoningEffort`, `runtimeRevision`, `cohortLabel`). Unknown/missing stays null and is never inferred from timestamps or deployment data. Multiple matched runs union first-non-null-per-field in run order. |
 | `artifacts` | `agentRunIds` + `pullRequestNumbers` as above. |
 | `prFix` | `{ itemId, repo, pr }` for fix-round attempts (the PR-fix queue item the round belongs to), `null` for execution attempts. |
@@ -88,12 +90,34 @@ without a release").
 ### wallTimeMs is attribution, not a partition
 
 Per-attempt `wallTimeMs` attributes run intervals to attempts; it does not
-partition a total. A run that spans a claim boundary appears in BOTH
-neighboring attempts with its full interval, so per-attempt values may
-overlap each other and `startedAt` can predate `claimedAt`. An event or run
-exactly at a shared boundary may attribute to both neighboring attempts. The
-only deduplicated quantity is the top-level `totalExecutionWallTimeMs` —
+partition a total. An attributable run that spans a claim boundary appears
+in BOTH neighboring attempts with its full interval, so per-attempt values
+may overlap each other and `startedAt` can predate `claimedAt`. An event or
+run exactly at a shared boundary may attribute to both neighboring attempts.
+The only deduplicated quantity is the top-level `totalExecutionWallTimeMs` —
 never sum the per-attempt values.
+
+### Run attribution is agent-aware
+
+A run is attributable to an attempt when its interval overlaps the attempt
+window AND the identities do not contradict each other (#1183 review):
+
+| Claim agent | Run agent | Attribution |
+|---|---|---|
+| known | same known agent | yes, by time overlap |
+| known | **different known agent** | **never** — not even when the interval crosses the claim boundary |
+| known | unknown (`null`) | yes, by time overlap (identity cannot be discriminated) |
+| unknown (`null`) | any | yes, by time overlap |
+
+Without this rule, two concurrent workers on one issue cross-attribute:
+alpha claims 10:00 with `run-alpha` 10:05–11:30, beta claims 11:00 (alpha
+superseded) with `run-beta` 11:05–11:45 — beta's unbounded window overlaps
+`run-alpha`, so a time-only match would give beta alpha's run id, alpha's
+`executionMetadata`, a `startedAt` predating beta's claim, and alpha's wall
+time. With the rule each attempt carries only its own worker's evidence.
+The top-level `totalExecutionWallTimeMs` is unchanged by this rule: it
+remains the item-wide union of **every** run interval, so no execution time
+is lost — only misattribution is prevented.
 
 ## Outcomes
 
@@ -114,8 +138,9 @@ events, and appear in the chain solely as artifact PR numbers inside an
 attempt's window.
 
 An attempt left open (no closing evidence) has an **unbounded forward
-window**: later runs and merges on the issue attribute to it until the next
-claim.
+window**: later attributable runs and merges on the issue attach to it
+until the next claim (attribution rules above still apply, so a different
+known agent's runs never flow into an open attempt).
 
 ## Dedupe guarantees
 

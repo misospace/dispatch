@@ -504,10 +504,23 @@ export function buildWorkItemDeliveryChain(
     }
 
     // Runs whose interval lies within/overlaps the attempt window supply the
-    // attempt's actual execution start/end and its wall time. Matched runs
-    // are ordered by start (then id) so the metadata union is order-invariant.
+    // attempt's actual execution start/end and its wall time. Attribution is
+    // agent-aware (#1183 review): when the claim and the run BOTH carry agent
+    // identity, a run from a different agent is never attributed, even if its
+    // interval crosses the claim boundary — otherwise concurrent workers
+    // inherit each other's runs, metadata, start time, and wall time. A run
+    // with no agent identity cannot be discriminated and still attributes by
+    // time alone. The top-level totalExecutionWallTimeMs stays the item-wide
+    // union of every run interval regardless. Matched runs are ordered by
+    // start (then id) so the metadata union is order-invariant.
+    const claimAgentForRuns = claim.row.agentName;
     const matched = runIntervals
-      .filter(({ start, end }) => start <= windowEnd && end >= windowStart)
+      .filter(
+        ({ run, start, end }) =>
+          start <= windowEnd &&
+          end >= windowStart &&
+          !(claimAgentForRuns !== null && run.agentName !== null && run.agentName !== claimAgentForRuns),
+      )
       .sort((a, b) => a.start - b.start || (a.run.id < b.run.id ? -1 : a.run.id > b.run.id ? 1 : 0));
 
     const startedAtMs = matched.length > 0 ? Math.min(...matched.map((m) => m.start)) : null;

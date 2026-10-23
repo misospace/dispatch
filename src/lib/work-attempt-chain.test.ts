@@ -211,6 +211,72 @@ describe("buildWorkItemDeliveryChain", () => {
     expect(result.totalExecutionWallTimeMs).toBe(5400000);
   });
 
+  it("never attributes a different known agent's run across a claim boundary (#1183 review)", () => {
+    // alpha claims 10:00, run-alpha 10:05–11:30; beta claims 11:00 (supersedes
+    // alpha), run-beta 11:05–11:45. run-alpha's interval overlaps beta's
+    // unbounded window: a time-only match would give beta alpha's run,
+    // metadata, start time (predating its claim), and wall time.
+    const alphaClaim = event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" });
+    const betaClaim = event({ kind: "claim", agentName: "beta", occurredAt: "2026-10-01T11:00:00.000Z" });
+    const result = chain({
+      events: [alphaClaim, betaClaim],
+      runs: [
+        run({
+          id: "run-alpha",
+          agentName: "alpha",
+          startedAt: "2026-10-01T10:05:00.000Z",
+          finishedAt: "2026-10-01T11:30:00.000Z",
+          executionMetadata: { worker: "courier", model: "gpt-5.5" },
+        }),
+        run({
+          id: "run-beta",
+          agentName: "beta",
+          startedAt: "2026-10-01T11:05:00.000Z",
+          finishedAt: "2026-10-01T11:45:00.000Z",
+          executionMetadata: { worker: "harness-b" },
+        }),
+      ],
+    });
+
+    const [alphaAttempt, betaAttempt] = result.attempts;
+    expect(alphaAttempt.attemptId).toBe(execId(alphaClaim));
+    expect(betaAttempt.attemptId).toBe(execId(betaClaim));
+
+    expect(alphaAttempt.artifacts.agentRunIds).toEqual(["run-alpha"]);
+    expect(betaAttempt.artifacts.agentRunIds).toEqual(["run-beta"]);
+    expect(betaAttempt.startedAt).toBe("2026-10-01T11:05:00.000Z");
+    expect(betaAttempt.endedAt).toBe("2026-10-01T11:45:00.000Z");
+    expect(betaAttempt.executionMetadata.workerProduct).toBe("harness-b");
+    expect(betaAttempt.executionMetadata.model).toBeNull();
+
+    // Attribution is not a partition for the OWNED run: alpha keeps its full
+    // 85-minute interval even though it crosses beta's claim at 11:00...
+    expect(alphaAttempt.wallTimeMs).toBe(5100000);
+    // ...but beta never inherits alpha's execution: 40 minutes, not the union.
+    expect(betaAttempt.wallTimeMs).toBe(2400000);
+    // Top-level total stays the item-wide union [10:05, 11:45] = 100 minutes.
+    expect(result.totalExecutionWallTimeMs).toBe(6000000);
+  });
+
+  it("attributes a run with no agent identity by time alone", () => {
+    // Unknown identity cannot be discriminated: the run still evidences the
+    // attempt whose window it overlaps (documented conservative fallback).
+    const result = chain({
+      events: [event({ kind: "claim", agentName: "beta", occurredAt: "2026-10-01T11:00:00.000Z" })],
+      runs: [
+        run({
+          id: "run-unknown",
+          agentName: null,
+          startedAt: "2026-10-01T11:05:00.000Z",
+          finishedAt: "2026-10-01T11:20:00.000Z",
+        }),
+      ],
+    });
+
+    expect(result.attempts[0].artifacts.agentRunIds).toEqual(["run-unknown"]);
+    expect(result.attempts[0].startedAt).toBe("2026-10-01T11:05:00.000Z");
+  });
+
   it("reads cross-product workers without product-specific branching (e)", () => {
     const alphaClaim = event({ kind: "claim", agentName: "alpha", occurredAt: "2026-10-01T10:00:00.000Z" });
     const betaClaim = event({ kind: "claim", agentName: "beta", occurredAt: "2026-10-02T10:00:00.000Z" });

@@ -11,6 +11,7 @@ import {
   type WorkAttemptRunRecord,
 } from "@/lib/work-attempt-chain";
 import { backfillMergesFromRunHistory, touchedPullRequestNumbers } from "@/lib/lifecycle-backfill";
+import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
 
 const BACKFILL_RATE_LIMIT = { limit: 5, windowMs: 60_000 };
 
@@ -134,7 +135,9 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
         },
       }),
       prisma.prFixQueueItem.findMany({
-        where: { repo: issue.repository.fullName, issue: issue.number },
+        // Queue writes fold repo through normalizeQueueRepo (#1145);
+        // Repository.fullName keeps caller casing, so reads must fold too.
+        where: { repo: normalizeQueueRepo(issue.repository.fullName), issue: issue.number },
         include: { history: { orderBy: { at: "asc" }, take: 100 } },
       }),
     ]);
