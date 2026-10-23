@@ -2536,6 +2536,62 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.reasons).toEqual(["Linked PR needs follow-up"]);
   });
 
+  it("dispatches a conflicted linked PR through the mechanical rebase lane (#1327)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "dirty",
+        linkedPrFollowupReasons: ["merge_conflict"],
+      }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.pullRequest.number).toBe(15);
+    // The dispatch identity names the rebase lane, not the ordinary fix lane.
+    expect(body.prFixItem.fixType).toBe("REBASE");
+    // The materialized row is a REBASE item carrying the contract as its
+    // single feedback entry (the same shape the ingestion path writes).
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    const materialized = mocks.prFixCreate.mock.calls[0][0].data;
+    expect(materialized.type).toBe("REBASE");
+    expect(materialized.feedback).toHaveLength(1);
+    expect(materialized.reason).toContain("Mechanical rebase");
+    // The contract IS the instruction wall: it must reach the worker.
+    const contract = body.reasons.join("\n");
+    expect(contract).toContain("MECHANICALLY ONLY");
+    expect(contract).toContain("--force-with-lease");
+    expect(contract).toContain("human_decision");
+  });
+
+  it("materializes a linked PR without a merge conflict as an ordinary fix item (#1327)", async () => {
+    mocks.issueFindMany.mockResolvedValue([
+      linkedIssue(42, 15, {
+        linkedPrMergeState: "behind",
+        linkedPrFollowupReasons: ["merge_state_behind"],
+      }),
+    ]);
+
+    const res = await GET(
+      request("/api/agents/example-agent/next-task?lane=local"),
+      { params: Promise.resolve({ agentName: "example-agent" }) },
+    );
+
+    const body = await res.json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("OTHER");
+    expect(mocks.prFixCreate).toHaveBeenCalledTimes(1);
+    const materialized = mocks.prFixCreate.mock.calls[0][0].data;
+    expect(materialized.type).toBe("OTHER");
+    expect(materialized.feedback).toEqual(["merge_state_behind"]);
+    // No conflict, no contract: the health reasons stand unchanged.
+    expect(body.reasons).toEqual(["merge_state_behind"]);
+  });
+
   it("normal issue still returns implement when no follow-up exists", async () => {
     mocks.issueFindMany.mockResolvedValue([
       {

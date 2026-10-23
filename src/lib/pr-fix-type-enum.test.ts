@@ -46,7 +46,7 @@ function migratedEnumValues(): string[] {
       const name = /'([A-Z][A-Z0-9_]*)'/.exec(value)?.[1];
       if (name) values.add(name);
     }
-    for (const match of sql.matchAll(/ALTER\s+TYPE\s+"PrFixType"\s+ADD\s+VALUE(?:\s+IF\s+NOT\s+EXISTS)?\s+'([A-Z][A-Z0-9_]*)'/gi)) {
+    for (const match of sql.matchAll(/ALTER\s+TYPE\s+"PrFixType"\s+ADD\s+VALUE(?:\s+IF\s+NOT\s+EXISTS)?\s+['"]([A-Z][A-Z0-9_]*)['"]/gi)) {
       values.add(match[1]);
     }
   }
@@ -70,6 +70,20 @@ describe("PrFixType parity across app, schema, and migrations (#1327)", () => {
         .filter((value) => !migrated.has(value))
         .join("\n"),
       "these PrFixType values are declared in prisma/schema.prisma but no migration adds them to the database enum",
+    ).toBe("");
+  });
+
+  it("no migration adds a value the schema no longer declares", () => {
+    // The other direction: a value a migration added to the live enum but
+    // the schema dropped would leave the database and the app disagreeing in
+    // the opposite direction — the database can hold a type the app can never
+    // normalize back.
+    const declared = new Set(schemaEnumValues());
+    expect(
+      migratedEnumValues()
+        .filter((value) => !declared.has(value))
+        .join("\n"),
+      "these PrFixType values exist in the database enum (per the migrations) but are no longer declared in prisma/schema.prisma",
     ).toBe("");
   });
 

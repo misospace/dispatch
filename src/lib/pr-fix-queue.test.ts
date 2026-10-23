@@ -3362,6 +3362,40 @@ describe("createLinkedPrFixItem materialization (#1145)", () => {
     ]);
   });
 
+  it("persists the REBASE type when the caller asks for the rebase lane (#1327)", async () => {
+    const client = makeClient();
+    const { item, created } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      type: "REBASE",
+      reason: "Mechanical rebase: PR dirty against base (#1327)",
+      feedback: ["Mechanical rebase required: this PR is dirty against its base branch (#1327)."],
+      evidenceKey: "linked-health:42:2026-01-01T00:00:00.000Z",
+    });
+
+    expect(created).toBe(true);
+    expect(item.type).toBe("REBASE");
+    expect(client.items[0].type).toBe("REBASE");
+  });
+
+  it("persists OTHER when the caller passes no type (#1327)", async () => {
+    const client = makeClient();
+    const { item } = await createLinkedPrFixItem(client, {
+      repo: "org/repo",
+      pr: 15,
+      issue: 42,
+      lane: "NORMAL",
+      reason: "changes_requested",
+      feedback: ["changes_requested"],
+      evidenceKey: "linked-health:42:unknown",
+    });
+
+    expect(item.type).toBe("OTHER");
+    expect(client.items[0].type).toBe("OTHER");
+  });
+
   it("leaves the baseline null when GitHub could not be read", async () => {
     const client = makeClient();
     const { item } = await createLinkedPrFixItem(client, {

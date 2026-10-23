@@ -84,7 +84,7 @@ A `followup-pr` task names the queued item's lane in `prFixItem.fixType`. The ta
 | `fixType` | Contract |
 |-----------|----------|
 | `REBASE` | Mechanical rebase lane (#1327). Rebase the PR branch onto its base and reconcile conflicts **mechanically only**: lockfiles, version strings, import order, doc indexes, adjacent non-overlapping hunks, and comment-only overlaps where one side is a strict subset. Never edit the same logic on both sides, never merge, never open a PR. Push with `--force-with-lease`, then run the repo's bounded typecheck — an unfixable error in a file this PR touches means the rebase was not mechanical. On **any** semantic conflict, report `outcome: "blocked"` with `blockReason: "human_decision"`, the conflicting files, and why the conflict is not mechanical; do not resolve it yourself. One attempt per dirty episode: do not retry. |
-| `MERGE_CONFLICT` | Pre-#1327 merge-conflict items. Same mechanical walls as `REBASE`; the item's `reasons` carry the contract. |
+| `MERGE_CONFLICT` | Pre-#1327 merge-conflict items. Same mechanical walls as `REBASE` — rebase onto the base, reconcile mechanically only, push with `--force-with-lease`, bail to a human on a semantic conflict — but a legacy item's stored reason can be a one-liner, so follow the walls above rather than the item's wording. |
 | `CI_FAILURE`, `REVIEW_FEEDBACK`, `OTHER` | Ordinary requested changes on the PR. |
 
 ### Report Outcomes

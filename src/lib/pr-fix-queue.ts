@@ -130,6 +130,12 @@ export interface CreateLinkedPrFixInput {
   lane: PrFixLane;
   reason: string;
   feedback: string[];
+  /**
+   * Queue type for the materialized row (#1327). Absent/null writes the
+   * ordinary fix lane (OTHER); "REBASE" routes a conflicted PR into the
+   * mechanical rebase lane, whose contract the caller supplies in `feedback`.
+   */
+  type?: string | null;
   evidenceKey: string;
   url?: string | null;
   title?: string | null;
@@ -2195,7 +2201,10 @@ export async function createLinkedPrFixItem(
           pr: input.pr,
           issue: input.issue,
           lane: input.lane,
-          type: "OTHER",
+          // The caller picks the lane's type (#1327): a conflicted linked PR
+          // materializes as REBASE, everything else stays the ordinary fix
+          // lane (OTHER).
+          type: normalizePrFixType(input.type),
           status: "QUEUED",
           reason: input.reason,
           feedback: input.feedback,
