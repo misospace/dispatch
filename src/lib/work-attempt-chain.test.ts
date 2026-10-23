@@ -258,6 +258,30 @@ describe("buildWorkItemDeliveryChain", () => {
     expect(result.totalExecutionWallTimeMs).toBe(6000000);
   });
 
+  it("leaves an attempt unclassified when only a different agent's run overlaps", () => {
+    // Exclusion empties the matched set: no run evidence, so the attempt is
+    // unclassified with null timing — the other agent's run is never absorbed.
+    const result = chain({
+      events: [event({ kind: "claim", agentName: "beta", occurredAt: "2026-10-01T11:00:00.000Z" })],
+      runs: [
+        run({
+          id: "run-alpha",
+          agentName: "alpha",
+          startedAt: "2026-10-01T11:05:00.000Z",
+          finishedAt: "2026-10-01T11:20:00.000Z",
+          executionMetadata: { worker: "courier" },
+        }),
+      ],
+    });
+
+    expect(result.attempts[0].classification).toBe("unclassified");
+    expect(result.attempts[0].startedAt).toBeNull();
+    expect(result.attempts[0].wallTimeMs).toBeNull();
+    expect(result.attempts[0].artifacts.agentRunIds).toEqual([]);
+    // The top-level total still counts the excluded run (item-wide union).
+    expect(result.totalExecutionWallTimeMs).toBe(900000);
+  });
+
   it("attributes a run with no agent identity by time alone", () => {
     // Unknown identity cannot be discriminated: the run still evidences the
     // attempt whose window it overlaps (documented conservative fallback).
