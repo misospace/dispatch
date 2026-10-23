@@ -101,6 +101,10 @@ async function confirmPrFixHandOut(
           dispatchedAt: new Date(),
           dispatchedGeneration: stampGeneration,
           postDispatchEvidenceKeys: [],
+          // #1327: stamp the lane THIS attempt is dispatched as. The row's
+          // `type` stays mutable across re-enqueues; the rebase terminal
+          // settlement and the concurrency gate key on this stamp.
+          attemptType: candidate.fixType ?? null,
         },
       });
       if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
@@ -368,9 +372,9 @@ export async function GET(
       if (agentAlreadyHanded(candidate, agentName)) return null;
       // #1327: the mechanical rebase lane is concurrency 1, no fan-out. A
       // REBASE candidate waits while another rebase hand-out is live
-      // somewhere (see hasInFlightRebaseHandout: bounded by the reclaim
-      // sweep, best-effort against concurrent polls). Non-rebase fix work is
-      // unaffected. Deferral is transient: the next poll retries it.
+      // somewhere (see hasInFlightRebaseHandout: bounded by the hand-out
+      // timeout, best-effort against concurrent polls). Non-rebase fix work
+      // is unaffected. Deferral is transient: the next poll retries it.
       if (candidate.fixType === "REBASE") {
         let rebaseBusy = false;
         try {
