@@ -1,116 +1,198 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, authedRequest } from "@/test/route-helpers";
 
+// #1129: bind the worker credential to `worker` (the body agentName used by
+// the worker-tier cases below) so the identity-scope gate accepts its
+// own-agent unclaim.
 const { WORKER_TOKEN } = vi.hoisted(() => ({ WORKER_TOKEN: "worker-token" }));
 
-const { mocks } = vi.hoisted(() => ({
+const { guardState, mocks } = vi.hoisted(() => ({
+  // #1367: the guard fake's state — `stillHolds` decides whether the fenced
+  // remote write runs, `busy` simulates another writer holding the anchor,
+  // `foreignKey` simulates the anchor's guard row failing its issue foreign
+  // key, `request` records the anchor request the route made, and `events`
+  // records the order in which the anchor, the issue read, the fenced write
+  // and the release happened.
+  guardState: {
+    stillHolds: true,
+    busy: false,
+    foreignKey: false,
+    request: null as unknown,
+    events: [] as string[],
+    // The options the route handed to the fenced remote write — the region's
+    // transaction budget.
+    fencedOptions: null as unknown,
+    // #1367: the transaction client the fenced write hands to its callback —
+    // what `fencedClaimClient` must reshape into the release's `prisma` arg.
+    fencedTx: { issue: { id: "tx-issue" }, issueLifecycleEvent: undefined },
+  },
   mocks: {
-    findUnique: vi.fn().mockResolvedValue(null),
-    updateIssue: vi.fn().mockResolvedValue(undefined),
+    findIssue: vi.fn().mockResolvedValue(null),
     createAuditLog: vi.fn().mockResolvedValue({ id: "log-1" }),
-    createLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
-    upsertLifecycleEvent: vi.fn().mockResolvedValue({ id: "evt-1" }),
-    removeIssueLabel: vi.fn().mockResolvedValue(undefined),
-    addIssueLabel: vi.fn().mockResolvedValue(undefined),
-    updateIssueLabels: vi.fn().mockResolvedValue(undefined),
-    releaseLeaseByAgentAndIssue: vi.fn().mockResolvedValue(undefined),
-    releaseAgentWorkByAgentAndIssue: vi.fn().mockResolvedValue(0),
-    fetchPullRequestState: vi.fn().mockResolvedValue({ state: "open" }),
+    releaseLease: vi.fn().mockResolvedValue(0),
+    releaseWork: vi.fn().mockResolvedValue(0),
+    releaseIssueClaim: vi.fn(),
+    supersedeIntent: vi.fn().mockResolvedValue(false),
   },
 }));
 
-process.env.DISPATCH_AGENT_TOKEN = mockToken;
-process.env.DISPATCH_WORKER_TOKEN = WORKER_TOKEN;
-// #1129: bind the worker credential to `test-agent` (the body agentName used
-// by the worker-tier cases below) so the identity-scope gate accepts its
-// own-agent unclaim.
-process.env.DISPATCH_WORKER_TOKENS = `test-agent:${WORKER_TOKEN}`;
-
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    // #1254: the unclaim route supersedes any pending reconciler release intent.
-    ownershipReleaseIntent: { findFirst: vi.fn(async () => null) },
     issue: {
-      findUnique: mocks.findUnique,
-      update: mocks.updateIssue,
+      findUnique: mocks.findIssue,
     },
     auditLog: {
       create: mocks.createAuditLog,
     },
-    issueLifecycleEvent: {
-      create: mocks.createLifecycleEvent,
-      upsert: mocks.upsertLifecycleEvent,
-    },
-    // The release cache write and its lifecycle event commit together (#1202).
-    $transaction: (arg: any) =>
-      Promise.resolve(
-        typeof arg === "function"
-          ? arg({
-              // #1254: the supersede helper runs its intent re-check in a tx.
-              ownershipReleaseIntent: { findFirst: vi.fn(async () => null) },
-              issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
-              issueLifecycleEvent: {
-                create: mocks.createLifecycleEvent,
-                upsert: mocks.upsertLifecycleEvent,
-              },
-            })
-          : Promise.all(arg),
-      ),
   },
 }));
 
-vi.mock("@/lib/github", () => ({
-  removeIssueLabel: mocks.removeIssueLabel,
-  addIssueLabel: mocks.addIssueLabel,
-  updateIssueLabels: mocks.updateIssueLabels,
-}));
-
 vi.mock("@/lib/lease", () => ({
-  releaseLeaseByAgentAndIssue: mocks.releaseLeaseByAgentAndIssue,
-  releaseAgentWorkByAgentAndIssue: mocks.releaseAgentWorkByAgentAndIssue,
+  releaseLeaseByAgentAndIssue: mocks.releaseLease,
+  releaseAgentWorkByAgentAndIssue: mocks.releaseWork,
 }));
 
-vi.mock("@/lib/github-prs", () => ({
-  fetchPullRequestState: mocks.fetchPullRequestState,
+vi.mock("@/lib/ownership-reconciliation", () => ({
+  supersedeOwnershipReleaseIntent: mocks.supersedeIntent,
 }));
 
+// #1367: the thin client is the load-bearing piece — the release's local
+// writes must join the fenced transaction instead of opening a nested
+// interactive transaction inside the region. The mock keeps the REAL
+// `fencedClaimClient` (a pure reshape) and stubs only the release itself.
+vi.mock("@/lib/issue-claim", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/issue-claim")>();
+  return { ...actual, releaseIssueClaim: mocks.releaseIssueClaim };
+});
+
+// #1367: the unclaim path serializes on the per-issue mutation anchor; the
+// fake grants the lock unless the test simulates a lost guard or a busy
+// anchor.
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  fencedWriteTimeoutMs: () => 60_000,
+  // The route derives its region budget from `githubCallBudgetMs()` × the
+  // derived call count + slack; the fake per-call budget here is the fake
+  // `fencedWriteTimeoutMs()`'s 60s minus the 15s slack, so the fake keeps the
+  // real helper's arithmetic (n × per-call budget + slack).
+  fencedWriteTimeoutForCalls: (calls: number) =>
+    Math.max(1, Math.ceil(calls)) * 45_000 + 15_000,
+  withIssueMutationGuard: async (
+    req: unknown,
+    cb: (
+      tx: unknown,
+      context: {
+        resuming: boolean;
+        stillHoldsGuard: () => Promise<boolean>;
+        runFencedRemoteWrite: <T>(
+          fn: (tx: unknown) => Promise<T>,
+          options?: { timeoutMs?: number },
+        ) => Promise<{ status: string; value?: T }>;
+      },
+    ) => Promise<{ complete: boolean; value: unknown }>,
+  ) => {
+    guardState.request = req;
+    if (guardState.foreignKey) {
+      // The anchor's guard row references the issue: an unknown issueId fails
+      // the foreign key before the callback ever runs.
+      throw { code: "P2003", meta: { field_name: "IssueMutationGuard_issueId_fkey" } };
+    }
+    if (guardState.busy) {
+      return { status: "busy", ownerToken: "owner-token", operation: "unclaim" };
+    }
+    guardState.events.push("anchor-entered");
+    return {
+      status: "completed",
+      value: (await cb(undefined, {
+        resuming: false,
+        stillHoldsGuard: async () => guardState.stillHolds,
+        // #1367: the fenced remote write is ATOMIC with the guard check — a
+        // stolen guard means the forge function is NEVER called.
+        runFencedRemoteWrite: async <T,>(fn: (tx: unknown) => Promise<T>, options?: { timeoutMs?: number }) => {
+          guardState.fencedOptions = options ?? null;
+          if (!guardState.stillHolds) return { status: "guard-lost" };
+          guardState.events.push("fenced-entered");
+          return { status: "written", value: await fn(guardState.fencedTx) };
+        },
+      })).value,
+    };
+  },
+}));
+
+process.env.DISPATCH_AGENT_TOKEN = mockToken;
+process.env.DISPATCH_WORKER_TOKENS = `worker:${WORKER_TOKEN}`;
+
+import { resetRateLimits } from "@/lib/rate-limit";
 import { POST } from "./route";
+
+// Reset process-global per-actor rate-limit windows and the guard fake's
+// state per test (see the claim/unassign suites).
+beforeEach(() => {
+  guardState.stillHolds = true;
+  guardState.busy = false;
+  guardState.foreignKey = false;
+  guardState.request = null;
+  guardState.events = [];
+  guardState.fencedOptions = null;
+  resetRateLimits();
+});
 
 function makePayload(overrides = {}) {
   return {
     issueId: "issue-1",
     repoFullName: "org/repo",
     issueNumber: 42,
-    agentName: "test-agent",
+    agentName: "worker" as const,
     ...overrides,
   };
 }
 
-function postRequest(payload = makePayload(), extraHeaders = {}) {
-  return POST(authedRequest("http://localhost/api/issues/unclaim", { method: "POST", body: payload, headers: extraHeaders }));
+function makeIssue(overrides = {}) {
+  return {
+    id: "issue-1",
+    state: "open",
+    number: 42,
+    repository: { fullName: "org/repo" },
+    labels: ["status/in-progress", "agent/worker"],
+    ...overrides,
+  };
+}
+
+function installReleaseLabels(labels: string[], extras = {}) {
+  mocks.findIssue.mockImplementation(async () => {
+    guardState.events.push("issue-read");
+    return { ...makeIssue(), labels, ...extras };
+  });
+  mocks.releaseIssueClaim.mockImplementation(async (args: any) => {
+    guardState.events.push("release-ran");
+    return { released: true, labels: args.issue.labels.filter((l: string) => !l.startsWith("agent/")), status: args.issue.labels.find((l: string) => l.startsWith("status/")) ?? null, statusNote: null };
+  });
+}
+
+function postRequest(payload = makePayload(), includeAuth = true) {
+  return POST(authedRequest("http://localhost/api/issues/unclaim", { method: "POST", body: payload, includeAuth }));
 }
 
 describe("POST /api/issues/unclaim — auth", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
   it("returns 401 when no authorization header is provided", async () => {
-    const res = await POST(
-      new Request("http://localhost/api/issues/unclaim", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(makePayload()),
-      })
-    );
+    const res = await postRequest(makePayload(), false);
     expect(res.status).toBe(401);
+
+    // No anchor engagement for an unauthorized caller.
+    expect(guardState.request).toBeNull();
   });
 
   it("returns 401 when token is incorrect", async () => {
     const res = await POST(
-      new Request("http://localhost/api/issues/unclaim", {
+      authedRequest("http://localhost/api/issues/unclaim", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
-        body: JSON.stringify(makePayload()),
-      })
+        body: makePayload(),
+        headers: { Authorization: "Bearer wrong-token" },
+      }),
     );
     expect(res.status).toBe(401);
+    expect(guardState.request).toBeNull();
   });
 });
 
@@ -120,114 +202,401 @@ describe("POST /api/issues/unclaim — validation", () => {
   });
 
   it("returns 400 when agentName is missing", async () => {
-    const res = await postRequest(makePayload({ agentName: undefined }));
+    const res = await postRequest(makePayload({ agentName: undefined as unknown as string }));
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("Missing required fields: issueId, repoFullName, issueNumber, agentName");
   });
 
   it("returns 400 when agentName is not a string", async () => {
-    const res = await postRequest(makePayload({ agentName: 123 }));
+    const res = await postRequest(makePayload({ agentName: 123 as unknown as string }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing required fields: issueId, repoFullName, issueNumber, agentName");
+  });
+
+  it("returns 400 when issueId is missing", async () => {
+    const res = await postRequest(makePayload({ issueId: undefined as unknown as string }));
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("Missing required fields: issueId, repoFullName, issueNumber, agentName");
   });
 
   it("returns 400 when repoFullName is missing", async () => {
-    const res = await postRequest(makePayload({ repoFullName: undefined }));
+    const res = await postRequest(makePayload({ repoFullName: undefined as unknown as string }));
     expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing required fields: issueId, repoFullName, issueNumber, agentName");
   });
 
   it("returns 400 when issueNumber is missing", async () => {
-    const res = await postRequest(makePayload({ issueNumber: undefined }));
+    const res = await postRequest(makePayload({ issueNumber: undefined as unknown as number }));
     expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing required fields: issueId, repoFullName, issueNumber, agentName");
   });
 
-  it("returns 400 for invalid JSON body", async () => {
+  it("returns 400 on malformed JSON", async () => {
     const res = await POST(
-      new Request("http://localhost/api/issues/unclaim", {
+      authedRequest("http://localhost/api/issues/unclaim", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: "not-json",
-      })
+      }),
     );
     expect(res.status).toBe(400);
   });
 
-  it("returns 400 for non-object body", async () => {
+  it("returns 400 on non-object JSON", async () => {
     const res = await POST(
-      new Request("http://localhost/api/issues/unclaim", {
+      authedRequest("http://localhost/api/issues/unclaim", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
         body: JSON.stringify([1, 2, 3]),
-      })
+      }),
     );
     expect(res.status).toBe(400);
   });
 });
 
-describe("POST /api/issues/unclaim — agent self-unclaim (regression)", () => {
+describe("POST /api/issues/unclaim — happy path (#1367)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent"],
-    } as never);
-    mocks.updateIssue.mockResolvedValue(undefined);
+    installReleaseLabels(["status/in-progress", "agent/worker"]);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.updateIssueLabels.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
+    mocks.supersedeIntent.mockResolvedValue(false);
   });
 
-  it("removes agent label and writes unclaim_issue audit with agent actor", async () => {
+  it("runs the entire mutation under the anchor and the release inside the fenced write", async () => {
     const res = await postRequest();
     expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.success).toBe(true);
 
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    // The anchor was engaged for this issue, as an unclaim by this agent.
+    expect(guardState.request).toEqual({ issueId: "issue-1", operation: "unclaim", agentName: "worker" });
 
-    expect(mocks.createAuditLog).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        action: "unclaim_issue",
-        success: true,
-        actor: "test-agent",
-      }),
+    // The issue was read and the release ran INSIDE the anchor.
+    expect(guardState.events).toEqual(["anchor-entered", "issue-read", "fenced-entered", "release-ran"]);
+
+    // §8.7: the pending reconciler release intent was superseded first.
+    expect(mocks.supersedeIntent).toHaveBeenCalledWith({
+      issueId: "issue-1",
+      actor: "worker",
+      reason: "explicit unclaim by worker",
     });
   });
 
-  it("agent self-unclaim does NOT call releaseAgentWorkByAgentAndIssue", async () => {
+  it("gives the fenced region the budget DERIVED from the observed label set", async () => {
     const res = await postRequest();
     expect(res.status).toBe(200);
-    expect(mocks.releaseAgentWorkByAgentAndIssue).not.toHaveBeenCalled();
-    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
+
+    // The unclaim region carries the shared release: the ownership removal
+    // (the `agent/*` label) plus, when the resting-status policy applies, a
+    // chained status transition that removes EVERY existing `status/*` label.
+    // The count is DATA-DEPENDENT, so the route derives the budget from the
+    // observed labels (`releaseIssueClaimWorstCaseCalls` — 1 agent removal +
+    // 1 status here → 4 calls: +1 add +1 PR read) instead of a fixed
+    // multiplier: a mid-region abort would release the guard row's lock with
+    // a remote effect still in flight, which is exactly the hole the fence
+    // closes. In this suite's fake: 4 calls × 45s + 15s slack = 195s.
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 195_000 });
+  });
+
+  it("grows the derived budget with the observed status labels so a duplicated-label chain cannot outrun the region", async () => {
+    // The review's counterexample shape: six duplicated `status/*` labels
+    // (a real data-quality edge, #1037) chain six removals + the add on top
+    // of the agent removal — a call sequence a fixed multiplier cannot bound.
+    // The derived budget must rise with the observed labels and dominate the
+    // sequence: 9 calls (1 agent + 6 removals + 1 add + 1 PR read) × 45s +
+    // 15s slack = 420s in this suite's fake.
+    installReleaseLabels([
+      "agent/worker",
+      "status/in-progress",
+      "status/ready",
+      "status/blocked",
+      "status/in-review",
+      "status/queued",
+      "status/hold",
+    ]);
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    expect(guardState.fencedOptions).toEqual({ timeoutMs: 420_000 });
+
+    // And it is strictly larger than the normal-shape budget: derived from
+    // the labels, not a constant.
+    expect((guardState.fencedOptions as { timeoutMs: number }).timeoutMs).toBeGreaterThan(195_000);
+  });
+
+  it("hands the release a thin client with no $transaction so its local writes join the fenced transaction", async () => {
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+    const args = mocks.releaseIssueClaim.mock.calls[0][0];
+    expect(args.repoFullName).toBe("org/repo");
+    expect(args.issueNumber).toBe(42);
+    expect(args.agentName).toBe("worker");
+    expect(args.options).toEqual({ actor: "worker" });
+    // The thin client carries the fenced transaction's surfaces and NO
+    // `$transaction` — the release's cache mirror and its `claim_released`
+    // evidence row join the fenced transaction instead of nesting an
+    // interactive transaction (a savepoint) with Prisma's 5s timeout inside
+    // the region.
+    expect("$transaction" in args.prisma).toBe(false);
+    expect(args.prisma.issue).toBe((guardState as any).fencedTx.issue);
+    expect(args.prisma.issueLifecycleEvent).toBeUndefined();
+  });
+
+  it("releases the lease, answers with the release result and keeps today's success audit", async () => {
+    const res = await postRequest();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ success: true, labels: ["status/in-progress"], status: "status/in-progress", statusNote: null });
+    expect(body.labels).not.toContain("agent/worker");
+
+    expect(mocks.releaseLease).toHaveBeenCalledWith("worker", "issue-1");
+
+    // Agent self-unclaim (bearer actor == agentName): no AgentWork release.
+    expect(mocks.releaseWork).not.toHaveBeenCalled();
+
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        actor: "worker",
+        action: "unclaim_issue",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        beforeLabels: ["status/in-progress", "agent/worker"],
+        afterLabels: ["status/in-progress"],
+        notes: null,
+        success: true,
+      }),
+    });
   });
 });
 
-describe("POST /api/issues/unclaim — operator path", () => {
+describe("POST /api/issues/unclaim — #1367 mutation anchor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/in-progress"],
-    } as never);
-    mocks.updateIssue.mockResolvedValue(undefined);
+    installReleaseLabels(["status/in-progress", "agent/worker"]);
     mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.updateIssueLabels.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(1);
   });
 
-  function basicAuthRequest() {
+  it("answers 404 when the anchor's guard row cannot reference the issue", async () => {
+    // The anchor's guard row has a foreign key on the issue: an unknown
+    // issueId fails the foreign key before the route's own lookup runs. The
+    // route's documented answer for a missing issue is 404, not a 500.
+    guardState.foreignKey = true;
+
+    const res = await postRequest();
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error).toBe("Issue not found in local cache");
+
+    expect(mocks.findIssue).not.toHaveBeenCalled();
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("answers 409 without any write when another writer holds the anchor", async () => {
+    guardState.busy = true;
+
+    const res = await postRequest();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("Issue mutation is in progress; retry shortly");
+
+    // The unclaim did not run at all — no writes whatsoever.
+    expect(mocks.findIssue).not.toHaveBeenCalled();
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.releaseWork).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("does not release remotely and answers 409 when the guard was lost before the fenced write", async () => {
+    guardState.stillHolds = false;
+
+    const res = await postRequest();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe(
+      "Unclaim was superseded by an operator override before the remote claim release; retry shortly",
+    );
+
+    // The forge function is NEVER called when the guard is gone.
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+
+    // No lease or AgentWork release: no remote effect may be implied.
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.releaseWork).not.toHaveBeenCalled();
+
+    // The guard loss is audited — the skipped unclaim must be visible.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "unclaim_issue",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        beforeLabels: ["status/in-progress", "agent/worker"],
+        afterLabels: [],
+        success: false,
+        errorMessage: "Unclaim was superseded by an operator override before the remote claim release",
+      }),
+    });
+    // ...and ONLY the failure audit.
+    expect(mocks.createAuditLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the error's message with a failure audit when the release rejects under the guard", async () => {
+    mocks.releaseIssueClaim.mockRejectedValue(new Error("github 500"));
+
+    const res = await postRequest();
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error).toBe("github 500");
+
+    // The failure audit names the release error...
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "unclaim_issue",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        beforeLabels: ["status/in-progress", "agent/worker"],
+        afterLabels: [],
+        success: false,
+        errorMessage: "github 500",
+      }),
+    });
+
+    // ...and no lease release: the remote release did not succeed.
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+
+    // The release was attempted exactly once (inner catch keeps the path
+    // linear; no retry inside the same request).
+    expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 400 for a closed issue without any release", async () => {
+    installReleaseLabels(["agent/worker"], { state: "closed" });
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Cannot unclaim a closed issue");
+
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for a done issue without any release", async () => {
+    installReleaseLabels(["status/done", "agent/worker"]);
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Cannot unclaim a done issue");
+
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for an issue assigned to another agent without any release", async () => {
+    installReleaseLabels(["status/in-progress", "agent/other"]);
+
+    const res = await postRequest();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Issue is not assigned to worker");
+
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 with the exact message when the body repoFullName does not match the anchored issue", async () => {
+    const res = await postRequest(makePayload({ repoFullName: "other/repo" }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("issueId does not match repoFullName/issueNumber; expected org/repo#42");
+
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.releaseWork).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 with the exact message when the body issueNumber does not match the anchored issue", async () => {
+    const res = await postRequest(makePayload({ issueNumber: 99 }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("issueId does not match repoFullName/issueNumber; expected org/repo#42");
+
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/unclaim — worker tier (#1129)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    installReleaseLabels(["status/in-progress", "agent/worker"]);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+  });
+
+  function workerPost(payload = makePayload()) {
+    return POST(
+      authedRequest("http://localhost/api/issues/unclaim", {
+        method: "POST",
+        body: payload,
+        token: WORKER_TOKEN,
+      }),
+    );
+  }
+
+  it("allows a bound worker to release its own claim without an x-agent-name header", async () => {
+    const res = await workerPost();
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+    expect(mocks.releaseLease).toHaveBeenCalledWith("worker", "issue-1");
+  });
+
+  it("returns 403 when a bound worker names another agent in the body", async () => {
+    const res = await workerPost(makePayload({ agentName: "other-agent" }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain("may not act for");
+    // The refusal happens before the anchor: no release attempts at all.
+    expect(guardState.request).toBeNull();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when the bound worker's own agent is not assigned to the issue", async () => {
+    // The bound worker acts for its own agent (passes the identity-scope
+    // gate), but the issue's labels carry no matching `agent/*` label.
+    installReleaseLabels(["status/in-progress", "agent/other"]);
+
+    const res = await workerPost();
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Issue is not assigned to worker");
+
+    // No fenced release, no lease/AgentWork release, no audit row.
+    expect(mocks.releaseIssueClaim).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.releaseWork).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+  });
+});
+
+// The route-helpers harness can traverse the real auth module (no @/lib/auth
+// mock), so basic-operator credentials are forged with env vars — the same
+// pattern the pre-#1367 unclaim suite used.
+describe("POST /api/issues/unclaim — operator path (basic auth)", () => {
+  function basicPost() {
     const credentials = Buffer.from("alice:hunter2").toString("base64");
     return POST(
       authedRequest("http://localhost/api/issues/unclaim", {
@@ -235,7 +604,7 @@ describe("POST /api/issues/unclaim — operator path", () => {
         body: makePayload(),
         includeAuth: false,
         headers: { Authorization: `Basic ${credentials}` },
-      })
+      }),
     );
   }
 
@@ -255,501 +624,58 @@ describe("POST /api/issues/unclaim — operator path", () => {
     }
   }
 
-  it("operator unclaim releases the lease via releaseLeaseByAgentAndIssue", async () => {
-    await withBasicAuth(async () => {
-      const res = await basicAuthRequest();
-      expect(res.status).toBe(200);
-      expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
-    });
+  beforeEach(() => {
+    vi.clearAllMocks();
+    installReleaseLabels(["status/in-progress", "agent/worker"]);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
   });
 
-  it("operator unclaim calls releaseAgentWorkByAgentAndIssue", async () => {
+  it("uses the operator audit action and releases AgentWork in addition to the lease", async () => {
     await withBasicAuth(async () => {
-      const res = await basicAuthRequest();
+      const res = await basicPost();
       expect(res.status).toBe(200);
-      expect(mocks.releaseAgentWorkByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
-    });
-  });
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.labels).not.toContain("agent/worker");
 
-  it("operator unclaim flips status/in-progress to status/ready on GitHub and in cache", async () => {
-    await withBasicAuth(async () => {
-      const res = await basicAuthRequest();
-      expect(res.status).toBe(200);
+      expect(mocks.releaseIssueClaim).toHaveBeenCalledTimes(1);
+      expect((mocks.releaseIssueClaim as any).mock.calls[0][0].options).toEqual({ actor: "alice" });
 
-      // Status transition uses targeted add/remove, not a full-set write.
-      expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
-      expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
-      expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-      expect(mocks.updateIssue).toHaveBeenCalledWith({
-        where: { id: "issue-1" },
-        data: expect.objectContaining({
-          labels: expect.arrayContaining(["status/ready"]),
-        }),
-      });
-    });
-  });
-
-  it("operator unclaim writes unclaim_issue_by_operator audit with operator actor and notes", async () => {
-    await withBasicAuth(async () => {
-      const res = await basicAuthRequest();
-      expect(res.status).toBe(200);
+      expect(mocks.releaseLease).toHaveBeenCalledWith("worker", "issue-1");
+      expect(mocks.releaseWork).toHaveBeenCalledWith("worker", "issue-1");
 
       expect(mocks.createAuditLog).toHaveBeenCalledWith({
         data: expect.objectContaining({
-          action: "unclaim_issue_by_operator",
-          success: true,
           actor: "alice",
-          notes: expect.stringContaining("test-agent"),
+          action: "unclaim_issue_by_operator",
+          repoFullName: "org/repo",
+          issueNumber: 42,
+          issueId: "issue-1",
+          beforeLabels: ["status/in-progress", "agent/worker"],
+          afterLabels: ["status/in-progress"],
+          notes: "Released agent worker as alice",
+          success: true,
         }),
       });
     });
   });
-});
 
-describe("POST /api/issues/unclaim — status handling", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.updateIssue.mockResolvedValue(undefined);
-    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.updateIssueLabels.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
-    mocks.fetchPullRequestState.mockResolvedValue({ state: "open", mergedAt: null });
-  });
+  it("audits a release failure under the anchor with the operator identity", async () => {
+    mocks.releaseIssueClaim.mockRejectedValue(new Error("github 500"));
 
-  it("flips in-progress to ready and reports status/ready", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/in-progress"],
-      blockedReason: null,
-      linkedPrNumber: null,
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.labels).toEqual(["status/ready"]);
-    expect(body.status).toBe("status/ready");
-    expect(body.statusNote).toBeNull();
-    // Targeted label writes: remove agent label, remove old status, add new status.
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
-    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
-    // Full-set write must never be used — it would revert labels changed on GitHub.
-    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({ labels: ["status/ready"] }),
+    await withBasicAuth(async () => {
+      const res = await basicPost();
+      expect(res.status).toBe(500);
+      expect(mocks.createAuditLog).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          actor: "alice",
+          action: "unclaim_issue_by_operator",
+          success: false,
+          errorMessage: "github 500",
+        }),
+      });
+      expect(mocks.releaseLease).not.toHaveBeenCalled();
+      expect(mocks.releaseWork).not.toHaveBeenCalled();
     });
-  });
-
-  it("flips blocked with a null blockedReason to ready and reports status/ready", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/blocked"],
-      blockedReason: null,
-      linkedPrNumber: null,
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.labels).toEqual(["status/ready"]);
-    expect(body.status).toBe("status/ready");
-    expect(body.statusNote).toBeNull();
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/blocked");
-    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/ready");
-    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({ labels: ["status/ready"] }),
-    });
-  });
-
-  it("keeps blocked with a blockedReason unchanged and says so in the response", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/blocked"],
-      blockedReason: "waiting on upstream API change",
-      linkedPrNumber: null,
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.labels).toEqual(["status/blocked"]);
-    expect(body.status).toBe("status/blocked");
-    expect(body.statusNote).toContain("blockedReason is set");
-    // No status transition — only the agent label is removed.
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
-    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({ labels: ["status/blocked"] }),
-    });
-  });
-
-  it("keeps in-review unchanged while the linked PR is still open and says so", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/in-review"],
-      blockedReason: null,
-      linkedPrNumber: 7,
-    } as never);
-    mocks.fetchPullRequestState.mockResolvedValueOnce({
-      state: "open",
-      mergedAt: null,
-    });
-
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.labels).toEqual(["status/in-review"]);
-    expect(body.status).toBe("status/in-review");
-    expect(body.statusNote).toContain("PR #7 is still open");
-    expect(mocks.fetchPullRequestState).toHaveBeenCalledWith("org/repo", 7);
-    // No status transition — only the agent label is removed.
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
-    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({ labels: ["status/in-review"] }),
-    });
-  });
-});
-
-describe("POST /api/issues/unclaim — guards", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent"],
-    } as never);
-    mocks.updateIssue.mockResolvedValue(undefined);
-    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.updateIssueLabels.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
-  });
-
-  it("returns 404 when issue not found in local cache", async () => {
-    mocks.findUnique.mockResolvedValueOnce(null);
-
-    const res = await postRequest();
-    expect(res.status).toBe(404);
-    const body = await res.json();
-    expect(body.error).toBe("Issue not found in local cache");
-  });
-
-  it("refuses to unclaim closed issues", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "closed",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent"],
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toBe("Cannot unclaim a closed issue");
-  });
-
-  it("refuses to unclaim done issues", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/done"],
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toBe("Cannot unclaim a done issue");
-  });
-
-  it("returns 400 when agent is not assigned to the issue", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/other-agent"],
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toBe("Issue is not assigned to test-agent");
-  });
-
-  it("returns 400 when no agent label exists", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: [],
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toBe("Issue is not assigned to test-agent");
-  });
-
-  it("writes failure audit log when GitHub API fails", async () => {
-    mocks.removeIssueLabel.mockRejectedValueOnce(new Error("github 500"));
-
-    const res = await postRequest();
-    expect(res.status).toBe(500);
-    const body = await res.json();
-    expect(body.error).toBe("github 500");
-
-    expect(mocks.createAuditLog).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        action: "unclaim_issue",
-        success: false,
-        errorMessage: "github 500",
-      }),
-    });
-  });
-
-  it("preserves other labels when removing agent label", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "priority/p1"],
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-    expect(mocks.updateIssue).toHaveBeenCalledWith({
-      where: { id: "issue-1" },
-      data: expect.objectContaining({
-        labels: ["priority/p1"],
-      }),
-    });
-  });
-
-  it("does not revert labels changed on GitHub since the last sync (stale cache)", async () => {
-    // Cache is behind GitHub: status/ready was already cleared on GitHub and
-    // a blocked/* label was added there. A full-set write from this stale row
-    // would restore status/ready and delete the blocked label.
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/ready"],
-    } as never);
-
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-
-    // Only the agent label is removed; no full-set write touches any other label.
-    expect(mocks.removeIssueLabel).toHaveBeenCalledTimes(1);
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
-    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
-  });
-});
-
-describe("POST /api/issues/unclaim — worker tier (#1111)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent"],
-    } as never);
-    mocks.updateIssue.mockResolvedValue(undefined);
-    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.updateIssueLabels.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
-  });
-
-  function workerPost(payload = makePayload()) {
-    return POST(
-      authedRequest("http://localhost/api/issues/unclaim", {
-        method: "POST",
-        body: payload,
-        token: WORKER_TOKEN,
-      }),
-    );
-  }
-
-  it("allows a worker to release its own claim without an x-agent-name header", async () => {
-    const res = await workerPost();
-    expect(res.status).toBe(200);
-    expect((await res.json()).success).toBe(true);
-    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
-  });
-
-  it("returns 403 when a bound worker names another agent in the body", async () => {
-    const res = await workerPost(makePayload({ agentName: "other-agent" }));
-    expect(res.status).toBe(403);
-    expect((await res.json()).error).toContain("may not act for");
-    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
-  });
-
-  it("returns 400 when the bound worker's own agent is not assigned to the issue", async () => {
-    mocks.findUnique.mockResolvedValueOnce({
-      id: "issue-1",
-      state: "open",
-      number: 42, repository: { fullName: "org/repo" },
-      labels: ["agent/other-agent"],
-    } as never);
-    const res = await workerPost();
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toBe("Issue is not assigned to test-agent");
-    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
-  });
-});
-
-describe("POST /api/issues/unclaim — cross-issue identity invariant (#1129 review)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({
-      id: "issue-1",
-      state: "open",
-      number: 42,
-      repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent"],
-    } as never);
-    mocks.updateIssue.mockResolvedValue(undefined);
-    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(0);
-  });
-
-  it("refuses with 400 when body repoFullName does not match the loaded issue's canonical repo", async () => {
-    // Token for alpha passes issueId of alpha-assigned A but repoFullName/issueNumber
-    // of a bravo-owned B. Without the cross-issue guard the route could
-    // mutate B's labels on GitHub while releasing A locally.
-    const res = await postRequest(makePayload({
-      repoFullName: "bravo/repo",
-      issueNumber: 99,
-    }));
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toContain("does not match");
-    expect(body.error).toContain("org/repo#42");
-    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
-    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
-    expect(mocks.updateIssue).not.toHaveBeenCalled();
-    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
-    expect(mocks.createAuditLog).not.toHaveBeenCalled();
-  });
-
-  it("refuses with 400 when body issueNumber does not match the loaded issue's canonical number", async () => {
-    const res = await postRequest(makePayload({ issueNumber: 7 }));
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toContain("does not match");
-    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
-    expect(mocks.releaseLeaseByAgentAndIssue).not.toHaveBeenCalled();
-  });
-
-  it("releases against the canonical pair when bodies agree", async () => {
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-    expect(mocks.removeIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
-    expect(mocks.releaseLeaseByAgentAndIssue).toHaveBeenCalledWith("test-agent", "issue-1");
-    expect(mocks.createAuditLog).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        action: "unclaim_issue",
-        repoFullName: "org/repo",
-        issueNumber: 42,
-        success: true,
-      }),
-    });
-  });
-});
-
-describe("POST /api/issues/unclaim — lifecycle evidence (#1202)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.findUnique.mockResolvedValue({
-      id: "issue-1",
-      state: "open",
-      number: 42,
-      repository: { fullName: "org/repo" },
-      labels: ["agent/test-agent", "status/in-progress"],
-    } as never);
-    mocks.updateIssue.mockResolvedValue(undefined);
-    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
-    mocks.removeIssueLabel.mockResolvedValue(undefined);
-    mocks.addIssueLabel.mockResolvedValue(undefined);
-    mocks.releaseLeaseByAgentAndIssue.mockResolvedValue(undefined);
-    mocks.releaseAgentWorkByAgentAndIssue.mockResolvedValue(1);
-  });
-
-  it("records the release, attributed to the releasing agent", async () => {
-    const res = await postRequest();
-    expect(res.status).toBe(200);
-
-    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        issueId: "issue-1",
-        repoFullName: "org/repo",
-        issueNumber: 42,
-        kind: "claim_released",
-        source: "api:unclaim",
-        actor: "test-agent",
-        agentName: "test-agent",
-        fromStatus: "status/in-progress",
-        toStatus: "status/ready",
-      }),
-    });
-  });
-
-  it("attributes an operator release to the operator, not to the released agent", async () => {
-    process.env.DISPATCH_AUTH_MODE = "basic";
-    process.env.DISPATCH_AUTH_USERNAME = "alice";
-    process.env.DISPATCH_AUTH_PASSWORD = "hunter2";
-    const credentials = Buffer.from("alice:hunter2").toString("base64");
-
-    const res = await POST(
-      authedRequest("http://localhost/api/issues/unclaim", {
-        method: "POST",
-        body: makePayload(),
-        includeAuth: false,
-        headers: { Authorization: `Basic ${credentials}` },
-      }),
-    );
-
-    expect(res.status).toBe(200);
-    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith({
-      data: expect.objectContaining({ kind: "claim_released", actor: "alice", agentName: "test-agent" }),
-    });
-
-    delete process.env.DISPATCH_AUTH_MODE;
-    delete process.env.DISPATCH_AUTH_USERNAME;
-    delete process.env.DISPATCH_AUTH_PASSWORD;
   });
 });

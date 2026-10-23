@@ -133,6 +133,14 @@ The flag is accepted and logged in the audit trail for transparency and to suppo
 - Returns **409 Conflict** while another writer holds the anchor (`Issue mutation is in progress; retry shortly`).
 - Rejects a body whose `repoFullName`/`issueNumber` do not match the anchored issue (**400**) — the write always targets the anchor's issue.
 
+### `POST /api/issues/unclaim` (unclaim)
+
+- Holds the same per-issue mutation anchor for the whole mutation and performs its remote `agent/*` label release inside a **fenced write** (#1367, mirroring the unassign bullet above): a stolen anchor means no remote write, a failure audit row, and a retryable **409 Conflict**.
+- The anchor is re-stamped when the fenced write commits, so a release that runs longer than the operator override's silence window (`GUARD_OVERRIDE_MIN_AGE_MS`) still leaves the anchor looking live: a maintainer force-claim waiting on it is told the issue is busy instead of taking the anchor away mid-release.
+- Returns **409 Conflict** while another writer holds the anchor (`Issue mutation is in progress; retry shortly`).
+- Rejects a body whose `repoFullName`/`issueNumber` do not match the anchored issue (**400**) — the release always targets the anchor's issue.
+- Answers **404 Not Found** when the anchored `issueId` is unknown: the anchor's guard row references the issue, so the foreign key fails before the route's own lookup can run.
+
 ### `GET /api/agents/<name>/queue` (agent queue)
 
 - Returns issues actionable for the given agent, ranked by priority and status.

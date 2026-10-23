@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { releaseIssueClaim, type IssueClaimClient } from "@/lib/issue-claim";
+import { releaseIssueClaim, fencedClaimClient, type IssueClaimClient } from "@/lib/issue-claim";
 import { lifecycleDedupeKey } from "@/lib/issue-lifecycle";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 
@@ -254,28 +254,6 @@ interface StaleWorkTransactionClient {
   agentWorkHistory: {
     create: (args: any) => Promise<unknown>;
   };
-}
-
-/**
- * A THIN `IssueClaimClient` over the fenced transaction client.
- *
- * `releaseIssueClaim` opens its own interactive transaction whenever the
- * client it is handed exposes `$transaction` — and a real Prisma interactive
- * transaction client DOES expose it (Prisma only denies `$connect`,
- * `$disconnect`, `$on`, `$use` and `$extends`). Inside the fenced region that
- * would open a NESTED interactive transaction (a savepoint) with Prisma's
- * default 5s timeout: the release's cache mirror and its `claim_released`
- * evidence row could roll back to the savepoint while the GitHub removal
- * stands. The thin client is therefore built EXPLICITLY from the transaction
- * client, WITHOUT `$transaction`, so the release's local writes join the
- * fenced transaction instead of nesting inside it.
- */
-function fencedClaimClient(tx: unknown): IssueClaimClient {
-  const source = tx as {
-    issue: IssueClaimClient["issue"];
-    issueLifecycleEvent?: IssueClaimClient["issueLifecycleEvent"];
-  };
-  return { issue: source.issue, issueLifecycleEvent: source.issueLifecycleEvent };
 }
 
 export interface StaleWorkClient {

@@ -19,6 +19,14 @@
  *       run.
  *   (B) the override's `DELETE` commits first → the fenced `UPDATE` matches
  *       0 rows → `guard-lost`, and the forge function is NEVER called.
+ *   (C) the region OUTRAN the override's silence window → the region
+ *       back-dates the guard row inside its own transaction (what its
+ *       opening stamp looks like after a long region) → the blocked steal
+ *       re-evaluates its predicate against the COMMITTED row, which the
+ *       commit-time re-stamp made FRESH → the steal is refused (`busy`).
+ *       Without that re-stamp the committed row would carry the stale stamp,
+ *       the steal's predicate would be TRUE and the force-claim would
+ *       SUCCEED.
  *
  * This exercises the guard module's OWN fenced-write helper (the real
  * `withIssueMutationGuard` / `runFencedRemoteWrite` code path) against the
@@ -32,7 +40,7 @@
  * laptop is unaffected; the database-integration CI job opts in explicitly.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 
 const url = process.env.DATABASE_URL;
@@ -190,5 +198,89 @@ suite("the fenced remote write against a real PostgreSQL", () => {
     // The abandoned holder did not delete or reclaim the override's guard.
     const row = await db.issueMutationGuard.findUnique({ where: { issueId } });
     expect(row?.agentName).toBe("beta");
+  });
+
+  it("(C) a region that outran the silence window still cannot be stolen: the commit-time re-stamp", async () => {
+    // (A) proves the LOCK alone serializes the steal; it does not prove the
+    // COMMITTED row is FRESH. This test covers the case the lock cannot: a
+    // region that runs LONGER than the override's silence window
+    // (`GUARD_OVERRIDE_MIN_AGE_MS`, 5 min). The fence's OPENING stamp is then
+    // as old as the region, and the heartbeat's own stamp cannot land while
+    // the region holds the row lock — so the COMMITTED row's freshness is
+    // carried by the COMMIT-TIME RE-STAMP alone.
+    let overrideSettled = false;
+    let stealBlockedDuringRegion: boolean | null = null;
+    let outcome: { status: string } | undefined;
+
+    const forge = vi.fn(async (tx: Prisma.TransactionClient) => {
+      // Back-date the guard row INSIDE the region's own transaction: this is
+      // what the region's OPENING stamp looks like once the region has
+      // outrun the silence window. WITHOUT the commit-time re-stamp the
+      // COMMITTED row would carry this stale stamp, so the blocked steal's
+      // silence predicate (`updatedAt <= cutoff`) would be TRUE.
+      const staleStamp = new Date(Date.now() - 10 * GUARD_OVERRIDE_MIN_AGE_MS);
+      await tx.issueMutationGuard.updateMany({ where: { issueId }, data: { updatedAt: staleStamp } });
+      // The same stale stamp, pinned with raw SQL: an `@updatedAt` column is
+      // only auto-refreshed when the client does not supply a value, and the
+      // discrimination must not rest on that nuance.
+      await tx.$executeRaw`
+        UPDATE "IssueMutationGuard" SET "updatedAt" = ${staleStamp} WHERE "issueId" = ${issueId}
+      `;
+      // The override's `DELETE` was issued against that row a moment ago: it
+      // can only be BLOCKED on the lock, so it cannot have settled yet.
+      await sleep(250);
+      stealBlockedDuringRegion = !overrideSettled;
+      return "written";
+    });
+
+    const holder = await withIssueMutationGuard(
+      { issueId, operation: "claim", agentName: "alpha" },
+      async (_tx, context) => {
+        await makeGuardSilent();
+
+        // The maintainer force-claim: the PRODUCTION override path (its
+        // `deleteMany` carries the same predicate the module uses). It is
+        // started WITHOUT being awaited so it can race the region.
+        const override = withIssueMutationGuard(
+          { issueId, operation: "claim", agentName: "beta", override: true },
+          async () => ({ complete: false, value: "stolen" }),
+        ).then((result) => {
+          overrideSettled = true;
+          return result;
+        });
+
+        outcome = await context.runFencedRemoteWrite(forge);
+
+        // The override answers only once the region committed and released
+        // the lock: it re-evaluates its silence predicate against the
+        // COMMITTED row.
+        //
+        // WITH the commit-time re-stamp that row is FRESH (the re-stamp
+        // overwrites the back-dated stamp the region wrote above), so the
+        // predicate `updatedAt <= cutoff` is FALSE, the row is skipped and
+        // the steal is refused with `busy`.
+        //
+        // WITHOUT the commit-time re-stamp the committed row would carry the
+        // back-dated stamp: the blocked steal's predicate would be TRUE, the
+        // row would be DELETED, and the force-claim would SUCCEED — the
+        // anchor would be taken right after the region's writes landed,
+        // while the callback is still running. That is what this test
+        // discriminates.
+        const overrideResult = await override;
+        expect(overrideResult).toMatchObject({ status: "busy" });
+        return { complete: false, value: outcome };
+      },
+    );
+
+    // The steal was serialized by the lock, not merely ineligible.
+    expect(stealBlockedDuringRegion).toBe(true);
+    // The region's own write landed: the guard was never lost under it.
+    expect(outcome).toMatchObject({ status: "written" });
+    expect(forge).toHaveBeenCalledOnce();
+    expect(holder).toMatchObject({ status: "retained" });
+
+    // The guard is still this holder's: nothing was stolen.
+    const row = await db.issueMutationGuard.findUnique({ where: { issueId } });
+    expect(row?.agentName).toBe("alpha");
   });
 });

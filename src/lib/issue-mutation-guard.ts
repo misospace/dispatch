@@ -67,18 +67,51 @@ const FENCED_WRITE_SLACK_MS = 15_000;
  * cold App installation-token fetch, every term bounded by #1347) plus slack
  * for the local writes a region carries alongside its forge call.
  *
- * It is deliberately SHORTER than the override's silence window
- * (`GUARD_OVERRIDE_MIN_AGE_MS`): the fence re-stamps the guard row, and a
- * region that ran longer than the silence window would leave the row looking
- * stale the moment it committed (the heartbeat's own stamp waits behind the
- * row lock), so an operator override could steal the guard right after the
- * region's writes landed. One mutating forge call per region keeps the
- * region inside that window.
+ * It is NOT bounded by the override's silence window
+ * (`GUARD_OVERRIDE_MIN_AGE_MS`). That window used to be the only thing
+ * keeping a committed region from looking stealable: the fence stamped the
+ * guard row when the region STARTED, and a region that ran longer than the
+ * silence window would leave the row looking stale the moment it committed
+ * (the heartbeat's own stamp cannot land while the region holds the row
+ * lock), so an operator
+ * override could steal the guard right after the region's writes landed.
+ * The COMMIT-TIME RE-STAMP now carries that invariant instead (see
+ * `runFencedRemoteWrite`): the region re-stamps the guard row inside its own
+ * transaction, after the forge calls and before the commit, so the committed
+ * row is FRESH however long the region ran and a waiting override re-evaluates
+ * its silence predicate against that fresh row and reports `busy` instead of
+ * stealing the anchor.
+ *
+ * So the budget only has to DOMINATE the region's forge calls (a mid-region
+ * abort would release the row lock with a remote effect still in flight); it
+ * does not have to fit inside the silence window.
  */
 export function fencedWriteTimeoutMs(): number {
   return githubCallBudgetMs() + FENCED_WRITE_SLACK_MS;
 }
 
+/**
+ * The transaction budget of a fenced region whose worst-case forge-call
+ * COUNT is known (#1367 review): it does not have to fit inside the override's
+ * silence window (the commit-time re-stamp keeps the committed row fresh,
+ * however long the region ran), but it must DOMINATE every mutating forge
+ * call the region carries — a mid-region abort would release the row lock
+ * with a remote effect still in flight.
+ *
+ * The bound is `githubCallBudgetMs()` per call. It deliberately over-counts:
+ * the per-call figure includes the cold App installation-token fetch that is
+ * in truth paid at most once per region, and callers derive the count from
+ * the observed label set rather than from the exact branch the release will
+ * take, so an over-bound stays valid as the release's own branches move. A
+ * bound that only just covers a branch's arithmetic would be the next thing
+ * a counterexample outgrows. The bound is still bounded itself: a region's
+ * label set is finite, so the derived count is finite (a force-claim's
+ * override `DELETE` waiting behind the row lock is bounded by the region's
+ * own budget, never unbounded).
+ */
+export function fencedWriteTimeoutForCalls(calls: number): number {
+  return githubCallBudgetMs() * Math.max(1, Math.ceil(calls)) + FENCED_WRITE_SLACK_MS;
+}
 
 /**
  * The outcome of a fenced remote write: either the remote write happened
@@ -94,10 +127,13 @@ export interface FencedRemoteWriteOptions {
    * The region's transaction budget, in milliseconds. The default
    * (`fencedWriteTimeoutMs()`) covers ONE mutating forge call — the region
    * invariant every fenced write follows. A region that carries MORE than one
-   * mutating forge call (the capacity handoff's shared release: the
-   * ownership removal plus the resting-status transition) MUST raise it to
-   * the worst case of the calls it holds: a mid-region abort would release
-   * the guard row's lock with a remote effect still in flight.
+   * mutating forge call (the capacity handoff's shared release and the
+   * unclaim route's release: the ownership removal plus the resting-status
+   * transition) MUST raise it to the worst case of the calls it holds: a
+   * mid-region abort would release the guard row's lock with a remote effect
+   * still in flight. A raised budget does NOT weaken the anchor: the region
+   * re-stamps the guard row at commit, so the committed row never looks
+   * silent to a waiting override.
    */
   timeoutMs?: number;
 }
@@ -132,15 +168,35 @@ export interface IssueMutationContext {
    *
    * So a steal can never commit between the check and the write THIS REGION
    * covers: there is no gap, because the check and the write share one
-   * transaction. (What the fence does NOT make atomic is a SET of writes:
-   * a region carries one mutating forge call, so a callback that needs two
-   * writes runs two regions — and a steal between them leaves the first one
-   * applied.)
+   * transaction — and a region that carries SEVERAL mutating forge calls
+   * holds the same lock across all of them, so a steal cannot land between
+   * two of them either. (What the fence does NOT make atomic is a SET of
+   * writes split across SEVERAL regions: a callback that needs two regions
+   * — e.g. the claim route's one-removal-per-region stale-label cleanup —
+   * leaves the earlier region's writes applied if a steal lands between
+   * them.)
    *
-   * The region MUST carry exactly ONE mutating forge call by default (see
-   * `fencedWriteTimeoutMs`) and MUST NOT start another interactive
+   * A region carries ONE mutating forge call by default (see
+   * `fencedWriteTimeoutMs`); a region that carries more (the capacity
+   * handoff's and the unclaim route's shared release: the ownership removal
+   * plus the resting-status transition) MUST raise its budget to dominate
+   * them (see `FencedRemoteWriteOptions`). The commit-time re-stamp is what
+   * keeps such a region sound: the committed row never looks silent to a
+   * waiting override, however long the region ran.
+   *
+   * The region MUST NOT start another interactive
    * transaction of its own — the callback receives the transaction client so
    * local writes join the fenced transaction instead of nesting.
+   *
+   * The region also RE-STAMPS the guard row at COMMIT (after the forge calls,
+   * inside the same transaction): the fence's opening stamp is as old as the
+   * region, and the heartbeat's own stamp cannot land while the region holds
+   * the row lock (it skips those ticks), so
+   * without the re-stamp a region that outran the override's silence window
+   * would commit a row that looks silent — and a waiting operator
+   * force-claim would take the anchor right after the region's writes landed,
+   * while the callback is still running. The committed row is therefore
+   * always fresh, whatever the region's budget.
    */
   runFencedRemoteWrite: <T>(
     fn: (tx: Prisma.TransactionClient) => Promise<T>,
@@ -201,7 +257,9 @@ export async function withIssueMutationGuard<T>(
     // `removed.count !== 1`, and the override reports `busy` WITHOUT
     // stealing. The operator's force-claim therefore WAITS for the in-flight
     // fenced write (bounded by the region's own transaction budget,
-    // `fencedWriteTimeoutMs`) and is then told the issue is busy; it never
+    // `fencedWriteTimeoutMs` for a single-call region, or the region's own
+    // raised or label-derived budget for a several-call region) and is then
+    // told the issue is busy; it never
     // waits unboundedly, because that budget is what bounds the lock hold.
     // If the override's `DELETE` wins the race instead, the holder's fenced
     // `UPDATE` matches no row and the forge write is never issued
@@ -258,6 +316,17 @@ export async function withIssueMutationGuard<T>(
   }
   if (!guard) return { status: "busy", ownerToken, operation: request.operation };
 
+  // #1367 review: a fenced region holds the guard row's EXCLUSIVE row lock
+  // for its whole duration, so the heartbeat's own stamp on that row would
+  // BLOCK behind the region's transaction — burning a pooled connection for
+  // the region's duration (a raised-budget region can run for minutes, and
+  // every blocked tick holds one connection until the region commits, which
+  // can starve every other query in the app). While a region is in flight the
+  // row's liveness is carried by the region's own opening stamp and its
+  // commit-time re-stamp, so the heartbeat skips those ticks: the stamp it
+  // would block on cannot land before the region commits anyway.
+  let fencedRegionInFlight = false;
+
   // #1254 review round 4: liveness heartbeat. While this holder runs, stamp
   // the guard every `GUARD_HEARTBEAT_MS` so an `executing` row's `updatedAt`
   // means "the owning process was alive then". The interval runs alongside
@@ -270,6 +339,10 @@ export async function withIssueMutationGuard<T>(
   // never pins the loop.
   const heartbeat = setInterval(() => {
     try {
+      // A fenced region owns the row's lock; stamping it now would block
+      // behind that transaction and hold a pooled connection until the
+      // region commits (see `fencedRegionInFlight` above).
+      if (fencedRegionInFlight) return;
       void Promise.resolve(
         prisma.issueMutationGuard.updateMany({
           where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
@@ -311,30 +384,80 @@ export async function withIssueMutationGuard<T>(
         fn: (tx: Prisma.TransactionClient) => Promise<T>,
         options?: FencedRemoteWriteOptions,
       ): Promise<FencedRemoteWriteResult<T>> => {
-        const outcome = await prisma.$transaction(async (tx) => {
-          const held = await tx.issueMutationGuard.updateMany({
-            where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
-            // The liveness stamp is set EXPLICITLY rather than left to the
-            // column's `@updatedAt` handling: the override's steal predicate
-            // is `updatedAt <= cutoff` (SILENCE), so the re-stamp that keeps a
-            // guard inside a fenced write un-stealable must not depend on the
-            // engine refreshing an `@updatedAt` column inside this update.
-            data: { executing: true, updatedAt: new Date() },
+        // The heartbeat skips its stamps while the region holds the row lock
+        // (see `fencedRegionInFlight`): those stamps would block behind this
+        // transaction and hold a pooled connection until it commits.
+        fencedRegionInFlight = true;
+        let outcome: { value: T } | null;
+        try {
+          outcome = await prisma.$transaction(async (tx) => {
+            const held = await tx.issueMutationGuard.updateMany({
+              where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
+              // The liveness stamp is set EXPLICITLY rather than left to the
+              // column's `@updatedAt` handling: the override's steal predicate
+              // is `updatedAt <= cutoff` (SILENCE), so the re-stamp that keeps a
+              // guard inside a fenced write un-stealable must not depend on the
+              // engine refreshing an `@updatedAt` column inside this update.
+              data: { executing: true, updatedAt: new Date() },
+            });
+            // The guard was deleted or re-owned between acquisition and this
+            // write: the anchor moved on, so NO remote write may happen.
+            if (held.count !== 1) return null;
+            const value = await fn(tx);
+            // The COMMIT-TIME RE-STAMP (#1367 review). The fence's opening
+            // stamp is as old as the region, and the heartbeat's own stamp
+            // cannot land while the region holds the row lock — so a region
+            // that ran longer than the override's silence window
+            // (`GUARD_OVERRIDE_MIN_AGE_MS`) would commit a row that looks
+            // SILENT, and a waiting operator force-claim could steal the
+            // anchor right after the region's writes landed, while the
+            // callback is still running. Re-stamping here, inside the same
+            // transaction and after the forge calls, makes the COMMITTED row
+            // fresh however long the region ran: a steal blocked on the row
+            // lock re-evaluates its silence predicate against this stamp,
+            // finds a live holder, and reports `busy` instead of taking the
+            // anchor. (The count is necessarily 1: the region holds the row's
+            // lock, so nothing could have deleted or re-owned the row under
+            // it.)
+            //
+            // Best-effort, and honestly bounded: in PostgreSQL a statement
+            // error ABORTS the whole transaction, so swallowing it here
+            // cannot rescue a poisoned region — the COMMIT that follows
+            // still fails and the region rolls back like any other database
+            // failure inside it (the catch then only keeps the region's own
+            // error from being replaced by a confusing "current transaction
+            // is aborted"). What the catch does buy is the narrow case where
+            // the stamp fails without touching the transaction (a client-side
+            // validation error): the region's remote write has already landed
+            // by then, and failing the region there would drop the release's
+            // local mirror while the GitHub write stands — the divergence the
+            // fence exists to prevent. Either way, a stamp that does not land
+            // leaves the guard carrying the PRE-region stamp (an abort rolls
+            // the region's opening stamp back too), i.e. the pre-fix
+            // behaviour.
+            try {
+              await tx.issueMutationGuard.updateMany({
+                where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true },
+                data: { updatedAt: new Date() },
+              });
+            } catch {
+              // Best-effort liveness re-stamp (see above).
+            }
+            return { value };
+          }, {
+            // The budget must dominate the worst case of the mutating forge
+            // call(s) the region holds, or the transaction could abort with a
+            // remote effect still in flight (which would release the row lock
+            // and reopen the hole). `maxWait` keeps pool waiters failing fast
+            // instead of queueing behind the held connection.
+            timeout: options?.timeoutMs ?? fencedWriteTimeoutMs(),
+            maxWait: 5_000,
           });
-          // The guard was deleted or re-owned between acquisition and this
-          // write: the anchor moved on, so NO remote write may happen.
-          if (held.count !== 1) return null;
-          const value = await fn(tx);
-          return { value };
-        }, {
-          // The budget must dominate the worst case of the mutating forge
-          // call(s) the region holds, or the transaction could abort with a
-          // remote effect still in flight (which would release the row lock
-          // and reopen the hole). `maxWait` keeps pool waiters failing fast
-          // instead of queueing behind the held connection.
-          timeout: options?.timeoutMs ?? fencedWriteTimeoutMs(),
-          maxWait: 5_000,
-        });
+        } finally {
+          // The region is over: the heartbeat may stamp the row again (it
+          // blocks behind the region's lock until here).
+          fencedRegionInFlight = false;
+        }
         return outcome === null
           ? { status: "guard-lost" }
           : { status: "written", value: outcome.value };
@@ -359,7 +482,15 @@ export async function withIssueMutationGuard<T>(
     // behind — that row is invisible to the ownership inspect surface (which
     // lists `executing` guards only) and would wedge EVERY writer on the
     // issue, claims included, with no operator-visible way to clear it.
-    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign") && !resuming) {
+    //
+    // #1367: same posture for "unclaim" — it also has no resume branch (only
+    // an `unclaim` attempt could take over an `unclaim` guard), and its route
+    // releases the anchor on every handled path (the callback catches its own
+    // failures), so a failed attempt deletes its guard row instead of leaving
+    // a demoted `executing: false` row that no one can resume — invisible to
+    // the ownership inspect surface (which lists `executing` guards only) and
+    // wedging every writer on the issue.
+    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign" || request.operation === "unclaim") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

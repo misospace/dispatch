@@ -517,7 +517,9 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > Every guarded callback (claim, the direct assignment route — `assign_agent`
 > AND `assign_owner`, whose label write is a full-set PUT — the unassign route
 > (#1361, whose label write is a full-set PUT too — the direct assignment's
-> twin in the other direction — the reconciler's
+> twin in the other direction), the unclaim route (#1367, whose remote release
+> removes the `agent/*` label and may chain a resting-status transition, and
+> whose entire mutation now runs under the anchor) — the reconciler's
 > Phase B delete, the stale-work sweep, and the capacity handoff's release)
 > performs its remote ownership write inside a **fenced write**
 > (`IssueMutationContext.runFencedRemoteWrite`,
@@ -550,22 +552,46 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > fetch — every term bounded by `DISPATCH_GITHUB_TIMEOUT_MS` (default 30s).
 > At the default configuration that is 180s, and the region's transaction
 > budget is `fencedWriteTimeoutMs()` = `githubCallBudgetMs()` + 15s of slack
-> = 195s. The budget is also deliberately shorter than the override's silence
-> window (`GUARD_OVERRIDE_MIN_AGE_MS`, 5 min): the fence re-stamps the guard
-> row, and a region that ran longer than the silence window would leave the
-> row looking stale the moment it committed (the heartbeat's own stamp waits
-> behind the row lock), so an override could steal the guard right after the
-> region's writes landed. Every region therefore carries **one** mutating
-> forge call — except the capacity handoff's release, which carries the
-> shared release (the ownership removal plus the resting-status transition:
-> up to three chained calls) and therefore raises its own budget to match.
+> = 195s. The budget is NOT bounded by the override's silence window
+> (`GUARD_OVERRIDE_MIN_AGE_MS`, 5 min). That window used to be the only thing
+> keeping a committed region from looking stealable: the fence stamped the
+> guard row when the region STARTED, and a region that ran longer than the
+> silence window would leave the row looking stale the moment it committed
+> (the heartbeat's own stamp cannot land while the region holds the row
+> lock), so an override could
+> steal the guard right after the region's writes landed — while the callback
+> was still running, and with the anchor it thought it held. A region now
+> **re-stamps the guard row at commit**, inside its own transaction, right
+> after its forge calls: the committed row is fresh however long the region
+> ran, so a steal blocked on the row lock re-evaluates its silence predicate
+> against that fresh row and reports `busy` instead of taking the anchor. The
+> budget therefore only has to dominate the region's forge calls; it does not
+> have to fit inside the silence window. Regions that carry more — or a
+> data-dependent number — of mutating forge calls derive their budget from
+> the calls they actually hold. The unclaim route's release is
+> **data-dependent** (a label set with duplicated `status/*` labels chains one
+> removal each), so its budget is **derived from the issue's observed label
+> set** — `releaseIssueClaimWorstCaseCalls`
+> (`src/lib/issue-claim.ts`) scaled by
+> `fencedWriteTimeoutForCalls`
+> (`src/lib/issue-mutation-guard.ts`, `githubCallBudgetMs()` per call +
+> slack) — rather than a fixed
+> multiplier, so no duplicate-label shape can outrun the region
+> (#1367 review). The capacity handoff's shared-release region derives its
+> budget the same way, from the release's own label set (its second live
+> read); its other region — the targeted own-label removal after an
+> ownership change — carries exactly one mutating forge call and uses the
+> default single-call budget.
 >
 > **What the fence proves, precisely.** The steal cannot COMMIT between the
 > fence and the write it covers: the steal's `DELETE` blocks on the guard
-> row's lock and then fails its silence predicate against the re-stamped row.
+> row's lock and then fails its silence predicate against the re-stamped row
+> (the commit-time stamp, or the fence's opening stamp for a region that
+> commits inside the silence window).
 > Two boundaries remain, by design:
 > - the claim route's forced stale-label cleanup runs **one removal per
->   fenced region** (a region carries one mutating forge call), so the
+>   fenced region** (each of that route's regions carries one mutating forge
+>   call), so the
 >   removal SET is **not atomic**: a steal that lands between two removals
 >   leaves the earlier ones applied. The next region's fence detects the
 >   loss and the callback backs off; the override's own claim converges the
@@ -576,14 +602,21 @@ no such claim; §8.7 defines the actual cross-system boundary.
 >   holder owns the claim at that moment.
 >
 > **The pool/lock tradeoff.** The fence deliberately holds ONE pooled
-> connection AND the guard row's lock for the duration of ONE hard-bounded
-> forge call. The hold is bounded by `fencedWriteTimeoutMs()` (195s at the
-> default configuration), so a GitHub outage can hold connections for that
-> budget — `maxWait: 5_000` keeps the other pool waiters failing fast
-> instead of queueing behind it. The guard heartbeat's stamp on the same row
-> waits behind that lock, so a long region also delays the holder's own
-> liveness stamp; the budget is what keeps that delay inside the silence
-> window.
+> connection AND the guard row's lock for the duration of the region's
+> hard-bounded forge call(s). The hold is bounded by the region's own
+> transaction budget — `fencedWriteTimeoutMs()` (195s at the default
+> configuration) for a single-call region (e.g. the capacity handoff's
+> targeted own-label removal), and the region's derived label-set budget for
+> the shared-release regions (the unclaim route and the capacity handoff) —
+> so a GitHub outage can hold connections for that budget:
+> `maxWait: 5_000` keeps
+> the other pool waiters failing fast instead of queueing behind it. The
+> guard heartbeat's stamp on the same row would wait behind that lock, so it
+> now SKIPS its ticks while a region is in flight: a blocked stamp would hold
+> a second pooled connection for the region's whole duration, and a long
+> region could otherwise tie up enough connections to starve every other
+> query in the app. The row's liveness during a region is carried by the
+> region's own opening stamp and its commit-time re-stamp instead.
 >
 > The residual window between the old read and the remote call — the
 > ownerToken-CAS-losing cost the override itself accepts — is therefore
