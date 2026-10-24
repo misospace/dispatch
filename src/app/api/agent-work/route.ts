@@ -589,11 +589,17 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // COMPLETED handover, so the next epoch of the same agent re-mints
           // a fresh row/token and can never re-read this identity. A failed
           // handover keeps the row (and this identity) intact, so its retry
-          // converges on the same evidence row. Once the row is already gone
-          // an attempt keyed off the work row still converges its OWN
-          // retries onto one row (at worst, a retry that runs after the
-          // teardown records a second, explicitly-labelled already-released
-          // row — noise, not a swallowed release).
+          // converges on the same evidence row. ONE exception: a same-owner
+          // replay (`newAgentName === oldAgentName`) renews the same row and
+          // its token survives, so the replay's release and a LATER real
+          // handover of that owner share this key and the later
+          // `claim_released` upserts onto the replay's row (audit stream
+          // only — the replay releases and re-adds the same label, and every
+          // lease/label/row end state stays correct). Once the row is
+          // already gone an attempt keyed off the work row still converges
+          // its OWN retries onto one row (at worst, a retry that runs after
+          // the teardown records a second, explicitly-labelled
+          // already-released row — noise, not a swallowed release).
           const oldClaim = await prisma.lease.findFirst({
             where: { agentName: oldAgentName, issueId },
             orderBy: { expiredAt: "desc" },
