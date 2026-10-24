@@ -589,23 +589,31 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // COMPLETED handover, so the next epoch of the same agent re-mints
           // a fresh row/token and can never re-read this identity. A failed
           // handover keeps the row (and this identity) intact, so its retry
-          // converges on the same evidence row. ONE exception: a same-owner
-          // replay (`newAgentName === oldAgentName`) renews the same row and
-          // its token survives, so the replay's release and a LATER real
-          // handover of that owner share this key and the later
-          // `claim_released` upserts onto the replay's row (audit stream
-          // only — the replay releases and re-adds the same label, and every
-          // lease/label/row end state stays correct). Once the row is
-          // already gone an attempt keyed off the work row still converges
-          // its OWN retries onto one row (at worst, a retry that runs after
-          // the teardown records a second, explicitly-labelled
+          // converges on the same evidence row. A same-owner replay
+          // (`newAgentName === oldAgentName`) is the ONE attempt that does
+          // NOT retire the epoch: it renews the same row and its token
+          // survives, so keying it off the epoch alone would make the
+          // replay's release and a LATER real handover of that owner share
+          // one identity, and the later `claim_released` would upsert onto
+          // the replay's row and be swallowed (#1407 review, third round).
+          // The replay therefore carries an explicit discriminator: its own
+          // retries still converge on one replay row (same row, same token,
+          // same key), while the next real handover of that epoch keeps the
+          // plain epoch key and records its OWN release evidence. Once the
+          // row is already gone an attempt keyed off the work row still
+          // converges its OWN retries onto one row (at worst, a retry that
+          // runs after the teardown records a second, explicitly-labelled
           // already-released row — noise, not a swallowed release).
           const oldClaim = await prisma.lease.findFirst({
             where: { agentName: oldAgentName, issueId },
             orderBy: { expiredAt: "desc" },
             select: { id: true, claimToken: true },
           });
-          const releaseKey = `agent-work-reassign:${workId}:${oldClaim?.claimToken ?? oldClaim?.id ?? "no-lease"}`;
+          const releaseEpoch = oldClaim?.claimToken ?? oldClaim?.id ?? "no-lease";
+          const releaseKey =
+            newAgentName === oldAgentName
+              ? `agent-work-reassign:${workId}:replay:${releaseEpoch}`
+              : `agent-work-reassign:${workId}:${releaseEpoch}`;
 
           // 1. Release the old owner's claim THROUGH the shared claim-release
           // path, so the `agent/*` removal, the cache mirror and the

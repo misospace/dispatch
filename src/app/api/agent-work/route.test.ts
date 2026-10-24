@@ -1500,6 +1500,49 @@ describe("POST /api/agent-work", () => {
       });
     });
 
+    // #1407 review (third round): a same-owner replay RENEWS the old owner's
+    // lease row (the teardown excludes the receipt), so its token survives
+    // into the next epoch. Keying the replay off the epoch alone made the
+    // LATER real handover of that owner derive the same releaseKey, and its
+    // `claim_released` upserted onto the replay's evidence row — a swallowed
+    // release. The replay carries an explicit discriminator; the real
+    // handover after it keeps the plain epoch key and records its own row.
+    it("keys a same-owner replay apart from the later real handover of the surviving epoch", async () => {
+      // Replay: the row already belongs to the target agent, and its live
+      // lease (token `epoch-tok-7`) survives the replay.
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow({ agentName: "new-agent" }));
+      mockGetLiveIssueLabels.mockResolvedValueOnce(["agent/new-agent", "status/in-progress"]);
+      lease.findFirst.mockResolvedValueOnce({ id: "lease-1", claimToken: "epoch-tok-7" });
+
+      const replay = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+        reason: "duplicate submit",
+      });
+      expect(replay.status).toBe(200);
+      expect(mockReleaseIssueClaim.mock.calls[0][0].options.releaseKey).toBe(
+        "agent-work-reassign:work-1:replay:epoch-tok-7",
+      );
+
+      // The later REAL handover of that surviving epoch (the same row, the
+      // same token) must NOT share the replay's identity.
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow({ agentName: "new-agent" }));
+      mockGetLiveIssueLabels.mockResolvedValueOnce(["agent/new-agent", "status/in-progress"]);
+      lease.findFirst.mockResolvedValueOnce({ id: "lease-1", claimToken: "epoch-tok-7" });
+
+      const next = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "other-agent",
+        reason: "handover",
+      });
+      expect(next.status).toBe(200);
+      expect(mockReleaseIssueClaim.mock.calls[1][0].options.releaseKey).toBe(
+        "agent-work-reassign:work-1:epoch-tok-7",
+      );
+    });
+
     it("leaves the lease receipt intact when the add guard is lost on a receipt this attempt only renewed", async () => {
       agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
       guardState.addGuardLost = true;
