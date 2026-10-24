@@ -38,6 +38,14 @@ const suite = enabled ? describe : describe.skip;
 
 const REPO_PREFIX = "integration/agent-work-stale-cleanup-";
 
+// A value that can never match a row: `Issue.id` and `AgentWork.issueId`
+// are cuids, so this literal is never a real id. It is the initial value of
+// `issueId`, so a cleanup filter built from it before setup completed is a
+// no-op instead of an unscoped delete — Prisma omits an `undefined` filter
+// entirely, which would erase every row of those tables in the shared
+// integration database.
+const UNSET_ISSUE_ID = "integration-agent-work-unset-issue-id";
+
 // The cleanup takes its client as a parameter, but importing the module
 // transitively imports the app's Prisma singleton; point it at THIS test's
 // client so the import chain stays hermetic even without DATABASE_URL.
@@ -58,7 +66,14 @@ const BLOCK_TRIGGER = "agent_work_rollback_test_audit_block";
 
 suite("the claim-path stale cleanup's delete+audit rollback against a real PostgreSQL", () => {
   let db: PrismaClient;
-  let issueId: string;
+  let issueId: string = UNSET_ISSUE_ID;
+  // Whether `beforeEach` got as far as creating the issue this test's
+  // cleanup would scope itself by.
+  let issueSeeded = false;
+  // Captured before any setup runs: the unset default must be a defined,
+  // non-matching value from the start, so a cleanup that ran before setup
+  // completed can never build an unscoped filter.
+  const INITIAL_ISSUE_ID = issueId;
 
   beforeAll(async () => {
     db = new PrismaClient({ adapter: new PrismaPg({ connectionString: url as string }) });
@@ -75,6 +90,11 @@ suite("the claim-path stale cleanup's delete+audit rollback against a real Postg
   });
 
   beforeEach(async () => {
+    // Reset first: if setup fails before the issue exists, the cleanup must
+    // not scope itself by the previous test's (already deleted) id.
+    issueId = UNSET_ISSUE_ID;
+    issueSeeded = false;
+
     const repo = await db.repository.create({
       data: {
         name: REPO_PREFIX,
@@ -96,19 +116,43 @@ suite("the claim-path stale cleanup's delete+audit rollback against a real Postg
       },
     });
     issueId = issue.id;
+    issueSeeded = true;
   });
 
-  afterEach(async () => {
-    // AgentWork rows first: deleting the issue would only null their FK
-    // (the relationship is optional, so Prisma's default action is
-    // SetNull), which would leave orphaned rows behind.
-    await db.agentWork.deleteMany({ where: { issueId } });
-    await db.issue.deleteMany({ where: { id: issueId } });
+  /**
+   * Remove this file's rows from the shared database.
+   *
+   * Everything scoped by this file's repository prefix is deleted
+   * unconditionally; the ONE delete that needs the seeded issue id — the
+   * issue-scoped one — is the one that is guarded. It is skipped when
+   * setup did not complete, because its filter must never be built from an
+   * unset id: Prisma omits an `undefined` filter, and an unscoped
+   * `deleteMany` would erase every row of those tables in the shared
+   * integration database.
+   */
+  async function cleanupSeededRows(): Promise<void> {
+    // This file's AgentWork rows first, reached through their issue's
+    // repository: the optional FK is still set at this point, because
+    // deleting the issue (or the repository, which cascades it) nulls it —
+    // and a nulled FK matches no later filter, so the row would be
+    // orphaned in the shared database.
+    await db.agentWork.deleteMany({
+      where: { issue: { repository: { fullName: { startsWith: REPO_PREFIX } } } },
+    });
+    if (issueSeeded) {
+      await db.issue.deleteMany({ where: { id: issueId } });
+    }
     // Same SetNull shape applies to the positive control's committed audit
     // row once the issue is gone; remove it by the test's repo prefix so
     // nothing accumulates on a reused database.
     await db.auditLog.deleteMany({ where: { repoFullName: { startsWith: REPO_PREFIX } } });
     await db.repository.deleteMany({ where: { fullName: { startsWith: REPO_PREFIX } } });
+  }
+
+  afterEach(async () => {
+    await cleanupSeededRows();
+    issueId = UNSET_ISSUE_ID;
+    issueSeeded = false;
   });
 
   /**
@@ -201,5 +245,72 @@ suite("the claim-path stale cleanup's delete+audit rollback against a real Postg
       repoFullName: expect.stringMatching(new RegExp(`^${REPO_PREFIX}positive-`)),
     });
     expect(audit[0]?.notes).toContain(work.id);
+  });
+
+  it("(cleanup scope) neither an unset id nor an unseeded setup can delete rows outside this file's prefix", async () => {
+    // The regression this guards: a cleanup that ran before setup completed
+    // used to filter on an unset issue id, and Prisma omits an `undefined`
+    // filter — so the cleanup became an unscoped delete of every AgentWork
+    // and Issue row in the shared integration database. These bystander
+    // rows belong to no other test and must survive such a cleanup.
+    const bystanderRepo = await db.repository.create({
+      data: {
+        name: "integration/bystander-",
+        owner: "integration",
+        fullName: `integration/bystander-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      },
+    });
+    const bystanderIssue = await db.issue.create({
+      data: {
+        number: 1,
+        repositoryId: bystanderRepo.id,
+        title: "cleanup-scope bystander",
+        state: "open",
+        url: "https://example.test/cleanup-scope-bystander",
+        labels: [],
+        assignees: [],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+    const bystanderWork = await db.agentWork.create({
+      data: { agentName: "bystander", issueId: bystanderIssue.id, state: "IN_PROGRESS" },
+    });
+
+    const survives = async () => {
+      expect(await db.agentWork.findUnique({ where: { id: bystanderWork.id } })).not.toBeNull();
+      expect(await db.issue.findUnique({ where: { id: bystanderIssue.id } })).not.toBeNull();
+      expect(await db.repository.findUnique({ where: { id: bystanderRepo.id } })).not.toBeNull();
+    };
+
+    try {
+      // The unset default is defined and non-matching from the start.
+      expect(INITIAL_ISSUE_ID).toBe(UNSET_ISSUE_ID);
+
+      // (a) The guard, independent of the sentinel: even a REAL issue id
+      // survives when setup did not complete, because the issue-scoped
+      // delete is skipped rather than run against an id it does not own.
+      issueId = bystanderIssue.id;
+      issueSeeded = false;
+      await cleanupSeededRows();
+      await survives();
+
+      // (b) The sentinel, independent of the guard: the issue-scoped delete
+      // DOES run (setup "completed"), but the id can never match a row —
+      // an `undefined` here would match every row in the table.
+      issueId = UNSET_ISSUE_ID;
+      issueSeeded = true;
+      await cleanupSeededRows();
+      await survives();
+    } finally {
+      // Restore the suite's state so this test's afterEach behaves like
+      // every other one's.
+      issueId = UNSET_ISSUE_ID;
+      issueSeeded = false;
+      // Explicitly, by id: this test's rows are outside this file's prefix.
+      await db.agentWork.deleteMany({ where: { id: bystanderWork.id } });
+      await db.issue.deleteMany({ where: { id: bystanderIssue.id } });
+      await db.repository.deleteMany({ where: { id: bystanderRepo.id } });
+    }
   });
 });
