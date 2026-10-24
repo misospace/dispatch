@@ -8,23 +8,28 @@ import { join } from "node:path";
 const lockfilePath = join(process.cwd(), "package-lock.json");
 const acceptedRisksPath = join(process.cwd(), "SECURITY-ACCEPTED-RISKS.md");
 
-// The vulnerable version ranges below mirror npm's advisory feed for the
-// transitive dependencies that kept the blocking `npm run audit` gate red on
-// `main` (#1386). They are checked against the lockfile so a later lock
-// refresh cannot silently re-resolve one of these packages into a vulnerable
-// release.
+// The vulnerable version ranges below are the **union of every advisory the
+// npm advisory feed lists for these packages** (fetched per-package on
+// 2026-10-24), not only the advisories named in #1386: the blocking gate flags
+// any vulnerable resolution, so pinning a subset of a package's advisory
+// history would let a re-resolution into an older advisory through.
 //
-// The ranges were read from npm's advisory database on 2026-10-24 and every
-// boundary was probed with `npm audit` against that exact version. They are
-// deliberately expressed as ranges instead of a single floor: several of the
-// advisories only cover part of a major line — `fast-uri` 2.x is not affected,
-// `body-parser` 1.x only up to 1.20.8, `undici` 6.x and 7.x have their own
-// boundaries — so one floor per package would fail on clean copies.
+// Every boundary was read from the feed and cross-checked: no release the feed
+// marks as patched falls inside a pinned range (checked per major line for
+// `fast-uri`, `body-parser` and `undici`), and every version the feed marks
+// vulnerable falls inside one. They are deliberately expressed as ranges
+// instead of a single floor: the advisories are per-major-line — `fast-uri` 2.x
+// ends at 2.4.7 while its 4.x line only ends at 4.2.2, `body-parser` 1.x only
+// up to 1.20.8 — so one floor per package would fail on clean copies.
 //
 // Scope mirrors the gate itself: the blocking audit is scoped to the
 // production tree (`npm audit --omit=dev --include=prod`), so production
 // packages are only checked on production-reachable copies. Dev-only copies
 // stay visible in the informational dev-inclusive audit step.
+//
+// `from` is inclusive and `to` is exclusive, matching the feed's
+// `< first-patched` boundary style: a range pins "vulnerable from `from`
+// until the first patched release".
 type VersionRange = { from: string; to: string };
 
 type AdvisorySpec = {
@@ -32,44 +37,61 @@ type AdvisorySpec = {
   ranges: VersionRange[];
   advisories: string[];
   scope: "prod" | "dev";
+  // One version per pinned range that the advisory feed marks vulnerable,
+  // plus the first patched release of each affected major line. If a range
+  // is dropped or narrowed, the vulnerable probes stop being flagged and
+  // this data fails the guard below.
+  vulnerableProbes: string[];
+  patchedProbes: string[];
 };
 
 const ADVISORY_SPECS: AdvisorySpec[] = [
   {
-    // body-parser: trailing-bytes DoS on a compressed body (2.0.0 - 2.3.0)
-    // plus the earlier 1.x advisories (through 1.20.8). Fixed in 1.20.9 and
-    // 2.4.0 respectively.
+    // body-parser: trailing-bytes DoS on a compressed body (2.0.0 - <2.4.0)
+    // plus the earlier advisories covering every 1.x below 1.20.9.
     name: "body-parser",
     ranges: [
-      { from: "0.0.0", to: "1.20.8" },
-      { from: "2.0.0", to: "2.3.0" },
+      { from: "0.0.0", to: "1.20.9" },
+      { from: "2.0.0", to: "2.4.0" },
     ],
     advisories: ["GHSA-27r3-jxmh-p828"],
     scope: "prod",
+    vulnerableProbes: ["1.20.8", "2.3.0"],
+    patchedProbes: ["1.20.9", "2.4.0"],
   },
   {
     // hono: the serveStatic request-path double-decode middleware bypass
-    // (4.12.4 - 4.13.10) together with the earlier advisories covering every
-    // release up to 4.13.6. Fixed in 4.13.11.
+    // (4.12.4 - <4.13.11) together with the advisories covering every earlier
+    // release. Fixed in 4.13.11.
     name: "hono",
-    ranges: [{ from: "0.0.0", to: "4.13.10" }],
+    ranges: [{ from: "0.0.0", to: "4.13.11" }],
     advisories: ["GHSA-5r4p-p66f-jhc7"],
     scope: "prod",
+    vulnerableProbes: ["4.13.10"],
+    patchedProbes: ["4.13.11"],
   },
   {
-    // ip-address: Address6 quadratic-time stall on zone-identifier input and
-    // the earlier advisories (SSRF / trust-boundary bypasses) covering every
-    // release up to 10.7.3. Fixed in 10.7.4.
+    // ip-address: Address6 quadratic-time stall on zone-identifier input plus
+    // the earlier advisories (SSRF / trust-boundary bypasses, XSS, subnet
+    // comparison) covering every release below 10.7.4. Fixed in 10.7.4.
     name: "ip-address",
-    ranges: [{ from: "0.0.0", to: "10.7.3" }],
+    ranges: [{ from: "0.0.0", to: "10.7.4" }],
     advisories: ["GHSA-rxp7-6hxx-x8q5"],
     scope: "prod",
+    vulnerableProbes: ["10.7.3"],
+    patchedProbes: ["10.7.4"],
   },
   {
     // fast-uri: URI scheme spoofing, path-equivalence, host-confusion and
-    // scheme-injection advisories across 3.0.0 - 3.1.8. Fixed in 3.1.9.
+    // scheme-injection advisories. Each major line carries its own boundary:
+    // 2.x below 2.4.8 (host confusion opens at 2.4.2), 3.x below 3.1.9, 4.x
+    // below 4.2.3. Fixed in 2.4.8 / 3.1.9 / 4.2.3.
     name: "fast-uri",
-    ranges: [{ from: "3.0.0", to: "3.1.8" }],
+    ranges: [
+      { from: "0.0.0", to: "2.4.8" },
+      { from: "3.0.0", to: "3.1.9" },
+      { from: "4.0.0", to: "4.2.3" },
+    ],
     advisories: [
       "GHSA-w74x-v6f9-j3xg",
       "GHSA-xhq7-xmqj-769h",
@@ -77,16 +99,19 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
       "GHSA-333x-w4r6-6crp",
     ],
     scope: "prod",
+    vulnerableProbes: ["2.4.7", "3.1.8", "4.2.2"],
+    patchedProbes: ["2.4.8", "3.1.9", "4.2.3"],
   },
   {
-    // undici: EventSource memory DoS, SRI bypass and content-encoding DoS
-    // across 8.0.0 - 8.12.1, plus the earlier 6.x and 7.x advisories. Fixed
-    // in 6.29.1, 7.31.0 and 8.12.2 respectively.
+    // undici: EventSource memory DoS, SRI bypass, content-encoding DoS and
+    // the earlier 4.x-7.x advisories (WebSocket parser crashes, response
+    // splitting, cookie disclosure, proxy pooling, TLS validation). The 6.x
+    // line closes at 6.29.1, 7.x at 7.30.1 and 8.x at 8.12.2.
     name: "undici",
     ranges: [
-      { from: "0.0.0", to: "6.29.0" },
-      { from: "7.0.0", to: "7.30.0" },
-      { from: "8.0.0", to: "8.12.1" },
+      { from: "0.0.0", to: "6.29.1" },
+      { from: "7.0.0", to: "7.30.1" },
+      { from: "8.0.0", to: "8.12.2" },
     ],
     advisories: [
       "GHSA-4qv8-2p9j-2685",
@@ -94,6 +119,8 @@ const ADVISORY_SPECS: AdvisorySpec[] = [
       "GHSA-xjj6-f33q-929c",
     ],
     scope: "dev",
+    vulnerableProbes: ["6.29.0", "7.30.0", "8.12.1"],
+    patchedProbes: ["6.29.1", "7.30.1", "8.12.2"],
   },
 ];
 
@@ -124,10 +151,12 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+// `range.to` is the first patched release and is exclusive: a version equal to
+// `to` is fixed, not vulnerable.
 function isInRange(version: string, range: VersionRange): boolean {
   return (
     compareVersions(version, range.from) >= 0 &&
-    compareVersions(version, range.to) <= 0
+    compareVersions(version, range.to) < 0
   );
 }
 
@@ -166,9 +195,30 @@ describe("advisory version ranges for the blocking npm audit gate (#1386)", () =
         for (const range of spec.ranges) {
           expect(
             isInRange(version, range),
-            `${spec.name}@${version} (${copy.path}) falls inside the vulnerable range ${range.from} - ${range.to} (${spec.advisories.join(", ")})`,
+            `${spec.name}@${version} (${copy.path}) falls inside the vulnerable range ${range.from} <= v < ${range.to} (${spec.advisories.join(", ")})`,
           ).toBe(false);
         }
+      }
+    });
+  }
+
+  // Self-check on the pins themselves: every vulnerable probe must fall in a
+  // pinned range and every patched probe must fall in none. This is what
+  // catches a range being dropped or narrowed (the #1386 review finding: the
+  // original pins missed fast-uri's 2.x and 4.x advisory lines).
+  for (const spec of ADVISORY_SPECS) {
+    it(`${spec.name} pins cover exactly their vulnerable/patched probe versions`, () => {
+      for (const version of spec.vulnerableProbes) {
+        expect(
+          spec.ranges.some((range) => isInRange(version, range)),
+          `${spec.name}@${version} must be pinned as vulnerable`,
+        ).toBe(true);
+      }
+      for (const version of spec.patchedProbes) {
+        expect(
+          spec.ranges.some((range) => isInRange(version, range)),
+          `${spec.name}@${version} is patched and must not be pinned as vulnerable`,
+        ).toBe(false);
       }
     });
   }
