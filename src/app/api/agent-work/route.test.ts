@@ -204,6 +204,7 @@ import { prisma } from "@/lib/prisma";
 import * as leaseModule from "@/lib/lease";
 import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
 import { authorizeRequest } from "@/lib/auth";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { resetRateLimits } from "@/lib/rate-limit";
 import { GET, POST } from "./route";
 
@@ -218,6 +219,7 @@ const issueFindUnique = prisma.issue.findUnique as any;
 const releaseLeaseByAgentAndIssueMock = leaseModule.releaseLeaseByAgentAndIssue as any;
 const releaseAllLeasesByAgentMock = leaseModule.releaseAllLeasesByAgent as any;
 const releaseAgentWorkByAgentAndIssueMock = leaseModule.releaseAgentWorkByAgentAndIssue as any;
+const supersedeOwnershipReleaseIntentMock = supersedeOwnershipReleaseIntent as any;
 
 const mockAuthorizeRequest = vi.mocked(authorizeRequest);
 
