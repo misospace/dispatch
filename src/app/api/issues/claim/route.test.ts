@@ -149,6 +149,15 @@ describe("POST /api/issues/claim — validation", () => {
     expect(res.status).toBe(400);
   });
 
+  // #1412: a whitespace-only name normalizes to absent, like the operator
+  // release (#1402) and reassign (#1406) paths.
+  it("returns 400 when agentName is whitespace-only", async () => {
+    const res = await POST(makeRequest(makePayload({agentName: "   "})));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Missing required fields: issueId, repoFullName, issueNumber, agentName");
+  });
+
   it("returns 400 when repoFullName is missing", async () => {
     const res = await POST(makeRequest(makePayload({repoFullName: undefined})));
     expect(res.status).toBe(400);
@@ -199,6 +208,29 @@ describe("POST /api/issues/claim — business logic", () => {
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
     expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "status/in-progress");
     expect(body.labels).toContain("status/in-progress");
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: true, actor: "test-agent" }) });
+  });
+
+  // #1412: the padded form used to be stored verbatim on the lease, the
+  // lifecycle event and the `agent/*` label, so every later name-keyed
+  // consumer (operator release, worker-ownership, the agent-work queue)
+  // missed the rows the padded claim had created.
+  it("trims a padded agentName so the lease, lifecycle event and label store the canonical name", async () => {
+    // The lease upsert branches on `lease.findUnique`; pin the read so the
+    // shape does not depend on whichever default a neighboring describe's
+    // Once-shaped stub left behind.
+    mocks.leaseFindUnique.mockResolvedValueOnce(null);
+    const res = await POST(makeRequest({ agentName: "  test-agent  " }));
+    expect(res.status).toBe(200);
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/test-agent");
+    expect(mocks.leaseCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ agentName: "test-agent" }) }),
+    );
+    expect(mocks.createLifecycleEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ kind: "claim", actor: "test-agent", agentName: "test-agent" }),
+      }),
+    );
     expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: true, actor: "test-agent" }) });
   });
 
@@ -660,6 +692,34 @@ describe("POST /api/issues/claim — worker tier (#1111)", () => {
     const res = await POST(workerRequest());
     expect(res.status).toBe(200);
     expect((await res.json()).success).toBe(true);
+  });
+
+  // #1412: a padded variant of the bound agent's own name canonicalizes to
+  // the bound name instead of being denied — the token identity is derived
+  // from the credential, and the stored form is the canonical one.
+  it("canonicalizes a bound worker's padded own agent name instead of denying it", async () => {
+    // The P2002-recovery lease upsert branches on `lease.findUnique`; earlier
+    // suites leave a non-null default queued after their Once-shaped stub, so
+    // pin the next read to null to take the fresh-create branch.
+    mocks.leaseFindUnique.mockResolvedValueOnce(null);
+    const res = await POST(workerRequest({ agentName: " worker-agent " }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+    expect(mocks.addIssueLabel).toHaveBeenCalledWith("org/repo", 42, "agent/worker-agent");
+    expect(mocks.leaseCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ agentName: "worker-agent" }) }),
+    );
+  });
+
+  // #1412 fail-closed invariant: canonicalization only forgives padding on
+  // the bound agent's own name; a padded variant of a different agent's name
+  // must still be denied.
+  it("still denies a bound worker padding a different agent's name", async () => {
+    const res = await POST(workerRequest({ agentName: " other-agent " }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain("may not act for");
+    expect(mocks.findUnique).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
   });
 
   it("does not let a truthy non-boolean force override another agent", async () => {

@@ -39,10 +39,24 @@ export async function POST(request: Request) {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName, force } = body as Record<string, unknown>;
+    const { issueId, repoFullName: bodyRepoFullName, issueNumber: bodyIssueNumber, agentName: rawAgentName, force } = body as Record<string, unknown>;
+
+    // #1412: normalize the operator-supplied agent name before it is written
+    // anywhere. `Lease.agentName`, `AgentWork.agentName`, the claim lifecycle
+    // event and the `agent/*` label all store the agent's canonical name, and
+    // every later name-keyed consumer — `releaseLeaseByAgentAndIssue`,
+    // `releaseAllLeasesByAgent`, `releaseAgentWorkByAgentAndIssue`, the
+    // agent-work queue and the operator release path — looks rows up under
+    // that canonical form. A padded value used to be stored verbatim, so
+    // those consumers missed the rows a padded claim created. Trimming here,
+    // before the write-side consumers run, keeps the stored form canonical by
+    // construction — matching the operator release (#1402) and reassign
+    // (#1406) paths and the worker parsers in `src/lib/agent-work.ts`. A
+    // whitespace-only value is absent, like those paths.
+    const agentName = typeof rawAgentName === "string" ? rawAgentName.trim() : null;
 
     // Validate required fields
-    if (!issueId || !bodyRepoFullName || typeof bodyIssueNumber !== "number" || !agentName || typeof agentName !== "string") {
+    if (!issueId || !bodyRepoFullName || typeof bodyIssueNumber !== "number" || !agentName) {
       return errorResponse("Missing required fields: issueId, repoFullName, issueNumber, agentName", 400);
     }
 
@@ -81,7 +95,7 @@ export async function POST(request: Request) {
     // Maintainer force-claims may take over a guard left `executing` by a
     // crashed process — the deliberate operator decision the fail-closed
     // guard posture defers to (#1254). Automation never overrides.
-    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName: agentName as string, override: force === true }, async (_tx, { resuming, runFencedRemoteWrite }) => {
+    const guarded = await withIssueMutationGuard({ issueId: issueId as string, operation: "claim", agentName, override: force === true }, async (_tx, { resuming, runFencedRemoteWrite }) => {
     let remoteStarted = false;
     const value = await (async (): Promise<Response> => {
     // Fetch the issue from the local database to check its state and current labels
@@ -361,7 +375,7 @@ export async function POST(request: Request) {
       // The lease is now the claim-side intent; the retry path replays the
       // idempotent add below (crash-matrix "claim side" row).
       const lease = await upsertLease({
-        agentName: agentName as string,
+        agentName,
         issueId: issueId as string,
         checkpoint: "issue_claimed",
         mutationGuardHeld: true,
@@ -424,8 +438,8 @@ export async function POST(request: Request) {
           issueNumber,
           kind: "claim",
           source: "api:claim",
-          actor: agentName as string,
-          agentName: agentName as string,
+          actor: agentName,
+          agentName,
           before: liveLabels,
           after: updatedLabels,
           // The GitHub writes above are already outside this transaction, so a
@@ -463,7 +477,7 @@ export async function POST(request: Request) {
 
       await prisma.auditLog.create({
         data: {
-          actor: agentName as string,
+          actor: agentName,
           action: "claim_issue",
           repoFullName,
           issueNumber,
@@ -486,7 +500,7 @@ export async function POST(request: Request) {
       // Write failure audit log
       await prisma.auditLog.create({
         data: {
-          actor: agentName as string,
+          actor: agentName,
           action: "claim_issue",
           repoFullName,
           issueNumber,
