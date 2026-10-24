@@ -1025,6 +1025,39 @@ describe("resolvePrFixFromAgentReport", () => {
     });
   });
 
+  // #1340 review: the fenced-only contract guards the already-settled skip
+  // path too — a token-less blocked report against a terminal row performs
+  // zero writes (the idempotent skip stays a pure no-op; nothing releases
+  // without the exact receipt).
+  it("releases nothing on an already-settled skip when a blocked report carries no handoutToken (#1340 review)", async () => {
+    const row = {
+      ...FIXTURE_ITEM,
+      status: "BLOCKED",
+      agentHandouts: ["fixer@1"],
+      handoutAcks: ["fixer@1"],
+      handoutReceipts: ["hnd_aabbccddeeff@fixer@1"],
+      dispatchedGeneration: 1,
+      dispatchedAt: "2026-01-01T00:02:00.000Z",
+    };
+    (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+
+    const result = await resolvePrFixFromAgentReport(baseInput({
+      outcome: "blocked",
+      summary: "still blocked, waiting on the product call",
+      agentName: "fixer",
+      attempt: ATTEMPT,
+    }));
+
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toBe("pr-fix item already BLOCKED");
+    // Fail closed: no release write despite the terminal row and the agent's
+    // live entries at this generation.
+    expect(prisma.prFixQueueItem.updateMany).not.toHaveBeenCalled();
+    expect(row.agentHandouts).toEqual(["fixer@1"]);
+    expect(row.handoutReceipts).toEqual(["hnd_aabbccddeeff@fixer@1"]);
+  });
+
   // #1340 review (round 2, after courier#516/#523 shipped the token echo on
   // every followup-pr report): the release is fenced to the exact issuance
   // ONLY. A report without the echoed handoutToken authorizes no release —

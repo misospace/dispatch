@@ -3475,6 +3475,9 @@ export async function releaseAgentHandout(
   const agent = agentName?.trim();
   if (!agent) return;
   const token = handoutToken?.trim();
+  // Exact-issuance fence (#1256 rule): without the echoed token, nothing is
+  // authorized — fail closed, on every path, settled row or not.
+  if (!token) return;
   try {
     for (let pass = 0; pass < 2; pass++) {
       const fresh = await client.prFixQueueItem.findUnique({ where: { id: itemId } });
@@ -3486,10 +3489,9 @@ export async function releaseAgentHandout(
         const parsed = parseAgentHandoutToken(entry);
         return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
       };
-      // Exact-issuance fence (#1256 rule): without the echoed token, nothing
-      // is authorized — fail closed. A mismatched, rotated, or already
-      // released receipt authorizes nothing either.
-      if (!token) return;
+      // Exact-issuance fence (#1256 rule): the presented receipt must be this
+      // agent's live receipt at this generation. A mismatched, rotated, or
+      // already released receipt authorizes nothing.
       const owned = findHandoutReceipt(receipts, { agentName: agent, generation, token });
       if (!owned) return;
       const remainingReceipts = receipts.filter((entry) => entry !== owned);
