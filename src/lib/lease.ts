@@ -229,11 +229,11 @@ export async function releaseLease(leaseId: string): Promise<any | null> {
  * #1362/#1256: release a lease row only while it still carries the exact
  * receipt the acquiring attempt holds, via the same `{id, claimToken,
  * renewedAt}` CAS as the claim route's supersede cleanup. Best-effort: a
- * later renewal re-stamps `renewedAt` and a reactivation
- * rotates `claimToken`, so a stale attempt's delete matches zero rows
- * instead of destroying a newer incarnation's receipt. Returns the number
- * of rows deleted (0 = the fence did not match; the row lives on) and
- * swallows store errors, mirroring the claim route's best-effort cleanup.
+ * later renewal re-stamps `renewedAt` and a reactivation rotates
+ * `claimToken`, so a stale attempt's delete matches zero rows instead of
+ * destroying a newer incarnation's receipt. Returns the number of rows
+ * deleted (0 = the fence did not match; the row lives on) and swallows
+ * store errors, mirroring the claim route's best-effort cleanup.
  */
 export async function releaseLeaseIfUnchanged(receipt: {
   id: string;
