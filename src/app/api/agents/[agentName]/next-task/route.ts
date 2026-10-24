@@ -21,6 +21,11 @@ type PrFixCandidate = {
   repo: string;
   pr: number;
   lane?: string | null;
+  agentHandouts?: string[];
+  // #495: CI park-and-resume deferral state; "active" suppresses the hand-out
+  // for every polling agent until the lifecycle settles or the generation
+  // moves.
+  ciParkState?: string | null;
   url?: string | null;
   issue?: number | null;
   generation: number;
@@ -87,9 +92,23 @@ async function confirmPrFixHandOut(
           id: candidate.id,
           generation: stampGeneration,
           status: "QUEUED",
-          OR: [
-            { dispatchedGeneration: null },
-            { dispatchedGeneration: { not: stampGeneration } },
+          AND: [
+            // First-hand-out pin: the OR clause matches rows not yet stamped
+            // at the stamped generation. Re-hand-outs of a still-QUEUED
+            // generation must not re-stamp or clear postDispatchEvidenceKeys.
+            {
+              OR: [
+                { dispatchedGeneration: null },
+                { dispatchedGeneration: { not: stampGeneration } },
+              ],
+            },
+            // #495: never stamp a hand-out on a row whose CI park deferral is
+            // still active. Prisma `{ not: "active" }` does NOT match NULL
+            // rows (SQL <> semantics), so the guard is composed explicitly:
+            // null (lifecycle never recorded) and released/settled rows pass.
+            {
+              OR: [{ ciParkState: null }, { ciParkState: { not: "active" } }],
+            },
           ],
         },
         data: {
@@ -353,6 +372,21 @@ export async function GET(
     const deferredIssues = new Set<string>();
 
     const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
+      // #495: an active CI park deferral suppresses the hand-out PER-ITEM and
+      // GLOBALLY — any polling agent is held back while Courier's repair
+      // opportunity stays open; the notice's agentName is transport identity
+      // only. Checked before the per-agent gates because no agent can take
+      // this work while the deferral is live.
+      if (candidate.ciParkState === "active") {
+        console.info("[next-task-pr-fix]", {
+          repoFullName: candidate.repo,
+          pullRequestNumber: candidate.pr,
+          generation: candidate.generation,
+          phase: "QUEUED",
+          reason: "ci-park-active",
+        });
+        return null;
+      }
       if (excluded(candidate.repo, candidate.pr, candidate.generation)) {
         return null;
       }
@@ -375,8 +409,22 @@ export async function GET(
       const handoutToken = newHandoutToken();
       try {
         // Conditional append fences concurrent polls for the same agent/generation.
+        // #495: the same explicit-null-aware CI park guard as the stamp — the
+        // deferral can activate between the queue read and this write, and a
+        // claim must never materialize on a row whose deferral is active.
         const claimed = await prisma.prFixQueueItem.updateMany({
-          where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED", NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } } },
+          where: {
+            id: candidate.id,
+            generation: confirmed.generation,
+            status: "QUEUED",
+            NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } },
+            AND: [
+              // Prisma `{ not: "active" }` does not match NULL rows, so the
+              // guard is composed explicitly: null, released, and settled
+              // rows pass; active rows fail (count 0 → no hand-out).
+              { OR: [{ ciParkState: null }, { ciParkState: { not: "active" } }] },
+            ],
+          },
           data: {
             agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] },
             handoutReceipts: { push: [handoutReceipt(handoutToken, agentName, confirmed.generation)] },
@@ -530,6 +578,7 @@ export async function GET(
         reason: materialized.item.reason,
         feedback: materialized.item.feedback ?? [],
         agentHandouts: materialized.item.agentHandouts ?? [],
+        ciParkState: materialized.item.ciParkState ?? null,
       };
       const task = await dispatchPrFixCandidate(candidate);
       if (task) {

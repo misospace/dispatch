@@ -38,6 +38,16 @@ export type PrFixQueueClient = {
     create: (args: any) => Promise<any>;
     findMany?: (args: any) => Promise<any[]>;
   };
+  // #495: CI park-and-resume lifecycle exactly-once ledger. Optional so
+  // legacy/test clients without the table still work: without a surface the
+  // lifecycle routes fall back to state-only writes where a repeated
+  // same-key commit is a same-value idempotent re-apply (safe by
+  // construction; the state itself is the replay witness), never a
+  // double-apply.
+  prFixCIParkLedger?: {
+    findUnique: (args: any) => Promise<any>;
+    create: (args: any) => Promise<any>;
+  };
   // #1249: durable per-item evidence ledger. Optional so legacy/test clients
   // without the table keep settling: with no surface the enqueue falls back to
   // the bounded `evidenceKeys` cache (identity-only, pre-#1249 semantics) and
@@ -3311,13 +3321,32 @@ export async function reconcileArchivedRepoPrFixItems(
 export function freshAttemptGeneration(): {
   generation: { increment: number };
   attemptEvidenceWatermark: null;
+  ciParkState: null;
+  ciParkHead: null;
+  ciParkKey: null;
+  ciParkFence: null;
+  ciParkAt: null;
 } {
   // A fresh attempt has no hand-out yet, so it has no evidence snapshot: the
   // watermark resets alongside the post-dispatch list and dies only with the
   // generation it bounded (#1249). The durable ledger COUNTER is not reset —
   // ledger positions are per-item history, and a stale-low watermark must
   // never survive into a new attempt to make known evidence read as new.
-  return { generation: { increment: 1 }, attemptEvidenceWatermark: null };
+  //
+  // #495 leash: every generation bump also clears the CI park deferral
+  // columns in the same write, so a deferral can never strand an item across
+  // attempts — a requeued, externally-woken, or reclaimed item is dispatchable
+  // again and a crashed Courier cycle leaves no suppression behind. No TTL and
+  // no new env var: this sole generation-bump helper is the expiry.
+  return {
+    generation: { increment: 1 },
+    attemptEvidenceWatermark: null,
+    ciParkState: null,
+    ciParkHead: null,
+    ciParkKey: null,
+    ciParkFence: null,
+    ciParkAt: null,
+  };
 }
 
 /**
@@ -3566,6 +3595,10 @@ export function toAgentQueuePrFixItem(item: any) {
     // disposition evidence must not override — operator-visible on queue
     // listings, cleared on reactivation or operator requeue.
     staleDisposition: item.staleDisposition ?? false,
+    // #495: CI park deferral lifecycle ("active" suppresses the hand-out for
+    // any polling agent; null/released/settled dispatch normally). Carried so
+    // the next-task route can honor the deferral before any write.
+    ciParkState: item.ciParkState ?? null,
     queuedAt: item.queuedAt,
     updatedAt: item.updatedAt,
     rankingReason: `queued PR review-fix item (${fixType})`,
