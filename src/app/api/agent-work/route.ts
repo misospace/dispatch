@@ -585,12 +585,14 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // B→A, A→B on one row), and an identity keyed only off the work row
           // would upsert that later release onto the first epoch's
           // `claim_released` row and swallow it. The old owner's lease row IS
-          // the epoch, and step 2 below destroys it as part of every
-          // handover, so the next epoch of the same agent re-mints a fresh
-          // row/token and can never re-read this identity. Once the row is
-          // already gone an attempt keyed off the work row still converges
-          // its OWN retries onto one row (at worst, a retry that runs after
-          // step 2 records a second, explicitly-labelled already-released
+          // the epoch, and step 5's transaction destroys it as part of every
+          // COMPLETED handover, so the next epoch of the same agent re-mints
+          // a fresh row/token and can never re-read this identity. A failed
+          // handover keeps the row (and this identity) intact, so its retry
+          // converges on the same evidence row. Once the row is already gone
+          // an attempt keyed off the work row still converges its OWN
+          // retries onto one row (at worst, a retry that runs after the
+          // teardown records a second, explicitly-labelled already-released
           // row — noise, not a swallowed release).
           const oldClaim = await prisma.lease.findFirst({
             where: { agentName: oldAgentName, issueId },
@@ -716,17 +718,25 @@ async function reassignAgentWork(body: Record<string, unknown>) {
             };
           }
 
-          // 2. Retire the old owner's lease rows for this issue (local), UN-
-          // CONDITIONALLY on expiry. The previous owner's live claim must not
-          // block the new owner's for the rest of its TTL (#1395), and the
-          // EXPIRED rows must go too: `upsertLease` renews an existing row by
-          // (agentName, issueId) keeping its id AND claim token, so a stale
-          // row surviving the handover would hand a later epoch of the same
-          // agent the SAME epoch identity this release just recorded — the
-          // `releaseLeaseByAgentAndIssue` helper (expiry-filtered, the
-          // operator-release semantics) is deliberately NOT reused here for
-          // that reason.
-          await prisma.lease.deleteMany({ where: { agentName: oldAgentName, issueId } });
+          // 2. The old owner's lease rows are NOT torn down here (#1407
+          // review): the work row still belongs to the old owner until step
+          // 4 moves it, and a `CLAIMED`/`IN_PROGRESS` row whose agent has no
+          // active lease is exactly what
+          // `findAndReleaseStaleAgentWorkForIssue` deletes — with its
+          // checkpoint, branch and prUrl. Deleting the old lease before the
+          // label add and the row move succeed would recreate that data-loss
+          // failure on every failed handover (a lost add guard, a failed
+          // GitHub write, a failed row-move transaction), which is the same
+          // failure mode #1395 exists to eliminate. The UNCONDITIONAL
+          // teardown (expired rows included — `upsertLease` renews a
+          // surviving row keeping its id AND claim token, so an expired
+          // survivor would hand a later epoch of the same agent the SAME
+          // epoch identity this release just recorded; the expiry-filtered
+          // `releaseLeaseByAgentAndIssue` operator helper is deliberately NOT
+          // reused) therefore happens inside step 5's transaction, ATOMIC
+          // with the row move: there is no window in which the row is active
+          // and lease-less, and a failed handover leaves the old owner's
+          // lease (and the operator's retry) intact.
 
           // 3. Mint the new owner's claim intent — the Lease row — BEFORE the
           // remote label add, the same §8.7 claim-side ordering the claim
@@ -813,12 +823,19 @@ async function reassignAgentWork(body: Record<string, unknown>) {
             };
           }
 
-          // 5. Move the AgentWork row, mirror the moved label in the cache,
-          // and record the new owner's claim evidence — the cache mirror and
-          // the `claim` event commit together (#1202), so the lifecycle
-          // stream never misses a hand-over that already landed on GitHub.
+          // 5. Move the AgentWork row, retire the old owner's lease rows,
+          // mirror the moved label in the cache, and record the new owner's
+          // claim evidence — the cache mirror and the `claim` event commit
+          // together (#1202), so the lifecycle stream never misses a
+          // hand-over that already landed on GitHub. The old-owner lease
+          // teardown is part of THIS transaction (#1407 review, step 2
+          // above): the row changes owner and the old lease disappears in
+          // one commit, so the work row is never left active and lease-less
+          // for the stale cleanup to delete — not even on a failed add or a
+          // failed row move, both of which roll the teardown back.
           const updatedLabels = buildNewLabels(liveLabels, "assign_agent", newAgentLabel);
           const work = await prisma.$transaction(async (tx) => {
+            await tx.lease.deleteMany({ where: { agentName: oldAgentName, issueId } });
             const moved = await reassignWorkRowsTx(tx, workId, newAgentName, reason);
             await tx.issue.update({
               where: { id: issueId },

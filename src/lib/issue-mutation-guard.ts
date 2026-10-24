@@ -490,7 +490,16 @@ export async function withIssueMutationGuard<T>(
     // a demoted `executing: false` row that no one can resume — invisible to
     // the ownership inspect surface (which lists `executing` guards only) and
     // wedging every writer on the issue.
-    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign" || request.operation === "unclaim") && !resuming) {
+    //
+    // #1395 (the #1407 review): same posture for "reassign" — the agent-work
+    // operator handover has no resume branch (only a `reassign` attempt could
+    // take over a `reassign` guard, and no such resume path exists), and its
+    // route releases the anchor on every handled path (the callback catches
+    // its own failures), so an escaped throw deletes its guard row instead of
+    // leaving a demoted `executing: false` row that no one can resume —
+    // invisible to the ownership inspect surface (which lists `executing`
+    // guards only) and wedging every writer on the issue, claims included.
+    if ((request.operation === "lease" || request.operation === "ownership" || request.operation === "unassign" || request.operation === "unclaim" || request.operation === "reassign") && !resuming) {
       await prisma.issueMutationGuard.deleteMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true } });
     } else {
       await prisma.issueMutationGuard.updateMany({ where: { issueId: request.issueId, ownerToken: guard.ownerToken, executing: true }, data: { executing: false } });

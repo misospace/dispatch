@@ -5,7 +5,7 @@ import { makeDispatchEnvMock } from "@/test/route-helpers";
 // collaborators are hoisted: the guard fake's per-region state plus the
 // stubbed remote/lease/lifecycle mocks used by both the vi.mock factories and
 // the test assertions.
-const { guardState, fencedTx, mockReleaseIssueClaim, mockAddIssueLabel, mockRemoveIssueLabel, mockGetLiveIssueLabels, mockRecordClaimEvent, mockUpsertLease } = vi.hoisted(() => ({
+const { guardState, fencedTx, mockReleaseIssueClaim, mockAddIssueLabel, mockRemoveIssueLabel, mockGetLiveIssueLabels, mockRecordClaimEvent, mockUpsertLease, mockLeaseTeardown } = vi.hoisted(() => ({
   guardState: {
     busy: false,
     releaseGuardLost: false,
@@ -24,6 +24,10 @@ const { guardState, fencedTx, mockReleaseIssueClaim, mockAddIssueLabel, mockRemo
     mintedToken: true,
     lease: { id: "lease-1", claimToken: "tok-1", renewedAt: new Date(0) },
   })),
+  // #1407 review: the old-owner lease teardown moved INSIDE the final
+  // row-move transaction, so it runs on the tx client while the receipt
+  // cleanup still runs on the root client — one shared spy pins both.
+  mockLeaseTeardown: vi.fn(async () => ({ count: 1 })),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -71,8 +75,10 @@ vi.mock("@/lib/prisma", () => ({
       // #1395: the release's dedupe key reads the old owner's claim epoch.
       findFirst: vi.fn(),
       delete: vi.fn(),
-      // #1395: fence-deletes the minted receipt when the add region loses the guard.
-      deleteMany: vi.fn(),
+      // #1395: fence-deletes the minted receipt when the add region loses the
+      // guard; #1407 review: the old-owner teardown shares this spy through
+      // the row-move transaction's client.
+      deleteMany: mockLeaseTeardown,
     },
     auditLog: {
       create: vi.fn(),
@@ -102,6 +108,8 @@ vi.mock("@/lib/prisma", () => ({
         },
         // #1395: the guarded reassign commits the cache mirror + lifecycle evidence.
         issue: { update: vi.fn(async () => ({ id: "issue-1" })) },
+        // #1407 review: the old-owner lease teardown commits with the row move.
+        lease: { deleteMany: mockLeaseTeardown },
         issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
       });
     }),
@@ -391,6 +399,8 @@ describe("POST /api/agent-work", () => {
         },
         // #1395: the guarded reassign commits the cache mirror + lifecycle evidence.
         issue: { update: vi.fn(async () => ({ id: "issue-1" })) },
+        // #1407 review: the old-owner lease teardown commits with the row move.
+        lease: { deleteMany: mockLeaseTeardown },
         issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
       });
     });
@@ -676,6 +686,8 @@ describe("POST /api/agent-work", () => {
           },
           // #1395: the guarded reassign also mirrors the moved label in the cache.
           issue: { update: vi.fn(async () => ({ id: "issue-1" })) },
+          // #1407 review: the old-owner lease teardown commits with the row move.
+          lease: { deleteMany: mockLeaseTeardown },
           issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
         });
       });
@@ -750,6 +762,8 @@ describe("POST /api/agent-work", () => {
           },
           // #1395: the guarded reassign also mirrors the moved label in the cache.
           issue: { update: vi.fn(async () => ({ id: "issue-1" })) },
+          // #1407 review: the old-owner lease teardown commits with the row move.
+          lease: { deleteMany: mockLeaseTeardown },
           issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
         });
       });
@@ -863,6 +877,8 @@ describe("POST /api/agent-work", () => {
           },
           // #1395: the guarded reassign also mirrors the moved label in the cache.
           issue: { update: vi.fn(async () => ({ id: "issue-1" })) },
+          // #1407 review: the old-owner lease teardown commits with the row move.
+          lease: { deleteMany: mockLeaseTeardown },
           issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
         });
       });
@@ -943,6 +959,8 @@ describe("POST /api/agent-work", () => {
             create: txAgentWorkHistoryCreate,
           },
           issue: { update: txIssueUpdate },
+          // #1407 review: the old-owner lease teardown commits with the row move.
+          lease: { deleteMany: mockLeaseTeardown },
           issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
         });
       });
@@ -994,7 +1012,9 @@ describe("POST /api/agent-work", () => {
       // rows included: an expired survivor would hand its id/claimToken to a
       // later epoch of the same agent through `upsertLease`'s renew, colliding
       // with the epoch identity this release just recorded. The
-      // expiry-filtered operator helper must NOT be used here.
+      // expiry-filtered operator helper must NOT be used here. #1407 review:
+      // the teardown is part of the row-move transaction, committing with the
+      // owner change, so the work row is never left active and lease-less.
       expect(lease.deleteMany).toHaveBeenCalledWith({
         where: { agentName: "old-agent", issueId: "issue-1" },
       });
@@ -1089,6 +1109,8 @@ describe("POST /api/agent-work", () => {
             create: vi.fn(async () => ({ id: "hist-1" })),
           },
           issue: { update: txIssueUpdate },
+          // #1407 review: the old-owner lease teardown commits with the row move.
+          lease: { deleteMany: mockLeaseTeardown },
           issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
         });
       });
@@ -1304,6 +1326,12 @@ describe("POST /api/agent-work", () => {
       expect(lease.deleteMany).toHaveBeenCalledWith({
         where: { id: "lease-1", claimToken: "tok-1", renewedAt: new Date(0) },
       });
+      // #1407 review: the blanket old-owner teardown commits WITH the row
+      // move — it must not have run here, or the old owner's still-owned
+      // work row would sit active and lease-less for the stale cleanup.
+      expect(lease.deleteMany).not.toHaveBeenCalledWith({
+        where: { agentName: "old-agent", issueId: "issue-1" },
+      });
 
       // No work-row move or lifecycle evidence committed.
       expect(transaction).not.toHaveBeenCalled();
@@ -1344,11 +1372,54 @@ describe("POST /api/agent-work", () => {
       expect(lease.deleteMany).toHaveBeenCalledWith({
         where: { id: "lease-1", claimToken: "tok-1", renewedAt: new Date(0) },
       });
+      // #1407 review: the old owner keeps its lease — the blanket teardown
+      // commits with the row move, which this failed handover never reached.
+      expect(lease.deleteMany).not.toHaveBeenCalledWith({
+        where: { agentName: "old-agent", issueId: "issue-1" },
+      });
 
       // No work-row move and no lifecycle evidence: the handover did not land.
       expect(transaction).not.toHaveBeenCalled();
       expect(mockRecordClaimEvent).not.toHaveBeenCalled();
 
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "agent_work_reassign_failed",
+            success: false,
+          }),
+        })
+      );
+    });
+
+    // #1407 review: the old-owner lease teardown commits WITH the row move.
+    // If that final transaction fails after the label add landed, the old
+    // owner's lease must survive with its still-owned work row — an active
+    // CLAIMED/IN_PROGRESS row whose agent has no lease is exactly what the
+    // claim route's stale cleanup deletes (checkpoint, branch, prUrl), the
+    // very data loss #1395 exists to eliminate. The retry converges: the
+    // release takes the already-released repair, the add is idempotent, and
+    // the teardown + row move + evidence land together.
+    it("keeps the old owner's lease when the final row-move transaction fails", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+      transaction.mockRejectedValueOnce(new Error("db write conflict"));
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+        reason: "handover",
+      });
+      expect(res.status).toBe(500);
+
+      // The remote handover steps ran (release + mint + add), but the local
+      // commit failed: no old-owner teardown, and no receipt cleanup either
+      // (the add succeeded, so the new owner's lease is consistent).
+      expect(mockReleaseIssueClaim).toHaveBeenCalledTimes(1);
+      expect(mockUpsertLease).toHaveBeenCalledTimes(1);
+      expect(mockAddIssueLabel).toHaveBeenCalledWith("org/repo", 10, "agent/new-agent");
+      expect(lease.deleteMany).not.toHaveBeenCalled();
+      // The failure is audited.
       expect(auditLog.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -1415,14 +1486,12 @@ describe("POST /api/agent-work", () => {
       });
       expect(res.status).toBe(409);
       expect(mockUpsertLease).toHaveBeenCalledTimes(1);
-      // Step 2's blanket old-owner cleanup runs, but the NEW owner's receipt
-      // this attempt only renewed (mintedToken false) must survive: the
-      // claim-route supersede rule deletes ONLY a receipt THIS attempt minted
-      // — deleting a live attempt's row is the bug that rule exists to
-      // prevent.
-      expect(lease.deleteMany).not.toHaveBeenCalledWith({
-        where: { id: "lease-live", claimToken: "tok-live", renewedAt: new Date(0) },
-      });
+      // #1407 review: nothing deletes the NEW owner's receipt on this path —
+      // the mintedToken rule skips the receipt cleanup (this attempt only
+      // renewed a live attempt's row) and the blanket old-owner teardown
+      // commits with the row move, which never ran. The old owner's lease
+      // also survives, protecting its still-owned work row.
+      expect(lease.deleteMany).not.toHaveBeenCalled();
     });
 
     it("reassigns a work row without an issue as a row-only move", async () => {
