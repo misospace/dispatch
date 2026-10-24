@@ -393,6 +393,109 @@ describe("releaseIssueClaim — ownership guard", () => {
   });
 });
 
+describe("releaseIssueClaim — claim move (allowOtherAgentPresent)", () => {
+  // #1407 review: the release reads the FIRST `agent/*` label of the set, so
+  // a set that carries BOTH owners makes it refuse — the old owner's label
+  // stays and the handover stacks two owners on one issue. A claim move opts
+  // out of that refusal; every other caller keeps it.
+  it("refuses to release the old owner's label while another agent's label is present", async () => {
+    const { client, findUnique, update } = makePrisma();
+
+    const result = await callRelease(
+      client,
+      ["agent/beta", "agent/alpha", "status/in-progress"],
+      { agentName: "alpha" },
+    );
+
+    expect(result).toEqual({
+      released: false,
+      labels: ["agent/beta", "agent/alpha", "status/in-progress"],
+      status: "status/in-progress",
+      statusNote: null,
+      skipReason: "agent claim belongs to agent/beta",
+    });
+
+    // No side effects of any kind: no GitHub writes, no cache writes.
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(addIssueLabelMock).not.toHaveBeenCalled();
+    expect(findUnique).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("removes the old owner's label when the new owner's label is already present", async () => {
+    const { client, update } = makePrisma();
+
+    const result = await callRelease(
+      client,
+      ["agent/beta", "agent/alpha", "status/in-progress"],
+      {
+        agentName: "alpha",
+        releaseOptions: { allowOtherAgentPresent: true, preserveStatus: true },
+      },
+    );
+
+    expect(result).toEqual({
+      released: true,
+      labels: ["agent/beta", "status/in-progress"],
+      status: "status/in-progress",
+      statusNote: null,
+    });
+
+    // ONLY the old owner's label is removed — the new owner's label is the
+    // one that stays, and the status label is untouched (ownership-only).
+    expect(removeIssueLabelMock).toHaveBeenCalledTimes(1);
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, ISSUE_NUMBER, "agent/alpha");
+    expect(removeIssueLabelMock).not.toHaveBeenCalledWith(REPO, ISSUE_NUMBER, "agent/beta");
+    expect(addIssueLabelMock).not.toHaveBeenCalled();
+
+    // The cache mirrors the post-release label set: the old owner's label is
+    // out, the new owner's label is in.
+    expect(update).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: { labels: ["agent/beta", "status/in-progress"], lastSyncedAt: expect.any(Date) },
+    });
+  });
+
+  it("records the already-released repair when the old owner's label is already gone", async () => {
+    const { client, update } = makePrisma();
+
+    // The old owner's label is gone (a half-applied handover); the new
+    // owner's label is already on the issue. The release is a no-op removal
+    // (idempotent) and still records the evidence.
+    const result = await callRelease(
+      client,
+      ["agent/beta", "status/in-progress"],
+      {
+        agentName: "alpha",
+        releaseOptions: {
+          allowOtherAgentPresent: true,
+          allowMissingAgent: true,
+          preserveStatus: true,
+          releaseKey: "epoch-1",
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      released: true,
+      labels: ["agent/beta", "status/in-progress"],
+      status: "status/in-progress",
+      statusNote: "agent claim already released: agent label is absent",
+    });
+
+    // The removal targets the OLD owner's label only — the new owner's label
+    // is never touched.
+    expect(removeIssueLabelMock).toHaveBeenCalledTimes(1);
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, ISSUE_NUMBER, "agent/alpha");
+    expect(removeIssueLabelMock).not.toHaveBeenCalledWith(REPO, ISSUE_NUMBER, "agent/beta");
+
+    expect(update).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: { labels: ["agent/beta", "status/in-progress"], lastSyncedAt: expect.any(Date) },
+    });
+  });
+});
+
 describe("releaseIssueClaim — guards", () => {
   it("throws without side effects when the agent is not assigned and allowMissingAgent is not set", async () => {
     const { client, findUnique, update } = makePrisma();

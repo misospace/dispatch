@@ -625,6 +625,16 @@ async function reassignAgentWork(body: Record<string, unknown>) {
                 options: {
                   allowMissingAgent: true,
                   preserveStatus: true,
+                  // A handover MOVES the claim: the old owner's label must go
+                  // even when the new owner's label is ALREADY on the issue (a
+                  // retry of the same handover, or a half-applied one). The
+                  // shared release refuses that case by default — it reads the
+                  // FIRST `agent/*` label, so it refuses whenever the new
+                  // owner's label comes first — and the refusal would leave
+                  // BOTH labels on GitHub (#1407 review). The foreign-agent
+                  // check above is what proves the other label belongs to the
+                  // intended new owner.
+                  allowOtherAgentPresent: true,
                   source: "api:unclaim",
                   actor: "operator",
                   releaseKey,
@@ -659,6 +669,40 @@ async function reassignAgentWork(body: Record<string, unknown>) {
               complete: true,
               value: errorResponse(
                 "Reassign was superseded by an operator override before the remote claim release; retry shortly",
+                409,
+              ),
+            };
+          }
+
+          // The release must have ACTUALLY released the old owner's claim. A
+          // refused release (another agent's label present) leaves the old
+          // owner's `agent/*` label on GitHub, and the add below would stack a
+          // second one next to the new owner's — two owners on one issue, the
+          // exact invariant the claim move exists to keep (#1407 review). Fail
+          // closed instead: no lease teardown, no lease mint, no label add.
+          if (!released.value.released) {
+            const skipReason = released.value.skipReason ?? "the claim release was refused";
+            try {
+              await prisma.auditLog.create({
+                data: {
+                  actor: "operator",
+                  action: "agent_work_reassign_failed",
+                  repoFullName,
+                  issueNumber,
+                  issueId,
+                  beforeLabels: liveLabels,
+                  afterLabels: [],
+                  success: false,
+                  errorMessage: `Claim release refused: ${skipReason}`,
+                },
+              });
+            } catch {
+              // Audit log failure should not mask the 409
+            }
+            return {
+              complete: true,
+              value: errorResponse(
+                `Reassign refused: ${skipReason}; resolve that claim before reassigning`,
                 409,
               ),
             };

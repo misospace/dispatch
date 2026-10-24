@@ -975,6 +975,10 @@ describe("POST /api/agent-work", () => {
       expect(releaseArgs.options).toEqual({
         allowMissingAgent: true,
         preserveStatus: true,
+        // #1407 review: the move opts out of the shared release's refusal to
+        // touch a label set that carries another agent's label — the old
+        // owner's label must go even when the new owner's is already there.
+        allowOtherAgentPresent: true,
         source: "api:unclaim",
         actor: "operator",
         releaseKey: "agent-work-reassign:work-1:no-lease",
@@ -1033,6 +1037,131 @@ describe("POST /api/agent-work", () => {
             action: "agent_work_reassigned",
             success: true,
             notes: expect.stringContaining("claim moved"),
+          }),
+        })
+      );
+    });
+
+    // #1407 review: the shared release refuses to release the old owner's
+    // label when ANOTHER agent's label is present — it reads the FIRST
+    // `agent/*` label of the set, so it refuses whenever the new owner's label
+    // comes first. The handover used to ignore that refusal and carried on,
+    // which left BOTH labels on GitHub (two owners on one issue). The move
+    // opts out of the refusal, and the foreign-agent check is what proves the
+    // other label belongs to the intended new owner.
+    it("moves the claim when the live labels carry both the old and the new owner", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+      mockGetLiveIssueLabels.mockResolvedValueOnce([
+        "agent/new-agent",
+        "agent/old-agent",
+        "status/in-progress",
+      ]);
+
+      const issueUpdates: Array<{ where: Record<string, unknown>; data: Record<string, any> }> = [];
+      transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+        const txIssueUpdate = vi.fn(async (args: any) => {
+          issueUpdates.push(args);
+          return { id: "issue-1" };
+        });
+
+        return fn({
+          agentWork: {
+            update: vi.fn(async () => ({
+              id: "work-1",
+              agentName: "new-agent",
+              issueId: "issue-1",
+              state: "CLAIMED",
+              leaseExpiresAt: new Date(),
+              summary: null,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              blockerReason: null,
+              runId: null,
+              checkpoint: "CLAIMED",
+              branch: null,
+              prUrl: null,
+              lastHeartbeatAt: new Date(),
+              issue: { number: 10, repository: { fullName: "org/repo" } },
+            })),
+            findMany: vi.fn(async () => []),
+          },
+          agentWorkHistory: {
+            create: vi.fn(async () => ({ id: "hist-1" })),
+          },
+          issue: { update: txIssueUpdate },
+          issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
+        });
+      });
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+        reason: "handover",
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.claimMoved).toBe(true);
+
+      // The release sees the LIVE label set (both owners) and is told to
+      // release the old owner's label even though another agent's label is on
+      // the issue.
+      expect(mockReleaseIssueClaim).toHaveBeenCalledTimes(1);
+      const releaseArgs = mockReleaseIssueClaim.mock.calls[0][0];
+      expect(releaseArgs.agentName).toBe("old-agent");
+      expect(releaseArgs.issue.labels).toEqual([
+        "agent/new-agent",
+        "agent/old-agent",
+        "status/in-progress",
+      ]);
+      expect(releaseArgs.options.allowOtherAgentPresent).toBe(true);
+
+      // The cached mirror keeps exactly ONE agent label — the new owner's.
+      expect(issueUpdates).toHaveLength(1);
+      expect(issueUpdates[0].data.labels).toEqual(["status/in-progress", "agent/new-agent"]);
+      expect(issueUpdates[0].data.labels).not.toContain("agent/old-agent");
+    });
+
+    // #1407 review: the route must NOT ignore a refused release. The release
+    // is the only writer that removes the old owner's label, so a refusal
+    // would leave both labels on GitHub once the new owner's label lands.
+    it("answers 409 and audits the failure when the claim release is refused", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+      mockReleaseIssueClaim.mockResolvedValueOnce({
+        released: false,
+        labels: ["agent/new-agent", "status/in-progress"],
+        status: "status/in-progress",
+        statusNote: null,
+        skipReason: "agent claim belongs to agent/new-agent",
+      });
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toBe(
+        "Reassign refused: agent claim belongs to agent/new-agent; resolve that claim before reassigning",
+      );
+
+      // Fail closed: no lease teardown, no lease mint, no label add, no row
+      // move — the handover stops at the refused release.
+      expect(lease.deleteMany).not.toHaveBeenCalled();
+      expect(mockUpsertLease).not.toHaveBeenCalled();
+      expect(mockAddIssueLabel).not.toHaveBeenCalled();
+      expect(transaction).not.toHaveBeenCalled();
+
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "agent_work_reassign_failed",
+            repoFullName: "org/repo",
+            issueNumber: 10,
+            issueId: "issue-1",
+            success: false,
+            errorMessage: "Claim release refused: agent claim belongs to agent/new-agent",
           }),
         })
       );
