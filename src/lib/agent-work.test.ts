@@ -1138,6 +1138,68 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     expect(survivor.id).toBe("resumed-1");
   });
 
+  it("a lease committed between the re-read and the delete aborts and rolls the cleanup back (#1390)", async () => {
+    // The in-transaction re-read cannot see a lease that commits AFTER it but
+    // before/while the deletes run. The post-consume verification takes a
+    // fresh snapshot before the audit: a lease for a consumed agent there
+    // means the cleanup raced live work, so the WHOLE transaction must fail —
+    // the caller sees the rejection (the claim route 500s fail-closed), the
+    // delete is rolled back, and no audit row may claim the consumption.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    // Scan: no lease. Re-read: still none — the delete proceeds. Verification:
+    // the late lease for the consumed agent is now visible.
+    mockPrisma.lease.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ agentName: "late-agent" }]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "late-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "late-agent", staleClaimReleasePending: false },
+    ];
+    mockPrisma.agentWork.deleteMany.mockImplementation(({ where }: any) => {
+      const rows = (mockPrisma.agentWork as any)._mockData as any[];
+      const row = rows.find((r: any) => r.id === where.id);
+      if (row && fencedWhereMatches(where, row)) {
+        rows.splice(rows.indexOf(row), 1);
+        return Promise.resolve({ count: 1 });
+      }
+      return Promise.resolve({ count: 0 });
+    });
+
+    await expect(
+      findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo"),
+    ).rejects.toThrow(/protecting lease was taken for consumed agent\(s\) \[late-agent\]/);
+    // No audit row may exist for a consumption the transaction is abandoning.
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("post-consume verification leaves the cleanup alone when only non-consumed agents hold leases (#1390)", async () => {
+    // The verification aborts ONLY for agents whose rows THIS cleanup consumed.
+    // A lease held by an agent that was never consumed (it was excluded at the
+    // scan and never a candidate) must not poison the audit of a legitimate
+    // deletion of a different, genuinely lease-less leftover row.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany
+      .mockResolvedValueOnce([]) // scan: crashed-agent looks lease-less
+      .mockResolvedValueOnce([{ agentName: "other-agent" }]) // re-read
+      .mockResolvedValue([{ agentName: "other-agent" }]); // verification
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "leftover-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "crashed-agent", staleClaimReleasePending: false },
+    ];
+    mockPrisma.agentWork.deleteMany.mockImplementation(({ where }: any) => {
+      const rows = (mockPrisma.agentWork as any)._mockData as any[];
+      const row = rows.find((r: any) => r.id === where.id);
+      if (row && fencedWhereMatches(where, row)) {
+        rows.splice(rows.indexOf(row), 1);
+        return Promise.resolve({ count: 1 });
+      }
+      return Promise.resolve({ count: 0 });
+    });
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(1);
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+  });
+
   it("deletes and audits in one transaction, and surfaces an audit failure (#1350)", async () => {
     // "A deletion is never left without its audit row" is a transaction-level
     // invariant: the deletes and the audit row must go through the SAME
@@ -1178,9 +1240,15 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     const result = await findAndReleaseStaleAgentWorkForIssue(scopedPrisma, "issue-1", "org/repo");
     expect(result).toBe(1);
     expect(scopedPrisma.$transaction).toHaveBeenCalledTimes(1);
-    // The #1390 lease re-read goes through the TRANSACTION client, not the
-    // outer one: the protection must observe the state the delete will see.
-    expect(txLeaseFindMany).toHaveBeenCalledTimes(1);
+    // The #1390 lease reads go through the TRANSACTION client, not the outer
+    // one: the protection must observe the state the delete sees. Twice: the
+    // pre-delete re-read and the post-consume verification.
+    expect(txLeaseFindMany).toHaveBeenCalledTimes(2);
+    expect(scopedPrisma.lease.findMany).toHaveBeenCalledTimes(1); // scan only
+    // The verification read happens AFTER the delete it audits (#1390).
+    expect(txDelete.mock.invocationCallOrder[0]).toBeLessThan(
+      txLeaseFindMany.mock.invocationCallOrder[1],
+    );
     // The delete and the audit row both went through the TRANSACTION client.
     expect(txDelete).toHaveBeenCalledTimes(1);
     expect(txAudit).toHaveBeenCalledTimes(1);
