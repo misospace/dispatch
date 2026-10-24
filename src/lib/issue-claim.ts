@@ -249,7 +249,14 @@ export async function releaseIssueClaim(params: {
     const latestIssue = prisma.issue.findUnique
       ? await prisma.issue.findUnique({ where: { id: issue.id }, select: { labels: true } })
       : null;
-    const cacheLabels = latestIssue?.labels ?? issue.labels;
+    // The mirror must not RE-PERSIST the label this release just proved
+    // absent on GitHub: the re-read can still carry it (the cache row is
+    // behind GitHub), and a stale owner label in the cache keeps the board
+    // listing the issue under the released owner. The sibling
+    // ownership-only branch filters the same label out of its mirror.
+    const cacheLabels = (latestIssue?.labels ?? issue.labels).filter(
+      (label: string) => label !== agentLabel,
+    );
     // A sweep that dies between the GitHub release and the final AgentWork
     // update repeats this repair, so the release event carries an identity:
     // the same already-released repair cannot be recorded twice.

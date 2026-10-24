@@ -494,6 +494,40 @@ describe("releaseIssueClaim — claim move (allowOtherAgentPresent)", () => {
       data: { labels: ["agent/beta", "status/in-progress"], lastSyncedAt: expect.any(Date) },
     });
   });
+
+  // #1407 review: the repair branch re-reads the CACHE row, which can still
+  // carry the label the release just proved absent on GitHub. Mirroring that
+  // set verbatim re-persists the released owner in the cache, and the board
+  // keeps listing the issue under it.
+  it("never re-persists the released agent label the cache row still carries", async () => {
+    const { client, update } = makePrisma({
+      // The cache row is behind GitHub: it still carries the old owner's
+      // label, which GitHub no longer has.
+      labels: ["agent/alpha", "agent/beta", "status/in-progress"],
+    });
+
+    const result = await callRelease(
+      client,
+      ["agent/beta", "status/in-progress"],
+      {
+        agentName: "alpha",
+        releaseOptions: {
+          allowOtherAgentPresent: true,
+          allowMissingAgent: true,
+          preserveStatus: true,
+        },
+      },
+    );
+
+    expect(result.released).toBe(true);
+    // The released owner's label is out of the mirrored set; the new owner's
+    // label stays.
+    expect(result.labels).toEqual(["agent/beta", "status/in-progress"]);
+    expect(update).toHaveBeenCalledWith({
+      where: { id: "issue-1" },
+      data: { labels: ["agent/beta", "status/in-progress"], lastSyncedAt: expect.any(Date) },
+    });
+  });
 });
 
 describe("releaseIssueClaim — guards", () => {

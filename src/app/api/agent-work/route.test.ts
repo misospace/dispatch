@@ -1321,6 +1321,44 @@ describe("POST /api/agent-work", () => {
       );
     });
 
+    // #1407 review: the guard-lost path already deletes the receipt this
+    // attempt minted. A FAILED label write must do the same: the receipt was
+    // minted before the add, so a lease with no `agent/*` label on the issue
+    // would block every other agent's claim with a 409 until it expires — and
+    // the new owner never got the claim.
+    it("deletes the minted lease receipt when the remote label write fails", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+      mockAddIssueLabel.mockRejectedValueOnce(new Error("github 500"));
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toBe("Failed to reassign agent work");
+
+      // The receipt is deleted by its exact CAS (the claim-route rule: only a
+      // receipt THIS attempt minted).
+      expect(lease.deleteMany).toHaveBeenCalledWith({
+        where: { id: "lease-1", claimToken: "tok-1", renewedAt: new Date(0) },
+      });
+
+      // No work-row move and no lifecycle evidence: the handover did not land.
+      expect(transaction).not.toHaveBeenCalled();
+      expect(mockRecordClaimEvent).not.toHaveBeenCalled();
+
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "agent_work_reassign_failed",
+            success: false,
+          }),
+        })
+      );
+    });
+
     it("scopes the release dedupe key to the old owner's claim epoch", async () => {
       agentWork.findUnique.mockResolvedValue(reassignWorkRow());
       // The old owner's live lease row IS the epoch: its token keys the

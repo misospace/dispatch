@@ -680,6 +680,14 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // second one next to the new owner's — two owners on one issue, the
           // exact invariant the claim move exists to keep (#1407 review). Fail
           // closed instead: no lease teardown, no lease mint, no label add.
+          //
+          // Defence in depth: the move's opt-in above lets the shared release
+          // touch a label set that carries another agent's label, so the
+          // release's own refusal path cannot fire for the label set this
+          // route passes. The check stands so a future release-side refusal
+          // (or a label set that slips past the foreign-agent check) can never
+          // be silently ignored — the handover would then stack two owners on
+          // one issue.
           if (!released.value.released) {
             const skipReason = released.value.skipReason ?? "the claim release was refused";
             try {
@@ -743,24 +751,41 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // guard delete ONLY a receipt this attempt minted (claim-route
           // rule: a renewal echoed a live attempt's own token, and that row
           // belongs to that attempt).
-          const added = await runFencedRemoteWrite(async () => {
-            await addIssueLabel(repoFullName, issueNumber, newAgentLabel);
-            return true;
-          });
-          if (added.status === "guard-lost") {
-            if (receipt.mintedToken) {
-              try {
-                await prisma.lease.deleteMany({
-                  where: {
-                    id: receipt.lease.id,
-                    claimToken: receipt.lease.claimToken ?? null,
-                    renewedAt: receipt.lease.renewedAt ?? null,
-                  },
-                });
-              } catch {
-                // Best-effort: a failed cleanup must not mask the 409.
-              }
+          const deleteMintedReceipt = async () => {
+            if (!receipt.mintedToken) return;
+            try {
+              await prisma.lease.deleteMany({
+                where: {
+                  id: receipt.lease.id,
+                  claimToken: receipt.lease.claimToken ?? null,
+                  renewedAt: receipt.lease.renewedAt ?? null,
+                },
+              });
+            } catch {
+              // Best-effort: a failed cleanup must not mask the failure.
             }
+          };
+
+          const added = await (async () => {
+            try {
+              return await runFencedRemoteWrite(async () => {
+                await addIssueLabel(repoFullName, issueNumber, newAgentLabel);
+                return true;
+              });
+            } catch (error) {
+              // The label write FAILED (a GitHub error, not a lost guard). The
+              // new owner's lease receipt was minted BEFORE the add, so it
+              // must not survive a failed add: a lease with no `agent/*` label
+              // on the issue blocks every other agent's claim with a 409 until
+              // it expires, and the new owner never got the claim. The
+              // cleanup runs OUTSIDE the fenced region — the region rolled
+              // back with the failed add.
+              await deleteMintedReceipt();
+              throw error;
+            }
+          })();
+          if (added.status === "guard-lost") {
+            await deleteMintedReceipt();
             try {
               await prisma.auditLog.create({
                 data: {
