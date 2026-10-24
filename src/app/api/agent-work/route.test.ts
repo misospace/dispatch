@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { makeDispatchEnvMock } from "@/test/route-helpers";
+import { resetRateLimits } from "@/lib/rate-limit";
 
 vi.mock("@/lib/auth", () => ({
   authorizeRequest: vi.fn(),
@@ -97,6 +98,12 @@ import * as leaseModule from "@/lib/lease";
 import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
 import { authorizeRequest } from "@/lib/auth";
 import { GET, POST } from "./route";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 const agentWork = prisma.agentWork as any;
 const lease = prisma.lease as any;
@@ -385,6 +392,229 @@ describe("POST /api/agent-work", () => {
           }),
         })
       );
+    });
+  });
+
+  // #1402: the operator release path keyed every lookup on the raw request
+  // value, so a padded identifier matched no row: the release freed nothing
+  // and the row the operator named was never the row that was released.
+  describe("release action — operator identifier normalization (#1402)", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      releaseLeaseByAgentAndIssueMock.mockResolvedValue(1);
+      releaseAllLeasesByAgentMock.mockResolvedValue(1);
+      releaseAgentWorkByAgentAndIssueMock.mockResolvedValue(0);
+      auditLog.create.mockResolvedValue({ id: "audit-1" });
+      issueFindUnique.mockResolvedValue({ number: 42, repository: { fullName: "org/repo" } });
+    });
+
+    it("releases the work item when the padded workId matches the stored row", async () => {
+      agentWork.findUnique.mockResolvedValueOnce({
+        id: "work-1",
+        agentName: "old-agent",
+        issueId: "issue-1",
+        state: "IN_PROGRESS",
+      });
+
+      const updatedWhere: Array<Record<string, unknown>> = [];
+      const historyCreates: Array<Record<string, unknown>> = [];
+      transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+        const txAgentWorkUpdate = vi.fn(async (args: any) => {
+          updatedWhere.push(args.where);
+          return {
+            id: "work-1",
+            agentName: "old-agent",
+            issueId: "issue-1",
+            state: "RELEASED",
+            issue: { number: 10, repository: { fullName: "org/repo" } },
+          };
+        });
+        return fn({
+          agentWork: {
+            update: txAgentWorkUpdate,
+            findFirst: vi.fn(),
+            findMany: vi.fn(async () => []),
+          },
+          agentWorkHistory: {
+            create: vi.fn(async (args: any) => {
+              historyCreates.push(args.data);
+              return { id: "hist-1" };
+            }),
+          },
+        });
+      });
+
+      const res = await makePostRequest({ action: "release", workId: "  work-1  " });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      // The lookup and the release both name the stored row, not the padded
+      // request value.
+      expect(agentWork.findUnique).toHaveBeenCalledWith({ where: { id: "work-1" } });
+      expect(updatedWhere).toEqual([{ id: "work-1" }]);
+      // The history row must name the same work item, or it points at a row
+      // that does not exist.
+      expect(historyCreates).toEqual([
+        expect.objectContaining({ workId: "work-1", action: "released" }),
+      ]);
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "agent_work_released",
+            notes: expect.stringContaining("Released work for agent old-agent"),
+          }),
+        })
+      );
+    });
+
+    it("releases the lease when the padded leaseId matches the stored row", async () => {
+      lease.findUnique.mockResolvedValueOnce({
+        id: "lease-1",
+        agentName: "stale-agent",
+        issueId: "issue-2",
+        issue: { number: 20, repository: { fullName: "org/repo" } },
+      } as any);
+
+      const res = await makePostRequest({ action: "release", leaseId: "  lease-1  " });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(lease.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "lease-1" } })
+      );
+      expect(lease.delete).toHaveBeenCalledWith({ where: { id: "lease-1" } });
+    });
+
+    it("releases leases and work when the padded agentName matches the stored agent", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "  test-agent  ",
+        issueId: "issue-1",
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(releaseLeaseByAgentAndIssueMock).toHaveBeenCalledWith("test-agent", "issue-1");
+      expect(releaseAgentWorkByAgentAndIssueMock).toHaveBeenCalledWith("test-agent", "issue-1");
+    });
+
+    it("releases all of an agent's work when the padded agentName matches the stored agent", async () => {
+      agentWork.findMany.mockResolvedValueOnce([{ id: "work-1", issueId: "issue-1" }]);
+      agentWork.findFirst.mockResolvedValueOnce({
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "  test-agent  ",
+        releaseAll: true,
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(releaseAllLeasesByAgentMock).toHaveBeenCalledWith("test-agent");
+      expect(agentWork.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ agentName: "test-agent" }),
+        })
+      );
+      // The released row and the audit trail must name the stored agent, not
+      // the padded request value.
+      expect(agentWork.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "work-1" } })
+      );
+      expect(agentWorkHistory.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            workId: "work-1",
+            summary: expect.stringContaining("Released all work for agent test-agent"),
+          }),
+        })
+      );
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "orphan_work_released",
+            notes: expect.stringContaining("for agent test-agent"),
+          }),
+        })
+      );
+    });
+
+    it("falls through to the agent path when the workId is whitespace-only and an agentName is given", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        workId: "   ",
+        agentName: "  test-agent  ",
+        issueId: "issue-1",
+      });
+
+      expect(res.status).toBe(200);
+      expect(releaseLeaseByAgentAndIssueMock).toHaveBeenCalledWith("test-agent", "issue-1");
+      expect(releaseAgentWorkByAgentAndIssueMock).toHaveBeenCalledWith("test-agent", "issue-1");
+      expect(agentWork.findUnique).not.toHaveBeenCalled();
+    });
+
+    it("answers 400 when the workId is whitespace-only and the agent path has no issue to release", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        workId: "   ",
+        agentName: "  test-agent  ",
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing required field: issueId, or set releaseAll: true");
+    });
+
+    it("treats a whitespace-only agentName as absent", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "   ",
+        issueId: "issue-1",
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
+      expect(releaseLeaseByAgentAndIssueMock).not.toHaveBeenCalled();
+      expect(releaseAgentWorkByAgentAndIssueMock).not.toHaveBeenCalled();
+    });
+
+    it("does not release an agent's work when the agentName is whitespace-only and releaseAll is set", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "   ",
+        releaseAll: true,
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
+      expect(releaseAllLeasesByAgentMock).not.toHaveBeenCalled();
+      expect(agentWork.findMany).not.toHaveBeenCalled();
+    });
+
+    it("treats a whitespace-only workId as absent instead of answering 404", async () => {
+      const res = await makePostRequest({ action: "release", workId: "   " });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
+      expect(agentWork.findUnique).not.toHaveBeenCalled();
+    });
+
+    it("treats a whitespace-only leaseId as absent instead of answering 404", async () => {
+      const res = await makePostRequest({ action: "release", leaseId: "   " });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing workId, leaseId, or agentName");
+      expect(lease.findUnique).not.toHaveBeenCalled();
     });
   });
 
