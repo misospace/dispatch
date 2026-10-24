@@ -419,7 +419,22 @@ async function reassignAgentWork(body: Record<string, unknown>) {
 
       return tx.agentWork.update({
         where: { id: workId },
-        data: { agentName: newAgentName, state: "CLAIMED", lastHeartbeatAt: new Date() },
+        // #1391: settle the marker the sweep's mark leaves when it parks a
+        // row for its retry arm (`state: "STALE"`,
+        // `staleClaimReleasePending: true`). Reassigning rewrites the row to
+        // `CLAIMED` for the new owner, so carrying the marker over would
+        // strand the owed release on a live-shaped row: the sweep's reclaim
+        // arms require the marker cleared and its retry arm requires
+        // `state: "STALE"`, which this write no longer satisfies — no
+        // component could advance it. The operator's reassignment supersedes the sweep's
+        // decision on the row, so the rewrite settles it here; the sweep
+        // stays the single owner of retiring an owed release elsewhere.
+        data: {
+          agentName: newAgentName,
+          state: "CLAIMED",
+          lastHeartbeatAt: new Date(),
+          staleClaimReleasePending: false,
+        },
         include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } },
       });
     });

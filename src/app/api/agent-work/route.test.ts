@@ -619,6 +619,86 @@ describe("POST /api/agent-work", () => {
         })
       );
     });
+
+    // #1391: a sweep-marked row (`STALE` + `staleClaimReleasePending: true`)
+    // reassigned to a new owner must not carry the marker into its `CLAIMED`
+    // shape — the sweep's retry arm only advances `STALE` rows, so a carried
+    // marker would strand the owed release on a live-shaped row forever.
+    it("settles the stale-claim-release marker when rewriting the swept row to CLAIMED", async () => {
+      agentWork.findUnique.mockResolvedValueOnce({
+        id: "work-1",
+        agentName: "old-agent",
+        issueId: "issue-1",
+        state: "STALE",
+        staleClaimReleasePending: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        runId: null,
+        summary: null,
+        blockerReason: null,
+        checkpoint: "CLAIMED",
+        branch: null,
+        prUrl: null,
+        leaseExpiresAt: new Date(),
+        lastHeartbeatAt: new Date(),
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+
+      // Capture the rewrite-to-CLAIMED update: the second of the two updates
+      // on work-1 inside the reassign transaction (the first sets RELEASED).
+      const claimedUpdates: Array<Record<string, unknown>> = [];
+      transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+        const txAgentWorkUpdate = vi.fn(async (args: any) => {
+          if (args.where.id === "work-1" && args.data.state === "CLAIMED") {
+            claimedUpdates.push(args.data);
+          }
+          return {
+            id: "work-1",
+            agentName: "new-agent",
+            issueId: "issue-1",
+            state: "CLAIMED",
+            leaseExpiresAt: new Date(),
+            summary: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            blockerReason: null,
+            runId: null,
+            checkpoint: "CLAIMED",
+            branch: null,
+            prUrl: null,
+            lastHeartbeatAt: new Date(),
+            issue: { number: 10, repository: { fullName: "org/repo" } },
+          };
+        });
+        const txAgentWorkFindMany = vi.fn(async () => []);
+        const txAgentWorkHistoryCreate = vi.fn(async () => ({ id: "hist-1" }));
+
+        return fn({
+          agentWork: {
+            update: txAgentWorkUpdate,
+            findMany: txAgentWorkFindMany,
+          },
+          agentWorkHistory: {
+            create: txAgentWorkHistoryCreate,
+          },
+        });
+      });
+
+      await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+      });
+
+      expect(claimedUpdates).toHaveLength(1);
+      expect(claimedUpdates[0]).toEqual(
+        expect.objectContaining({
+          agentName: "new-agent",
+          state: "CLAIMED",
+          staleClaimReleasePending: false,
+        })
+      );
+    });
   });
 
   describe("release by agentName + issueId", () => {
