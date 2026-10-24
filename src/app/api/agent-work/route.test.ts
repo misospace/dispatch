@@ -1998,7 +1998,6 @@ describe("POST /api/agent-work", () => {
       const body = await res.json();
       expect(body.error).toBe("Missing required field: issueId, or set releaseAll: true");
     });
-  });
 
     // #1399: the operator path keys every lookup on the stored (normalized)
     // issue id, so a padded operator-supplied value must be trimmed before
