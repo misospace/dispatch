@@ -30,8 +30,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
     return errorResponse("runId and repo required", 400);
   }
 
+  // runId is a BigInt column: a non-numeric value must 400 here, not NaN-reach
+  // Prisma as a validation 500 (issue #1379).
+  const runIdNumber = Number.parseInt(runId, 10);
+  if (!Number.isSafeInteger(runIdNumber)) {
+    return errorResponse("runId must be a number", 400);
+  }
+
   const run = await prisma.githubWorkflowRun.findUnique({
-    where: { runId: parseInt(runId) },
+    where: { runId: runIdNumber },
     include: { workflow: true },
   });
 
@@ -44,7 +51,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
     let errorMessage: string | null = null;
 
     if (action === "rerun") {
-      await rerunWorkflow(repoFullName, parseInt(runId));
+      await rerunWorkflow(repoFullName, runIdNumber);
       success = true;
     } else if (action === "dispatch") {
       const workflow = await prisma.githubWorkflow.findUnique({
