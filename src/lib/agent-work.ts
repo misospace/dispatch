@@ -2,6 +2,20 @@ import { normalizeAgentWorkState, normalizeAgentWorkCheckpoint, AgentWorkState, 
 import { nonEmpty } from "./pr-fix-queue";
 import { findCurrentClaimWork } from "./worker-ownership";
 
+/**
+ * The lease horizon the CLAIM PATH stamps on an active AgentWork row: how
+ * long the claim stays live without a heartbeat. `startAgentWork` stamps it
+ * on every start and `checkpointAgentWork` on every checkpoint, so the
+ * field's horizon is stable across a claim's writes. Writers outside the
+ * claim path use their own horizons on purpose (the ownership renewal writes
+ * its configurable renew TTL, a `blocked` disposition writes the park
+ * deadline), so this constant names the claim path's horizon only — a writer
+ * that stamped a different expiry would shrink the lease under the worker,
+ * and one that left the field at a past timestamp would hand the sweep an
+ * already-expired claim.
+ */
+export const AGENT_WORK_LEASE_DURATION_MS = 5 * 60 * 1000;
+
 export type AgentWorkClient = {
   agentWork: {
     findUnique: (args: any) => Promise<any>;
@@ -80,17 +94,34 @@ export interface CheckpointAgentWorkInput {
  * @body agentName (string, required) - Worker identifier matching the active work record
  * @body state (string, required) - One of the valid state values listed above
  * @body summary (string, optional) - Final summary of what was accomplished or why blocked
+ * @body issueId (string, optional) - GitHub issue ID this finish belongs to
+ *                                   (POST /api/agent-work/finish); scopes selection
+ *                                   to that issue's active rows (#1331)
  *
  * Response 200: Updated work object with final state set and lease expired
  * Response 400: { error: string } with details about which field failed validation
  * Response 401: { error: "Unauthorized" } when bearer token is missing/invalid
  * Response 404: { error: "No active work found for agent" } when agent has no active work
- *               (also cleans up orphaned leases automatically)
+ *               (also cleans up orphaned leases automatically). When the request
+ *               identified an issue, the message names it —
+ *               { error: "No active work found for agent (issueId: …)" } — and the
+ *               agent's other issues' work is never settled as a fallback.
  */
 export interface FinishAgentWorkInput {
   agentName: string;
   state: string;
   summary?: string | null;
+  /**
+   * Optional GitHub issue ID identifying the finish's issue (#1331).
+   * When present, selection is scoped to this issue's active rows so a
+   * finish can never settle another issue's active work.
+   *
+   * Workers that know their issue should send it: without it the finish
+   * settles the agent's FRESHEST active row, and a renewal on another issue
+   * can reorder that pick — only the issue-scoped pick names the intended
+   * attempt for certain.
+   */
+  issueId?: string | null;
 }
 
 /**
@@ -168,13 +199,13 @@ export function parseFinishAgentWorkInput(body: unknown): FinishAgentWorkInput |
     agentName: input.agentName.trim(),
     state: normalized,
     summary: typeof input.summary === "string" ? input.summary : null,
+    issueId: typeof input.issueId === "string" && nonEmpty(input.issueId.trim()) ? input.issueId.trim() : null,
   };
 }
 
 export async function startAgentWork(client: AgentWorkClient, input: StartAgentWorkInput) {
   const now = new Date();
-  const leaseDuration = 5 * 60 * 1000; // 5 minutes
-  const leaseExpiresAt = new Date(now.getTime() + leaseDuration);
+  const leaseExpiresAt = new Date(now.getTime() + AGENT_WORK_LEASE_DURATION_MS);
 
   return client.$transaction(async (tx) => {
     // Release all existing active work for this agent (single work per agent)
@@ -214,7 +245,6 @@ export async function startAgentWork(client: AgentWorkClient, input: StartAgentW
 
 export async function checkpointAgentWork(client: AgentWorkClient, input: CheckpointAgentWorkInput) {
   const now = new Date();
-  const leaseDuration = 5 * 60 * 1000;
 
   return client.$transaction(async (tx) => {
     // #1328: select the current claim's work through the shared deterministic
@@ -231,7 +261,7 @@ export async function checkpointAgentWork(client: AgentWorkClient, input: Checkp
     }
 
     // Extend lease on heartbeat
-    const leaseExpiresAt = new Date(now.getTime() + leaseDuration);
+    const leaseExpiresAt = new Date(now.getTime() + AGENT_WORK_LEASE_DURATION_MS);
 
     const updateData: Record<string, unknown> = {
       lastHeartbeatAt: now,
@@ -277,14 +307,17 @@ export async function finishAgentWork(client: AgentWorkClient, input: FinishAgen
   const state = input.state as AgentWorkState;
 
   return client.$transaction(async (tx) => {
-    // #1316 review: select through the shared current-claim-work rule
-    // (freshest lastHeartbeatAt, then createdAt, then id) instead of an
-    // unordered pick. A `blocked` disposition parks its row as an external
-    // wait that survives `startAgentWork` (which releases only
+    // #1316 review / #1331: select the current claim's work through the
+    // shared deterministic rule (freshest lastHeartbeatAt, then createdAt,
+    // then id) instead of an unordered pick, scoped to the finish's issue when
+    // the request identifies one. A `blocked` disposition parks its row as an
+    // external wait that survives `startAgentWork` (which releases only
     // CLAIMED/IN_PROGRESS rows), so an unordered findFirst could terminalize
     // another issue's parked row while the attempt actually being finished
-    // stays active — the same hazard #1328 closed for checkpoints.
-    const existing = await findCurrentClaimWork(tx, input.agentName);
+    // stays active — the same hazard #1328 closed for checkpoints. Without
+    // issueId scoping the pick could also settle a different issue's active
+    // row entirely.
+    const existing = await findCurrentClaimWork(tx, input.agentName, input.issueId ?? undefined);
 
     if (!existing) {
       return null;
@@ -385,6 +418,32 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * History entries are automatically cascaded via onDelete: Cascade.
  * An AuditLog entry is created for traceability.
  *
+ * #1350: a row still owed a claim release (`staleClaimReleasePending`) is
+ * never consumed here — neither the scan nor the delete takes one. This
+ * cleanup is the repository's only `agentWork.deleteMany` (the sweep only
+ * MARKS rows STALE), so leaving a pending row out of it is what keeps the
+ * release the previous sweep decided on from being dropped. The sweep's own
+ * boundary (`activeStateFamilies` in `stale-work.ts` is the canon) is
+ * `staleClaimReleasePending: false`, mirrored here.
+ *
+ * The marker conjunct is LOAD-BEARING, not redundant with the state filter:
+ * the operator reassign route rewrites a row to `state: "CLAIMED"` without
+ * clearing the marker, so a sweep-marked `STALE` row can arrive here as an
+ * ACTIVE-SHAPED row that still owes its release, and the state filter alone
+ * would not keep it. Who retires it differs by shape: the sweep's retry arm
+ * (`state: "STALE"`, `staleClaimReleasePending: true`) retires the owed
+ * release of a STALE row, but an ACTIVE-SHAPED pending row belongs to NO
+ * sweep arm — its reclaim arms require `staleClaimReleasePending: false` and
+ * its retry arm requires `state: "STALE"` — so the sweep cannot retire it
+ * either. This boundary is what keeps such a row, and the owed release it
+ * carries, alive instead of dropping it; the stranded-release side of that
+ * shape is tracked in #1391.
+ *
+ * The delete is fenced on the same conjuncts the scan matched, ownership
+ * included: a row whose owner changed between the scan and the delete
+ * (reassigned to another agent) is left to its new owner instead of being
+ * deleted out from under it.
+ *
  * Returns the count of deleted records.
  */
 export async function findAndReleaseStaleAgentWorkForIssue(
@@ -404,11 +463,19 @@ export async function findAndReleaseStaleAgentWorkForIssue(
 
   const activeAgentNames = Array.from(new Set(activeLeases.map((l: any) => l.agentName)));
 
-  // Find active AgentWork records for this issue whose agent has no active lease
+  // Find active AgentWork records for this issue whose agent has no active lease.
+  //
+  // #1350: the pending-release boundary is shared with the stale-work sweep
+  // (`activeStateFamilies` in `stale-work.ts` is the canon) — a row still owed
+  // a claim release is never this cleanup's to take. The state filter already
+  // keeps a marked STALE row out; this conjunct additionally refuses an
+  // active-shaped row that still owes its release, so a claim attempt cannot
+  // hard-delete the release a previous sweep decided on.
   const staleWorks = await prisma.agentWork.findMany({
     where: {
       issueId,
       state: { in: ["CLAIMED", "IN_PROGRESS"] },
+      staleClaimReleasePending: false,
       agentName: { notIn: activeAgentNames },
     },
     select: { id: true, agentName: true },
@@ -416,13 +483,50 @@ export async function findAndReleaseStaleAgentWorkForIssue(
 
   if (staleWorks.length === 0) return 0;
 
-  const staleIds = staleWorks.map((w: any) => w.id);
-
-  // Delete + audit atomically so a deletion is never left without its audit row.
+  // Delete + audit atomically so a deletion is never left without its audit
+  // row. Each delete is fenced on the SAME conjuncts the scan matched (#1350):
+  // the executing state family, the pending-release boundary, and the scanned
+  // ownership fields (`issueId`, `agentName`), mirroring the sweep's own CAS
+  // practice. A row that changed shape between the scan and the delete is
+  // left for whoever now owns that shape, and the audit (and the returned
+  // count) report exactly the rows the fence actually consumed.
+  //
+  // The claim route (this function's only production caller) runs this cleanup
+  // inside the per-issue mutation guard, but the writers it races with do NOT
+  // take that guard: the operator agent-work routes (release / release-all /
+  // reassign — `src/app/api/agent-work/route.ts`), the operator unclaim path
+  // (`releaseAgentWorkByAgentAndIssue` — `src/lib/lease.ts`, called from
+  // `src/app/api/issues/unclaim/route.ts` AFTER its guarded block) and the
+  // worker agent-work start / checkpoint / finish paths (`src/lib/agent-work.ts`).
+  // The fence (not the guard) is therefore the load-bearing protection here;
+  // preserving the row is the safe direction in every case. The stale-work
+  // sweep — the only writer that SETS the pending marker — does take the
+  // guard, so it normally cannot interleave with the claim path (a maintainer
+  // force-claim may override that guard); either way the fence's pending
+  // conjunct refuses a row that became pending after the scan, so the
+  // reachable pending shape is one that ARRIVES pending (the operator
+  // reassign route's leftover marker).
+  // One CAS delete per candidate row (N = the issue's leftover rows), all
+  // inside the transaction: a failure rolls the whole cleanup back, so a
+  // partial delete without its audit row is not reachable.
+  const deletedIds: string[] = [];
   await prisma.$transaction(async (tx: any) => {
-    await tx.agentWork.deleteMany({
-      where: { id: { in: staleIds } },
-    });
+    for (const work of staleWorks) {
+      const deleted = await tx.agentWork.deleteMany({
+        where: {
+          id: work.id,
+          issueId,
+          agentName: work.agentName,
+          state: { in: ["CLAIMED", "IN_PROGRESS"] },
+          staleClaimReleasePending: false,
+        },
+      });
+      if ((deleted?.count ?? 0) === 1) {
+        deletedIds.push(work.id);
+      }
+    }
+
+    if (deletedIds.length === 0) return;
 
     await tx.auditLog.create({
       data: {
@@ -431,10 +535,10 @@ export async function findAndReleaseStaleAgentWorkForIssue(
         repoFullName,
         issueId: issueId,
         success: true,
-        notes: `Deleted ${staleWorks.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${staleIds.join(", ")}])`,
+        notes: `Deleted ${deletedIds.length} stale AgentWork record(s) with no matching active Lease (agentWorkIds=[${deletedIds.join(", ")}])`,
       },
     });
   });
 
-  return staleWorks.length;
+  return deletedIds.length;
 }

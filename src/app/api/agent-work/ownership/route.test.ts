@@ -438,6 +438,8 @@ function makeSweepClient(getRow: () => Record<string, unknown> | null) {
       // wait marker, so nothing is parked.
       findMany: vi.fn(async () => []),
     },
+    // #1254: the sweep defers to pending reconciler release intents.
+    ownershipReleaseIntent: { findMany: vi.fn(async () => []) },
     agentWorkHistory: { create: vi.fn(async () => ({})) },
     auditLog: { create: vi.fn(async () => ({})) },
     $transaction: vi.fn(async () => false),

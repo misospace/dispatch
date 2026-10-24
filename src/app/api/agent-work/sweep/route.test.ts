@@ -24,6 +24,11 @@ vi.mock("@/lib/sync-lock", () => ({
   acquireLock: mocks.acquireLock,
   releaseLock: mocks.releaseLock,
 }));
+vi.mock("@/lib/ownership-reconciliation", () => ({
+  // #1254: the sweep slot runs the mode-gated reconciliation pass; the fake
+  // answers a settled zero report.
+  reconcileOwnership: vi.fn(async () => ({ mode: "off", examined: 0, released: 0, retained: 0, held: 0, superseded: 0, replayed: 0, parked: 0, skipped: 0, errors: [] })),
+}));
 vi.mock("@/lib/stale-work", () => ({
   DEFAULT_STALE_WORK_MAX_AGE_MS: 300000,
   DEFAULT_STALE_WORK_BATCH_SIZE: 50,

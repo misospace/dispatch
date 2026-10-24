@@ -3149,7 +3149,13 @@ export async function reconcileStalePrFixItems(
     if (prNumbers.size === 0) continue;
     const staleCandidates = await client.prFixQueueItem.findMany({
       where: {
-        repo,
+        // The queue stores the folded repo identity (#1145), so this lookup
+        // must fold the caller's key too (#1372): callers pass the cached
+        // repo casing ("Org/Repo" from repo.fullName / repoFullNames), which
+        // matches no row and silently skips the reap. The prStateByRepo
+        // lookup below keeps the caller's original key — both input maps are
+        // keyed identically per caller.
+        repo: normalizeQueueRepo(repo),
         pr: { in: Array.from(prNumbers) },
         status: { in: ["QUEUED", "BLOCKED", "PARKED", "WAITING_EXTERNAL"] },
       },

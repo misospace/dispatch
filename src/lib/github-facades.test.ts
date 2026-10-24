@@ -10,7 +10,19 @@ import * as Barrel from "./github";
 describe("github domain modules expose expected exports", () => {
   it("github-auth exports token + pagination symbols", () => {
     expect(Object.keys(Auth).sort()).toEqual(
-      ["GITHUB_API", "__resetGitHubAppState", "fetchPaginated", "fetchWithRetry", "getGitHubToken", "getHeadersAsync", "validateGitHubToken"].sort(),
+      [
+        "GITHUB_API",
+        "GITHUB_FETCH_MAX_ATTEMPTS",
+        "GITHUB_RETRY_MAX_DELAY_MS",
+        "__resetGitHubAppState",
+        "fetchPaginated",
+        "fetchWithRetry",
+        "getGitHubToken",
+        "getHeadersAsync",
+        "githubCallBudgetMs",
+        "githubFetchTimeoutMs",
+        "validateGitHubToken",
+      ].sort(),
     );
   });
 

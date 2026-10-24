@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
-import { errorResponse, handleApiError } from "@/lib/api-errors";
+import { handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
-import { STATUS_LABELS } from "@/types";
-import { isRenovateIssue } from "@/lib/agent-queue";
-import { applyRenovateIssueExclusion } from "@/lib/issue-filters";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
+import { parseListLimit } from "@/lib/query-limit";
+import { appendIssueWhere, applyRenovateIssueExclusion, buildNoStatusWhere } from "@/lib/issue-filters";
 
 /**
  * GET /api/issues/untriaged
@@ -14,9 +13,13 @@ import { authorizeRequest, authErrorResponse } from "@/lib/auth";
  * so they can be classified into status/backlog, status/ready, or closed.
  *
  * Query parameters:
- *   limit     — max results (default 50, bounded per run)
+ *   limit     — max results (default 50, hard cap 200)
  *   repo      — filter by repository fullName
  *   excludeRenovate  — skip Renovate/dashboard noise (default true)
+ *
+ * Every filter is expressed in the Prisma `where` clause and the capped limit
+ * is carried by `take`, so the database returns at most `limit` untriaged rows
+ * and this process never loads the whole open-issue set (issue #1309).
  */
 
 interface UntriagedIssue {
@@ -39,27 +42,31 @@ export async function GET(request: Request) {
 
   try {
     const { searchParams } = new URL(request.url);
-    const limit = Math.min(
-      parseInt(searchParams.get("limit") ?? "50", 10),
-      200, // hard cap to prevent runaway queries
-    );
+    // Clamp before it reaches Prisma `take`: NaN, zero and negative values
+    // fall back to the default, oversized values are capped at 200.
+    const limit = parseListLimit(searchParams.get("limit"));
     const repoFilter = searchParams.get("repo");
     const excludeRenovate = searchParams.get("excludeRenovate") !== "false";
 
-    // Fetch all open issues from enabled repos
-    let where: Record<string, unknown> = {
+    // Open issues in enabled repos, narrowed in the query so `take` below
+    // bounds the rows this process ever receives.
+    const where: Record<string, unknown> = {
       state: "open",
       repository: { enabled: true },
     };
-    if (excludeRenovate) {
-      applyRenovateIssueExclusion(where);
-    }
 
     if (repoFilter) {
-      where = {
-        ...where,
-        repository: { enabled: true, fullName: repoFilter },
-      };
+      where.repository = { enabled: true, fullName: repoFilter };
+    }
+
+    // Untriaged = carries no `status/*` label. Expressed in the query (not as
+    // a post-fetch filter) so the capped `take` is exact.
+    appendIssueWhere(where, buildNoStatusWhere(true));
+
+    // Renovate/dashboard noise, excluded with the same criteria the shared
+    // `isRenovateIssue` predicate uses (see buildRenovateIssueExclusionWhere).
+    if (excludeRenovate) {
+      applyRenovateIssueExclusion(where);
     }
 
     const issues: UntriagedIssue[] = await prisma.issue.findMany({
@@ -76,31 +83,11 @@ export async function GET(request: Request) {
         repository: { select: { fullName: true } },
       },
       orderBy: { updatedAt: "desc" },
+      // The cap is applied by the query, not by slicing the fetched rows.
+      take: limit,
     });
 
-    // Filter to only issues with no status/* label (untriaged)
-    const untriaged = issues.filter((issue) => {
-      for (const label of issue.labels) {
-        if ((STATUS_LABELS as string[]).includes(label)) return false;
-      }
-      return true;
-    });
-
-    // Filter by repo if specified
-    let result = untriaged;
-    if (repoFilter) {
-      result = result.filter((issue) => issue.repository.fullName === repoFilter);
-    }
-
-    // Optionally exclude Renovate/dashboard noise
-    if (excludeRenovate) {
-      result = result.filter((issue) => !isRenovateIssue(issue));
-    }
-
-    // Bound results per run
-    result = result.slice(0, limit);
-
-    return NextResponse.json(result);
+    return NextResponse.json(issues);
   } catch (error) {
     return handleApiError("fetch untriaged issues", error);
   }

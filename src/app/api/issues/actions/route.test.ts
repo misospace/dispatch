@@ -2,7 +2,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 // vi.hoisted() runs at the very top of the file, before vi.mock() hoisting.
-const { mocks } = vi.hoisted(() => ({
+const { mocks, guardState } = vi.hoisted(() => ({
+  guardState: { stillHolds: true },
   mocks: {
     findIssue: vi.fn().mockResolvedValue(null),
     updateIssue: vi.fn().mockResolvedValue(undefined),
@@ -13,8 +14,10 @@ const { mocks } = vi.hoisted(() => ({
 }));
 
 // Mock dependencies — return the mock functions directly
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
+vi.mock("@/lib/prisma", () => {
+  const prisma = {
+    // #1254: assign supersedes any pending reconciler release intent.
+    ownershipReleaseIntent: { findFirst: vi.fn(async () => null) },
     issue: {
       findUnique: mocks.findIssue,
       update: mocks.updateIssue,
@@ -22,8 +25,10 @@ vi.mock("@/lib/prisma", () => ({
     auditLog: {
       create: mocks.createAuditLog,
     },
-  },
-}));
+    $transaction: (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+  };
+  return { prisma };
+});
 
 vi.mock("@/lib/github", () => ({
   updateIssueLabels: mocks.updateIssueLabels,
@@ -32,6 +37,33 @@ vi.mock("@/lib/github", () => ({
 }));
 
 vi.mock("@/lib/claim-gate", () => ({ getLiveIssueLabels: mocks.getLiveIssueLabels }));
+vi.mock("@/lib/issue-mutation-guard", () => ({
+  // #1254: the assign path serializes on the per-issue anchor; the fake
+  // always grants the lock.
+  withIssueMutationGuard: async (
+    _req: unknown,
+    cb: (
+      tx: unknown,
+      context: {
+        resuming: boolean;
+        stillHoldsGuard: () => Promise<boolean>;
+        runFencedRemoteWrite: <T>(fn: () => Promise<T>) => Promise<{ status: string; value?: T }>;
+      },
+    ) => Promise<{ complete: boolean; value: unknown }>,
+  ) => ({
+    status: "completed",
+    value: (await cb(undefined, {
+      resuming: false,
+      stillHoldsGuard: async () => guardState.stillHolds,
+      // #1254: the fenced remote write is ATOMIC with the guard check — a
+      // stolen guard means the forge function is NEVER called.
+      runFencedRemoteWrite: async (fn: any) => {
+        if (!guardState.stillHolds) return { status: "guard-lost" };
+        return { status: "written", value: await fn(undefined) };
+      },
+    })).value,
+  }),
+}));
 
 // Import the route after mocks are set up
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -43,6 +75,7 @@ import { POST } from "./route";
 
 // Reset process-global per-actor rate-limit windows per test (see claim suite).
 beforeEach(() => {
+  guardState.stillHolds = true;
   resetRateLimits();
 });
 
@@ -359,6 +392,37 @@ describe("POST /api/issues/actions — assign_agent", () => {
     expect(body.labels).toContain("type/bug");
     expect(body.labels).not.toContain("agent/old");
   });
+
+  it("does not commit a superseded assign_agent before the remote label write and audits the guard loss (#1254)", async () => {
+    guardState.stillHolds = false;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "type/feature"]);
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("superseded");
+    // No remote label write, no local cache write: the holder lost the guard.
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    // #1254: the guard loss is audited — the skipped assignment must be
+    // visible, not silent.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "assign_agent",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        success: false,
+        errorMessage: "Assignment was superseded by an operator override before the remote label write",
+      }),
+    });
+  });
+
+  it("commits a normal assign_agent when the guard is still held (control)", async () => {
+    guardState.stillHolds = true;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/backlog", "type/feature"]);
+    const res = await postRequest(makePayload());
+    expect(res.status).toBe(200);
+    expect(mocks.updateIssueLabels).toHaveBeenCalled();
+  });
 });
 
 describe("POST /api/issues/actions — assign_owner", () => {
@@ -414,6 +478,35 @@ describe("POST /api/issues/actions — assign_owner", () => {
       42,
       ["status/in-progress", "owner/alice"]
     );
+  });
+
+  it("does not commit a superseded assign_owner before the remote label write and audits the guard loss (#1254 review)", async () => {
+    // #1254: `updateIssueLabels` replaces the WHOLE label set, so the set it
+    // writes is a snapshot taken before the write — a stale snapshot strips
+    // every label another writer added in the meantime, including the
+    // `agent/*` label a maintainer force-claim owns. The write is therefore
+    // fenced for EVERY action, not only `assign_agent`.
+    guardState.stillHolds = false;
+    mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/in-progress", "type/bug"]);
+    const res = await postRequest(
+      makePayload({ action: "assign_owner" as const, value: "owner/alice" })
+    );
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("superseded");
+    // No remote label write, no local cache write: the holder lost the guard.
+    expect(mocks.updateIssueLabels).not.toHaveBeenCalled();
+    expect(mocks.updateIssue).not.toHaveBeenCalled();
+    // The skip is audited — it must not be silent.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "assign_owner",
+        repoFullName: "org/repo",
+        issueNumber: 42,
+        issueId: "issue-1",
+        success: false,
+        errorMessage: "Assignment was superseded by an operator override before the remote label write",
+      }),
+    });
   });
 
   it("can assign both agent and owner on same issue", async () => {

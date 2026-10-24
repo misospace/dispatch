@@ -133,22 +133,12 @@ function formatDecision(decision: PrFixDecisionContext | null | undefined): stri
 }
 
 /**
- * Build the markdown comment body for a BLOCKED PR-fix item.
- *
- * Everything except `reason` is optional so historical and minimally-reported
- * blocks (a plain enqueue with no attempt context) still render a useful,
- * non-empty comment.
+ * Append the attempt context shared by the BLOCKED and PARKED notices: metrics,
+ * per-lane enqueue counts, final failure, failing run links, last attempt
+ * summary, and the stale-disposition note (#1253). Kept in one place so the two
+ * surfaces cannot drift apart.
  */
-export function buildNeedsHumanComment(input: SurfacePrFixBlockedInput): string {
-  const context = input.context ?? {};
-  const lines: string[] = [
-    NEEDS_HUMAN_COMMENT_MARKER,
-    "",
-    "> ⚠️ This PR fix item has been marked as **BLOCKED** and needs human attention.",
-    "",
-    `**Reason:** ${input.reason}`,
-  ];
-
+function appendSurfaceContext(lines: string[], context: PrFixSurfaceContext): void {
   for (const metric of formatMetrics(context)) lines.push("", metric);
 
   const laneText = formatLaneAttempts(context);
@@ -171,6 +161,26 @@ export function buildNeedsHumanComment(input: SurfacePrFixBlockedInput): string 
       "**Note:** Fresh actionable feedback arrived after this disposition was recorded; it did not reopen the item (#1253).",
     );
   }
+}
+
+/**
+ * Build the markdown comment body for a BLOCKED PR-fix item.
+ *
+ * Everything except `reason` is optional so historical and minimally-reported
+ * blocks (a plain enqueue with no attempt context) still render a useful,
+ * non-empty comment.
+ */
+export function buildNeedsHumanComment(input: SurfacePrFixBlockedInput): string {
+  const context = input.context ?? {};
+  const lines: string[] = [
+    NEEDS_HUMAN_COMMENT_MARKER,
+    "",
+    "> ⚠️ This PR fix item has been marked as **BLOCKED** and needs human attention.",
+    "",
+    `**Reason:** ${input.reason}`,
+  ];
+
+  appendSurfaceContext(lines, context);
 
   lines.push(...formatDecision(input.decision));
 
@@ -217,28 +227,7 @@ export function buildParkedComment(input: SurfacePrFixParkedInput): string {
     `**Outcome:** ${outcome}`,
   ];
 
-  for (const metric of formatMetrics(context)) lines.push("", metric);
-
-  const laneText = formatLaneAttempts(context);
-  if (laneText) lines.push("", laneText);
-
-  if (context.finalFailureSignature) {
-    lines.push("", `**Final failure:** ${context.finalFailureSignature}`);
-  }
-
-  const runLinks = formatFailingRunLinks(context.failingRunLinks);
-  if (runLinks) lines.push("", runLinks);
-
-  if (context.lastAttemptSummary) {
-    lines.push("", `**Last attempt:** ${context.lastAttemptSummary}`);
-  }
-
-  if (context.staleDisposition) {
-    lines.push(
-      "",
-      "**Note:** Fresh actionable feedback arrived after this disposition was recorded; it did not reopen the item (#1253).",
-    );
-  }
+  appendSurfaceContext(lines, context);
 
   if (input.latestNote) {
     lines.push("", `**Latest note:** ${input.latestNote}`);
@@ -289,6 +278,50 @@ function isDispatchMarkerComment(body: string | null | undefined): boolean {
 }
 
 /**
+ * Post a surface notice, or PATCH the existing Dispatch marker comment in
+ * place. `buildBody` receives the existing marker body (null when there is
+ * none) so a caller can fold its notice into the comment already on the PR.
+ */
+async function writeMarkerComment(
+  repo: string,
+  pr: number,
+  buildBody: (existingBody: string | null) => string | null,
+): Promise<{ posted: boolean; updated: boolean }> {
+  const existing = await fetchIssueComments(repo, pr, 100, "desc");
+  const marker = existing.find((c) => isDispatchMarkerComment(c.body));
+  if (marker) {
+    // A marker without an id (old caller / mocked data) is treated as present:
+    // the anti-spam guard wins over freshness.
+    if (typeof marker.id !== "number") return { posted: false, updated: false };
+    const body = buildBody(marker.body ?? null);
+    if (body === null) return { posted: false, updated: false };
+    await updateIssueComment(repo, marker.id, body);
+    return { posted: false, updated: true };
+  }
+  const body = buildBody(null);
+  if (body === null) return { posted: false, updated: false };
+  await addIssueComment(repo, pr, body);
+  return { posted: true, updated: false };
+}
+
+/**
+ * Live PR state for a surface write. A failed lookup reads as a synthetic
+ * terminal state: when in doubt, do not write to a PR.
+ */
+async function fetchPrStateForSurface(
+  repo: string,
+  pr: number,
+  logLabel: string,
+): Promise<{ state: string | null; mergedAt: string | null }> {
+  try {
+    return await fetchPullRequestState(repo, pr);
+  } catch (error) {
+    console.error(`pr-fix-surfacing ${logLabel} for ${repo}#${pr}:`, error);
+    return { state: null, mergedAt: null };
+  }
+}
+
+/**
  * Surface a BLOCKED PR-fix item on GitHub: apply the needs-human label and post
  * (or update in place) an explanatory marker comment. Best-effort — never throws.
  *
@@ -309,13 +342,7 @@ export async function surfacePrFixBlocked(input: SurfacePrFixBlockedInput): Prom
   // queue row, a late status transition, a re-queue racing a merge — and asking for
   // "human attention" on something merged months ago is pure noise. Unknown state
   // (lookup failed) is treated as terminal and skipped: when in doubt, do not write.
-  let prState: { state: string | null; mergedAt: string | null };
-  try {
-    prState = await fetchPullRequestState(input.repo, input.pr);
-  } catch (error) {
-    console.error(`pr-fix-surfacing PR state error for ${input.repo}#${input.pr}:`, error);
-    prState = { state: null, mergedAt: null };
-  }
+  const prState = await fetchPrStateForSurface(input.repo, input.pr, "PR state error");
   if (isTerminalState(prState)) {
     result.skippedTerminal = true;
     console.warn(
@@ -339,21 +366,11 @@ export async function surfacePrFixBlocked(input: SurfacePrFixBlockedInput): Prom
   }
 
   try {
-    const existing = await fetchIssueComments(input.repo, input.pr, 100, "desc");
-    const marker = existing.find((c) => isDispatchMarkerComment(c.body));
-    const body = buildNeedsHumanComment(input);
-
-    if (marker) {
-      // If the marker lacks an id (old caller / mocked data), treat it as existing
-      // and avoid a duplicate post — the anti-spam guard wins over freshness.
-      if (typeof marker.id === "number") {
-        await updateIssueComment(input.repo, marker.id, body);
-        result.commentUpdated = true;
-      }
-    } else {
-      await addIssueComment(input.repo, input.pr, body);
-      result.commentPosted = true;
-    }
+    const written = await writeMarkerComment(input.repo, input.pr, () =>
+      buildNeedsHumanComment(input),
+    );
+    result.commentPosted = written.posted;
+    result.commentUpdated = written.updated;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`pr-fix-surfacing comment error for ${input.repo}#${input.pr}:`, error);
@@ -379,13 +396,7 @@ export async function surfacePrFixParked(input: SurfacePrFixParkedInput): Promis
     errors: [],
   };
 
-  let prState: { state: string | null; mergedAt: string | null };
-  try {
-    prState = await fetchPullRequestState(input.repo, input.pr);
-  } catch (error) {
-    console.error(`pr-fix-surfacing parked PR state error for ${input.repo}#${input.pr}:`, error);
-    prState = { state: null, mergedAt: null };
-  }
+  const prState = await fetchPrStateForSurface(input.repo, input.pr, "parked PR state error");
   if (isTerminalState(prState)) {
     result.skippedTerminal = true;
     console.warn(
@@ -410,19 +421,11 @@ export async function surfacePrFixParked(input: SurfacePrFixParkedInput): Promis
   }
 
   try {
-    const existing = await fetchIssueComments(input.repo, input.pr, 100, "desc");
-    const marker = existing.find((c) => isDispatchMarkerComment(c.body));
-    const body = buildParkedComment(input);
-
-    if (marker) {
-      if (typeof marker.id === "number") {
-        await updateIssueComment(input.repo, marker.id, body);
-        result.commentUpdated = true;
-      }
-    } else {
-      await addIssueComment(input.repo, input.pr, body);
-      result.commentPosted = true;
-    }
+    const written = await writeMarkerComment(input.repo, input.pr, () =>
+      buildParkedComment(input),
+    );
+    result.commentPosted = written.posted;
+    result.commentUpdated = written.updated;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`pr-fix-surfacing parked comment error for ${input.repo}#${input.pr}:`, error);
@@ -484,13 +487,7 @@ export async function surfacePrFixUnblocked(
     errors: [],
   };
 
-  let prState: { state: string | null; mergedAt: string | null };
-  try {
-    prState = await fetchPullRequestState(repo, pr);
-  } catch (error) {
-    console.error(`pr-fix-surfacing requeue PR state error for ${repo}#${pr}:`, error);
-    prState = { state: null, mergedAt: null };
-  }
+  const prState = await fetchPrStateForSurface(repo, pr, "requeue PR state error");
   if (isTerminalState(prState)) {
     result.skippedTerminal = true;
     return result;

@@ -284,16 +284,19 @@ export async function syncAutomationRepo(repoFullName: string): Promise<Automati
     }
 
     // Batch PR upserts in a single transaction.
-    // The merged rows from the closed listing carry the authoritative
-    // merged_at the open listing can never hold (#1313); the upsert already
-    // persists pr.merged_at. A PR that merges between the two listings can
-    // appear in both — the merged row wins, so the open duplicate is dropped
-    // rather than writing mergedAt back to null.
-    const mergedPrs = closedPrs.filter((pr) => pr.merged_at);
-    const mergedPrNumbers = new Set(mergedPrs.map((pr) => pr.number));
+    // The closed listing carries rows the open listing can never reflect:
+    // merged rows hold the authoritative merged_at the open listing lacks
+    // (#1313), and a PR that closed without merging drops out of the
+    // state=open listing entirely — leaving it out here would keep its row
+    // state "open" with updatedAt frozen at last sighting (#1321). A PR can
+    // appear in both listings when it changes state between the two
+    // concurrent snapshots; the closed row wins, so an open snapshot never
+    // overwrites newer closed state (or nulls a merged row's merge time).
+    const closedPrsToUpsert = closedPrs.slice(0, 50);
+    const closedPrNumbers = new Set(closedPrsToUpsert.map((pr) => pr.number));
     const prsToUpsert = [
-      ...mergedPrs.slice(0, 50),
-      ...prs.filter((pr) => !mergedPrNumbers.has(pr.number)).slice(0, 50),
+      ...closedPrsToUpsert,
+      ...prs.filter((pr) => !closedPrNumbers.has(pr.number)).slice(0, 50),
     ];
     if (prsToUpsert.length > 0) {
       await prisma.$transaction(

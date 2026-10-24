@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchWithRetry } from "./github-auth";
+import { fetchWithRetry, githubFetchTimeoutMs } from "./github-auth";
 
 function jsonResponse(status: number, headers: Record<string, string> = {}, body = "{}"): Response {
   return new Response(body, { status, headers });
@@ -142,5 +142,145 @@ describe("fetchWithRetry", () => {
 
     expect(res.status).toBe(401);
     expect(calls).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps a single backoff sleep (#1347: no unbounded rate-limit wait inside a guard window)", async () => {
+    const calls = vi.fn(async () => {
+      if (calls.mock.calls.length === 1) return jsonResponse(429, { "Retry-After": "3600" });
+      return jsonResponse(200);
+    });
+    vi.stubGlobal("fetch", calls);
+
+    await fetchWithRetry("https://api.github.com/x", {}, { sleep: fakeSleep });
+
+    // The header asks for an hour; the holder must wait at most the cap.
+    expect(sleeps[0]).toBe(30000);
+  });
+});
+
+describe("fetchWithRetry bounded timeout (#1347)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  const sleeps: number[] = [];
+  const fakeSleep = vi.fn(async (ms: number) => {
+    sleeps.push(ms);
+  });
+  const timeoutError = () => Object.assign(new Error("The operation timed out"), { name: "TimeoutError" });
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    sleeps.length = 0;
+    fakeSleep.mockClear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    globalThis.fetch = originalFetch;
+    delete process.env.DISPATCH_GITHUB_TIMEOUT_MS;
+  });
+
+  it("every attempt gets a fresh AbortSignal; a caller signal is combined, not dropped", async () => {
+    const calls = vi.fn(async (_url: string, _init?: RequestInit) => {
+      if (calls.mock.calls.length === 1) return jsonResponse(503);
+      return jsonResponse(200);
+    });
+    vi.stubGlobal("fetch", calls);
+
+    await fetchWithRetry("https://api.github.com/x", {}, { sleep: fakeSleep });
+
+    const first = calls.mock.calls[0][1]?.signal;
+    const second = calls.mock.calls[1][1]?.signal;
+    expect(first).toBeInstanceOf(AbortSignal);
+    expect(second).toBeInstanceOf(AbortSignal);
+    expect(second).not.toBe(first);
+
+    // #1347: a caller-supplied signal must NOT void the hard bound — the
+    // two are composed, and the composed signal is still an AbortSignal.
+    const controller = new AbortController();
+    await fetchWithRetry("https://api.github.com/x", { signal: controller.signal }, { sleep: fakeSleep });
+    const composed = calls.mock.calls[2][1]?.signal;
+    expect(composed).toBeInstanceOf(AbortSignal);
+    expect(composed).not.toBe(controller.signal);
+    controller.abort();
+    expect(composed?.aborted).toBe(true);
+  });
+
+  it("a stalled GET is retried and a late success still resolves", async () => {
+    const calls = vi.fn(async () => {
+      if (calls.mock.calls.length === 1) throw timeoutError();
+      return jsonResponse(200);
+    });
+    vi.stubGlobal("fetch", calls);
+
+    const res = await fetchWithRetry("https://api.github.com/x", {}, { sleep: fakeSleep });
+
+    expect(res.status).toBe(200);
+    expect(calls).toHaveBeenCalledTimes(2);
+  });
+
+  it("a permanently stalled GET rejects with the timeout after bounded attempts", async () => {
+    const calls = vi.fn(async () => {
+      throw timeoutError();
+    });
+    vi.stubGlobal("fetch", calls);
+
+    await expect(
+      fetchWithRetry("https://api.github.com/x", {}, { sleep: fakeSleep }),
+    ).rejects.toThrow(/timed out/);
+    expect(calls).toHaveBeenCalledTimes(3); // default maxAttempts, then fail closed
+    expect(sleeps).toEqual([1000, 2000]); // bounded backoff between attempts
+  });
+
+  it("a stalled WRITE is never retried (it may have applied server-side)", async () => {
+    const calls = vi.fn(async () => {
+      throw timeoutError();
+    });
+    vi.stubGlobal("fetch", calls);
+
+    await expect(
+      fetchWithRetry("https://api.github.com/x", { method: "PATCH", body: "{}" }, { sleep: fakeSleep }),
+    ).rejects.toThrow(/timed out/);
+    expect(calls).toHaveBeenCalledTimes(1);
+    expect(fakeSleep).not.toHaveBeenCalled();
+  });
+
+  it("retryOnTimeout admits a caller-declared read-idempotent POST (GraphQL)", async () => {
+    const calls = vi.fn(async () => {
+      if (calls.mock.calls.length === 1) throw timeoutError();
+      return jsonResponse(200, {});
+    });
+    vi.stubGlobal("fetch", calls);
+
+    const res = await fetchWithRetry(
+      "https://api.github.com/graphql",
+      { method: "POST", body: "{}" },
+      { sleep: fakeSleep, retryOnTimeout: true },
+    );
+
+    expect(res.status).toBe(200);
+    expect(calls).toHaveBeenCalledTimes(2);
+  });
+
+  it("a caller-signal abort is surfaced once and never treated as our timeout", async () => {
+    const calls = vi.fn(async () => {
+      throw Object.assign(new Error("aborted by caller"), { name: "AbortError" });
+    });
+    vi.stubGlobal("fetch", calls);
+    const controller = new AbortController();
+
+    await expect(
+      fetchWithRetry("https://api.github.com/x", { signal: controller.signal }, { sleep: fakeSleep }),
+    ).rejects.toThrow(/aborted by caller/);
+    expect(calls).toHaveBeenCalledTimes(1);
+  });
+
+  it("DISPATCH_GITHUB_TIMEOUT_MS configures the bound (floored, invalid-safe)", async () => {
+    process.env.DISPATCH_GITHUB_TIMEOUT_MS = "5000";
+    expect(githubFetchTimeoutMs()).toBe(5000);
+    process.env.DISPATCH_GITHUB_TIMEOUT_MS = "10";
+    expect(githubFetchTimeoutMs()).toBe(1000); // floor: a sub-second bound would break large reads
+    process.env.DISPATCH_GITHUB_TIMEOUT_MS = "nonsense";
+    expect(githubFetchTimeoutMs()).toBe(30000); // default
+    delete process.env.DISPATCH_GITHUB_TIMEOUT_MS;
+    expect(githubFetchTimeoutMs()).toBe(30000);
   });
 });

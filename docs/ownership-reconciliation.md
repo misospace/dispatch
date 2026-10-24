@@ -1,13 +1,20 @@
 # Ownership Reconciliation Design
 
-> **Status:** Partially implemented. #1251 landed the §6 optional worker
-> capability (register/renew/disposition on `Lease`), the §4 derived
-> ownership read model, and the §9 inspect surfaces — see
-> [Worker Ownership Capability](./worker-ownership-capability.md). The §8
-> reconciliation/release protocol (confirmation ladder, two-sided intent
-> protocol) remains design-only: no claim release, label cleanup, requeue,
-> worker-credential migration, or deployment change is authorised by this
-> document.
+> **Status:** Landed. #1251 landed the §6 optional worker capability
+> (register/renew/disposition on `Lease`), the §4 derived ownership read model,
+> and the §9 inspect surfaces — see
+> [Worker Ownership Capability](./worker-ownership-capability.md). #1254 landed
+> the §8 bounded reconciliation pass and the §8.7 two-sided release boundary:
+> `src/lib/ownership-reconciliation.ts` implements the confirmation ladder
+> (§8.2), the Phase A/B/C intent protocol (§8.7), the crash/replay matrix, and
+> the §8.5 release selection, mode-gated by
+> `DISPATCH_OWNERSHIP_RECONCILE_MODE` (`off` by default — no automatic release;
+> `audit` annotates only; `enforce` releases confirmed-abandoned claims). The
+> pass runs in the stale-work scheduler slot (`/api/agent-work/sweep`) under
+> the existing sync lock. Pending release intents and ladder candidates are
+> surfaced on the §9 read surface (`GET /api/issues/ownership` →
+> `reconciliation`). Still design-only: no worker-credential migration and no
+> deployment change.
 >
 > **Issue:** [misospace/dispatch#1245](https://github.com/misospace/dispatch/issues/1245)
 > **Date:** 2026-10-13
@@ -165,8 +172,10 @@ every 5 min when the in-process scheduler is enabled
   `skipped`, and `leasesReleased` — the number of lease rows the CAS-fenced
   delete actually consumed, so operators can see when a reclaim ran without a
   lease and when a retention deleted nothing (#1317 accounting).
-- `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:350`) deletes
-  `AgentWork` rows with no matching active lease during a claim.
+- `findAndReleaseStaleAgentWorkForIssue` (`src/lib/agent-work.ts:437`) deletes
+  `AgentWork` rows with no matching active lease during a claim, skipping any row
+  still owed a claim release (`staleClaimReleasePending`) and fencing each delete
+  on the scanned row's state, owner and issue (#1350).
 
 **Gap:** the sweep's liveness inputs are still heartbeat and lease-expiry age
 only. A worker whose model call or test run exceeds the heartbeat window, or
@@ -447,9 +456,199 @@ no such claim; §8.7 defines the actual cross-system boundary.
 
 ### 8.7 The two-sided release boundary (cross-system serialization)
 
+> **Implementation note (#1254).** Landed in `src/lib/ownership-reconciliation.ts`.
+> The anchor is the per-issue `IssueMutationGuard` fence with operation
+> `reconcile-release` (resumable after a demoted guard, like `stale-release`); the
+> release intent is the `OwnershipReleaseIntent` row (unique per
+> `(issue, agentLabel)`, carrying `attemptToken`, `phase`, a bounded Phase-B
+> `attempts` counter and a `parkedAt` fail-closed marker); the ladder state is
+> the `OwnershipReconcileCandidate` row (stale observations, per-claim reclaim
+> counter and cooldown — reset per owner, kept across release/reclaim churn).
+> The claim side's intent is the `Lease` row itself: the claim route commits the
+> lease (fresh attempt token) *before* the remote label add and holds any claim
+> with a retryable 409 while an intent is pending — the maintainer force-claim (which may also take over a guard left
+> `executing` by a crashed process via the guard `override` — the deliberate
+> operator decision the fail-closed posture defers to; the override is
+> silence-fenced on the guard's `updatedAt` (`GUARD_OVERRIDE_MIN_AGE_MS`): a
+> live holder stamps its guard every `GUARD_HEARTBEAT_MS` while it runs, and
+> every remote call it can make is hard-bounded (#1347: per-attempt
+> `AbortSignal.timeout`, default 30s via `DISPATCH_GITHUB_TIMEOUT_MS`, plus a
+> capped retry backoff in `fetchWithRetry`), so silence past the fence
+> evidences a holder that cannot prove liveness — dead, event-loop-blocked,
+> or DB-starved. The converse is the accepted cost: a holder that is alive
+> and stamping is never override-eligible, however wedged its operation is,
+> and the issue stays pinned until that process restarts (the inspect
+> surface's `overrideEligible` says which situation the operator is looking
+> at); a silent-but-live holder that resumes after an override loses on the
+> ownerToken CAS. A young or freshly stamped executing guard keeps the
+> override fail-closed instead of racing a live
+> writer through the anchor), the owner/operator
+> unclaim and the operator agent-work release, and the direct `assign_agent`
+> path (which takes the same anchor as operation `assign`) instead supersede
+> a pending intent (audited) via `supersedeOwnershipReleaseIntent`;
+> `assign_owner` does not touch agent labels and never cancels a pending
+> release. The unassign route (#1361) takes the same anchor as operation
+> `unassign` and writes its full label set inside a fenced write, so an
+> unassign can neither interleave a maintainer force-claim's `agent/*` add nor
+> leave GitHub and the cache disagreeing about it (an unassign that runs
+> AFTER a force-claim still removes the claim's label — that is what
+> unassigning an agent means); it has no resume branch (it releases the
+> anchor on every handled path), so a failed attempt deletes its guard row
+> instead of leaving a demoted one behind. Guards left `executing` by a hard crash surface on the ownership
+> inspect read view; only an operator clears them. The CAS-unpinnable facts
+> are re-derived at commit time, under the anchor: a fresh live-label read
+> fails closed on forge errors, and a maintainer hold (`status/blocked` +
+> reason), review ownership (open linked PR or open PR-fix queue row), or a
+> future lease `retryAfter` withholds the release (issue #1254 "re-check …
+> at commit time"). Phase A runs it before the intent-commit transaction
+> (nothing commits when withheld); `driveReleaseIntent` repeats it directly
+> before every Phase B delete, so a hold that lands while an intent is
+> pending withholds the replay too (the intent stays pending; exempt
+> operator paths supersede it). Phase A CAS-fences on
+> the full claim epoch — `{claimToken, expiredAt, lastRenewalObservedAt,
+> disposition}` plus the observed `AgentWork` heartbeat (§8.6) — with the
+> heartbeat CAS sequenced before the token-retiring lease CAS so a failed
+> heartbeat check cannot partially commit. Phase C refuses to settle over a
+> fresh claim (a lease still carrying its token, or any lease behind a
+> token-less intent), and clears the intent without a second lifecycle event
+> when another writer already released the claim. The stale-work sweep defers
+> to pending intents (the reconciler owns that release). The §8.5 status
+> selection is computed against a fresh live label read (#1037). The override's
+> CAS is the load-bearing fence, and the guarded remote ownership write is now
+> **atomic with the guard check** — it is not a read-then-act tripwire.
+> Every guarded callback (claim, the direct assignment route — `assign_agent`
+> AND `assign_owner`, whose label write is a full-set PUT — the unassign route
+> (#1361, whose label write is a full-set PUT too — the direct assignment's
+> twin in the other direction), the unclaim route (#1367, whose remote release
+> removes the `agent/*` label and may chain a resting-status transition, and
+> whose entire mutation now runs under the anchor) — the reconciler's
+> Phase B delete, the stale-work sweep, and the capacity handoff's release)
+> performs its remote ownership write inside a **fenced write**
+> (`IssueMutationContext.runFencedRemoteWrite`,
+> `src/lib/issue-mutation-guard.ts`): the fenced write opens a transaction,
+> takes the guard row's **exclusive row lock** with a CAS-scoped `UPDATE`
+> (which also re-stamps the liveness stamp) and holds that lock **across the
+> forge call**. A steal therefore cannot commit between the check and the
+> write: the two are one step.
+> - the override wins first (it deleted the guard, or a different
+>   `ownerToken` owns it) → the fenced `UPDATE` matches no row → the forge
+>   function is **never called** → the callback backs off (fenced-deleting any
+>   lease it minted) and answers the same busy/conflict shape it used for the
+>   old tripwire;
+> - the holder wins first → the override's `DELETE` **blocks** on the row lock
+>   until the fenced write commits, then re-evaluates its silence predicate
+>   (`updatedAt <= cutoff`) against the row the fenced `UPDATE` just re-stamped
+>   → the predicate is false → the row is skipped → the override reports
+>   `busy` and does **not** steal. The operator's force-claim therefore waits
+>   for the in-flight fenced write — bounded by that region's own transaction
+>   budget — and is then told the issue is busy; it never waits unboundedly,
+>   because that budget is what bounds the lock hold.
+>
+> **The budget.** A region's transaction budget must dominate the worst case
+> of the mutating forge call(s) it holds: a mid-flight abort would release
+> the row lock with the remote effect still in flight, which reopens the hole
+> the fence closes. `githubCallBudgetMs()` (`src/lib/github-auth.ts`) is the
+> worst case of ONE mutating forge call — the attempt chain (3 attempts × the
+> per-attempt timeout), the capped retry backoff between attempts
+> (2 × `GITHUB_RETRY_MAX_DELAY_MS`), and one cold App installation-token
+> fetch — every term bounded by `DISPATCH_GITHUB_TIMEOUT_MS` (default 30s).
+> At the default configuration that is 180s, and the region's transaction
+> budget is `fencedWriteTimeoutMs()` = `githubCallBudgetMs()` + 15s of slack
+> = 195s. The budget is NOT bounded by the override's silence window
+> (`GUARD_OVERRIDE_MIN_AGE_MS`, 5 min). That window used to be the only thing
+> keeping a committed region from looking stealable: the fence stamped the
+> guard row when the region STARTED, and a region that ran longer than the
+> silence window would leave the row looking stale the moment it committed
+> (the heartbeat's own stamp cannot land while the region holds the row
+> lock), so an override could
+> steal the guard right after the region's writes landed — while the callback
+> was still running, and with the anchor it thought it held. A region now
+> **re-stamps the guard row at commit**, inside its own transaction, right
+> after its forge calls: the committed row is fresh however long the region
+> ran, so a steal blocked on the row lock re-evaluates its silence predicate
+> against that fresh row and reports `busy` instead of taking the anchor. The
+> budget therefore only has to dominate the region's forge calls; it does not
+> have to fit inside the silence window. Regions that carry more — or a
+> data-dependent number — of mutating forge calls derive their budget from
+> the calls they actually hold. The unclaim route's release is
+> **data-dependent** (a label set with duplicated `status/*` labels chains one
+> removal each), so its budget is **derived from the issue's observed label
+> set** — `releaseIssueClaimWorstCaseCalls`
+> (`src/lib/issue-claim.ts`) scaled by
+> `fencedWriteTimeoutForCalls`
+> (`src/lib/issue-mutation-guard.ts`, `githubCallBudgetMs()` per call +
+> slack) — rather than a fixed
+> multiplier, so no duplicate-label shape can outrun the region
+> (#1367 review). The capacity handoff's shared-release region derives its
+> budget the same way, from the release's own label set (its second live
+> read); its other region — the targeted own-label removal after an
+> ownership change — carries exactly one mutating forge call and uses the
+> default single-call budget.
+>
+> **What the fence proves, precisely.** The steal cannot COMMIT between the
+> fence and the write it covers: the steal's `DELETE` blocks on the guard
+> row's lock and then fails its silence predicate against the re-stamped row
+> (the commit-time stamp, or the fence's opening stamp for a region that
+> commits inside the silence window).
+> Two boundaries remain, by design:
+> - the claim route's forced stale-label cleanup runs **one removal per
+>   fenced region** (each of that route's regions carries one mutating forge
+>   call), so the
+>   removal SET is **not atomic**: a steal that lands between two removals
+>   leaves the earlier ones applied. The next region's fence detects the
+>   loss and the callback backs off; the override's own claim converges the
+>   label state;
+> - the claim's **status transition is deliberately outside the fence** —
+>   status labels are disjoint from `agent/*`, and the fenced ownership
+>   write in front of it already proved, under the row lock, that this
+>   holder owns the claim at that moment.
+>
+> **The pool/lock tradeoff.** The fence deliberately holds ONE pooled
+> connection AND the guard row's lock for the duration of the region's
+> hard-bounded forge call(s). The hold is bounded by the region's own
+> transaction budget — `fencedWriteTimeoutMs()` (195s at the default
+> configuration) for a single-call region (e.g. the capacity handoff's
+> targeted own-label removal), and the region's derived label-set budget for
+> the shared-release regions (the unclaim route and the capacity handoff) —
+> so a GitHub outage can hold connections for that budget:
+> `maxWait: 5_000` keeps
+> the other pool waiters failing fast instead of queueing behind it. The
+> guard heartbeat's stamp on the same row would wait behind that lock, so it
+> now SKIPS its ticks while a region is in flight: a blocked stamp would hold
+> a second pooled connection for the region's whole duration, and a long
+> region could otherwise tie up enough connections to starve every other
+> query in the app. The row's liveness during a region is carried by the
+> region's own opening stamp and its commit-time re-stamp instead.
+>
+> The residual window between the old read and the remote call — the
+> ownerToken-CAS-losing cost the override itself accepts — is therefore
+> **gone** for every write the fence covers: the only way the override can
+> win is to delete the guard first, and then the fenced write finds no row
+> to lock and issues no remote write.
+> The re-read (`stillHoldsGuard`) survives for LOCAL decisions only (a
+> Postgres-only decision that needs no forge fence).
+> Mode semantics: `off` (default) starts no new release but still **replays**
+> intents already committed before the mode change — otherwise a pending
+> intent would hold the issue's claim path forever with no self-healing path;
+> `audit` performs no mutations at all — it is read-only for persisted
+> `OwnershipReconcileCandidate` state (each pass re-derives the ladder from
+> stored state, or a simulated fresh row when none exists), writes only
+> AuditLog annotations, and does not even replay intents; `enforce` runs the
+> full protocol. A claim with zero Dispatch-side evidence still derives
+> `UNKNOWN` (#1251) and is never released — the intent-only Phase A (null
+> attempt token) is reachable only for claims whose ladder decision rested on
+> an active `AgentWork` row with no `Lease` row (a worker that started work
+> before claiming), and it aborts when a lease row appears under the lock.
+
 Because the remote write cannot be fenced, the design fences **admission** in
 Postgres and lets that barrier serialize the remote write against every other
-automation writer of the same label. The invariant:
+automation writer of the same label. The anchor's row lock additionally makes
+each guarded ownership write **atomic with its admission check** (see the
+§8.7 implementation note above): the forge call happens while the anchor row's
+lock is held, so no ownership steal can commit between "the guard is mine" and
+"the label changed" (status writes are the documented exception — they are
+disjoint from `agent/*` and deliberately sit outside the fence). The
+invariant:
 
 > **Every reconciler-initiated `agent/*` label delete, and every claim-path
 > `agent/*` label add, is backed by a Postgres intent committed under one
@@ -697,15 +896,25 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
 
 - Implement behind a mode flag (`off`/`audit`/`enforce`), mirroring
   `DISPATCH_QUEUE_ADMISSION_MODE` (#1065), so the reconciler can annotate
-  without acting first.
+  without acting first. **Landed (#1254)** as
+  `DISPATCH_OWNERSHIP_RECONCILE_MODE` (default `off`), with
+  `DISPATCH_RECONCILE_MAX_RECLAIMS`, `DISPATCH_RECONCILE_BATCH_SIZE`,
+  `DISPATCH_RECONCILE_RECHECK_INTERVAL_MS`,
+  `DISPATCH_RECONCILE_RECLAIM_COOLDOWN_MS` and
+  `DISPATCH_RECONCILE_MAX_FORGE_RETRIES` as the bounded-window knobs (§8.3).
 - **Open:** exact window defaults and whether `renew` should be a new endpoint
-  or an extension of `POST /api/agent-work/checkpoint`.
+  or an extension of `POST /api/agent-work/checkpoint`. (#1251 settled the
+  endpoint; the defaults remain operator-tunable.)
 - **Open:** whether explicit holds use a new `status/`-adjacent label or a
   Postgres marker; either way it must be auditable and operator-cleared.
+  (#1254 parks over-reclaimed claims via audit rows + the candidate read
+  surface; a first-class hold marker remains open.)
 - **Open:** whether the read model is computed on demand or materialised by the
-  reconcile job.
+  reconcile job. (#1254 persists only the ladder/candidate rows; the state
+  itself stays derived on demand.)
 - **Open:** how `CONFLICTED` ownership appears on the Board and in
-  `GET /api/issues` for operators.
+  `GET /api/issues` for operators. (`GET /api/issues/ownership` surfaces it;
+  Board rendering remains open.)
 
 ## 14. Requirements traceability (#1245)
 

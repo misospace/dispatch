@@ -22,10 +22,13 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
  * Authorization: Bearer <DISPATCH_AGENT_TOKEN>
  *
  * {
- *   "agentName": "saffron",    // string, required — worker identifier
- *   "state": "DONE",           // string, required — one of:
- *                              //   CLAIMED | IN_PROGRESS | BLOCKED | DONE | RELEASED | STALE
- *   "summary": "..."           // string, optional — final summary of work or block reason
+ *   "agentName": "saffron",          // string, required — worker identifier
+ *   "state": "DONE",                 // string, required — one of:
+ *                                    //   CLAIMED | IN_PROGRESS | BLOCKED | DONE | RELEASED | STALE
+ *   "summary": "...",                // string, optional — final summary of work or block reason
+ *   "issueId": "GH_issue_abc123"     // string, optional — scopes selection to this
+ *                                    //   issue's active work (#1331); when omitted
+ *                                    //   the freshest active row for the agent is used
  * }
  *
  * ─── Response Schema ──────────────────────────────────────────────────────
@@ -47,6 +50,8 @@ const RATE_LIMIT = { limit: 30, windowMs: 10_000 } as const;
  *
  * 404 Not Found — No active work for this agent
  * { "error": "No active work found for agent" }
+ *   (or { "error": "No active work found for agent (issueId: GH_issue_abc123)" } when the
+ *    request identified an issue — the agent's other issues' work is never settled)
  *   (or { "releasedOrphan": true, "message": "Orphaned lease released — no active work to finish" })
  *
  * 500 Internal Server Error
@@ -98,7 +103,12 @@ export async function POST(request: Request) {
         return NextResponse.json({ releasedOrphan: true, message: "Orphaned lease released — no active work to finish" });
       }
 
-      return errorResponse("No active work found for agent", 404);
+      return errorResponse(
+        parsed.issueId
+          ? `No active work found for agent (issueId: ${parsed.issueId})`
+          : "No active work found for agent",
+        404,
+      );
     }
 
     await prisma.auditLog.create({

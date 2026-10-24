@@ -1,6 +1,20 @@
 vi.mock("@/lib/issue-mutation-guard", () => ({
+  // The capacity-handoff module derives its shared-release region's
+  // transaction budget per release from the observed label set (#1367
+  // review): the fake keeps the real helper's arithmetic (n × per-call
+  // budget + slack) on a 45s per-call figure.
+  fencedWriteTimeoutMs: () => 195_000,
+  fencedWriteTimeoutForCalls: (calls: number) => Math.max(1, Math.ceil(calls)) * 45_000 + 15_000,
   withIssueMutationGuard: async (_request: unknown, callback: any) => {
-    const result = await callback(undefined, { resuming: false });
+    const result = await callback(undefined, {
+      resuming: false,
+      // #1254: the fenced remote write is ATOMIC with the guard check — a
+      // stolen guard means the forge function is NEVER called.
+      runFencedRemoteWrite: async (fn: any) => {
+        const { prisma } = await import("@/lib/prisma");
+        return { status: "written", value: await fn({ issue: prisma.issue }) };
+      },
+    });
     return { status: result.complete ? "completed" : "retained", value: result.value };
   },
 }));

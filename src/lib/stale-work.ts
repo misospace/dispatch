@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { releaseIssueClaim, type IssueClaimClient } from "@/lib/issue-claim";
+import { releaseIssueClaim, fencedClaimClient, type IssueClaimClient } from "@/lib/issue-claim";
 import { lifecycleDedupeKey } from "@/lib/issue-lifecycle";
 import { withIssueMutationGuard } from "@/lib/issue-mutation-guard";
 
@@ -230,7 +230,10 @@ export interface StaleWorkReport {
  * `retryAfter` is NOT a fence field: it is read to decide whether the claim
  * is PARKED (a running wait marker, #1316/#1334) and is deliberately not
  * compared for equality — the delete's own condition excludes a running park
- * instead.
+ * instead. The retry arm does not take a fresh epoch snapshot: a lease present
+ * at retry time postdates the stale mark, which committed only after consuming
+ * the marked lease and rechecking the pair empty (#1359). It must be refused,
+ * not mistaken for the incarnation whose release is owed.
  */
 interface ClaimEpochSnapshot {
   claimToken: string | null;
@@ -255,6 +258,16 @@ interface StaleWorkTransactionClient {
 
 export interface StaleWorkClient {
   agentWork: {
+    findMany: (args: any) => Promise<any[]>;
+  };
+  /**
+   * #1254: pending reconciler release intents. A claim the ownership
+   * reconciler is already releasing (intent pending) must not ALSO be
+   * released by the sweep — two writers releasing one claim double-records
+   * the lifecycle release and races the §8.5 status policies. The intent is
+   * the sole authorization for that delete; the sweep defers to it.
+   */
+  ownershipReleaseIntent: {
     findMany: (args: any) => Promise<any[]>;
   };
   issue: IssueClaimClient["issue"];
@@ -286,6 +299,7 @@ interface StaleWorkOutcome {
   marked: boolean;
   retained: boolean;
   retention?: "live_sibling" | "claim_epoch_moved";
+  staleRetryRefusal?: boolean;
   liveSiblingId?: string | null;
   /**
    * Lease rows the fenced delete removed in this marked transaction
@@ -293,6 +307,13 @@ interface StaleWorkOutcome {
    * once the transaction commits.
    */
   leasesDeleted?: number;
+  /**
+   * #1254: the sweep lost the per-issue mutation guard before the lease
+   * delete — the mark was restored and the release was abandoned. The
+   * transaction client has no `auditLog`, so the flag carries the decision
+   * out of the transaction and the failure audit is written after it.
+   */
+  guardLost?: boolean;
 }
 
 /**
@@ -354,15 +375,21 @@ async function findLiveSiblingWork(
  *    `executing` by a crashed process is never taken over automatically: it
  *    stays fail-closed (like a crashed claim guard) pending operator
  *    intervention.
- * 2. **Claim-epoch fence.** The lease delete is a compare-and-delete against
- *    a snapshot of `{claimToken, expiredAt, lastRenewalObservedAt}` taken
- *    BEFORE the sibling lookup, re-checked after the delete for any lease left
- *    on the pair. If any renew, re-claim or fresh claim commits between the
- *    snapshot and the delete, the fence no longer matches (or a new row shows
- *    up) and the sweep backs off: the row is still reclaimed (STALE) but the
- *    claim, lease and label are reported retained, never released. This is
- *    the belt to the fence's braces — it also covers any future writer that
- *    forgets the mutation guard.
+ * 2. **Claim-epoch fence.** The mark-arm lease delete is a compare-and-delete
+ *    against a snapshot of `{claimToken, expiredAt, lastRenewalObservedAt}`
+ *    taken BEFORE the sibling lookup, rechecked after the delete for any
+ *    lease left on the pair. If any renew, re-claim or fresh claim commits
+ *    between the snapshot and the delete, the fence no longer matches (or a
+ *    new row shows up) and the sweep backs off: the row is still reclaimed
+ *    (STALE) but the claim, lease and label are reported retained, never
+ *    released. This is the belt to the fence's braces — it also covers any
+ *    future writer that forgets the mutation guard.
+ * 3. **No retry re-snapshot (#1359).** The mark commits a pending release only
+ *    after consuming the marked lease incarnation and rechecking that no lease
+ *    remains. A lease found by a later retry therefore postdates the mark, even
+ *    if it belongs to the same agent; the retry refuses to delete it or release
+ *    its label. The lease stays untouched and the pending row is retired as a
+ *    claim-epoch retention.
  *
  * A third rule sits in front of both: a PARKED claim is not stale work at
  * all. A running wait marker on the lease (`retryAfter` in the future,
@@ -418,11 +445,41 @@ export async function sweepStaleWork(
     },
   });
 
+  // #1254: defer rows whose issue has a pending reconciler release intent.
+  // Review round 4: the lookup is scoped to the CANDIDATE issue ids instead
+  // of a capped global pending read. A cap silently under-defers once pending
+  // intents exceed the window — a deferred candidate would then be released
+  // by the sweep alongside its live intent (two writers, one claim). Scoping
+  // by id is both exact and bounded: the id list is at most `batchSize`.
+  const candidateIssueIds = Array.from(
+    new Set(
+      candidates
+        .map((work: any) => work.issueId as string | null)
+        .filter((id: string | null): id is string => Boolean(id)),
+    ),
+  );
+  const pendingIntentIssueIds = new Set<string>(
+    candidateIssueIds.length === 0
+      ? []
+      : (
+          await client.ownershipReleaseIntent.findMany({
+            where: { phase: "pending", issueId: { in: candidateIssueIds } },
+            select: { issueId: true },
+          })
+        ).map((row: any) => row.issueId),
+  );
+
+  const releasableCandidates = candidates.filter(
+    (work: any) => !(work.issueId && pendingIntentIssueIds.has(work.issueId)),
+  );
+
   const report: StaleWorkReport = {
     examined: candidates.length,
     released: 0,
     claimRetained: 0,
-    skipped: 0,
+    // Deferred rows are examined but not actioned: the reconciler owns their
+    // release (its intent holds the claim path until settle).
+    skipped: candidates.length - releasableCandidates.length,
     leasesReleased: 0,
     errors: [],
   };
@@ -431,7 +488,20 @@ export async function sweepStaleWork(
   // lease (fenced on its epoch), release the GitHub claim, finalize the row.
   // For issue-scoped claims the whole pipeline runs inside the per-issue
   // mutation fence held by the caller.
-  const reclaimStaleRow = async (work: any): Promise<void> => {
+  //
+  // `guard` carries the two anchor capabilities of that fence: the LOCAL
+  // re-check (`stillHoldsGuard`, used for the in-transaction decision below)
+  // and the ATOMIC fenced write (`runFencedRemoteWrite`, used for the remote
+  // label release, which must not be able to land after the guard was stolen).
+  const reclaimStaleRow = async (
+    work: any,
+    guard?: {
+      stillHoldsGuard: () => Promise<boolean>;
+      runFencedRemoteWrite: <T>(
+        fn: (tx: any) => Promise<T>,
+      ) => Promise<{ status: "written"; value: T } | { status: "guard-lost" }>;
+    },
+  ): Promise<void> => {
     // Claim the stale transition before external I/O. A heartbeat that
     // commits first makes the conditional update miss; a heartbeat after
     // this point sees a terminal STALE row and cannot revive it midway.
@@ -443,6 +513,14 @@ export async function sweepStaleWork(
         leaseExpiresAt: work.leaseExpiresAt,
         staleClaimReleasePending: work.staleClaimReleasePending,
       };
+
+      // Which arm this decision belongs to, captured BEFORE either CAS runs:
+      // the retry update below requires exactly `state: "STALE"` plus the
+      // pending marker, the mark update an active-shaped non-pending row —
+      // disjoint predicates, so this pre-write snapshot decides the arm. The
+      // mark CAS flips the row to STALE as a SIDE EFFECT, so the arm must
+      // never be re-derived from the row state after it (#1359).
+      const retryArm = work.state === "STALE";
 
       // Claim-epoch snapshot, taken BEFORE the sibling lookup: every write the
       // fenced delete below can no longer match is a write that committed
@@ -512,6 +590,29 @@ export async function sweepStaleWork(
         return { marked: true, retained: true, retention: "live_sibling", liveSiblingId: liveSibling.id };
       }
 
+      // #1254: re-check the anchor before the sweep commits the release. A
+      // maintainer force-claim can take this holder's guard between the mark
+      // and the lease delete; a superseded stale-release must not delete the
+      // lease and then run the post-transaction release, which would strip the
+      // agent label the new claim owns. Restore the row to the shape the sweep
+      // found it in and back off — the force-claim's own receipt converges the
+       // state, and `marked: false` short-circuits the release below. Like the
+       // park restore below, the restore leaves the `stale` AgentWorkHistory
+       // entry written by the mark in place: the history is the sweep's own
+       // observation log, not claim state, and deleting a row the transition
+       // genuinely reached would hide a real decision from the audit trail.
+       if (guard && !(await guard.stillHoldsGuard())) {
+        await tx.agentWork.updateMany({
+          where: { id: work.id, state: "STALE" },
+          data: {
+            state: before.state,
+            leaseExpiresAt: before.leaseExpiresAt,
+            staleClaimReleasePending: before.staleClaimReleasePending,
+          },
+        });
+        return { marked: false, retained: false, guardLost: true };
+      }
+
       // Releasing the lease in the same transaction as the stale marker
       // keeps the database-side queue blockers consistent across retries.
       // The delete is CAS-fenced on the epoch snapshot: a lease that was
@@ -524,26 +625,35 @@ export async function sweepStaleWork(
       if (work.issueId) {
         let epochMoved = false;
         if (epoch) {
-          const deleted = await tx.lease.deleteMany({
-            where: {
-              agentName: work.agentName,
-              issueId: work.issueId,
-              claimToken: epoch.claimToken,
-              expiredAt: epoch.expiredAt,
-              lastRenewalObservedAt: epoch.lastRenewalObservedAt,
-              // #1334: a RUNNING park is not evidence of abandonment, so the
-              // delete must not consume the lease the park was recorded on.
-              // Defence in depth: every writer of the marker takes the same
-              // per-issue fence the sweep holds, so the lease cannot change
-              // inside the decision window — but the sweep must not depend on
-              // that to keep a park alive. A lease with no wait marker
-              // (`retryAfter IS NULL`) or an elapsed one is reclaimable as
-              // before.
-              OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
-            },
-          });
-          if ((deleted?.count ?? 0) !== 1) epochMoved = true;
-          else leasesDeleted = deleted.count;
+          if (retryArm) {
+            // #1359: the mark committed pending only after its CAS consumed the
+            // marked lease incarnation and its recheck found the pair empty.
+            // A lease read now is a newer claim incarnation (including a
+            // same-agent re-claim in the crash window), so retry must not
+            // consume it or release its agent label.
+            epochMoved = true;
+          } else {
+            const deleted = await tx.lease.deleteMany({
+              where: {
+                agentName: work.agentName,
+                issueId: work.issueId,
+                claimToken: epoch.claimToken,
+                expiredAt: epoch.expiredAt,
+                lastRenewalObservedAt: epoch.lastRenewalObservedAt,
+                // #1334: a RUNNING park is not evidence of abandonment, so the
+                // delete must not consume the lease the park was recorded on.
+                // Defence in depth: every writer of the marker takes the same
+                // per-issue fence the sweep holds, so the lease cannot change
+                // inside the decision window — but the sweep must not depend on
+                // that to keep a park alive. A lease with no wait marker
+                // (`retryAfter IS NULL`) or an elapsed one is reclaimable as
+                // before.
+                OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
+              },
+            });
+            if ((deleted?.count ?? 0) !== 1) epochMoved = true;
+            else leasesDeleted = deleted.count;
+          }
         }
         // A lease on the pair at the end of the window that the sweep did not
         // consume — a fresh claim that raced in during the window, or behind
@@ -578,11 +688,17 @@ export async function sweepStaleWork(
         }
         if (remaining) epochMoved = true;
         if (epochMoved) {
-          // A renewal, re-claim or fresh claim won the window. Back off — the
-          // row stays reclaimed, but the lease, the label and the claim are
-          // left alone, and the retry marker goes down so the next sweep does
-          // not chase it. The next sweep re-decides against CURRENT state:
-          // the fresh claim is then visible to the sibling lookup as well.
+          // A renewal, re-claim or fresh claim won — inside the mark arm's
+          // decision window, or in the crash window after the mark that the
+          // retry arm just found (#1359). Back off — the row stays
+          // reclaimed, but the lease, the label and the claim are left
+          // alone, and the retry marker goes down so the sweep does not
+          // chase it. In the mark arm the newer incarnation belongs to a
+          // live worker: the next sweep re-decides against CURRENT state,
+          // where the fresh claim is visible to the sibling lookup. In the
+          // retry arm the refused lease postdates the mark and the row is
+          // already terminal: it matches no candidate arm again, and the
+          // bare claim behind it has no AgentWork row to re-decide about.
           const reverted = await tx.agentWork.updateMany({
             where: { id: work.id, state: "STALE" },
             data: { leaseExpiresAt: now, staleClaimReleasePending: false },
@@ -591,11 +707,46 @@ export async function sweepStaleWork(
           // In the pathological case where the CAS delete consumed a row AND
           // a recheck still found one, the consumed deletion is still real —
           // report it honestly even though this row is retained.
-          return { marked: true, retained: true, retention: "claim_epoch_moved", leasesDeleted };
+          return {
+            marked: true,
+            retained: true,
+            retention: "claim_epoch_moved",
+            staleRetryRefusal: retryArm,
+            leasesDeleted,
+          };
         }
       }
       return { marked: true, retained: false, liveSiblingId: null, leasesDeleted };
     });
+
+    // #1254: the guard-loss tripwire leaves a failure audit. The sweep
+    // abandoned a release because an operator override took the per-issue
+    // anchor away; without the audit row the skip is invisible. It is written
+    // AFTER the transaction (the transaction client has no `auditLog`) and it
+    // is best-effort: a failing audit must not strand the sweep.
+    if (outcome?.guardLost) {
+      try {
+        await client.auditLog.create({
+          data: {
+            actor: "system",
+            action: "stale_agentwork_release_superseded",
+            repoFullName: work.issue?.repository?.fullName ?? "",
+            issueNumber: work.issue?.number ?? undefined,
+            issueId: work.issueId ?? undefined,
+            beforeLabels: work.issue?.labels ?? [],
+            afterLabels: work.issue?.labels ?? [],
+            success: false,
+            errorMessage:
+              "stale sweep skipped the release: the mutation guard was taken by an operator override before the lease delete",
+          },
+        });
+      } catch (error) {
+        report.errors.push({
+          workId: work.id,
+          error: `guard-loss audit failed (the release was skipped): ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
 
     if (!outcome?.marked) {
       report.skipped++;
@@ -614,7 +765,9 @@ export async function sweepStaleWork(
         .join(" ");
       const reason =
         outcome.retention === "claim_epoch_moved"
-          ? "the claim epoch moved (renewal, re-claim or fresh claim committed inside the sweep's decision window)"
+          ? outcome.staleRetryRefusal
+            ? "a newer claim incarnation landed after the row's stale mark (#1359)"
+            : "the claim epoch moved (renewal, re-claim or fresh claim committed inside the sweep's decision window)"
           : `live AgentWork ${outcome.liveSiblingId} still owns the claim`;
       // The retention decision is already committed and the row is no longer
       // a sweep candidate, so a failure here must NOT escape: it would leave
@@ -645,30 +798,84 @@ export async function sweepStaleWork(
     }
 
     if (work.issue) {
+      // #1254: second tripwire — now an ATOMIC fenced write. The mark
+      // committed above, so an override that lands between that commit and
+      // this remote write must still not strip the label a forced claimant now
+      // owns. The fenced write makes the anchor check and the remote label
+      // release ONE step (the guard row's lock is held across the release),
+      // so the release can neither slip past a steal nor land after one: if
+      // the guard was already taken, the forge function is NEVER called and
+      // the sweep skips the release. The row keeps its pending-release
+      // marker, so the next sweep (or the force-claim's own receipt) converges.
+      // Known shape (pre-existing crash-matrix, narrowed here): if the override
+      // re-claimed for the SAME agent without a fresh AgentWork row, the retry
+      // snapshots that lease as the epoch and would release it — the same
+      // window a crash between mark and release already had; the epoch CAS
+      // against a renewed clock, not this tripwire, is the standing fence.
+      //
       // The release is attributed to the sweep, not to the abandoned agent:
       // nobody chose to let this claim go, and a claim-to-merge read must be
       // able to tell a recovered stall apart from a worker's own unclaim
       // (#1202).
-      await releaseIssueClaim({
-        prisma: client,
-        issue: work.issue,
-        repoFullName: work.issue.repository.fullName,
-        issueNumber: work.issue.number,
-        agentName: work.agentName,
-        options: {
-          allowMissingAgent: true,
-          preserveStatus: true,
-          source: "stale-recovery",
-          actor: "system",
-          // This AgentWork row is this claim epoch, and it is stable across a
-          // retry of the same sweep (the retry re-marks the same STALE row).
-          // Keying the release on it means the release and the
-          // already-released repair a retry has to take are one
-          // `claim_released`, not two. A reclaimed issue gets a new row and
-          // therefore a new key, so a genuine second release still counts.
-          releaseKey: lifecycleDedupeKey("agent-work", work.id),
-        },
-      });
+      const releaseWith = (claimClient: IssueClaimClient) =>
+        releaseIssueClaim({
+          // The release's own local writes (the cache mirror and the
+          // `claim_released` event) join the fenced transaction, so they
+          // cannot open an interactive transaction of their own inside it.
+          // `preserveStatus` keeps the region at exactly ONE mutating forge
+          // call (the agent-label removal), so the region's transaction
+          // budget always covers the call it holds.
+          prisma: claimClient,
+          issue: work.issue,
+          repoFullName: work.issue.repository.fullName,
+          issueNumber: work.issue.number,
+          agentName: work.agentName,
+          options: {
+            allowMissingAgent: true,
+            preserveStatus: true,
+            source: "stale-recovery",
+            actor: "system",
+            // This AgentWork row is this claim epoch, and it is stable across a
+            // retry of the same sweep (the retry re-marks the same STALE row).
+            // Keying the release on it means the release and the
+            // already-released repair a retry has to take are one
+            // `claim_released`, not two. A reclaimed issue gets a new row and
+            // therefore a new key, so a genuine second release still counts.
+            releaseKey: lifecycleDedupeKey("agent-work", work.id),
+          },
+        });
+      const released = guard
+        ? await guard.runFencedRemoteWrite(async (tx) => releaseWith(fencedClaimClient(tx)))
+        : { status: "written" as const, value: await releaseWith(client as unknown as IssueClaimClient) };
+      if (released.status === "guard-lost") {
+        // #1254: the second tripwire leaves a failure audit too — the remote
+        // release was skipped because the anchor moved on, and the skip must
+        // be visible. Best-effort: a failing audit is reported, never thrown,
+        // so the sweep is not stranded by it.
+        try {
+          await client.auditLog.create({
+            data: {
+              actor: "system",
+              action: "stale_agentwork_release_superseded",
+              repoFullName: work.issue?.repository?.fullName ?? "",
+              issueNumber: work.issue?.number ?? undefined,
+              issueId: work.issueId ?? undefined,
+              beforeLabels: work.issue?.labels ?? [],
+              afterLabels: work.issue?.labels ?? [],
+              success: false,
+              errorMessage:
+                "stale sweep skipped the remote label release: the mutation guard was taken by an operator override",
+            },
+          });
+        } catch (error) {
+          report.errors.push({
+            workId: work.id,
+            error: `guard-loss audit failed (the remote release was skipped): ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        report.skipped++;
+        return;
+      }
     }
 
     const finalized = await client.$transaction(async (tx) => {
@@ -712,7 +919,7 @@ export async function sweepStaleWork(
     }
   };
 
-  for (const work of candidates) {
+  for (const work of releasableCandidates) {
     try {
       if (work.issueId) {
         // Issue-scoped claim: run the whole decision-and-release pipeline
@@ -726,7 +933,7 @@ export async function sweepStaleWork(
         // window that completed far enough to owe one.
         const guarded = await withIssueMutationGuard(
           { issueId: work.issueId, operation: "stale-release", agentName: work.agentName },
-          async () => ({ complete: true, value: await reclaimStaleRow(work) }),
+          async (_tx, context) => ({ complete: true, value: await reclaimStaleRow(work, context) }),
         );
         if (guarded.status === "busy") report.skipped++;
       } else {

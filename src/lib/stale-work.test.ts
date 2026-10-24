@@ -20,13 +20,24 @@ vi.mock("@/lib/prisma", () => ({ prisma: {} }));
 const { guard } = vi.hoisted(() => {
   const held = new Map<string, { operation: string; agentName?: string }>();
   const attempts: Array<{ issueId: string; operation: string; agentName?: string; status: string }> = [];
+  // #1254: the per-holder anchor re-check. Tests flip `value` to false to make
+  // the sweep's pre-write re-check report that the guard was superseded.
+  const checks = { value: true };
+  // #1254: the transaction client the fenced remote write hands to the
+  // callback — the fake guard passes it through so the guarded local writes
+  // join the same (fake) transaction.
+  const tx: { current: any } = { current: undefined };
   return {
     guard: {
       held,
       attempts,
+      checks,
+      tx,
       reset: () => {
         held.clear();
         attempts.length = 0;
+        checks.value = true;
+        tx.current = undefined;
       },
     },
   };
@@ -42,7 +53,16 @@ vi.mock("@/lib/issue-mutation-guard", () => ({
     guard.held.set(request.issueId, { operation: request.operation, agentName: request.agentName });
     guard.attempts.push({ ...request, status: "acquired" });
     try {
-      const result = await callback(undefined, { resuming: false });
+      const result = await callback(undefined, {
+        resuming: false,
+        stillHoldsGuard: async () => guard.checks.value,
+        // #1254: the fenced remote write is ATOMIC with the guard check — a
+        // stolen guard means the forge function is NEVER called.
+        runFencedRemoteWrite: async (fn: any) => {
+          if (!guard.checks.value) return { status: "guard-lost" };
+          return { status: "written", value: await fn(guard.tx.current) };
+        },
+      });
       if (result.complete) return { status: "completed", value: result.value };
       return { status: "retained", ownerToken: "self", value: result.value };
     } finally {
@@ -108,6 +128,8 @@ const CLAUSE_KEYS = new Set([
   "claimToken",
   "expiredAt",
   "lastRenewalObservedAt",
+  // #1254: the pending-release-intent deferral lookup.
+  "phase",
   // The external-wait marker (#1316/#1334): the park the sweep reads off the
   // lease and the fenced delete excludes while it is still running.
   "retryAfter",
@@ -231,6 +253,12 @@ function makeSweepClient(options: {
   /** Lease rows visible to the epoch snapshot and the fenced delete. */
   leases?: LeaseRow[];
   /**
+   * #1254: `OwnershipReleaseIntent` rows visible to the pending-intent
+   * deferral lookup. Evaluated through the real clause, so a lookup that is
+   * capped or unscoped mis-defers here exactly as it would in the database.
+   */
+  pendingIntents?: Array<{ issueId: string; phase: string }>;
+  /**
    * Runs INSIDE the sweep's decision window — after the claim-epoch snapshot
    * and the live-sibling lookup, before the fenced lease delete. This is the
    * deterministic stand-in for the interleaving the review demanded: a
@@ -333,9 +361,23 @@ function makeSweepClient(options: {
   // row here exactly as it would in the database.
   const leases = options.leases ?? [];
 
-  const leaseFindFirst = vi.fn(async ({ where }: any) => {
+  /**
+   * The lease read, projected onto the columns the caller asked for.
+   *
+   * The projection is honoured because Prisma honours it too: a read that
+   * asks for `retryAfter` and does not get it must look exactly like a read
+   * that never asked for it. A fake that always returned the whole row would
+   * let a production read that forgot the park marker pass its tests.
+   */
+  const leaseFindFirst = vi.fn(async ({ where, select }: any) => {
     const matched = leases.find((lease) => matchesWhere(lease as unknown as Record<string, unknown>, where));
-    return matched ? { ...matched } : null;
+    if (!matched) return null;
+    if (!select) return { ...matched };
+    const projected: Record<string, unknown> = {};
+    for (const [key, wanted] of Object.entries(select as Record<string, unknown>)) {
+      if (wanted) projected[key] = (matched as unknown as Record<string, unknown>)[key];
+    }
+    return projected;
   });
 
   // The parked-claim read: the sweep asks which claims carry a running wait
@@ -360,11 +402,41 @@ function makeSweepClient(options: {
     agentWorkHistory: { create: vi.fn().mockResolvedValue({ id: "h-1" }) },
     issue,
     issueLifecycleEvent,
+    // #1254: a REAL Prisma interactive-transaction client DOES expose
+    // `$transaction` (Prisma only denies `$connect`/`$disconnect`/`$on`/
+    // `$use`/`$extends`). The fake mirrors production here, so a callee that
+    // opens a NESTED interactive transaction inside the fenced region — which
+    // in production would savepoint the release's evidence row under
+    // Prisma's default 5s timeout — fails the test loudly instead of
+    // silently taking the non-transactional branch.
+    $transaction: vi.fn(async () => {
+      throw new Error("nested $transaction inside the fenced region");
+    }),
+  };
+
+  // #1254: the sweep defers to pending reconciler release intents. Evaluated
+  // faithfully through the production clause (with `take`/`select` honored),
+  // so a capped or unscoped lookup mis-defers here exactly as in the database.
+  const intentRows = options.pendingIntents ?? [];
+  const ownershipReleaseIntentFindMany = vi.fn(async ({ where, take, select }: any) => {
+    let matched = intentRows.filter((row) => matchesWhere(row as unknown as Record<string, unknown>, where));
+    if (typeof take === "number") matched = matched.slice(0, take);
+    return select ? matched.map((row) => ({ issueId: row.issueId })) : matched.map((row) => ({ ...row }));
+  });
+
+  // #1254: the pool client and the interactive transaction's client are
+  // DISTINCT surfaces in production, so the fake keeps them distinct: a test
+  // can then tell whether the release's local writes joined the fenced
+  // transaction or went around it through the pool client.
+  const clientIssue = {
+    update: vi.fn(async () => null),
+    findUnique: vi.fn(async () => null),
   };
 
   const client = {
     agentWork: { findMany: agentWorkFindMany },
-    issue,
+    ownershipReleaseIntent: { findMany: ownershipReleaseIntentFindMany },
+    issue: clientIssue,
     issueLifecycleEvent,
     lease: tx.lease,
     agentWorkHistory: tx.agentWorkHistory,
@@ -377,7 +449,12 @@ function makeSweepClient(options: {
     $transaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
   } as unknown as StaleWorkClient;
 
-  return { client, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases };
+  // #1254: the fenced remote write hands its transaction client to the
+  // callback, so the release's own local writes join the same fake
+  // transaction instead of opening one of their own.
+  guard.tx.current = tx;
+
+  return { client, tx, clientIssue, eventRows, auditRows, leaseDeleteMany, leaseFindFirst, agentWorkFindFirst, candidateClauses, rows, leases, ownershipReleaseIntentFindMany };
 }
 
 function makeWork(overrides: Partial<WorkRow> = {}): WorkRow {
@@ -406,6 +483,120 @@ beforeEach(() => {
   vi.clearAllMocks();
   guard.reset();
   removeIssueLabelMock.mockResolvedValue(undefined);
+});
+
+describe("sweepStaleWork — §8.7 override pre-write re-check (#1254)", () => {
+  it("does not release a claim when the sweep's guard was superseded before the lease delete", async () => {
+    const work = makeWork();
+    const { client, leaseDeleteMany, auditRows } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+
+    // A maintainer force-claim takes the sweep's guard right before the sweep's
+    // lease delete: the re-check must stop the release in its tracks.
+    guard.checks.value = false;
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(0);
+    expect(report.claimRetained).toBe(0);
+    expect(report.skipped).toBe(1);
+    // No lease delete, no label removal: the override's claim owns the issue.
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    // The row was restored to the shape the sweep found it in.
+    expect(work.state).toBe("CLAIMED");
+    expect(work.staleClaimReleasePending).toBe(false);
+    // #1254: the guard loss is audited — a skipped release must be visible.
+    const superseded = auditRows.filter((row: any) => row.action === "stale_agentwork_release_superseded");
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].success).toBe(false);
+    expect(superseded[0].actor).toBe("system");
+    expect(superseded[0].issueNumber).toBe(42);
+    expect(superseded[0].issueId).toBe("issue-1");
+    expect(superseded[0].errorMessage).toContain("before the lease delete");
+  });
+
+  it("does not strip the label when the guard is lost after the mark commits, before the remote release", async () => {
+    // The second tripwire: the mark + lease delete committed while the sweep
+    // still owned the guard; a force-claim lands before the remote
+    // releaseIssueClaim. The remote label write must not run — the row keeps
+    // its pending-release marker so the next sweep (or the force-claim's own
+    // receipt) converges.
+    const work = makeWork();
+    const { client, leaseDeleteMany, auditRows } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+    const originalDeleteMany = leaseDeleteMany.getMockImplementation();
+    leaseDeleteMany.mockImplementation(((...args: unknown[]) => {
+      guard.checks.value = false; // the override wins right after the delete
+      return (originalDeleteMany as (...a: unknown[]) => unknown)(...args);
+    }) as typeof leaseDeleteMany);
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    // The mark stays (with its pending-release marker) for the retry arm.
+    expect(work.state).toBe("STALE");
+    expect(work.staleClaimReleasePending).toBe(true);
+    // #1254: the guard loss is audited — a skipped remote release must be
+    // visible, not silent.
+    const superseded = auditRows.filter((row: any) => row.action === "stale_agentwork_release_superseded");
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].success).toBe(false);
+    expect(superseded[0].errorMessage).toContain("skipped the remote label release");
+  });
+
+  it("releases the claim normally when the sweep still holds the guard (control)", async () => {
+
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    expect(report.claimRetained).toBe(0);
+    expect(leaseDeleteMany).toHaveBeenCalledTimes(1);
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+  });
+
+  it("runs the release's local writes inside the fenced transaction — never a nested one (#1254 review)", async () => {
+    // The release hands `releaseIssueClaim` a client. If that client exposed
+    // `$transaction` (a real Prisma interactive-transaction client DOES),
+    // the release would open a NESTED interactive transaction inside the
+    // fenced region — a savepoint under Prisma's default 5s timeout — and
+    // the release's cache mirror and its `claim_released` evidence row could
+    // roll back while the GitHub removal stands. The thin client the release
+    // receives has no `$transaction`, so the local writes join the fenced
+    // transaction instead.
+    const work = makeWork();
+    const { client, tx, clientIssue, eventRows } = makeSweepClient({
+      candidates: [work],
+      rows: [work],
+      leases: [makeLease()],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report.released).toBe(1);
+    // The cache mirror and the evidence row went through the FENCED
+    // transaction's client...
+    expect(tx.issue.update).toHaveBeenCalled();
+    expect(eventRows.filter((row) => row.kind === "claim_released")).toHaveLength(1);
+    // ...and NOT through the pool client, and no callee opened a nested
+    // interactive transaction (the fake's `$transaction` throws if it does).
+    expect(clientIssue.update).not.toHaveBeenCalled();
+    expect(tx.$transaction).not.toHaveBeenCalled();
+  });
 });
 
 describe("sweepStaleWork — one claim_released per claim epoch (#1202 review)", () => {
@@ -883,6 +1074,91 @@ describe("sweepStaleWork — a stale row never releases a claim a live sibling o
   });
 });
 
+describe("sweepStaleWork — retry arm refuses a claim that postdates the mark (#1359)", () => {
+  const retryRow = () =>
+    makeWork({
+      state: "STALE",
+      staleClaimReleasePending: true,
+      lastHeartbeatAt: minutesAgo(30),
+      leaseExpiresAt: minutesAgo(25),
+    });
+
+  it("retains a same-agent lease created after the mark without releasing its label", async () => {
+    const row = retryRow();
+    const lease = makeLease({ claimToken: "token-new-claim", createdAt: new Date() });
+    const { client, eventRows, auditRows, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ released: 0, claimRetained: 1, leasesReleased: 0, skipped: 0 });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toEqual([lease]);
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(eventRows.filter((event) => event.kind === "claim_released")).toHaveLength(0);
+    expect(row).toMatchObject({ state: "STALE", staleClaimReleasePending: false });
+    const audit = auditRows.find((entry) => entry.action === "stale_agentwork_claim_retained");
+    expect(audit).toBeDefined();
+    expect(audit?.notes).toContain("newer claim incarnation landed after the row's stale mark (#1359)");
+  });
+
+  it("retires the row: the next sweep does not pick a refused row up again", async () => {
+    const row = retryRow();
+    const lease = makeLease({ claimToken: "token-new-claim", createdAt: new Date() });
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+    });
+
+    await sweepStaleWork(client);
+    const second = await sweepStaleWork(client);
+
+    // The refusal retired the row (STALE, marker down): it matches no
+    // candidate arm any more — the newer incarnation's lease would otherwise
+    // be re-judged every sweep forever — and the lease stays untouched.
+    expect(second).toMatchObject({ examined: 0, released: 0, claimRetained: 0, skipped: 0 });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toEqual([lease]);
+  });
+
+  it("completes the owed release when retry finds no lease", async () => {
+    const row = retryRow();
+    const { client, eventRows, leaseDeleteMany } = makeSweepClient({ candidates: [row], rows: [row], leases: [] });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ released: 1, claimRetained: 0, skipped: 0, leasesReleased: 0 });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(REPO, 42, "agent/alpha");
+    expect(eventRows.filter((event) => event.kind === "claim_released")).toHaveLength(1);
+    expect(row.staleClaimReleasePending).toBe(false);
+  });
+
+  it("skips a retry row when a park appears after the parked-claim filter", async () => {
+    const row = retryRow();
+    const lease = makeLease();
+    const { client, leaseDeleteMany, leases } = makeSweepClient({
+      candidates: [row],
+      rows: [row],
+      leases: [lease],
+      afterParkFilter: () => {
+        lease.retryAfter = minutesAhead(40);
+      },
+    });
+
+    const report = await sweepStaleWork(client);
+
+    expect(report).toMatchObject({ released: 0, claimRetained: 0, skipped: 1 });
+    expect(row).toMatchObject({ state: "STALE", staleClaimReleasePending: true });
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(leases).toEqual([lease]);
+  });
+});
+
 // ─── Fence + claim-epoch protection (#1251 review, TOCTOU blocker) ───────────
 //
 // The live-sibling lookup alone is a check, not a fence: a renewal or fresh
@@ -1316,6 +1592,83 @@ describe("sweepStaleWork — leasesReleased accounting (#1317)", () => {
     expect(report.claimRetained).toBe(1);
     expect(report.leasesReleased).toBe(1);
     expect(leases).toHaveLength(0);
+  });
+});
+
+describe("sweepStaleWork — defers to pending reconciler release intents (#1254)", () => {
+  it("skips a candidate whose issue has a pending release intent: no lease delete, no label release", async () => {
+    const work = makeWork();
+    const { client, auditRows, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      pendingIntents: [{ issueId: "issue-1", phase: "pending" }],
+    });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.skipped).toBe(1);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabel).not.toHaveBeenCalled();
+    expect(auditRows).toHaveLength(0);
+  });
+
+  it("still releases candidates whose issues have no pending intent", async () => {
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({ candidates: [work], leases: [makeLease()] });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.released).toBe(1);
+    expect(leaseDeleteMany).toHaveBeenCalled();
+  });
+
+  it("ignores superseded intents: only pending ones defer the sweep", async () => {
+    const work = makeWork();
+    const { client, leaseDeleteMany } = makeSweepClient({
+      candidates: [work],
+      leases: [makeLease()],
+      pendingIntents: [{ issueId: "issue-1", phase: "superseded" }],
+    });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.released).toBe(1);
+    expect(leaseDeleteMany).toHaveBeenCalled();
+  });
+
+  it("review round 4: defers a candidate whose intent sits behind 500+ unrelated pending intents", async () => {
+    // The regression: a capped global pending-intent read drops intents beyond
+    // the window and the sweep releases a claim whose reconciler intent is
+    // still live (two writers, one claim). The candidate's intent is seeded
+    // LAST among 600 unrelated ones, so any read capped below that misses it.
+    const work = makeWork();
+    const noise = Array.from({ length: 600 }, (_, i) => ({
+      issueId: `issue-noise-${i}`,
+      phase: "pending",
+    }));
+    const { client, leaseDeleteMany, ownershipReleaseIntentFindMany } = makeSweepClient({
+      candidates: [work],
+      leases: [makeLease()],
+      pendingIntents: [...noise, { issueId: "issue-1", phase: "pending" }],
+    });
+
+    const report = await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(report.skipped).toBe(1);
+    expect(leaseDeleteMany).not.toHaveBeenCalled();
+    expect(removeIssueLabel).not.toHaveBeenCalled();
+    // And the lookup is scoped to the candidate ids, not a capped global scan.
+    const query = ownershipReleaseIntentFindMany.mock.calls[0]?.[0] as any;
+    expect(query.where.issueId).toEqual({ in: ["issue-1"] });
+    expect(query.take).toBeUndefined();
+  });
+
+  it("issues no intent query at all when no candidate is issue-scoped", async () => {
+    const work = makeWork({ issueId: null as unknown as string });
+    const { client, ownershipReleaseIntentFindMany } = makeSweepClient({ candidates: [work] });
+
+    await sweepStaleWork(client as unknown as StaleWorkClient);
+
+    expect(ownershipReleaseIntentFindMany).not.toHaveBeenCalled();
   });
 });
 
