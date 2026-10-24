@@ -730,8 +730,7 @@ describe("resolvePrFixFromAgentReport", () => {
     };
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
     // Stateful write: the release re-reads the row AFTER the settlement
-    // landed, so the mock must show the settled status (the unfenced
-    // fallback only releases non-QUEUED rows).
+    // landed, so the mock tracks the writes as they land.
     (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
       Object.assign(row, data);
       return { count: 1 };
@@ -741,7 +740,7 @@ describe("resolvePrFixFromAgentReport", () => {
       outcome: "blocked",
       summary: "the spec is ambiguous about retry semantics",
       agentName: "fixer",
-      attempt: ATTEMPT,
+      attempt: { ...ATTEMPT, handoutToken: "hnd_aabbccddeeff" },
     }));
 
     expect(result.matched).toBe(true);
@@ -781,8 +780,7 @@ describe("resolvePrFixFromAgentReport", () => {
       attemptEvidenceWatermark: "watermark-1",
     };
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
-    // Stateful write: the release re-reads the row AFTER the settlement
-    // landed (the unfenced fallback only releases non-QUEUED rows).
+    // Stateful write: the release re-reads the row AFTER the settlement landed.
     (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
       Object.assign(row, data);
       return { count: 1 };
@@ -792,7 +790,7 @@ describe("resolvePrFixFromAgentReport", () => {
       outcome: "blocked",
       summary: "repeated no-progress runs",
       agentName: "fixer",
-      attempt: ATTEMPT,
+      attempt: { ...ATTEMPT, handoutToken: "hnd_aabbccddeeff" },
     }));
 
     expect(result.matched).toBe(true);
@@ -872,7 +870,7 @@ describe("resolvePrFixFromAgentReport", () => {
       blockReason: "human_decision",
       summary: "the spec is ambiguous about retry semantics",
       agentName: "fixer",
-      attempt: ATTEMPT,
+      attempt: { ...ATTEMPT, handoutToken: "hnd_aabbccddeeff" },
     }));
 
     expect(result.matched).toBe(true);
@@ -1027,10 +1025,13 @@ describe("resolvePrFixFromAgentReport", () => {
     });
   });
 
-  // #1340 review: the no-token migration-window fallback releases only settled
-  // rows. When the settlement itself lost its pinned write, the row is still
-  // QUEUED — an unfenced release must not clear a live hand-out there.
-  it("skips the unfenced release when a no-token blocked report loses its settlement on a QUEUED row (#1340 review)", async () => {
+  // #1340 review (round 2, after courier#516/#523 shipped the token echo on
+  // every followup-pr report): the release is fenced to the exact issuance
+  // ONLY. A report without the echoed handoutToken authorizes no release —
+  // even when its settlement lands on a settled row, the agent's hand-out
+  // entries stay untouched (fail closed; they clear on the next generation
+  // change).
+  it("releases nothing when a no-token blocked report settles (fenced-only release, #1340 review)", async () => {
     const row = {
       ...FIXTURE_ITEM,
       agentHandouts: ["fixer@1"],
@@ -1040,8 +1041,11 @@ describe("resolvePrFixFromAgentReport", () => {
       dispatchedAt: "2026-01-01T00:02:00.000Z",
     };
     (prisma.prFixQueueItem.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(row);
-    // The settlement's pinned write loses its race: nothing landed.
-    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+    // Stateful write: the settlement lands; the release must not follow.
+    (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: any) => {
+      Object.assign(row, data);
+      return { count: 1 };
+    });
 
     const result = await resolvePrFixFromAgentReport(baseInput({
       outcome: "blocked",
@@ -1050,9 +1054,11 @@ describe("resolvePrFixFromAgentReport", () => {
       attempt: ATTEMPT,
     }));
 
-    expect(result.action).toBe("skipped");
-    // No release-shaped write (one pinning the hand-out arrays) was attempted:
-    // the row never left QUEUED, so the unfenced fallback refuses it.
+    // The settlement itself still lands (PARKED) — only the release is refused.
+    expect(result.action).toBe("parked");
+    // Exactly one write: the settlement. No release-shaped write (one pinning
+    // the hand-out arrays) was attempted, settled row or not.
+    expect(prisma.prFixQueueItem.updateMany).toHaveBeenCalledTimes(1);
     const writes = (prisma.prFixQueueItem.updateMany as ReturnType<typeof vi.fn>).mock.calls.map((c: any) => c[0]);
     expect(writes.every((w: any) => w.data?.agentHandouts === undefined)).toBe(true);
     expect(row.agentHandouts).toEqual(["fixer@1"]);

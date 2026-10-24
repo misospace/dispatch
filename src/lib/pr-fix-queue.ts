@@ -3450,20 +3450,18 @@ export function agentAlreadyHanded(
  * row — they only gate dispatch while the item is QUEUED at that
  * generation, and the next generation change clears them.
  *
- * Fencing (#1340 review, mirroring #1256): when the report echoes the issued
- * `handoutToken`, the release is authorized ONLY by the exact live receipt —
- * (agent, generation, token) must all match. A rotated/reclaimed/released
- * token has no authority over the current issuance, so a stale same-agent
- * report can never remove a newer live hand-out; a mismatch releases nothing.
- * A report without a token (Courier's `blocked` reports do not echo one yet —
- * tracked as a courier-side follow-up) falls back to (agent, generation)
- * matching, authorized by the identity-bound report route, but ONLY against a
- * settled (non-QUEUED) row: on a still-QUEUED row the report's settlement did
- * not land, and an unfenced release could clobber a re-issued live hand-out —
- * exactly what the token fence exists to prevent. On a settled row the
- * entries are inert (they gate dispatch only while QUEUED), so removing the
- * reporting agent's own entries there is the intended cleanup.
- *
+   * Fencing (#1340 review, mirroring #1256): the release is authorized ONLY by
+   * the exact live receipt — the report must echo the issued `handoutToken`
+   * and the (agent, generation, token) triple must all match. A rotated/
+   * reclaimed/released token has no authority over the current issuance, so a
+   * stale same-agent report can never remove a newer live hand-out; a
+   * mismatch — or a report with no token at all — releases nothing (fail
+   * closed). Courier echoes the token on every `followup-pr` report since
+   * misospace/courier#516 (courier PR #523), so a live settlement always
+   * carries it; the token-less shape stays accepted by the route for legacy
+   * work ids, whose hand-outs predate receipts and settle via the #1074
+   * skip path rather than a release.
+   *
  * Best-effort throughout: the settlement (or the skip decision) is already
  * made, so a failure here only logs and never fails the report.
  */
@@ -3488,23 +3486,13 @@ export async function releaseAgentHandout(
         const parsed = parseAgentHandoutToken(entry);
         return parsed !== null && parsed.agentName === agent && parsed.generation === generation;
       };
-      let remainingReceipts: string[];
-      if (token) {
-        // Exact-issuance fence: the presented receipt must be this agent's
-        // live receipt at this generation (#1256 rule). An unknown, rotated,
-        // or already-released token authorizes nothing.
-        const owned = findHandoutReceipt(receipts, { agentName: agent, generation, token });
-        if (!owned) return;
-        remainingReceipts = receipts.filter((entry) => entry !== owned);
-      } else {
-        // Migration-window fallback (see the doc comment above): only a
-        // settled row may be released unfenced.
-        if (fresh.status === "QUEUED") return;
-        remainingReceipts = receipts.filter((entry) => {
-          const parsed = parseHandoutReceipt(entry);
-          return !(parsed !== null && parsed.agentName === agent && parsed.generation === generation);
-        });
-      }
+      // Exact-issuance fence (#1256 rule): without the echoed token, nothing
+      // is authorized — fail closed. A mismatched, rotated, or already
+      // released receipt authorizes nothing either.
+      if (!token) return;
+      const owned = findHandoutReceipt(receipts, { agentName: agent, generation, token });
+      if (!owned) return;
+      const remainingReceipts = receipts.filter((entry) => entry !== owned);
       const remainingHandouts = handouts.filter((entry) => !isOwnToken(entry));
       const remainingAcks = acks.filter((entry) => !isOwnToken(entry));
       // Nothing for this agent at this generation (or a malformed row) — no
