@@ -198,10 +198,31 @@ export async function POST(request: Request) {
   }
 }
 
+/**
+ * Normalize an operator-supplied identifier for the release path (#1402).
+ *
+ * `AgentWork.agentName`, `Lease.agentName` and the work/lease row ids are
+ * stored in their canonical form, so the request side is the side that can
+ * disagree. The release path keyed every lookup on the raw request value, so
+ * a padded value matched no row: the release freed nothing and the row the
+ * operator named was never the row that was released. Normalizing the input
+ * makes it agree with the stored value, the way the worker paths normalize
+ * their own identifiers (#1328 checkpoint, #1331 finish). A whitespace-only
+ * value is absent, matching those paths — and #1399, which normalizes this
+ * route's `issueId` the same way.
+ */
+function normalizeOperatorIdentifier(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 async function releaseAgentWork(body: Record<string, unknown>) {
-  const workId = typeof body.workId === "string" ? body.workId : null;
-  const leaseId = typeof body.leaseId === "string" ? body.leaseId : null;
-  const agentName = typeof body.agentName === "string" ? body.agentName : null;
+  // #1402: normalize the operator-supplied identifiers so a padded value
+  // matches the value stored on the row (#1399 normalizes `issueId`).
+  const workId = normalizeOperatorIdentifier(body.workId);
+  const leaseId = normalizeOperatorIdentifier(body.leaseId);
+  const agentName = normalizeOperatorIdentifier(body.agentName);
   // #1399: normalize the operator-supplied issue id so a padded value\n  // matches the normalized id stored on the row.\n  const issueId = normalizeIssueId(body.issueId);
   const releaseAll = body.releaseAll === true;
   const reason = typeof body.reason === "string" ? body.reason : "Released by operator";
