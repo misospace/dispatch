@@ -297,6 +297,9 @@ model PrFixQueueItem {
   author                   String?
   history                  PrFixHistory[]
   evidence                 PrFixEvidence[]
+  // #1183: worker executions durably associated to this item's fix rounds
+  // (AgentRun.prFixQueueItemId). SetNull on item deletion keeps run evidence.
+  agentRuns                AgentRun[]
 
   @@unique([repo, pr])
   @@index([status])
@@ -406,6 +409,17 @@ model AgentRun {
   createdAt        DateTime  @default(now())
   issueId          String?
   issue            Issue?    @relation(fields: [issueId], references: [id])
+  // #1183: durable run→fix-round association. Stamped by tasks/report ONLY
+  // after the report's (id, generation) attempt token was verified against
+  // the queue item (item exists, repo/PR match, generation within the item's
+  // issued range). Null for every run that never carried a verified PR-fix
+  // attempt token — that absence is the honest fact, not a hidden bug.
+  // The pair (prFixQueueItemId, prFixGeneration) is the attempt identity the
+  // worker was issued; the chain projects the run into the fix round keyed by
+  // that generation, never a timestamp guess.
+  prFixQueueItemId String?
+  prFixGeneration  Int?
+  prFixQueueItem   PrFixQueueItem? @relation(fields: [prFixQueueItemId], references: [id], onDelete: SetNull)
 
   // Escalated lane outcome tracking
   outcome       EscalatedOutcome?
@@ -418,6 +432,9 @@ model AgentRun {
   @@index([createdAt])
   // #1183: the attempt-chain read resolves an issue's run evidence by issueId.
   @@index([issueId])
+  // #1183: the attempt-chain read also fetches runs by their fix-round
+  // association (the queue items of this issue), so the FK is indexed.
+  @@index([prFixQueueItemId])
 }
 
 enum EscalatedOutcome {

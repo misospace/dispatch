@@ -114,36 +114,41 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
       events,
     );
 
-    // Bounded attempt evidence (#1183): the runs attached to this issue
-    // (capped at MAX_ATTEMPT_RUNS) and the PR-fix items matching this item's
+    // Bounded attempt evidence (#1183): the PR-fix items matching this item's
     // exact (repo, issue) coordinates — the filter is bounded to the linked
     // PRs (one row per PR), each item's history capped at the OLDEST 100
-    // entries per item (asc order). Both feeds are plain data for the pure
+    // entries per item (asc order) — and the runs attached to this issue OR
+    // durably associated to one of those items' fix rounds (#1183 review:
+    // a followup-pr run may not carry an issueId; its prFixQueueItemId stamp
+    // is what pulls its evidence into this item's chain). The run read is
+    // capped at MAX_ATTEMPT_RUNS. Both feeds are plain data for the pure
     // projection; neither read can expand into a full-history scan.
-    const [runRows, prFixRows] = await Promise.all([
-      prisma.agentRun.findMany({
-        where: { issueId },
-        orderBy: { startedAt: "asc" },
-        take: MAX_ATTEMPT_RUNS + 1,
-        select: {
-          id: true,
-          agentName: true,
-          runType: true,
-          status: true,
-          startedAt: true,
-          finishedAt: true,
-          executionMetadata: true,
-        },
-      }),
-      prisma.prFixQueueItem.findMany({
-        // Queue writes fold repo through normalizeQueueRepo (#1145);
-        // Repository.fullName keeps caller casing, so reads must fold too.
-        where: { repo: normalizeQueueRepo(issue.repository.fullName), issue: issue.number },
-        // Secondary `id` key: with >100 rows tied on `at` at the cap boundary,
-        // a lone `at` order would leave WHICH row survives DB-nondeterministic.
-        include: { history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: MAX_ATTEMPT_HISTORY + 1 } },
-      }),
-    ]);
+    const prFixRows = await prisma.prFixQueueItem.findMany({
+      // Queue writes fold repo through normalizeQueueRepo (#1145);
+      // Repository.fullName keeps caller casing, so reads must fold too.
+      where: { repo: normalizeQueueRepo(issue.repository.fullName), issue: issue.number },
+      // Secondary `id` key: with >100 rows tied on `at` at the cap boundary,
+      // a lone `at` order would leave WHICH row survives DB-nondeterministic.
+      include: { history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: MAX_ATTEMPT_HISTORY + 1 } },
+    });
+    const runRows = await prisma.agentRun.findMany({
+      where: {
+        OR: [{ issueId }, { prFixQueueItemId: { in: prFixRows.map((row) => row.id) } }],
+      },
+      orderBy: { startedAt: "asc" },
+      take: MAX_ATTEMPT_RUNS + 1,
+      select: {
+        id: true,
+        agentName: true,
+        runType: true,
+        status: true,
+        startedAt: true,
+        finishedAt: true,
+        executionMetadata: true,
+        prFixQueueItemId: true,
+        prFixGeneration: true,
+      },
+    });
     const attemptsTruncated = runRows.length > MAX_ATTEMPT_RUNS;
     const attemptsRunRows = attemptsTruncated ? runRows.slice(0, MAX_ATTEMPT_RUNS) : runRows;
 
@@ -158,6 +163,8 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
         typeof row.executionMetadata === "object" && row.executionMetadata !== null
           ? (row.executionMetadata as Record<string, unknown>)
           : null,
+      prFixQueueItemId: row.prFixQueueItemId,
+      prFixGeneration: row.prFixGeneration,
     }));
     const prFixItems: WorkAttemptPrFixItemRecord[] = prFixRows.map((row) => ({
       id: row.id,

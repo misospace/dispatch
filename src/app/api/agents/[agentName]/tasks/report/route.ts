@@ -5,7 +5,12 @@ import { errorResponse, handleApiError } from "@/lib/api-errors";
 import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse, getBoundWorkerAgent } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
-import { resolvePrFixFromAgentReport, MAX_EVIDENCE_LENGTH, type ResolvePrFixFromAgentReportResult } from "@/lib/pr-fix-queue";
+import {
+  resolvePrFixFromAgentReport,
+  normalizeQueueRepo,
+  MAX_EVIDENCE_LENGTH,
+  type ResolvePrFixFromAgentReportResult,
+} from "@/lib/pr-fix-queue";
 import { isValidPrFixOutcome, VALID_PR_FIX_OUTCOMES, type PrFixDecisionContext } from "@/types";
 import {
   resolveAlreadyDoneFromAgentReport,
@@ -144,6 +149,41 @@ async function resolveIssueId(
   });
 
   return issue?.id ?? null;
+}
+
+/**
+ * Durable run→fix-round association (#1183 review): verify the echoed
+ * (id, generation) attempt token against real queue state before stamping it
+ * on the AgentRun. Authority for the STAMP is identity agreement — the item
+ * exists, its queue-normalized repo/PR matches the report's coordinates, and
+ * the generation is one the item actually reached (1..item.generation: a
+ * superseded generation still names a round that really ran; a future one is
+ * fail-closed rejected as a forged identity). Settlement authority stays
+ * separate: the resolver still requires the hand-out token to mutate the
+ * queue. The stamp records which fix round the execution claims to have
+ * implemented, never a timestamp guess.
+ */
+async function verifyPrFixAttemptIdentity(
+  prFixItem: { id: string; generation: number } | null | undefined,
+  repoFullName: string | undefined,
+  pullRequestNumber: number | undefined,
+): Promise<{ itemId: string; generation: number } | null> {
+  if (!prFixItem) return null;
+  if (!repoFullName) return null;
+  if (typeof pullRequestNumber !== "number" || !Number.isInteger(pullRequestNumber)) {
+    return null;
+  }
+  const item = await prisma.prFixQueueItem.findUnique({
+    where: { id: prFixItem.id },
+    select: { id: true, repo: true, pr: true, generation: true },
+  });
+  if (!item) return null;
+  // Queue writes fold repo through normalizeQueueRepo (#1145); compare folded.
+  if (item.repo !== normalizeQueueRepo(repoFullName) || item.pr !== pullRequestNumber) {
+    return null;
+  }
+  if (prFixItem.generation > item.generation) return null;
+  return { itemId: item.id, generation: prFixItem.generation };
 }
 
 /**
@@ -598,6 +638,14 @@ export async function POST(
     // Build touched URLs
     const touchedIssueUrls = buildTouchedUrls(report);
 
+    // #1183: durable run→fix-round association. Stamped at creation when a
+    // followup-pr report carries an attempt token whose (id, generation)
+    // matches real queue state; every other report leaves it null.
+    const prFixAttemptIdentity =
+      report.taskType === "followup-pr"
+        ? await verifyPrFixAttemptIdentity(prFixItem, report.repoFullName, report.pullRequestNumber)
+        : null;
+
     // Persist AgentRun
     const runData = {
       agentName,
@@ -613,6 +661,14 @@ export async function POST(
       // #1183: persisted only when the worker supplied a non-empty validated
       // bag; absent stays null (additive, backward compatible).
       ...(executionMetadata ? { executionMetadata } : {}),
+      // #1183: fix-round association persisted only when the attempt token
+      // matched real queue state; absent/null identity stays null.
+      ...(prFixAttemptIdentity
+        ? {
+            prFixQueueItemId: prFixAttemptIdentity.itemId,
+            prFixGeneration: prFixAttemptIdentity.generation,
+          }
+        : {}),
     };
 
     let run: { id: string };

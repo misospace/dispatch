@@ -56,6 +56,18 @@ export interface WorkAttemptRunRecord {
   startedAt: Date | string;
   finishedAt: Date | string | null;
   executionMetadata: Record<string, unknown> | null;
+  /**
+   * Durable run→fix-round association (#1183 review): the queue item and
+   * generation whose hand-out token this run's report carried, verified
+   * against real queue state at the report boundary. A run that carries it
+   * is attributed to that item's fix round — and ONLY that round: it is
+   * never attributed to an execution attempt by time overlap. Runs without
+   * the association (issue work, or pre-association history) keep the
+   * window join and are never attributed to a fix round (no timestamp
+   * guessing).
+   */
+  prFixQueueItemId?: string | null;
+  prFixGeneration?: number | null;
 }
 
 export interface WorkAttemptHistoryRecord {
@@ -529,8 +541,8 @@ export function buildWorkItemDeliveryChain(
   // different content) keep the first row in content order so the result
   // stays order-invariant.
   const sortedRuns = [...inputs.runs].sort((a, b) =>
-    contentKey([a.id, a.agentName, a.runType, a.status, toMillis(a.startedAt), toMillis(a.finishedAt), a.executionMetadata]) <
-    contentKey([b.id, b.agentName, b.runType, b.status, toMillis(b.startedAt), toMillis(b.finishedAt), b.executionMetadata])
+    contentKey([a.id, a.agentName, a.runType, a.status, toMillis(a.startedAt), toMillis(a.finishedAt), a.executionMetadata, a.prFixQueueItemId, a.prFixGeneration]) <
+    contentKey([b.id, b.agentName, b.runType, b.status, toMillis(b.startedAt), toMillis(b.finishedAt), b.executionMetadata, b.prFixQueueItemId, b.prFixGeneration])
       ? -1
       : 1,
   );
@@ -637,13 +649,20 @@ export function buildWorkItemDeliveryChain(
     // time alone. The top-level totalExecutionWallTimeMs stays the item-wide
     // union of every run interval regardless. Matched runs are ordered by
     // start (then id) so the metadata union is order-invariant.
+    //
+    // A run carrying a durable fix-round association (#1183 review) is
+    // excluded from this time join entirely: it is fix-round evidence by its
+    // verified (item, generation) identity, and a PR-fix execution crossing a
+    // claim's time window must never be read as that claim's issue work.
     const claimAgentForRuns = claim.row.agentName;
     const matched = runIntervals
       .filter(
         ({ run, start, end }) =>
-          start <= windowEnd &&
-          end >= windowStart &&
-          !(claimAgentForRuns !== null && run.agentName !== null && run.agentName !== claimAgentForRuns),
+          run.prFixQueueItemId === null || run.prFixQueueItemId === undefined
+            ? start <= windowEnd &&
+              end >= windowStart &&
+              !(claimAgentForRuns !== null && run.agentName !== null && run.agentName !== claimAgentForRuns)
+            : false,
       )
       .sort((a, b) => a.start - b.start || (a.run.id < b.run.id ? -1 : a.run.id > b.run.id ? 1 : 0));
 
@@ -759,9 +778,13 @@ export function buildWorkItemDeliveryChain(
   // exactly one round per generation 1..item.generation. `fixAttempts` is the
   // worker-execution count (#1103), not a work identity, and must never
   // fabricate extra rounds. The history stream carries no generation
-  // attribution, so a fix round's claim time and agent stay unknown — never
-  // guessed from queue or history timestamps. The attemptId keys off the
-  // item id, which stays unique even when two items share the same repo#pr.
+  // attribution, so a fix round's CLAIM time stays unknown — never guessed
+  // from queue or history timestamps. Run evidence is attached only through
+  // the durable (item, generation) association verified at the report
+  // boundary (#1183 review): those runs supply the round's agent, timing,
+  // metadata, and artifact ids; unstamped runs are never attached by time.
+  // The attemptId keys off the item id, which stays unique even when two
+  // items share the same repo#pr.
   const sortedItems = [...inputs.prFixItems].sort((a, b) =>
     contentKey([a.repo, a.pr, a.id]) < contentKey([b.repo, b.pr, b.id]) ? -1 : 1,
   );
@@ -782,8 +805,37 @@ export function buildWorkItemDeliveryChain(
       addNote(`pr-fix item ${item.repo}#${item.pr} queuedAt unparseable`);
     }
 
+    // Stamped runs bucket by their VERIFIED generation (#1183 review): a
+    // run's report carried this item's (id, generation) attempt token, checked
+    // against real queue state at the report boundary. Rounds are keyed by
+    // that identity only — never by run timestamps, which would guess.
+    const runsByGeneration = new Map<number, typeof runIntervals>();
+    for (const interval of runIntervals) {
+      if (interval.run.prFixQueueItemId !== item.id) continue;
+      const generation = interval.run.prFixGeneration;
+      if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+        addNote(`agent run ${interval.run.id} fix-round generation unusable; not attributed`);
+        continue;
+      }
+      const bucket = runsByGeneration.get(generation);
+      if (bucket) bucket.push(interval);
+      else runsByGeneration.set(generation, [interval]);
+    }
+
     const lastGeneration = item.generation;
     for (let generation = 1; generation <= lastGeneration; generation += 1) {
+      // Deterministic order (start, then id) so the metadata union and the
+      // agentRunIds list never depend on row arrival.
+      const attributed = (runsByGeneration.get(generation) ?? []).sort((a, b) =>
+        a.start - b.start || (a.run.id < b.run.id ? -1 : a.run.id > b.run.id ? 1 : 0),
+      );
+      const fixStartedMs = attributed.length > 0 ? Math.min(...attributed.map((m) => m.start)) : null;
+      const fixEndedMs = attributed.length > 0 ? Math.max(...attributed.map((m) => m.end)) : null;
+      // Single known agent when every attributed run agrees; a mixed set is
+      // left null rather than picking a representative.
+      const fixAgents = new Set(attributed.map((m) => m.run.agentName));
+      const fixAgentName = attributed.length > 0 && fixAgents.size === 1 ? attributed[0].run.agentName : null;
+
       let outcome: WorkItemAttemptOutcome;
       if (generation < lastGeneration) {
         // A newer generation exists on the same item: this round was
@@ -803,16 +855,25 @@ export function buildWorkItemDeliveryChain(
         attempt: {
           attemptId: `fix-${item.id}-g${generation}`,
           kind: "fix-round",
-          agentName: null,
+          agentName: fixAgentName,
           claimedAt: { at: null, provenance: "unknown" },
-          startedAt: null,
-          endedAt: null,
+          startedAt: fixStartedMs !== null ? toIso(fixStartedMs) : null,
+          endedAt: fixEndedMs !== null ? toIso(fixEndedMs) : null,
           reportedAt: null,
           outcome,
-          classification: "unclassified",
-          executionMetadata: emptyExecutionMetadata(),
-          artifacts: { agentRunIds: [], pullRequestNumbers: [] },
-          wallTimeMs: null,
+          classification: attributed.length > 0 ? "active-execution" : "unclassified",
+          executionMetadata:
+            attributed.length > 0
+              ? executionMetadataFromRuns(attributed.map((m) => m.run))
+              : emptyExecutionMetadata(),
+          artifacts: {
+            agentRunIds: attributed.map((m) => m.run.id),
+            pullRequestNumbers: [],
+          },
+          wallTimeMs:
+            attributed.length > 0
+              ? unionLength(attributed.map((m) => ({ start: m.start, end: m.end })))
+              : null,
           prFix: { itemId: item.id, repo: item.repo, pr: item.pr, type: item.type },
         },
         // The round's oldest evidence — its first history entry, else the

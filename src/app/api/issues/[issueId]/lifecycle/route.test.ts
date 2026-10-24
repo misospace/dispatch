@@ -309,6 +309,61 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
     );
   });
 
+  it("fetches stamped fix runs by item id and projects them into their round (#1183 review)", async () => {
+    // A followup-pr report may carry no issueId; its verified
+    // prFixQueueItemId stamp is what pulls its evidence into this item's
+    // chain, and the projection attaches it to the round the stamp names.
+    mocks.prFixItemFindMany.mockResolvedValue([
+      {
+        id: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        issue: 42,
+        generation: 1,
+        fixAttempts: 1,
+        status: "FIXED",
+        outcome: null,
+        type: "CI_FAILURE",
+        queuedAt: new Date("2026-10-01T12:00:00Z"),
+        history: [],
+      },
+    ]);
+    mocks.agentRunFindMany.mockResolvedValue([
+      {
+        id: "run-fix-1",
+        agentName: "agent/alpha",
+        runType: "followup-pr",
+        status: "completed",
+        startedAt: new Date("2026-10-01T12:05:00Z"),
+        finishedAt: new Date("2026-10-01T12:30:00Z"),
+        executionMetadata: { worker: "courier" },
+        prFixQueueItemId: "item-1",
+        prFixGeneration: 1,
+      },
+    ]);
+
+    const body = await (await get()).json();
+    // The read spans both feeds: issue-attached runs OR runs stamped to
+    // this issue's queue items.
+    expect(mocks.agentRunFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          OR: [{ issueId: "issue-1" }, { prFixQueueItemId: { in: ["item-1"] } }],
+        },
+      }),
+    );
+    const round = body.attempts.attempts.find(
+      (a: { attemptId: string }) => a.attemptId === "fix-item-1-g1",
+    );
+    expect(round).toMatchObject({
+      agentName: "agent/alpha",
+      classification: "active-execution",
+      artifacts: { agentRunIds: ["run-fix-1"] },
+      wallTimeMs: 1500000,
+    });
+    expect(round.executionMetadata).toMatchObject({ workerProduct: "courier" });
+  });
+
   it("flags attemptsTruncated when the bounded run read hits its cap", async () => {
     const many = Array.from({ length: 501 }, (_, i) => ({
       id: `run-${i}`,

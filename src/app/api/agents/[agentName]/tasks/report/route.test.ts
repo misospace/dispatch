@@ -101,6 +101,9 @@ vi.mock("@prisma/client", () => ({
 
 vi.mock("@/lib/pr-fix-queue", () => ({
   resolvePrFixFromAgentReport: prFixResolveMock,
+  // Real folding semantics: the route's fix-round stamp verification compares
+  // the queue row's repo against normalizeQueueRepo(repoFullName).
+  normalizeQueueRepo: (repo: string) => repo.trim().toLowerCase(),
   MAX_EVIDENCE_LENGTH: 2000,
 }));
 
@@ -2683,5 +2686,89 @@ describe("POST /api/agents/[agentName]/tasks/report — rate limit", () => {
       { params: Promise.resolve({ agentName: "test-agent" }) },
     );
     expect(res.status).toBe(200);
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — durable run→fix-round association (#1183 review)", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+  });
+
+  const queueRow = { id: "item-9", repo: "org/repo", pr: 10, generation: 3 };
+  const fixReport = {
+    taskType: "followup-pr",
+    outcome: "pr_updated",
+    repoFullName: "Org/Repo",
+    pullRequestNumber: 10,
+  };
+
+  it("stamps the verified (item, generation) pair on the created AgentRun", async () => {
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce(queueRow);
+
+    const res = await postRequest({ ...fixReport, prFixItem: { id: "item-9", generation: 2 } });
+    expect(res.status).toBe(200);
+    expect(prismaMock.prFixQueueItem.findUnique).toHaveBeenCalledWith({
+      where: { id: "item-9" },
+      select: { id: true, repo: true, pr: true, generation: true },
+    });
+    expect(mockAgentRun.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ prFixQueueItemId: "item-9", prFixGeneration: 2 }),
+    });
+  });
+
+  it("stamps a superseded generation (the round really ran), fail-closed on a future one", async () => {
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce(queueRow);
+    await postRequest({ ...fixReport, prFixItem: { id: "item-9", generation: 1 } });
+    expect(mockAgentRun.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ prFixQueueItemId: "item-9", prFixGeneration: 1 }),
+    });
+
+    vi.clearAllMocks();
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce({ ...queueRow, generation: 1 });
+    await postRequest({ ...fixReport, prFixItem: { id: "item-9", generation: 4 } });
+    const data = mockAgentRun.create.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty("prFixQueueItemId");
+    expect(data).not.toHaveProperty("prFixGeneration");
+  });
+
+  it("stamps nothing when the token does not match real queue state", async () => {
+    // Item not found.
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce(null);
+    await postRequest({ ...fixReport, prFixItem: { id: "ghost", generation: 1 } });
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+
+    vi.clearAllMocks();
+    // Repo/PR mismatch against the REPORT coordinates (folded compare).
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce({ ...queueRow, pr: 11 });
+    await postRequest({ ...fixReport, prFixItem: { id: "item-9", generation: 1 } });
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+
+    vi.clearAllMocks();
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce({ ...queueRow, repo: "other/repo" });
+    await postRequest({ ...fixReport, prFixItem: { id: "item-9", generation: 1 } });
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+  });
+
+  it("stamps nothing for issue work (implement) or reports without a token", async () => {
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce(queueRow);
+    await postRequest({
+      taskType: "implement",
+      outcome: "pr_opened",
+      repoFullName: "org/repo",
+      issueNumber: 42,
+      pullRequestNumber: 10,
+    });
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+    // The verification read runs only for followup-pr reports with a token.
+    expect(prismaMock.prFixQueueItem.findUnique).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce(queueRow);
+    await postRequest(fixReport);
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+    expect(prismaMock.prFixQueueItem.findUnique).not.toHaveBeenCalled();
   });
 });

@@ -15,7 +15,10 @@ work item:
 
 - the `IssueLifecycleEvent` rows the timeline already reads (same shape the
   GET route builds),
-- the `AgentRun` rows attached to the issue (capped at 500, oldest first),
+- the `AgentRun` rows attached to the issue **or** durably associated to one
+  of its PR-fix items' fix rounds (capped at 500, oldest first) — a
+  `followup-pr` run may carry no `issueId`; its `prFixQueueItemId` stamp is
+  what pulls its evidence into this item's chain,
 - the `PrFixQueueItem` rows matching the item's exact (repo, issue)
   coordinates — the filter is bounded to the linked PRs (one row per PR),
   each with its history capped at the OLDEST 100 entries per item (asc
@@ -59,7 +62,10 @@ Everything hangs off identity that survives retries and replays:
   (`MERGE_CONFLICT` / `CI_FAILURE` / `REVIEW_FEEDBACK` / `OTHER` — mutable
   across rounds, so it is item context, not per-round truth; per-round
   triggering evidence is distinct in `prFixEvents`). Execution attempts
-  carry `prFix: null`.
+  carry `prFix: null`. A round's worker-execution evidence (agent, timing,
+  artifacts, metadata) comes ONLY from runs carrying the durable run→round
+  association for that exact (item, generation) — see "Fix rounds link their
+  worker runs" below.
 - **Artifacts** = the `AgentRun` ids whose intervals overlap the attempt
   window **and whose agent identity does not contradict the claim's** (see
   "Run attribution is agent-aware"), plus the PR numbers of `pr_merged`
@@ -75,12 +81,12 @@ Each `attempts.attempts[]` entry carries:
 |---|---|
 | `attemptId` | Stable id as above. |
 | `kind` | `"execution"` or `"fix-round"`. |
-| `agentName` | From the claim / closing event or the matched run; `null` when unknown. Fix rounds are `null` — the PR-fix history stream carries no agent attribution. |
+| `agentName` | From the claim / closing event or the matched run; `null` when unknown. Fix rounds carry the single known agent shared by ALL of the round's associated runs; a mixed set is `null` rather than a picked representative — the PR-fix history stream itself carries no agent attribution. |
 | `claimedAt` | `{ at, provenance }` from the claim event: `observed` when at least one observation of the claim was recorded live, `backfilled` when every observation of it is a backfill (see "Dedupe guarantees"). Null means unknown — **never** inferred from the issue's creation time or from run timestamps. |
-| `startedAt` / `endedAt` | Only from `AgentRun` intervals (`startedAt` / `finishedAt`) when a run's interval lies within/overlaps the attempt window **and is attributable to the attempt** (see "Run attribution is agent-aware"); null otherwise. Claim/admission time and actual execution time are different facts and stay distinct: `claimedAt` is admission, these are execution. |
+| `startedAt` / `endedAt` | Only from `AgentRun` intervals (`startedAt` / `finishedAt`): for execution attempts when a run's interval lies within/overlaps the attempt window **and is attributable to the attempt** (see "Run attribution is agent-aware"); for fix rounds from the runs carrying that round's durable association (see "Fix rounds link their worker runs"). Null otherwise. Claim/admission time and actual execution time are different facts and stay distinct: `claimedAt` is admission, these are execution. |
 | `reportedAt` | `occurredAt` of the closing lifecycle event (`attempt_failed` / `completed` / `claim_released`) that ends the attempt; null when open. |
 | `outcome` | See below. Every attempt is preserved with its outcome. |
-| `classification` | `"active-execution"` ONLY when an attributable run interval overlaps the attempt window; `"waiting-review"` when a `claim_released` deliberately retained `status/in-review`; `"unclassified"` otherwise. Conservative by design: queued, waiting-CI, and merge-adjacent states stay unclassified unless explicit evidence says otherwise. |
+| `classification` | `"active-execution"` when an attributable run interval overlaps the attempt window (execution) or a run carries the round's durable association (fix round); `"waiting-review"` when a `claim_released` deliberately retained `status/in-review`; `"unclassified"` otherwise. Conservative by design: queued, waiting-CI, and merge-adjacent states stay unclassified unless explicit evidence says otherwise. |
 | `executionMetadata` | `{ workerProduct, model, reasoningEffort, runtimeRevision, cohortLabel }` normalized from the matched runs' stored execution metadata (keys `worker`, `model`, `reasoningEffort`, `runtimeRevision`, `cohortLabel`). Unknown/missing stays null and is never inferred from timestamps or deployment data. Multiple matched runs union first-non-null-per-field in run order. |
 | `artifacts` | `agentRunIds` + `pullRequestNumbers` as above. |
 | `prFix` | `{ itemId, repo, pr, type }` for fix-round attempts (the PR-fix queue item the round belongs to and its current queue type), `null` for execution attempts. |
@@ -123,6 +129,53 @@ time. With the rule each attempt carries only its own worker's evidence.
 The top-level `totalExecutionWallTimeMs` is unchanged by this rule: it
 remains the item-wide union of **every** run interval, so no execution time
 is lost — only misattribution is prevented.
+
+## Fix rounds link their worker runs (durable association)
+
+The reviewer blocker (#1183 re-review at `aeb2774`): fix rounds must not be
+synthesized shells always carrying `artifacts.agentRunIds: []` — the worker
+execution that actually implemented a generation must be durably linked to
+it, **never guessed from timestamps**.
+
+The link is a persisted pair on `AgentRun`:
+
+- `prFixQueueItemId` + `prFixGeneration` (nullable; FK `SET NULL` on item
+  deletion, so a pruned queue row never erases run evidence).
+
+Writer boundary (`POST /api/agents/[agentName]/tasks/report`): a
+`followup-pr` report echoing the `prFixItem { id, generation }` token that
+next-task issued gets the pair stamped **only after it is verified against
+real queue state**:
+
+| Check | Fail-closed result |
+|---|---|
+| The item id exists | no stamp |
+| The item's queue-normalized repo/PR (`normalizeQueueRepo`, #1145) match the report's coordinates | no stamp |
+| The claimed generation is within `1..item.generation` (a superseded generation still names a round that really ran; a future one is a forged identity) | no stamp |
+
+Stamp authority is identity agreement with the queue, deliberately separate
+from **settlement** authority: settling the item still requires the issued
+hand-out token inside `resolvePrFixFromAgentReport`. The stamp records which
+round the execution claims to have implemented; it never mutates the queue.
+Reports without a verified identity (issue work, legacy token-less reports,
+`already_done` closes, hand-offs) leave the pair null.
+
+Projection rules:
+
+- A run with the pair lands in exactly one round: `fix-<prFixQueueItemId>
+  -g<prFixGeneration>`, and only if that round exists (`generation ≤
+  item.generation`). Rounds never absorb a run by time proximity.
+- A stamped run is **excluded from the execution-attempt time join**: it is
+  fix-round evidence, and a PR-fix execution crossing a claim's window must
+  never be read as that claim's issue work (cross-product / cross-worker
+  leakage guard).
+- A stamped run whose generation is missing or unusable attaches nowhere
+  (with a note); pre-association history stays exactly as before — an empty
+  round shell is the truthful rendering, not a guess.
+- The runs of a round are ordered by `(startedAt, id)`; `agentRunIds`, the
+  metadata union, and timing are order-invariant.
+- Unassociated stamped runs still count in `totalExecutionWallTimeMs` (the
+  item-wide union of every retained run interval).
 
 ## Outcomes
 

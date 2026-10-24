@@ -41,6 +41,8 @@ function run(overrides: Partial<WorkAttemptRunRecord> & { id: string; startedAt:
     status: overrides.status ?? "completed",
     finishedAt: overrides.finishedAt ?? null,
     executionMetadata: overrides.executionMetadata ?? null,
+    prFixQueueItemId: overrides.prFixQueueItemId ?? null,
+    prFixGeneration: overrides.prFixGeneration ?? null,
     ...overrides,
   };
 }
@@ -1123,6 +1125,229 @@ describe("buildWorkItemDeliveryChain", () => {
       const clean = chain({ prFixItems: [prFixItem({ id: "item-1", pr: 7 })] });
       expect(clean.prFixEvents).toEqual([]);
       expect(clean.prFixEventsTruncated).toBe(false);
+    });
+  });
+
+  describe("fix-round attribution via the durable run association (#1183 review)", () => {
+    it("projects a stamped run's ids, agent, timing, and metadata into its round", () => {
+      const result = chain({
+        prFixItems: [prFixItem({ id: "item-1", pr: 7, generation: 1, status: "FIXED" })],
+        runs: [
+          run({
+            id: "run-fix-1",
+            runType: "followup-pr",
+            agentName: "alpha",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            finishedAt: "2026-10-01T12:30:00.000Z",
+            executionMetadata: { worker: "courier", model: "gpt-5.5" },
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 1,
+          }),
+        ],
+      });
+      expect(result.attempts).toHaveLength(1);
+      const round = result.attempts[0];
+      expect(round.attemptId).toBe(fixId("item-1", 1));
+      expect(round.outcome).toBe("success");
+      expect(round.agentName).toBe("alpha");
+      expect(round.classification).toBe("active-execution");
+      expect(round.startedAt).toBe("2026-10-01T12:05:00.000Z");
+      expect(round.endedAt).toBe("2026-10-01T12:30:00.000Z");
+      expect(round.reportedAt).toBeNull();
+      expect(round.claimedAt).toEqual({ at: null, provenance: "unknown" });
+      expect(round.artifacts.agentRunIds).toEqual(["run-fix-1"]);
+      expect(round.wallTimeMs).toBe(1500000);
+      expect(round.executionMetadata.workerProduct).toBe("courier");
+      expect(round.executionMetadata.model).toBe("gpt-5.5");
+      expect(result.totalExecutionWallTimeMs).toBe(1500000);
+    });
+
+    it("routes each generation's runs to its own round, never a timestamp guess", () => {
+      // The g2 run started BEFORE the g1 run finished (overlapping intervals):
+      // only the persisted generation identity separates the rounds.
+      const result = chain({
+        prFixItems: [prFixItem({ id: "item-1", pr: 7, generation: 2, status: "FIXED" })],
+        runs: [
+          run({
+            id: "run-g2",
+            runType: "followup-pr",
+            agentName: "beta",
+            startedAt: "2026-10-01T12:10:00.000Z",
+            finishedAt: "2026-10-01T12:20:00.000Z",
+            executionMetadata: { worker: "beta-harness" },
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 2,
+          }),
+          run({
+            id: "run-g1",
+            runType: "followup-pr",
+            agentName: "alpha",
+            startedAt: "2026-10-01T12:00:00.000Z",
+            finishedAt: "2026-10-01T12:25:00.000Z",
+            executionMetadata: { worker: "courier" },
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 1,
+          }),
+          // Unstamped and fully inside the g1 round's interval: a PR-fix run
+          // is NEVER attached by time alone.
+          run({
+            id: "run-unstamped",
+            runType: "followup-pr",
+            agentName: "alpha",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            finishedAt: "2026-10-01T12:06:00.000Z",
+          }),
+        ],
+      });
+      const rounds = new Map(result.attempts.map((a) => [a.attemptId, a]));
+      const g1 = rounds.get(fixId("item-1", 1));
+      const g2 = rounds.get(fixId("item-1", 2));
+      expect(g1?.artifacts.agentRunIds).toEqual(["run-g1"]);
+      expect(g1?.agentName).toBe("alpha");
+      expect(g1?.outcome).toBe("superseded");
+      expect(g2?.artifacts.agentRunIds).toEqual(["run-g2"]);
+      expect(g2?.agentName).toBe("beta");
+      expect(g2?.executionMetadata.workerProduct).toBe("beta-harness");
+      expect(g2?.outcome).toBe("success");
+      // The unstamped run rides no round but still counts in the item union.
+      expect(result.totalExecutionWallTimeMs).toBe(1500000);
+    });
+
+    it("never leaks a stamped run into another item's round or an execution attempt", () => {
+      const betaClaim = event({ kind: "claim", agentName: "beta", occurredAt: "2026-10-01T12:10:00.000Z" });
+      const result = chain({
+        events: [betaClaim],
+        prFixItems: [
+          prFixItem({ id: "item-1", pr: 7, generation: 1 }),
+          prFixItem({ id: "item-2", pr: 8, generation: 1 }),
+        ],
+        runs: [
+          run({
+            id: "run-fix-item1",
+            runType: "followup-pr",
+            agentName: "alpha",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            finishedAt: "2026-10-01T12:30:00.000Z",
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 1,
+          }),
+        ],
+      });
+      const rounds = new Map(result.attempts.map((a) => [a.attemptId, a]));
+      expect(rounds.get(fixId("item-1", 1))?.artifacts.agentRunIds).toEqual(["run-fix-item1"]);
+      // Same product, different item: no leak.
+      expect(rounds.get(fixId("item-2", 1))?.artifacts.agentRunIds).toEqual([]);
+      // A claim whose window fully contains the fix run must not inherit it:
+      // stamped runs are fix-round evidence only, never window evidence.
+      const execAttempt = rounds.get(execId(betaClaim));
+      expect(execAttempt?.artifacts.agentRunIds).toEqual([]);
+      expect(execAttempt?.classification).toBe("unclassified");
+      expect(execAttempt?.startedAt).toBeNull();
+    });
+
+    it("keeps a stamped run with an unissued or unusable generation out of every round", () => {
+      const result = chain({
+        prFixItems: [prFixItem({ id: "item-1", pr: 7, generation: 1 })],
+        runs: [
+          run({
+            id: "run-future-gen",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 3,
+          }),
+          run({
+            id: "run-null-gen",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            prFixQueueItemId: "item-1",
+            prFixGeneration: null,
+          }),
+          run({
+            id: "run-foreign-item",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            prFixQueueItemId: "item-other",
+            prFixGeneration: 1,
+          }),
+        ],
+      });
+      const round = result.attempts.find((a) => a.attemptId === fixId("item-1", 1));
+      expect(round?.artifacts.agentRunIds).toEqual([]);
+      expect(round?.classification).toBe("unclassified");
+      expect(result.notes).toContain(
+        "agent run run-null-gen fix-round generation unusable; not attributed",
+      );
+      // Every retained interval still counts in the item-wide union.
+      expect(result.totalExecutionWallTimeMs).toBe(0);
+    });
+
+    it("leaves the agent null when a round's runs disagree and keeps both artifacts", () => {
+      const result = chain({
+        prFixItems: [prFixItem({ id: "item-1", pr: 7, generation: 1 })],
+        runs: [
+          run({
+            id: "run-beta",
+            agentName: "beta",
+            startedAt: "2026-10-01T12:20:00.000Z",
+            finishedAt: "2026-10-01T12:40:00.000Z",
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 1,
+          }),
+          run({
+            id: "run-alpha",
+            agentName: "alpha",
+            startedAt: "2026-10-01T12:05:00.000Z",
+            finishedAt: "2026-10-01T12:10:00.000Z",
+            prFixQueueItemId: "item-1",
+            prFixGeneration: 1,
+          }),
+        ],
+      });
+      const round = result.attempts.find((a) => a.attemptId === fixId("item-1", 1));
+      expect(round?.agentName).toBeNull();
+      // Deterministic list: start order, then id.
+      expect(round?.artifacts.agentRunIds).toEqual(["run-alpha", "run-beta"]);
+      expect(round?.startedAt).toBe("2026-10-01T12:05:00.000Z");
+      expect(round?.endedAt).toBe("2026-10-01T12:40:00.000Z");
+      // Union, not sum: two disjoint intervals (5m + 20m), no double-count.
+      expect(round?.wallTimeMs).toBe(1500000);
+    });
+
+    it("is order-invariant with stamped fix runs", () => {
+      const runs = [
+        run({
+          id: "run-a",
+          agentName: "alpha",
+          startedAt: "2026-10-01T12:05:00.000Z",
+          finishedAt: "2026-10-01T12:10:00.000Z",
+          executionMetadata: { worker: "courier" },
+          prFixQueueItemId: "item-1",
+          prFixGeneration: 1,
+        }),
+        run({
+          id: "run-b",
+          agentName: "alpha",
+          startedAt: "2026-10-01T12:15:00.000Z",
+          finishedAt: "2026-10-01T12:20:00.000Z",
+          executionMetadata: { worker: "courier", model: "gpt-5.5" },
+          prFixQueueItemId: "item-1",
+          prFixGeneration: 1,
+        }),
+        run({
+          id: "run-c",
+          agentName: "beta",
+          startedAt: "2026-10-01T12:00:00.000Z",
+          finishedAt: "2026-10-01T12:30:00.000Z",
+          prFixQueueItemId: "item-2",
+          prFixGeneration: 2,
+        }),
+      ];
+      const items = [
+        prFixItem({ id: "item-1", pr: 7, generation: 1 }),
+        prFixItem({ id: "item-2", pr: 8, generation: 2 }),
+      ];
+      const forward = chain({ runs, prFixItems: items });
+      const reversed = chain({ runs: [...runs].reverse(), prFixItems: [...items].reverse() });
+      expect(reversed.attempts).toEqual(forward.attempts);
+      expect(reversed.totalExecutionWallTimeMs).toBe(forward.totalExecutionWallTimeMs);
     });
   });
 });
