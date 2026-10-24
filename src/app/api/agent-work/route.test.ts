@@ -839,6 +839,58 @@ describe("POST /api/agent-work", () => {
         );
       });
 
+      it("stores the canonical agent name on the reassigned row", async () => {
+        // Capture the transaction's row writes: the canonical `agentName` must
+        // land on `AgentWork.agentName` (a padded value stored verbatim is the
+        // defect), the history row must name the canonical work id, and the
+        // free-text `reason` must NOT be trimmed.
+        const workUpdates: Array<Record<string, any>> = [];
+        const historyRows: Array<Record<string, any>> = [];
+        transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+          const txAgentWorkUpdate = vi.fn(async (args: any) => {
+            workUpdates.push(args);
+            return reassignWorkRow({
+              agentName: args.data?.agentName ?? "old-agent",
+              state: "CLAIMED",
+            });
+          });
+          const txAgentWorkHistoryCreate = vi.fn(async (args: any) => {
+            historyRows.push(args.data);
+            return { id: "hist-1" };
+          });
+
+          return fn({
+            agentWork: {
+              update: txAgentWorkUpdate,
+              findFirst: vi.fn(),
+              findMany: vi.fn(async () => []),
+            },
+            agentWorkHistory: { create: txAgentWorkHistoryCreate },
+            issue: { update: vi.fn(async () => ({ id: "issue-1" })) },
+            lease: { deleteMany: mockLeaseTeardown },
+            issueLifecycleEvent: { create: vi.fn(), upsert: vi.fn() },
+          });
+        });
+
+        agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+
+        const res = await makePostRequest({
+          action: "reassign",
+          workId: "  work-1  ",
+          newAgentName: "  new-agent  ",
+          reason: "  handover note  ",
+        });
+
+        expect(res.status).toBe(200);
+        const claimed = workUpdates.find((u) => u.data?.state === "CLAIMED");
+        expect(claimed).toBeDefined();
+        expect(claimed!.where).toEqual({ id: "work-1" });
+        expect(claimed!.data.agentName).toBe("new-agent");
+        expect(historyRows).toHaveLength(1);
+        expect(historyRows[0].workId).toBe("work-1");
+        expect(historyRows[0].summary).toContain("  handover note  ");
+      });
+
       it("treats a whitespace-only workId as absent", async () => {
         const res = await makePostRequest({ action: "reassign", workId: "   ", newAgentName: "new-agent" });
         expect(res.status).toBe(400);
