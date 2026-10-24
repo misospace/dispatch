@@ -734,9 +734,10 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // epoch identity this release just recorded; the expiry-filtered
           // `releaseLeaseByAgentAndIssue` operator helper is deliberately NOT
           // reused) therefore happens inside step 5's transaction, ATOMIC
-          // with the row move: there is no window in which the row is active
-          // and lease-less, and a failed handover leaves the old owner's
-          // lease (and the operator's retry) intact.
+          // with the row move (excluding the receipt step 3 mints — a
+          // same-owner replay renews the same row): there is no window in
+          // which the row is active and lease-less, and a failed handover
+          // leaves the old owner's lease (and the operator's retry) intact.
 
           // 3. Mint the new owner's claim intent — the Lease row — BEFORE the
           // remote label add, the same §8.7 claim-side ordering the claim
@@ -833,9 +834,21 @@ async function reassignAgentWork(body: Record<string, unknown>) {
           // one commit, so the work row is never left active and lease-less
           // for the stale cleanup to delete — not even on a failed add or a
           // failed row move, both of which roll the teardown back.
+          //
+          // The teardown EXCLUDES the receipt row step 3 just minted or
+          // renewed: a same-owner replay (`newAgentName === oldAgentName`,
+          // e.g. a duplicate POST after a completed handover) re-enters with
+          // the new owner as the "old" one, and `upsertLease` RENEWS that
+          // same row — deleting it here by agentName would leave the row
+          // with its label back on GitHub but no lease, the exact
+          // stale-cleanup data-loss shape (#1407 review, second round). On a
+          // normal A→B move the exclusion is inert: the receipt belongs to B
+          // and can never be one of A's rows.
           const updatedLabels = buildNewLabels(liveLabels, "assign_agent", newAgentLabel);
           const work = await prisma.$transaction(async (tx) => {
-            await tx.lease.deleteMany({ where: { agentName: oldAgentName, issueId } });
+            await tx.lease.deleteMany({
+              where: { agentName: oldAgentName, issueId, id: { not: receipt.lease.id } },
+            });
             const moved = await reassignWorkRowsTx(tx, workId, newAgentName, reason);
             await tx.issue.update({
               where: { id: issueId },

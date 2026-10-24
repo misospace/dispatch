@@ -1014,9 +1014,11 @@ describe("POST /api/agent-work", () => {
       // with the epoch identity this release just recorded. The
       // expiry-filtered operator helper must NOT be used here. #1407 review:
       // the teardown is part of the row-move transaction, committing with the
-      // owner change, so the work row is never left active and lease-less.
+      // owner change, so the work row is never left active and lease-less —
+      // and it excludes the receipt this attempt minted (inert for a real
+      // A→B move; on a same-owner replay it is what protects the renewed row).
       expect(lease.deleteMany).toHaveBeenCalledWith({
-        where: { agentName: "old-agent", issueId: "issue-1" },
+        where: { agentName: "old-agent", issueId: "issue-1", id: { not: "lease-1" } },
       });
       expect(releaseLeaseByAgentAndIssueMock).not.toHaveBeenCalled();
       // The new owner's receipt is minted with the work row's resume context
@@ -1329,9 +1331,11 @@ describe("POST /api/agent-work", () => {
       // #1407 review: the blanket old-owner teardown commits WITH the row
       // move — it must not have run here, or the old owner's still-owned
       // work row would sit active and lease-less for the stale cleanup.
-      expect(lease.deleteMany).not.toHaveBeenCalledWith({
-        where: { agentName: "old-agent", issueId: "issue-1" },
-      });
+      expect(lease.deleteMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ agentName: "old-agent" }),
+        }),
+      );
 
       // No work-row move or lifecycle evidence committed.
       expect(transaction).not.toHaveBeenCalled();
@@ -1374,9 +1378,11 @@ describe("POST /api/agent-work", () => {
       });
       // #1407 review: the old owner keeps its lease — the blanket teardown
       // commits with the row move, which this failed handover never reached.
-      expect(lease.deleteMany).not.toHaveBeenCalledWith({
-        where: { agentName: "old-agent", issueId: "issue-1" },
-      });
+      expect(lease.deleteMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ agentName: "old-agent" }),
+        }),
+      );
 
       // No work-row move and no lifecycle evidence: the handover did not land.
       expect(transaction).not.toHaveBeenCalled();
@@ -1428,6 +1434,34 @@ describe("POST /api/agent-work", () => {
           }),
         })
       );
+    });
+
+    // #1407 review (round 2): a duplicate POST after a COMPLETED handover
+    // re-enters with the new owner as the "old" owner, and `upsertLease`
+    // RENWS that same lease row. The in-transaction teardown must exclude
+    // the receipt row — deleting it by agentName alone would leave the work
+    // row with its label back on GitHub but no lease, the exact stale-cleanup
+    // data-loss shape this whole change exists to prevent.
+    it("keeps the renewed receipt lease on a same-owner replay", async () => {
+      agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow({ agentName: "new-agent" }));
+      mockGetLiveIssueLabels.mockResolvedValueOnce(["agent/new-agent", "status/in-progress"]);
+
+      const res = await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+        reason: "duplicate submit",
+      });
+      expect(res.status).toBe(200);
+
+      // The release targets the same name the add re-lands; the teardown
+      // spares the lease row step 3 renewed (mockUpsertLease echoes lease-1).
+      expect(mockReleaseIssueClaim).toHaveBeenCalledTimes(1);
+      expect(mockReleaseIssueClaim.mock.calls[0][0].agentName).toBe("new-agent");
+      expect(mockAddIssueLabel).toHaveBeenCalledWith("org/repo", 10, "agent/new-agent");
+      expect(lease.deleteMany).toHaveBeenCalledWith({
+        where: { agentName: "new-agent", issueId: "issue-1", id: { not: "lease-1" } },
+      });
     });
 
     it("scopes the release dedupe key to the old owner's claim epoch", async () => {
