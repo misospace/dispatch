@@ -48,7 +48,51 @@ export type PrFixQueueClient = {
     upsert: (args: any) => Promise<any>;
   };
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
+  // Raw SQL surface used by the #1327 rebase-lane advisory lock. Optional so
+  // legacy/test clients without a raw driver still admit (they simply skip
+  // the serialization, same as pre-#1327); every real Prisma client has it.
+  $executeRaw?: (query: Prisma.Sql, ...values: unknown[]) => Promise<number>;
 };
+
+/**
+ * #1327 review: advisory transaction-lock key serializing REBASE lane
+ * admission. One global key — the lane is concurrency 1 across ALL rows and
+ * ALL agents, so every REBASE hand-out contends on exactly this lock.
+ */
+export const REBASE_LANE_ADVISORY_LOCK_KEY = 13270001327n;
+
+/**
+ * Run a REBASE hand-out admission (gate read + dispatch stamp + hand-out
+ * push) SERIALIZED at the database boundary (#1327 review).
+ *
+ * The concurrency-1 gate is only sound if the liveness read and the
+ * hand-out write commit together — a preflight read followed by separate
+ * writes lets two concurrent polls both observe an idle lane and both
+ * dispatch (the exact fan-out the lane forbids). This helper runs `run`
+ * inside one transaction holding `pg_advisory_xact_lock`: a competing
+ * admission blocks on the lock and, when it proceeds, the gate read inside
+ * its transaction sees the first admission's COMMITTED hand-out and defers.
+ * The lock is transaction-scoped, so commit, rollback, or a dead connection
+ * all release it — it can never strand the lane the way a leaked row lock
+ * would.
+ *
+ * `SET LOCAL lock_timeout` bounds the WAIT: the caller treats an admission
+ * failure as fail-open (fall back to the preflight-gate path), so even a
+ * pathologically long lock holder cannot stall a poll beyond the timeout.
+ */
+export async function withRebaseLaneAdmission<T>(
+  client: PrFixQueueClient,
+  run: (tx: PrFixQueueClient) => Promise<T>,
+): Promise<T> {
+  return client.$transaction(async (tx) => {
+    if (typeof tx.$executeRaw === "function") {
+      // `SET` accepts no bind parameters, so the interval is a literal.
+      await tx.$executeRaw(Prisma.raw("SET LOCAL lock_timeout = '5s'"));
+      await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
+    }
+    return run(tx);
+  });
+}
 
 // #1121: upper bound on an already_addressed evidence string, shared by the
 // tasks/report route and the pr-fix-queue/mark parser.
@@ -2320,11 +2364,16 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
  * neither free the lane from a live rebase (REBASE -> other) nor let an
  * in-flight ordinary fix attempt block it (other -> REBASE).
  *
- * Best-effort by construction: there is no global lock, so two concurrent
- * polls can each pass this check before either stamps its hand-out. That
- * residual window is accepted — items are singletons per (repo, PR), reports
- * are generation-fenced, and the failed-report settlement is terminal for
- * REBASE, so a doubled hand-out cannot turn into a retry loop.
+ * Admission is SERIALIZED at the database boundary: next-task issues every
+ * REBASE hand-out inside `withRebaseLaneAdmission`, which holds a
+ * transaction-scoped advisory lock across this read AND the hand-out write.
+ * A competing poll therefore never passes this check before the winner's
+ * hand-out commits — concurrency 1 is enforced, not preflight-advisory.
+ * The residual best-effort window is only the documented fail-open path (an
+ * admission transaction that cannot run falls back to this read without the
+ * lock): items are singletons per (repo, PR), reports are generation-fenced,
+ * and failed REBASE settlement is terminal, so even there a doubled hand-out
+ * cannot turn into a retry loop.
  */
 export async function hasInFlightRebaseHandout(
   client: PrFixQueueClient,
@@ -3603,10 +3652,15 @@ export async function releaseAgentHandout(
 }
 
 export function toAgentQueuePrFixItem(item: any) {
-  const fixType = normalizePrFixType(item.type);
-  return {
-    type: "pr-review-fix",
-    fixType,
+ const fixType = normalizePrFixType(item.type);
+ return {
+   type: "pr-review-fix",
+   fixType,
+   // #1327 review: the persisted DISPATCHED lane (`attemptType`), the same
+   // value settlement and the rebase concurrency gate key on. Listed so a
+   // consumer (and next-task's gate) sees the lane a live attempt actually
+   // runs, even after the mutable `type` is rewritten by a re-observation.
+   attemptType: item.attemptType == null ? null : normalizePrFixType(item.attemptType),
     id: item.id,
     repo: item.repo,
     pr: item.pr,

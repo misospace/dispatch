@@ -23,38 +23,47 @@ const { mocks } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/lib/prisma", () => ({
-  prisma: {
-    issue: { findMany: mocks.issueFindMany },
-    prFixQueueItem: {
-      findMany: mocks.prFixFindMany,
-      findUnique: vi.fn(async ({ where }: any) => {
-        const rows = [...mocks.linkedRows, ...(await mocks.prFixFindMany())];
-        if (where.id !== undefined) {
-          const byId = await mocks.prFixFindUnique({ where });
-          return byId ?? rows.find((row: any) => row.id === where.id) ?? null;
-        }
-        return mocks.prFixFindUniqueByRepo({ where });
-      }),
-      create: mocks.prFixCreate,
-      updateMany: mocks.prFixUpdateMany,
-    },
-    prFixHistory: { create: mocks.prFixHistoryCreate },
-    capacityHandoff: {
-      findMany: mocks.capacityHandoffFindMany,
-      deleteMany: mocks.capacityHandoffDeleteMany,
-    },
-    $transaction: async (fn: any) => fn({
-      prFixQueueItem: {
-        create: mocks.prFixCreate,
-        findUnique: mocks.prFixFindUniqueByRepo,
-        updateMany: mocks.prFixUpdateMany,
-      },
-      prFixHistory: { create: mocks.prFixHistoryCreate },
+vi.mock("@/lib/prisma", () => {
+  const prFixQueueItem = {
+    findMany: mocks.prFixFindMany,
+    findUnique: vi.fn(async ({ where }: any) => {
+      const rows = [...mocks.linkedRows, ...((await mocks.prFixFindMany()) ?? [])];
+      if (where?.id !== undefined) {
+        const byId = await mocks.prFixFindUnique({ where });
+        return byId ?? rows.find((row: any) => row.id === where.id) ?? null;
+      }
+      if (where?.repo_pr) return mocks.prFixFindUniqueByRepo({ where });
+      if (where?.repo !== undefined && where?.pr !== undefined) {
+        return rows.find((row: any) => row.repo === where.repo && row.pr === where.pr) ?? null;
+      }
+      return null;
     }),
-  },
-  asPrFixQueueClient: (client: any) => client,
-}));
+    create: mocks.prFixCreate,
+    updateMany: mocks.prFixUpdateMany,
+  };
+  return {
+    prisma: {
+      issue: { findMany: mocks.issueFindMany },
+      prFixQueueItem,
+      prFixHistory: { create: mocks.prFixHistoryCreate },
+      capacityHandoff: {
+        findMany: mocks.capacityHandoffFindMany,
+        deleteMany: mocks.capacityHandoffDeleteMany,
+      },
+      // The #1327 REBASE admission transaction runs the concurrency gate,
+      // the dispatch stamp, and the hand-out push on the TRANSACTION client;
+      // it mirrors the top-level surface here. $executeRaw is a no-op
+      // standing in for the advisory lock (its real serialization is proven
+      // against PostgreSQL in pr-fix-rebase-type.integration.test.ts).
+      $transaction: async (fn: any) => fn({
+        prFixQueueItem,
+        prFixHistory: { create: mocks.prFixHistoryCreate },
+        $executeRaw: async () => 1,
+      }),
+    },
+    asPrFixQueueClient: (client: any) => client,
+  };
+});
 
 vi.mock("@/lib/github", () => ({
   fetchPullRequestLabels: mocks.fetchPullRequestLabels,
@@ -347,6 +356,66 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.pullRequest.number).toBe(23);
   });
 
+  it("gates a REBASE-dispatched row whose type flipped to OTHER while its hand-out is live (#1327 review)", async () => {
+    // Self-live case on the DISPATCHED lane: the row was handed out as
+    // REBASE and a re-observation flipped the mutable `type` to OTHER. A
+    // second hand-out would still put two `--force-with-lease` pushes on
+    // one branch, so the concurrency gate must defer it.
+    const row = { ...prFixRow(33), type: "OTHER", attemptType: "REBASE", agentHandouts: ["other-agent@1"], dispatchedAt: new Date() };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE")
+        : [row].filter((r: any) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.shouldRun).toBe(false);
+    expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("ships the persisted dispatched lane when the row type flipped to REBASE mid-attempt (#1327 review)", async () => {
+    // The row was DISPATCHED as an ordinary fix (attemptType stamped at the
+    // first hand-out); a re-observation flipped the mutable `type` to REBASE.
+    // The task must carry the lane the server will settle against
+    // (`attemptType ?? type`), not the mutable row type.
+    const row = { ...prFixRow(31), type: "REBASE", attemptType: "CI_FAILURE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        // The concurrency gate keys on the dispatched lane: this row is not
+        // a live REBASE, so it must not gate itself.
+        ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE" && (r.agentHandouts ?? []).length > 0)
+        : [row].filter((r: any) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("CI_FAILURE");
+  });
+
+  it("ships the persisted REBASE dispatched lane after a mid-attempt flip away from REBASE (#1327 review)", async () => {
+    // Mirror direction: dispatched as REBASE, the row's mutable `type` has
+    // since flipped to OTHER. The worker must still see REBASE — settlement
+    // will bound this attempt on the rebase lane (terminal PARKED on
+    // failure), and a payload claiming OTHER would promise the generic
+    // retry ladder the rebase lane deliberately does not get.
+    const row = { ...prFixRow(32), type: "OTHER", attemptType: "REBASE" };
+    mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+      where?.OR
+        ? [row].filter((r: any) => (r.attemptType ?? r.type) === "REBASE" && (r.agentHandouts ?? []).length > 0)
+        : [row].filter((r: any) => r.status === "QUEUED"));
+    mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+      (where.id === row.id ? { ...row } : null));
+    const body = await (await GET(request(exclusionUrl()), {
+      params: Promise.resolve({ agentName: "example-agent" }),
+    })).json();
+    expect(body.type).toBe("followup-pr");
+    expect(body.prFixItem.fixType).toBe("REBASE");
+  });
+
   it("skips linked generation 1 before materialization or GitHub reads", async () => {
     mocks.issueFindMany.mockResolvedValue([linkedIssue(42, 12), independentIssue(99)]);
     const body = await (await GET(request(exclusionUrl(["org/repo#12@1"])), {
@@ -530,7 +599,7 @@ describe("GET /api/agents/[agentName]/next-task", () => {
       const items = await mocks.prFixFindMany();
       const first = items[0];
       return first
-        ? { reason: first.reason, feedback: first.feedback, generation: first.generation, status: first.status, lane: first.lane, agentHandouts: first.agentHandouts }
+        ? { reason: first.reason, feedback: first.feedback, generation: first.generation, status: first.status, lane: first.lane, agentHandouts: first.agentHandouts, attemptType: first.attemptType, type: first.type }
         : null;
     });
     mocks.prFixUpdateMany.mockResolvedValue({ count: 1 });

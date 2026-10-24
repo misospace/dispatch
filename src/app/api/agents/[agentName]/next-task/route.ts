@@ -10,13 +10,14 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, hasInFlightRebaseHandout, newHandoutToken, normalizeQueueRepo } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, hasInFlightRebaseHandout, newHandoutToken, normalizeQueueRepo, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
 import { rebaseWorkItem } from "@/lib/pr-fix-rebase";
 import { buildCapacitySkip, loadActiveCapacityHandoffs, normalizeCapacity } from "@/lib/capacity-handoff";
 import type { PrFixType } from "@/types";
+import { normalizePrFixType } from "@/types";
 
 /** A queued PR-fix item as the route consumes it (see toAgentQueuePrFixItem). */
 type PrFixCandidate = {
@@ -31,6 +32,13 @@ type PrFixCandidate = {
   feedback: string[];
   /** The queued item's PrFixType (e.g. REBASE, #1327); absent on legacy lines. */
   fixType?: PrFixType;
+  /**
+   * The persisted DISPATCHED lane (#1327 review): `attemptType` stamped at
+   * the first hand-out of the generation, immutable until the attempt
+   * resets. The rebase gate keys on this when present, because the mutable
+   * `fixType` can be rewritten mid-attempt by a re-observation.
+   */
+  attemptType?: PrFixType | null;
 };
 
 /**
@@ -59,14 +67,23 @@ type PrFixCandidate = {
  * Best-effort: a failure here only loses freshness tracking, never
  * the task.
  */
-async function confirmPrFixHandOut(
-  candidate: PrFixCandidate,
-  agentName: string,
-  excluded: (repo: string, pr: number, generation: number) => boolean,
-): Promise<{ generation: number; reason: string; feedback: string[]; lane: string | null } | null> {
-  let dispatchReason = candidate.reason;
-  let dispatchFeedback = candidate.feedback;
-  let dispatchLane = candidate.lane ?? null;
+ async function confirmPrFixHandOut(
+   candidate: PrFixCandidate,
+   agentName: string,
+   excluded: (repo: string, pr: number, generation: number) => boolean,
+   client: PrFixQueueClient = asPrFixQueueClient(prisma),
+ ): Promise<{ generation: number; reason: string; feedback: string[]; lane: string | null; attemptType: PrFixType | undefined } | null> {
+   let dispatchReason = candidate.reason;
+   let dispatchFeedback = candidate.feedback;
+   let dispatchLane = candidate.lane ?? null;
+   // #1327 review: the DISPATCHED lane as persisted — `attemptType` (stamped
+   // on the first hand-out of the generation and immutable after), falling
+   // back to the row's `type` only for rows stamped before the column
+   // existed. The payload must ship this, never the mutable candidate type:
+   // settlement keys bounded resolution on `attemptType ?? type`, and a
+   // mid-attempt re-observation flip must not tell the worker it runs a
+   // different lane than the server will settle it as.
+   let dispatchAttemptType: PrFixType | undefined;
   // The generation the task token ships, or null when no pass
   // confirmed the live row (defer the hand-out to the next poll).
   let confirmedGeneration: number | null = null;
@@ -87,7 +104,7 @@ async function confirmPrFixHandOut(
     for (let attempt = 0; attempt < 2; attempt++) {
       const stampGeneration = nextGeneration;
       if (excluded(candidate.repo, candidate.pr, stampGeneration)) return null;
-      const stamp = await prisma.prFixQueueItem.updateMany({
+       const stamp = await client.prFixQueueItem.updateMany({
         where: {
           id: candidate.id,
           generation: stampGeneration,
@@ -108,15 +125,20 @@ async function confirmPrFixHandOut(
         },
       });
       if (stamp.count === 1) newlyDispatchedGeneration = stampGeneration;
-      const fresh = await prisma.prFixQueueItem.findUnique({
-        where: { id: candidate.id },
-        select: {
-          reason: true,
-          feedback: true,
-          generation: true,
-          status: true,
-          lane: true,
-          agentHandouts: true,
+       const fresh = await client.prFixQueueItem.findUnique({
+         where: { id: candidate.id },
+         select: {
+           reason: true,
+           feedback: true,
+           generation: true,
+           status: true,
+           lane: true,
+           agentHandouts: true,
+           // #1327 review: read back the persisted dispatched lane so the
+           // task ships the lane settlement will bound, not the candidate's
+           // mutable type.
+           attemptType: true,
+           type: true,
           // #1249: read the durable ledger counter in the SAME snapshot as the
           // payload it bounds. Reading it separately would let a transition
           // recorded in between raise the watermark past evidence this hand-out
@@ -131,9 +153,13 @@ async function confirmPrFixHandOut(
         (fresh.lane !== undefined && candidate.lane !== undefined && fresh.lane !== candidate.lane)
       ) break;
       if (agentAlreadyHanded({ agentHandouts: fresh.agentHandouts, generation: fresh.generation }, agentName)) break;
-      dispatchReason = fresh.reason;
-      dispatchFeedback = fresh.feedback ?? [];
-      dispatchLane = fresh.lane ?? null;
+       dispatchReason = fresh.reason;
+       dispatchFeedback = fresh.feedback ?? [];
+       dispatchLane = fresh.lane ?? null;
+       dispatchAttemptType =
+         fresh.attemptType != null || fresh.type != null
+           ? normalizePrFixType(String(fresh.attemptType ?? fresh.type))
+           : undefined;
       // A re-read generation that is a number and not the one we just
       // stamped means the row moved under us: log the race (#1119) and
       // retry the stamp+re-read against the new generation. The token
@@ -175,11 +201,11 @@ async function confirmPrFixHandOut(
   // reopens rather than absorbs evidence the first worker never received.
   // (The per-agent feedback re-read above still gives every worker the full
   // current picture; the watermark guards settlement, not delivery.)
-  if (confirmedGeneration !== null && newlyDispatchedGeneration === confirmedGeneration) {
-    await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration, dispatchEvidenceSequence);
-  }
-  return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane };
-}
+   if (confirmedGeneration !== null && newlyDispatchedGeneration === confirmedGeneration) {
+     await stampAttemptEvidenceWatermark(candidate.id, confirmedGeneration, dispatchEvidenceSequence, client);
+   }
+   return { generation: confirmedGeneration, reason: dispatchReason, feedback: dispatchFeedback, lane: dispatchLane, attemptType: dispatchAttemptType };
+ }
 
 /**
  * Stamp the durable evidence-snapshot boundary of this hand-out (#1249): the
@@ -213,14 +239,15 @@ async function confirmPrFixHandOut(
  * Best-effort like the dispatch stamp around it: a failure here loses durable
  * freshness tracking, never the task.
  */
-async function stampAttemptEvidenceWatermark(
-  itemId: string,
-  generation: number,
-  evidenceSequence: number | null,
-): Promise<void> {
-  if (evidenceSequence === null) return;
-  try {
-    const { count } = await prisma.prFixQueueItem.updateMany({
+ async function stampAttemptEvidenceWatermark(
+   itemId: string,
+   generation: number,
+   evidenceSequence: number | null,
+   client: PrFixQueueClient = asPrFixQueueClient(prisma),
+ ): Promise<void> {
+   if (evidenceSequence === null) return;
+   try {
+     const { count } = await client.prFixQueueItem.updateMany({
       where: {
         id: itemId,
         generation,
@@ -361,78 +388,113 @@ export async function GET(
     // re-creating the loop this fix removes.
     const deferredIssues = new Set<string>();
 
-    const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
-      if (excluded(candidate.repo, candidate.pr, candidate.generation)) {
-        return null;
-      }
-      // #1256: the exhausted capacity must not be re-handed the attempt it
-      // gave up (and an undeclared capacity is conservatively treated the
-      // same); unrelated capacities dispatch it normally.
-      if (skipPrForCapacity(candidate.repo, candidate.pr)) return null;
-      if (agentAlreadyHanded(candidate, agentName)) return null;
-      // #1327: the mechanical rebase lane is concurrency 1, no fan-out. A
-      // REBASE candidate waits while another rebase hand-out is live
-      // somewhere (see hasInFlightRebaseHandout: bounded by the hand-out
-      // timeout, best-effort against concurrent polls). Non-rebase fix work
-      // is unaffected. Deferral is transient: the next poll retries it.
-      if (candidate.fixType === "REBASE") {
-        let rebaseBusy = false;
-        try {
-          rebaseBusy = await hasInFlightRebaseHandout(asPrFixQueueClient(prisma));
-        } catch (error) {
-          // Fail open on the gate check itself: a read failure must not 500
-          // the poll, and dispatching one rebase is safer than losing the
-          // lane's dispatch path to a transient error.
-          console.error(`next-task pr-fix rebase concurrency check failed for ${candidate.repo}#${candidate.pr}; dispatching without it:`, error);
-        }
-        if (rebaseBusy) {
-          console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
-          return null;
-        }
-      }
-      const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded);
-      if (!confirmed) return null;
+     const dispatchPrFixCandidate = async (candidate: PrFixCandidate) => {
+       if (excluded(candidate.repo, candidate.pr, candidate.generation)) {
+         return null;
+       }
+       // #1256: the exhausted capacity must not be re-handed the attempt it
+       // gave up (and an undeclared capacity is conservatively treated the
+       // same); unrelated capacities dispatch it normally.
+       if (skipPrForCapacity(candidate.repo, candidate.pr)) return null;
+       if (agentAlreadyHanded(candidate, agentName)) return null;
 
-      if (excluded(candidate.repo, candidate.pr, confirmed.generation)) return null;
-      // Mint the per-hand-out receipt token (#1256 review): every issuance
-      // rotates in a fresh opaque token, pushed atomically with the hand-out
-      // record (one conditional write — the hand-out/receipt bijection never
-      // drifts). The task ships it in `prFixItem.handoutToken`; only a
-      // capacity-exhausted report must present it back, and settlement then
-      // releases exactly THIS hand-out — not a newer one for the same agent
-      // at the same generation, and never another agent's.
-      const handoutToken = newHandoutToken();
-      try {
-        // Conditional append fences concurrent polls for the same agent/generation.
-        const claimed = await prisma.prFixQueueItem.updateMany({
-          where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED", NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } } },
-          data: {
-            agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] },
-            handoutReceipts: { push: [handoutReceipt(handoutToken, agentName, confirmed.generation)] },
-          },
-        });
-        if (claimed.count !== 1) return null;
-      } catch (error) {
-        console.error(`next-task pr-fix hand-out record failed for ${candidate.repo}#${candidate.pr}:`, error);
-        return null;
-      }
+       // Stamp-confirm the live row, then push the hand-out/receipt pair.
+       // `client` decides where those writes run: on the module client for
+       // ordinary fix work, or on the REBASE admission transaction so the
+       // writes commit atomically with the concurrency gate read (#1327).
+       const issueHandout = async (client: PrFixQueueClient) => {
+         const confirmed = await confirmPrFixHandOut(candidate, agentName, excluded, client);
+         if (!confirmed) return null;
 
-      const reasons = [...new Set([confirmed.reason, ...confirmed.feedback].filter(Boolean))];
-      return createFollowupPrTask({
-        agentName,
-        lane: confirmed.lane ?? undefined,
-        pullRequest: {
-          repoFullName: candidate.repo,
-          number: candidate.pr,
-          url: candidate.url ?? undefined,
-        },
-        issue: candidate.issue
-          ? { repoFullName: candidate.repo, number: candidate.issue }
-          : undefined,
-        prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: candidate.fixType },
-        reasons,
-      });
-    };
+         if (excluded(candidate.repo, candidate.pr, confirmed.generation)) return null;
+         // Mint the per-hand-out receipt token (#1256 review): every issuance
+         // rotates in a fresh opaque token, pushed atomically with the hand-out
+         // record (one conditional write — the hand-out/receipt bijection never
+         // drifts). The task ships it in `prFixItem.handoutToken`; only a
+         // capacity-exhausted report must present it back, and settlement then
+         // releases exactly THIS hand-out — not a newer one for the same agent
+         // at the same generation, and never another agent's.
+         const handoutToken = newHandoutToken();
+         try {
+           // Conditional append fences concurrent polls for the same agent/generation.
+           const claimed = await client.prFixQueueItem.updateMany({
+             where: { id: candidate.id, generation: confirmed.generation, status: "QUEUED", NOT: { agentHandouts: { has: agentHandoutToken(agentName, confirmed.generation) } } },
+             data: {
+               agentHandouts: { push: [agentHandoutToken(agentName, confirmed.generation)] },
+               handoutReceipts: { push: [handoutReceipt(handoutToken, agentName, confirmed.generation)] },
+             },
+           });
+           if (claimed.count !== 1) return null;
+         } catch (error) {
+           console.error(`next-task pr-fix hand-out record failed for ${candidate.repo}#${candidate.pr}:`, error);
+           return null;
+         }
+
+         const reasons = [...new Set([confirmed.reason, ...confirmed.feedback].filter(Boolean))];
+         return createFollowupPrTask({
+           agentName,
+           lane: confirmed.lane ?? undefined,
+           pullRequest: {
+             repoFullName: candidate.repo,
+             number: candidate.pr,
+             url: candidate.url ?? undefined,
+           },
+           issue: candidate.issue
+             ? { repoFullName: candidate.repo, number: candidate.issue }
+             : undefined,
+           // #1327 review: ship the PERSISTED dispatched lane (the same
+           // derivation settlement keys on), not the candidate's mutable
+           // type — a mid-attempt re-observation flip must not change the
+           // lane identity the worker and the server agree on.
+           prFixItem: { id: candidate.id, generation: confirmed.generation, handoutToken, fixType: confirmed.attemptType ?? candidate.fixType },
+           reasons,
+         });
+       };
+
+       // #1327: the mechanical rebase lane is concurrency 1, no fan-out. The
+       // gate read AND the hand-out write are serialized at the database
+       // boundary: inside `withRebaseLaneAdmission` an advisory transaction
+       // lock spans `hasInFlightRebaseHandout` plus the confirm/push, so a
+       // competing poll's gate sees the winner's COMMITTED hand-out and
+       // defers instead of racing past a preflight read. The condition keys
+       // on the DISPATCHED lane (`attemptType`) when stamped, falling back
+       // to the candidate's queue type: a row whose mutable type flipped
+       // mid-attempt still belongs to whichever lane is live on it — a
+       // REBASE-dispatched row must not slip a second worker past the gate
+       // (two `--force-with-lease` pushes on one branch), and an
+       // ordinary-dispatched row that merely looks dirty now is settled as
+       // its stamped lane, so the rebase gate is not its bound. Deferral is
+       // transient: the next poll retries it. Non-rebase fix work is
+       // unaffected.
+       const dispatchedLane = candidate.attemptType ?? candidate.fixType;
+       if (dispatchedLane === "REBASE") {
+         try {
+           return await withRebaseLaneAdmission(asPrFixQueueClient(prisma), async (tx) => {
+             if (await hasInFlightRebaseHandout(tx)) {
+               console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
+               return null;
+             }
+             return await issueHandout(tx);
+           });
+         } catch (error) {
+           // Fail open on admission failure (lock timeout, transaction
+           // abort): a read/lock problem must not 500 the poll or strand the
+           // lane. Fall back to the preflight-only gate — the residual
+           // check-then-write window is bounded by generation fencing and
+           // terminal REBASE settlement, the pre-serialization semantics.
+           console.error(`next-task pr-fix rebase admission failed for ${candidate.repo}#${candidate.pr}; falling back to the preflight gate:`, error);
+           try {
+             if (await hasInFlightRebaseHandout(asPrFixQueueClient(prisma))) {
+               console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
+               return null;
+             }
+           } catch (gateError) {
+             console.error(`next-task pr-fix rebase concurrency check failed for ${candidate.repo}#${candidate.pr}; dispatching without it:`, gateError);
+           }
+         }
+       }
+       return await issueHandout(asPrFixQueueClient(prisma));
+     };
 
     // PR-fix items come first, but an item this agent already received at
     // its current generation is not dispatchable to it again (#1133): the

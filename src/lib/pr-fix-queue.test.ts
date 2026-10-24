@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -5623,5 +5623,49 @@ describe("hasInFlightRebaseHandout (#1327)", () => {
     client.items[1].agentHandouts = ["worker-b@1"];
     client.items[1].dispatchedAt = new Date();
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+});
+
+describe("withRebaseLaneAdmission (#1327 review)", () => {
+  it("holds the advisory transaction lock across the admission run", async () => {
+    const raw: { sql: string; values: string[] }[] = [];
+    const client: any = {
+      $transaction: async (fn: any) => fn(client),
+      $executeRaw: async (query: any) => {
+        raw.push({
+          sql: String(query?.sql ?? query),
+          values: (query?.values ?? []).map((value: unknown) => String(value)),
+        });
+        return 1;
+      },
+    };
+    const result = await withRebaseLaneAdmission(client, async (tx) => {
+      // The run executes with the lock statements already issued, inside
+      // the same transaction client it receives.
+      expect(tx).toBe(client);
+      return "admitted";
+    });
+    expect(result).toBe("admitted");
+    expect(raw).toHaveLength(2);
+    expect(raw[0].sql).toContain("lock_timeout");
+    expect(raw[1].sql).toContain("pg_advisory_xact_lock");
+    expect(raw[1].values).toContain(String(REBASE_LANE_ADVISORY_LOCK_KEY));
+  });
+
+  it("still runs admission when the client has no raw surface", async () => {
+    // Legacy/test clients without $executeRaw cannot take the advisory lock;
+    // admission proceeds (the pre-serialization semantics) rather than
+    // failing the hand-out path.
+    const client: any = { $transaction: async (fn: any) => fn(client) };
+    expect(await withRebaseLaneAdmission(client, async () => "admitted")).toBe("admitted");
+  });
+
+  it("propagates an admission failure so the caller can fail open", async () => {
+    const client: any = {
+      $transaction: async () => {
+        throw new Error("lock_timeout");
+      },
+    };
+    await expect(withRebaseLaneAdmission(client, async () => "admitted")).rejects.toThrow("lock_timeout");
   });
 });

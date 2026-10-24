@@ -16,7 +16,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import { prisma } from "@/lib/prisma";
-import { enqueuePrFixItem, listQueuedPrFixItems, toAgentQueuePrFixItem } from "./pr-fix-queue";
+import { enqueuePrFixItem, hasInFlightRebaseHandout, listQueuedPrFixItems, toAgentQueuePrFixItem, withRebaseLaneAdmission } from "./pr-fix-queue";
 
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: false, commentPosted: false, errors: [] }),
@@ -64,5 +64,55 @@ suite("PrFixType REBASE against a real PostgreSQL (#1327)", () => {
     const queued = await listQueuedPrFixItems(prisma, { lane: "NORMAL" });
     const surfaced = queued.map(toAgentQueuePrFixItem).find((item) => item.id === enqueued.id);
     expect(surfaced?.fixType, "the queue listing must surface the REBASE fix type").toBe("REBASE");
+  });
+
+  it("hands out exactly one live rebase under concurrent admission (concurrency 1 at the DB boundary, #1327 review)", async () => {
+    // The unit suite drives the gate through mocks that execute admissions
+    // one after another — a check-then-write gate passes its own test and
+    // still fans out in production, because the overlap is a DATABASE
+    // interleaving. Here two admissions run truly concurrently: without the
+    // advisory transaction lock serializing them (the pre-review shape),
+    // both read the idle lane during the deliberate window and BOTH stamp a
+    // hand-out. With `withRebaseLaneAdmission` the loser blocks on the
+    // lock, re-reads the gate after the winner commits, and defers.
+    await enqueuePrFixItem(prisma, {
+      repo: REPO,
+      pr: 2,
+      lane: "NORMAL",
+      type: "REBASE",
+      reason: "Mechanical rebase: PR dirty against base (#1327)",
+      feedback: "Mechanical rebase required: this PR is dirty against its base branch (#1327).",
+      evidenceKey: "merge_state:integration/rebase-type#2",
+    });
+
+    const admit = async (agent: string): Promise<"admitted" | "deferred"> =>
+      withRebaseLaneAdmission(prisma, async (tx) => {
+        if (await hasInFlightRebaseHandout(tx)) return "deferred";
+        // Widen the historical check-then-write window: the loser of an
+        // unlocked race reads here AFTER the winner's read and BEFORE its
+        // commit, then would push a second live hand-out.
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        const claimed = await tx.prFixQueueItem.updateMany({
+          where: {
+            repo: REPO,
+            pr: 2,
+            status: "QUEUED",
+            NOT: { agentHandouts: { has: `${agent}@1` } },
+          },
+          data: {
+            attemptType: "REBASE",
+            dispatchedAt: new Date(),
+            dispatchedGeneration: 1,
+            agentHandouts: { push: [`${agent}@1`] },
+          },
+        });
+        return claimed.count === 1 ? "admitted" : "deferred";
+      });
+
+    const results = await Promise.all([admit("agent-a"), admit("agent-b")]);
+    expect(results.filter((r) => r === "admitted"), `admissions must serialize to exactly one hand-out, got ${JSON.stringify(results)}`).toHaveLength(1);
+
+    const row = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 2 } } });
+    expect(row?.agentHandouts, "exactly one live rebase hand-out may exist on the branch").toHaveLength(1);
   });
 });
