@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { makeDispatchEnvMock } from "@/test/route-helpers";
 
 // #1395: the reassign path now moves the claim, so its guarded-flow
@@ -520,6 +520,13 @@ describe("POST /api/agent-work", () => {
       issueFindUnique.mockResolvedValue({ number: 42, repository: { fullName: "org/repo" } });
     });
 
+    // `vi.clearAllMocks()` clears calls but keeps implementations, so the
+    // `issue.findUnique` stub set above would outlive this block and answer
+    // a later test that expects no issue row. Drop it on the way out.
+    afterEach(() => {
+      issueFindUnique.mockReset();
+    });
+
     it("releases the work item when the padded workId matches the stored row", async () => {
       agentWork.findUnique.mockResolvedValueOnce({
         id: "work-1",
@@ -570,6 +577,8 @@ describe("POST /api/agent-work", () => {
       expect(historyCreates).toEqual([
         expect.objectContaining({ workId: "work-1", action: "released" }),
       ]);
+      // The audit note names the released row's own agent (the stored
+      // `AgentWork.agentName`), not a value taken from the request.
       expect(auditLog.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
