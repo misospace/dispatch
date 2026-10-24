@@ -297,6 +297,9 @@ model PrFixQueueItem {
   author                   String?
   history                  PrFixHistory[]
   evidence                 PrFixEvidence[]
+  // #1183: worker executions durably associated to this item's fix rounds
+  // (AgentRun.prFixQueueItemId). SetNull on item deletion keeps run evidence.
+  agentRuns                AgentRun[]
 
   @@unique([repo, pr])
   @@index([status])
@@ -308,6 +311,9 @@ model PrFixQueueItem {
   // FIRST is part of the index key order because it is part of the ORDER BY;
   // the trailing `id` matches the deterministic tiebreak.
   @@index([status, triggerEvaluatedAt(sort: Asc, nulls: First), id])
+  // #1183: the attempt-chain read fetches the queue items for one work
+  // item's exact (repo, issue) coordinates.
+  @@index([repo, issue])
 }
 
 model PrFixHistory {
@@ -389,9 +395,31 @@ model AgentRun {
   // a follow-up cleanup. Renderers that treat non-https entries as broken
   // links should be aware of this when deciding how to handle them.
   touchedIssueUrls String[]
+  // #1183: optional worker-supplied execution metadata (worker product,
+  // model, effective reasoning effort, runtime/config revision, experiment/
+  // cohort label). Bounded and validated at the API write boundaries (the
+  // tasks/report route, via src/lib/execution-metadata.ts): recognized keys
+  // only, trimmed printable-ASCII strings of at most 128 characters on a
+  // single line. This is STRUCTURAL validation only, not a content filter —
+  // a credential short enough to fit the shape would pass; workers must not
+  // send secrets and Dispatch does not scan content. The shape keeps
+  // multiline prompts and stack traces out and bounds size. Values are
+  // preserved (trimmed), never inferred; absent stays null.
+  executionMetadata Json?
   createdAt        DateTime  @default(now())
   issueId          String?
   issue            Issue?    @relation(fields: [issueId], references: [id])
+  // #1183: durable run→fix-round association. Stamped by tasks/report ONLY
+  // after the report's (id, generation) attempt token was verified against
+  // the queue item (item exists, repo/PR match, generation within the item's
+  // issued range). Null for every run that never carried a verified PR-fix
+  // attempt token — that absence is the honest fact, not a hidden bug.
+  // The pair (prFixQueueItemId, prFixGeneration) is the attempt identity the
+  // worker was issued; the chain projects the run into the fix round keyed by
+  // that generation, never a timestamp guess.
+  prFixQueueItemId String?
+  prFixGeneration  Int?
+  prFixQueueItem   PrFixQueueItem? @relation(fields: [prFixQueueItemId], references: [id], onDelete: SetNull)
 
   // Escalated lane outcome tracking
   outcome       EscalatedOutcome?
@@ -402,6 +430,11 @@ model AgentRun {
   @@index([runType])
   @@index([status])
   @@index([createdAt])
+  // #1183: the attempt-chain read resolves an issue's run evidence by issueId.
+  @@index([issueId])
+  // #1183: the attempt-chain read also fetches runs by their fix-round
+  // association (the queue items of this issue), so the FK is indexed.
+  @@index([prFixQueueItemId])
 }
 
 enum EscalatedOutcome {

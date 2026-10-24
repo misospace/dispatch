@@ -5,7 +5,13 @@ import { rejectAgentCaller } from "@/lib/operator-only";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { prisma } from "@/lib/prisma";
 import { buildIssueLifecycleTimeline, type LifecycleEventRecord } from "@/lib/issue-lifecycle-read";
+import {
+  buildWorkItemDeliveryChain,
+  type WorkAttemptPrFixItemRecord,
+  type WorkAttemptRunRecord,
+} from "@/lib/work-attempt-chain";
 import { backfillMergesFromRunHistory, touchedPullRequestNumbers } from "@/lib/lifecycle-backfill";
+import { normalizeQueueRepo } from "@/lib/pr-fix-queue";
 
 const BACKFILL_RATE_LIMIT = { limit: 5, windowMs: 60_000 };
 
@@ -15,6 +21,14 @@ const BACKFILL_RATE_LIMIT = { limit: 5, windowMs: 60_000 };
  * `truncated` rather than silently dropped or expanded into an unbounded scan.
  */
 const MAX_EVENTS = 500;
+
+/**
+ * Bounded attempt read (#1183): the run evidence behind the attempt chain is
+ * capped like the event window; hitting the cap is surfaced as
+ * `attemptsTruncated` rather than silently dropped.
+ */
+const MAX_ATTEMPT_RUNS = 500;
+const MAX_ATTEMPT_HISTORY = 100;
 
 function toEventRecord(row: {
   kind: string;
@@ -56,7 +70,10 @@ function toEventRecord(row: {
  * claim never reads as zero, and a close without an observed merge is
  * `closed-unmerged`, never "shipped". The contract is worker-neutral: it
  * assumes nothing Courier- or Dispatch-writer-specific beyond the event
- * taxonomy in docs/issue-lifecycle-events.md.
+ * taxonomy in docs/issue-lifecycle-events.md. Additively (#1183), the
+ * response also carries `attempts` — the work item's attempt chain from
+ * docs/work-attempt-chain.md — with an `attemptsTruncated` flag when the
+ * bounded run read hit its cap; no existing field changes shape.
  */
 export async function GET(request: NextRequest, context: { params: Promise<{ issueId: string }> }) {
   const auth = await authorizeRequest(request);
@@ -97,6 +114,88 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
       events,
     );
 
+    // Bounded attempt evidence (#1183): the PR-fix items matching this item's
+    // exact (repo, issue) coordinates — the filter is bounded to the linked
+    // PRs (one row per PR), each item's history capped at the OLDEST 100
+    // entries per item (asc order) — and the runs attached to this issue OR
+    // durably associated to one of those items' fix rounds (#1183 review:
+    // a followup-pr run may not carry an issueId; its prFixQueueItemId stamp
+    // is what pulls its evidence into this item's chain). The run read is
+    // capped at MAX_ATTEMPT_RUNS. Both feeds are plain data for the pure
+    // projection; neither read can expand into a full-history scan.
+    const prFixRows = await prisma.prFixQueueItem.findMany({
+      // Queue writes fold repo through normalizeQueueRepo (#1145);
+      // Repository.fullName keeps caller casing, so reads must fold too.
+      where: { repo: normalizeQueueRepo(issue.repository.fullName), issue: issue.number },
+      // Secondary `id` key: with >100 rows tied on `at` at the cap boundary,
+      // a lone `at` order would leave WHICH row survives DB-nondeterministic.
+      include: { history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: MAX_ATTEMPT_HISTORY + 1 } },
+    });
+    const runRows = await prisma.agentRun.findMany({
+      where: {
+        OR: [{ issueId }, { prFixQueueItemId: { in: prFixRows.map((row) => row.id) } }],
+      },
+      // Secondary `id` key: with >500 rows tied on `startedAt` at the cap
+      // boundary, a lone time key would leave WHICH rows survive
+      // DB-nondeterministic (same rule as the history read below).
+      orderBy: [{ startedAt: "asc" }, { id: "asc" }],
+      take: MAX_ATTEMPT_RUNS + 1,
+      select: {
+        id: true,
+        agentName: true,
+        runType: true,
+        status: true,
+        startedAt: true,
+        finishedAt: true,
+        executionMetadata: true,
+        prFixQueueItemId: true,
+        prFixGeneration: true,
+      },
+    });
+    const attemptsTruncated = runRows.length > MAX_ATTEMPT_RUNS;
+    const attemptsRunRows = attemptsTruncated ? runRows.slice(0, MAX_ATTEMPT_RUNS) : runRows;
+
+    const runs: WorkAttemptRunRecord[] = attemptsRunRows.map((row) => ({
+      id: row.id,
+      agentName: row.agentName,
+      runType: row.runType,
+      status: row.status,
+      startedAt: row.startedAt,
+      finishedAt: row.finishedAt,
+      executionMetadata:
+        typeof row.executionMetadata === "object" && row.executionMetadata !== null
+          ? (row.executionMetadata as Record<string, unknown>)
+          : null,
+      prFixQueueItemId: row.prFixQueueItemId,
+      prFixGeneration: row.prFixGeneration,
+    }));
+    const prFixItems: WorkAttemptPrFixItemRecord[] = prFixRows.map((row) => ({
+      id: row.id,
+      repo: row.repo,
+      pr: row.pr,
+      issue: row.issue,
+      generation: row.generation,
+      fixAttempts: row.fixAttempts,
+      status: row.status,
+      outcome: row.outcome,
+      type: row.type,
+      queuedAt: row.queuedAt,
+      historyTruncated: row.history.length > MAX_ATTEMPT_HISTORY,
+      history: row.history.slice(0, MAX_ATTEMPT_HISTORY).map((entry) => ({
+        id: entry.id,
+        at: entry.at,
+        action: entry.action,
+        status: entry.status,
+        outcome: entry.outcome,
+        evidenceKey: entry.evidenceKey,
+      })),
+    }));
+
+    const attempts = buildWorkItemDeliveryChain(
+      { repoFullName: issue.repository.fullName, issueNumber: issue.number },
+      { events, runs, prFixItems },
+    );
+
     return NextResponse.json({
       issue: {
         id: issue.id,
@@ -108,6 +207,10 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
       timeline,
       events,
       truncated,
+      // #1183, additive: the attempt chain rides alongside the timeline;
+      // no existing field changes shape.
+      attempts,
+      attemptsTruncated,
     });
   } catch (error) {
     console.error("Failed to build issue lifecycle timeline:", error);

@@ -1,0 +1,983 @@
+/**
+ * A pure, order-invariant projection of one work item's execution evidence
+ * into a typed "work-item attempt chain" (#1183).
+ *
+ * The lifecycle timeline (`issue-lifecycle-read.ts`) answers what happened to
+ * the work item. This module answers a different question: *who executed it,
+ * how many times, and how did each execution end*. It links every execution
+ * attempt and every PR-fix round of ONE work item into a single delivery
+ * chain from plain data — the same `IssueLifecycleEvent` rows the timeline
+ * reads, the `AgentRun` rows attached to the issue, and the `PrFixQueueItem`
+ * rows for the item's PRs — so a reader sees one ordered chain:
+ *
+ * - `attempts` in oldest-first order: one `exec-<hash12>` per observed
+ *   claim (a content-derived id over the claim event's canonical dedupe
+ *   identity — stable even when backfilled evidence arrives out of order,
+ *   and stable even when a later duplicate observation of the same claim
+ *   arrives), one `fix-<itemId>-g<generation>` per PR-fix generation.
+ * - `totalExecutionWallTimeMs`: the union of ALL execution-interval evidence
+ *   across attempts and fix rounds, so overlapping intervals are never
+ *   double-counted.
+ *
+ * Three rules keep it honest, mirroring the timeline's:
+ *
+ * 1. **Unknown is a value.** A claim time with no claim event, a start/end
+ *    with no AgentRun interval, a merge with no `pr_merged` row — all stay
+ *    null. Claimed time is never inferred from the issue's creation or from
+ *    run timestamps; start/end come only from AgentRun intervals, because
+ *    claim/admission time and actual execution time are different facts.
+ * 2. **Conservative classification.** An attempt is `active-execution` only
+ *    when a run interval overlaps its window; anything else (queued,
+ *    waiting-review, waiting-ci) stays `unclassified` unless explicit
+ *    evidence says otherwise (a release that deliberately retained
+ *    `status/in-review`). When in doubt, unclassified.
+ * 3. **Every attempt is preserved.** Failures, blocked runs, attempts
+ *    superseded by a newer claim or a newer fix generation, and open
+ *    attempts all appear with their outcome — the chain never drops an
+ *    attempt, and a worker success report never becomes merge evidence:
+ *    merges live only in the timeline's `pr_merged` events.
+ *
+ * The function is pure: no Prisma, no I/O, no clock reads, and its output is
+ * invariant to the order the rows arrive in.
+ */
+
+import { createHash } from "node:crypto";
+
+import type {
+  LifecycleEventRecord,
+  LifecycleProvenance,
+} from "./issue-lifecycle-read";
+
+export interface WorkAttemptRunRecord {
+  id: string;
+  agentName: string | null;
+  runType: string;
+  status: string;
+  startedAt: Date | string;
+  finishedAt: Date | string | null;
+  executionMetadata: Record<string, unknown> | null;
+  /**
+   * Durable run→fix-round association (#1183 review): the queue item and
+   * generation whose hand-out token this run's report carried, verified
+   * against real queue state at the report boundary. A run that carries it
+   * is attributed to that item's fix round — and ONLY that round: it is
+   * never attributed to an execution attempt by time overlap. Runs without
+   * the association (issue work, or pre-association history) keep the
+   * window join and are never attributed to a fix round (no timestamp
+   * guessing).
+   */
+  prFixQueueItemId?: string | null;
+  prFixGeneration?: number | null;
+}
+
+export interface WorkAttemptHistoryRecord {
+  /** Persisted `PrFixHistory` row id — the event's identity in the chain. */
+  id: string;
+  at: Date | string;
+  action: string;
+  status: string | null;
+  outcome: string | null;
+  /** Enqueue rows carry the triggering evidence key (`<kind>:<repo>#<pr>...`). */
+  evidenceKey: string | null;
+}
+
+export interface WorkAttemptPrFixItemRecord {
+  id: string;
+  repo: string;
+  pr: number;
+  issue: number | null;
+  generation: number;
+  fixAttempts: number;
+  status: string;
+  outcome: string | null;
+  /** `PrFixQueueItem.type` (MERGE_CONFLICT / CI_FAILURE / REVIEW_FEEDBACK / OTHER). */
+  type: string;
+  queuedAt: Date | string;
+  history: readonly WorkAttemptHistoryRecord[];
+  /** True when the bounded read cut this item's history off (#1183). */
+  historyTruncated: boolean;
+}
+
+export type WorkItemAttemptKind = "execution" | "fix-round";
+
+export type WorkItemAttemptOutcome =
+  | "success"
+  | "failed"
+  | "blocked"
+  | "abandoned"
+  | "superseded"
+  | "unclassified";
+
+export type WorkItemAttemptClassification =
+  | "active-execution"
+  | "waiting-review"
+  | "unclassified";
+
+export interface WorkItemAttemptExecutionMetadata {
+  workerProduct: string | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  runtimeRevision: string | null;
+  cohortLabel: string | null;
+}
+
+export interface WorkItemAttemptArtifacts {
+  agentRunIds: string[];
+  pullRequestNumbers: number[];
+}
+
+export interface WorkItemAttempt {
+  attemptId: string;
+  kind: WorkItemAttemptKind;
+  agentName: string | null;
+  claimedAt: { at: string | null; provenance: LifecycleProvenance };
+  startedAt: string | null;
+  endedAt: string | null;
+  reportedAt: string | null;
+  outcome: WorkItemAttemptOutcome;
+  classification: WorkItemAttemptClassification;
+  executionMetadata: WorkItemAttemptExecutionMetadata;
+  artifacts: WorkItemAttemptArtifacts;
+  wallTimeMs: number | null;
+  // The PR-fix queue item behind a fix-round attempt (#1183 review): the
+  // attemptId keys off the item id — unique even when two items share the
+  // same repo#pr — so this field carries the coordinates. `type` is the
+  // item's CURRENT queue type (mutable across rounds); per-round triggering
+  // evidence is distinct in `prFixEvents`. null for execution attempts.
+  prFix: { itemId: string; repo: string; pr: number; type: string } | null;
+}
+
+/**
+ * Closed classification of one `PrFixHistory` row (#1183 acceptance): enqueue,
+ * review-request/CI-failure/conflict triggers (via the evidence kind), acks,
+ * reclaims, requeues, and settlements stay DISTINCT — the chain never folds
+ * the history stream into the round's single outcome. Derived only from the
+ * row's persisted `action`/`status`; an unrecognized action stays `other`
+ * rather than being guessed.
+ */
+export type WorkItemPrFixEventClass =
+  | "enqueue"
+  | "ack"
+  | "reclaim"
+  | "requeue"
+  | "capacity-handoff"
+  | "reactivation"
+  | "external-wait"
+  | "settlement"
+  | "other";
+
+/**
+ * What triggered a fix round, from the evidence kind its enqueue row carried.
+ * `merge-state` is ambiguous (a merge-state observation can back either a
+ * conflict or a generic update) and is never folded into `conflict`.
+ */
+export type WorkItemPrFixEvidenceTrigger =
+  | "review"
+  | "ci-failure"
+  | "conflict"
+  | "comment"
+  | "merge-state"
+  | "unknown";
+
+export interface WorkItemPrFixEvent {
+  /** The persisted `PrFixHistory` row id; replays of the same row are one event. */
+  eventId: string;
+  itemId: string;
+  repo: string;
+  pr: number;
+  at: string;
+  /** Raw persisted action, verbatim — the class never replaces the source fact. */
+  action: string;
+  eventClass: WorkItemPrFixEventClass;
+  status: string | null;
+  outcome: string | null;
+  /** Raw evidence-kind prefix of `evidenceKey` (null when the row carried none). */
+  evidenceKind: string | null;
+  evidenceTrigger: WorkItemPrFixEvidenceTrigger | null;
+}
+
+export interface WorkItemDeliveryChain {
+  schema: "dispatch.work-item-attempt-chain/v1";
+  units: "milliseconds";
+  workItem: { repoFullName: string; issueNumber: number };
+  attempts: WorkItemAttempt[];
+  /**
+   * Per-item PR-fix evidence stream (#1183 acceptance): every retained
+   * `PrFixHistory` row as a classified, distinct event. Generation
+   * attribution is NOT guessed — history rows carry no generation — so the
+   * events stay item-level and chronologically ordered.
+   */
+  prFixEvents: WorkItemPrFixEvent[];
+  /** True when any item's history exceeded the bounded read. */
+  prFixEventsTruncated: boolean;
+  totalExecutionWallTimeMs: number | null;
+  notes: string[];
+}
+
+export interface WorkItemChainInput {
+  repoFullName: string;
+  issueNumber: number;
+}
+
+/** Parse a defensive timestamp: unparseable (or absent) values yield null. */
+function toMillis(value: Date | string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function toIso(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+function isBackfilled(metadata: Record<string, unknown> | null): boolean {
+  return metadata?.backfilled === true;
+}
+
+/**
+ * Which PR a `pr_merged` row is about: the metadata's number when it carries
+ * one, else the `pr-<n>` sourceEventId. Mirrors the timeline's resolver so
+ * both readers agree on a merge's identity.
+ */
+function resolvePrNumber(row: LifecycleEventRecord): number | null {
+  const metadata = row.metadata ?? {};
+  if (typeof metadata.pullRequestNumber === "number" && Number.isFinite(metadata.pullRequestNumber)) {
+    return metadata.pullRequestNumber;
+  }
+  const match = row.sourceEventId?.match(/^pr-(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
+
+function contentKey(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+/**
+ * The canonical identity of ONE logical lifecycle observation — the exact key
+ * the timeline's dedupe uses: `kind`, `fromStatus`, `toStatus`,
+ * `occurredAtMs`, `agentName` (plus the PR number for a merge).
+ *
+ * `source` and `actor` are deliberately NOT part of it (#1183 review): the
+ * same transition observed by two writers (the documented api-vs-webhook
+ * double-record) is one fact, and either writer may be the only one
+ * recorded so far. Identity must never depend on WHICH duplicate observation
+ * happens to represent the fact, or a later duplicate would rename an
+ * existing attempt.
+ */
+function observationIdentityKey(row: LifecycleEventRecord, occurredAtMs: number): string {
+  return [
+    row.kind,
+    row.fromStatus ?? "",
+    row.toStatus ?? "",
+    occurredAtMs,
+    row.agentName ?? "",
+    row.kind === "pr_merged" ? (resolvePrNumber(row) ?? "") : "",
+  ].join("\u0000");
+}
+
+/**
+ * Content-derived execution-attempt identity (#1183 review): sha256 over the
+ * claim event's canonical dedupe identity, first 12 hex chars.
+ *
+ * The join is exactly the dedupe identity, so it is stable: a duplicate
+ * observation of the same claim (different `source`/`actor`, same fact) maps
+ * to the same attempt id and can never rename an existing attempt. It is
+ * also exactly as discriminating as the dedupe key — two claim rows that
+ * survive dedupe have different identities and therefore different ids. A
+ * positional `exec-<ordinal>` would rename every attempt when a backfilled
+ * EARLIER claim arrives — the ordinal shifts, the content id does not.
+ * `node:crypto` createHash is used instead of an inline FNV-1a/djb2 to keep
+ * a hand-rolled hash out of the identity path; the module stays pure
+ * (deterministic, no I/O, no clock reads).
+ */
+function executionAttemptId(claim: { identityKey: string }): string {
+  return `exec-${createHash("sha256").update(claim.identityKey).digest("hex").slice(0, 12)}`;
+}
+
+/**
+ * ONE logical fact, merged across every observation of it.
+ *
+ * The dedupe collapses duplicate observations of the same transition into a
+ * single fact. The fact's EVIDENCE is the union of what its observations
+ * say — not whatever the representative row happens to carry (#1183 review):
+ * a late duplicate must never flip an attempt's provenance or outcome.
+ *
+ * - `observed`: at least one observation was recorded live (not a backfill).
+ *   A backfill is a reconstruction from existing evidence, so a fact that
+ *   ALSO has a live observation was observed; only a fact whose EVERY
+ *   observation is a backfill is `backfilled`. More evidence never weakens
+ *   the claim, so a late duplicate can only refine it.
+ * - `outcome`: the first non-null `metadata.outcome` across the fact's
+ *   observations (deterministic: the observations are visited in the same
+ *   content order the dedupe sorts by). A duplicate that carries no outcome
+ *   never erases an attested one.
+ */
+interface DedupeFact {
+  row: LifecycleEventRecord;
+  occurredAtMs: number;
+  identityKey: string;
+  observed: boolean;
+  outcome: string | null;
+}
+
+/**
+ * The timeline's exact-duplicate collapse, applied to the same rows: the
+ * same transition observed twice (the documented api-vs-webhook pair) is one
+ * fact and must not inflate the attempt count. `source` is deliberately not
+ * part of the identity; `agentName` is. A merge's identity additionally
+ * includes its PR number. Rows come back in occurredAt order.
+ */
+function dedupeEvents(
+  events: readonly LifecycleEventRecord[],
+  addNote: (note: string) => void,
+): DedupeFact[] {
+  const ordered = [...events].sort((a, b) =>
+    contentKey([
+      a.kind,
+      a.source,
+      a.actor,
+      a.agentName,
+      a.fromStatus,
+      a.toStatus,
+      a.sourceEventId,
+      toMillis(a.occurredAt),
+      toMillis(a.observedAt),
+      a.metadata,
+    ]) < contentKey([
+      b.kind,
+      b.source,
+      b.actor,
+      b.agentName,
+      b.fromStatus,
+      b.toStatus,
+      b.sourceEventId,
+      toMillis(b.occurredAt),
+      toMillis(b.observedAt),
+      b.metadata,
+    ])
+      ? -1
+      : 1,
+  );
+
+  const facts: DedupeFact[] = [];
+  const byIdentity = new Map<string, DedupeFact>();
+  let collapsed = false;
+  for (const row of ordered) {
+    const occurredAtMs = toMillis(row.occurredAt);
+    if (occurredAtMs === null) {
+      addNote(`event ${row.kind} (${row.source}) skipped: unparseable occurredAt`);
+      continue;
+    }
+    const key = observationIdentityKey(row, occurredAtMs);
+    const reported = (row.metadata ?? {}).outcome;
+    const existing = byIdentity.get(key);
+    if (existing) {
+      collapsed = true;
+      // Merge the duplicate's evidence into the fact it observes.
+      if (!isBackfilled(row.metadata)) existing.observed = true;
+      if (existing.outcome === null && typeof reported === "string") {
+        existing.outcome = reported;
+      }
+      continue;
+    }
+    const fact: DedupeFact = {
+      row,
+      occurredAtMs,
+      identityKey: key,
+      observed: !isBackfilled(row.metadata),
+      outcome: typeof reported === "string" ? reported : null,
+    };
+    byIdentity.set(key, fact);
+    facts.push(fact);
+  }
+  if (collapsed) addNote("duplicate observation collapsed");
+
+  facts.sort(
+    (a, b) =>
+      a.occurredAtMs - b.occurredAtMs ||
+      (a.row.kind < b.row.kind ? -1 : a.row.kind > b.row.kind ? 1 : 0),
+  );
+  return facts;
+}
+
+/** Union length of closed intervals: overlapping intervals are counted once,
+ * never summed. Null when there are no intervals at all. */
+function unionLength(intervals: Array<{ start: number; end: number }>): number | null {
+  if (intervals.length === 0) return null;
+  const sorted = [...intervals].sort((a, b) => a.start - b.start || a.end - b.end);
+  let total = 0;
+  let currentStart = sorted[0].start;
+  let currentEnd = sorted[0].end;
+  for (const interval of sorted.slice(1)) {
+    if (interval.end > currentEnd) {
+      if (interval.start > currentEnd) {
+        total += currentEnd - currentStart;
+        currentStart = interval.start;
+      }
+      currentEnd = interval.end;
+    }
+  }
+  return total + (currentEnd - currentStart);
+}
+
+const EXECUTION_METADATA_FIELDS: Array<[keyof WorkItemAttemptExecutionMetadata, string]> = [
+  ["workerProduct", "worker"],
+  ["model", "model"],
+  ["reasoningEffort", "reasoningEffort"],
+  ["runtimeRevision", "runtimeRevision"],
+  ["cohortLabel", "cohortLabel"],
+];
+
+function emptyExecutionMetadata(): WorkItemAttemptExecutionMetadata {
+  return {
+    workerProduct: null,
+    model: null,
+    reasoningEffort: null,
+    runtimeRevision: null,
+    cohortLabel: null,
+  };
+}
+
+/** First non-null per field across the matched runs, in run order. Values
+ * are taken verbatim from the run's stored executionMetadata — never
+ * inferred from timestamps or deployment data. */
+function executionMetadataFromRuns(
+  runs: ReadonlyArray<WorkAttemptRunRecord>,
+): WorkItemAttemptExecutionMetadata {
+  const merged = emptyExecutionMetadata();
+  for (const run of runs) {
+    const metadata = run.executionMetadata;
+    for (const [field, key] of EXECUTION_METADATA_FIELDS) {
+      if (merged[field] !== null) continue;
+      const value = metadata?.[key];
+      if (typeof value === "string" && value.length > 0) merged[field] = value;
+    }
+  }
+  return merged;
+}
+
+const CLOSING_KINDS = new Set(["attempt_failed", "completed", "claim_released"]);
+
+/**
+ * Classify a `PrFixHistory` row from its persisted fields ONLY. `mark`
+ * splits by the status it stamped: a QUEUED mark is an internal reopen /
+ * reactivation (cooldown, post-dispatch evidence, failure-report reopen), a
+ * WAITING_EXTERNAL mark records an external wait, anything else settles the
+ * item. Unknown actions stay `other` — never guessed.
+ */
+function classifyPrFixEventClass(row: WorkAttemptHistoryRecord): WorkItemPrFixEventClass {
+  switch (row.action) {
+    case "enqueue":
+      return "enqueue";
+    case "ack":
+      return "ack";
+    case "reclaim":
+      return "reclaim";
+    case "requeue":
+      return "requeue";
+    case "capacity_handoff":
+      return "capacity-handoff";
+    case "mark":
+      if (row.status === "QUEUED") return "reactivation";
+      if (row.status === "WAITING_EXTERNAL") return "external-wait";
+      return "settlement";
+    default:
+      return "other";
+  }
+}
+
+const EVIDENCE_TRIGGER_BY_KIND = new Map<string, WorkItemPrFixEvidenceTrigger>([
+  ["review", "review"],
+  ["review_comment", "review"],
+  ["check_run", "ci-failure"],
+  ["merge_conflict", "conflict"],
+  ["comment", "comment"],
+  ["merge_state", "merge-state"],
+  ["unknown", "unknown"],
+]);
+
+/**
+ * The triggering evidence class of a history row: the prefix of its
+ * `evidenceKey` (`"<kind>:<repo>#<pr>[:<sourceId>]"`). Only enqueue rows
+ * carry an evidence key; every other row reports null rather than inheriting
+ * the item's (mutable) current type. An unrecognized kind is `unknown` with
+ * its raw prefix preserved in `evidenceKind`.
+ */
+function prFixEvidenceTrigger(evidenceKey: string | null): {
+  evidenceKind: string | null;
+  evidenceTrigger: WorkItemPrFixEvidenceTrigger | null;
+} {
+  if (evidenceKey === null || evidenceKey === "") return { evidenceKind: null, evidenceTrigger: null };
+  const kind = evidenceKey.slice(0, evidenceKey.indexOf(":") === -1 ? evidenceKey.length : evidenceKey.indexOf(":"));
+  return {
+    evidenceKind: kind,
+    evidenceTrigger: EVIDENCE_TRIGGER_BY_KIND.get(kind) ?? "unknown",
+  };
+}
+
+/**
+ * Build the delivery chain for one work item. Inputs are plain data — a
+ * prisma result, a webhook payload, or a test fixture — and the projection
+ * is invariant to the order rows arrive in.
+ */
+export function buildWorkItemDeliveryChain(
+  workItem: WorkItemChainInput,
+  inputs: {
+    events: readonly LifecycleEventRecord[];
+    runs: readonly WorkAttemptRunRecord[];
+    prFixItems: readonly WorkAttemptPrFixItemRecord[];
+  },
+): WorkItemDeliveryChain {
+  const notes: string[] = [];
+  const addNote = (note: string) => {
+    if (!notes.includes(note)) notes.push(note);
+  };
+
+  const events = dedupeEvents(inputs.events, addNote);
+
+  // Runs are deduped by id: two identical reports land on one AgentRun row
+  // (the report dedupe reuses it), so a replayed run must contribute one
+  // attempt's worth of evidence, not two. Conflicting duplicates (same id,
+  // different content) keep the first row in content order so the result
+  // stays order-invariant.
+  const sortedRuns = [...inputs.runs].sort((a, b) =>
+    contentKey([a.id, a.agentName, a.runType, a.status, toMillis(a.startedAt), toMillis(a.finishedAt), a.executionMetadata, a.prFixQueueItemId, a.prFixGeneration]) <
+    contentKey([b.id, b.agentName, b.runType, b.status, toMillis(b.startedAt), toMillis(b.finishedAt), b.executionMetadata, b.prFixQueueItemId, b.prFixGeneration])
+      ? -1
+      : 1,
+  );
+  const seenRunIds = new Set<string>();
+  const runIntervals: Array<{ run: WorkAttemptRunRecord; start: number; end: number }> = [];
+  let runsCollapsed = false;
+  for (const run of sortedRuns) {
+    if (seenRunIds.has(run.id)) {
+      runsCollapsed = true;
+      continue;
+    }
+    seenRunIds.add(run.id);
+    const start = toMillis(run.startedAt);
+    if (start === null) {
+      addNote(`agent run ${run.id} skipped: unparseable startedAt`);
+      continue;
+    }
+    const finishedMs = toMillis(run.finishedAt);
+    if (finishedMs === null && run.finishedAt !== null && run.finishedAt !== undefined) {
+      addNote(`agent run ${run.id} finishedAt unparseable; treated as not finished`);
+    }
+    // A still-running (or unparseable-finishedAt) run is a zero-length
+    // instant at its start: it evidences execution without inventing an end.
+    const end = finishedMs !== null && finishedMs > start ? finishedMs : start;
+    runIntervals.push({ run, start, end });
+  }
+  if (runsCollapsed) addNote("duplicate agent run collapsed");
+
+  // Every run interval is execution-interval evidence for the item, so the
+  // total unions them all — overlapping intervals across attempts and fix
+  // rounds are never double-counted.
+  const totalExecutionWallTimeMs = unionLength(
+    runIntervals.map(({ start, end }) => ({ start, end })),
+  );
+
+  // Each ordered entry carries the attempt plus its private ordering anchor;
+  // the anchor is stripped before the chain is returned.
+  interface OrderedAttempt {
+    attempt: WorkItemAttempt;
+    anchorMs: number | null;
+    kindRank: number;
+    ordinal: number;
+  }
+  const ordered: OrderedAttempt[] = [];
+
+  // Execution attempts: one per claim event, in claim order. Each attempt's
+  // window is [claim, first closing evidence) where closing evidence is an
+  // attempt_failed, a completed, a claim_released — or the next claim, which
+  // supersedes the attempt without erasing it.
+  let ordinal = 0;
+  for (let eventIndex = 0; eventIndex < events.length; eventIndex += 1) {
+    const claim = events[eventIndex];
+    if (claim.row.kind !== "claim") continue;
+    ordinal += 1;
+    const windowStart = claim.occurredAtMs;
+
+    let closeIndex: number | null = null;
+    let supersededByClaim = false;
+    for (let i = eventIndex + 1; i < events.length; i += 1) {
+      const kind = events[i].row.kind;
+      if (kind === "claim") {
+        closeIndex = i;
+        supersededByClaim = true;
+        break;
+      }
+      if (CLOSING_KINDS.has(kind)) {
+        closeIndex = i;
+        break;
+      }
+    }
+    let closing = closeIndex !== null ? events[closeIndex] : null;
+    if (closing !== null && !supersededByClaim) {
+      // Among closing events at the SAME instant, the claim's own agent wins:
+      // a cross-agent report must not mask the claim's own outcome just
+      // because it sorts first (#1183 review). Only events AFTER the claim
+      // are candidates — a closing observation that precedes the claim
+      // belongs to an earlier attempt.
+      const claimAgent = claim.row.agentName;
+      const closingAtMs = closing.occurredAtMs;
+      if (claimAgent !== null) {
+        for (let i = eventIndex + 1; i < events.length; i += 1) {
+          const candidate = events[i];
+          if (candidate.occurredAtMs > closingAtMs) break;
+          if (candidate.occurredAtMs !== closingAtMs) continue;
+          if (!CLOSING_KINDS.has(candidate.row.kind)) continue;
+          if (candidate.row.agentName !== claimAgent) continue;
+          closing = candidate;
+          break;
+        }
+      }
+    }
+    const windowEnd = closing !== null ? closing.occurredAtMs : Number.POSITIVE_INFINITY;
+    if (supersededByClaim) {
+      addNote("attempt closed by a newer claim without a release");
+    }
+
+    // Runs whose interval lies within/overlaps the attempt window supply the
+    // attempt's actual execution start/end and its wall time. Attribution is
+    // agent-aware (#1183 review): when the claim and the run BOTH carry agent
+    // identity, a run from a different agent is never attributed, even if its
+    // interval crosses the claim boundary — otherwise concurrent workers
+    // inherit each other's runs, metadata, start time, and wall time. A run
+    // with no agent identity cannot be discriminated and still attributes by
+    // time alone. The top-level totalExecutionWallTimeMs stays the item-wide
+    // union of every run interval regardless. Matched runs are ordered by
+    // start (then id) so the metadata union is order-invariant.
+    //
+    // A run carrying a durable fix-round association (#1183 review) is
+    // excluded from this time join entirely: it is fix-round evidence by its
+    // verified (item, generation) identity, and a PR-fix execution crossing a
+    // claim's time window must never be read as that claim's issue work.
+    const claimAgentForRuns = claim.row.agentName;
+    const matched = runIntervals
+      .filter(
+        ({ run, start, end }) =>
+          run.prFixQueueItemId === null || run.prFixQueueItemId === undefined
+            ? start <= windowEnd &&
+              end >= windowStart &&
+              !(claimAgentForRuns !== null && run.agentName !== null && run.agentName !== claimAgentForRuns)
+            : false,
+      )
+      .sort((a, b) => a.start - b.start || (a.run.id < b.run.id ? -1 : a.run.id > b.run.id ? 1 : 0));
+
+    const startedAtMs = matched.length > 0 ? Math.min(...matched.map((m) => m.start)) : null;
+    const endedAtMs = matched.length > 0 ? Math.max(...matched.map((m) => m.end)) : null;
+
+    // Merge evidence stays lifecycle-owned: PR numbers come only from
+    // pr_merged events whose occurrence falls in the attempt window, and a
+    // merge never decides an attempt's outcome.
+    const pullRequestNumbers = [
+      ...new Set(
+        events
+          .filter(
+            (event) =>
+              event.row.kind === "pr_merged" &&
+              event.occurredAtMs >= windowStart &&
+              event.occurredAtMs <= windowEnd &&
+              resolvePrNumber(event.row) !== null,
+          )
+          .map((event) => resolvePrNumber(event.row) as number),
+      ),
+    ].sort((a, b) => a - b);
+
+    let outcome: WorkItemAttemptOutcome = "unclassified";
+    if (supersededByClaim) {
+      outcome = "superseded";
+    } else if (
+      closing !== null &&
+      (closing.row.kind === "completed" || closing.row.kind === "attempt_failed")
+    ) {
+      // Outcome attribution requires the closing report's agent to match the
+      // claim's agent (#1183 review): a closing event from a DIFFERENT agent
+      // still ends the window (reportedAt is set) but never decides the
+      // outcome — the attempt stays unclassified.
+      const claimAgent = claim.row.agentName;
+      const closingAgent = closing.row.agentName;
+      if (
+        claimAgent !== null &&
+        closingAgent !== null &&
+        closingAgent !== claimAgent
+      ) {
+        addNote("closing report from a different agent ignored for outcome attribution");
+      } else if (closing.row.kind === "completed") {
+        outcome = "success";
+      } else {
+        // The outcome is the fact's merged evidence, not the representative
+        // row's metadata: a duplicate observation that carries no outcome
+        // never erases an attested one.
+        const reported = closing.outcome;
+        if (reported === "failed") outcome = "failed";
+        else if (reported === "blocked") outcome = "blocked";
+      }
+    }
+    // A claim_released alone never certifies success or failure: the release
+    // leaves the attempt unclassified regardless of the status it retained.
+
+    let classification: WorkItemAttemptClassification = "unclassified";
+    if (matched.length > 0) {
+      classification = "active-execution";
+    } else if (
+      closing !== null &&
+      !supersededByClaim &&
+      closing.row.kind === "claim_released" &&
+      closing.row.toStatus === "status/in-review"
+    ) {
+      // Explicit evidence only: the release deliberately retained
+      // status/in-review. A merged PR in the window is NOT derivable as
+      // waiting-review and stays unclassified.
+      classification = "waiting-review";
+    }
+
+    const agentName =
+      claim.row.agentName ??
+      closing?.row.agentName ??
+      (matched.length > 0 ? matched[0].run.agentName : null) ??
+      null;
+
+    ordered.push({
+      attempt: {
+        attemptId: executionAttemptId(claim),
+        kind: "execution",
+        agentName,
+        claimedAt: {
+          at: toIso(windowStart),
+          // Fact-level provenance: observed when at least one observation of
+          // the claim was recorded live, backfilled only when every
+          // observation is a backfill.
+          provenance: claim.observed ? "observed" : "backfilled",
+        },
+        startedAt: startedAtMs !== null ? toIso(startedAtMs) : null,
+        endedAt: endedAtMs !== null ? toIso(endedAtMs) : null,
+        reportedAt: closing !== null ? toIso(closing.occurredAtMs) : null,
+        outcome,
+        classification,
+        executionMetadata: executionMetadataFromRuns(matched.map((m) => m.run)),
+        artifacts: {
+          agentRunIds: matched.map((m) => m.run.id),
+          pullRequestNumbers,
+        },
+        wallTimeMs:
+          matched.length > 0
+            ? unionLength(matched.map((m) => ({ start: m.start, end: m.end })))
+            : null,
+        prFix: null,
+      },
+      anchorMs: windowStart,
+      kindRank: 0,
+      ordinal,
+    });
+  }
+
+  // PR-fix rounds: one per generation the item records, in generation order —
+  // exactly one round per generation 1..item.generation. `fixAttempts` is the
+  // worker-execution count (#1103), not a work identity, and must never
+  // fabricate extra rounds. The history stream carries no generation
+  // attribution, so a fix round's CLAIM time stays unknown — never guessed
+  // from queue or history timestamps. Run evidence is attached only through
+  // the durable (item, generation) association verified at the report
+  // boundary (#1183 review): those runs supply the round's agent, timing,
+  // metadata, and artifact ids; unstamped runs are never attached by time.
+  // The attemptId keys off the item id, which stays unique even when two
+  // items share the same repo#pr.
+  const sortedItems = [...inputs.prFixItems].sort((a, b) =>
+    contentKey([a.repo, a.pr, a.id]) < contentKey([b.repo, b.pr, b.id]) ? -1 : 1,
+  );
+  for (const item of sortedItems) {
+    const historyTimes = item.history
+      .map((entry) => ({ entry, ms: toMillis(entry.at) }))
+      .filter((entry): entry is { entry: WorkAttemptHistoryRecord; ms: number } => entry.ms !== null)
+      .sort(
+        (a, b) =>
+          a.ms - b.ms ||
+          (a.entry.action < b.entry.action ? -1 : a.entry.action > b.entry.action ? 1 : 0),
+      );
+    if (historyTimes.length < item.history.length) {
+      addNote(`pr-fix item ${item.repo}#${item.pr} history entry skipped: unparseable at`);
+    }
+    const queuedAtMs = toMillis(item.queuedAt);
+    if (queuedAtMs === null) {
+      addNote(`pr-fix item ${item.repo}#${item.pr} queuedAt unparseable`);
+    }
+
+    // Stamped runs bucket by their VERIFIED generation (#1183 review): a
+    // run's report carried this item's (id, generation) attempt token, checked
+    // against real queue state at the report boundary. Rounds are keyed by
+    // that identity only — never by run timestamps, which would guess.
+    const runsByGeneration = new Map<number, typeof runIntervals>();
+    for (const interval of runIntervals) {
+      if (interval.run.prFixQueueItemId !== item.id) continue;
+      const generation = interval.run.prFixGeneration;
+      if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+        addNote(`agent run ${interval.run.id} fix-round generation unusable; not attributed`);
+        continue;
+      }
+      if (generation > item.generation) {
+        // Defensive: the report boundary fail-closes future generations, so
+        // this only fires on corrupted data. Announced, never silent.
+        addNote(
+          `agent run ${interval.run.id} fix-round generation ${generation} exceeds item ${item.id} generation ${item.generation}; not attributed`,
+        );
+        continue;
+      }
+      const bucket = runsByGeneration.get(generation);
+      if (bucket) bucket.push(interval);
+      else runsByGeneration.set(generation, [interval]);
+    }
+
+    const lastGeneration = item.generation;
+    for (let generation = 1; generation <= lastGeneration; generation += 1) {
+      // Deterministic order (start, then id) so the metadata union and the
+      // agentRunIds list never depend on row arrival.
+      const attributed = (runsByGeneration.get(generation) ?? []).sort((a, b) =>
+        a.start - b.start || (a.run.id < b.run.id ? -1 : a.run.id > b.run.id ? 1 : 0),
+      );
+      const fixStartedMs = attributed.length > 0 ? Math.min(...attributed.map((m) => m.start)) : null;
+      const fixEndedMs = attributed.length > 0 ? Math.max(...attributed.map((m) => m.end)) : null;
+      // Single known agent when every attributed run agrees; a mixed set is
+      // left null rather than picking a representative.
+      const fixAgents = new Set(attributed.map((m) => m.run.agentName));
+      const fixAgentName = attributed.length > 0 && fixAgents.size === 1 ? attributed[0].run.agentName : null;
+
+      let outcome: WorkItemAttemptOutcome;
+      if (generation < lastGeneration) {
+        // A newer generation exists on the same item: this round was
+        // superseded, not deleted.
+        outcome = "superseded";
+      } else if (item.status === "FIXED") {
+        outcome = "success";
+      } else if (item.status === "BLOCKED") {
+        outcome = "blocked";
+      } else if (item.status === "PARKED") {
+        outcome = "abandoned";
+      } else {
+        outcome = "unclassified";
+      }
+
+      ordered.push({
+        attempt: {
+          attemptId: `fix-${item.id}-g${generation}`,
+          kind: "fix-round",
+          agentName: fixAgentName,
+          claimedAt: { at: null, provenance: "unknown" },
+          startedAt: fixStartedMs !== null ? toIso(fixStartedMs) : null,
+          endedAt: fixEndedMs !== null ? toIso(fixEndedMs) : null,
+          reportedAt: null,
+          outcome,
+          classification: attributed.length > 0 ? "active-execution" : "unclassified",
+          executionMetadata:
+            attributed.length > 0
+              ? executionMetadataFromRuns(attributed.map((m) => m.run))
+              : emptyExecutionMetadata(),
+          artifacts: {
+            agentRunIds: attributed.map((m) => m.run.id),
+            pullRequestNumbers: [],
+          },
+          wallTimeMs:
+            attributed.length > 0
+              ? unionLength(attributed.map((m) => ({ start: m.start, end: m.end })))
+              : null,
+          prFix: { itemId: item.id, repo: item.repo, pr: item.pr, type: item.type },
+        },
+        // The round's oldest evidence — its first history entry, else the
+        // queue time — orders it against the execution attempts.
+        anchorMs: historyTimes.length > 0 ? historyTimes[0].ms : queuedAtMs,
+        kindRank: 1,
+        ordinal: generation,
+      });
+    }
+  }
+
+  // PR-fix evidence events (#1183 acceptance): the history stream is exposed
+  // as its own classified, chronologically ordered evidence — never folded
+  // into the fix round's single outcome. Rows are persisted facts with their
+  // own ids, so no lifecycle-style dedupe is needed for genuine facts; only
+  // exact replays of the SAME row id (a bounded read returning a duplicate,
+  // or a fixture re-listing one) collapse, keyed by id and content. History
+  // rows carry no generation attribution, so events are deliberately NOT
+  // attached to a generation's attempt — item coordinates plus time keep
+  // them placeable without guessing.
+  const prFixEvents: WorkItemPrFixEvent[] = [];
+  const seenHistoryIds = new Map<string, string>();
+  let prFixEventsTruncated = false;
+  const sortedHistoryItems = [...inputs.prFixItems].sort((a, b) =>
+    contentKey([a.repo, a.pr, a.id]) < contentKey([b.repo, b.pr, b.id]) ? -1 : 1,
+  );
+  for (const item of sortedHistoryItems) {
+    if (item.historyTruncated) {
+      prFixEventsTruncated = true;
+      addNote(`pr-fix item ${item.repo}#${item.pr} history truncated by the bounded read`);
+    }
+    const historyRows = [...item.history].sort((a, b) =>
+      contentKey([a.id, toMillis(a.at), a.action, a.status, a.outcome, a.evidenceKey]) <
+      contentKey([b.id, toMillis(b.at), b.action, b.status, b.outcome, b.evidenceKey])
+        ? -1
+        : 1,
+    );
+    for (const entry of historyRows) {
+      const atMs = toMillis(entry.at);
+      if (atMs === null) continue; // already noted by the round pass above
+      const contentKeyForReplay = contentKey([entry.id, atMs, entry.action, entry.status, entry.outcome, entry.evidenceKey]);
+      const seenKey = seenHistoryIds.get(entry.id);
+      if (seenKey !== undefined) {
+        // Same persisted row seen twice (or conflicting duplicates of one id):
+        // one event, first-in-content-order — matching the run-dedupe rule.
+        if (seenKey !== contentKeyForReplay) {
+          addNote(`pr-fix history row ${entry.id} has conflicting content; kept first`);
+        }
+        continue;
+      }
+      seenHistoryIds.set(entry.id, contentKeyForReplay);
+      const { evidenceKind, evidenceTrigger } = prFixEvidenceTrigger(entry.evidenceKey);
+      prFixEvents.push({
+        eventId: entry.id,
+        itemId: item.id,
+        repo: item.repo,
+        pr: item.pr,
+        at: toIso(atMs),
+        action: entry.action,
+        eventClass: classifyPrFixEventClass(entry),
+        status: entry.status,
+        outcome: entry.outcome,
+        evidenceKind,
+        evidenceTrigger,
+      });
+    }
+  }
+  // Chronological, deterministic: at (then item coordinates, then row id) so
+  // the order never depends on row arrival.
+  prFixEvents.sort(
+    (a, b) =>
+      Date.parse(a.at) - Date.parse(b.at) ||
+      (contentKey([a.itemId, a.eventId]) < contentKey([b.itemId, b.eventId]) ? -1 : 1),
+  );
+
+  // Oldest-first: by anchor time, execution attempts before fix rounds at an
+  // equal instant, then execution ordinal / fix generation, then arrival
+  // index as the final tie-break — a deterministic total order independent of
+  // row arrival order.
+  ordered.sort((a, b) => {
+    const anchorA = a.anchorMs ?? Number.MAX_SAFE_INTEGER;
+    const anchorB = b.anchorMs ?? Number.MAX_SAFE_INTEGER;
+    if (anchorA !== anchorB) return anchorA - anchorB;
+    if (a.kindRank !== b.kindRank) return a.kindRank - b.kindRank;
+    if (a.ordinal !== b.ordinal) return a.ordinal - b.ordinal;
+    return 0;
+  });
+
+  return {
+    schema: "dispatch.work-item-attempt-chain/v1",
+    units: "milliseconds",
+    workItem: { repoFullName: workItem.repoFullName, issueNumber: workItem.issueNumber },
+    attempts: ordered.map(({ attempt }) => attempt),
+    prFixEvents,
+    prFixEventsTruncated,
+    totalExecutionWallTimeMs,
+    notes,
+  };
+}

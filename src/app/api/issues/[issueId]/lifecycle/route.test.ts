@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMockWithSafeEqual as makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
@@ -12,6 +13,7 @@ const { mocks } = vi.hoisted(() => ({
     eventCreate: vi.fn(),
     eventUpsert: vi.fn(),
     agentRunFindMany: vi.fn(),
+    prFixItemFindMany: vi.fn(),
     automationRepoFindUnique: vi.fn(),
     githubPullRequestFindMany: vi.fn(),
     githubPullRequestCount: vi.fn(),
@@ -28,6 +30,7 @@ vi.mock("@/lib/prisma", () => ({
       upsert: mocks.eventUpsert,
     },
     agentRun: { findMany: mocks.agentRunFindMany },
+    prFixQueueItem: { findMany: mocks.prFixItemFindMany },
     automationRepo: { findUnique: mocks.automationRepoFindUnique },
     githubPullRequest: {
       findMany: mocks.githubPullRequestFindMany,
@@ -103,6 +106,7 @@ beforeEach(() => {
   mocks.eventsFindMany.mockResolvedValue([]);
   mocks.eventUpsert.mockResolvedValue({});
   mocks.agentRunFindMany.mockResolvedValue([]);
+  mocks.prFixItemFindMany.mockResolvedValue([]);
   mocks.automationRepoFindUnique.mockResolvedValue({ id: "repo-1" });
   mocks.githubPullRequestFindMany.mockResolvedValue([]);
   mocks.githubPullRequestCount.mockResolvedValue(0);
@@ -202,6 +206,216 @@ describe("GET /api/issues/[issueId]/lifecycle", () => {
     const body = await (await get()).json();
     expect(body.truncated).toBe(true);
     expect(body.events).toHaveLength(500);
+  });
+
+  it("additively projects the attempt chain from runs and pr-fix items (#1183)", async () => {
+    mocks.eventsFindMany.mockResolvedValue([
+      eventRow({ kind: "claim", agentName: "agent/alpha" }),
+    ]);
+    mocks.agentRunFindMany.mockResolvedValue([
+      {
+        id: "run-1",
+        agentName: "agent/alpha",
+        runType: "implement",
+        status: "completed",
+        startedAt: new Date("2026-10-01T10:05:00Z"),
+        finishedAt: new Date("2026-10-01T11:00:00Z"),
+        executionMetadata: { worker: "courier", model: "gpt-5.5" },
+      },
+    ]);
+    mocks.prFixItemFindMany.mockResolvedValue([
+      {
+        id: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        issue: 42,
+        generation: 1,
+        fixAttempts: 1,
+        status: "FIXED",
+        outcome: null,
+        type: "CI_FAILURE",
+        queuedAt: new Date("2026-10-01T12:00:00Z"),
+        history: [
+          { id: "h-ack", at: new Date("2026-10-01T12:10:00Z"), action: "ack", status: null, outcome: null, evidenceKey: null },
+        ],
+      },
+    ]);
+
+    const body = await (await get()).json();
+    expect(body.attempts.schema).toBe("dispatch.work-item-attempt-chain/v1");
+    expect(body.attempts.workItem).toEqual({ repoFullName: "org/repo", issueNumber: 42 });
+    expect(body.attemptsTruncated).toBe(false);
+    // Content-derived execution id (#1183): sha256 over the claim event's
+    // canonical dedupe identity [kind, fromStatus, toStatus, occurredAtMs,
+    // agentName]. `source`/`actor` are excluded on purpose — the same claim
+    // observed by two writers is one fact and keeps one id.
+    const claimKey = [
+      "claim",
+      "status/ready",
+      "status/in-progress",
+      Date.parse("2026-10-01T10:00:00.000Z"),
+      "agent/alpha",
+      "",
+    ].join("\u0000");
+    const execId = `exec-${createHash("sha256").update(claimKey).digest("hex").slice(0, 12)}`;
+    expect(body.attempts.attempts.map((a: { attemptId: string }) => a.attemptId)).toEqual([
+      execId,
+      "fix-item-1-g1",
+    ]);
+    expect(body.attempts.attempts[0]).toMatchObject({
+      outcome: "unclassified",
+      classification: "active-execution",
+      executionMetadata: { workerProduct: "courier", model: "gpt-5.5" },
+      artifacts: { agentRunIds: ["run-1"] },
+      prFix: null,
+    });
+    expect(body.attempts.attempts[1].outcome).toBe("success");
+    expect(body.attempts.attempts[1].prFix).toEqual({ itemId: "item-1", repo: "org/repo", pr: 7, type: "CI_FAILURE" });
+    // #1183: the history stream rides as its own classified evidence, distinct
+    // from the round outcome.
+    expect(body.attempts.prFixEvents).toEqual([
+      {
+        eventId: "h-ack",
+        itemId: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        at: "2026-10-01T12:10:00.000Z",
+        action: "ack",
+        eventClass: "ack",
+        status: null,
+        outcome: null,
+        evidenceKind: null,
+        evidenceTrigger: null,
+      },
+    ]);
+    expect(body.attempts.prFixEventsTruncated).toBe(false);
+    expect(body.attempts.totalExecutionWallTimeMs).toBe(3300000);
+  });
+
+  it("folds the cached repo casing into the pr-fix read (#1183 review)", async () => {
+    // Queue writes always fold repo lowercase (#1145); Repository.fullName
+    // keeps caller casing, so a mixed-case cache row must still find its
+    // normalized queue items instead of silently reading none.
+    mocks.issueFindUnique.mockResolvedValue(
+      issue({ repository: { fullName: "Org/Repo" } }),
+    );
+
+    const res = await get();
+    expect(res.status).toBe(200);
+    expect(mocks.prFixItemFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { repo: "org/repo", issue: 42 },
+      }),
+    );
+  });
+
+  it("fetches stamped fix runs by item id and projects them into their round (#1183 review)", async () => {
+    // A followup-pr report may carry no issueId; its verified
+    // prFixQueueItemId stamp is what pulls its evidence into this item's
+    // chain, and the projection attaches it to the round the stamp names.
+    mocks.prFixItemFindMany.mockResolvedValue([
+      {
+        id: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        issue: 42,
+        generation: 1,
+        fixAttempts: 1,
+        status: "FIXED",
+        outcome: null,
+        type: "CI_FAILURE",
+        queuedAt: new Date("2026-10-01T12:00:00Z"),
+        history: [],
+      },
+    ]);
+    mocks.agentRunFindMany.mockResolvedValue([
+      {
+        id: "run-fix-1",
+        agentName: "agent/alpha",
+        runType: "followup-pr",
+        status: "completed",
+        startedAt: new Date("2026-10-01T12:05:00Z"),
+        finishedAt: new Date("2026-10-01T12:30:00Z"),
+        executionMetadata: { worker: "courier" },
+        prFixQueueItemId: "item-1",
+        prFixGeneration: 1,
+      },
+    ]);
+
+    const body = await (await get()).json();
+    // The read spans both feeds: issue-attached runs OR runs stamped to
+    // this issue's queue items.
+    expect(mocks.agentRunFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          OR: [{ issueId: "issue-1" }, { prFixQueueItemId: { in: ["item-1"] } }],
+        },
+      }),
+    );
+    const round = body.attempts.attempts.find(
+      (a: { attemptId: string }) => a.attemptId === "fix-item-1-g1",
+    );
+    expect(round).toMatchObject({
+      agentName: "agent/alpha",
+      classification: "active-execution",
+      artifacts: { agentRunIds: ["run-fix-1"] },
+      wallTimeMs: 1500000,
+    });
+    expect(round.executionMetadata).toMatchObject({ workerProduct: "courier" });
+  });
+
+  it("flags attemptsTruncated when the bounded run read hits its cap", async () => {
+    const many = Array.from({ length: 501 }, (_, i) => ({
+      id: `run-${i}`,
+      agentName: null,
+      runType: "implement",
+      status: "completed",
+      startedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, i)),
+      finishedAt: null,
+      executionMetadata: null,
+    }));
+    mocks.agentRunFindMany.mockResolvedValue(many);
+
+    const body = await (await get()).json();
+    expect(body.attemptsTruncated).toBe(true);
+    expect(body.attempts.attempts).toEqual([]);
+  });
+
+  it("flags pr-fix history truncation from the bounded per-item read (#1183)", async () => {
+    // The read takes MAX_ATTEMPT_HISTORY + 1 rows per item; 101 rows mean the
+    // 101st is cut, the flag flips, and only the 100 oldest become events.
+    mocks.prFixItemFindMany.mockResolvedValue([
+      {
+        id: "item-1",
+        repo: "org/repo",
+        pr: 7,
+        issue: 42,
+        generation: 1,
+        fixAttempts: 1,
+        status: "QUEUED",
+        outcome: null,
+        type: "CI_FAILURE",
+        queuedAt: new Date("2026-10-01T12:00:00Z"),
+        history: Array.from({ length: 101 }, (_, i) => ({
+          id: `h-${i}`,
+          at: new Date(Date.UTC(2026, 9, 1, 0, 0, i)),
+          action: "mark",
+          status: "QUEUED",
+          outcome: null,
+          evidenceKey: null,
+        })),
+      },
+    ]);
+
+    const body = await (await get()).json();
+    expect(body.attempts.prFixEvents).toHaveLength(100);
+    expect(body.attempts.prFixEvents[99].eventId).toBe("h-99");
+    expect(body.attempts.prFixEventsTruncated).toBe(true);
+    expect(mocks.prFixItemFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: { history: { orderBy: [{ at: "asc" }, { id: "asc" }], take: 101 } },
+      }),
+    );
   });
 });
 
