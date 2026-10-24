@@ -482,13 +482,18 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   // The claim route (this function's only production caller) runs this cleanup
   // inside the per-issue mutation guard, but the writers it races with do NOT
   // take that guard: the operator agent-work routes (release / release-all /
-  // reassign — `src/app/api/agent-work/route.ts`) and the worker agent-work
-  // start / checkpoint / finish paths (`src/lib/agent-work.ts`). The fence
-  // (not the guard) is therefore the load-bearing protection here; preserving
-  // the row is the safe direction in every case. The stale-work sweep — the
-  // only writer that SETS the pending marker — does take the guard, so it
-  // cannot interleave with the claim path; the reachable pending shape is one
-  // that ARRIVES pending (the operator reassign route's leftover marker).
+  // reassign — `src/app/api/agent-work/route.ts`), the operator unclaim path
+  // (`releaseAgentWorkByAgentAndIssue` — `src/lib/lease.ts`, called from
+  // `src/app/api/issues/unclaim/route.ts` AFTER its guarded block) and the
+  // worker agent-work start / checkpoint / finish paths (`src/lib/agent-work.ts`).
+  // The fence (not the guard) is therefore the load-bearing protection here;
+  // preserving the row is the safe direction in every case. The stale-work
+  // sweep — the only writer that SETS the pending marker — does take the
+  // guard, so it normally cannot interleave with the claim path (a maintainer
+  // force-claim may override that guard); either way the fence's pending
+  // conjunct refuses a row that became pending after the scan, so the
+  // reachable pending shape is one that ARRIVES pending (the operator
+  // reassign route's leftover marker).
   // One CAS delete per candidate row (N = the issue's leftover rows), all
   // inside the transaction: a failure rolls the whole cleanup back, so a
   // partial delete without its audit row is not reachable.
