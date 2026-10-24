@@ -15,8 +15,9 @@
  * explicitly.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { enqueuePrFixItem, hasInFlightRebaseHandout, listQueuedPrFixItems, toAgentQueuePrFixItem, withRebaseLaneAdmission } from "./pr-fix-queue";
+import { enqueuePrFixItem, hasInFlightRebaseHandout, listQueuedPrFixItems, toAgentQueuePrFixItem, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY } from "./pr-fix-queue";
 
 vi.mock("./pr-fix-surfacing", () => ({
   surfacePrFixBlocked: vi.fn().mockResolvedValue({ labelApplied: false, commentPosted: false, errors: [] }),
@@ -114,5 +115,55 @@ suite("PrFixType REBASE against a real PostgreSQL (#1327)", () => {
 
     const row = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 2 } } });
     expect(row?.agentHandouts, "exactly one live rebase hand-out may exist on the branch").toHaveLength(1);
+  });
+
+  it("fails closed with no hand-out when the advisory lock cannot be taken (#1327 review)", async () => {
+    // The review finding: the lock-timeout fallback restored an unlocked
+    // check-then-write, so an admission that could NOT take the advisory lock
+    // could still issue a second live rebase. Here the lane's advisory lock
+    // is held in a SEPARATE session, so the admission waits and PostgreSQL
+    // cancels it at the 3s `lock_timeout`: the admission must reject and NO
+    // hand-out may be written. The route's fail-closed path then defers the
+    // candidate — never hands it out unlocked.
+    await enqueuePrFixItem(prisma, {
+      repo: REPO,
+      pr: 3,
+      lane: "NORMAL",
+      type: "REBASE",
+      reason: "Mechanical rebase: PR dirty against base (#1327)",
+      feedback: "Mechanical rebase required: this PR is dirty against its base branch (#1327).",
+      evidenceKey: "merge_state:integration/rebase-type#3",
+    });
+
+    let admissionError: unknown = null;
+    await prisma.$transaction(
+      async (holder) => {
+        await holder.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
+        try {
+          await withRebaseLaneAdmission(prisma, async (tx) => {
+            await tx.prFixQueueItem.updateMany({
+              where: { repo: REPO, pr: 3, status: "QUEUED" },
+              data: {
+                attemptType: "REBASE",
+                dispatchedAt: new Date(),
+                dispatchedGeneration: 1,
+                agentHandouts: { push: ["agent-c@1"] },
+              },
+            });
+            return "admitted";
+          });
+        } catch (error) {
+          admissionError = error;
+        }
+      },
+      // The outer holder transaction outlives the inner 3s lock wait.
+      { timeout: 30000 },
+    );
+
+    expect(admissionError, "an admission that cannot take the advisory lock must fail").not.toBeNull();
+    const row = await prisma.prFixQueueItem.findUnique({ where: { repo_pr: { repo: REPO, pr: 3 } } });
+    expect(row?.agentHandouts ?? [], "a failed admission must not write a hand-out").toHaveLength(0);
+    expect(row?.attemptType ?? null, "a failed admission must not stamp the dispatched lane").toBeNull();
+    expect(await hasInFlightRebaseHandout(prisma), "the failed admission must not occupy the lane").toBe(false);
   });
 });

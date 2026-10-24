@@ -81,7 +81,7 @@ The `next-task` endpoint returns one of three task types:
 
 A `followup-pr` task names the queued item's lane in `prFixItem.fixType`. The task's `reasons` carry the full contract for the item; `fixType` is the branch key that lets a worker pick the lane without parsing prose. `fixType` is the DISPATCHED lane (the stamped `attemptType`, falling back to the row's current type for pre-stamp rows) — the same value settlement keys on — not the row's mutable type, so a mid-attempt re-observation cannot change the lane a live attempt runs and settles as.
 
-For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#1327): `next-task` hands out at most one live rebase at a time across all PRs (concurrency 1, no fan-out; deferred candidates are retried next poll), and a `failed` or give-up `blocked` report on a `REBASE` item settles as a terminal `PARKED` — it is never re-dispatched as a fresh attempt the way other fix types are under `PR_FIX_MAX_ATTEMPTS`. A new dirty episode (a new head) re-opens the item.
+For `REBASE` the one-attempt bound is enforced server-side, not only in prose (#1327): `next-task` hands out at most one live rebase at a time across all PRs (concurrency 1, no fan-out; deferred candidates are retried next poll, including when the lane's admission lock cannot be taken — a rebase is never handed out unlocked), and a `failed` or give-up `blocked` report on a `REBASE` item settles as a terminal `PARKED` — it is never re-dispatched as a fresh attempt the way other fix types are under `PR_FIX_MAX_ATTEMPTS`. A new dirty episode (a new head) re-opens the item.
 
 | `fixType` | Contract |
 |-----------|----------|

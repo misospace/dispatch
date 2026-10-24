@@ -48,9 +48,12 @@ export type PrFixQueueClient = {
     upsert: (args: any) => Promise<any>;
   };
   $transaction: <T>(fn: (tx: PrFixQueueClient) => Promise<T>) => Promise<T>;
-  // Raw SQL surface used by the #1327 rebase-lane advisory lock. Optional so
-  // legacy/test clients without a raw driver still admit (they simply skip
-  // the serialization, same as pre-#1327); every real Prisma client has it.
+  // Raw SQL surface used by the #1327 rebase-lane advisory lock. Optional on
+  // the type (legacy/test clients may omit it) but MANDATORY for a rebase
+  // admission: `withRebaseLaneAdmission` REFUSES to admit without it, because
+  // an admission that cannot take the advisory lock would run the gate read
+  // and the hand-out write unlocked — the check-then-write fan-out the lane
+  // forbids. Every real Prisma transaction client has it.
   $executeRaw?: (query: Prisma.Sql, ...values: unknown[]) => Promise<number>;
 };
 
@@ -76,27 +79,44 @@ export const REBASE_LANE_ADVISORY_LOCK_KEY = 13270001327n;
  * all release it — it can never strand the lane the way a leaked row lock
  * would.
  *
- * `SET LOCAL lock_timeout` bounds the WAIT: the caller treats an admission
- * failure as fail-open (fall back to the preflight-gate path), so even a
- * pathologically long lock holder cannot stall a poll beyond the timeout.
+ * FAIL CLOSED (#1327 review): the advisory lock is MANDATORY, not best
+ * effort. If the lock cannot be taken — no raw SQL surface, a `lock_timeout`
+ * on the wait, an aborted transaction — this helper throws and the caller
+ * MUST defer the hand-out (the next poll retries it). There is deliberately
+ * no unlocked fallback: an admission that ran the gate read and the
+ * hand-out write outside the lock is the check-then-write the lane
+ * forbids, and the review finding was exactly that fallback re-opening
+ * the fan-out window. Deferring costs one poll; fanning out costs two
+ * `--force-with-lease` pushes on one branch.
+ *
+ * `SET LOCAL lock_timeout` bounds the WAIT so even a pathologically long
+ * lock holder cannot stall a poll beyond the timeout: the wait ends on the
+ * PG side, the transaction aborts, and the caller fails closed.
  */
 export async function withRebaseLaneAdmission<T>(
   client: PrFixQueueClient,
   run: (tx: PrFixQueueClient) => Promise<T>,
 ): Promise<T> {
   return client.$transaction(async (tx) => {
-    if (typeof tx.$executeRaw === "function") {
-      // `SET` accepts no bind parameters, so the interval is a literal.
-      // 3s is deliberately BELOW Prisma's interactive-transaction timeout
-      // (default 5s): the lock wait must end on the PG side — statement
-      // cancelled, transaction aborted, caller fails open — before Prisma
-      // gives up on a connection still blocked inside the lock function,
-      // where its rollback cannot land and the abandoned transaction would
-      // transiently re-acquire and hold the lock the fail-open path just
-      // raced past.
-      await tx.$executeRaw(Prisma.raw("SET LOCAL lock_timeout = '3s'"));
-      await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
+    if (typeof tx.$executeRaw !== "function") {
+      // Fail closed: without the raw surface the advisory lock cannot be
+      // taken, so the gate read and the hand-out write would run
+      // UNSERIALIZED — the fan-out the lane forbids. Refuse the admission
+      // instead of admitting an unlocked hand-out.
+      throw new Error(
+        "rebase lane admission requires a raw SQL surface to take the advisory lock",
+      );
     }
+    // `SET` accepts no bind parameters, so the interval is a literal.
+    // 3s is deliberately BELOW Prisma's interactive-transaction timeout
+    // (default 5s): the lock wait must end on the PG side — statement
+    // cancelled, transaction aborted, caller fails closed — before Prisma
+    // gives up on a connection still blocked inside the lock function,
+    // where its rollback cannot land and the abandoned transaction would
+    // transiently re-acquire and hold the lock the failing admission just
+    // gave up on.
+    await tx.$executeRaw(Prisma.raw("SET LOCAL lock_timeout = '3s'"));
+    await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${REBASE_LANE_ADVISORY_LOCK_KEY})`);
     return run(tx);
   });
 }
@@ -2376,11 +2396,11 @@ export async function listQueuedPrFixItems(client: PrFixQueueClient, options: { 
  * transaction-scoped advisory lock across this read AND the hand-out write.
  * A competing poll therefore never passes this check before the winner's
  * hand-out commits — concurrency 1 is enforced, not preflight-advisory.
- * The residual best-effort window is only the documented fail-open path (an
- * admission transaction that cannot run falls back to this read without the
- * lock): items are singletons per (repo, PR), reports are generation-fenced,
- * and failed REBASE settlement is terminal, so even there a doubled hand-out
- * cannot turn into a retry loop.
+ * The lock is MANDATORY and the admission fails CLOSED: when the lock
+ * cannot be taken the hand-out is deferred (the next poll retries it)
+ * rather than issued through an unlocked check-then-write. So the only
+ * remaining best-effort window is the hand-out TIMEOUT above (a live
+ * hand-out older than the timeout is not counted), not an admission path.
  */
 export async function hasInFlightRebaseHandout(
   client: PrFixQueueClient,

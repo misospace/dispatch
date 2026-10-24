@@ -5652,15 +5652,18 @@ describe("withRebaseLaneAdmission (#1327 review)", () => {
     expect(raw[1].values).toContain(String(REBASE_LANE_ADVISORY_LOCK_KEY));
   });
 
-  it("still runs admission when the client has no raw surface", async () => {
-    // Legacy/test clients without $executeRaw cannot take the advisory lock;
-    // admission proceeds (the pre-serialization semantics) rather than
-    // failing the hand-out path.
+  it("refuses admission when the client has no raw surface (fail closed)", async () => {
+    // Without $executeRaw the advisory lock cannot be taken, so the gate read
+    // and the hand-out write would run UNSERIALIZED — the check-then-write
+    // fan-out the lane forbids. The admission must refuse rather than admit
+    // an unlocked hand-out; the caller defers and the next poll retries.
     const client: any = { $transaction: async (fn: any) => fn(client) };
-    expect(await withRebaseLaneAdmission(client, async () => "admitted")).toBe("admitted");
+    await expect(withRebaseLaneAdmission(client, async () => "admitted")).rejects.toThrow(
+      /advisory lock/,
+    );
   });
 
-  it("propagates an admission failure so the caller can fail open", async () => {
+  it("propagates an admission failure so the caller can fail closed", async () => {
     const client: any = {
       $transaction: async () => {
         throw new Error("lock_timeout");

@@ -464,11 +464,14 @@ export async function GET(
        // (two `--force-with-lease` pushes on one branch), and an
        // ordinary-dispatched row that merely looks dirty now is settled as
        // its stamped lane, so the rebase gate is not its bound. Deferral is
-       // transient: the next poll retries it. Non-rebase fix work is
-       // unaffected. `attemptType` is trustworthy as the current attempt's
-       // lane because `freshAttemptGeneration` clears it on every generation
-       // bump: non-null here means THIS generation was handed out as that
-       // lane; a fresh attempt falls back to the queue type.
+       // transient: the next poll retries it. The admission FAILS CLOSED — a
+       // lane that cannot take the lock defers the hand-out rather than
+       // issuing it unlocked — so concurrency 1 holds on every path.
+       // Non-rebase fix work is unaffected. `attemptType` is trustworthy as
+       // the current attempt's lane because `freshAttemptGeneration` clears
+       // it on every generation bump: non-null here means THIS generation
+       // was handed out as that lane; a fresh attempt falls back to the
+       // queue type.
        const dispatchedLane = candidate.attemptType ?? candidate.fixType;
        if (dispatchedLane === "REBASE") {
          try {
@@ -480,20 +483,20 @@ export async function GET(
              return await issueHandout(tx);
            });
          } catch (error) {
-           // Fail open on admission failure (lock timeout, transaction
-           // abort): a read/lock problem must not 500 the poll or strand the
-           // lane. Fall back to the preflight-only gate — the residual
-           // check-then-write window is bounded by generation fencing and
-           // terminal REBASE settlement, the pre-serialization semantics.
-           console.error(`next-task pr-fix rebase admission failed for ${candidate.repo}#${candidate.pr}; falling back to the preflight gate:`, error);
-           try {
-             if (await hasInFlightRebaseHandout(asPrFixQueueClient(prisma))) {
-               console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
-               return null;
-             }
-           } catch (gateError) {
-             console.error(`next-task pr-fix rebase concurrency check failed for ${candidate.repo}#${candidate.pr}; dispatching without it:`, gateError);
-           }
+           // Fail CLOSED (#1327 review): the lane is concurrency 1, so a
+           // hand-out issued without the advisory lock is a fan-out — two
+           // `--force-with-lease` pushes on one branch. The admission can
+           // fail (lock_timeout, aborted transaction, a client without a raw
+           // surface), and there is deliberately no unlocked fallback: the
+           // old preflight read left a check-then-write window where two
+           // concurrent polls both saw an idle lane and both dispatched.
+           // Defer the candidate instead — the next poll retries it, and
+           // ordinary fix work (which never takes the lock) is unaffected.
+           // The reason travels in the message so an operator can tell lock
+           // contention ("lock timeout") from a database outage.
+           const reason = error instanceof Error ? error.message : String(error);
+           console.error(`next-task pr-fix rebase admission failed for ${candidate.repo}#${candidate.pr} (${reason}); deferring the REBASE hand-out (fail closed, concurrency 1)`);
+           return null;
          }
        }
        return await issueHandout(asPrFixQueueClient(prisma));
