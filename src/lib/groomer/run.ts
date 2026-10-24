@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { addIssueComment, addIssueLabel, closeIssue, createIssue, updateIssueLabels, updateIssueTitleAndBody } from "@/lib/github";
 import { fetchCollaboratorPermission } from "@/lib/github-issues";
-import { findActiveLeasesForIssue, IssueMutationBusyError, releaseLease, upsertLease } from "@/lib/lease";
+import { findActiveLeasesForIssue, IssueMutationBusyError, releaseLeaseIfUnchanged, upsertLease } from "@/lib/lease";
 import { acquireGroomerLock, heartbeatGroomerLock, HEARTBEAT_MS, releaseGroomerLock } from "./groomer-lock";
 import { selectGroomingCandidate } from "./selector";
 import { buildIssueContext, fetchIssueComments } from "./context";
@@ -132,7 +132,8 @@ export interface GroomerDeps {
   addLabel: typeof addIssueLabel;
   findActiveLeases: typeof findActiveLeasesForIssue;
   upsertLease: typeof upsertLease;
-  releaseLease: typeof releaseLease;
+  /** #1362: fenced release — deletes only while the row still carries the acquired receipt. */
+  releaseLeaseIfUnchanged: typeof releaseLeaseIfUnchanged;
   prisma: typeof prisma;
   fetchCollaboratorPermission?: typeof fetchCollaboratorPermission;
   buildRepositoryContext: typeof buildRepositoryContext;
@@ -166,7 +167,7 @@ const defaultDeps: GroomerDeps = {
   addLabel: addIssueLabel,
   findActiveLeases: findActiveLeasesForIssue,
   upsertLease,
-  releaseLease,
+  releaseLeaseIfUnchanged,
   prisma,
   fetchCollaboratorPermission,
   buildRepositoryContext,
@@ -249,13 +250,16 @@ async function executeGroomerRun(
     staleReasons: candidate.staleReasons,
   });
 
-  let lease: { id: string } | undefined;
   // #1362: `upsertLease` RENEWS an existing (agent, issue) row instead of
   // creating one, and a plain renewal keeps that row's own claim token — the
   // receipt belongs to whoever minted it, not to this run. Only release the
   // row in `finally` when THIS call minted it (created the row, reactivated
   // a disposed one, or tokenized a token-less one), mirroring the claim
-  // route's mint-based supersede rule (#1256).
+  // route's mint-based supersede rule (#1256). The full receipt row is kept:
+  // `renewedAt`/`claimToken` as acquired are the CAS values the fenced
+  // release below deletes against, so a row re-stamped or re-tokenized by a
+  // newer attempt after this acquisition is never destroyed.
+  let lease: { id: string; claimToken?: string | null; renewedAt?: Date | null } | undefined;
   let leaseMintedByThisRun = false;
   const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
@@ -1372,16 +1376,20 @@ async function executeGroomerRun(
     });
     throw error;
   } finally {
-    // #1362: release only a row THIS run minted. A renewal of an existing
-    // lease (e.g. one this agent's earlier run or a live attempt still owns)
-    // must leave the row intact for its minting attempt's own lifecycle.
-    // A leftover renewed row is TTL-bounded, not stranded: the renewal
-    // pushed `expiredAt` forward by GROOMER_LEASE_TTL_MS, after which the
-    // row is no longer an active lease (findActiveLeasesForIssue filters on
-    // expiry) and the claim route's expired-lease recovery purges it. A
-    // non-force worker claim can therefore see this agent's renewed lease as
-    // an active conflict for at most that window.
-    if (lease && leaseMintedByThisRun) await deps.releaseLease(lease.id);
+    // #1362: release only a row THIS run minted, and then only while it still
+    // carries the exact receipt ({id, claimToken, renewedAt}) acquired above.
+    // Two fences, matching the claim route's supersede cleanup: the mint gate
+    // skips a plain renewal (whose row belongs to the live attempt that minted
+    // it), and the CAS delete keeps a stale run — e.g. one whose groomer lock
+    // was reclaimed after heartbeats stopped — from destroying a newer
+    // attempt's re-stamped/rotated row. A mismatched fence deletes 0 rows and
+    // leaves the row TTL-bounded: `expiredAt` was pushed forward by
+    // GROOMER_LEASE_TTL_MS, after which the row is no longer an active lease
+    // (findActiveLeasesForIssue filters on expiry) and the claim route's
+    // expired-lease recovery purges it. A non-force worker claim can
+    // therefore see such a lease as an active conflict for at most that
+    // window.
+    if (lease && leaseMintedByThisRun) await deps.releaseLeaseIfUnchanged(lease);
   }
 }
 
