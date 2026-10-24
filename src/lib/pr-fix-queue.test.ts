@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
+import { createLinkedPrFixItem, enqueuePrFixItem, hasInFlightRebaseHandout, withRebaseLaneAdmission, REBASE_LANE_ADVISORY_LOCK_KEY, normalizeQueueRepo, listQueuedPrFixItems, markPrFixItem, toAgentQueuePrFixItem, reconcileStalePrFixItems, requeuePrFixItem, buildPrFixBlockedContext, parseMarkPrFixInput, parseEnqueuePrFixInput, resolvePrFixFromAgentReport, ackPrFixHandout, parseAckPrFixHandoutInput, reclaimStalePrFixHandouts, prFixHandoutTimeoutMs, maxPrFixReclaims, agentAlreadyHanded, isRebaseLaneAgent, parseRebaseAgentPool, DEFAULT_PR_FIX_HANDOUT_TIMEOUT_MS, DEFAULT_PR_FIX_MAX_RECLAIMS, PrFixQueueClient, type MarkPrFixResult } from "./pr-fix-queue";
 
 function mutatedItem(result: MarkPrFixResult): any {
   if (!result.mutated) throw new Error(`expected mutation, got ${result.reason}`);
@@ -5708,5 +5708,30 @@ describe("fresh attempts drop the previous attempt's dispatched lane (#1327 revi
     reopened.agentHandouts = ["worker-a@2"];
     reopened.dispatchedAt = new Date();
     expect(await hasInFlightRebaseHandout(client)).toBe(false);
+  });
+});
+
+describe("rebase worker pool eligibility (DISPATCH_REBASE_AGENTS, #1327)", () => {
+  afterEach(() => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
+  });
+
+  it("unset means no restriction", () => {
+    delete process.env.DISPATCH_REBASE_AGENTS;
+    expect(parseRebaseAgentPool(undefined)).toBeNull();
+    expect(isRebaseLaneAgent("anyone")).toBe(true);
+  });
+
+  it("parses comma and whitespace separated names case-insensitively", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "Local-Coder, other-local\nthird";
+    expect(parseRebaseAgentPool("Local-Coder, other-local\nthird")).toEqual(new Set(["local-coder", "other-local", "third"]));
+    expect(isRebaseLaneAgent("  LOCAL-CODER ")).toBe(true);
+    expect(isRebaseLaneAgent("someone-else")).toBe(false);
+  });
+
+  it("an explicitly empty value is fail-closed: the pool admits nobody", () => {
+    process.env.DISPATCH_REBASE_AGENTS = "   ";
+    expect(parseRebaseAgentPool("   ")).toEqual(new Set());
+    expect(isRebaseLaneAgent("local-coder")).toBe(false);
   });
 });

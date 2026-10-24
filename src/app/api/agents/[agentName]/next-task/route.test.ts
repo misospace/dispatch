@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } from "@/test/route-helpers";
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
@@ -348,6 +348,86 @@ describe("GET /api/agents/[agentName]/next-task", () => {
     expect(body.type).toBe("followup-pr");
     expect(body.prFixItem.fixType).toBe("REBASE");
     expect(body.reasons[0]).toContain("Mechanical rebase");
+  });
+
+  describe("rebase worker pool eligibility (DISPATCH_REBASE_AGENTS, #1327)", () => {
+    const rebaseRow = () => ({ ...prFixRow(31), type: "REBASE", reason: "Mechanical rebase: PR dirty against base (#1327)" });
+
+    function rowMocks(row: any) {
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR ? [row] : [row]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        (where.id === row.id ? { ...row } : null));
+    }
+
+    afterEach(() => {
+      delete process.env.DISPATCH_REBASE_AGENTS;
+    });
+
+    it("defers REBASE for an agent outside the configured local pool", async () => {
+      // #1327's rebase worker is the local-only pool; the operator declares
+      // it server-side via DISPATCH_REBASE_AGENTS. An agent outside the pool
+      // must not receive the hand-out — the candidate is deferred (transient,
+      // retried by the next eligible poll), and the deferral happens BEFORE
+      // the lane admission, so the advisory lock is never contended.
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder, other-local";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.shouldRun).toBe(false);
+      expect(body.prFixItem).toBeUndefined();
+      // Deferred before admission: no hand-out stamp, no transaction surface.
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      expect(mocks.prFixTxSurfaces).toEqual([]);
+      expect(row.agentHandouts).toEqual([]);
+    });
+
+    it("hands REBASE to an agent inside the configured local pool", async () => {
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder, Example-Agent";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.prFixItem.fixType).toBe("REBASE");
+      expect(body.prFixItem.id).toBe(row.id);
+    });
+
+    it("still dispatches ordinary fix work for an agent outside the pool", async () => {
+      // The pool gates the REBASE lane only: the same ineligible poll must
+      // keep serving ordinary fix work and issue work.
+      process.env.DISPATCH_REBASE_AGENTS = "local-coder";
+      const rebase = rebaseRow();
+      const fix = prFixRow(32);
+      mocks.prFixFindMany.mockImplementation(async ({ where }: any = {}) =>
+        where?.OR ? [rebase] : [rebase, fix]);
+      mocks.prFixFindUnique.mockImplementation(async ({ where }: any) =>
+        where.id === fix.id ? { ...fix } : where.id === rebase.id ? { ...rebase } : null);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.type).toBe("followup-pr");
+      expect(body.pullRequest.number).toBe(32);
+    });
+
+    it("empty pool value is fail-closed: no agent receives REBASE", async () => {
+      process.env.DISPATCH_REBASE_AGENTS = "   ";
+      const row = rebaseRow();
+      rowMocks(row);
+
+      const body = await (await GET(request(exclusionUrl()), {
+        params: Promise.resolve({ agentName: "example-agent" }),
+      })).json();
+      expect(body.shouldRun).toBe(false);
+      expect(mocks.prFixUpdateMany).not.toHaveBeenCalled();
+      expect(row.agentHandouts).toEqual([]);
+    });
   });
 
   it("defers REBASE hand-outs while any rebase hand-out is live (concurrency 1, #1327)", async () => {

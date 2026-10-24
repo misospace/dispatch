@@ -65,6 +65,34 @@ export type PrFixQueueClient = {
 export const REBASE_LANE_ADVISORY_LOCK_KEY = 13270001327n;
 
 /**
+ * #1327: the rebase lane's worker pool is LOCAL-only by contract — git is its
+ * tool surface and it must not consume paid cloud capacity. Dispatch has no
+ * model/runner knowledge of agents, so the pool is operator-declared: when
+ * `DISPATCH_REBASE_AGENTS` is set to a non-empty list of agent names
+ * (comma or whitespace separated, case-insensitive), only those agents
+ * receive REBASE hand-outs; any other agent's poll defers the REBASE
+ * candidate for an eligible poller (the item stays QUEUED, the poll keeps
+ * serving other work). Unset: no restriction — legacy behavior, where any
+ * polling worker may take the lane and the operator relies on the harness
+ * to route it. An explicitly EMPTY value is fail-closed: no agent is
+ * eligible and the lane stops dispatching until the operator names workers.
+ */
+export function parseRebaseAgentPool(raw: string | undefined): Set<string> | null {
+  if (raw === undefined) return null;
+  const names = raw
+    .split(/[\s,]+/)
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(names);
+}
+
+/** Whether `agentName` may receive a REBASE lane hand-out (see `parseRebaseAgentPool`). */
+export function isRebaseLaneAgent(agentName: string): boolean {
+  const pool = parseRebaseAgentPool(process.env.DISPATCH_REBASE_AGENTS);
+  return pool === null || pool.has(agentName.trim().toLowerCase());
+}
+
+/**
  * Run a REBASE hand-out admission (gate read + dispatch stamp + hand-out
  * push) SERIALIZED at the database boundary (#1327 review).
  *

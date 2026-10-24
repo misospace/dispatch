@@ -10,7 +10,7 @@ import {
 } from "@/lib/agent-task";
 import { isBacklogLane, prFixLaneForRequest } from "@/lib/lane-config";
 import { fetchAgentQueueData } from "@/lib/agent-queue-fetch";
-import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, hasInFlightRebaseHandout, newHandoutToken, normalizeQueueRepo, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
+import { agentAlreadyHanded, agentHandoutToken, createLinkedPrFixItem, handoutReceipt, hasInFlightRebaseHandout, isRebaseLaneAgent, newHandoutToken, normalizeQueueRepo, withRebaseLaneAdmission, type PrFixQueueClient } from "@/lib/pr-fix-queue";
 import { fetchPullRequestLabels, fetchPullRequestHeadSha } from "@/lib/github";
 import { NEEDS_HUMAN_LABEL } from "@/lib/pr-fix-surfacing";
 import { CONFLICTING_STATUSES } from "@/lib/linked-pr-health";
@@ -472,9 +472,22 @@ export async function GET(
        // it on every generation bump: non-null here means THIS generation
        // was handed out as that lane; a fresh attempt falls back to the
        // queue type.
-       const dispatchedLane = candidate.attemptType ?? candidate.fixType;
-       if (dispatchedLane === "REBASE") {
-         try {
+        const dispatchedLane = candidate.attemptType ?? candidate.fixType;
+        if (dispatchedLane === "REBASE") {
+          // #1327 review: the rebase worker pool is local-only by contract —
+          // git is its tool surface and it must not consume paid cloud
+          // capacity. Dispatch has no model/runner knowledge of agents, so
+          // the pool is operator-declared via `DISPATCH_REBASE_AGENTS`; an
+          // agent outside the pool defers the candidate (transient — the
+          // next eligible poll hands it out) instead of entering the lane
+          // admission at all. The check is config-only and precedes the
+          // advisory lock, so ineligible polls never contend on the lane
+          // lock. Unset keeps the legacy no-restriction behavior.
+          if (!isRebaseLaneAgent(agentName)) {
+            console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: agent ${agentName} is not in the rebase worker pool (DISPATCH_REBASE_AGENTS, #1327)`);
+            return null;
+          }
+          try {
            return await withRebaseLaneAdmission(asPrFixQueueClient(prisma), async (tx) => {
              if (await hasInFlightRebaseHandout(tx)) {
                console.info(`[next-task-pr-fix] deferring REBASE ${candidate.repo}#${candidate.pr}: another rebase hand-out is live (concurrency 1, #1327)`);
