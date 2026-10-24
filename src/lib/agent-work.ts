@@ -410,9 +410,14 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * to the stale-work sweep's retry arm (`activeStateFamilies` in
  * `stale-work.ts` is the canon), so neither this scan nor its delete ever
  * consumes one — no path can drop the release the previous sweep decided on.
- * Live writers never leave the marker on an active-shaped row (the sweep
- * pairs it with the STALE mark), so the boundary is defence in depth on top
- * of the state filter.
+ * The marker conjunct is LOAD-BEARING, not redundant with the state filter:
+ * the operator reassign route rewrites a row to `state: "CLAIMED"` without
+ * clearing the marker, so a sweep-marked `STALE` row can arrive here as an
+ * ACTIVE-SHAPED row that still owes its release, and the state filter alone
+ * would not keep it. Such a row is inert for the sweep (its reclaim arms
+ * require `staleClaimReleasePending: false`, its retry arm requires
+ * `state: "STALE"`), so this boundary is what keeps the owed release alive on
+ * the row instead of dropping it.
  *
  * The delete is fenced on the same conjuncts the scan matched, ownership
  * included: a row whose owner changed between the scan and the delete
@@ -467,9 +472,11 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   // agent-work routes (release / release-all / reassign) and the self-heal
   // routes — is left for whoever now owns that shape, and the audit (and the
   // returned count) report exactly the rows the fence actually consumed. The
-  // claim route runs this cleanup inside that guard, but the other callers do
-  // not, so the fence (not the guard) is the load-bearing protection here;
-  // preserving the row is the safe direction in every case.
+  // claim route (this function's only production caller) runs the cleanup
+  // inside that guard, but the concurrent writers it races with — the operator
+  // agent-work routes and the self-heal routes — do NOT take it, so the fence
+  // (not the guard) is the load-bearing protection here; preserving the row
+  // is the safe direction in every case.
   const deletedIds: string[] = [];
   await prisma.$transaction(async (tx: any) => {
     for (const work of staleWorks) {

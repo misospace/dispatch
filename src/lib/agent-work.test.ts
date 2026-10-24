@@ -997,4 +997,44 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     expect(row.id).toBe("settled-1");
     expect(row.state).toBe("RELEASED");
   });
+
+  it("the audit names only the rows the fence actually consumed (#1350)", async () => {
+    // Mixed case: one candidate is consumed, the other is refused because its
+    // state changed between the scan and the delete. The returned count and
+    // the audit's id list must report the consumed row ONLY — an accounting
+    // that reported the scanned ids would claim a deletion that did not
+    // happen, which is exactly the dishonest shape this fix removed.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "consumed-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "agent-a", staleClaimReleasePending: false },
+      { id: "refused-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "agent-b", staleClaimReleasePending: false },
+    ];
+
+    mockPrisma.agentWork.deleteMany.mockImplementation(({ where }: any) => {
+      const rows = (mockPrisma.agentWork as any)._mockData as any[];
+      const row = rows.find((r: any) => r.id === where.id);
+      if (row && row.id === "refused-1") {
+        // The concurrent settle lands between the scan and this delete.
+        row.state = "RELEASED";
+      }
+      if (row && fencedWhereMatches(where, row)) {
+        rows.splice(rows.indexOf(row), 1);
+        return Promise.resolve({ count: 1 });
+      }
+      return Promise.resolve({ count: 0 });
+    });
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(1);
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+    const notes = mockPrisma.auditLog.create.mock.calls[0][0].data.notes as string;
+    expect(notes).toContain("Deleted 1 stale AgentWork record");
+    expect(notes).toContain("consumed-1");
+    expect(notes).not.toContain("refused-1");
+    // The refused row survives, in the shape its concurrent writer gave it.
+    const survivor = ((mockPrisma.agentWork as any)._mockData as any[])[0];
+    expect(survivor.id).toBe("refused-1");
+    expect(survivor.state).toBe("RELEASED");
+  });
 });
