@@ -520,6 +520,10 @@ model AuditLog {
   @@index([repoFullName])
   @@index([issueId])
   @@index([createdAt])
+  // #1363: the reconciler's per-pass annotation dedupe reads the latest
+  // annotation per (actor, action, issue) on every examined candidate; this
+  // keeps that lookup a single ordered seek as the log grows.
+  @@index([actor, action, issueId, createdAt(sort: Desc)])
 }
 
 model IssueLane {

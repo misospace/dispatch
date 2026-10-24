@@ -171,6 +171,9 @@ function orderRows(rows: Row[], orderBy: any): Row[] {
 function makeFakePrisma() {
   let seq = 0;
   const nextId = () => `row-${++seq}`;
+  // Prisma's @default(now()) on createdAt, on a controllable clock so tests
+  // can age rows deterministically against a synthetic pass clock (#1363).
+  const clock = { now: new Date() };
   const tables: Record<string, Row[]> = {
     issue: [],
     lease: [],
@@ -222,6 +225,7 @@ function makeFakePrisma() {
       },
       create: async (args: any) => {
         const row = { id: nextId(), ...CLONE(args.data) };
+        if (row.createdAt === undefined) row.createdAt = new Date(clock.now);
         rows().push(row);
         return CLONE(row);
       },
@@ -262,6 +266,7 @@ function makeFakePrisma() {
           return CLONE(existing);
         }
         const row = { id: nextId(), ...CLONE(args.create) };
+        if (row.createdAt === undefined) row.createdAt = new Date(clock.now);
         rows().push(row);
         return CLONE(row);
       },
@@ -290,7 +295,7 @@ function makeFakePrisma() {
       return result;
     },
   };
-  return { client, tables, faults };
+  return { client, tables, faults, clock };
 }
 
 // ─── Mutual-exclusion guard fake (stale-work.test.ts pattern) ────────────────
@@ -333,7 +338,7 @@ function minutesAgo(now: Date, minutes: number): Date {
 }
 
 function buildFixture(now: Date) {
-  const { client, tables, faults } = makeFakePrisma();
+  const { client, tables, faults, clock } = makeFakePrisma();
   const guard = makeFakeGuard();
 
   tables.issue.push({
@@ -371,7 +376,7 @@ function buildFixture(now: Date) {
   });
 
   forgeShared.setLabels(REPO, 42, ["status/in-progress", "agent/alpha"]);
-  return { client, tables, faults, guard };
+  return { client, tables, faults, clock, guard };
 }
 
 async function runReconcile(fixture: ReturnType<typeof buildFixture>, now: Date, mode = "enforce") {
@@ -391,6 +396,7 @@ function stubDefaults() {
   vi.stubEnv("DISPATCH_RECONCILE_MAX_RECLAIMS", "");
   vi.stubEnv("DISPATCH_RECONCILE_BATCH_SIZE", "");
   vi.stubEnv("DISPATCH_RECONCILE_MAX_FORGE_RETRIES", "");
+  vi.stubEnv("DISPATCH_RECONCILE_ANNOTATION_REEMIT_MS", "");
 }
 
 beforeEach(() => {
@@ -637,6 +643,152 @@ describe("ownership reconciliation (#1254)", () => {
       expect(annotations[0].notes).toContain("wouldRelease=yes");
       expect(forgeShared.removeCalls).toHaveLength(0);
       expect(fixture.tables.ownershipReleaseIntent).toHaveLength(0);
+    });
+  });
+
+  // ─── #1363: per-pass annotation growth is bounded ──────────────────────────
+
+  describe("per-pass annotation dedupe (#1363)", () => {
+    function candidateAnnotations(fixture: ReturnType<typeof buildFixture>) {
+      return fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_candidate");
+    }
+    function parkedAnnotations(fixture: ReturnType<typeof buildFixture>) {
+      return fixture.tables.auditLog.filter((r: any) => r.action === "ownership_reconcile_parked");
+    }
+
+    it("an unchanged abandoned candidate annotates once, not once per pass", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+
+      await runReconcile(fixture, now, "audit");
+      // Past the re-check interval, so the pass re-derives the identical
+      // simulated ladder state — the exact shape that used to write one
+      // identical row per pass (hundreds per candidate per day).
+      const second = await runReconcile(fixture, new Date(now.getTime() + 6 * MIN), "audit");
+
+      expect(second.examined).toBe(1);
+      expect(second.retained).toBe(1);
+      expect(candidateAnnotations(fixture)).toHaveLength(1);
+      expect(candidateAnnotations(fixture)[0].notes).toContain("ladder=1/2");
+      expect(candidateAnnotations(fixture)[0].notes).toContain("wouldRelease=no (confirmation pending)");
+    });
+
+    it("after the re-emit window the unchanged candidate is re-annotated once", async () => {
+      vi.stubEnv("DISPATCH_RECONCILE_ANNOTATION_REEMIT_MS", String(10 * MIN));
+      const now = new Date();
+      const fixture = buildFixture(now);
+
+      await runReconcile(fixture, now, "audit");
+      await runReconcile(fixture, new Date(now.getTime() + 6 * MIN), "audit"); // identical → suppressed
+      await runReconcile(fixture, new Date(now.getTime() + 11 * MIN), "audit"); // window elapsed → fresh confirmation
+
+      // Bounded: one row per state change plus one per re-emit window,
+      // never one per pass.
+      expect(candidateAnnotations(fixture)).toHaveLength(2);
+    });
+
+    it("a state change re-annotates immediately (renewal observed)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      // A stored ladder row keeps the issue in the candidate scan even after
+      // the renewal makes the heartbeat fresh again.
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 0,
+        firstStaleAt: null,
+        lastObservedAt: null,
+        reclaimCount: 0,
+        lastReclaimAt: null,
+      });
+      await runReconcile(fixture, now, "audit");
+
+      // The worker renews between passes: fresh evidence → non-abandoned,
+      // a different annotation content that must NOT be suppressed.
+      const second = new Date(now.getTime() + 6 * MIN);
+      fixture.tables.lease[0].renewedAt = second;
+      fixture.tables.lease[0].lastRenewalObservedAt = second;
+      fixture.tables.lease[0].expiredAt = new Date(second.getTime() + 40 * MIN);
+      fixture.tables.agentWork[0].lastHeartbeatAt = second;
+      await runReconcile(fixture, second, "audit");
+
+      const annotations = candidateAnnotations(fixture);
+      expect(annotations).toHaveLength(2);
+      expect(annotations[0].notes).toContain("state=ABANDONED_CANDIDATE");
+      expect(annotations[1].notes).toContain("state=CLAIMED_ACTIVE");
+    });
+
+    it("a parked claim's needs-human annotation is written once, not once per pass (enforce)", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      fixture.tables.ownershipReconcileCandidate.push({
+        id: "cand-1",
+        issueId: ISSUE_ID,
+        agentName: "alpha",
+        staleCount: 0,
+        firstStaleAt: null,
+        lastObservedAt: null,
+        reclaimCount: 3,
+        lastReclaimAt: minutesAgo(now, 180),
+      });
+
+      await runReconcile(fixture, now, "enforce");
+      const second = await runReconcile(fixture, new Date(now.getTime() + 6 * MIN), "enforce");
+
+      expect(second.held).toBe(1);
+      expect(second.released).toBe(0);
+      expect(parkedAnnotations(fixture)).toHaveLength(1);
+      expect(parkedAnnotations(fixture)[0].notes).toContain("needs-human");
+    });
+
+    it("event-shaped actions stay exempt: a second release intent for the same issue is annotated again", async () => {
+      const now = new Date();
+      const fixture = buildFixture(now);
+      const intentAnnotations = (f: ReturnType<typeof buildFixture>) =>
+        f.tables.auditLog.filter((r: any) => r.action === "ownership_release_intent");
+
+      // Cycle 1: the ladder matures across two passes, then releases.
+      await runReconcile(fixture, now, "enforce");
+      await runReconcile(fixture, new Date(now.getTime() + 10 * MIN), "enforce");
+      expect(intentAnnotations(fixture)).toHaveLength(1);
+
+      // The owner re-claims under a fresh token and abandons again. The
+      // second commit's annotation content is byte-identical to the first
+      // (same agent, token pinned) — only the exemption lets it through.
+      const reclaimAt = new Date(now.getTime() + 60 * MIN);
+      fixture.tables.lease.push({
+        id: "lease-2",
+        agentName: "alpha",
+        issueId: ISSUE_ID,
+        claimToken: "tok-h",
+        expiredAt: minutesAgo(reclaimAt, 20),
+        renewedAt: minutesAgo(reclaimAt, 60),
+        registeredAt: minutesAgo(reclaimAt, 60),
+        registrationOccurredAt: minutesAgo(reclaimAt, 60),
+        renewCount: 1,
+        lastRenewalObservedAt: minutesAgo(reclaimAt, 60),
+        lastRenewalOccurredAt: minutesAgo(reclaimAt, 60),
+        retryAfter: null,
+        waitReason: null,
+        disposition: null,
+      });
+      fixture.tables.agentWork.push({
+        id: "work-2",
+        agentName: "alpha",
+        issueId: ISSUE_ID,
+        state: "IN_PROGRESS",
+        lastHeartbeatAt: minutesAgo(new Date(now.getTime() + 60 * MIN), 60),
+      });
+      fixture.tables.issue[0].labels = ["status/ready", "agent/alpha"];
+      forgeShared.setLabels(REPO, 42, ["status/ready", "agent/alpha"]);
+      const cycleNow = new Date(now.getTime() + 70 * MIN);
+      await runReconcile(fixture, cycleNow, "enforce");
+      await runReconcile(fixture, new Date(cycleNow.getTime() + 10 * MIN), "enforce");
+
+      const intents = intentAnnotations(fixture);
+      expect(intents).toHaveLength(2);
+      expect(intents[0].notes).toBe(intents[1].notes);
     });
   });
 
