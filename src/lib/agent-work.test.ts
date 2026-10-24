@@ -879,11 +879,13 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
 
   it("the fenced delete refuses a row that became owed a release after the scan (#1350)", async () => {
     // The delete re-checks the SAME boundary conjuncts the scan matched on
-    // (the sweep's CAS practice). A writer outside the per-issue mutation
-    // guard — e.g. the self-heal agent-work routes — can land between the
-    // scan and the delete; here the concurrent write pins the pending marker
-    // mid-flight, so the fence must consume nothing and no audit row may
-    // claim a deletion that did not happen.
+    // (the sweep's CAS practice). Here the concurrent write pins the pending
+    // marker mid-flight, so the fence must consume nothing and no audit row
+    // may claim a deletion that did not happen. Defence in depth: the sweep —
+    // the only writer that SETS the marker — takes the per-issue mutation
+    // guard, so it cannot interleave with the claim path in production; the
+    // reachable pending shape is one that ARRIVES pending (the test above).
+    // The fence must hold for that shape all the same.
     const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
     mockPrisma.lease.findMany.mockResolvedValue([]);
     (mockPrisma.agentWork as any)._mockData = [
@@ -1036,5 +1038,92 @@ describe("findAndReleaseStaleAgentWorkForIssue", () => {
     const survivor = ((mockPrisma.agentWork as any)._mockData as any[])[0];
     expect(survivor.id).toBe("refused-1");
     expect(survivor.state).toBe("RELEASED");
+  });
+
+  it("the fenced delete refuses a row whose issue changed after the scan (#1350)", async () => {
+    // The fence pins the ISSUE the scan matched, next to the owner, the state
+    // family and the pending boundary. No current writer moves an AgentWork
+    // row between issues, so this conjunct is defensive — but it is part of
+    // the fence, and dropping it must not pass silently: a fence without it
+    // would consume a row that no longer belongs to the issue being claimed.
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+    mockPrisma.lease.findMany.mockResolvedValue([]);
+    (mockPrisma.agentWork as any)._mockData = [
+      { id: "moved-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "crashed-agent", staleClaimReleasePending: false },
+    ];
+
+    let firstDelete = false;
+    mockPrisma.agentWork.deleteMany.mockImplementation(({ where }: any) => {
+      const rows = (mockPrisma.agentWork as any)._mockData as any[];
+      if (!firstDelete) {
+        firstDelete = true;
+        // The concurrent move lands after the scan returned the row.
+        rows[0].issueId = "issue-2";
+      }
+      const row = rows.find((r: any) => r.id === where.id);
+      if (row && fencedWhereMatches(where, row)) {
+        rows.splice(rows.indexOf(row), 1);
+        return Promise.resolve({ count: 1 });
+      }
+      return Promise.resolve({ count: 0 });
+    });
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(mockPrisma, "issue-1", "org/repo");
+    expect(result).toBe(0);
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+    const row = ((mockPrisma.agentWork as any)._mockData as any[])[0];
+    expect(row.id).toBe("moved-1");
+    expect(row.issueId).toBe("issue-2");
+  });
+
+  it("deletes and audits in one transaction, and surfaces an audit failure (#1350)", async () => {
+    // "A deletion is never left without its audit row" is a transaction-level
+    // invariant: the deletes and the audit row must go through the SAME
+    // transaction client, and an audit write that fails must surface the
+    // failure instead of the cleanup reporting a successful deletion. What
+    // this pins is the SHAPE (one transaction, the delete before the audit,
+    // no swallowed audit failure); the real rollback — an aborted transaction
+    // leaving the row and its `AgentWorkHistory` cascade intact — needs a
+    // live PostgreSQL and is NOT covered by CI's Database integration job
+    // (it runs a fixed file list that does not include this path).
+    const { findAndReleaseStaleAgentWorkForIssue } = await import("./agent-work");
+
+    const outerDelete = vi.fn();
+    const outerAudit = vi.fn();
+    const txDelete = vi.fn().mockResolvedValue({ count: 1 });
+    const txAudit = vi.fn().mockResolvedValue({ id: "log-1" });
+    const tx = { agentWork: { deleteMany: txDelete }, auditLog: { create: txAudit } };
+    const scopedPrisma: any = {
+      lease: { findMany: vi.fn().mockResolvedValue([]) },
+      agentWork: {
+        // The fake returns the candidate regardless of the scan's where; the
+        // row carries a realistic shape so the fixture does not read as
+        // scan-behaviour coverage.
+        findMany: vi.fn().mockResolvedValue([
+          { id: "tx-1", issueId: "issue-1", state: "IN_PROGRESS", agentName: "crashed-agent" },
+        ]),
+        deleteMany: outerDelete,
+      },
+      auditLog: { create: outerAudit },
+      $transaction: vi.fn(async (fn: any) => fn(tx)),
+    };
+
+    const result = await findAndReleaseStaleAgentWorkForIssue(scopedPrisma, "issue-1", "org/repo");
+    expect(result).toBe(1);
+    expect(scopedPrisma.$transaction).toHaveBeenCalledTimes(1);
+    // The delete and the audit row both went through the TRANSACTION client.
+    expect(txDelete).toHaveBeenCalledTimes(1);
+    expect(txAudit).toHaveBeenCalledTimes(1);
+    expect(outerDelete).not.toHaveBeenCalled();
+    expect(outerAudit).not.toHaveBeenCalled();
+    // The audit row is written after the deletion it accounts for.
+    expect(txDelete.mock.invocationCallOrder[0]).toBeLessThan(txAudit.mock.invocationCallOrder[0]);
+
+    // A failing audit write must surface, not be swallowed: the caller must
+    // not be told the cleanup succeeded.
+    txAudit.mockRejectedValueOnce(new Error("audit write failed"));
+    await expect(findAndReleaseStaleAgentWorkForIssue(scopedPrisma, "issue-1", "org/repo")).rejects.toThrow(
+      "audit write failed",
+    );
   });
 });
