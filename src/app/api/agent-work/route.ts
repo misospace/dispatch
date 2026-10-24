@@ -306,7 +306,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
           action: "agent_work_release_failed",
           repoFullName: "",
           success: false,
-          errorMessage: String(error),
+          errorMessage: error instanceof Error ? error.message : "Unknown error",
         },
       });
       return errorResponse("Failed to release agent work", 500);
@@ -415,7 +415,7 @@ async function releaseAgentWork(body: Record<string, unknown>) {
         action: "orphan_work_release_failed",
         repoFullName: "",
         success: false,
-        errorMessage: String(error),
+        errorMessage: error instanceof Error ? error.message : "Unknown error",
       },
     });
     return errorResponse("Failed to release agent work", 500);
@@ -962,7 +962,7 @@ async function reassignAgentWork(body: Record<string, unknown>) {
                 issueNumber: auditIssueNumber,
                 issueId,
                 success: false,
-                errorMessage: String(error),
+                errorMessage: error instanceof Error ? error.message : "Unknown error",
               },
             });
           } catch {
@@ -986,7 +986,7 @@ async function reassignAgentWork(body: Record<string, unknown>) {
         action: "agent_work_reassign_failed",
         repoFullName: "",
         success: false,
-        errorMessage: String(error),
+        errorMessage: error instanceof Error ? error.message : "Unknown error",
       },
     });
     return errorResponse("Failed to reassign agent work", 500);
