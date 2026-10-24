@@ -31,8 +31,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ run
   }
 
   // runId is a BigInt column: a non-numeric value must 400 here, not NaN-reach
-  // Prisma as a validation 500 (issue #1379).
-  const runIdNumber = Number.parseInt(runId, 10);
+  // Prisma as a validation 500 (issue #1379). Validation is whole-string strict
+  // (`123abc` / `12.5` reject outright), so a partially numeric identifier can
+  // never resolve to a shorter numeric prefix's run.
+  if (!/^\d+$/.test(runId)) {
+    return errorResponse("runId must be a number", 400);
+  }
+  const runIdNumber = Number(runId);
   if (!Number.isSafeInteger(runIdNumber)) {
     return errorResponse("runId must be a number", 400);
   }
