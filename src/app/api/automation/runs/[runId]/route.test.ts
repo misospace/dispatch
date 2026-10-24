@@ -65,6 +65,28 @@ describe("POST /api/automation/runs/[runId] — validation", () => {
     expect(res.status).toBe(400);
   });
 
+  it("returns 400 for a non-numeric runId instead of NaN-reaching Prisma as a 500", async () => {
+    const res = await POST(new Request("http://localhost/api/automation/runs/abc?repo=org/repo&action=rerun", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+    }), { params: Promise.resolve({ runId: "abc" }) });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "runId must be a number" });
+    expect(mocks.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("rejects partially numeric runId values like \"123abc\" and \"12.5\" outright", async () => {
+    for (const bad of ["123abc", "12.5"]) {
+      const res = await POST(new Request(`http://localhost/api/automation/runs/${bad}?repo=org/repo&action=rerun`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${mockToken}` },
+      }), { params: Promise.resolve({ runId: bad }) });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "runId must be a number" });
+      expect(mocks.findUnique).not.toHaveBeenCalled();
+    }
+  });
+
   it("returns 404 when run not found", async () => {
     mocks.findUnique.mockResolvedValueOnce(null);
     const res = await POST(new Request("http://localhost/api/automation/runs/999?repo=org/repo&action=rerun", {

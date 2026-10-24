@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, parseListLimit } from "./query-limit";
+import {
+  DEFAULT_LIST_LIMIT,
+  MAX_ISSUE_NUMBER,
+  MAX_LIST_LIMIT,
+  parseIssueNumber,
+  parseListLimit,
+} from "./query-limit";
 
 describe("parseListLimit", () => {
   it("returns the default when the param is absent, blank, or whitespace", () => {
@@ -32,5 +38,29 @@ describe("parseListLimit", () => {
     expect(parseListLimit(null, 25)).toBe(25);
     expect(parseListLimit("abc", 25)).toBe(25);
     expect(parseListLimit("500", DEFAULT_LIST_LIMIT, 100)).toBe(100);
+  });
+});
+
+describe("parseIssueNumber", () => {
+  it("returns undefined when the param is absent, blank, or whitespace", () => {
+    expect(parseIssueNumber(null)).toBeUndefined();
+    expect(parseIssueNumber(undefined)).toBeUndefined();
+    expect(parseIssueNumber("")).toBeUndefined();
+    expect(parseIssueNumber("   ")).toBeUndefined();
+  });
+
+  it("returns undefined on non-numeric input", () => {
+    expect(parseIssueNumber("abc")).toBeUndefined();
+  });
+
+  it("returns undefined on out-of-range input that would overflow a Prisma Int", () => {
+    expect(parseIssueNumber("999999999999999999999")).toBeUndefined();
+    expect(parseIssueNumber("-5")).toBeUndefined();
+  });
+
+  it("passes through integers within range unclamped", () => {
+    expect(parseIssueNumber("42")).toBe(42);
+    expect(parseIssueNumber("10")).toBe(10);
+    expect(parseIssueNumber(MAX_ISSUE_NUMBER.toString())).toBe(MAX_ISSUE_NUMBER);
   });
 });

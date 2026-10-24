@@ -20,3 +20,22 @@ export function parseListLimit(
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, cap);
 }
+
+/**
+ * Parse an optional integer entity-number query parameter (e.g. `issueNumber`,
+ * issue #1379 — sibling of the `limit` guard above). Absent, blank, non-numeric,
+ * or out-of-range values yield `undefined` so the caller can omit the filter
+ * instead of NaN-reaching a Prisma `Int` column as a validation-error 500.
+ * GitHub issue numbers are non-negative and fit an Int, so anything outside
+ * [0, MAX_ISSUE_NUMBER] is treated as "no value" too.
+ */
+export const MAX_ISSUE_NUMBER = 2147483647; // 2**31 - 1, the Prisma `Int` bound.
+
+export function parseIssueNumber(value: string | null | undefined): number | undefined {
+  if (value === null || value === undefined || value.trim() === "") return undefined;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_ISSUE_NUMBER) {
+    return undefined;
+  }
+  return parsed;
+}

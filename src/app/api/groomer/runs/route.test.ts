@@ -126,6 +126,25 @@ describe("GET /api/groomer/runs", () => {
     );
   });
 
+  it("omits the issueNumber filter on a non-numeric value instead of 500ing", async () => {
+    const res = await GET(request("/api/groomer/runs?issueNumber=abc"));
+
+    expect(res.status).toBe(200);
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ issueNumber: undefined }),
+    );
+  });
+
+  it("omits the issueNumber filter on a blank value", async () => {
+    await GET(request("/api/groomer/runs?issueNumber="));
+
+    expect(mocks.listGroomingRuns).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ issueNumber: undefined }),
+    );
+  });
+
   it("returns runs on success", async () => {
     mocks.listGroomingRuns.mockResolvedValue([
       {
