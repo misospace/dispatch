@@ -1275,6 +1275,9 @@ describe("buildWorkItemDeliveryChain", () => {
       expect(result.notes).toContain(
         "agent run run-null-gen fix-round generation unusable; not attributed",
       );
+      expect(result.notes).toContain(
+        "agent run run-future-gen fix-round generation 3 exceeds item item-1 generation 1; not attributed",
+      );
       // Every retained interval still counts in the item-wide union.
       expect(result.totalExecutionWallTimeMs).toBe(0);
     });

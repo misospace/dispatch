@@ -145,7 +145,11 @@ The link is a persisted pair on `AgentRun`:
 Writer boundary (`POST /api/agents/[agentName]/tasks/report`): a
 `followup-pr` report echoing the `prFixItem { id, generation }` token that
 next-task issued gets the pair stamped **only after it is verified against
-real queue state**:
+real queue state**. Outcomes that did not implement the round never stamp:
+`handed-off` returns the task to independent sync, and
+`capacity-exhausted` releases the SAME generation for a fresh worker with no
+progress — stamping either would render a round that is still awaiting real
+work as executed.
 
 | Check | Fail-closed result |
 |---|---|

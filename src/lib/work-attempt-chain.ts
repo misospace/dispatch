@@ -817,6 +817,14 @@ export function buildWorkItemDeliveryChain(
         addNote(`agent run ${interval.run.id} fix-round generation unusable; not attributed`);
         continue;
       }
+      if (generation > item.generation) {
+        // Defensive: the report boundary fail-closes future generations, so
+        // this only fires on corrupted data. Announced, never silent.
+        addNote(
+          `agent run ${interval.run.id} fix-round generation ${generation} exceeds item ${item.id} generation ${item.generation}; not attributed`,
+        );
+        continue;
+      }
       const bucket = runsByGeneration.get(generation);
       if (bucket) bucket.push(interval);
       else runsByGeneration.set(generation, [interval]);

@@ -135,7 +135,10 @@ export async function GET(request: NextRequest, context: { params: Promise<{ iss
       where: {
         OR: [{ issueId }, { prFixQueueItemId: { in: prFixRows.map((row) => row.id) } }],
       },
-      orderBy: { startedAt: "asc" },
+      // Secondary `id` key: with >500 rows tied on `startedAt` at the cap
+      // boundary, a lone time key would leave WHICH rows survive
+      // DB-nondeterministic (same rule as the history read below).
+      orderBy: [{ startedAt: "asc" }, { id: "asc" }],
       take: MAX_ATTEMPT_RUNS + 1,
       select: {
         id: true,

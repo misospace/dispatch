@@ -641,8 +641,14 @@ export async function POST(
     // #1183: durable run→fix-round association. Stamped at creation when a
     // followup-pr report carries an attempt token whose (id, generation)
     // matches real queue state; every other report leaves it null.
+    // Hand-offs and capacity exhaustion are NOT an implementation of the
+    // round: the first returns the task to independent sync, the second
+    // releases the same generation for a fresh worker with no progress. An
+    // `implement` report never stamps even when it echoes a token.
     const prFixAttemptIdentity =
-      report.taskType === "followup-pr"
+      report.taskType === "followup-pr" &&
+      report.outcome !== "handed-off" &&
+      report.outcome !== "capacity-exhausted"
         ? await verifyPrFixAttemptIdentity(prFixItem, report.repoFullName, report.pullRequestNumber)
         : null;
 

@@ -2752,6 +2752,30 @@ describe("POST /api/agents/[agentName]/tasks/report — durable run→fix-round 
     expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
   });
 
+  it("stamps nothing for hand-offs or capacity exhaustion (the round was not implemented)", async () => {
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValue(queueRow);
+
+    await postRequest({
+      ...fixReport,
+      outcome: "handed-off",
+      prFixItem: { id: "item-9", generation: 2 },
+    });
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+    expect(prismaMock.prFixQueueItem.findUnique).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    mockAgentRun.create.mockResolvedValue({ id: "run-1" });
+    prismaMock.prFixQueueItem.findUnique.mockResolvedValue(queueRow);
+    await postRequest({
+      ...fixReport,
+      outcome: "capacity-exhausted",
+      capacity: "provider/model",
+      prFixItem: { id: "item-9", generation: 2, handoutToken: "hnd_deadbeef00" },
+    });
+    expect(mockAgentRun.create.mock.calls[0][0].data).not.toHaveProperty("prFixQueueItemId");
+    expect(prismaMock.prFixQueueItem.findUnique).not.toHaveBeenCalled();
+  });
+
   it("stamps nothing for issue work (implement) or reports without a token", async () => {
     prismaMock.prFixQueueItem.findUnique.mockResolvedValueOnce(queueRow);
     await postRequest({
