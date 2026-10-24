@@ -32,6 +32,29 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
   const latestWorkflow = repo.workflows[0];
   const latestRelease = repo.releases[0];
   const isStale = repo.lastSyncedAt && new Date(repo.lastSyncedAt) < new Date(Date.now() - 60 * 60 * 1000);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  async function handleSync() {
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      const res = await authedFetch(`/api/automation/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo: repo.fullName }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || `Failed to sync (HTTP ${res.status})`);
+      }
+      window.location.reload();
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : "Failed to sync repository");
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   return (
     <Card className={`${repo.syncError ? "border-destructive" : ""} min-w-0 overflow-hidden`}>
@@ -121,6 +144,7 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
           </>
         )}
 
+        {syncError && <div className="text-sm text-destructive break-words">{syncError}</div>}
         <div className="flex gap-2 pt-2 flex-wrap">
           <Button variant="outline" size="sm" asChild className="text-xs">
             <Link href={`/automation/repos/${repo.fullName}`}>Details</Link>
@@ -128,16 +152,11 @@ function RepoCard({ repo, onDelete }: { repo: RepoOverview; onDelete?: () => voi
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => {
-              authedFetch(`/api/automation/sync`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ repo: repo.fullName }),
-              }).then(() => window.location.reload());
-            }}
+            onClick={handleSync}
+            disabled={syncing}
             className="text-xs"
           >
-            <RefreshCw className="h-3 w-3 mr-1" /> Sync
+            <RefreshCw className={`h-3 w-3 mr-1 ${syncing ? "animate-spin" : ""}`} /> Sync
           </Button>
           <Button variant="ghost" size="sm" asChild className="text-xs">
             <a href={`https://github.com/${repo.fullName}`} target="_blank" rel="noopener noreferrer">
