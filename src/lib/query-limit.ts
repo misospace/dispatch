@@ -1,4 +1,20 @@
 /**
+ * Parse a whole-string integer. `Number.parseInt` accepts a partially numeric
+ * value and silently selects the wrong entity — `"42abc"` parses as `42`, so a
+ * malformed `issueNumber` filtered a run list by an issue the caller never
+ * asked for. The digits are validated in full before they are trusted.
+ *
+ * A leading sign is accepted (`"+5"`), because it names the same integer; any
+ * trailing or embedded non-digit makes the whole value non-numeric.
+ */
+function parseWholeInteger(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
  * Clamp and validate a `limit` query parameter before it reaches Prisma `take`
  * (issue #1308). A misconfigured client or bad link must never produce a 500
  * (Prisma rejects a NaN take) or an effectively unbounded row pull.
@@ -15,9 +31,9 @@ export function parseListLimit(
   fallback: number = DEFAULT_LIST_LIMIT,
   cap: number = MAX_LIST_LIMIT,
 ): number {
-  if (value === null || value === undefined || value.trim() === "") return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  if (value === null || value === undefined) return fallback;
+  const parsed = parseWholeInteger(value);
+  if (parsed === null || parsed <= 0) return fallback;
   return Math.min(parsed, cap);
 }
 
@@ -32,9 +48,9 @@ export function parseListLimit(
 export const MAX_ISSUE_NUMBER = 2147483647; // 2**31 - 1, the Prisma `Int` bound.
 
 export function parseIssueNumber(value: string | null | undefined): number | undefined {
-  if (value === null || value === undefined || value.trim() === "") return undefined;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_ISSUE_NUMBER) {
+  if (value === null || value === undefined) return undefined;
+  const parsed = parseWholeInteger(value);
+  if (parsed === null || parsed < 0 || parsed > MAX_ISSUE_NUMBER) {
     return undefined;
   }
   return parsed;

@@ -19,6 +19,19 @@ describe("parseListLimit", () => {
     expect(parseListLimit("abc")).toBe(DEFAULT_LIST_LIMIT);
   });
 
+  it("returns the default on partially numeric input", () => {
+    expect(parseListLimit("42abc")).toBe(DEFAULT_LIST_LIMIT);
+    expect(parseListLimit("42.5")).toBe(DEFAULT_LIST_LIMIT);
+  });
+
+  it("caps an out-of-range value instead of falling back to the default", () => {
+    expect(parseListLimit("999999999999999999999")).toBe(MAX_LIST_LIMIT);
+  });
+
+  it("accepts a leading sign", () => {
+    expect(parseListLimit("+5")).toBe(5);
+  });
+
   it("returns the default on non-positive input", () => {
     expect(parseListLimit("0")).toBe(DEFAULT_LIST_LIMIT);
     expect(parseListLimit("-5")).toBe(DEFAULT_LIST_LIMIT);
@@ -51,6 +64,17 @@ describe("parseIssueNumber", () => {
 
   it("returns undefined on non-numeric input", () => {
     expect(parseIssueNumber("abc")).toBeUndefined();
+  });
+
+  it("returns undefined on partially numeric input instead of selecting a wrong issue", () => {
+    expect(parseIssueNumber("42abc")).toBeUndefined();
+    expect(parseIssueNumber("42.5")).toBeUndefined();
+    expect(parseIssueNumber("0x1f")).toBeUndefined();
+    expect(parseIssueNumber("42 ")).toBe(42);
+  });
+
+  it("accepts a leading sign", () => {
+    expect(parseIssueNumber("+42")).toBe(42);
   });
 
   it("returns undefined on out-of-range input that would overflow a Prisma Int", () => {
