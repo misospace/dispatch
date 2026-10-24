@@ -133,11 +133,14 @@ jobs:
       # mutation-guard integration test joins it for the same reason: the
       # fenced write's guarantee is a DATABASE guarantee (the guard row's lock
       # is held across the forge call), and only a real PostgreSQL can prove
-      # it (#1254).
+      # it (#1254). The agent-work stale-cleanup integration test joins it for
+      # the same reason: "a deletion is never left without its audit row" is a
+      # transaction-level rollback guarantee, which the mocks cannot prove
+      # (#1392).
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts src/lib/agent-work.integration.test.ts
 
   coverage:
     name: Coverage
