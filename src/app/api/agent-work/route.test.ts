@@ -793,6 +793,65 @@ describe("POST /api/agent-work", () => {
       auditLog.create.mockResolvedValue({ id: "audit-1" });
     });
 
+    // #1406: operator-supplied reassign identifiers are canonicalized before
+    // any lookup, guard request, lease mint, row rewrite, history or audit.
+    describe("operator identifier normalization (#1406)", () => {
+      it("trims a padded workId before looking up the stored row", async () => {
+        agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+
+        const res = await makePostRequest({
+          action: "reassign",
+          workId: "  work-1  ",
+          newAgentName: "new-agent",
+        });
+
+        expect(res.status).toBe(200);
+        expect(agentWork.findUnique).toHaveBeenCalledWith(
+          expect.objectContaining({ where: { id: "work-1" } })
+        );
+      });
+
+      it("uses the canonical newAgentName throughout the handover", async () => {
+        agentWork.findUnique.mockResolvedValueOnce(reassignWorkRow());
+
+        const res = await makePostRequest({
+          action: "reassign",
+          workId: "work-1",
+          newAgentName: "  new-agent  ",
+        });
+
+        expect(res.status).toBe(200);
+        expect(guardState.request).toEqual(
+          expect.objectContaining({ operation: "reassign", agentName: "new-agent" })
+        );
+        expect(mockUpsertLease).toHaveBeenCalledWith(
+          expect.objectContaining({ agentName: "new-agent", issueId: "issue-1" })
+        );
+        expect(auditLog.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              action: "agent_work_reassigned",
+              notes: expect.stringContaining("old-agent to new-agent"),
+            }),
+          })
+        );
+      });
+
+      it("treats a whitespace-only workId as absent", async () => {
+        const res = await makePostRequest({ action: "reassign", workId: "   ", newAgentName: "new-agent" });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toBe("Missing workId");
+        expect(agentWork.findUnique).not.toHaveBeenCalled();
+      });
+
+      it("treats a whitespace-only newAgentName as absent", async () => {
+        const res = await makePostRequest({ action: "reassign", workId: "work-1", newAgentName: "   " });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toBe("Missing newAgentName");
+        expect(agentWork.findUnique).not.toHaveBeenCalled();
+      });
+    });
+
     it("reassigns work to a new agent", async () => {
       agentWork.findUnique.mockResolvedValueOnce({
         id: "work-1",
