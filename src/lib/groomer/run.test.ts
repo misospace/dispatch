@@ -317,7 +317,7 @@ describe("runHostedGroomer", () => {
     mocks.addIssueComment.mockResolvedValue({ url: null });
     mocks.closeIssue.mockResolvedValue(undefined);
     mocks.findActiveLeasesForIssue.mockResolvedValue([]);
-    mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
+    mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" }, mintedToken: true });
     mocks.releaseLease.mockResolvedValue({ id: "lease-1" });
     mocks.acquireGroomerLock.mockResolvedValue({ locked: true, token: "lock-token" });
     mocks.heartbeatGroomerLock.mockResolvedValue(undefined);
@@ -1691,6 +1691,43 @@ describe("runHostedGroomer", () => {
     await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
 
     expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+  });
+
+  it("leaves a renewed lease row intact on success (#1362)", async () => {
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" }, mintedToken: false });
+
+    const result = await runHostedGroomer();
+
+    expect(result).not.toBeNull();
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+  });
+
+  it("leaves a renewed lease row intact when the run fails (#1362)", async () => {
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" }, mintedToken: false });
+    mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+
+    await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
+  });
+
+  it("releases a minted lease row even when the run fails (#1362)", async () => {
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" }, mintedToken: true });
+    mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+
+    await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+    expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+  });
+
+  it("does not release the lease when upsertLease omits mintedToken (fail-closed)", async () => {
+    // A legacy/loose receipt without `mintedToken` must not authorize a
+    // destructive release of a row this run may merely have renewed.
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" } });
+
+    await runHostedGroomer();
+
+    expect(mocks.releaseLease).not.toHaveBeenCalled();
   });
 
   it("sets currentLane on issue update", async () => {

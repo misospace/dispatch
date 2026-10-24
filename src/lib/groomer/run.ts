@@ -250,6 +250,13 @@ async function executeGroomerRun(
   });
 
   let lease: { id: string } | undefined;
+  // #1362: `upsertLease` RENEWS an existing (agent, issue) row instead of
+  // creating one, and a plain renewal keeps that row's own claim token — the
+  // receipt belongs to whoever minted it, not to this run. Only release the
+  // row in `finally` when THIS call minted it (created the row, reactivated
+  // a disposed one, or tokenized a token-less one), mirroring the claim
+  // route's mint-based supersede rule (#1256).
+  let leaseMintedByThisRun = false;
   const leaseExpiresAt = Date.now() + GROOMER_LEASE_TTL_MS;
 
   // Freshness (#1064): a human comment after this instant is new evidence.
@@ -272,12 +279,16 @@ async function executeGroomerRun(
       });
       return null;
     }
-    ({ lease } = await deps.upsertLease({
-      agentName: "hosted-groomer",
-      issueId: candidate.id,
-      checkpoint: "issue_claimed",
-      ttlMs: GROOMER_LEASE_TTL_MS,
-    }));
+    {
+      const leaseReceipt = await deps.upsertLease({
+        agentName: "hosted-groomer",
+        issueId: candidate.id,
+        checkpoint: "issue_claimed",
+        ttlMs: GROOMER_LEASE_TTL_MS,
+      });
+      lease = leaseReceipt.lease;
+      leaseMintedByThisRun = leaseReceipt.mintedToken === true;
+    }
     stage = "selected";
     let comments: Awaited<ReturnType<typeof fetchIssueComments>> = [];
     try {
@@ -1361,7 +1372,10 @@ async function executeGroomerRun(
     });
     throw error;
   } finally {
-    if (lease) await deps.releaseLease(lease.id);
+    // #1362: release only a row THIS run minted. A renewal of an existing
+    // lease (e.g. one this agent's earlier run or a live attempt still owns)
+    // must leave the row intact for its minting attempt's own lifecycle.
+    if (lease && leaseMintedByThisRun) await deps.releaseLease(lease.id);
   }
 }
 
