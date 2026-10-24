@@ -205,8 +205,45 @@ export async function POST(request: Request) {
       console.warn(`Released ${expiredCount} expired lease(s) for issue #${issueNumber}`);
     }
 
-    // Clean up stale AgentWork records (no matching active Lease)
-    const staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string, repoFullName);
+    // Clean up stale AgentWork records (no matching active Lease).
+    //
+    // #1390: the cleanup ABORTS (throws) when its post-consume verification
+    // sees a protecting lease for a row it had consumed — a live agent resumed
+    // mid-cleanup and the transaction rolled everything back. That failure is
+    // converted to a retryable 503 HERE, inside the guarded callback and
+    // before `remoteStarted`, rather than allowed to escape: an escaped throw
+    // demotes the claim guard to `executing: false` (the guard catch does not
+    // delete for operation "claim"), and a demoted claim guard wedges every
+    // other-agent claim, force-claim (the override only clears `executing`
+    // guards), and lease/ownership writer on the issue with no
+    // operator-visible clear — the #1361/#1367 wedge class. Returning here
+    // makes the callback complete normally, which releases the guard; the
+    // claimer simply retries.
+    let staleWorkCount: number;
+    try {
+      staleWorkCount = await findAndReleaseStaleAgentWorkForIssue(prisma, issueId as string, repoFullName);
+    } catch (error) {
+      const cleanupError = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Stale AgentWork cleanup failed for issue #${issueNumber}:`, cleanupError);
+      try {
+        await prisma.auditLog.create({
+          data: {
+            actor,
+            action: "claim_issue",
+            repoFullName,
+            issueNumber,
+            issueId: issueId as string,
+            beforeLabels: liveLabels,
+            afterLabels: [],
+            success: false,
+            errorMessage: `Stale AgentWork cleanup failed before the claim was taken: ${cleanupError}`,
+          },
+        });
+      } catch {
+        // Audit log failure should not mask the 503
+      }
+      return errorResponse(`Stale-work cleanup failed; retry the claim: ${cleanupError}`, 503);
+    }
     if (staleWorkCount > 0) {
       console.warn(`Released ${staleWorkCount} stale AgentWork record(s) for issue #${issueNumber}`);
     }

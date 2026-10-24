@@ -453,6 +453,48 @@ export async function releaseStaleWork(client: AgentWorkClient, maxAgeMs: number
  * (reassigned to another agent) is left to its new owner instead of being
  * deleted out from under it.
  *
+ * #1390: a lease taken between the scan and the delete (the agent resumes
+ * its work, or a force-claim takes the issue) keeps its row, through three
+ * layers:
+ *
+ * 1. SCAN exclusion (`agentName: { notIn: activeAgentNames }`) — leases
+ *    committed before the scan.
+ * 2. IN-TRANSACTION RE-READ + per-candidate DECLINE — the protecting-lease
+ *    set is re-derived inside the cleanup `$transaction` with the same
+ *    predicate as the scan; a candidate whose agent holds a protecting lease
+ *    at re-read time is not deleted, the count stays as-is, and no audit row
+ *    claims the deletion. Declines are logged so they are not invisible.
+ * 3. POST-CONSUME VERIFICATION + ROLLBACK — after the deletes, before the
+ *    audit, the protecting-lease set is read a third time (fresh READ
+ *    COMMITTED snapshot, so it observes every lease commit up to that
+ *    statement). If any agent whose row WAS consumed now holds a protecting
+ * lease, the whole transaction throws and rolls back: the delete lands
+ * nowhere, no audit row is written, and the row is back exactly where it
+ * started. The claim route (the only production caller) converts this
+ * rejection into a retryable 503 INSIDE its guarded callback — an escaping
+ * throw would demote the claim guard to `executing: false` and wedge every
+ * other writer on the issue, the #1361/#1367 class — so a decline never
+ * strands the anchor.
+ *
+ * The remaining window between the verification read and the COMMIT is
+ * closed by SYNCHRONIZATION, not by snapshot timing: every lease-granting
+ * writer holds the per-issue mutation guard ACROSS its lease commit —
+ * `upsertLease` renews/creates under the guard (`lease.ts`; the claim route
+ * passes `mutationGuardHeld` because it already holds it) and the ownership
+ * renew/disposition paths run under `withOwnershipGuard` →
+ * `withIssueMutationGuard`. The claim route — this cleanup's only production
+ * caller — holds that same guard for the whole guarded region containing
+ * this cleanup, so a guard-respecting lease acquisition cannot COMMIT inside
+ * any window of the cleanup: it is `busy` before it ever writes, and a
+ * renewal racing the guard fails as `mutation_busy`. The only residual is
+ * the maintainer force-claim OVERRIDE of a guard whose holder has gone silent
+ * past `GUARD_OVERRIDE_MIN_AGE_MS` (a live claim holder stamps every
+ * `GUARD_HEARTBEAT_MS`, so this never hits an in-flight cleanup of a healthy
+ * process) — the repo-wide accepted cost of the deliberate override,
+ * documented in `issue-mutation-guard.ts`. The #1350 delete-fence conjuncts
+ * above stay the last line of defense for non-lease shape changes, same as
+ * before.
+ *
  * Returns the count of deleted records.
  */
 export async function findAndReleaseStaleAgentWorkForIssue(
@@ -460,13 +502,19 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   issueId: string,
   repoFullName: string,
 ): Promise<number> {
+  // The protecting-lease predicate, shared by the scan, the in-transaction
+  // re-read, and the post-consume verification (#1390): non-expired, or a
+  // running park. Byte-identical arms keep the SQL-3VL NULL behavior
+  // identical at every read.
+  const protectingLeaseWhere = (asOf: Date) => ({
+    issueId,
+    OR: [{ expiredAt: { gt: asOf } }, { retryAfter: { gt: asOf } }],
+  });
+
   // Active lease agent names for this issue: non-expired, or a running park.
   const now = new Date();
   const activeLeases = await prisma.lease.findMany({
-    where: {
-      issueId,
-      OR: [{ expiredAt: { gt: now } }, { retryAfter: { gt: now } }],
-    },
+    where: protectingLeaseWhere(now),
     select: { agentName: true },
   });
 
@@ -519,8 +567,26 @@ export async function findAndReleaseStaleAgentWorkForIssue(
   // inside the transaction: a failure rolls the whole cleanup back, so a
   // partial delete without its audit row is not reachable.
   const deletedIds: string[] = [];
+  const consumedAgentNames: string[] = [];
+  const declinedAgentNames: string[] = [];
+
   await prisma.$transaction(async (tx: any) => {
+    // #1390 layer 2: re-read the protecting-lease set inside the transaction.
+    // The scan's exclusion was evaluated at scan time; a lease taken after it
+    // (agent resume, force-claim) must protect its row, and the fenced
+    // delete's own conjuncts cannot observe it.
+    const txNow = new Date();
+    const liveLeases = await tx.lease.findMany({
+      where: protectingLeaseWhere(txNow),
+      select: { agentName: true },
+    });
+    const liveAgentNames = new Set<string>(liveLeases.map((l: any) => l.agentName));
+
     for (const work of staleWorks) {
+      if (liveAgentNames.has(work.agentName)) {
+        declinedAgentNames.push(work.agentName);
+        continue;
+      }
       const deleted = await tx.agentWork.deleteMany({
         where: {
           id: work.id,
@@ -532,10 +598,32 @@ export async function findAndReleaseStaleAgentWorkForIssue(
       });
       if ((deleted?.count ?? 0) === 1) {
         deletedIds.push(work.id);
+        consumedAgentNames.push(work.agentName);
       }
     }
 
     if (deletedIds.length === 0) return;
+
+    // #1390 layer 3: post-consume verification. This read takes a fresh READ
+    // COMMITTED snapshot, so it observes every lease commit that landed up to
+    // this statement — including one that raced in BETWEEN the re-read above
+    // and the deletes. A lease for an agent whose row was just consumed means
+    // the cleanup raced live work it must not clobber, so the whole
+    // transaction ABORTS: the deletes roll back, no audit row is written, and
+    // the caller fails closed. The residual commit-after-verification window
+    // is closed by the per-issue mutation guard (docblock), not by this read.
+    const verifyNow = new Date();
+    const finalLeases = await tx.lease.findMany({
+      where: protectingLeaseWhere(verifyNow),
+      select: { agentName: true },
+    });
+    const finalLiveAgentNames = new Set<string>(finalLeases.map((l: any) => l.agentName));
+    const racedAgentNames = Array.from(new Set(consumedAgentNames.filter((a) => finalLiveAgentNames.has(a))));
+    if (racedAgentNames.length > 0) {
+      throw new Error(
+        `[agent-work] stale cleanup aborted for issue ${issueId}: a protecting lease was taken for consumed agent(s) [${racedAgentNames.join(", ")}] after the in-transaction re-read; rolling back so the live work's row stays (#1390)`,
+      );
+    }
 
     await tx.auditLog.create({
       data: {
@@ -548,6 +636,12 @@ export async function findAndReleaseStaleAgentWorkForIssue(
       },
     });
   });
+
+  if (declinedAgentNames.length > 0) {
+    console.info(
+      `[agent-work] stale cleanup declined ${declinedAgentNames.length} candidate(s) after a lease was taken mid-flight on issue ${issueId} (agents=[${declinedAgentNames.join(", ")}])`,
+    );
+  }
 
   return deletedIds.length;
 }
