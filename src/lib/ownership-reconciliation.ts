@@ -113,6 +113,19 @@ export function reconcileMaxForgeRetries(): number {
   return readWindowEnv("DISPATCH_RECONCILE_MAX_FORGE_RETRIES", 5, 1, 20);
 }
 
+/**
+ * How long an unchanged per-pass annotation stays suppressed before it is
+ * re-emitted as a fresh confirmation (#1363). Default 24h, clamped 1m–7d.
+ */
+export function reconcileAnnotationReemitMs(): number {
+  return readWindowEnv(
+    "DISPATCH_RECONCILE_ANNOTATION_REEMIT_MS",
+    24 * 60 * 60 * 1000,
+    MIN_WINDOW_MS,
+    7 * 24 * 60 * 60 * 1000,
+  );
+}
+
 // ─── Client shapes (narrow, stale-work style) ────────────────────────────────
 
 export interface OwnershipReconcileForge {
@@ -159,6 +172,7 @@ export interface OwnershipReconcileTransactionClient {
     deleteMany: (args: any) => Promise<{ count: number }>;
   };
   auditLog: {
+    findFirst: (args: any) => Promise<any>;
     create: (args: any) => Promise<unknown>;
   };
   issueLifecycleEvent: LifecycleEventStore;
@@ -273,6 +287,47 @@ interface AuditIssueRef {
   repository: { fullName: string };
 }
 
+/**
+ * The per-pass annotation actions (#1363). Each fires for every examined
+ * candidate on every sweep pass (the stale-work slot, 5m by default), so an
+ * unchanged candidate would otherwise grow the audit log by hundreds of
+ * identical rows per day. These dedupe per candidate: a write whose content
+ * is identical to the candidate's latest annotation is suppressed until the
+ * re-emit window elapses. Event-shaped actions (`ownership_release_intent`,
+ * `ownership_release_intent_superseded`, `ownership_reconcile_guard_lost`,
+ * `ownership_reconcile_intent_parked`) stay exempt — each marks one lifecycle
+ * milestone, and their volume is bounded by the intent lifecycle, not by pass
+ * cadence.
+ */
+const PER_PASS_ANNOTATION_ACTIONS: ReadonlySet<string> = new Set([
+  "ownership_reconcile_candidate",
+  "ownership_reconcile_parked",
+  "ownership_reconcile_release_withheld",
+  "ownership_reconcile_unverifiable",
+]);
+
+function labelsEqual(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  const left = a ?? [];
+  const right = b ?? [];
+  return left.length === right.length && left.every((label, i) => label === right[i]);
+}
+
+function sameAnnotationContent(latest: any, input: {
+  notes?: string;
+  beforeLabels?: string[];
+  afterLabels?: string[];
+  success?: boolean;
+  errorMessage?: string;
+}): boolean {
+  return (
+    (latest.notes ?? null) === (input.notes ?? null) &&
+    labelsEqual(latest.beforeLabels, input.beforeLabels) &&
+    labelsEqual(latest.afterLabels, input.afterLabels) &&
+    latest.success === (input.success ?? true) &&
+    (latest.errorMessage ?? null) === (input.errorMessage ?? null)
+  );
+}
+
 async function auditReconcileEvent(
   client: Pick<OwnershipReconcileTransactionClient, "auditLog">,
   input: {
@@ -284,15 +339,53 @@ async function auditReconcileEvent(
     success?: boolean;
     errorMessage?: string;
     notes?: string;
+    /** Pass clock, for the dedupe re-emit age check. */
+    now?: Date;
   },
 ): Promise<void> {
+  const issueId = input.issue?.id ?? input.issueId ?? null;
+
+  // #1363: bound per-pass annotation growth. A per-pass annotation identical
+  // to the candidate's latest one carries no new information — suppress it
+  // until the re-emit window elapses, then re-emit once so the operator keeps
+  // a fresh confirmation that the candidate is still in that state. State,
+  // ladder and label changes always differ in content and are never
+  // suppressed. A failed lookup falls through to the write: annotation stays
+  // best-effort, exactly as before.
+  if (issueId != null && PER_PASS_ANNOTATION_ACTIONS.has(input.action)) {
+    try {
+      const latest = await client.auditLog.findFirst({
+        where: { actor: "reconciler", action: input.action, issueId },
+        orderBy: { createdAt: "desc" },
+        select: {
+          notes: true,
+          beforeLabels: true,
+          afterLabels: true,
+          success: true,
+          errorMessage: true,
+          createdAt: true,
+        },
+      });
+      if (
+        latest &&
+        sameAnnotationContent(latest, input) &&
+        (input.now ?? new Date()).getTime() - latest.createdAt.getTime() <
+          reconcileAnnotationReemitMs()
+      ) {
+        return;
+      }
+    } catch {
+      // Dedupe is an optimization; never let its lookup mask the annotation.
+    }
+  }
+
   await client.auditLog.create({
     data: {
       actor: "reconciler",
       action: input.action,
       repoFullName: input.issue?.repository.fullName ?? "",
       issueNumber: input.issue?.number,
-      issueId: input.issue?.id ?? input.issueId,
+      issueId,
       beforeLabels: input.beforeLabels ?? [],
       afterLabels: input.afterLabels ?? [],
       success: input.success ?? true,
@@ -1327,6 +1420,7 @@ export async function reconcileOwnership(
             success: false,
             errorMessage: message,
             notes: "live label read failed; ladder not advanced (fail closed)",
+            now,
           });
         } catch {
           // Audit failure must not mask the report's error entry.
@@ -1398,6 +1492,7 @@ export async function reconcileOwnership(
               beforeLabels: issue.labels,
               afterLabels: issue.labels,
               notes: `state=${assessment.state} reasons=[${assessment.reasonCodes.join(",")}] verified=${assessment.verified}`,
+              now,
             });
           } catch {
             // Annotation only.
@@ -1474,6 +1569,7 @@ export async function reconcileOwnership(
             beforeLabels: issue.labels,
             afterLabels: issue.labels,
             notes: `state=ABANDONED_CANDIDATE reasons=[${assessment.reasonCodes.join(",")}] verified=${assessment.verified} ladder=${ladderCount}/2 wouldRelease=${wouldRelease}`,
+            now,
           });
         } catch {
           // Annotation only; a failing audit must not break the pass.
@@ -1505,6 +1601,7 @@ export async function reconcileOwnership(
             beforeLabels: issue.labels,
             afterLabels: issue.labels,
             notes: `reclaim limit (${maxReclaims}) reached for ${assessment.ownerAgent ?? labelOwner}; needs-human, no release`,
+            now,
           });
         } catch {
           // Annotation only.
@@ -1565,6 +1662,7 @@ export async function reconcileOwnership(
             beforeLabels: issue.labels,
             afterLabels: issue.labels,
             notes: `mode=audit; would release ${assessment.ownerAgent ?? labelOwner} (reasons=[${assessment.reasonCodes.join(",")}], staleCount=${staleCount})`,
+            now,
           });
         } catch {
           // Annotation only.

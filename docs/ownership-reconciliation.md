@@ -640,6 +640,26 @@ no such claim; §8.7 defines the actual cross-system boundary.
 > an active `AgentWork` row with no `Lease` row (a worker that started work
 > before claiming), and it aborts when a lease row appears under the lock.
 
+**Annotation cadence (#1363).** The per-pass annotations
+(`ownership_reconcile_candidate`, `ownership_reconcile_parked`,
+`ownership_reconcile_release_withheld`, `ownership_reconcile_unverifiable`)
+fire for every examined candidate on every sweep pass, so an unchanged
+candidate would grow the audit log by one identical row per pass — hundreds
+per day at the default cadence. They therefore dedupe per candidate: a write
+whose content (state/reasons/ladder notes, label snapshots, success and error
+fields) is byte-identical to the candidate's latest annotation of the same
+action is suppressed until `DISPATCH_RECONCILE_ANNOTATION_REEMIT_MS` has
+elapsed since that annotation (default 24h, clamped 1m–7d), after which it is
+re-emitted once as a fresh confirmation that the candidate is still in that
+state. A state change, a ladder advance, or a label change always differs in
+content and is never suppressed, so the operator still sees a candidate's
+current state and every ladder transition. The event-shaped actions
+(`ownership_release_intent`, `ownership_release_intent_superseded`,
+`ownership_reconcile_guard_lost`, `ownership_reconcile_intent_parked`) are
+exempt: each marks one lifecycle milestone, and their volume is bounded by the
+intent lifecycle, not by pass cadence. The dedupe lookup is served by the
+`AuditLog(actor, action, issueId, createdAt DESC)` index.
+
 Because the remote write cannot be fenced, the design fences **admission** in
 Postgres and lets that barrier serialize the remote write against every other
 automation writer of the same label. The anchor's row lock additionally makes
@@ -902,6 +922,9 @@ All operator actions are maintainer-only and audit-logged, matching §3.6.
   `DISPATCH_RECONCILE_RECHECK_INTERVAL_MS`,
   `DISPATCH_RECONCILE_RECLAIM_COOLDOWN_MS` and
   `DISPATCH_RECONCILE_MAX_FORGE_RETRIES` as the bounded-window knobs (§8.3).
+  Annotation volume is bounded per candidate (#1363) via
+  `DISPATCH_RECONCILE_ANNOTATION_REEMIT_MS` (see the annotation-cadence note
+  on the §8.7 implementation).
 - **Open:** exact window defaults and whether `renew` should be a new endpoint
   or an extension of `POST /api/agent-work/checkpoint`. (#1251 settled the
   endpoint; the defaults remain operator-tunable.)
