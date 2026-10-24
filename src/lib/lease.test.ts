@@ -129,6 +129,18 @@ describe("upsertLease", () => {
       const callData = (mocks.leaseCreate.mock.calls[0] as any)[0].data;
       expect(callData.prUrl).toBe("https://github.com/org/repo/pull/456");
     });
+
+    it("reports that the create minted the claim token", async () => {
+      // #1254: the caller that may destroy the receipt must know it minted
+      // it — a renewal that merely echoed a live attempt's token may not.
+      mocks.leaseFindUnique.mockImplementation(() => Promise.resolve(null));
+      mocks.leaseCreate.mockImplementation((args: any) => Promise.resolve({ id: "l-1", ...args.data }));
+
+      const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+      expect(result.created).toBe(true);
+      expect(result.mintedToken).toBe(true);
+    });
   });
 
   describe("concurrent create race", () => {
@@ -161,6 +173,10 @@ describe("upsertLease", () => {
       expect(b.lease.id).toBe("l-winner");
       expect(a.created).toBe(true);
       expect(b.created).toBe(false);
+      // #1254: the loser did NOT mint the winner's token — only the caller
+      // that created the row may treat the receipt as its own.
+      expect(a.mintedToken).toBe(true);
+      expect(b.mintedToken).toBe(false);
     });
 
     it("re-throws non-unique create errors", async () => {
@@ -268,6 +284,9 @@ describe("upsertLease", () => {
       // The returned lease carries the rotated token, never the stale one.
       expect(result.lease.claimToken).toBe(updateData.claimToken);
       expect(result.lease.claimToken).not.toBe("claim_retired");
+      // #1254: the reactivation minted the token — the row is this attempt's
+      // own receipt, so a supersede cleanup may delete it.
+      expect(result.mintedToken).toBe(true);
       // Terminal evidence cleared.
       expect(updateData.disposition).toBeNull();
       expect(updateData.dispositionNote).toBeNull();
@@ -318,6 +337,44 @@ describe("upsertLease", () => {
       expect(updateData.renewCount).toBeUndefined();
       expect(updateData.lastRenewalObservedAt).toBeUndefined();
       expect(updateData.lastRenewalOccurredAt).toBeUndefined();
+      // #1254: this renewal only echoed the live attempt's token — it did NOT
+      // mint the receipt, so a supersede cleanup must leave the row intact.
+      expect(result.mintedToken).toBe(false);
+    });
+
+    it("mints a fresh claim token when renewing a token-less row retired by Phase A (#1254)", async () => {
+      // The reconciler's Phase A retires the fence with `claimToken = null`
+      // while leaving `disposition = null`. A claim that supersedes the
+      // pending intent must NOT echo that null token into the new attempt.
+      mocks.leaseFindUnique.mockImplementation(() =>
+        Promise.resolve(
+          makeLease({
+            id: "l-1",
+            claimToken: null,
+            disposition: null,
+            registeredAt: new Date(),
+            renewCount: 4,
+            lastRenewalObservedAt: new Date(),
+          }),
+        ),
+      );
+      mocks.leaseUpdate.mockImplementation((args: any) =>
+        Promise.resolve({ ...makeLease(args.where), claimToken: null, ...args.data }),
+      );
+
+      const result = await upsertLease({ agentName: "saffron", issueId: "i-1" });
+
+      expect(result.created).toBe(false);
+      const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+      expect(updateData.claimToken).toEqual(expect.stringMatching(/^claim_/));
+      expect(result.lease.claimToken).toBe(updateData.claimToken);
+      // Not a reactivation: the row's liveness provenance survives.
+      expect(updateData.runRef).toBeUndefined();
+      expect(updateData.registeredAt).toBeUndefined();
+      expect(updateData.renewCount).toBeUndefined();
+      // #1254: the renewal minted the fresh token — the receipt is this
+      // attempt's own, so a supersede cleanup may delete it.
+      expect(result.mintedToken).toBe(true);
     });
   });
 });
@@ -363,6 +420,32 @@ describe("releaseLease", () => {
   });
 });
 
+/**
+ * SQL three-valued evaluation of the `releaseExpiredLeases` cleanup clause
+ * against one lease row, so the park-skip guard is behavioral rather than a
+ * where-shape snapshot. The clause selects leases whose `expiredAt` has
+ * elapsed AND whose wait marker is gone: `retryAfter IS NULL` (unknown-safe:
+ * the NULL arm is literal null equality) or `retryAfter` already elapsed (a
+ * NULL column makes the `lte` comparison UNKNOWN, never a match).
+ */
+function matchesReleaseExpiredWhere(
+  lease: Record<string, unknown>,
+  where: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> },
+): boolean {
+  const expiredAt = lease.expiredAt as Date;
+  const retryAfter = (lease.retryAfter ?? null) as Date | null;
+  if (expiredAt.getTime() > where.expiredAt.lte.getTime()) return false;
+  for (const arm of where.OR) {
+    if (arm.retryAfter === null) {
+      if (retryAfter === null) return true;
+      continue;
+    }
+    const armLte = (arm.retryAfter as { lte: Date }).lte;
+    if (retryAfter !== null && retryAfter.getTime() <= armLte.getTime()) return true;
+  }
+  return false;
+}
+
 describe("releaseExpiredLeases", () => {
   it("deletes all expired leases for an issue and returns count", async () => {
     mocks.leaseFindMany.mockImplementation(() => Promise.resolve([{ id: "l-1" }, { id: "l-2" }]));
@@ -383,6 +466,70 @@ describe("releaseExpiredLeases", () => {
 
     expect(result).toBe(0);
     expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not select a lease whose retryAfter park is still running, so cleanup cannot erase the park evidence (#1316, #1334)", async () => {
+    let capturedWhere: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseFindMany.mockImplementation(async (args: any) => {
+      capturedWhere = args.where;
+      return [];
+    });
+
+    const result = await releaseExpiredLeases("i-1");
+
+    expect(result).toBe(0);
+    expect(capturedWhere).toBeDefined();
+
+    // A still-running park — expired ownership TTL, wait deadline in the
+    // future — is NOT selected: the block park (or a renewal's externalWait)
+    // owns its receipt until the deadline elapses.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() + 3600_000) }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
+    // The expired lease this cleanup exists for is still selected…
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: null }),
+        capturedWhere!,
+      ),
+    ).toBe(true);
+    // …and the lease-existence gate stays intact: a non-expired lease is
+    // never selected by the cleanup, park or no park.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() + 5 * 60_000), retryAfter: null }),
+        capturedWhere!,
+      ),
+    ).toBe(false);
+  });
+
+  it("selects an expired lease once its retryAfter has elapsed (park over)", async () => {
+    let capturedWhere: { expiredAt: { lte: Date }; OR: Array<Record<string, unknown>> } | undefined;
+    mocks.leaseFindMany.mockImplementation(async (args: any) => {
+      capturedWhere = args.where;
+      return [];
+    });
+
+    await releaseExpiredLeases("i-1");
+
+    expect(capturedWhere).toBeDefined();
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: new Date(Date.now() - 60_000) }),
+        capturedWhere!,
+      ),
+    ).toBe(true);
+    // The boundary is inclusive per `lte`: a retryAfter exactly at the
+    // cleanup's `now` is no longer a park.
+    expect(
+      matchesReleaseExpiredWhere(
+        makeLease({ expiredAt: new Date(Date.now() - 5 * 60_000), retryAfter: capturedWhere!.expiredAt.lte }),
+        capturedWhere!,
+      ),
+    ).toBe(true);
   });
 });
 

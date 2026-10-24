@@ -64,6 +64,66 @@ export interface IssueClaimClient {
 }
 
 /**
+ * A THIN `IssueClaimClient` over the fenced transaction client.
+ *
+ * `releaseIssueClaim` opens its own interactive transaction whenever the
+ * client it is handed exposes `$transaction` — and a real Prisma interactive
+ * transaction client DOES expose it (Prisma only denies `$connect`,
+ * `$disconnect`, `$on`, `$use` and `$extends`). Inside the fenced region that
+ * would open a NESTED interactive transaction (a savepoint) with Prisma's
+ * default 5s timeout: the release's cache mirror and its `claim_released`
+ * evidence row could roll back to the savepoint while the GitHub removal
+ * stands. The thin client is therefore built EXPLICITLY from the transaction
+ * client, WITHOUT `$transaction`, so the release's local writes join the
+ * fenced transaction instead of nesting inside it.
+ *
+ * Shared with the release's fenced callers (#1254/#1361/#1367): the capacity
+ * handoff, the unclaim route, and the stale-work sweep all hand the release
+ * this helper's client, so the release's local writes join each caller's
+ * fenced transaction instead of nesting inside it.
+ */
+export function fencedClaimClient(tx: unknown): IssueClaimClient {
+  const source = tx as {
+    issue: IssueClaimClient["issue"];
+    issueLifecycleEvent?: IssueClaimClient["issueLifecycleEvent"];
+  };
+  return { issue: source.issue, issueLifecycleEvent: source.issueLifecycleEvent };
+}
+
+/**
+ * The worst-case number of bounded remote calls `releaseIssueClaim` can make
+ * for an issue whose cached label set is `labels` (#1367 review).
+ *
+ * The call count is DATA-DEPENDENT, so a region that wraps this release needs
+ * a budget DERIVED from the observed labels rather than a fixed multiplier: a
+ * fixed one can be outrun by the duplicated-`status/*`-labels data-quality
+ * edge case (#1037) — `transitionIssueStatus` removes EVERY existing
+ * `status/*` label, one call each. The bound is deliberately branch-blind and
+ * over-counts: exactly ONE branch of the release's resting-status policy runs
+ * per attempt, but the bound charges every observed status label as a
+ * potential removal, plus the target add and the in-review PR-state read,
+ * regardless of which branch fires:
+ *
+ *   1 for the `agent/*` removal (every live path makes it)
+ *   + S for the observed `status/*` labels (each a potential removal)
+ *   + 1 for the transition's target add
+ *   + 1 for the in-review branch's linked-PR state read
+ *
+ * S here is the count of the LABELS THE CALLER PASSES. Callers inside a
+ * fenced region must pass the label set the release receives (the route's
+ * in-anchor re-read; the capacity handoff's live labels), not an older cache
+ * row — the bound must cover the calls the region will actually issue. The
+ * worst-case bound covering the WIDEST policy usage (no `preserveStatus`) is
+ * valid for narrower usages too; callers that change the release's policy or
+ * its call shape must revisit this helper — it is co-located above
+ * `releaseIssueClaim` so the two are edited together.
+ */
+export function releaseIssueClaimWorstCaseCalls(labels: string[]): number {
+  const statusLabelCount = labels.filter((label) => label.startsWith("status/")).length;
+  return 1 + statusLabelCount + 1 + 1;
+}
+
+/**
  * Release an issue's agent claim and mirror the result in the local cache.
  *
  * The operator unclaim route and stale-work recovery use this same mutation

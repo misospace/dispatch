@@ -126,6 +126,7 @@ Workers must respect these constraints:
 * **`next-task` failure:** If the endpoint returns an error, log a warning and stop — do not start the model.
 * **`tasks/report` failure:** If reporting fails after execution, log a warning and stop. The work was completed; the report is best-effort visibility.
 * **Optional sync failure:** Log as a freshness warning. Never block task execution.
+* **`POST /api/issues/claim` returns `409 "Ownership release is pending on this issue"` (#1254):** the ownership reconciler is releasing a previously abandoned claim on that issue and its two-sided release barrier holds every claim until the release settles (typically one sweep tick). Treat this 409 as transient: retry the claim after a short backoff, or pick different work. A maintainer `force=true` claim supersedes the pending intent instead of waiting.
 * **Tokens are secrets.** Never log, echo, or persist `DISPATCH_WORKER_TOKENS`, a worker's `WORKER_BEARER_TOKEN`, `DISPATCH_AGENT_TOKEN`, `DISPATCH_MAINTAINER_TOKEN`, or `GITHUB_TOKEN`. Keep maintainer-tier credentials out of ordinary worker processes.
 
 ### Auditability

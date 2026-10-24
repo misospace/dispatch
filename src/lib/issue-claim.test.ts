@@ -15,7 +15,7 @@ vi.mock("@/lib/github-prs", () => ({
 import { addIssueLabel, removeIssueLabel } from "@/lib/github";
 import { fetchPullRequestState } from "@/lib/github-prs";
 
-import { releaseIssueClaim, type IssueClaimClient } from "./issue-claim";
+import { releaseIssueClaim, releaseIssueClaimWorstCaseCalls, type IssueClaimClient } from "./issue-claim";
 
 const addIssueLabelMock = addIssueLabel as ReturnType<typeof vi.fn>;
 const removeIssueLabelMock = removeIssueLabel as ReturnType<typeof vi.fn>;
@@ -612,5 +612,64 @@ describe("releaseIssueClaim — one identity per release attempt (#1202 review)"
     expect(repaired.upsertEvent.mock.calls[0][0].create.dedupeKey).toBe(
       "claim-released|issue-1|agent/alpha|already-released",
     );
+  });
+});
+
+describe("releaseIssueClaimWorstCaseCalls (#1367 review)", () => {
+  it("charges the agent removal plus every observed status label, the add and the PR read", () => {
+    // no status labels: 1 agent removal + 0 removals + 1 add + 1 read
+    expect(releaseIssueClaimWorstCaseCalls(["agent/alpha"])).toBe(3);
+    // the review's counterexample: six duplicated status labels chain six
+    // removals + the add on top of the agent removal
+    expect(
+      releaseIssueClaimWorstCaseCalls([
+        "agent/alpha",
+        "status/in-progress",
+        "status/ready",
+        "status/blocked",
+        "status/in-review",
+        "status/queued",
+        "status/hold",
+      ]),
+    ).toBe(9);
+  });
+
+  it("covers the release's actual remote-call sequence for every branch", async () => {
+    // Branch-blind bound: whichever branch of the resting-status policy a
+    // label set takes, the bounded remote calls the release issues must not
+    // exceed the helper's answer for that set. The default mocks (set in the
+    // file's beforeEach — the transition delegates to the add/remove
+    // primitives, the PR read answers an open PR) drive every branch's live
+    // path below.
+    const branchShapes: { labels: string[]; callOptions: Parameters<typeof callRelease>[2] }[] = [
+      { labels: ["agent/alpha", "status/in-progress"], callOptions: {} }, // transition
+      { labels: ["agent/alpha", "status/blocked"], callOptions: {} }, // no blockedReason: transition
+      { labels: ["agent/alpha", "status/blocked"], callOptions: { blockedReason: "stalled" } }, // retained
+      { labels: ["agent/alpha", "status/in-review"], callOptions: { linkedPrNumber: 7 } }, // PR read + retained
+      { labels: ["agent/alpha", "status/in-review"], callOptions: {} }, // retained: no linked PR
+      { labels: ["agent/alpha", "status/ready"], callOptions: {} },
+      { labels: ["agent/alpha"], callOptions: {} },
+      // A duplicated-status shape plus a non-status secondary category: the
+      // bound must still cover the removal loop and ignore other categories.
+      {
+        labels: ["agent/alpha", "owner/alice", "status/in-progress", "status/ready"],
+        callOptions: {},
+      },
+    ];
+    for (const shape of branchShapes) {
+      removeIssueLabelMock.mockClear();
+      addIssueLabelMock.mockClear();
+      fetchPullRequestStateMock.mockClear();
+
+      await callRelease(makePrisma().client, shape.labels, shape.callOptions);
+
+      const observed =
+        removeIssueLabelMock.mock.calls.length +
+        addIssueLabelMock.mock.calls.length +
+        fetchPullRequestStateMock.mock.calls.length;
+      // Every remote call carries the same per-call bound, so the derived
+      // budget dominates the region whenever the count stays ≤ the helper.
+      expect(observed).toBeLessThanOrEqual(releaseIssueClaimWorstCaseCalls(shape.labels));
+    }
   });
 });

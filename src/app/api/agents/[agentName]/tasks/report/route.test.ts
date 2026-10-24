@@ -3,7 +3,7 @@ import { TEST_AGENT_TOKEN as mockToken, makeDispatchEnvMock, authedRequest } fro
 
 process.env.DISPATCH_AGENT_TOKEN = mockToken;
 
-vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha" }));
+vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock(mockToken, { "test-worker-token": "worker" }, { "bound-token": "alpha", "bound-report-agent": "test-agent" }));
 
 const { mocks, mockAgentRun, mockDedupe, prFixResolveMock, closeResolveMock, prismaMock, getLiveIssueLabelsMock } = vi.hoisted(() => {
   const mockAgentRun = {
@@ -115,6 +115,13 @@ vi.mock("@/lib/claim-gate", () => ({
 import { POST } from "./route";
 import { resetAuthCaches } from "@/lib/auth";
 import { Prisma } from "@prisma/client";
+import { resetRateLimits } from "@/lib/rate-limit";
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 function postRequest(body: unknown, agentName = "test-agent", includeAuth = true) {
   return POST(
@@ -2480,5 +2487,62 @@ describe("POST /api/agents/[agentName]/tasks/report — lifecycle evidence (#120
 
     expect(res.status).toBe(200);
     expect(warn).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/agents/[agentName]/tasks/report — rate limit", () => {
+  beforeEach(() => {
+    delete process.env.DISPATCH_AUTH_MODE;
+    resetAuthCaches();
+    vi.clearAllMocks();
+    resetRateLimits();
+  });
+
+  it("returns 429 after exceeding the rate limit (30 per 60s) without recording runs", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await postRequest({ taskType: "implement", outcome: "pr_opened" });
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+    // The rejected request recorded no AgentRun.
+    expect(mockAgentRun.create).toHaveBeenCalledTimes(30);
+  });
+
+  it("keeps an independent window for a second credential (#1322)", async () => {
+    // Primary requests carry the same x-agent-name the second credential is
+    // bound to, so a limiter regressing to the self-reported actor (or a
+    // shared bucket) collapses both credentials into one window and 429s here.
+    const primary = () =>
+      POST(
+        authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+          method: "POST",
+          body: { taskType: "implement", outcome: "pr_opened" },
+          headers: { "x-agent-name": "test-agent" },
+        }),
+        { params: Promise.resolve({ agentName: "test-agent" }) },
+      );
+    for (let i = 0; i < 30; i++) {
+      const res = await primary();
+      expect(res.status).toBe(200);
+    }
+    const throttled = await primary();
+    expect(throttled.status).toBe(429);
+
+    // A different credential reporting for the same agent name still succeeds:
+    // the window is keyed on the credential-derived throttleKey, never a
+    // shared or caller-supplied agent-name bucket.
+    const res = await POST(
+      authedRequest("http://localhost/api/agents/test-agent/tasks/report", {
+        method: "POST",
+        token: "bound-report-agent",
+        body: { taskType: "implement", outcome: "pr_opened" },
+      }),
+      { params: Promise.resolve({ agentName: "test-agent" }) },
+    );
+    expect(res.status).toBe(200);
   });
 });

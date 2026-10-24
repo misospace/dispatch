@@ -71,6 +71,28 @@ describe("GET /api/audit", () => {
     expect(call.take).toBe(10);
   });
 
+  it("clamps an oversized limit at 200", async () => {
+    await GET(request("http://localhost/api/audit?limit=999999999"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.take).toBe(200);
+  });
+
+  it("falls back to the default on a non-numeric limit instead of erroring", async () => {
+    const res = await GET(request("http://localhost/api/audit?limit=abc"));
+
+    expect(res.status).toBe(200);
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.take).toBe(50);
+  });
+
+  it("falls back to the default on a negative limit", async () => {
+    await GET(request("http://localhost/api/audit?limit=-5"));
+
+    const call = mocks.auditLogFindMany.mock.calls[0][0];
+    expect(call.take).toBe(50);
+  });
+
   it("filters by repo when repo param is provided", async () => {
     await GET(request("http://localhost/api/audit?repo=org/repo"));
 

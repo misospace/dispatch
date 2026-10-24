@@ -85,6 +85,37 @@ describe("GET /api/automation/events", () => {
     });
   });
 
+  it("clamps an oversized limit at 200", async () => {
+    mockFetch.mockResolvedValue([]);
+
+    await GET(new Request("http://localhost/api/automation/events?limit=999999999"));
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 200 }),
+    );
+  });
+
+  it("falls back to the default on a non-numeric limit instead of erroring", async () => {
+    mockFetch.mockResolvedValue([]);
+
+    const response = await GET(new Request("http://localhost/api/automation/events?limit=abc"));
+
+    expect(response.status).toBe(200);
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 50 }),
+    );
+  });
+
+  it("falls back to the default on a negative limit", async () => {
+    mockFetch.mockResolvedValue([]);
+
+    await GET(new Request("http://localhost/api/automation/events?limit=-5"));
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 50 }),
+    );
+  });
+
   it("returns 500 on database error", async () => {
     mockFetch.mockRejectedValue(new Error("DB down"));
 

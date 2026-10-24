@@ -1,7 +1,19 @@
-const { guardState } = vi.hoisted(() => ({ guardState: { resuming: false } }));
+const { guardState } = vi.hoisted(() => ({
+  guardState: { resuming: false, stillHolds: true, fencedGuardLost: false },
+}));
 vi.mock("@/lib/issue-mutation-guard", () => ({
   withIssueMutationGuard: async (_request: unknown, callback: any) => {
-    const result = await callback(undefined, { resuming: guardState.resuming });
+    const result = await callback(undefined, {
+      resuming: guardState.resuming,
+      stillHoldsGuard: async () => guardState.stillHolds,
+      // #1254: the fenced remote write is ATOMIC with the guard check — a
+      // stolen guard means the forge function is NEVER called. `fencedGuardLost`
+      // models the steal landing between the local re-check and the write.
+      runFencedRemoteWrite: async (fn: any) => {
+        if (guardState.fencedGuardLost || !guardState.stillHolds) return { status: "guard-lost" };
+        return { status: "written", value: await fn(undefined) };
+      },
+    });
     return { status: result.complete ? "completed" : "retained", value: result.value };
   },
 }));
@@ -19,9 +31,13 @@ const { mocks } = vi.hoisted(() => ({
     leaseFindMany: vi.fn(), leaseDeleteMany: vi.fn(),
     leaseFindUnique: vi.fn(), leaseFindUniqueOrThrow: vi.fn(),
     leaseCreate: vi.fn(), leaseUpdate: vi.fn(), leaseDelete: vi.fn(), leaseFindFirst: vi.fn(),
+    intentFindFirst: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
+    intentUpdateMany: vi.fn(async () => ({ count: 1 })),
+    supersedeAuditCreate: vi.fn(async () => ({ id: "audit-supersede" })),
     getLiveIssueLabels: vi.fn().mockResolvedValue([] as string[]),
     agentWorkFindMany: vi.fn().mockResolvedValue([]),
     agentWorkUpdate: vi.fn().mockResolvedValue({}),
+    agentWorkDeleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     transaction: vi.fn((arg: any) => {
       if (typeof arg === "function") {
         return Promise.resolve(
@@ -49,6 +65,8 @@ process.env.DISPATCH_WORKER_TOKENS = `worker-agent:${WORKER_TOKEN}`;
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
+    // #1254: the claim route checks for a pending reconciler release intent.
+    ownershipReleaseIntent: { findFirst: mocks.intentFindFirst, findUnique: vi.fn(async () => null), updateMany: mocks.intentUpdateMany },
     issue: { findUnique: mocks.findUnique, update: mocks.updateIssue },
     auditLog: { create: mocks.createAuditLog },
     issueLifecycleEvent: {
@@ -68,6 +86,7 @@ vi.mock("@/lib/prisma", () => ({
     agentWork: {
       findMany: mocks.agentWorkFindMany,
       update: mocks.agentWorkUpdate,
+      deleteMany: mocks.agentWorkDeleteMany,
     },
     $transaction: mocks.transaction,
   },
@@ -86,6 +105,8 @@ import { POST } from "./route";
 // as move/webhook suites).
 beforeEach(() => {
   guardState.resuming = false;
+  guardState.stillHolds = true;
+  guardState.fencedGuardLost = false;
   resetRateLimits();
 });
 
@@ -217,15 +238,33 @@ describe("POST /api/issues/claim — business logic", () => {
     guardState.resuming = false;
     mocks.getLiveIssueLabels.mockResolvedValueOnce(["status/ready"]).mockResolvedValue(["agent/test-agent", "status/in-progress"]);
     mocks.transaction.mockRejectedValueOnce(new Error("db transaction failed"));
+    // §8.7 claim side: the first attempt commits the claim intent (the lease
+    // row, fresh attempt token) BEFORE the remote writes; the retry renews
+    // that same row instead of minting a second one.
+    const leaseRow = {
+      id: "l-1",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      claimToken: "claim_retry-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 60000),
+      renewedAt: new Date(),
+      createdAt: new Date(),
+    };
+    mocks.leaseFindUnique.mockResolvedValueOnce(null).mockResolvedValue(leaseRow);
+    mocks.leaseUpdate.mockResolvedValue(leaseRow);
     const first = await POST(makeRequest());
     expect(first.status).toBe(500);
     guardState.resuming = true;
     const retry = await POST(makeRequest());
     expect(retry.status).toBe(200);
-    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(2);
+    // The remote add is replayed idempotently on retry: a crash between the
+    // intent commit and the remote add must never leave the label un-added.
+    expect(mocks.addIssueLabel).toHaveBeenCalledTimes(3); // agent + status on attempt 1, agent replay on retry
     expect(mocks.removeIssueLabel).toHaveBeenCalledTimes(1);
     expect(mocks.createLifecycleEvent).toHaveBeenCalledTimes(1);
-    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1); // attempt 1 only; the retry renewed
+    expect(mocks.leaseUpdate).toHaveBeenCalledTimes(1);
   });
 
   it("refuses a resumed claim after live ownership changes without writes", async () => {
@@ -827,5 +866,408 @@ describe("POST /api/issues/claim — lifecycle evidence (#1202)", () => {
     expect(mocks.createAuditLog).toHaveBeenCalledWith({
       data: expect.objectContaining({ action: "claim_issue", success: false }),
     });
+  });
+});
+
+describe("POST /api/issues/claim — §8.7 pending release intent (#1254)", () => {
+  const intent = {
+    id: "int-1", issueId: "issue-1", agentName: "alpha", agentLabel: "agent/alpha",
+    phase: "pending", attemptToken: "claim_retired",
+  };
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["status/ready", "agent/alpha"] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue(["status/ready", "agent/alpha"]);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+        // supersedeOwnershipReleaseIntent drives the intent through tx.
+        ownershipReleaseIntent: { findFirst: vi.fn(async () => intent), updateMany: mocks.intentUpdateMany },
+        auditLog: { create: mocks.supersedeAuditCreate },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  it("holds a non-force claim with a retryable 409 while a release intent is pending", async () => {
+    mocks.intentFindFirst.mockResolvedValueOnce(intent);
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("Ownership release is pending");
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    // The supersede is the force-claim exemption only: a held claim cancels nothing.
+    expect(mocks.intentUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("force-claim supersedes the pending intent and mints a FRESH claim token over the Phase A retired lease", async () => {
+    // §8.7 control 1b through the production claim wiring: the reconciler's
+    // Phase A retired the fence (`claimToken = null`, `disposition = null`).
+    // Superseding the intent and re-claiming must NOT renew the token-less
+    // row into a null-token echo — the response and the persisted row must
+    // carry a fresh attempt token, or every later fence is inert.
+    mocks.intentFindFirst.mockResolvedValueOnce(intent);
+    const retired = {
+      id: "l-1", agentName: "test-agent", issueId: "issue-1",
+      claimToken: null, disposition: null, checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date(),
+      runRef: null, registeredAt: null, renewCount: 2, lastRenewalObservedAt: null,
+    };
+    mocks.leaseFindUnique.mockResolvedValue(retired);
+    mocks.leaseUpdate.mockImplementation((args: any) => Promise.resolve({ ...retired, ...args.data }));
+
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.claimToken).toBe("string");
+    expect(body.claimToken).toMatch(/^claim_/);
+    // The minted token is what got persisted on the lease row.
+    const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+    expect(updateData.claimToken).toBe(body.claimToken);
+    // The pending intent was superseded (force exemption), not raced.
+    expect(mocks.intentUpdateMany).toHaveBeenCalled();
+    expect(mocks.supersedeAuditCreate).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/claim — §8.7 override pre-write re-check (#1254)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.leaseFindMany.mockResolvedValue([]);
+    // clearAllMocks does not reset prior tests' implementations; pin the lease
+    // read so upsertLease takes the create path and honors the per-test lease.
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 1 });
+    mocks.intentFindFirst.mockResolvedValue(null);
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  it("does not commit a superseded non-force claim before the remote add (check b)", async () => {
+    guardState.stillHolds = false;
+    // The real create path leaves `renewedAt` null; the fence must carry it
+    // explicitly (null-safe) rather than drop it from the CAS.
+    mocks.leaseCreate.mockResolvedValue({ id: "lease-1", claimToken: "tok-1", renewedAt: null });
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(409);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The minted receipt is fenced-deleted so the override's claim can own it.
+    // #1254: this attempt MINTED the receipt (the create path), so the
+    // cleanup may delete it — the mint gate only spares renewed receipts.
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1", renewedAt: null } });
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
+  });
+
+  it("deletes a renewed receipt when the renewal itself minted the token (#1254)", async () => {
+    // The mirror of the regression above: a renewal that minted a FRESH token
+    // (the reconciler's Phase A retired the fence, so the row carried no
+    // token) owns the receipt it just wrote — the mint gate must let the
+    // cleanup delete it, and the `{id, claimToken, renewedAt}` CAS still
+    // pins the exact row this commit produced.
+    guardState.stillHolds = false;
+    const retired = {
+      id: "lease-1",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      claimToken: null,
+      disposition: null,
+      renewedAt: new Date("2026-10-22T00:00:00.000Z"),
+      checkpoint: "issue_claimed",
+    };
+    const ourRenewal = { ...retired, claimToken: "claim_minted", renewedAt: new Date("2026-10-23T01:00:00.000Z") };
+    mocks.leaseFindUnique.mockResolvedValue(retired);
+    mocks.leaseUpdate.mockResolvedValue(ourRenewal);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({
+      where: { id: "lease-1", claimToken: "claim_minted", renewedAt: ourRenewal.renewedAt },
+    });
+  });
+
+  it("does not delete a live attempt's lease receipt when the claim only RENEWED it (#1254)", async () => {
+    // #1254 regression: this claim only renewed a pre-existing lease row
+    // (same agent, the row already carries a claim token), so it did NOT
+    // mint the receipt — the row belongs to the live attempt. The old
+    // `{id, claimToken, renewedAt}` fence was not enough: renewals
+    // deliberately KEEP the claim token (#1256) and the loser's own renewal
+    // re-stamps `renewedAt` AFTER the winner's renewal, so the CAS could
+    // still match and delete the live attempt's row. The cleanup is now
+    // gated on the mint, so the row survives.
+    guardState.stillHolds = false;
+    const existing = {
+      id: "lease-1",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      claimToken: "tok-live",
+      disposition: null,
+      renewedAt: new Date("2026-10-22T00:00:00.000Z"),
+      checkpoint: "issue_claimed",
+    };
+    const ourRenewal = { ...existing, renewedAt: new Date("2026-10-23T01:00:00.000Z") };
+    mocks.leaseFindUnique.mockResolvedValue(existing);
+    mocks.leaseUpdate.mockResolvedValue(ourRenewal);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    // No remote write at all.
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The live attempt's receipt is left intact.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The failure audit says so.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: "claim_issue",
+        success: false,
+        errorMessage: expect.stringContaining("belongs to a live attempt"),
+      }),
+    });
+  });
+
+  it("does not start a superseded force claim before the remote removals (check a)", async () => {
+    guardState.stillHolds = false;
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: ["agent/other"] });
+    mocks.getLiveIssueLabels.mockResolvedValue(["agent/other"]);
+    const res = await POST(makeRequest({ force: true }));
+    expect(res.status).toBe(409);
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    // No lease was minted before the re-check, so there is nothing to fence-delete.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
+  });
+
+  it("commits a normal claim when the guard is still held (control)", async () => {
+    // stillHolds stays true (reset in the module-level beforeEach): the claim lands.
+    const res = await POST(makeRequest());
+    expect(res.status).toBe(200);
+    expect(mocks.addIssueLabel).toHaveBeenCalled();
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not land the remote add when the guard is stolen inside the fenced write window (#1254 review)", async () => {
+    // The reviewer's hole: the read-only pre-write tripwire could pass, the
+    // maintainer force-claim could then steal the guard, and the stale
+    // callback could still commit its remote ownership write. The fenced
+    // write makes the check and the write ONE step: the guard is stolen
+    // before the write starts, so the forge function is NEVER called.
+    guardState.fencedGuardLost = true;
+    mocks.leaseCreate.mockResolvedValue({ id: "lease-1", claimToken: "tok-1", renewedAt: null });
+
+    const res = await POST(makeRequest({ force: true }));
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain("superseded");
+    // No remote ownership write at all — not the label add, not a removal.
+    expect(mocks.addIssueLabel).not.toHaveBeenCalled();
+    expect(mocks.removeIssueLabel).not.toHaveBeenCalled();
+    // The receipt this attempt minted is fenced-deleted so the override's
+    // claim can own the issue.
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({ where: { id: "lease-1", claimToken: "tok-1", renewedAt: null } });
+    // The skip is audited — it must not be silent.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "claim_issue", success: false }) });
+  });
+});
+
+describe("POST /api/issues/claim — parked claims (#1316, #1334)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.findUnique.mockResolvedValue({ id: "issue-1", state: "open", number: 42, repository: { fullName: "org/repo" }, labels: [] as string[] });
+    mocks.updateIssue.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue({ id: "log-1" });
+    mocks.addIssueLabel.mockResolvedValue(undefined);
+    mocks.removeIssueLabel.mockResolvedValue(undefined);
+    mocks.leaseDeleteMany.mockResolvedValue({ count: 0 });
+    mocks.leaseFindUnique.mockResolvedValue(null);
+    mocks.leaseCreate.mockResolvedValue({ id: "l-new", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.leaseUpdate.mockResolvedValue({ id: "l-1", agentName: "test-agent", issueId: "issue-1", checkpoint: "issue_claimed", branch: null, prUrl: null, expiredAt: new Date(Date.now() + 60000), renewedAt: new Date(), createdAt: new Date() });
+    mocks.agentWorkFindMany.mockResolvedValue([]);
+    mocks.getLiveIssueLabels.mockResolvedValue([] as string[]);
+    mocks.transaction.mockImplementation((arg: any) => {
+      if (typeof arg === "function") return Promise.resolve(arg({
+        issue: { update: mocks.updateIssue },
+        issueLifecycleEvent: { create: mocks.createLifecycleEvent, upsert: mocks.upsertLifecycleEvent },
+        agentWork: { update: mocks.agentWorkUpdate, deleteMany: mocks.agentWorkDeleteMany },
+        agentWorkHistory: { create: vi.fn().mockResolvedValue({}) },
+        auditLog: { create: mocks.createAuditLog },
+      }));
+      return Promise.all(arg.map((op: any) => op));
+    });
+  });
+
+  /**
+   * Behavioral stand-in (SQL 3VL) for the three lease queries the claim path
+   * runs against one parked row: `findActiveLeasesForIssue` (`expiredAt > now`
+   * — a park whose ownership TTL elapsed is not "active"), `releaseExpiredLeases`
+   * (`expiredAt <= now` AND the wait marker gone — a future `retryAfter`
+   * matches neither OR arm), and `findAndReleaseStaleAgentWorkForIssue`'s
+   * protecting-lease read (`expiredAt > now OR retryAfter > now` — a running
+   * park protects its agent's active-shaped rows, mirroring the sweep's
+   * parked-claim exclusion). A NULL comparison column never satisfies a
+   * bound arm. The parked row is only ever returned to a query that actually
+   * selects it, so the assertions below cannot pass by accident.
+   */
+  function leaseQueriesSee(parked: Record<string, any>) {
+    mocks.leaseFindMany.mockImplementation(({ where }: any) => {
+      const cmp = (value: Date | null | undefined, cond: any): boolean => {
+        if (value === null || value === undefined) return false;
+        if (cond.gt !== undefined) return value.getTime() > cond.gt.getTime();
+        if (cond.lte !== undefined) return value.getTime() <= cond.lte.getTime();
+        return false;
+      };
+      const matchesArm = (row: Record<string, any>, arm: Record<string, any>) =>
+        Object.entries(arm).every(([field, cond]) =>
+          // The marker-gone arm of the cleanup clause is a literal-NULL test.
+          cond === null ? row[field] === null || row[field] === undefined : cmp(row[field], cond),
+        );
+      const matches = (row: Record<string, any>) => {
+        if (where.issueId !== undefined && row.issueId !== where.issueId) return false;
+        if (where.expiredAt !== undefined && !cmp(row.expiredAt, where.expiredAt)) return false;
+        if (where.OR !== undefined) return where.OR.some((arm: any) => matchesArm(row, arm));
+        return true;
+      };
+      return Promise.resolve(matches(parked) ? [parked] : []);
+    });
+  }
+
+  it("does not erase another agent's running park through expired-lease cleanup when claiming the issue (#1334)", async () => {
+    // The #1334 hazard end to end at the route: agent `other-agent` parked a
+    // blocked claim (wait deadline in the future, ownership TTL elapsed), and
+    // `test-agent` now claims the same issue. The pre-claim cleanup used to
+    // delete any expired lease — destroying the park receipt — while the
+    // parked BLOCKED AgentWork row survived until its own deadline.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    // The park's lease row is never deleted, by any cleanup call the route makes.
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    // The claim is its own row (the park row is keyed to another agent and is
+    // never mutated by a different agent's claim).
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).toHaveBeenCalledTimes(1);
+    expect((mocks.leaseCreate.mock.calls[0] as any)[0].data.agentName).toBe("test-agent");
+  });
+
+  it("does not delete a renewal-parked agent's active-shaped AgentWork row during the claim-path cleanup (#1316, #1334)", async () => {
+    // An `externalWait` renewal parks the LEASE but leaves the heartbeated
+    // AgentWork row CLAIMED/IN_PROGRESS. Once the ownership TTL lapses while
+    // the wait deadline is still running — the steady state of any park
+    // longer than the renew TTL — a claim on the issue must not delete that
+    // row: the running park protects its agent, exactly as it does the
+    // stale-work sweep.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+    const parkedWork = [{ id: "work-parked", state: "IN_PROGRESS", agentName: "other-agent" }];
+    mocks.agentWorkFindMany.mockImplementation(({ where }: any) => {
+      let rows = [...parkedWork];
+      if (where?.state?.in) rows = rows.filter((w) => where.state.in.includes(w.state));
+      if (where?.agentName?.notIn) rows = rows.filter((w) => !where.agentName.notIn.includes(w.agentName));
+      return Promise.resolve(rows);
+    });
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    // The parked agent's row survived the cleanup: nothing was deleted, and
+    // the cleanup's audit row was never written.
+    expect(mocks.agentWorkDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.createAuditLog.mock.calls.filter((call: any) => (call[0] as any).data.action === "stale_agentwork_cleanup")).toHaveLength(0);
+  });
+
+  it("a running park with a live ownership TTL 409s a normal claim outright (#1334)", async () => {
+    // Before the TTL elapses the park is simply an active lease: no cleanup
+    // runs, no write happens, and the claim is refused without force.
+    const parked = {
+      id: "lease-parked",
+      agentName: "other-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      expiredAt: new Date(Date.now() + 10 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    leaseQueriesSee(parked);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(409);
+    expect(mocks.leaseDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.leaseUpdate).not.toHaveBeenCalled();
+    expect(mocks.leaseCreate).not.toHaveBeenCalled();
+  });
+
+  it("the parked owner's own re-claim releases the park by design (documented resume path)", async () => {
+    // A claim-path write is a fresh assertion of ACTIVE ownership (#1251):
+    // the owner re-claiming its parked issue ends the wait deliberately, so
+    // the renewal clears the marker instead of inheriting it. This is the
+    // release path the capability doc names ("until it expires naturally or
+    // the same agent re-claims") — not evidence loss.
+    const parked = {
+      id: "lease-parked",
+      agentName: "test-agent",
+      issueId: "issue-1",
+      checkpoint: "issue_claimed",
+      disposition: "blocked",
+      expiredAt: new Date(Date.now() - 5 * 60_000),
+      retryAfter: new Date(Date.now() + 30 * 60_000),
+      waitReason: "waiting on dependency",
+    };
+    mocks.leaseFindUnique.mockResolvedValue(parked);
+    mocks.leaseFindMany.mockResolvedValue([]);
+
+    const res = await POST(makeRequest());
+
+    expect(res.status).toBe(200);
+    expect(mocks.leaseUpdate).toHaveBeenCalledTimes(1);
+    const updateData = (mocks.leaseUpdate.mock.calls[0] as any)[0].data;
+    expect(updateData.retryAfter).toBeNull();
+    expect(updateData.waitReason).toBeNull();
   });
 });

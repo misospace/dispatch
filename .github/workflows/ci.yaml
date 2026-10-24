@@ -129,11 +129,15 @@ jobs:
       # reject with a P2002-shaped error, but only a real PostgreSQL aborts the
       # surrounding transaction, and that abort is what broke #843 (P2039,
       # #850). Two fixes to this lock shipped green against mocks and failed in
-      # the cluster, so this job is the guard rather than a nicety.
+      # the cluster, so this job is the guard rather than a nicety. The
+      # mutation-guard integration test joins it for the same reason: the
+      # fenced write's guarantee is a DATABASE guarantee (the guard row's lock
+      # is held across the forge call), and only a real PostgreSQL can prove
+      # it (#1254).
       - name: Concurrency and idempotency against a real PostgreSQL
         env:
           RUN_DB_INTEGRATION: "1"
-        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts
+        run: npx vitest run src/lib/sync-lock.integration.test.ts "src/app/api/agents/[agentName]/tasks/report/route.integration.test.ts" src/lib/groomer/apply.integration.test.ts src/lib/pr-fix-external-wait.integration.test.ts src/lib/issue-mutation-guard.integration.test.ts
 
   coverage:
     name: Coverage

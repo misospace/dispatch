@@ -76,10 +76,16 @@ vi.mock("@/lib/prisma", () => ({
 
 vi.mock("@/lib/dispatch-env", () => makeDispatchEnvMock("test-token"));
 
-vi.mock("@/lib/agent-work", () => ({
+vi.mock("@/lib/agent-work", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agent-work")>()),
   releaseStaleWork: vi.fn(async () => []),
 }));
 
+vi.mock("@/lib/ownership-reconciliation", () => ({
+  // #1254: operator release supersedes pending reconciler intents; the fake
+  // records nothing.
+  supersedeOwnershipReleaseIntent: vi.fn(async () => false),
+}));
 vi.mock("@/lib/lease", () => ({
   releaseLeaseByAgentAndIssue: vi.fn(async () => 1),
   releaseAllLeasesByAgent: vi.fn(async () => 1),
@@ -88,6 +94,7 @@ vi.mock("@/lib/lease", () => ({
 
 import { prisma } from "@/lib/prisma";
 import * as leaseModule from "@/lib/lease";
+import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
 import { authorizeRequest } from "@/lib/auth";
 import { GET, POST } from "./route";
 
@@ -612,6 +619,102 @@ describe("POST /api/agent-work", () => {
             notes: expect.stringContaining("Reassigned work from old-agent to new-agent"),
           }),
         })
+      );
+    });
+
+    // #1391: a sweep-marked row (`STALE` + `staleClaimReleasePending: true`)
+    // reassigned to a new owner must not carry the marker into its `CLAIMED`
+    // shape — the sweep's retry arm only advances `STALE` rows, so a carried
+    // marker would strand the owed release on a live-shaped row forever.
+    it("settles the stale-claim-release marker when rewriting the swept row to CLAIMED", async () => {
+      agentWork.findUnique.mockResolvedValueOnce({
+        id: "work-1",
+        agentName: "old-agent",
+        issueId: "issue-1",
+        state: "STALE",
+        staleClaimReleasePending: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        runId: null,
+        summary: null,
+        blockerReason: null,
+        checkpoint: "CLAIMED",
+        branch: null,
+        prUrl: null,
+        leaseExpiresAt: new Date(),
+        lastHeartbeatAt: new Date(),
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+
+      // Capture the rewrite-to-CLAIMED update: the second of the two updates
+      // on work-1 inside the reassign transaction (the first sets RELEASED).
+      const claimedUpdates: Array<Record<string, unknown>> = [];
+      const before = Date.now();
+      transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+        const txAgentWorkUpdate = vi.fn(async (args: any) => {
+          if (args.where.id === "work-1" && args.data.state === "CLAIMED") {
+            claimedUpdates.push(args.data);
+          }
+          return {
+            id: "work-1",
+            agentName: "new-agent",
+            issueId: "issue-1",
+            state: "CLAIMED",
+            leaseExpiresAt: new Date(),
+            summary: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            blockerReason: null,
+            runId: null,
+            checkpoint: "CLAIMED",
+            branch: null,
+            prUrl: null,
+            lastHeartbeatAt: new Date(),
+            issue: { number: 10, repository: { fullName: "org/repo" } },
+          };
+        });
+        const txAgentWorkFindMany = vi.fn(async () => []);
+        const txAgentWorkHistoryCreate = vi.fn(async () => ({ id: "hist-1" }));
+
+        return fn({
+          agentWork: {
+            update: txAgentWorkUpdate,
+            findMany: txAgentWorkFindMany,
+          },
+          agentWorkHistory: {
+            create: txAgentWorkHistoryCreate,
+          },
+        });
+      });
+
+      await makePostRequest({
+        action: "reassign",
+        workId: "work-1",
+        newAgentName: "new-agent",
+      });
+
+      expect(claimedUpdates).toHaveLength(1);
+      expect(claimedUpdates[0]).toEqual(
+        expect.objectContaining({
+          agentName: "new-agent",
+          state: "CLAIMED",
+          staleClaimReleasePending: false,
+        })
+      );
+
+      // PR #1393 review: the same write must hand the new owner a LIVE
+      // lease. The preceding RELEASED update stamps `leaseExpiresAt` with
+      // "now", so a rewrite that left the field alone would carry an
+      // already-expired lease into the `CLAIMED` shape. The handover is a
+      // fresh claim, so it carries the claim path's horizon — asserted
+      // against the write's own heartbeat so the check is clock-independent.
+      const claimedLease = claimedUpdates[0].leaseExpiresAt as Date | undefined;
+      const claimedHeartbeat = claimedUpdates[0].lastHeartbeatAt as Date | undefined;
+      expect(claimedLease).toBeInstanceOf(Date);
+      expect(claimedHeartbeat).toBeInstanceOf(Date);
+      expect(claimedLease!.getTime()).toBeGreaterThan(before);
+      expect(claimedLease!.getTime() - claimedHeartbeat!.getTime()).toBe(
+        AGENT_WORK_LEASE_DURATION_MS
       );
     });
   });

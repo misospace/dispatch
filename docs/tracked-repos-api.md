@@ -97,4 +97,4 @@ for (const repo of repos) {
 
 - The legacy `project_groom.py` script read `TRACKED_REPOS` from environment variables.
 - Replace hardcoded repo references with calls to this endpoint.
-- The existing `/api/repos` and `/api/automation/repos` endpoints remain unchanged.
+- The `/api/automation/repos` endpoint is the canonical tracked-repository API; the deprecated `/api/repos` POST alias was removed.

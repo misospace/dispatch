@@ -17,6 +17,12 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope } from "@/lib/worker-identity";
 import { runSyncBestEffort, runReconcileBestEffort } from "@/lib/heartbeat";
+import { enforceRateLimit } from "@/lib/rate-limit";
+
+// Heartbeat runs a full repo sync + reconcile per call, and the worker loop
+// heartbeats once per task cycle — minutes apart — so 30 per minute tolerates
+// a small fleet retrying through one credential while bounding runaway clients.
+const RATE_LIMIT = { limit: 30, windowMs: 60_000 } as const;
 
 export type AgentHeartbeatResponse = {
   status: "ok" | "warning" | "error";
@@ -44,6 +50,9 @@ export async function POST(
   if (!auth.authorized) {
     return authErrorResponse(auth);
   }
+
+  const limited = enforceRateLimit(`heartbeat:${auth.throttleKey}`, RATE_LIMIT);
+  if (limited) return limited;
 
   // A bound worker credential may only heartbeat for its own agent; an unbound
   // legacy worker token is refused on this identity-scoped route (#1129).

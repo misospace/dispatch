@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { authorizeRequest, authErrorResponse } from "@/lib/auth";
 import { enforceWorkerAgentScope, enforceWorkerBound } from "@/lib/worker-identity";
 import { releaseLeaseByAgentAndIssue, releaseAllLeasesByAgent, releaseAgentWorkByAgentAndIssue } from "@/lib/lease";
+import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
@@ -188,6 +190,11 @@ async function releaseAgentWork(body: Record<string, unknown>) {
         if (!existing) {
           return errorResponse("Work item not found", 404);
         }
+        // #1254: an operator release supersedes a pending reconciler release
+        // intent (audited) instead of racing its Phase-B delete.
+        if (existing.issueId) {
+          await supersedeOwnershipReleaseIntent({ issueId: existing.issueId, actor: "operator", reason: "operator agent-work release" });
+        }
         if (existing.state === "DONE" || existing.state === "RELEASED") {
           return errorResponse("Work is already completed or released", 400);
         }
@@ -223,6 +230,8 @@ async function releaseAgentWork(body: Record<string, unknown>) {
           return errorResponse("Lease not found", 404);
         }
 
+        // #1254: operator release supersedes a pending reconciler intent.
+        await supersedeOwnershipReleaseIntent({ issueId: lease.issueId, actor: "operator", reason: "operator lease release" });
         await prisma.lease.delete({ where: { id: leaseId } });
 
         await prisma.auditLog.create({
@@ -266,6 +275,8 @@ async function releaseAgentWork(body: Record<string, unknown>) {
     let issueNumber: number | null = null;
 
     if (issueId) {
+      // #1254: operator release supersedes a pending reconciler intent.
+      await supersedeOwnershipReleaseIntent({ issueId, actor: "operator", reason: "operator agent-work release" });
       // Release by agentName + issueId
       const [leasesReleased, workReleased] = await Promise.all([
         releaseLeaseByAgentAndIssue(agentName, issueId),
@@ -383,11 +394,16 @@ async function reassignAgentWork(body: Record<string, unknown>) {
       return errorResponse("Work item not found", 404);
     }
 
+    // One instant for the whole handover: the old owner's lease expires now,
+    // and the new owner's claim starts from the same instant.
+    const now = new Date();
+    const leaseExpiresAt = new Date(now.getTime() + AGENT_WORK_LEASE_DURATION_MS);
+
     const work = await prisma.$transaction(async (tx) => {
       // Release old agent's work
       await tx.agentWork.update({
         where: { id: workId },
-        data: { state: "RELEASED", leaseExpiresAt: new Date() },
+        data: { state: "RELEASED", leaseExpiresAt: now },
       });
       await tx.agentWorkHistory.create({
         data: { workId, action: "reassigned", summary: `${reason} -> ${newAgentName}` },
@@ -400,7 +416,7 @@ async function reassignAgentWork(body: Record<string, unknown>) {
       for (const active of newAgentActive) {
         await tx.agentWork.update({
           where: { id: active.id },
-          data: { state: "RELEASED", leaseExpiresAt: new Date() },
+          data: { state: "RELEASED", leaseExpiresAt: now },
         });
         await tx.agentWorkHistory.create({
           data: { workId: active.id, action: "released_by_reassignment" },
@@ -409,7 +425,39 @@ async function reassignAgentWork(body: Record<string, unknown>) {
 
       return tx.agentWork.update({
         where: { id: workId },
-        data: { agentName: newAgentName, state: "CLAIMED", lastHeartbeatAt: new Date() },
+        // #1391: settle the marker the sweep's mark leaves when it parks a
+        // row for its retry arm (`state: "STALE"`,
+        // `staleClaimReleasePending: true`). Reassigning rewrites the row to
+        // `CLAIMED` for the new owner, so carrying the marker over would
+        // strand the owed release on a live-shaped row: the sweep's reclaim
+        // arms require the marker cleared and its retry arm requires
+        // `state: "STALE"`, which this write no longer satisfies — no
+        // component could advance it. The operator's reassignment supersedes the sweep's
+        // decision on the row, so the rewrite settles it here; the sweep
+        // stays the single owner of retiring an owed release elsewhere.
+        //
+        // PR #1393 review: the rewrite must also leave the row with a LIVE
+        // lease. The RELEASED write above stamps `leaseExpiresAt` with `now`,
+        // so a rewrite that left the field alone would carry an expiry that
+        // is already in the past into the `CLAIMED` shape — a shape no claim
+        // path produces. The sweep's reclaim arm
+        // (`src/lib/stale-work.ts:161`) fires on
+        // `lastHeartbeatAt < cutoff OR leaseExpiresAt < cutoff`, so an expiry
+        // that is not ahead of the heartbeat lets the EXPIRY arm fire at the
+        // same instant as the heartbeat arm instead of strictly after it.
+        // The handover is a fresh claim, so it carries the claim path's lease
+        // horizon (`AGENT_WORK_LEASE_DURATION_MS`, the same value
+        // `startAgentWork`/`checkpointAgentWork` stamp): the expiry stays
+        // ahead of the heartbeat, the reclaim stays governed by the heartbeat
+        // window — exactly like a row from `startAgentWork` — and the field
+        // never shrinks under the new owner.
+        data: {
+          agentName: newAgentName,
+          state: "CLAIMED",
+          lastHeartbeatAt: now,
+          leaseExpiresAt,
+          staleClaimReleasePending: false,
+        },
         include: { issue: { select: { number: true, repository: { select: { fullName: true } } } } },
       });
     });

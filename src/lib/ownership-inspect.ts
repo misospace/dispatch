@@ -15,6 +15,7 @@
 
 import { prisma } from "./prisma";
 import { getLiveIssueLabels } from "./claim-gate";
+import { normalizeQueueRepo } from "./pr-fix-queue";
 import { CURRENT_CLAIM_WORK_ORDER_BY } from "./worker-ownership";
 import {
   deriveOwnershipState,
@@ -119,11 +120,15 @@ export interface InspectIssueOwnershipOptions {
 
 /**
  * Choose the ownership-relevant lease among a set of lease rows for an issue:
- * the freshest ACTIVE lease (`expiredAt > now`), ordered by `renewedAt` desc
- * (nulls last) with a `createdAt` desc tiebreak; when none is active, the most
- * recently created lease so a lapsed-but-disposed claim still surfaces.
+ * the freshest ACTIVE lease (`expiredAt > now`), ordered by the SAME activity
+ * key the bounded ownership scan uses (#1312) — last renewal falling back to
+ * the claim time (`renewedAt ?? createdAt`) desc, with `id` asc as the
+ * deterministic tiebreak — so the operator view and the scan never disagree
+ * about which lease is operative on an issue that carries several; when none
+ * is active, the most recently created lease so a lapsed-but-disposed claim
+ * still surfaces.
  */
-function selectLease<T extends { expiredAt: Date; renewedAt: Date | null; createdAt: Date }>(
+function selectLease<T extends { id: string; expiredAt: Date; renewedAt: Date | null; createdAt: Date }>(
   leases: T[],
   now: Date,
 ): T | null {
@@ -133,10 +138,10 @@ function selectLease<T extends { expiredAt: Date; renewedAt: Date | null; create
   const active = leases
     .filter((l) => l.expiredAt.getTime() > nowMs)
     .sort((a, b) => {
-      const aRen = a.renewedAt ? a.renewedAt.getTime() : -1;
-      const bRen = b.renewedAt ? b.renewedAt.getTime() : -1;
-      if (bRen !== aRen) return bRen - aRen;
-      return b.createdAt.getTime() - a.createdAt.getTime();
+      const aActivity = (a.renewedAt ?? a.createdAt).getTime();
+      const bActivity = (b.renewedAt ?? b.createdAt).getTime();
+      if (bActivity !== aActivity) return bActivity - aActivity;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
   if (active.length > 0) return active[0];
 
@@ -207,7 +212,10 @@ export async function inspectIssueOwnership(
   }
   const openPrFixRow = await prisma.prFixQueueItem.findFirst({
     where: {
-      repo: repoFullName,
+      // The queue stores the folded repo identity (#1145), so this lookup must
+      // fold too (#1357) — the raw cached casing ("Org/Repo") matches no row
+      // and the open-PR-fix evidence would vanish without an error.
+      repo: normalizeQueueRepo(repoFullName),
       status: { in: OPEN_PR_FIX_STATES },
       OR: prFixOrConditions,
     },

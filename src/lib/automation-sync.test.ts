@@ -814,9 +814,10 @@ describe("syncAutomationRepo", () => {
       );
     });
 
-    it("skips unmerged closed PRs and keeps an open PR's mergedAt null", async () => {
+    it("refreshes a closed-unmerged PR to state closed with mergedAt null (#1321)", async () => {
+      // The stale-open failure of #1321: after the PR closes without
+      // merging, its row must stop reporting state "open".
       stubFetches({
-        open: [fixturePr({ number: 1 })],
         closed: [fixturePr({ number: 2, state: "closed", merged_at: null })],
       });
 
@@ -826,9 +827,65 @@ describe("syncAutomationRepo", () => {
       expect(upsertPR).toHaveBeenCalledTimes(1);
       expect(upsertPR).toHaveBeenCalledWith(
         expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 2 } },
+          create: expect.objectContaining({
+            state: "closed",
+            mergedAt: null,
+          }),
+          update: expect.objectContaining({
+            state: "closed",
+            mergedAt: null,
+          }),
+        }),
+      );
+    });
+
+    it("keeps a not-merged PR's mergedAt null while upserting both listings' rows", async () => {
+      // The open listing keeps its row; the unmerged closed row never gains
+      // a merge time — mergedAt stays null for both.
+      stubFetches({
+        open: [fixturePr({ number: 1 })],
+        closed: [fixturePr({ number: 2, state: "closed", merged_at: null })],
+      });
+
+      const result = await syncAutomationRepo("o/r");
+
+      expect(result.success).toBe(true);
+      expect(upsertPR).toHaveBeenCalledTimes(2);
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 2 } },
+          create: expect.objectContaining({ mergedAt: null }),
+          update: expect.objectContaining({ mergedAt: null }),
+        }),
+      );
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
           where: { repoId_number: { repoId: "repo-1", number: 1 } },
           create: expect.objectContaining({ mergedAt: null }),
           update: expect.objectContaining({ mergedAt: null }),
+        }),
+      );
+    });
+
+    it("drops an open-listing duplicate of a closed-unmerged PR in favor of the closed row", async () => {
+      // A PR closing between the two concurrent listings can be served as
+      // open by one snapshot and closed by the other; the closed reading is
+      // the newer state and must not be overwritten by the open duplicate.
+      stubFetches({
+        open: [fixturePr({ number: 5 })],
+        closed: [fixturePr({ number: 5, state: "closed", merged_at: null })],
+      });
+
+      const result = await syncAutomationRepo("o/r");
+
+      expect(result.success).toBe(true);
+      expect(upsertPR).toHaveBeenCalledTimes(1);
+      expect(upsertPR).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { repoId_number: { repoId: "repo-1", number: 5 } },
+          create: expect.objectContaining({ state: "closed", mergedAt: null }),
+          update: expect.objectContaining({ state: "closed", mergedAt: null }),
         }),
       );
     });

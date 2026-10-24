@@ -227,8 +227,9 @@ export const CURRENT_CLAIM_WORK_ORDER_BY = [
  * to one issue. When `issueId` is provided the search is restricted to that
  * issue's rows; when omitted the ordering rule alone picks the freshest
  * active row across the agent's issues (callers that know their issue —
- * e.g. `checkpointAgentWork` since #1328 — must pass it so a checkpoint can
- * never heartbeat another issue's active row).
+ * e.g. `checkpointAgentWork` since #1328 and `finishAgentWork` since #1331 —
+ * must pass it so a checkpoint or finish can never touch another issue's
+ * active row).
  */
 export function findCurrentClaimWork<T extends { agentWork: { findFirst: (args: any) => Promise<any> } }>(
   client: T,
@@ -571,11 +572,17 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
     // route rejects retryAfter on other kinds with 400; here, a terminal
     // non-blocked disposition additionally CLEARS any wait marker recorded by
     // an earlier renew, so a gone owner is never parked as EXTERNAL_WAIT in
-    // the read model (which would shadow the terminal evidence).
+    // the read model (which would shadow the terminal evidence). A `blocked`
+    // disposition WITHOUT `retryAfter` clears the marker for the same
+    // coherence reason: the disposition is the latest statement of the
+    // owner's intent — no wait deadline — and a stale future marker left by
+    // an earlier renew would contradict the recorded no-park settlement and
+    // put the read model in EXTERNAL_WAIT (a wait marker this settlement's
+    // row write no longer protects, #1316 review).
     const waitPatch = input.disposition === "blocked"
       ? (input.retryAfter
           ? { retryAfter: input.retryAfter, waitReason: input.waitReason ?? input.note ?? null }
-          : {})
+          : { retryAfter: null, waitReason: null })
       : { retryAfter: null, waitReason: null };
 
     // Everything from the terminal compare-and-set onward is one local fact
@@ -607,6 +614,22 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
       // current IN_PROGRESS row must not absorb a `completed`/`released`
       // disposition while the current attempt stays active. History is
       // written by the same call; the lease row itself is retained as evidence.
+      //
+      // A `blocked` disposition WITH `retryAfter` parks the claim as an
+      // external wait, and the parked row's park deadline is its
+      // `leaseExpiresAt`: the stale-work sweep treats `BLOCKED` as an active
+      // state, and a parked worker is silent BY DESIGN, so the park deadline —
+      // not the heartbeat — is what keeps the row out of the reclaim
+      // (see `stale-work.ts`). Without this refresh the row keeps the short
+      // execution expiry written by start/checkpoint, the sweep reclaims the
+      // parked row a few minutes later and deletes the very lease the park
+      // was recorded on (#1316). A `blocked` disposition WITHOUT `retryAfter`
+      // has no deadline to park until: the deliberate choice is NO park — the
+      // row's `leaseExpiresAt` is CLEARED so the settlement invents no
+      // park-shaped hold of its own. The sweep's `BLOCKED` family reclaims a
+      // NULL-deadline row immediately (`leaseExpiresAt IS NULL`) and its
+      // `live` arm is UNKNOWN on NULL, so the row can neither escape the
+      // normal stale path nor shield the claim its park sits on.
       const work = await findCurrentClaimWork(tx, input.agentName, input.issueId);
       if (work) {
         const terminalState = DISPOSITION_AGENT_WORK_STATE[input.disposition];
@@ -614,7 +637,12 @@ export async function dispositionOwnership(input: DispositionOwnershipInput): Pr
           where: { id: work.id },
           data: {
             state: terminalState,
-            ...(input.disposition === "blocked" ? { blockerReason: input.note ?? work.blockerReason } : {}),
+            ...(input.disposition === "blocked"
+              ? {
+                  blockerReason: input.note ?? work.blockerReason,
+                  leaseExpiresAt: input.retryAfter ? input.retryAfter : null,
+                }
+              : {}),
           },
         });
         await tx.agentWorkHistory.create({
