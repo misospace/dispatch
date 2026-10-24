@@ -47,7 +47,7 @@ vi.mock("@/lib/next-action", () => ({
 }));
 
 import { Prisma } from "@prisma/client";
-import { upsertLease, isLeaseExpired, findActiveLeasesForIssue, releaseLease, releaseExpiredLeases, resolveActiveWork, findLeasedIssueIds, calculateLeaseExpiry, DEFAULT_LEASE_TTL_MS } from "./lease";
+import { upsertLease, isLeaseExpired, findActiveLeasesForIssue, releaseLease, releaseLeaseIfUnchanged, releaseExpiredLeases, resolveActiveWork, findLeasedIssueIds, calculateLeaseExpiry, DEFAULT_LEASE_TTL_MS } from "./lease";
 
 function makeNow() { return new Date(); }
 function makeLease(overrides: Partial<any> = {}) {
@@ -417,6 +417,74 @@ describe("releaseLease", () => {
     const result = await releaseLease("nonexistent");
 
     expect(result).toBeNull();
+  });
+});
+
+describe("releaseLeaseIfUnchanged", () => {
+  /**
+   * SQL-equivalent evaluation of the CAS where-clause against a lease row,
+   * so the fence's behavior (a row renewed or re-tokenized after acquisition
+   * must NOT match) is asserted behaviorally rather than as a where-shape
+   * snapshot.
+   */
+  function receiptMatches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
+    return (
+      row.id === where.id &&
+      row.claimToken === where.claimToken &&
+      Number(row.renewedAt) === Number(where.renewedAt)
+    );
+  }
+
+  it("deletes through the fence and reports the row count", async () => {
+    mocks.leaseDeleteMany.mockImplementation(() => Promise.resolve({ count: 1 }));
+
+    const result = await releaseLeaseIfUnchanged({ id: "l-1", claimToken: "tok-a", renewedAt: new Date(1_000) });
+
+    expect(result).toBe(1);
+  });
+
+  it("carries the acquired receipt values as null-normalized fence terms", async () => {
+    mocks.leaseDeleteMany.mockImplementation(() => Promise.resolve({ count: 1 }));
+
+    await releaseLeaseIfUnchanged({ id: "l-1", claimToken: undefined, renewedAt: undefined });
+
+    expect(mocks.leaseDeleteMany).toHaveBeenCalledWith({
+      where: { id: "l-1", claimToken: null, renewedAt: null },
+    });
+  });
+
+  it("does not destroy a row renewed or re-tokenized after acquisition (stale attempt)", async () => {
+    mocks.leaseDeleteMany.mockImplementation(() => Promise.resolve({ count: 0 }));
+
+    // The attempt acquired a minted receipt; a newer attempt then renewed the
+    // row (#1256: renewals re-stamp `renewedAt`, reactivations rotate
+    // `claimToken`). Deleting through the captured fence terms must keep
+    // matching the original row and the newer incarnation's row must NOT
+    // match — the stale attempt's release selects 0 rows.
+    const acquired = { id: "l-1", claimToken: "tok-a", renewedAt: new Date(1_000) };
+    await releaseLeaseIfUnchanged(acquired);
+
+    const where = mocks.leaseDeleteMany.mock.calls[0][0].where;
+    expect(receiptMatches({ id: "l-1", claimToken: "tok-a", renewedAt: new Date(1_000) }, where)).toBe(true);
+    expect(receiptMatches({ id: "l-1", claimToken: "tok-a", renewedAt: new Date(2_000) }, where)).toBe(false);
+    expect(receiptMatches({ id: "l-1", claimToken: "tok-b", renewedAt: new Date(1_000) }, where)).toBe(false);
+    expect(receiptMatches({ id: "l-1", claimToken: null, renewedAt: null }, where)).toBe(false);
+  });
+
+  it("reports 0 when the fence matches no row", async () => {
+    mocks.leaseDeleteMany.mockImplementation(() => Promise.resolve({ count: 0 }));
+
+    const result = await releaseLeaseIfUnchanged({ id: "l-1", claimToken: "tok-a", renewedAt: new Date(1_000) });
+
+    expect(result).toBe(0);
+  });
+
+  it("swallows store errors and reports 0 (best-effort cleanup)", async () => {
+    mocks.leaseDeleteMany.mockImplementation(() => Promise.reject(new Error("not found")));
+
+    const result = await releaseLeaseIfUnchanged({ id: "l-1", claimToken: "tok-a", renewedAt: new Date(1_000) });
+
+    expect(result).toBe(0);
   });
 });
 

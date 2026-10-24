@@ -293,7 +293,7 @@ export async function runCandidate(
     addLabel: async () => {},
     findActiveLeases: async () => [],
     upsertLease: async () => ({ created: true, lease: { id: "lease-1" }, mintedToken: true }),
-    releaseLease: async () => ({ id: "lease-1" }),
+    releaseLeaseIfUnchanged: async () => 1,
     fetchCollaboratorPermission: async () => ({ status: "ok", permission: "write" }),
     prisma: prisma as unknown as GroomerDeps["prisma"],
     buildRepositoryContext: async () => ({ text: "", sources: [], warnings: [], bytes: 0, queries: [], emptyQueries: [] }),

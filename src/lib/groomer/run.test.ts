@@ -31,7 +31,7 @@ const { mocks } = vi.hoisted(() => ({
     createIssue: vi.fn(),
     findActiveLeasesForIssue: vi.fn(),
     upsertLease: vi.fn(),
-    releaseLease: vi.fn(),
+    releaseLeaseIfUnchanged: vi.fn(),
     addIssueLabel: vi.fn(),
     removeIssueLabel: vi.fn(),
     buildRepositoryContext: vi.fn(),
@@ -100,7 +100,7 @@ vi.mock("@/lib/lease", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/lease")>()),
   findActiveLeasesForIssue: mocks.findActiveLeasesForIssue,
   upsertLease: mocks.upsertLease,
-  releaseLease: mocks.releaseLease,
+  releaseLeaseIfUnchanged: mocks.releaseLeaseIfUnchanged,
 }));
 
 vi.mock("./repository-context", () => ({
@@ -317,8 +317,8 @@ describe("runHostedGroomer", () => {
     mocks.addIssueComment.mockResolvedValue({ url: null });
     mocks.closeIssue.mockResolvedValue(undefined);
     mocks.findActiveLeasesForIssue.mockResolvedValue([]);
-    mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" } });
-    mocks.releaseLease.mockResolvedValue({ id: "lease-1" });
+    mocks.upsertLease.mockResolvedValue({ created: true, lease: { id: "lease-1" }, mintedToken: true });
+    mocks.releaseLeaseIfUnchanged.mockResolvedValue(1);
     mocks.acquireGroomerLock.mockResolvedValue({ locked: true, token: "lock-token" });
     mocks.heartbeatGroomerLock.mockResolvedValue(undefined);
     mocks.releaseGroomerLock.mockResolvedValue(undefined);
@@ -508,7 +508,7 @@ describe("runHostedGroomer", () => {
     expect(mocks.prisma.issueLane.create).not.toHaveBeenCalled();
     expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
     expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
-    expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+    expect(mocks.releaseLeaseIfUnchanged).toHaveBeenCalledWith({ id: "lease-1" });
   });
 
   it("persists related-work queries and refs in the explored context summary", async () => {
@@ -1470,7 +1470,7 @@ describe("runHostedGroomer", () => {
     mocks.upsertLease.mockRejectedValueOnce(new IssueMutationBusyError());
     expect(await runHostedGroomer()).toBeNull();
     expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
-    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
     expect(mocks.prisma.agentRun.create).not.toHaveBeenCalled();
     expect(mocks.prisma.auditLog.create).not.toHaveBeenCalled();
     expect(mocks.prisma.issue.update).not.toHaveBeenCalled();
@@ -1487,7 +1487,7 @@ describe("runHostedGroomer", () => {
     mocks.upsertLease.mockRejectedValueOnce(new Error("database unavailable"));
     await expect(runHostedGroomer()).rejects.toThrow("database unavailable");
     expect(mocks.callGroomerLLM).not.toHaveBeenCalled();
-    expect(mocks.releaseLease).not.toHaveBeenCalled();
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
     expect(mocks.prisma.groomingRun.update).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: "failed", stage: "lease_acquisition", errorMessage: "database unavailable" }),
     }));
@@ -1690,7 +1690,79 @@ describe("runHostedGroomer", () => {
 
     await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
 
-    expect(mocks.releaseLease).toHaveBeenCalledWith("lease-1");
+    expect(mocks.releaseLeaseIfUnchanged).toHaveBeenCalledWith({ id: "lease-1" });
+  });
+
+  it("leaves a renewed lease row intact on success (#1362)", async () => {
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" }, mintedToken: false });
+
+    const result = await runHostedGroomer();
+
+    expect(result).not.toBeNull();
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+  });
+
+  it("leaves a renewed lease row intact when the run fails (#1362)", async () => {
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" }, mintedToken: false });
+    mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+
+    await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+  });
+
+  it("releases a minted lease row via receipt-fenced CAS even when the run fails (#1362)", async () => {
+    mocks.upsertLease.mockResolvedValue({
+      created: false,
+      lease: { id: "lease-1", claimToken: "tok-a", renewedAt: new Date(1_000) },
+      mintedToken: true,
+    });
+    mocks.callGroomerLLM.mockRejectedValue(new Error("LLM timeout"));
+
+    await expect(runHostedGroomer()).rejects.toThrow(/LLM timeout/);
+
+    expect(mocks.releaseLeaseIfUnchanged).toHaveBeenCalledWith({
+      id: "lease-1",
+      claimToken: "tok-a",
+      renewedAt: new Date(1_000),
+    });
+  });
+
+  it("does not release the lease when upsertLease omits mintedToken (fail-closed)", async () => {
+    // A legacy/loose receipt without `mintedToken` must not authorize a
+    // destructive release of a row this run may merely have renewed.
+    mocks.upsertLease.mockResolvedValue({ created: false, lease: { id: "lease-1" } });
+
+    await runHostedGroomer();
+
+    expect(mocks.releaseLeaseIfUnchanged).not.toHaveBeenCalled();
+  });
+
+  it("fences the release on the exact acquired receipt, so a row renewed by a newer attempt survives a stale run's finally (#1362)", async () => {
+    // Takeover interleaving: this run's lock was reclaimed after swallowed
+    // heartbeat failures, and a newer attempt renewed the row while the stale
+    // run was still going. The fenced release must be issued against the
+    // receipt AS ACQUIRED — the acquired claimToken/renewedAt pair — so the
+    // post-acquisition renewal (which re-stamped renewedAt) makes the CAS
+    // match zero rows and the newer attempt's row survives. Mocking the CAS
+    // as having matched zero rows also keeps this run's overall outcome
+    // healthy: a lost CAS is the newer attempt's row, not an error of this
+    // run.
+    mocks.upsertLease.mockResolvedValue({
+      created: true,
+      lease: { id: "lease-1", claimToken: "tok-a", renewedAt: new Date(1_000) },
+      mintedToken: true,
+    });
+    mocks.releaseLeaseIfUnchanged.mockResolvedValue(0);
+
+    const result = await runHostedGroomer();
+
+    expect(result).not.toBeNull();
+    expect(mocks.releaseLeaseIfUnchanged).toHaveBeenCalledWith({
+      id: "lease-1",
+      claimToken: "tok-a",
+      renewedAt: new Date(1_000),
+    });
   });
 
   it("sets currentLane on issue update", async () => {

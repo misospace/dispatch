@@ -226,6 +226,35 @@ export async function releaseLease(leaseId: string): Promise<any | null> {
 }
 
 /**
+ * #1362/#1256: release a lease row only while it still carries the exact
+ * receipt the acquiring attempt holds, via the same `{id, claimToken,
+ * renewedAt}` CAS as the claim route's supersede cleanup. Best-effort: a
+ * later renewal re-stamps `renewedAt` and a reactivation rotates
+ * `claimToken`, so a stale attempt's delete matches zero rows instead of
+ * destroying a newer incarnation's receipt. Returns the number of rows
+ * deleted (0 = the fence did not match; the row lives on) and swallows
+ * store errors, mirroring the claim route's best-effort cleanup.
+ */
+export async function releaseLeaseIfUnchanged(receipt: {
+  id: string;
+  claimToken?: string | null;
+  renewedAt?: Date | null;
+}): Promise<number> {
+  try {
+    const result = await prisma.lease.deleteMany({
+      where: {
+        id: receipt.id,
+        claimToken: receipt.claimToken ?? null,
+        renewedAt: receipt.renewedAt ?? null,
+      },
+    });
+    return result.count;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Release all expired leases for a given issue. Returns count of released leases.
  *
  * A lease carrying a `retryAfter` still in the future is a RUNNING park (#1316):
