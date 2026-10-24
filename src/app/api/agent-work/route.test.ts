@@ -96,6 +96,8 @@ import { prisma } from "@/lib/prisma";
 import * as leaseModule from "@/lib/lease";
 import { AGENT_WORK_LEASE_DURATION_MS } from "@/lib/agent-work";
 import { authorizeRequest } from "@/lib/auth";
+import { supersedeOwnershipReleaseIntent } from "@/lib/ownership-reconciliation";
+import { resetRateLimits } from "@/lib/rate-limit";
 import { GET, POST } from "./route";
 
 const agentWork = prisma.agentWork as any;
@@ -109,8 +111,16 @@ const issueFindUnique = prisma.issue.findUnique as any;
 const releaseLeaseByAgentAndIssueMock = leaseModule.releaseLeaseByAgentAndIssue as any;
 const releaseAllLeasesByAgentMock = leaseModule.releaseAllLeasesByAgent as any;
 const releaseAgentWorkByAgentAndIssueMock = leaseModule.releaseAgentWorkByAgentAndIssue as any;
+const supersedeOwnershipReleaseIntentMock = supersedeOwnershipReleaseIntent as any;
 
 const mockAuthorizeRequest = vi.mocked(authorizeRequest);
+
+// The rate limiter keeps module-global state — reset it so the per-credential
+// window never leaks between tests (same convention as the checkpoint, finish
+// and ownership route tests).
+beforeEach(() => {
+  resetRateLimits();
+});
 
 // ─── GET Tests ───────────────────────────────────────────────────────────────
 
@@ -784,6 +794,86 @@ describe("POST /api/agent-work", () => {
       expect(res.status).toBe(400);
       const body = await res.json();
       expect(body.error).toBe("Missing required field: issueId, or set releaseAll: true");
+    });
+
+    // #1399: the operator path keys every lookup on the stored (normalized)
+    // issue id, so a padded operator-supplied value must be trimmed before
+    // it is matched, superseded, or audited.
+    it("trims a padded issueId so it matches the stored id (#1399)", async () => {
+      issueFindUnique.mockResolvedValueOnce({ number: 42, repository: { fullName: "org/repo" } });
+
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        issueId: "  issue-orphaned  ",
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.releasedLeases).toBe(1);
+      expect(body.releasedWork).toBe(0);
+
+      expect(releaseLeaseByAgentAndIssueMock).toHaveBeenCalledWith("test-agent", "issue-orphaned");
+      expect(releaseAgentWorkByAgentAndIssueMock).toHaveBeenCalledWith("test-agent", "issue-orphaned");
+      expect(issueFindUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "issue-orphaned" } }),
+      );
+      expect(supersedeOwnershipReleaseIntentMock).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: "issue-orphaned" }),
+      );
+      expect(auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            action: "orphan_work_released",
+            issueId: "issue-orphaned",
+          }),
+        }),
+      );
+    });
+
+    it("treats a whitespace-only issueId as absent (#1399)", async () => {
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        issueId: "   ",
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("Missing required field: issueId, or set releaseAll: true");
+      expect(releaseLeaseByAgentAndIssueMock).not.toHaveBeenCalled();
+      expect(releaseAgentWorkByAgentAndIssueMock).not.toHaveBeenCalled();
+      expect(issueFindUnique).not.toHaveBeenCalled();
+      expect(supersedeOwnershipReleaseIntentMock).not.toHaveBeenCalled();
+      expect(auditLog.create).not.toHaveBeenCalled();
+    });
+
+    // #1399: a whitespace-only issueId is absent, so an explicit releaseAll
+    // takes the agent-wide branch instead of an issue-scoped release that
+    // matched no row.
+    it("falls back to releaseAll when the issueId is whitespace-only (#1399)", async () => {
+      agentWork.findMany.mockResolvedValueOnce([{ id: "work-1", issueId: "issue-1" }]);
+      agentWork.findFirst.mockResolvedValueOnce({
+        issue: { number: 10, repository: { fullName: "org/repo" } },
+      });
+
+      const res = await makePostRequest({
+        action: "release",
+        agentName: "test-agent",
+        issueId: "   ",
+        releaseAll: true,
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.releasedLeases).toBe(1);
+      expect(body.releasedWork).toBe(1);
+
+      expect(releaseAllLeasesByAgentMock).toHaveBeenCalledWith("test-agent");
+      expect(releaseLeaseByAgentAndIssueMock).not.toHaveBeenCalled();
+      expect(releaseAgentWorkByAgentAndIssueMock).not.toHaveBeenCalled();
+      expect(issueFindUnique).not.toHaveBeenCalled();
     });
   });
 
