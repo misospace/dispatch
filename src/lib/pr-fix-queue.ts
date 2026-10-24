@@ -3450,18 +3450,18 @@ export function agentAlreadyHanded(
  * row — they only gate dispatch while the item is QUEUED at that
  * generation, and the next generation change clears them.
  *
-   * Fencing (#1340 review, mirroring #1256): the release is authorized ONLY by
-   * the exact live receipt — the report must echo the issued `handoutToken`
-   * and the (agent, generation, token) triple must all match. A rotated/
-   * reclaimed/released token has no authority over the current issuance, so a
-   * stale same-agent report can never remove a newer live hand-out; a
-   * mismatch — or a report with no token at all — releases nothing (fail
-   * closed). Courier echoes the token on every `followup-pr` report since
-   * misospace/courier#516 (courier PR #523), so a live settlement always
-   * carries it; the token-less shape stays accepted by the route for legacy
-   * work ids, whose hand-outs predate receipts and settle via the #1074
-   * skip path rather than a release.
-   *
+ * Fencing (#1340 review, mirroring #1256): the release is authorized ONLY by
+ * the exact live receipt — the report must echo the issued `handoutToken`
+ * and the (agent, generation, token) triple must all match. A rotated/
+ * reclaimed/released token has no authority over the current issuance, so a
+ * stale same-agent report can never remove a newer live hand-out; a
+ * mismatch — or a report with no token at all — releases nothing (fail
+ * closed). Courier echoes the token on every `followup-pr` report since
+ * misospace/courier#516 (courier PR #523), so a live settlement always
+ * carries it; the token-less shape stays accepted by the route for legacy
+ * work ids, whose hand-outs predate receipts and settle via the #1074
+ * skip path rather than a release.
+ *
  * Best-effort throughout: the settlement (or the skip decision) is already
  * made, so a failure here only logs and never fails the report.
  */
