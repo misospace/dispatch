@@ -199,7 +199,8 @@ export async function POST(request: Request) {
 }
 
 /**
- * Normalize an operator-supplied identifier for the release and reassign\n * paths (#1402, #1406).
+ * Normalize an operator-supplied identifier for the release and reassign
+ * paths (#1402, #1406).
  *
  * `AgentWork.agentName`, `Lease.agentName` and the work/lease row ids are
  * stored in their canonical form, so the request side is the side that can
